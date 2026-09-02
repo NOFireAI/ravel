@@ -439,3 +439,45 @@ class TestBaseline(RepoCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGeneratedScope(RepoCase):
+    """docs/reference/* is generated from the clap definitions, so its prose is
+    the code's prose. TRACKER and SRCPATH would demand editing doc comments to
+    satisfy a documentation gate, and the page would drift from the definition
+    at the next regeneration. Every other rule still applies."""
+
+    REF = "docs/reference/ravel-server-flags.md"
+
+    def test_scope_is_generated_not_user(self):
+        self.assertEqual(check_docs.classify(self.REF), "generated")
+
+    def test_citations_and_source_paths_are_allowed(self):
+        f = self.findings({
+            self.REF: (
+                "# Flags\n\n"
+                "| `--adaptive-flush-delay` |  |  | Feeds the compactor "
+                "(ADR-0067 decision 3); see crates/ravel-ingest/src/config.rs "
+                "and issue #123 |\n"
+            ),
+        })
+        self.assertEqual(self.rules(f, "TRACKER"), [])
+        self.assertEqual(self.rules(f, "SRCPATH"), [])
+
+    def test_the_same_text_in_a_guide_still_fires(self):
+        # The exemption is scope-bound, not a hole in the rules.
+        f = self.findings({
+            "docs/guides/a.md": (
+                "# G\n\nFeeds the compactor (ADR-0067 decision 3); see "
+                "crates/ravel-ingest/src/config.rs and issue #123.\n"
+            ),
+        })
+        self.assertTrue(self.rules(f, "TRACKER"))
+        self.assertTrue(self.rules(f, "SRCPATH"))
+
+    def test_other_rules_still_apply_to_generated(self):
+        f = self.findings({
+            self.REF: "# Flags\n\nA seamless corridor.\n\nSee [gone](nope.md).\n",
+        })
+        self.assertTrue(self.rules(f, "SUPERLATIVE"))
+        self.assertTrue(self.rules(f, "LINK"))
