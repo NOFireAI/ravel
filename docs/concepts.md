@@ -425,6 +425,11 @@ expanded; other pages use them bare.
   `query`, and `maintain`, selected with `--mode`. Aliases: `tier`, `role`.
   Tier is the cache, and role belongs to a storage credential. The flag
   keeps its spelling.
+- **Object Lock**: the S3 feature that holds an object version under a
+  retention period, enabled per bucket and applied per object version either
+  as a bucket default retention or as a per-object retention; Ravel sets
+  neither, and [docs/object-store-contract.md](object-store-contract.md)
+  states which mechanism does.
 - **OTAP**: OpenTelemetry Arrow Protocol, the bidirectional gRPC protocol
   that carries telemetry as Arrow record batches. Feature-gated in Ravel; see
   [docs/otap-ingest.md](otap-ingest.md).
@@ -496,13 +501,11 @@ expanded; other pages use them bare.
 - **UDTF**: user-defined table function, a function that returns a table
   rather than a value. Ravel registers none, and the SQL surface's tables are
   the registered tables only.
-- **WORM**: write once read many, a bucket policy that forbids overwriting or
-  deleting an object version for a retention period. Ravel's bucket
-  protection contract asks for it, as Object Lock in compliance mode, on the
-  deployment records, the provisioning records, the commit records, and the
-  catalog HEAD history, paired with versioning so that a HEAD
-  compare-and-swap creates a new locked version rather than overwriting one.
-  The contract is in [docs/object-store-contract.md](object-store-contract.md).
+- **WORM**: write once read many, storage that forbids overwriting or
+  deleting an object version for a retention period; Ravel's bucket
+  protection contract asks for it on the protected prefixes, and
+  [docs/object-store-contract.md](object-store-contract.md) states the
+  mechanism that applies it.
 - **writer**: the identity a shard actor writes under, carried in commit and
   data object keys as a writer id and epoch. Commits are sequenced per
   writer and shard, and a restarted process takes a new epoch rather than
