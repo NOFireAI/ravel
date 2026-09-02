@@ -1,4 +1,4 @@
-# Query Engine Design (Phase 1)
+# Query Engine Design
 
 Implementer contract for `ravel-query` and the query side of `ravel-server`.
 ADR-0006/0007 give the reasoning; docs/consistency-model.md the semantics.
@@ -155,13 +155,13 @@ object bound to the covered part set) and loaded once per query by
 with a `MetadataOnlyExec` leaf whose `EXPLAIN` line reads
 `MetadataOnlyExec: metadata_only=true, rows=<n>`. The two shapes are:
 
-- **q02** — `SELECT COUNT(*) FROM logs WHERE <declared column> <> <literal>`,
-  one residual filter over the scan and no `GROUP BY`. Answered as
+- **q02**: `SELECT COUNT(*) FROM logs WHERE <typed attribute column> <>
+  <literal>`, one residual filter over the scan and no `GROUP BY`. Answered as
   `sum over segments of (non_null_count - count(value = literal))`, read from
   each segment's exact dictionary. NULL rows are excluded, matching SQL
   three-valued logic for `<>`.
-- **q08** — `SELECT <declared column>, COUNT(*) FROM logs GROUP BY <declared
-  column>`, a plain declared-column group key directly over the scan and no
+- **q08**: `SELECT <typed attribute column>, COUNT(*) FROM logs GROUP BY
+  <typed attribute column>`, a plain group key directly over the scan and no
   filter. Answered by merging every touched segment's exact dictionary by
   value, plus the summed `null_count` as a synthetic NULL group when nonzero.
 
@@ -193,8 +193,8 @@ cannot be proven. The full set of decline conditions:
   channel is present: both also survive pushdown as `Exact` (deleted
   `FilterExec`, evaluated per row inside the scan), and neither is reflected in
   the whole-segment dictionary counts.
-- A `Str`-typed declared column, a predicate or group key over a non-declared
-  column, or a segment with no loaded statistics.
+- A `Str`-typed typed attribute column, a predicate or group key over a
+  column that is not declared, or a segment with no loaded statistics.
 - A segment whose per-value dictionary the fold omitted for exceeding the
   cardinality ceiling (ADR-0850 decision 3) -- an omitted dictionary carries no
   exact per-value counts, so a derived count could be wrong outright, not
@@ -210,20 +210,23 @@ which requires no pending erasure, an empty `content`, an empty `prune`, and a
 
 ## Declared-column MIN/MAX from two statistics carriers
 
-`SELECT MIN(<declared column>), MAX(<declared column>) FROM logs` (ClickBench
+`SELECT MIN(<typed attribute column>), MAX(<typed attribute column>) FROM logs`
+(ClickBench
 q07's shape) is answered at plan time, with no `LogsScanExec` in the plan and
 zero data GETs, through DataFusion's stock `AggregateStatistics` rule rather
 than through `MetadataOnlyAggregate`: `LogsScanExec::partition_statistics`
 reports the column's `min_value`/`max_value` as `Precision::Exact`, and its
-`null_count` too where that figure is proven, so `COUNT(<declared column>)`
-takes the same path. A statement answered this way records zero
+`null_count` too where that figure is proven, so
+`COUNT(<typed attribute column>)` takes the same path. A statement answered
+this way records zero
 `data_objects_touched`, since no segment is opened on either read route.
 
 Two carriers feed it, unioned per segment and per column (ADR-0873 decision
 4):
 
 - the `SegmentRef` stamp (`SegmentRef::declared_column_stats`, ADR-0873), an
-  exact whole-object min/max and NULL count per eligible declared column, read
+  exact whole-object min/max and NULL count per eligible typed attribute
+  column, read
   off the commit record (field 20), the compaction part (field 12), or the
   snapshot entry (field 15) that resolution already reads. Because it rides
   those records, it covers the live tail above the fold watermark and
@@ -281,8 +284,8 @@ column that reads NULL in every touched row has an exactly-NULL extremum, and
 this scan reports it as `Precision::Exact(<typed null>)`, but DataFusion's
 `FromColumnStatistics` implementations for `Min`/`Max` refuse an exact extremum
 that is null, so `MIN`/`MAX` over such a column keeps its `LogsScanExec` and
-scans to the same NULL. `COUNT(<declared column>)` on that same column is still
-a plan-time literal (`num_rows - null_count`, exactly 0).
+scans to the same NULL. `COUNT(<typed attribute column>)` on that same column
+is still a plan-time literal (`num_rows - null_count`, exactly 0).
 
 ### Defect metrics for the two carriers
 
@@ -308,7 +311,7 @@ through `read_commit_record`, so snapshot-entry drops are observed under the
 `read_snapshot_entry_twin`.
 
 `ravel_sql::declared_stat_carrier_conflicts` counts carrier disagreements, one
-per (declared column, conflicting segment, `partition_statistics` call).
+per (typed attribute column, conflicting segment, `partition_statistics` call).
 Within one call a column counts at most once, since the first conflicting
 segment declines it; across calls nothing is deduplicated, and DataFusion may
 call `partition_statistics` several times while building one plan, so repeated
@@ -323,8 +326,8 @@ deliberately not built here.
 
 ## Predicate-free full-window logs scan: request count
 
-Every OTHER predicate-free, full-window logs statement — `SUM`, `AVG`,
-`GROUP BY`, `ORDER BY ... LIMIT` over the whole table — still executes
+Every OTHER predicate-free, full-window logs statement (`SUM`, `AVG`,
+`GROUP BY`, `ORDER BY ... LIMIT` over the whole table) still executes
 `LogsScanExec`, but issues exactly one whole-object GET per relevant segment and
 ZERO suffix probes (#693 part 3). When the query carries no block-level
 predicate and no pending erasure, its window fully contains every relevant
@@ -332,8 +335,8 @@ segment, and there are at least `target_partitions` of them, `LogsScanExec`
 skips its plan phase entirely: no block can be pruned,
 so it assigns whole segments round-robin (one owner per segment) and reads each
 in a single `GetRange::Full`. That removes both probe classes the pre-#693-part-3
-path paid above the block-range threshold — the plan-phase footer probe and the
-per-open scan-side re-probe — which on the 8424-object ClickBench tenant (#680)
+path paid above the block-range threshold (the plan-phase footer probe and the
+per-open scan-side re-probe), which on the 8424-object ClickBench tenant (#680)
 were a combined ~24,700 probes on top of the 8,424 whole-object reads for one
 `SELECT`. When any of those conditions fails the unchanged plan-then-stripe path
 runs (its plan phase probes each segment once), and the scan publishes a
@@ -351,8 +354,8 @@ object per `(shard, hour)` disqualify an entire 8,424-object snapshot).
 The conjuncts above decide the ASSIGNMENT: no plan phase, one owner per
 segment. They say nothing about the read, because every one of them is about
 which BLOCKS survive and none is about which COLUMNS the projection wants.
-Under RLOG v3 those were the same question — reading every block meant needing
-every byte — and the fast path read every segment whole regardless of
+Under RLOG v3 those were the same question, since reading every block meant
+needing every byte, and the fast path read every segment whole regardless of
 projection. Under v4 they are independent: a block's pages sit one per column
 chunk inside its row group, so a statement projecting one column of 105 can
 read every block and still leave most of the object untouched.
@@ -361,7 +364,7 @@ So the read shape is a per-segment decision taken at open time, arbitrated by
 `LogSegmentFetcher::ranged_projection_pays`:
 
 - **Wide projection** (`SELECT *`, any reference to the merged `attrs` map, or
-  simply enough columns): one whole-object `GetRange::Full`, unchanged. The
+  enough columns on their own): one whole-object `GetRange::Full`, unchanged. The
   ranged path would fetch the same bytes and pay a probe and a section GET per
   object on top.
 - **Narrow projection**: the probe-and-range entry
@@ -392,19 +395,19 @@ pages turn out to cover the object after all. `LogsScanExec` publishes
 
 ## Selective (predicated) logs scan: request count
 
-A statement with a block-level predicate — a declared-column or `attrs`
-numeric comparison (the ClickBench q20 and q37-q43 shapes), a text
-`has_word`, a stream filter — is not block-predicate-free, so it takes the
+A statement with a block-level predicate (a declared-column or `attrs`
+numeric comparison, the ClickBench q20 and q37-q43 shapes; a text
+`has_word`; a stream filter) is not block-predicate-free, so it takes the
 plan-then-stripe path, never the whole-segment fast path above. Before #761
 that path read every relevant object WHOLE twice over: the plan phase opened
 each segment to count survivors, and the scan's `fetch_object_with_footer`
 resolved candidate blocks by `SkipIndex::candidate_blocks(ts, ts, None, &[])`
-— no numeric arms — so every block was a ts candidate, the coverage crossover
+with no numeric arms, so every block was a ts candidate, the coverage crossover
 (`candidate_bytes / BLOCKS-section bytes >= 0.75`) fired, and the read
 collapsed to one whole-object GET. The predicate pruned blocks only at decode,
 shrinking `blocks_scanned` but not the bytes moved. On the 8,424-object
 ClickBench tenant (#680) q37 moved 19,690 GETs and 11.7 GB to decode 144 of
-17,731 blocks, and q20 moved 29,614 GETs and 17.9 GB — more than the 11.1 GB
+17,731 blocks, and q20 moved 29,614 GETs and 17.9 GB, more than the 11.1 GB
 of objects on disk, because a cold cache re-read each surviving segment once
 per owning partition.
 
@@ -416,7 +419,7 @@ is resolved against the object's own FIELD_DIR
 - **Fetch side.** `fetch_object_with_footer` prunes the candidate set to the
   surviving blocks before it weighs the coverage crossover, so a selective
   query reads only those blocks (and the crossover fires only when the
-  survivors genuinely cover >= 75% of the BLOCKS section — the threshold is
+  survivors genuinely cover >= 75% of the BLOCKS section; the threshold is
   unchanged). On a version-4 object the unit is the surviving blocks' pages in
   the projected columns' chunks rather than whole blocks; see "Requests per
   object on a version-4 object" below. This is byte-identical to the unpruned
@@ -428,8 +431,8 @@ is resolved against the object's own FIELD_DIR
   (footer + SKIP_IDX via the 256 KiB suffix probe, plus the object's FIELD_DIR
   to resolve the arms) and fetches no block, carrying the footer forward so
   each per-partition subset open skips its own probe (#693 part 3). This is
-  sound because for a query the skip index can decide — ts bounds and NumRange
-  arms only — the reader's full prune reduces to its skip step, so the count
+  sound because for a query the skip index can decide (ts bounds and NumRange
+  arms only) the reader's full prune reduces to its skip step, so the count
   equals the survivor list the scan stripes. It takes at least one NumRange arm
   to qualify: a query with no prune arm is skip-decidable too, but its plan read
   already fetches only the ts-candidate blocks and warms exactly the extents the
@@ -437,12 +440,12 @@ is resolved against the object's own FIELD_DIR
   N per-partition ones over the same bytes. This branch's `fetch_plan_sections`
   read is wrapped in its own `page_fetch` span (#782), recording the probe and
   section GET count and `BlockRangeStats::block_bytes_fetched` on it, the same
-  way `plan_segment_fast` and `plan_segment_block_stats` already do — before
+  way `plan_segment_fast` and `plan_segment_block_stats` already do. Before
   #782 this branch's read was the one plan-phase GET on the query path with no
   span at all, invisible to a trace over a statement that took it.
 
-A predicate the skip index cannot decide — a `has_word`/text arm (bloom prunes
-it only at decode), an `attrs['k']='v'` POSTINGS equality, a stream filter —
+A predicate the skip index cannot decide (a `has_word`/text arm, which bloom
+prunes only at decode; an `attrs['k']='v'` POSTINGS equality; a stream filter)
 still reads the whole object in the plan phase and is counted in the
 `plan_full_reads` metric, so a report can see which statements still pay it. A
 segment at or below the block-range threshold counts there too: the fetch reads
@@ -484,7 +487,7 @@ The pieces, and why each is where it is:
 - STREAM_DIR and FIELD_DIR sit at the object's *front*, so no suffix probe of
   any length reaches them. FIELD_DIR is read only when the query needs it (a
   NumRange arm to resolve, or a projection narrower than every column), and it
-  is an extra GET only when the probe's cached suffix does not cover it — which
+  is an extra GET only when the probe's cached suffix does not cover it, which
   on a small object, where the probe spans the whole object, it does.
 - Chunk ranges: one per surviving `(row group, projected column)`, fewer when
   adjacent chunks coalesce, and one for the whole group when the projection
@@ -499,7 +502,7 @@ Reference figures on the 8,424-object ClickBench tenant, at version 4. A
 single-column, predicate-free statement reads 8,424 probes plus about one
 coalesced range per object (these objects hold roughly two blocks, so one row
 group), moving on the order of `1/N` of each object for `N` columns of similar
-width — a few hundred MB against the 11.1 GB the version-3 whole-object reads
+width, a few hundred MB against the 11.1 GB the version-3 whole-object reads
 moved for the same statement. A selective statement adds its FIELD_DIR range
 where the probe did not cover it and reads only the surviving blocks' pages:
 q37-class drops from 19,690 GETs and 11.7 GB, and q20-class from 29,614 GETs and
@@ -521,9 +524,15 @@ and passes through bit-exactly.
 1. Segment level: commit-record event-time bounds vs padded range (already
    done by Catalog::resolve).
 2. Series level: SERIES_META entry ts bounds vs padded range, then matcher
-   evaluation against the decoded LabelSet. Equality matchers use dictionary
-   ordinal lookups (resolve value -> ordinal once, compare ordinals);
-   regex/negative matchers evaluate on materialized label sets.
+   evaluation against the decoded LabelSet. Every matcher kind, equality
+   included, evaluates on materialized label sets: `SegmentFetcher` decodes
+   the catalog and filters with `matches_series`, which reads each label's
+   value as a string. A reader that resolves an equality value to a
+   LABEL_DICT ordinal once and compares ordinals exists
+   (`decode_catalog_matching_v4`), but no production fetch path calls it;
+   its callers are the read-path accounting benchmark and a fuzz target. So
+   an equality matcher costs a label-set materialization per candidate
+   series, the same as a regex or negative matcher.
 3. Page level: v1 has one page pair per series; nothing further to prune.
 
 ## Segment catalog fetch: whole-object vs sparse catalog-probe
@@ -560,7 +569,7 @@ trips. Measured per-request latency (~1-5 ms loopback, ~15-80 ms projected
 real S3) did not meter this specific within-segment crossover, so the floor
 is set
 conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
-below any real compacted sparse L1 part) rather than fit to a measured point.
+below any real compacted sparse L1 segment) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
 
 ## Endpoints (Prometheus compatibility subset)
@@ -624,7 +633,7 @@ The within-segment GET/byte model is the `selective_read_accounting` bench.
   matrix channel is float-only. Range queries render histogram matrices
   normally.
 
-## Budgets (Phase 1: static config)
+## Budgets (static config)
 
 Per query: max segments touched (1024, a cap on the one shared snapshot,
 not per selector), max concurrent GETs (8, applied both across selectors
@@ -655,7 +664,7 @@ through: `admit(&snapshot, &origins, &config)` for the sealed-count check,
 `request_budget_exceeded(requests, max_s3_requests)` for the incremental
 budget check. `QueryEngine::resolve_bounded` (`engine.rs`) is the call site
 for PromQL; the SQL executor, the five SQL table providers, and the
-exemplars state moved onto the same seam — no site still runs a
+exemplars state moved onto the same seam; no site still runs a
 pre-ADR-0073 per-surface check.
 
 An end-to-end test proves this seam through both real HTTP query
@@ -829,8 +838,8 @@ query pays nothing for the machinery. When the gate trips, the coordinator
 partitions the snapshot **shard-major** (`partition_snapshot`): a segment's
 ingest shard is the primary grouping key, a shard's segments are never split
 across slices, and whole shard groups are packed so the slice count never
-exceeds `max_parallel_slices`. Partitioning is total and disjoint — every
-segment lands in exactly one non-empty slice — and because the k-way merge is
+exceeds `max_parallel_slices`. Partitioning is total and disjoint, since every
+segment lands in exactly one non-empty slice, and because the k-way merge is
 order-insensitive over the flat pool of decoded runs, the specific
 shard-to-slice assignment never changes the result.
 
@@ -844,8 +853,8 @@ marker survive) ending with one terminal summary frame. A slice contributes
 to the merge only after its summary arrives; partial frames from a failed
 attempt are discarded whole, which is what makes re-dispatch safe with no
 dedup bookkeeping. Worker membership is a heartbeat key per process with
-rendezvous hashing of `(tenant_hash, signal, shard)` over the live set — no
-leader, no assignment object, no new durable state — and the per-process
+rendezvous hashing of `(tenant_hash, signal, shard)` over the live set, with no
+leader, no assignment object, and no new durable state, and the per-process
 content-addressed read caches behave as one aggregate cache because segments
 are immutable.
 
@@ -891,8 +900,8 @@ it fails closed rather than under-filter).
 A Metrics `FetchRequest` may carry a `PartialAggregateRequest`
 (`want_count`/`want_min`/`want_max`, plus `reduce_start_ns`/`reduce_end_ns`,
 ADR-0103 decision 2 and its Amendment). The worker then returns one
-`PartialAggregate` frame per series — series identity, labels, and whichever of
-count/min/max was asked for, the bounds as raw f64 bit patterns — in place of
+`PartialAggregate` frame per series (series identity, labels, and whichever of
+count/min/max was asked for, the bounds as raw f64 bit patterns) in place of
 every `SeriesFrame`, under the same slice atomicity. All three value flags
 false is the group-only request: identity frames with no value fields, the
 distinct-group enumeration. The branch is per request, so a slice returns all
@@ -902,7 +911,7 @@ partials or all raw frames, never a mix, and a request with no
 `reduce_start_ns`/`reduce_end_ns` restrict the reduction to an exact
 `(start, end]` window, matching the evaluator's own matrix-selector convention
 (`crates/ravel-promql/src/eval.rs`'s `eval_matrix_selector`) rather than
-whatever the fetched segments happen to span — the two bounds must both be
+whatever the fetched segments happen to span. The two bounds must both be
 present or both absent, or the worker refuses with a typed `Internal` error.
 The worker also unconditionally filters `STALE_NAN_BITS` samples out of its
 merged set before counting, *after* `merge_soa_runs` runs, never before: the
@@ -918,7 +927,7 @@ exact, given ADR-0103 decision 1's eligibility gate (not federated, every
 resolved segment inside one shard generation's stable interval): under that gate
 no other worker and no remote cluster holds runs of the same series, so nothing
 is left for the coordinator's cross-worker dedup belt to reconcile. `min`/`max`
-fold under `f64::total_cmp`, the ADR-0023 total order, never `PartialOrd` — but
+fold under `f64::total_cmp`, the ADR-0023 total order, never `PartialOrd`, but
 per the Amendment, no caller combines min/max yet: `total_cmp` disagrees with
 PromQL's own `min_over_time`/`max_over_time` (plain IEEE, NaN-overwrite) on NaN
 and `-0.0` windows, so only `count` pushdown is wired to a caller. The terminal
@@ -937,18 +946,18 @@ wire for the one eligible plan (epic #64 T4c/T4d); `MergedSource` overrides
 to the PromQL fast path (T4b), with `PROTOCOL_VERSION` bumped to 4 in the
 same commit as the wire opt-in. A worker's `count: Some(0)` (a real,
 correctly-computed zero-in-window count) is dropped before it reaches
-`MergedSource`, never surfaced as a phantom zero-valued series — the same
+`MergedSource`, never surfaced as a phantom zero-valued series, the same
 absence-of-output-sample contract the raw path already has.
 
 This is the engine-level (queryfrag) fetch, merge, and federation machinery for
-all five signals — shipped and covered by the per-signal differential, erasure,
+all five signals, shipped and covered by the per-signal differential, erasure,
 skew, and federation tests. The coordinator caller that actually dispatches a
 Logs/Alerts/Audit/Spans distributed *search* is the SQL surface (log and trace
 search runs through the `logs`/`alerts`/`audit`/`spans` tables, not PromQL); the
 PromQL engine's own fetch/federation flow drives `Signal::Metrics` only today.
 The SQL-lane distributed scan that drives that log and trace search is a
-separate step, now landed but not yet wired into a running server; see "The
-SQL-lane distributed scan" below.
+separate step, and it exists only in a `flight-sql` build, which no published
+image is; see "The SQL-lane distributed scan" below.
 
 ### The log/span coordinator merge: order-independent, no dedup
 
@@ -958,7 +967,7 @@ duplicates there are harmless and collapse. The RLOG-family and span merges
 (`merge_log_records`, `merge_spans` in `distrib/mod.rs`) differ in one decisive
 way: **they never dedup.** `docs/consistency-model.md` ("logs and spans") and
 ADR-0051 section 5 are explicit that logs, alerts, audit, and spans carry no
-query-time dedup — a retry after a lost ack produces byte-identical rows that
+query-time dedup: a retry after a lost ack produces byte-identical rows that
 are legitimately duplicate user data and must stay visible. Every record in the
 pool is returned.
 
@@ -982,9 +991,9 @@ slices):
   compare by bit pattern; for spans: `(trace_id, span_id, start_ts_ns,
   end_ts_ns, parent_span_id, name, status_code, status_message, service_name,
   attrs)`). Sorting the flattened multiset is a pure function of that multiset,
-  so the shard-major slice grouping — which differs from the local per-segment
-  grouping, and which a reshard-straddling stream or trace makes differ further
-  — never changes the result. The output is bit-identical to a local
+  so the shard-major slice grouping, which differs from the local per-segment
+  grouping and which a reshard-straddling stream or trace makes differ
+  further, never changes the result. The output is bit-identical to a local
   multi-segment read merged under the same order, which the differential test
   exercises with at least one generated case placing one stream's or trace's
   segments in two slices.
@@ -994,7 +1003,7 @@ path uses (`retain_series_soa` for metrics, `LogQuery` erasure for the RLOG
 family, `is_erased_span` for spans); the coordinator never re-applies it.
 Because each segment is self-contained, a resource-attribute-only exclusion
 evaluates identically wherever the segment is read, including when one stream's
-segments straddle two slices — proven by an erasure property test that diffs a
+segments straddle two slices, proven by an erasure property test that diffs a
 distributed slice set against a local read of the same segments.
 
 ### The SQL-lane distributed scan (logs, alerts, audit, spans)
@@ -1010,7 +1019,7 @@ at the coordinator.
 It reproduces the same total-order, no-dedup merge rule the queryfrag lane uses,
 one layer up in the DataFusion plan. Each worker returns its slice as one
 globally-sorted partition under the table's total-order key, and the coordinator
-runs a `SortPreservingMergeExec` under that key with **nothing above it** — no
+runs a `SortPreservingMergeExec` under that key with **nothing above it**: no
 dedup node, no distinct. Logs, alerts, audit, and spans have no query-time dedup
 (`docs/consistency-model.md`, ADR-0051 section 5), so every row every slice
 returns stays visible, exactly as `merge_log_records`/`merge_spans` do in the
@@ -1025,11 +1034,16 @@ Reachability: the distributed scan is installed on a table provider through each
 provider's `with_distributed_scan` (`LogsTableProvider` and the
 alerts/audit/spans siblings) and is exercised end to end by the acceptance tests
 (`crates/ravel-sql/tests/flight_distributed.rs`) driving `provider.scan(..)`. It
-is **not yet wired into a running server's coordinator and worker paths**: the
-server-side coordinator that installs the distributed context from
-`get_flight_info_statement`, and the worker `do_get` slice-fragment branch that
-runs each provider's `worker_fragment`, are still later wiring. The SQL lane
-exists and is tested, but no live server binary reaches it yet.
+is also wired into a running server: `ravel-server` installs the
+coordinator-side distributed scan on its Flight SQL service through
+`RavelFlightSqlService::with_distributed_scan`, from the same live
+query-worker roster and the same cost thresholds the PromQL distributed lane
+uses, whenever `--distributed-query` is on in `all` or `query` mode. Absent
+that flag the service runs every statement whole-set on the coordinator.
+
+The whole seam sits behind the `flight-sql` cargo feature, and no published
+image builds that feature, so reaching this code takes a build that asks for
+it.
 
 ### Budgets and the fault matrix
 
@@ -1040,7 +1054,7 @@ arrive, and the bytes-scanned cap is checked against the saturating fold of
 every slice's reported cost (saturating, never wrapping, so a counter near
 `u64::MAX` clamps rather than slipping under the cap). Every slice's real
 spend is folded into the query's live accounting handle before any failure or
-fallback, so the reported cost reflects work already paid for — a query that
+fallback, so the reported cost reflects work already paid for: a query that
 fetches remotely and then re-runs locally (a version-skew fallback) reports
 both, never one.
 
@@ -1066,7 +1080,7 @@ Failures map to the same typed outcomes the local path produces:
   **unwired log/span fetcher**, or a **matcher-bearing log/span slice:** the
   worker answers `Unsupported`, and the
   coordinator silently falls back to fully local execution for the whole
-  query — never an error, never a partial result. This is the load-bearing skew
+  query, never an error and never a partial result. This is the load-bearing skew
   direction: a *new* coordinator against an *old* worker that predates the
   log/span fan-out sees `Unsupported` for Logs/Alerts/Audit/Spans and degrades
   to local execution, so the new `LogRecordFrame`/`SpanFrame` variants never
@@ -1120,13 +1134,14 @@ service, and the distinction is a security invariant, not an optimization:
   cluster is handed a short-lived fragment token and the already-resolved
   `tenant_hash` on the wire. The worker trusts the coordinator: it uses the
   wire `tenant_hash` directly. This token is a slice credential, never a
-  cross-cluster credential — a remote cluster must reject it (see the
-  `federation_rejects_the_fragment_token` test in `distrib.rs`).
+  cross-cluster credential, and a remote cluster must reject it (see the
+  `federation_rejects_the_fragment_token` test in
+  `services/ravel-server/src/distrib.rs`).
 - **`Resolve` (cross-cluster federation).** A remote cluster is a separate
   trust domain. The coordinator authenticates to it with an ordinary
   per-remote tenant credential (the `credential` on `RemoteClusterConfig`),
   and the remote resolves the tenant from *its own* `TenantResolver` applied
-  to that credential — never from the wire `tenant_hash`, which it
+  to that credential, never from the wire `tenant_hash`, which it
   overwrites with the locally resolved value. A federated request therefore
   cannot name a tenant the presented credential does not authorize on the
   remote, exactly as a direct client request to that remote could not.
@@ -1158,7 +1173,7 @@ a version-skew coverage gap. A version-skewed remote instead answers
 A remote that answers `Unsupported` for the whole query is the federation analog
 of the intra-cluster skew fallback: a
 remote resolves its own snapshot, so `Unsupported` can only mean "this cluster
-does not serve this query kind yet" — an availability/coverage property, not a
+does not serve this query kind yet", an availability/coverage property, not a
 wrong-data one. The concrete cases are a remote running code that predates the
 log/span fan-out (it rejects a Logs/Alerts/Audit/Spans query with `Unsupported`,
 its `run_slice_inner` rejecting every non-Metrics signal) and a remote on an
@@ -1183,7 +1198,7 @@ bare convenience wrappers `QueryEngine::{instant, range, resolve_series}`
 return their value paired with a `#[must_use] Coverage`
 (`Complete | Partial { skipped }`), derived by `Coverage::from_stats` from
 the same `QueryStats` their `_with_stats` sibling returns. Nothing new is
-tracked; the wrappers simply cannot drop what the fan-out already recorded.
+tracked; the wrappers cannot drop what the fan-out already recorded.
 A caller that does not care must bind the coverage to a name, which puts the
 decision to ignore it where review can see it. The `_with_stats` and
 `_with_stats_annotated` variants are unchanged and remain the source for the
@@ -1205,7 +1220,7 @@ docs/catalog-and-mvcc.md (created_unix_ns, writer_epoch, writer_seq,
 in-page index). Those provenance fields are meaningful only *within* one
 cluster: two clusters can mint the same `(writer_epoch, writer_seq)` for
 unrelated writes. Federation therefore assumes disjoint series identity
-across clusters — the intended deployment is region- or tenant-sharded, so
+across clusters: the intended deployment is region- or tenant-sharded, so
 one series lives in exactly one cluster. When the same `(series_id, ts)`
 does arrive from two clusters with different values, the winner is
 unspecified (whichever the total order happens to order first); the merge
@@ -1337,9 +1352,9 @@ one moment cannot cover both (ADR-0044 decision 3, amended).
 **The catalog term**, computed before `Catalog::resolve` runs:
 `Catalog::estimated_catalog_requests` bounds the store requests resolve
 will issue before it has listed anything, from inputs the planner already
-has going in. Two pieces: one LIST per `(shard, hour)` pair — `shard_count`
+has going in. Two pieces: one LIST per `(shard, hour)` pair, `shard_count`
 times the number of hour buckets the padded window spans, with no snapshot
-HEAD to shorten the listed suffix — plus
+HEAD to shorten the listed suffix, plus
 `SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`, a fixed constant covering the
 snapshot-window path (`Catalog::resolve_snapshot_window`) that
 `resolve_impl` always tries first whenever the window is non-empty, before
@@ -1375,23 +1390,23 @@ budget on this number.
 
 Constants (crates/ravel-query/src/engine.rs):
 
-- `OPEN_REQUESTS_PER_SEGMENT = 2` — `open_segment`'s footer GET plus the
+- `OPEN_REQUESTS_PER_SEGMENT = 2`: `open_segment`'s footer GET plus the
   worst-case one extra `NeedRange` chase.
-- `CATALOG_REQUESTS_PER_SEGMENT = 4` — the sparse catalog-probe path's
+- `CATALOG_REQUESTS_PER_SEGMENT = 4`: the sparse catalog-probe path's
   worst-case coalesced GET count over LABEL_DICT/SERIES_IDS/
   SERIES_META_CHUNKS/SERIES_IDX; the whole-object and below-threshold
   paths cost strictly less.
-- `PAGE_REQUESTS_PER_RUN = 2` per matched series — a TS run and a VAL (or
+- `PAGE_REQUESTS_PER_RUN = 2` per matched series: a TS run and a VAL (or
   HIST) run, before `ensure_ranges`' `covers()` dedup can ever reduce it.
-- `STORE_BYTES_SAFETY_FACTOR = 2` applied to `object_size` — covers
+- `STORE_BYTES_SAFETY_FACTOR = 2` applied to `object_size`: covers
   re-reading a segment across a retry (snapshot invalidation) without
   claiming a tighter per-page bound than the catalog can prove pre-fetch.
-- `Catalog::estimated_catalog_requests(window, now_ns)` — the catalog term:
+- `Catalog::estimated_catalog_requests(window, now_ns)`: the catalog term,
   `shard_count * hour_buckets_spanned` LISTs plus
   `SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND` (3) for the snapshot-window path,
   computed pre-resolve.
 - `segment_decompressed_bytes_upper_bound` applied per segment for
-  `estimated_decompressed_bytes` — derived from the segment's own value
+  `estimated_decompressed_bytes`, derived from the segment's own value
   kinds rather than one constant, per ADR-0044's amended requirement.
   `SegmentRef::sample_count` aggregates scalar and native-histogram
   samples with no split by kind, so this bounds every sample at
@@ -1399,14 +1414,14 @@ Constants (crates/ravel-query/src/engine.rs):
   decoded sample can structurally exceed), capped again by twice
   `ReaderLimits::max_section_uncompressed_bytes` (a segment carries at
   most one VAL_PAGES and one HIST_PAGES section). This never
-  under-shoots, but is deliberately loose for scalar-only segments —
+  under-shoots, but is deliberately loose for scalar-only segments:
   closing that gap needs a persisted per-kind sample count, which is a
   frozen-format change, not something this estimate can derive today.
 
 `prefetch` fans out one independent fetch per selector against the same
 shared snapshot, so `estimate_cost` takes a `fetch_multiplier` (the
 selector/plan count; 1 for the single-fetch `resolve_series_inner` path)
-and scales every estimated quantity by it — an N-selector query can cost
+and scales every estimated quantity by it: an N-selector query can cost
 up to N times a single per-segment pass.
 
 Each query records the estimate and the actual accounting snapshot side
@@ -1425,16 +1440,16 @@ phase they cover: `catalog_resolve` (`Catalog::resolve_impl` in
 (`build_scalar_decodes`/`build_histogram_decodes`), `evaluate` (wrapping
 the evaluator call in `instant_inner`/`range_inner`). `catalog_resolve`
 lives on the catalog's own resolve body rather than ravel-query's
-`resolve_bounded` wrapper, so every caller of `Catalog::resolve*` gets it
-— including ravel-sql's executor, which calls
+`resolve_bounded` wrapper, so every caller of `Catalog::resolve*` gets it,
+including ravel-sql's executor, which calls
 `resolve_pruned_with_accounting` directly and never reaches the ravel-query
 wrapper.
 
 Each phase span also records the per-span byte/request counts ADR-0044
 decision 5 requires, scoped to that call's own work rather than the whole
 query. Except on `catalog_resolve`, these come from values local to the
-phase — the bytes and request count of the GET/decode calls that
-invocation makes itself — not from a before/after `QueryAccounting`
+phase (the bytes and request count of the GET/decode calls that
+invocation makes itself), not from a before/after `QueryAccounting`
 snapshot delta. A delta would be wrong for every fetch/decode phase: the
 segment futures run concurrently over one shared `QueryAccounting` handle
 (`buffer_unordered` in `engine.rs`), so a sibling segment's GETs land
@@ -1443,10 +1458,10 @@ this span. These GET counts are store-sourced only: `guarded_get` routes
 cache-eligible ranges through the ADR-0046 read cache, and a cache hit
 serves bytes with no store round trip at all (`record_cache_hit`, never an
 `AccountedOp::Get`), so it contributes zero requests and zero bytes to the
-span. Each `guarded_get` call returns its own `{requests, bytes}` cost —
+span. Each `guarded_get` call returns its own `{requests, bytes}` cost,
 `{1, len}` for a store GET (the uncached path, a cache miss's leader, or a
 single-flight follower riding another caller's in-flight GET, matching the
-log path's rule below), `{0, 0}` for a cache hit — and the caller folds
+log path's rule below) and `{0, 0}` for a cache hit, and the caller folds
 those in, so the store-vs-cache decision lives once, at the seam that
 already knows it. `segment_open` sums the store-sourced cost of its own one
 or two `guarded_get` calls; which of those can reach zero on a warm cache
@@ -1485,9 +1500,9 @@ sequence issued (probe, directory sections, coalesced candidate-block
 ranges) and the bytes they moved, again zero when every extent was a cache
 hit.
 
-Span fields otherwise carry only bounded values — `tenant_hash` as a hex
+Span fields otherwise carry only bounded values: `tenant_hash` as a hex
 string, `object_size`, matcher/series counts, and fixed-set kind strings
-(`page_kind`, `eval_kind`) — never query text, label values, object keys,
+(`page_kind`, `eval_kind`), never query text, label values, object keys,
 or `shard` (ADR-0044 decision 5's rejected alternative 6: shard is not a
 label), the same allowlist ADR-0044 sets for `/metrics` labels.
 
@@ -1496,7 +1511,7 @@ label), the same allowlist ADR-0044 sets for `/metrics` labels.
 `GET /api/v1/query` and `/query_range`'s `stats` object carries these
 cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
 
-- `stats.accounting` — the `QueryAccountingSnapshot`, split by op for the
+- `stats.accounting`: the `QueryAccountingSnapshot`, split by op for the
   S3 counters (`s3GetRequests`/`s3GetBytes`, `s3ListRequests`/
   `s3ListBytes`, `s3HeadRequests`/`s3HeadBytes`), plus `cacheHits`/
   `cacheMisses`/`cacheBytes`, `decompressedBytes`, `segmentsOpened`,
@@ -1506,13 +1521,13 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `Catalog::resolve`'s own count; `QueryAccounting`'s own
   `segments_pruned` counter has no caller in `ravel-query` or
   `ravel-catalog` and would only ever render 0.
-- `stats.estimate` — the `CostEstimate`: `estimatedRequests`,
+- `stats.estimate`: the `CostEstimate`, carrying `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
-- `stats.phases` — the same GETs and bytes `stats.accounting` pools, split
+- `stats.phases`: the same GETs and bytes `stats.accounting` pools, split
   by phase (issue #935 exposing issue #796's `PhaseAccounting`; ADR-0927
   decision 7). An array of one object per `QueryPhase`, in
-  `QueryPhase::ALL` order, each phase exactly once: `resolve` (catalog
+  `QueryPhase::ALL` order, each phase present one time only: `resolve` (catalog
   snapshot resolve), `plan` (footer and skip-index probing), `probe`
   (segment catalog fetch), `scan` (block and page data reads). The
   rendering iterates `QueryPhase::ALL`, so a phase added to the enum
@@ -1542,7 +1557,7 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
 
 ## PromQL conformance (ADR-0035)
 
-What Ravel supports, what it deliberately refuses, and what is simply
+What Ravel supports, what it deliberately refuses, and what is merely
 untested, one row per construct. The classification is ADR-0035's:
 
 1. **supported** -- implemented, with a passing test proving it. The Evidence
@@ -1766,11 +1781,11 @@ query, and no query needs to scan or join metrics and logs together.
 
 Schema (fixed columns plus one map):
 
-- `ts`, `observed_ts` — `Timestamp(ns)`.
-- `severity_num` — `UInt8`; `severity_text`, `body` — `Utf8`.
-- `trace_id` — `FixedSizeBinary(16)`, `span_id` — `FixedSizeBinary(8)`, both
-  nullable; `flags` — `UInt32`.
-- `attrs` — `Map(Utf8, Utf8)` carrying each record's resource, scope, and
+- `ts`, `observed_ts`: `Timestamp(ns)`.
+- `severity_num`: `UInt8`; `severity_text` and `body`: `Utf8`.
+- `trace_id`: `FixedSizeBinary(16)`; `span_id`: `FixedSizeBinary(8)`, both
+  nullable; `flags`: `UInt32`.
+- `attrs`: `Map(Utf8, Utf8)` carrying each record's resource, scope, and
   per-record dynamic attributes merged into one map. On a key collision the
   per-record value wins over the resource/scope value. Positional scope name
   and version are excluded (no synthetic `scope.name`/`scope.version` keys).
@@ -1779,14 +1794,14 @@ Supported predicates (all pushdown is widen-only; DataFusion always re-applies
 the original predicate above the scan, so pruning can only ever widen the fetch,
 never drop a true result):
 
-- `ts` range comparisons — exact segment-level pruning from the catalog
+- `ts` range comparisons: exact segment-level pruning from the catalog
   summary, the same shape as the metrics table's `ts` bounds.
-- `has_word(body, 'literal')` — a word/phrase content search whose SQL
+- `has_word(body, 'literal')`: a word/phrase content search whose SQL
   semantics equal the RLOG reader's exact token filter, so it both pushes down
   (bloom-accelerated pruning inside the scan) and needs no residual correction.
   A plain `LIKE '%word%'` pattern's literal is recognized but is **not** pushed
   as a prune, because token matching is not a superset of SQL substring `LIKE`.
-- `attrs['k'] = 'v'` — an attribute equality. `extract_logs` sends it to a
+- `attrs['k'] = 'v'`: an attribute equality. `extract_logs` sends it to a
   prune-only channel that drives POSTINGS block pruning (ADR-0049). The channel
   never becomes the reader's per-row filter, so it cannot drop a resource-only
   match. The merged `attrs` residual evaluates the equality exactly.
@@ -1809,10 +1824,10 @@ never drop a true result):
     the same envelope.
   - `str`/`bytes` `=` against a matching-type literal → the same
     `Predicate::Equals` the `attrs['k'] = 'v'` shape builds, driving POSTINGS.
-  Everything else — `!=`, `NOT`, negated `BETWEEN`, `IS [NOT] NULL`, a general
+  Everything else (`!=`, `NOT`, negated `BETWEEN`, `IS [NOT] NULL`, a general
   `OR`, a range operator on a `str`/`bytes` column, a `str`/`bytes` `IN`, or a
-  type-mismatched literal (including one DataFusion coercion has already wrapped
-  in a `Cast`, which is no longer a bare column) — is not extracted and scans as
+  type-mismatched literal, including one DataFusion coercion has already wrapped
+  in a `Cast`, which is no longer a bare column) is not extracted and scans as
   before. Two soundness caveats are inherited, not new: the equality half
   declines all pruning on a POSTINGS section written before the #333 write-path
   fix (a section-version gate, so no per-predicate code carries it), and inherits
@@ -1877,13 +1892,15 @@ last resolved declaration instead and counts
 [guides/operations.md](guides/operations.md#declared-typed-attribute-columns-adr-0090)
 for the operator-facing contract.
 
-Predicates on a declared column are pushed down as prune-only arms (ADR-0093):
+Predicates on a typed attribute column are pushed down as prune-only arms
+(ADR-0093):
 an `i64`/`bool` comparison or `BETWEEN` and an `i64` `IN` drive the skip index,
 and a `str`/`bytes` equality drives POSTINGS, exactly as the "Supported
 predicates" list above describes. The pushdown is always `Inexact`, so the typed
 comparison is still re-evaluated exactly as a residual filter above the scan; the
-prune only changes which blocks the fetch decodes. A declared column referenced
-by the query's projection -- which DataFusion also folds residual-filter columns
+prune only changes which blocks the fetch decodes. A typed attribute column
+referenced by the query's projection -- which DataFusion also folds
+residual-filter columns
 into -- is decoded by the scan's column selection, so `WHERE` on a declared
 column decodes only the pages it needs. Moving an equality predicate from
 `attrs['k'] = 'v'` to a declared `k = 'v'` now prunes through the same POSTINGS
@@ -1938,8 +1955,8 @@ sequence depends on the object's size (ADR-0107,
 one whole-object GET; above it a suffix probe, one GET per directory section,
 and coalesced GETs covering only the candidate blocks skip-index pruning kept.
 With the cache, every GET of either shape is keyed by the extent it fetched and
-coalesces through single-flight — the whole object below the threshold, and the
-probe, each section, and each block above it — so `n` partitions striping one
+coalesces through single-flight (the whole object below the threshold, and the
+probe, each section, and each block above it), so `n` partitions striping one
 segment cost one request per distinct extent rather than `n` sequences. Without
 a cache each is a real object-store GET, and partitions beyond the segment count
 would multiply GETs with nothing absorbing them. Note what the cap does and does
@@ -1953,9 +1970,9 @@ cached rows a cache sized to hold the whole dataset), not striping in general.
 Its rows put a number on the residual multiplier and show where it no longer
 applies: each row carries reads per segment and bytes fetched over dataset
 bytes, derived in the report rather than left to the reader. For a
-block-predicate-free statement whose window contains every relevant segment —
-the report's `SELECT ts, body FROM logs`, and the shape the whole-segment fast
-path serves (#693 part 3, amended by #739) — those two figures are about 1
+block-predicate-free statement whose window contains every relevant segment
+(the report's `SELECT ts, body FROM logs`, and the shape the whole-segment fast
+path serves, #693 part 3, amended by #739) those two figures are about 1
 (the reads figure divides every accounted GET by the segment count, so the
 resolve's one catalog probe lifts it slightly above 1: 1.03 on the 32-segment
 fixture) and 1.0 at every partition count that fits inside the segment count,
@@ -1963,7 +1980,7 @@ on both read shapes and with or without a cache: since #739 dropped the block-ra
 conjunct, object size no longer gates the fast path, so the plan phase is skipped
 and each segment is read whole once, and there is nothing left for the cache to
 absorb. The multiplier reappears only on the cache-wired row whose partition
-count exceeds the segment count, which falls back to plan-then-stripe — and even
+count exceeds the segment count, which falls back to plan-then-stripe, and even
 there only on the above-threshold read shape, since a whole-object stripe
 coalesces onto the one `(0, object_size)` cache key.
 `crates/ravel-query/tests/log_block_range.rs` pins the
@@ -1976,7 +1993,7 @@ The peak-memory consequence follows the same gate, with a second term above the
 block-range threshold. Concurrently-held *decoded* memory is bounded by block
 size times the number of partitions decoding at once, so only the cached
 configuration raises that bound above the old
-`min(target_partitions, segment_count)` one — an un-cached deployment's bound is
+`min(target_partitions, segment_count)` one; an un-cached deployment's bound is
 unchanged by ADR-0102. Raw bytes behave differently on the two read shapes: at
 or below the threshold every partition shares one cached whole-object `Bytes`
 (a cheap clone), while above it each partition assembles its own object-sized
@@ -2095,8 +2112,8 @@ path.
 Projection pushdown only helps a query that asks for few columns. A
 `SELECT <wide projection> ... WHERE ... ORDER BY ... LIMIT k` asks for all of
 them, and gets them for every row, to return `k`. On the ClickBench reference
-tenant (100M rows, 8,424 objects, 105 declared columns) that is the difference
-between a query and a timeout:
+tenant (100M rows, 8,424 objects, 105 typed attribute columns) that is the
+difference between a query and a timeout:
 
 | statement | before | expected after |
 |---|---|---|
@@ -2263,25 +2280,25 @@ exact schema, the exact pushdown, and which predicate prunes where.
 
 Schema (fixed columns plus one map, `crates/ravel-sql/src/spans_schema.rs`):
 
-- `trace_id` — `FixedSizeBinary(16)`, non-null; `span_id` —
+- `trace_id`: `FixedSizeBinary(16)`, non-null; `span_id`:
   `FixedSizeBinary(8)`, non-null.
-- `parent_span_id` — `FixedSizeBinary(8)`, nullable (NULL on a root span, never
+- `parent_span_id`: `FixedSizeBinary(8)`, nullable (NULL on a root span, never
   zero-filled).
-- `name` — `Utf8`, non-null (the span/operation name).
-- `start_ts`, `end_ts` — `Timestamp(Nanosecond, None)`, non-null.
-- `status_code` — `UInt8`, non-null: the stored OTLP byte, `0=Unset`, `1=Ok`,
+- `name`: `Utf8`, non-null (the span/operation name).
+- `start_ts`, `end_ts`: `Timestamp(Nanosecond, None)`, non-null.
+- `status_code`: `UInt8`, non-null, the stored OTLP byte, `0=Unset`, `1=Ok`,
   `2=Error`. A `UInt8` for the same reason `logs.severity_num` is one: a tiny
   fixed enum a plain integer round-trips exactly. Map it to text in SQL when a
   caller wants the string.
-- `status_message` — `Utf8`, nullable.
-- `attrs` — `Map(Utf8, Utf8)`: the span's already-merged resource, scope, and
+- `status_message`: `Utf8`, nullable.
+- `attrs`: `Map(Utf8, Utf8)`, the span's already-merged resource, scope, and
   span attributes. RSPAN stores that merged map directly, so unlike `logs`
   there is no separate stream-identity blob to fold in at scan time.
-- `service_name` — `Utf8`, nullable: populated from `attrs["service.name"]`
+- `service_name`: `Utf8`, nullable, populated from `attrs["service.name"]`
   (NULL when the span has no such attribute). RSPAN v4 stores it as a
   block-local dictionary column (ADR-0054); the scan exposes it as a plain
   column so `WHERE service_name = '...'` is pushdown-eligible.
-- `duration_ns` — `Int64`, non-null: **computed** `end_ts - start_ts`, never a
+- `duration_ns`: `Int64`, non-null, **computed** as `end_ts - start_ts`, never a
   stored column (ADR-0045 decision 5, rejected alternative 3). Both endpoints
   are already stored, so materializing the difference per row would add bytes to
   answer a question the block bounds answer for free. It is exposed as a SQL
@@ -2294,28 +2311,28 @@ predicate above the scan, and pruning can only ever widen the fetch, never drop
 a true result). Six shapes are recognized; every other predicate contributes no
 prune and is evaluated as a residual only:
 
-- `trace_id = <literal>` — the RSPAN fast path (ADR-0041). The literal is a
+- `trace_id = <literal>`: the RSPAN fast path (ADR-0041). The literal is a
   16-byte binary or a 32-character hex string. It compiles to a
   `SpanQuery::trace` lookup, and the skip index drops every block whose
   `[min_trace_id, max_trace_id]` range excludes the target: a bounded
   single-trace scan instead of a full window scan.
 - `start_ts` / `end_ts` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and
-  `BETWEEN`) — both columns fold into one inclusive `[ts_min, ts_max]` window
+  `BETWEEN`): both columns fold into one inclusive `[ts_min, ts_max]` window
   the reader prunes blocks against by time-interval overlap. Folding both
   endpoints into one window is a widen, never a narrow, because `end_ts >=
   start_ts` on every record.
-- `duration_ns` range comparisons — fold into a `[lo, hi]` window exactly as
+- `duration_ns` range comparisons: fold into a `[lo, hi]` window exactly as
   the ts window folds, pruned against each block's `min/max_duration_ns` (RSPAN
   v2 skip-index fields). Strict `>`/`<` use `checked_add`/`checked_sub`.
 - `status_code = <literal>`, `status_code IN (...)`, and a same-axis `OR` of
-  `status_code` equalities — map to the skip index's status bits and prune
+  `status_code` equalities: map to the skip index's status bits and prune
   against each block's one-byte `status_mask` (RSPAN v2). `status_code = 2`
   skips every block with no Error span. Multiple sibling equalities
   AND-intersect; a same-axis `OR`/`IN` unions.
-- `service_name = <literal>` — a per-block `service.name` bloom probe (RSPAN
+- `service_name = <literal>`: a per-block `service.name` bloom probe (RSPAN
   v3, ADR-0054). A block whose bloom proves the token absent is skipped before
   decode.
-- `name = <literal>` — the span-name sibling of `service_name`, the other field
+- `name = <literal>`: the span-name sibling of `service_name`, the other field
   the v3 per-block bloom is built over.
 
 Prune site by predicate: `trace_id`, `start_ts`/`end_ts`, `duration_ns`, and
@@ -2344,10 +2361,10 @@ page; and the row path, which rebuilds each `SpanRecord` and is what a query
 touching `attrs` (`SELECT *` included) runs. Four partition metrics show what
 happened, and `EXPLAIN ANALYZE` prints them:
 
-- `columnar_batches` / `rowpath_batches` — batches emitted by each path. The two
+- `columnar_batches` / `rowpath_batches`: batches emitted by each path. The two
   paths' output is identical by construction, so these are the only external
   proof of which one ran.
-- `pages_decoded` / `pages_skipped` — column pages the partition's decode
+- `pages_decoded` / `pages_skipped`: column pages the partition's decode
   decompressed and walked past. **Both counters are written on both paths.** The
   row path decodes every page of every block it scans, so a direct row scan
   reports its whole page count as decoded and 0 as skipped; the columnar path
@@ -2498,8 +2515,8 @@ operator was holding.
 ADR-0046 added a content-addressed RAM read-cache tier (`ravel-cache`,
 S3-FIFO eviction, single-flighted) consulted at four funnels:
 `SegmentFetcher::guarded_get`, `Catalog::guarded_get`,
-`LogSegmentFetcher::fetch`, and — for an RLOG object above the block-range
-threshold — `BlockRangeFetcher` (ADR-0107), which routes its suffix probe, each
+`LogSegmentFetcher::fetch`, and, for an RLOG object above the block-range
+threshold, `BlockRangeFetcher` (ADR-0107), which routes its suffix probe, each
 directory section, and each candidate block through the cache on that extent's
 own key, admitting one entry per verified block and never a coalesced range.
 Cache keys are `(tenant_hash, content_hash, offset,
