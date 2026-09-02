@@ -57,13 +57,6 @@ docs/catalog-and-mvcc.md	TERM	l1 part
 docs/catalog-and-mvcc.md	TERM	l1 part
 docs/catalog-and-mvcc.md	TERM	l1 part
 docs/catalog-and-mvcc.md	TERM	strongly consistent
-docs/consistency-model.md	SUPERLATIVE	em-dash
-docs/consistency-model.md	SUPERLATIVE	simply
-docs/consistency-model.md	SUPERLATIVE	simply
-docs/consistency-model.md	TERM	exactly-once
-docs/consistency-model.md	TERM	l1 part
-docs/consistency-model.md	TERM	l1 part
-docs/consistency-model.md	TERM	strongly consistent
 docs/diagrams/README.md	ORPHAN	docs/diagrams/README.md
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
