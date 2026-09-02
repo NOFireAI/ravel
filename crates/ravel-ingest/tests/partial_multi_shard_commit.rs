@@ -125,10 +125,10 @@ fn fail_shard_data_puts(shard: u32) -> FaultPlan {
 /// Non-vacuity: the failing shard (shard 1) sorts before shard 2 in the
 /// router's ascending-shard ack loop, so the pre-fix `tokens.push(inner?)`
 /// returned at shard 1 and dropped both siblings' tokens. Against that unfixed
-/// loop this test fails at `durable.len() == 2` (the recovered list is empty,
-/// and the error is the bare abandonment, not `PartialWrite`). The injected
-/// fault is asserted via the `FaultStore` counter so the abandonment is proven
-/// to have fired.
+/// loop this test fails at the `PartialWrite` match below, because the error
+/// is the bare abandonment and carries no recovered tokens at all. The
+/// injected fault is asserted via the `FaultStore` counter so the abandonment
+/// is proven to have fired.
 #[tokio::test]
 async fn metrics_partial_commit_reports_surviving_tokens_in_shard_order() {
     let shard_count = 3;
@@ -435,30 +435,22 @@ async fn ack_timeout_recovers_no_tokens_but_commit_lands_after_release() {
         assert!(gate.release(id), "held call {id} is released");
     }
 
-    // Poll (bounded) until the shard's commit record appears under its commit
-    // prefix. There is exactly one, at the key the flush chose.
+    // Shutdown joins every in-flight flush, so once it returns the released
+    // shard's commit is durable or was abandoned: one LIST decides, with no
+    // wall-clock band.
+    router.shutdown().await;
     let commit_prefix =
         keys::commit_shard_prefix(&tenant.hash(), Signal::Metrics, 0).expect("commit shard prefix");
-    let mut commit_keys: Vec<String> = Vec::new();
-    for _ in 0..200 {
-        let objects = list_all(store.as_ref(), &commit_prefix)
-            .await
-            .expect("list");
-        commit_keys = objects
-            .into_iter()
-            .map(|o| o.key)
-            .filter(|k| k.ends_with(".cmt"))
-            .collect();
-        if !commit_keys.is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let commit_keys: Vec<String> = list_all(store.as_ref(), &commit_prefix)
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|o| o.key)
+        .filter(|k| k.ends_with(".cmt"))
+        .collect();
     assert_eq!(
         commit_keys.len(),
         1,
         "the held shard's commit lands after release, at exactly one key: {commit_keys:?}"
     );
-
-    router.shutdown().await;
 }

@@ -389,7 +389,20 @@ async fn write_batch(
         .router
         .write_values(tenant.clone(), points, mode, ingest.ack_deadline)
         .await
-        .map_err(IngestRequestError::Write)?;
+        .map_err(|err| {
+            // A partial multi-shard commit: the durable siblings are real
+            // data, logged the way the OTLP paths log them since OTAP has no
+            // channel to hand their tokens back.
+            let durable_shard_count = err.durable_tokens().len();
+            if durable_shard_count > 0 {
+                tracing::warn!(
+                    durable_shard_count,
+                    "metric write partially committed before a sibling shard \
+                     failed"
+                );
+            }
+            IngestRequestError::Write(err)
+        })?;
     Ok(WriteOutcome {
         tokens: receipt.tokens,
         dropped_points,

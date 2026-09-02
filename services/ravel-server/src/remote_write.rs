@@ -433,6 +433,17 @@ async fn remote_write(
     {
         Ok(receipt) => receipt,
         Err(err) => {
+            // A partial multi-shard commit: the durable siblings are real
+            // data, and remote write has no channel to hand their tokens
+            // back, so the count is logged the way the OTLP paths log it.
+            let durable_shard_count = err.durable_tokens().len();
+            if durable_shard_count > 0 {
+                tracing::warn!(
+                    durable_shard_count,
+                    "metric write partially committed before a sibling shard \
+                     failed"
+                );
+            }
             state.metrics.record_request_rejected();
             return write_error_response(err);
         }
