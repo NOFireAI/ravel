@@ -148,6 +148,35 @@ pub const DEFAULT_PIPELINE_DEPTH: usize = 4;
 /// workload with a different memory owner.
 pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = DEFAULT_PIPELINE_DEPTH as u32;
 
+/// Build the router [`IngestConfig`] a load drives, given the three
+/// operator-facing flush levers.
+///
+/// `max_flush_delay` is `None` when `--max-flush-delay` is unset: the field is
+/// then left at its [`IngestConfig::default`] value, so an unset flag produces
+/// a byte-for-byte default config and changes nothing. `Some(d)` overrides only
+/// the router's age trigger, the third binding constraint on object layout
+/// beside `target_bytes` and a batch's per-shard slice footprint (issue #801):
+/// a shard buffer flushes when it reaches `target_bytes`, when its oldest point
+/// ages past `max_flush_delay`, or at the final drain. At the default 2s a
+/// buffer that fills slower than one target's worth every 2s is released by age
+/// before it ever reaches a large `target_bytes`, so a bulk load that wants
+/// target-sized objects must raise this delay past the time one target takes to
+/// fill.
+pub(crate) fn build_ingest_config(
+    shards: u32,
+    target_bytes: usize,
+    max_inflight_flushes: u32,
+    max_flush_delay: Option<Duration>,
+) -> IngestConfig {
+    IngestConfig {
+        shard_count: shards,
+        target_bytes,
+        max_inflight_flushes,
+        max_flush_delay: max_flush_delay.unwrap_or_else(|| IngestConfig::default().max_flush_delay),
+        ..IngestConfig::default()
+    }
+}
+
 /// Ack deadline for each Strict write. Generous: a bulk load values completing
 /// over racing a slow store.
 const WRITE_ACK_DEADLINE: Duration = Duration::from_secs(60);
@@ -421,6 +450,7 @@ pub async fn run(
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
     target_bytes: usize,
+    max_flush_delay: Option<Duration>,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_warning_to(
@@ -435,6 +465,7 @@ pub async fn run(
         max_inflight_flushes,
         decode_queue_batches,
         target_bytes,
+        max_flush_delay,
         now_ns,
         &mut std::io::stderr(),
     )
@@ -461,6 +492,7 @@ pub(crate) async fn run_warning_to(
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
     target_bytes: usize,
+    max_flush_delay: Option<Duration>,
     now_ns: i64,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
@@ -487,6 +519,7 @@ pub(crate) async fn run_warning_to(
         max_inflight_flushes,
         decode_queue_batches,
         target_bytes,
+        max_flush_delay,
         now_ns,
         Arc::new(SystemClock),
         LoadPath::Columnar,
@@ -925,6 +958,7 @@ pub async fn load(
         DEFAULT_MAX_INFLIGHT_FLUSHES,
         DEFAULT_DECODE_QUEUE_BATCHES,
         DEFAULT_TARGET_BYTES,
+        None,
         now_ns,
         clock,
         LoadPath::Columnar,
@@ -962,6 +996,13 @@ type BuildStartHook = Arc<dyn Fn() + Send + Sync>;
 /// tested once per write, so a value at or below one batch's per-shard slice
 /// changes nothing at all; [`target_bytes_no_effect_warning`] documents that
 /// arithmetic and is what reports the case to the operator.
+///
+/// `max_flush_delay` is the `--max-flush-delay` lever (`None` = the
+/// [`IngestConfig::default`] age trigger). It is the third constraint on when a
+/// buffer flushes, beside `target_bytes` and the slice footprint: a buffer that
+/// does not reach `target_bytes` within this delay is released by the age
+/// trigger, so a large `target_bytes` is only reachable once this is raised past
+/// the time one target's worth accumulates. See [`build_ingest_config`].
 #[allow(clippy::too_many_arguments)]
 async fn load_instrumented(
     store: Arc<dyn ObjectStoreBackend>,
@@ -975,6 +1016,7 @@ async fn load_instrumented(
     max_inflight_flushes: u32,
     decode_queue_batches: usize,
     target_bytes: usize,
+    max_flush_delay: Option<Duration>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
     path: LoadPath,
@@ -1087,6 +1129,18 @@ async fn load_instrumented(
     // window must therefore be wide enough to hold the batches that accumulate
     // into one flush, or every flush waits out `max_flush_delay`.
     //
+    // That age trigger (`max_flush_delay`, the `--max-flush-delay` lever) is the
+    // THIRD binding constraint on object layout, beside `target_bytes` and one
+    // batch's per-shard slice footprint. At its 2s default a shard buffer that
+    // fills slower than one target's worth every 2s ages out before it reaches a
+    // large `target_bytes`, so the size trigger never fires and the target is
+    // unreachable as a lever no matter how the other two are set: the v4 load's
+    // ~11,871-row objects are about 2s of one shard's ingest rate. A bulk load
+    // that wants target-sized objects must therefore raise `--max-flush-delay`
+    // past the time one target takes to fill, in addition to widening the
+    // in-flight window. `None` here leaves the age trigger at its default, so an
+    // unset flag changes nothing.
+    //
     // "Larger" is measured against the shard's `est_bytes` footprint estimate,
     // not the encoded object, and tested once per write after a whole batch's
     // slice has merged: below one slice's footprint the target is unreachable
@@ -1106,12 +1160,7 @@ async fn load_instrumented(
     // (`Semaphore::new(config.max_inflight_flushes as usize)` in
     // crates/ravel-ingest/src/log_shard.rs); nothing downstream clamps it.
     let router = Arc::new(LogIngestRouter::new(
-        IngestConfig {
-            shard_count: shards,
-            target_bytes,
-            max_inflight_flushes,
-            ..IngestConfig::default()
-        },
+        build_ingest_config(shards, target_bytes, max_inflight_flushes, max_flush_delay),
         Arc::clone(&store),
         clock,
     ));
@@ -3738,6 +3787,59 @@ type = "i64"
         }
     }
 
+    /// A deterministic clock the test advances by hand, whose `sleep` the shard
+    /// actor's flush tick waits on (mirrors `ravel-ingest`'s own unit-test
+    /// `TestClock`, restated here because that clock is private to that crate's
+    /// test module). Advancing it past `max_flush_delay` is what drives an age
+    /// flush with no real-time sleep, so the age trigger can be exercised
+    /// through the loader deterministically.
+    struct TestClock {
+        now_ns: std::sync::atomic::AtomicI64,
+        wake_tx: tokio::sync::watch::Sender<()>,
+    }
+
+    impl TestClock {
+        fn new(start_ns: i64) -> std::sync::Arc<Self> {
+            let (wake_tx, _rx) = tokio::sync::watch::channel(());
+            std::sync::Arc::new(TestClock {
+                now_ns: std::sync::atomic::AtomicI64::new(start_ns),
+                wake_tx,
+            })
+        }
+
+        fn advance_ns(&self, delta_ns: i64) {
+            self.now_ns
+                .fetch_add(delta_ns, std::sync::atomic::Ordering::SeqCst);
+            let _ = self.wake_tx.send(());
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_ns(&self) -> i64 {
+            self.now_ns.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn sleep(
+            &self,
+            dur: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let deadline = self
+                .now_ns()
+                .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+            let mut rx = self.wake_tx.subscribe();
+            Box::pin(async move {
+                loop {
+                    if self.now_ns() >= deadline {
+                        return;
+                    }
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            })
+        }
+    }
+
     /// Load a fixture of one record with `n_attrs` distinct i64 attribute
     /// columns (plus one resource attribute) through the real `load`, and return
     /// its report. `n_attrs` past the writer's 1000-column budget forces
@@ -3995,6 +4097,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
+            None,
             NOW_NS,
             &mut sink,
         )
@@ -4188,6 +4291,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             0,
             DEFAULT_TARGET_BYTES,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -4235,6 +4339,7 @@ type = "i64"
             0,
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -4476,6 +4581,7 @@ type = "i64"
                     DEFAULT_MAX_INFLIGHT_FLUSHES,
                     depth,
                     DEFAULT_TARGET_BYTES,
+                    None,
                     NOW_NS,
                     Arc::new(FixedClock(NOW_NS)),
                     LoadPath::Columnar,
@@ -4660,6 +4766,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             QUEUE_DEPTH,
             DEFAULT_TARGET_BYTES,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -4962,6 +5069,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -5370,6 +5478,7 @@ type = "i64"
                     DEFAULT_MAX_INFLIGHT_FLUSHES,
                     DEFAULT_DECODE_QUEUE_BATCHES,
                     target_bytes,
+                    None,
                     NOW_NS,
                     // A real clock: above target 1 the tail of a load is
                     // released by the router's wall-clock age trigger, which a
@@ -5481,6 +5590,7 @@ type = "i64"
                     DEFAULT_MAX_INFLIGHT_FLUSHES,
                     DEFAULT_DECODE_QUEUE_BATCHES,
                     target_bytes,
+                    None,
                     NOW_NS,
                     // A real clock: above the size trigger the tail of a load is
                     // released by the router's wall-clock age trigger, which a
@@ -5597,6 +5707,7 @@ type = "i64"
                     DEFAULT_MAX_INFLIGHT_FLUSHES,
                     DEFAULT_DECODE_QUEUE_BATCHES,
                     target_bytes,
+                    None,
                     NOW_NS,
                     &mut sink,
                 )
@@ -5725,6 +5836,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             8 * 1024 * 1024,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -5775,6 +5887,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             0,
+            None,
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
             LoadPath::Columnar,
@@ -5791,6 +5904,197 @@ type = "i64"
             err.to_string()
                 .contains("--target-bytes must be at least 1"),
             "the error names the lever: {err}"
+        );
+    }
+
+    /// `--max-flush-delay` unset (`None`) leaves the router's age trigger at
+    /// its `IngestConfig::default()` value, so an omitted flag builds a
+    /// byte-for-byte default config (issue #801, deliverable 1). The config
+    /// field is the thing that flows to the router, so it is what this asserts.
+    ///
+    /// Prove-the-test: change `build_ingest_config` to substitute any other
+    /// duration when `max_flush_delay` is `None` (e.g.
+    /// `Duration::from_secs(1)`) and this fails at
+    /// `left: 1s, right: 2s`.
+    #[test]
+    fn max_flush_delay_unset_keeps_the_default_age_trigger() {
+        let cfg = build_ingest_config(4, DEFAULT_TARGET_BYTES, DEFAULT_MAX_INFLIGHT_FLUSHES, None);
+        assert_eq!(
+            cfg.max_flush_delay,
+            IngestConfig::default().max_flush_delay,
+            "an unset --max-flush-delay must not change the router's age trigger"
+        );
+    }
+
+    /// `--max-flush-delay 10m` reaches `IngestConfig::max_flush_delay` as
+    /// exactly 600s (issue #801, deliverable 2). The humantime parse lives in
+    /// `parse_max_flush_delay`; this pins that a `Some(_)` overrides the field
+    /// exactly, with no scaling or rounding.
+    ///
+    /// Prove-the-test: change the `Some` arm of `build_ingest_config` to ignore
+    /// its argument (fall through to the default) and this fails at
+    /// `left: 2s, right: 600s`.
+    #[test]
+    fn max_flush_delay_set_reaches_the_config_exactly() {
+        let cfg = build_ingest_config(
+            4,
+            DEFAULT_TARGET_BYTES,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            Some(Duration::from_secs(600)),
+        );
+        assert_eq!(
+            cfg.max_flush_delay,
+            Duration::from_secs(600),
+            "--max-flush-delay 10m must arrive as exactly 600s"
+        );
+    }
+
+    /// The `--max-flush-delay` lever is observable in the flush mix (issue #801,
+    /// deliverable 3): whether two sequential writes to one shard coalesce into
+    /// one object or split into two turns on the age trigger, holding the target
+    /// fixed. Geometry: one shard, two equal 4 KB-payload rows read one per
+    /// batch (`--batch-rows 1 --read-cursors 1`), so each write's estimated
+    /// per-shard slice is about 4.1 KB. `TARGET = 6000` sits above one slice and
+    /// below two, so a single write can never reach it on its own -- it is
+    /// released only by a later write merging in (size) or by aging out.
+    ///
+    /// - Raised delay (`Some(1h)`), both writes in flight (`--pipeline-depth
+    ///   2`), a `FixedClock` that never ages anything: whichever write the shard
+    ///   actor sees first buffers under `TARGET`, and the second merges into the
+    ///   same buffer, pushing it over `TARGET` and flushing both as ONE object by
+    ///   size. Order-independent, so no write is stranded. Mix: size 1, age 0.
+    /// - Default delay (`None` = 2s), serial writes (`--pipeline-depth 1`), an
+    ///   injected clock advanced past 2s: the loader awaits the first write's ack
+    ///   before submitting the second, so the two never share a buffer. With no
+    ///   later write to push either over `TARGET`, each is released only by the
+    ///   age trigger, which the advanced clock fires. TWO objects, both aged.
+    ///
+    /// The demonstrated lever is the delay: same target, same rows, one object
+    /// versus two. The age total is 2 rather than 1 because equal slices make
+    /// the second write age out too instead of flushing itself by size; equal
+    /// slices are what make the raised-delay coalesce robust to the loader's
+    /// unordered spawn of the two writes. The default-delay side drives the clock
+    /// past the age trigger in an unbounded loop, so it pins the age/size layout
+    /// the trigger produces, not the exact delay value; that the plumbed value
+    /// reaches the config is pinned directly by
+    /// [`max_flush_delay_unset_keeps_the_default_age_trigger`] and
+    /// [`max_flush_delay_set_reaches_the_config_exactly`].
+    ///
+    /// Prove-the-test: hardcode `target_bytes: 1` into `build_ingest_config`
+    /// regardless of its argument and the raised-delay side no longer coalesces
+    /// -- each write flushes itself by size, so it writes two objects and the
+    /// object-count assertion fails at `left: 2, right: 1`. Dropping the `age`
+    /// count from `FlushMixCounts` (reporting size where age belongs) fails the
+    /// default-delay mix assertion instead, at `age: 0` where `age: 2` is
+    /// required.
+    #[tokio::test]
+    async fn max_flush_delay_decides_whether_two_writes_coalesce() {
+        use ravel_object_store::memory::MemoryStore;
+
+        // TARGET between one 4.1 KB slice and two, with margin on both sides, so
+        // one write never reaches it and two always do.
+        const TARGET: usize = 6_000;
+        let (_dir, pq, _mapping_path, m) = fat_attr_sorted_by_shard_fixture(1, 2, 4000);
+
+        // Raised delay, both writes concurrent, a clock that never ages: the two
+        // writes merge into one buffer and flush together by size.
+        let coalesced_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let coalesced = load_instrumented(
+            Arc::clone(&coalesced_store),
+            &pq,
+            "acme",
+            &m,
+            1,
+            1,
+            Some(1),
+            2,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            TARGET,
+            Some(Duration::from_secs(3600)),
+            NOW_NS,
+            Arc::new(FixedClock(NOW_NS)),
+            LoadPath::Columnar,
+            None,
+            None,
+        )
+        .await
+        .expect("raised-delay load succeeds");
+
+        assert_eq!(
+            coalesced.objects_written(),
+            1,
+            "a raised delay lets the second write push the first over the target: one object"
+        );
+        assert_eq!(
+            coalesced.flush_mix_report().totals,
+            FlushMixCounts {
+                size: 1,
+                age: 0,
+                final_drain: 0,
+            },
+            "the single object is a size flush; nothing ages under a raised delay"
+        );
+
+        // Default 2s delay, serial writes, an injected clock advanced past 2s:
+        // each write is released only by aging out, into its own object.
+        let split_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(NOW_NS);
+        let load_fut = load_instrumented(
+            Arc::clone(&split_store),
+            &pq,
+            "acme",
+            &m,
+            1,
+            1,
+            Some(1),
+            1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            TARGET,
+            None,
+            NOW_NS,
+            std::sync::Arc::clone(&clock) as Arc<dyn Clock>,
+            LoadPath::Columnar,
+            None,
+            None,
+        );
+        tokio::pin!(load_fut);
+        // Drive the injected clock past the 2s age trigger until the load
+        // completes. Each serial write is suspended waiting for its ack;
+        // advancing the clock fires the age tick that releases it. An advance on
+        // an empty buffer is a no-op, so over-advancing is harmless.
+        let split = loop {
+            tokio::select! {
+                report = &mut load_fut => break report.expect("default-delay load succeeds"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {
+                    clock.advance_ns(3 * 1_000_000_000);
+                }
+            }
+        };
+
+        assert_eq!(
+            split.objects_written(),
+            2,
+            "at the default 2s delay with serial writes neither write coalesces: two objects"
+        );
+        assert_eq!(
+            split.flush_mix_report().totals,
+            FlushMixCounts {
+                size: 0,
+                age: 2,
+                final_drain: 0,
+            },
+            "each serial write is released by the age trigger, one object apiece"
+        );
+
+        // Same rows either way, only their object layout differs.
+        assert_eq!(coalesced.rows_processed, 2);
+        assert_eq!(split.rows_processed, 2);
+        assert_eq!(
+            decoded_records(coalesced_store.as_ref()).await,
+            decoded_records(split_store.as_ref()).await,
+            "the same two rows, decoded, regardless of how many objects hold them"
         );
     }
 
@@ -5920,6 +6224,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
+            None,
             NOW_NS,
             &mut sink,
         )
@@ -5949,6 +6254,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
+            None,
             NOW_NS,
             &mut sink,
         )
@@ -5992,6 +6298,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
+            None,
             NOW_NS,
             &mut sink,
         )
@@ -6876,6 +7183,7 @@ type = "i64"
             DEFAULT_MAX_INFLIGHT_FLUSHES,
             DEFAULT_DECODE_QUEUE_BATCHES,
             DEFAULT_TARGET_BYTES,
+            None,
             now_ns,
             clock,
             LoadPath::Row,
@@ -7259,6 +7567,7 @@ type = "i64"
                 flushes,
                 DEFAULT_DECODE_QUEUE_BATCHES,
                 DEFAULT_TARGET_BYTES,
+                None,
                 NOW_NS,
                 Arc::new(FixedClock(NOW_NS)),
                 LoadPath::Columnar,
@@ -7392,6 +7701,7 @@ type = "i64"
                 flushes,
                 DEFAULT_DECODE_QUEUE_BATCHES,
                 DEFAULT_TARGET_BYTES,
+                None,
                 NOW_NS,
                 Arc::new(FixedClock(NOW_NS)),
                 LoadPath::Columnar,
