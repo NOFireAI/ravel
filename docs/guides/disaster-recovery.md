@@ -52,7 +52,7 @@ clean. The flag is off by default, so an existing deployment is unchanged
 until an operator turns it on. Enforcement itself stays at the bucket and IAM
 layer either way: nothing in a Ravel process can configure Object Lock.
 
-What the tiers below add on top of that baseline is replication, and, at Tier
+What the tiers below add on top of that baseline is replication, and, at level
 2, **bucket-default** retention across every prefix including the data
 objects. That last one is the choice with an erasure cost.
 
@@ -66,7 +66,7 @@ that cost, never by hiding it. Do not soften or omit it. The bounds the
 modifiers apply to are in
 [deletion-and-gc.md](../deletion-and-gc.md#modifiers-to-the-bound).
 
-### Tier 0, no replication (default)
+### level 0, no replication (default)
 
 Unversioned bucket beyond the protected prefixes. Erasure bounds hold as
 stated in [consistency-model.md](../consistency-model.md) with no modifiers.
@@ -75,7 +75,7 @@ posture**, but its blast radius is total: every durable byte (data objects,
 commit records, manifests, catalog snapshots, control objects under `sys/`)
 lives in one bucket, and Ravel itself cannot recover from losing it.
 
-### Tier 1, replicated (the recommended posture)
+### level 1, replicated (the recommended posture)
 
 On the primary bucket:
 
@@ -99,7 +99,7 @@ Replication to a replica bucket:
 replication lag plus `E_v_r` after the primary sweep, **provided
 `DeleteMarkerReplication` is enabled**. See the mandate below.
 
-### Tier 2, Tier 1 plus bucket-default Object Lock retention
+### level 2, level 1 plus bucket-default Object Lock retention
 
 Bucket-default retention `D` across every prefix on the primary, the replica,
 or both. This is a strict superset of the scoped Object Lock the
@@ -109,16 +109,16 @@ becomes `max(bound, D)`; query-time exclusion stays immediate either way.
 Where you have erasure obligations, prefer **scoped legal holds** over blanket
 default retention, or keep `D` inside the erasure service level agreement.
 
-Tier 2 is **supported, but not part of the recommended baseline**. Its only
-marginal protection over Tier 1 is against a compromised primary credential
-purging version history, and Tier 1 already contains that threat: version-id
+level 2 is **supported, but not part of the recommended baseline**. Its only
+marginal protection over level 1 is against a compromised primary credential
+purging version history, and level 1 already contains that threat: version-id
 permanent deletes are never replicated, the replica lives in an account whose
 credentials Ravel never holds, and the replica retains deleted data as
 noncurrent versions for `E_v_r`. Making blanket retention mandatory would
 impose `max(bound, D)` on every replicating deployment's erasure bound to
 defend against a threat the cross-account replica already covers. Deployments
 whose compliance regime demands bucket-wide write-once-read-many storage take
-Tier 2 as a deliberate choice, with the erasure consequence disclosed.
+level 2 as a deliberate choice, with the erasure consequence disclosed.
 
 ## `DeleteMarkerReplication` is mandatory for erasure-obligated deployments
 
@@ -139,11 +139,11 @@ the same.
 Note the deliberate asymmetry this buys: version-id permanent deletes are
 **never** replicated at all, so a compromised primary credential cannot purge
 the replica through the replication channel. That is the property that lets
-the cross-account replica stand in for bucket-wide Object Lock at Tier 1.
+the cross-account replica stand in for bucket-wide Object Lock at level 1.
 
 ## `E_v` is one knob controlling two windows
 
-The load-bearing design insight of Tier 1: **`E_v` is one knob controlling two
+The load-bearing design insight of level 1: **`E_v` is one knob controlling two
 windows.**
 
 - It is the **disaster-detection budget**: after an accidental or malicious
@@ -180,7 +180,7 @@ aws s3api get-bucket-versioning --bucket <replica>
 aws s3api get-bucket-lifecycle-configuration --bucket <replica>
 
 # Object Lock: compliance mode on the protected prefixes at every tier,
-# and the bucket-default retention D that makes it Tier 2
+# and the bucket-default retention D that makes it level 2
 aws s3api get-object-lock-configuration --bucket <primary>
 ```
 
@@ -254,7 +254,7 @@ verified operation.
    credentials scoped to the restore bucket.
 6. **Re-protect.** Re-establish versioning, lifecycle rules, the protected
    prefixes' Object Lock, and replication to a new replica before declaring
-   the incident closed. An unreplicated restored primary is Tier 0.
+   the incident closed. An unreplicated restored primary is level 0.
 
 ## RPO and RTO: defined here, published only from a rehearsal
 
@@ -323,9 +323,9 @@ rehearsal record: a real end-to-end run against MinIO is what fills a row.
 | Tier | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
 | **Every tier** | Object Lock compliance mode on `sys/`, provisioning records, commit records and catalog HEAD history, paired with versioning; `--require-bucket-protection` to gate startup on it | None; those prefixes hold no erasable subject value | Not a recovery control |
-| **Tier 0** (default) | No replication | None; bounds as in consistency-model.md | None; bucket loss is total loss |
-| **Tier 1** (recommended) | Primary: versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup. Replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended, `NoncurrentDays = E_v_r` | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
-| **Tier 2** (optional) | Tier 1 plus bucket-default Object Lock retention `D` across every prefix | `max(bound, D)`; query-time exclusion still immediate | As Tier 1 |
+| **level 0** (default) | No replication | None; bounds as in consistency-model.md | None; bucket loss is total loss |
+| **level 1** (recommended) | Primary: versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup. Replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended, `NoncurrentDays = E_v_r` | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
+| **level 2** (optional) | level 1 plus bucket-default Object Lock retention `D` across every prefix | `max(bound, D)`; query-time exclusion still immediate | As level 1 |
 
 `DeleteMarkerReplication` is mandatory for any erasure-obligated deployment;
 omitting it leaves erased bytes on the replica indefinitely and is

@@ -138,17 +138,18 @@ save. They take no parameters.
 build's git SHA when the build exported `RAVEL_GIT_SHA`, empty otherwise.
 
 `/api/v1/metadata` returns real per-metric type, help, and unit for any metric
-ingested after ADR-0085 shipped, in Prometheus' documented shape (`data` maps
+ingested after metric metadata capture shipped, in Prometheus' documented shape (`data` maps
 each family name to a length-1 array of `{type, help, unit}`). It resolves the
 requesting tenant from the same bearer credential the other query routes use and
 serves that tenant's metadata from a per-process, per-tenant cache (one object
 read per tenant per refresh horizon, never a read per request). The optional
 `metric` and `limit` query parameters filter to one family and cap the number of
 names, matching Prometheus. Metadata is best-effort: a metric ingested before
-ADR-0085, or over a path that sent no type/help/unit, has no entry, and a request
+metric metadata capture shipped, or over a path that sent no type/help/unit, has no entry, and a request
 that carries no resolvable tenant still gets `{"status": "success", "data": {}}`
-(this endpoint never returns `401`). See [ADR-0085](../adrs/0085-metric-metadata-and-otlp-suffixing.md)
-for the record format and the OTLP name suffixing that decides the family names.
+(this endpoint never returns `401`). See
+[the ingest guide](ingest.md#metric-metadata-and-otlp-name-suffixing) for the
+OTLP name suffixing that decides the family names.
 
 ### `GET/POST /api/v1/query_exemplars`
 
@@ -169,7 +170,7 @@ table are in [analytics.md](../analytics.md#endpoint).
 ## PromQL support
 
 Ravel's evaluator (`ravel-promql`) is a full PromQL evaluator, differentially
-tested against real Prometheus (ADR-0021, ADR-0035). Function calls,
+tested against real Prometheus. Function calls,
 aggregations, binary operators, subqueries, unary and paren expressions, the
 `@` modifier, and vector matching are all supported. The generated conformance
 table in [docs/query-engine.md](../query-engine.md#promql-conformance-adr-0035)
@@ -181,9 +182,7 @@ divergences.
 
 A handful of constructs are still intentionally rejected. Each answers with a
 typed `422 unprocessable_entity` error naming the construct, never a panic and
-never silently wrong data. The current set (from
-[crates/ravel-promql-difftest/src/scoring.rs](../../crates/ravel-promql-difftest/src/scoring.rs)'s
-`REJECTION_CASES`) is:
+never silently wrong data. The current set is:
 
 | Rejected | Error names it as |
 |---|---|
@@ -232,7 +231,7 @@ asked for. See [docs/guides/ingest.md](ingest.md#commit-tokens-and-read-your-wri
 ## Query budgets
 
 Every query is bounded, and every bound is a typed error, never a silent
-truncation ([crates/ravel-query/src/config.rs](../../crates/ravel-query/src/config.rs)):
+truncation:
 
 | Budget | Default | Error when exceeded |
 |---|---|---|
@@ -254,14 +253,14 @@ downstream, plus whatever aggregate state the operators above it accumulate --
 not the number of bytes the query has produced over its lifetime. A full-table
 scan over `logs` therefore does not exhaust it merely by being large: the logs
 scan streams one block at a time and releases each block before decoding the
-next (ADR-0087), so its own contribution tracks block size and partition count.
+next, so its own contribution tracks block size and partition count.
 An `ORDER BY` or a high-cardinality `GROUP BY` over a large result is what
 genuinely accumulates. Exceeding the ceiling is an HTTP 422 `execution` error
 naming the pool, never a truncated result.
 
 ### Operator-configurable budgets (server flags)
 
-Four of these budgets are process-wide server flags (ADR-0088). Each default is
+Four of these budgets are process-wide server flags. Each default is
 exactly the compiled-in value, so a server started with none of the flags
 behaves byte-for-byte as before they existed. All four are process-wide, not
 per-tenant.
@@ -275,8 +274,8 @@ per-tenant.
 
 `--fetch-concurrency` is a single knob with three coupled effects, **not**
 decoupled by this change: it governs the PromQL/analytics per-query segment
-fetch fan-out, the SQL scan partition count (`target_partitions` in
-`crates/ravel-sql/src/session.rs`), and object-store GET concurrency (ADR-0087).
+fetch fan-out, the SQL scan partition count (`target_partitions`), and
+object-store GET concurrency.
 Raising it widens all three together; size it against the host's cores and the
 store's request budget.
 
@@ -292,12 +291,12 @@ concurrent SQL queries (the multi-tenant isolation ceiling, defaulting to four
 times the per-query pool). Both apply only in a build with the `sql` feature.
 Per-tenant SQL budgets are **not** configurable in the `--limits-file`: its
 per-tenant query overrides have no per-tenant `EngineConfig` lookup at query
-time today and are inert (ADR-0088), so these ceilings are process-wide flags
+time today and are inert, so these ceilings are process-wide flags
 until that gap closes.
 
 `max_bytes_scanned` is **not** a flag. It stays a `--limits-file` entry
 (`query_defaults.max_bytes_scanned`, default Unlimited); see
-[admission-limits.md](admission-limits.md). `--max-s3-requests` (ADR-0075)
+[admission-limits.md](admission-limits.md). `--max-s3-requests`
 remains a flag; omitted, it is derived from `--shards` and the flush cadence.
 
 `--gc-max-query-duration` sets the engine's enforced wall-clock deadline. It
@@ -315,7 +314,7 @@ query is refused up front, before it can run up an object-store bill or
 saturate the listing path; the error reports both the estimate and the limit,
 so narrow the time range by the reported factor and retry. The ceiling
 permits roughly an 11-year window at one shard and about 8.5 months at
-sixteen; it scales down as shard count rises (ADR-0044). Note the
+sixteen; it scales down as shard count rises. Note the
 limit is on the query's *start*: a narrow `start`/`end` pair costs little
 however recent it is, so the fix is always to move `start` forward, never to
 change `end`.
@@ -351,10 +350,11 @@ verbatim. Both are client-visible changes from the pre-declaration plain `Utf8`
 column. Declared keys still appear in `attrs`. A declaration comes from the server's
 `--typed-attr-column` flags or from the durable per-tenant override written by
 `ravel-cli typed-attr-column set`, and a query process picks a durable change
-up within 60s. Querying an undeclared column is an unknown-column error, and a
+up within 60s. Querying a column that is not a typed attribute column is an
+unknown-column error, and a
 row whose stored value has another type reads NULL rather than being cast.
 
-A predicate on a declared column now prunes blocks before decode (ADR-0093), so
+A predicate on a typed attribute column now prunes blocks before decode, so
 it is no longer slower than the equivalent `attrs['k']` filter. A selective
 `i64`/`bool` comparison, `BETWEEN`, or `i64` `IN (...)` skips blocks through the
 RLOG skip index (`status_code > 500`, `is_active = true`, `status_code IN (200,
@@ -376,12 +376,12 @@ Loading a dataset and declaring its typed columns are **two separate steps**,
 in order:
 
 1. **Load** the data with `ravel-cli load --parquet ...` (see
-   [ingest.md](ingest.md#bulk-import-ravel-cli-load---parquet-adr-0089)). The
+   [ingest.md](ingest.md#bulk-import-ravel-cli-load---parquet)). The
    loader writes data objects only; it never touches tenant config.
 2. **Declare** the typed columns with `ravel-cli typed-attr-column set`. This is
    a control-plane write, kept out of the loader on purpose (a durable
    CAS whole-list replace does not belong in an append-only data-plane command,
-   where it could clobber a hand-declared column). You can pass the columns
+   where it could clobber a hand-declared typed attribute column). You can pass the columns
    explicitly as `KEY:TYPE` specs, or derive them from the same `--mapping` the
    load used:
 
@@ -390,11 +390,11 @@ in order:
    ```
 
    `--from-mapping` turns every `[[attribute]]` and `[[resource_attribute]]`
-   entry into a declared column of the same-named type (`str`/`i64`/`bool`/
+   entry into a typed attribute column of the same-named type (`str`/`i64`/`bool`/
    `bytes`). A resource (stream-level) key is legitimately declarable because a
-   declared column reads the merged resource+scope+record attribute view. An
+   typed attribute column reads the merged resource+scope+record attribute view. An
    `f64`-typed entry is **skipped with a per-key warning** (there is no `f64`
-   declared column type yet); the rest are still written. A key declared twice,
+   typed attribute column type yet); the rest are still written. A key declared twice,
    or a key colliding with a fixed logs column name, is rejected and nothing is
    written.
 
@@ -402,8 +402,8 @@ in order:
 query-serving process resolves the durable declaration behind a **staleness
 horizon** (60s by default), so a `set` lands durably at once but a query may
 keep using the previous declaration until the server refreshes within that
-horizon. No restart is needed; wait out the horizon before asserting a newly
-declared column is typed. An attribute that overflowed the load's
+horizon. No restart is needed; wait out the horizon before asserting a fresh
+declaration reads as a typed attribute column. An attribute that overflowed the load's
 dynamic-column budget (see [ingest.md](ingest.md#the-dynamic-column-budget-and-its-warnings))
 stays queryable through `attrs['<key>']` regardless of whether it is declared.
 

@@ -37,7 +37,7 @@ excludes the target, so the reader decodes only the blocks that can hold the
 trace, on whichever shard(s) it lists. Shard-level pruning by `trace_id` is a
 later capability, not a current one.
 
-One caveat applies regardless. ADR-0052 online resharding can move a tenant
+One caveat applies regardless. Online resharding can move a tenant
 to a new shard count while spans are still arriving. A trace whose spans
 straddle a reshard activation can split across two shards; a trace-by-id
 query still returns every stored span from wherever it landed.
