@@ -51,11 +51,14 @@ no `.tla` file, no checker, no CI lane.
 Add a TLA+ verification suite under `formal/tla/`, checked by a pinned
 TLC through `scripts/check-tla.sh`, with a smoke lane on every pull
 request that touches the suite and an exhaustive lane on a schedule.
-The suite is five independent specifications over one shared object-store
-module, each with named safety invariants, named liveness properties with
-their fairness assumptions stated, deliberately broken variants that TLC
-must reject, and a traceability table from every action and property to
-the Rust symbol that performs or asserts it.
+The suite covers five protocol areas with six specification modules
+(maintenance carries two) over one shared object-store module, each with
+named safety invariants, named liveness properties with their fairness
+assumptions stated, deliberately broken variants that TLC must reject, and
+a traceability table from every action and property to the Rust symbol
+that performs or asserts it. Every count of "models" below means the six
+modules; smoke, exhaustive, negative, traceability, and the report cover
+all six.
 
 ```mermaid
 flowchart LR
@@ -74,9 +77,9 @@ flowchart LR
     report["REPORT.md"]
   end
   subgraph harness["Checker"]
-    script["scripts/check-tla.sh smoke | exhaustive | negative"]
+    script["scripts/check-tla.sh smoke | exhaustive | negative | traceability"]
     tlc["TLC 1.7.4, pinned by sha256"]
-    ci[".github/workflows/tla.yml"]
+    ci["ci.yml tla job (PR), tla-nightly.yml (exhaustive)"]
   end
   docs --> commit
   docs --> catalog
@@ -101,11 +104,13 @@ flowchart LR
   lifecycle -. counterexample .-> rust
 ```
 
-### D1. Five models, one store module, no monolith
+### D1. Five protocol areas, six specifications, one store module, no monolith
 
-The suite models five protocols as separate specifications with explicit
-abstraction boundaries. Each is labeled with what it checks: a shipped
-protocol, or a proposed design.
+The suite models five protocol areas as separate specifications with
+explicit abstraction boundaries; the maintenance area holds two
+specifications because ownership and claims are different mechanisms.
+Each is labeled with what it checks: a shipped protocol, or a proposed
+design.
 
 | Model | Files | Checks | Label |
 |---|---|---|---|
@@ -135,9 +140,12 @@ docs/object-store-contract.md promises and Ravel relies on:
 - read-after-write and list-after-write for successful writes;
 - paginated listing as a nondeterministic traversal: every key present
   before the first page eventually appears, a key created during the
-  traversal may or may not appear, and a key may appear twice, so a
-  caller that does not deduplicate is a modelling error the checker can
-  find;
+  traversal may or may not appear, and a key may appear twice. A model
+  consumer whose result depends on multiplicity (a count, a candidate
+  set fed to a breaker, a fold that inserts entries) must deduplicate or
+  the checker finds the error; a consumer whose result is unchanged by a
+  repeated key (the marker lookup in `read_marker`, which keeps the
+  newest hour) is modeled as it ships;
 - a lost response: the store applies the operation and the caller
   observes a failure, then retries;
 - transient conditional-write conflicts that resolve to the protocol
@@ -145,7 +153,11 @@ docs/object-store-contract.md promises and Ravel relies on:
 - idempotent deletion;
 - `last_modified` as a server-assigned value that no correctness
   property may read; the module exposes it only to the claim-expiry
-  operators, where the contract permits an advisory use;
+  operators, where the contract permits an advisory use. Commit-record
+  reconstruction (ADR-0058), which derives a reconstructed
+  `created_unix_ns` from `last_modified`, is out of scope for every
+  model; the commit area's README records that edge as an assumption the
+  suite does not check;
 - multipart uploads invisible until completed.
 
 The module separates three things in its header comment and its
@@ -172,15 +184,28 @@ commit follows the shipped code (logs report durable tokens, metrics and
 spans do not), and the model must not invent cross-shard atomicity for
 any signal. The marker's ingest hour is the request-receive hour, not the
 flush-open hour, and the lookup window absorbs the difference. The model
-must carry an explicit `AtLeastOnce` property for logs and spans and must
-fail if any variant makes ingestion exactly-once.
+carries two separate obligations for logs and spans: `AtLeastOnce` (a
+durable commit exists for every acknowledged write) and a reachability
+obligation `DuplicateReachable` (a retry after a lost acknowledgement
+with no usable idempotency marker reaches a state with two commit records
+of the same content). `AtLeastOnce` alone is satisfied by exactly-once
+delivery, so it cannot detect a variant that deduplicates; the second
+obligation is what fails on such a variant, and the negative control that
+deduplicates targets it.
 
 Catalog. Both seal predicates are constants. Reconcile is an action
 enabled by watermark advance, never by a tick. A segment is a multiset of
-record identities, and the compaction action preserves it as an
-assumption stated in the header (discharged in Rust by the differential
-test in `crates/ravel-query/tests/differential_compaction.rs`), while
-the conservation gate is modelled as the count comparison it is. The
+record identities, and `CompactionPreservesMultiset` is a checked
+invariant over those abstract multisets: the correct-form compaction
+action emits exactly the union of its inputs, a negative-control switch
+makes it replace one record with another of the same count, and the
+conservation gate is modelled as the count comparison it is, so the
+switched variant passes the gate and the invariant is what catches it.
+What the model does not check is that the Rust merge realizes the
+abstract action; that correspondence is an assumption stated in the
+header, and the differential test in
+`crates/ravel-query/tests/differential_compaction.rs` is the only
+evidence for it. The
 invariant "no object named by the current HEAD is deleted" is checked
 with compaction publish lag as a free variable, which is expected to
 produce the lagging-compactor counterexample the reconciliation window
@@ -229,7 +254,13 @@ that eventually completes a retried operation, a maintainer that
 eventually ticks, a folder that eventually advances the watermark, a
 router that eventually refreshes). Every liveness property is checked
 against `FairSpec` only, and its `results.md` entry names the fairness
-conjuncts it needed. A property that is intentionally false under a
+conjuncts it needed. Where the implementation bounds its own retries
+(`publish_with_rng` stops after `RetryPolicy::max_attempts`; the ingest
+flush stops at `max_flush_lifetime`), the model carries the same bound as
+a constant and the property is stated as "eventually durable, or the
+actor has stopped with an explicit failure", never as unconditional
+eventual publication. A liveness result is a protocol-design claim under
+the stated fairness, not an implementation claim. A property that is intentionally false under a
 permanently wedged live worker, an indefinite store outage, a legal hold,
 or operator-disabled maintenance says so next to its definition. Crashes
 and transient failures are allowed and the specification states when
@@ -256,7 +287,8 @@ formal/tla/
   resharding/    OnlineResharding.tla, ...
   maintenance/   MaintenanceOwnership.tla, CompactionClaims.tla, ...
 scripts/check-tla.sh
-.github/workflows/tla.yml
+.github/workflows/ci.yml        (the tla job and the formal_area classification)
+.github/workflows/tla-nightly.yml
 ```
 
 Each area owns its files. No area edits another area's directory, and
@@ -351,8 +383,8 @@ do not appear anywhere in the suite.
 
 ### D9. Harness: `scripts/check-tla.sh`, pinned TLC, fail closed
 
-`scripts/check-tla.sh <smoke|exhaustive|negative|all> [-a <area>]` is the
-one entry point locally and in CI.
+`scripts/check-tla.sh <smoke|exhaustive|negative|traceability|all> [-a <area>]`
+is the one entry point locally and in CI.
 
 - TLC is pinned to the TLA+ tools release 1.7.4 (`tla2tools.jar`, TLC2
   version 2.19, sha256
@@ -370,38 +402,65 @@ one entry point locally and in CI.
   goes to `.cache/tla/logs/<area>/<cfg>.log`, which CI uploads as an
   artifact on failure so a counterexample trace is never lost to a
   truncated job log.
-- `smoke` runs every `smoke.cfg` with a per-model wall-clock budget of
-  five minutes; `exhaustive` runs every `exhaustive.cfg` with a budget
+- `smoke` runs every `smoke.cfg` with a per-model wall-clock ceiling of
+  five minutes; `exhaustive` runs every `exhaustive.cfg` with a ceiling
   of sixty minutes; `negative` runs every `negative/*.cfg` and applies
-  D6. `all` runs the three in that order. A budget overrun is a failure,
-  not a skip.
-- After each run the script parses TLC's states-generated, distinct-
-  states, and depth line and appends it to `.cache/tla/last-run.tsv`.
-  The per-area `results.md` files and REPORT.md are written from that
-  table, never from memory. A results entry without a matching run is a
-  documentation defect.
+  D6; `traceability` runs the name-freshness check below. `all` runs
+  smoke, negative, traceability, then exhaustive. A ceiling overrun is a
+  failure, not a skip.
+- Each invocation mints a run identifier (UTC timestamp plus the git
+  tree hash), truncates `.cache/tla/last-run.tsv` at suite start, and
+  after each configuration appends one row: run id, area, configuration,
+  states generated, distinct states, depth, seconds, result. The table
+  therefore holds exactly one invocation. The per-area `results.md` files
+  and REPORT.md are written from that table and name the run id they were
+  taken from, never from memory. A results entry without a matching run
+  is a documentation defect.
+- `scripts/check-tla.sh traceability` scans every `traceability.md` for
+  the Rust paths and symbols it names and fails when a named path does
+  not exist or a named symbol no longer appears in it. This is a freshness
+  check on names only; it cannot see a semantic change behind an unchanged
+  name (see D10).
 
-### D10. CI: smoke and negative on every pull request that touches the suite, exhaustive nightly
+### D10. CI: a required `tla` job on pull requests, exhaustive nightly
 
-A new workflow `.github/workflows/tla.yml`:
+The smoke and negative suites run as a job named `tla` inside
+`.github/workflows/ci.yml`, in the same shape as the other lanes:
 
-- `pull_request` and `push` to `main`, path-filtered to `formal/**`,
-  `scripts/check-tla.sh`, and the workflow file, runs `check-tla.sh
-  smoke` then `check-tla.sh negative` on `ubuntu-latest` with
-  `actions/setup-java` (Temurin 21, action pinned by commit SHA like
-  every other action in this repository). Budget: 20 minutes.
-- `schedule` (nightly) and `workflow_dispatch` run `check-tla.sh
-  exhaustive` with a 120-minute budget. A red nightly is a regression or
-  a state-space growth to investigate, never a retry.
-- Logs are uploaded with `actions/upload-artifact` on failure.
-- `ci.yml`'s `changes` job classifies a change that touches only
-  `formal/**` and `scripts/check-tla.sh` like a docs-only change: no
-  cargo lane runs for it. The TLA+ workflow is the gate for those paths.
-  A change that also touches a crate keeps the full run.
+- The `changes` job gains a `formal_area` output. It is true when any
+  changed path is under `formal/`, is `scripts/check-tla.sh`, or is under
+  one of the implementation paths the traceability tables cite
+  (`crates/ravel-object-store/`, `crates/ravel-commit/`,
+  `crates/ravel-catalog/`, `crates/ravel-ingest/`, `crates/ravel-maintain/`,
+  `crates/ravel-fleet/`, `services/ravel-server/`), and it is forced true
+  by the existing workspace-level rule. A change that touches only
+  `formal/**` and `scripts/check-tla.sh` is classified like a docs-only
+  change for the cargo lanes: they skip, and `tla` runs.
+- `tla` runs when `formal_area` is true: `actions/setup-java` (Temurin
+  21, pinned by commit SHA like every other action here), then
+  `check-tla.sh smoke`, `check-tla.sh negative`, and `check-tla.sh
+  traceability` as separate unpiped steps, on `ubuntu-latest`, with a
+  45-minute job budget (six smoke configurations at a 300-second ceiling
+  each plus the negative cases; the target for the whole smoke suite is
+  under 15 minutes and the ceiling is what a runaway configuration hits).
+  Logs are uploaded with `actions/upload-artifact` on failure.
+- `tla` is added to the required status checks of the `protect-main`
+  ruleset once the job exists on `main`. A skipped `tla` (no relevant
+  path changed) reports success the way the other gated lanes do, so an
+  unrelated change is not blocked; a failed `tla` blocks the merge.
+- A separate `.github/workflows/tla-nightly.yml` runs `check-tla.sh
+  exhaustive` on a schedule and on `workflow_dispatch`, with a 120-minute
+  budget and the same artifact upload. A red nightly is a regression or a
+  state-space growth to investigate, never a retry.
 
-The workflow is not a required check on `main`: it runs only when the
-suite changes, and a change under `formal/` that breaks the smoke suite
-fails its own pull request.
+What this enforces and what it does not: a change under `formal/` that
+breaks a model blocks its own pull request; a change under a protocol
+crate runs the smoke suite and the name-freshness check, so a renamed or
+removed symbol that a traceability table cites blocks the change. A
+semantic protocol change behind unchanged names is not detected by CI.
+Keeping the model in step with such a change is a reviewer duty, and the
+traceability table is the reviewer's map from the changed symbol to the
+model action that must be re-examined.
 
 ### D11. Rust regression tests and documentation corrections land in the same epic
 
@@ -474,8 +533,14 @@ The TLC suite does not depend on it and CI does not run it.
   offline hosts.
 - Running TLC from `cargo test`. That puts a JVM dependency into the
   workspace gate every crate build pays for, and couples a change under
-  `formal/` to a full Rust CI run. A separate script and workflow keep
-  the two toolchains apart and let a TLA+-only change skip cargo.
+  `formal/` to a full Rust CI run. A separate script and a separately
+  gated job keep the two toolchains apart and let a TLA+-only change skip
+  cargo.
+- A standalone path-filtered workflow instead of a job in `ci.yml`. A
+  workflow that is not a required check cannot block a merge, so a broken
+  model would fail its check and merge anyway. The `changes`-gated job
+  pattern already used by the other lanes gives a required check that
+  skips cleanly when nothing relevant changed.
 - A Rust-native model checker (Stateright) over the real types. Closer
   to the implementation, but the request is protocol-design
   verification with TLA+, and a Rust model would inherit the
@@ -493,16 +558,18 @@ The TLC suite does not depend on it and CI does not run it.
 
 ## Consequences
 
-- A new directory `formal/tla/`, a new script, a new workflow, and one
-  classification rule in `ci.yml`'s `changes` job. No new Rust
-  dependency. Java and TLC are needed only to run the suite.
+- A new directory `formal/tla/`, a new script, a `tla` job and a
+  `formal_area` classification in `ci.yml`, a nightly workflow, and one
+  new required status check on `main`. No new Rust dependency. Java and
+  TLC are needed only to run the suite.
 - The five specifications can be written and checked in parallel, each
   in its own directory, after the store module and the harness land.
   Delivery runs in three waves: the harness with the store module; the
   five models; then the report, the traceability index, the Rust
   regression tests, and the documentation corrections.
-- Every pull request that touches `formal/` runs the smoke and negative
-  suites within twenty minutes. The exhaustive suite runs nightly.
+- Every pull request that touches `formal/` or a protocol crate runs the
+  smoke and negative suites and the traceability freshness check. The
+  exhaustive suite runs nightly.
 - The suite records exactly which finite bounds TLC explored. A claim
   about an unbounded system is never made.
 - Two hand-derived counterexamples and one conditional safety argument
@@ -511,7 +578,8 @@ The TLC suite does not depend on it and CI does not run it.
   corrected in the same epic.
 - Implementation gaps outside the suite's scope are filed as issues with
   traces attached, not fixed silently.
-- Maintainers who change a protocol must change its model, or the smoke
-  lane fails on the next pull request that touches the suite. A
-  protocol change that does not touch `formal/` is not caught by CI;
-  the traceability table is what tells a reviewer which model to update.
+- A change under a protocol crate runs the smoke suite and fails CI when
+  it renames or removes a symbol a traceability table cites. A semantic
+  change behind unchanged names is not caught by CI; keeping the model in
+  step is a reviewer duty, and the traceability table is the reviewer's
+  map from the changed symbol to the model action to re-examine.
