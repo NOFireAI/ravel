@@ -14,7 +14,7 @@ kinds are metrics. A tenant's actual time series are a query against
 
 ## This guide and the operations guide
 
-This guide is the catalog of `/metrics`. It names every metric family, states
+This guide is the catalog of `/metrics`. It names the metric families, states
 what each number means, and shows how to read the query-cost numbers. Read it
 to understand a sample you see on the route.
 
@@ -27,7 +27,8 @@ them.
 The [tracing guide](tracing.md) covers the query-path `tracing` spans. Metrics
 here answer "how much" in aggregate across the process; the per-request spans
 answer "where the time went" for one query. Read the tracing guide to
-attribute a slow query to a phase.
+attribute a slow query to a phase. The [cost model guide](cost-model.md)
+turns the request and byte counts here into a predicted bill.
 
 ## The route
 
@@ -37,7 +38,7 @@ object-store call, so a scrape costs nothing on the store.
 
 The route is unauthenticated, like the two health routes. A scrape has no
 tenant to resolve, so no handler can authenticate it. An operator must keep
-the listener off untrusted networks (ADR-0044 consequences).
+the listener off untrusted networks.
 
 Every sample carries a `mode` label. One Prometheus job can then scrape a
 fleet of `all`, `gateway`, `query`, and `maintain` processes without their
@@ -46,10 +47,13 @@ series colliding.
 ## The label allowlist
 
 The renderer can attach only these label keys: `tenant_hash`, `signal`,
-`mode`, `op`, `error_kind`, `workload_class`, `level`, and `reason`. Section 4
-of ADR-0044 fixed the first seven. Section 6 of ADR-0051 added `reason` for
-the admission family. Each key carries a closed enum value or a fixed-width
-hash. The `level` key is reserved and no family renders it today.
+`mode`, `op`, `error_kind`, `workload_class`, `level`, `reason`, `cache`,
+`tier`, and `kind`, eleven in all. `reason` is shared by two families, the
+admission-rejection counter and the scrub seal-divergence counter. `cache` and
+`tier` split the read-cache family across its two caches and, when a disk tier
+is configured, its two tiers; the [caching guide](caching.md) documents both.
+`kind` splits the maintenance merge-memory gauge into its transient and total
+high-water marks. The `level` key is reserved and no family renders it today.
 
 The allowlist is closed for two reasons. The first reason is cardinality. An
 unbounded label value multiplies the series count without a ceiling, and the
@@ -58,34 +62,45 @@ tenant-identity disclosure. A raw tenant name or a raw query text on an
 unauthenticated route would leak one tenant's activity to anyone who can reach
 the port. A closed enum cannot carry either failure.
 
-The renderer enforces the allowlist at compile time. A ninth label key is a
-compile error across the module. A `shard` label is deliberately absent,
-because shard count times tenant count times operation count is unbounded in
-the dimension Ravel controls least.
+The allowlist is closed at compile time. Attaching a label is possible only
+through a closed enum, so a new label key means a new enum variant and a
+compilation failure at every place the renderer matches on a label; a raw
+string can never reach the label position. A `shard` label is deliberately
+absent, because shard count times tenant count times operation count is
+unbounded in the dimension Ravel controls least.
+
+Histogram families carry one further reserved key, `le`, on their `_bucket`
+series. It is the Prometheus-standard bucket bound, not a member of the
+allowlist above, and no non-histogram sample renders it.
 
 ### The `tenant_hash="other"` fold
 
-Three families can carry a `tenant_hash` label: the admission family, the
-per-query cost family, and the ingest PUT attribution family. By default
-every tenant folds into the single bucket `tenant_hash="other"`, and that
-bucket sums every folded tenant's counters. The scrape then holds one series
-per (signal or workload class), never one per tenant, regardless of how many
-tenants send traffic.
+Four families can carry a `tenant_hash` label: the admission family, the
+per-query cost family, the ingest PUT attribution family, and the fleet
+admission-reconciliation counter. By default every tenant folds into the
+single bucket `tenant_hash="other"`, and that bucket sums every folded
+tenant's counters. The scrape then holds one series per (signal or workload
+class), never one per tenant, regardless of how many tenants send traffic.
 
-The `--metrics-tenant-labels` flag opts out of the fold (ADR-0051 section 6).
-With the flag on, each configured tenant keeps its own real `tenant_hash`, and
-the operator accepts both the higher cardinality and the disclosure on this
-unauthenticated route. Turn the flag on only where the scrape network is
-trusted. Every tenant without an explicit admission limit still folds into
-`other` even with the flag on.
+The `--metrics-tenant-labels` flag opts out of the fold. With the flag on,
+each configured tenant keeps its own real `tenant_hash`, and the operator
+accepts both the higher cardinality and the disclosure on this unauthenticated
+route. Turn the flag on only where the scrape network is trusted. Every tenant
+without an explicit admission limit still folds into `other` even with the
+flag on.
 
 ## Metric families by subsystem
 
-Every name below comes from `services/ravel-server/src/metrics.rs`. A family
+Every name below is emitted by `ravel-server`'s `/metrics` renderer. A family
 that has no data source in the current mode is omitted, not rendered as zero.
-The ingest families are absent in `query` and `maintain` mode. The two
-maintenance families and the tenant-discovery family render only in `maintain`
+The ingest and log-postings families are absent in `query` and `maintain`
 mode. The cache family is absent under `--disable-cache`.
+
+The maintenance families, that is discovery, safety, ownership and
+concurrency, merge memory, and the at-rest scrubber, render only in a
+`maintain` mode process, because only that mode runs compaction, retention,
+the sweep, and the scrubber. An operator scraping an `all` mode process never
+sees those families move, and that is expected.
 
 ### Object store (`ravel_store_*`)
 
@@ -130,22 +145,62 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 The collisions family carries no `signal="spans"` series. Spans derive no
 identity that can collide, so that sample is structurally absent, not zero.
 
-#### Per-tenant PUT attribution (ADR-0076 decision 2)
+#### Per-tenant PUT attribution (`ravel_ingest_attribution_puts_total`)
+
+Labels: `mode`, `tenant_hash`, `signal`.
 
 | Metric | Meaning |
 |---|---|
 | `ravel_ingest_attribution_puts_total` | Object-store PUT requests attributed to completed flushes, by tenant and signal. |
 
-Labels: `mode`, `tenant_hash`, `signal`. This is the answer to "which tenant is
-generating the PUT bill": each completed flush charges 2 PUTs (a data object
-and a commit record) to the flushing tenant, tracked per signal by a bounded
-top-K structure in the ingest router (`MAX_TRACKED_TENANTS = 1024`, see
-`crates/ravel-ingest/src/attribution.rs`). That top-K bound protects the
-router's internal accounting; the `tenant_hash` label on this family is
-bounded separately, by the same `--metrics-tenant-labels` allowlist and the
-same `tenant_hash="other"` fold described above — a tenant outside the
-allowlist never gets a series of its own here, regardless of how much it
-contributes to the top-K table.
+This answers which tenant is generating the PUT bill: each completed flush
+charges 2 PUTs (a data object and a commit record) to the flushing tenant,
+tracked per signal by a bounded top-K structure in the ingest router that
+follows at most 1024 tenants. That bound protects the router's internal
+accounting; the `tenant_hash` label on this family is bounded separately, by
+the same `--metrics-tenant-labels` allowlist and the same `tenant_hash="other"`
+fold described above. A tenant outside the allowlist never gets a series of its
+own here, regardless of how much it contributes to the top-K table.
+
+### Log postings and dynamic columns (`ravel_logs_postings_*`, `ravel_logs_dynamic_columns_*`)
+
+Labels: `mode` and `signal`. One series per pipeline that builds a POSTINGS
+index, so an idle-but-configured pipeline still renders its zero. These
+families are ingest-side, present where ingest runs.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_logs_postings_objects_total` | Flushed log objects that carried a POSTINGS section, by signal (the denominator for average section bytes per indexed object). |
+| `ravel_logs_postings_bytes_total` | Cumulative encoded POSTINGS section bytes across flushed log objects, by signal. |
+| `ravel_logs_postings_indexed_fields_total` | Cumulative count of indexed fields that emitted a posting list, summed over objects, by signal. |
+| `ravel_logs_postings_distinct_values_total` | Cumulative distinct-value count across non-capped indexed fields, summed over objects, by signal. |
+| `ravel_logs_postings_capped_fields_total` | Indexed fields dropped from POSTINGS for exceeding the per-field distinct-value cap, summed over objects, by signal. |
+| `ravel_logs_dynamic_columns_used_total` | Distinct (name, type) attribute pairs that received a real dynamic column, summed over flushed log objects, by signal. |
+| `ravel_logs_dynamic_columns_overflowed_total` | Distinct (name, type) attribute pairs that overflowed the max_dynamic_columns budget and folded into attrs_raw, summed over flushed log objects, by signal. |
+| `ravel_logs_dynamic_columns_used_max` | Gauge. Largest per-object dynamic-column count seen so far, by signal: the budget-pressure signal that rises before any object overflows max_dynamic_columns. |
+
+A climbing `ravel_logs_dynamic_columns_overflowed_total`, or a
+`ravel_logs_dynamic_columns_used_max` gauge sitting near the configured
+budget, is the sign that a tenant's attribute set has outgrown its
+`max_dynamic_columns` and is folding attributes into the raw column. A
+climbing `ravel_logs_postings_capped_fields_total` is the same story for a
+single high-cardinality field hitting the per-field distinct-value cap.
+
+### Query-side pruning (`ravel_logs_prune_*`)
+
+Labels: `mode` and `signal="logs"`. These are query-side counters over the
+logs scans, present where queries run.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_logs_prune_blocks_total` | Blocks the logs scans considered before postings pruning, cumulative (the denominator of prune selectivity). |
+| `ravel_logs_prune_blocks_survived_total` | Blocks that survived postings pruning and were scanned, cumulative (the numerator of prune selectivity). |
+| `ravel_logs_prune_blocks_pruned_by_postings_total` | Blocks dropped by the POSTINGS index before scanning, cumulative. |
+
+Prune selectivity is `survived / total`. A ratio near 1 means the POSTINGS
+index is dropping almost nothing and the scans are reading most blocks anyway,
+which points either at queries whose predicates the index cannot serve or at
+an index that is not discriminating for this workload.
 
 ### Catalog integrity (`ravel_catalog_*`)
 
@@ -164,21 +219,18 @@ an explicit isolation-fault error. The operations guide gives its alert rule.
 ### Tenancy adoption (`ravel_tenancy_v1_unkeyed_adoptions_total`)
 
 Labels: `mode`. Counts buckets this process pinned to the unkeyed tenant hash
-when it adopted a pre-ADR-0050 bucket that held `t/` data but no `sys/tenancy`
-marker. A nonzero value is the visible signal that the one-time migration
-happened.
+when it adopted a bucket that held `t/` data but no `sys/tenancy` marker. A
+nonzero value is the visible signal that the one-time migration happened.
 
 ### Provisioning (`ravel_provisioning_shard_count_mismatch_total`)
 
 Labels: `mode`. Counts dynamic-tenant provisioning checks that failed: a
 `shard_count` disagreement, an unreadable record, or a maintain-loop check
-catching either (ADR-0050 section 5). The operations guide gives its alert
-rule.
+catching either. The operations guide gives its alert rule.
 
-### Store reachability (`ravel_store_*`)
+### Store reachability (`ravel_store_reachable`, `ravel_store_probe_failures_total`)
 
-Labels: `mode`. Both samples come from the background store-reachability probe
-(ADR-0050 section 7).
+Labels: `mode`. Both samples come from the background store-reachability probe.
 
 | Metric | Meaning |
 |---|---|
@@ -188,9 +240,13 @@ Labels: `mode`. Both samples come from the background store-reachability probe
 ### Durable auth refresh (`ravel_durable_auth_*`)
 
 Labels: `mode`. Renders only when the process built a durable `sys/auth`
-resolver, that is `--deployment-key` set in a request-serving mode (`all`,
-`gateway`, `query`); omitted otherwise (ADR-0066 decision 6). All three come
-from the background refresh loop that keeps the cached token map current.
+resolver: `--tenant-hash-key-file` set on `ravel-server` in a request-serving
+mode (`all`, `gateway`, `query`). A `maintain` mode process, or one started
+without a deployment key, omits the whole family. The file that flag names is
+the deployment key; the `ravel-cli tenant-token` subcommands take the same key
+through their own `--deployment-key-file` flag, a separate flag on a separate
+binary despite the similar name. All three counters come from the background
+refresh loop that keeps the cached token map current.
 
 | Metric | Meaning |
 |---|---|
@@ -203,9 +259,9 @@ early-warning signal: it climbs as soon as the loop cannot read `sys/auth`,
 long before the hard-stale horizon starts refusing tokens. The operations
 guide gives its alert rule.
 
-### Maintenance discovery (`ravel_maintain_*`)
+### Maintenance discovery (`ravel_maintain_tenants_*`, `ravel_maintain_tenant_discovery_failures_total`)
 
-Labels: `mode`. Renders only in `maintain` mode (ADR-0048 decision 3).
+Labels: `mode`.
 
 | Metric | Meaning |
 |---|---|
@@ -213,10 +269,10 @@ Labels: `mode`. Renders only in `maintain` mode (ADR-0048 decision 3).
 | `ravel_maintain_tenants_maintained` | Gauge. Discovered tenants actually maintained this cycle, after any flag restriction. |
 | `ravel_maintain_tenant_discovery_failures_total` | Maintenance cycles skipped because tenant discovery itself failed. |
 
-### Maintenance safety (`ravel_maintain_*`)
+### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`)
 
-Labels: `mode`, plus `signal` on three of the four. Renders only in `maintain`
-mode (ADR-0048 decisions 1, 4, and 6). These carry no `tenant_hash` label.
+Labels: `mode`, plus `signal` on all but the legal-hold counter. These carry no
+`tenant_hash` label.
 
 | Metric | Meaning |
 |---|---|
@@ -224,13 +280,71 @@ mode (ADR-0048 decisions 1, 4, and 6). These carry no `tenant_hash` label.
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
 | `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the most recent sweep pass, by signal. |
+| `ravel_maintain_orphans_present` | Gauge. Orphan candidates the most recent sweep pass found, by signal, whether or not the breaker tripped. |
 
 The operations guide gives the alert rules and the breaker runbook. A zero
-value on the `orphans_withheld` gauge does not mean a prior trip was resolved.
+value on the `orphans_withheld` or `orphans_present` gauge does not mean a
+prior trip was resolved: it is this pass's count, not a resolution signal.
+
+### Maintenance ownership and concurrency (`ravel_maintain_workers_live`, `ravel_maintain_units_*`, `ravel_maintain_memo_warm_start_units_total`, `ravel_maintain_full_sweep_passes_total`)
+
+Labels: `mode`. Every series here is process-wide, with no `tenant_hash`
+dimension.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_maintain_workers_live` | Gauge. In-process maintenance workers this supervisor currently sees as live. |
+| `ravel_maintain_units_owned` | Gauge. Owned (tenant, signal, shard) units this process is currently maintaining. |
+| `ravel_maintain_units_stalled` | Gauge. Owned units with consecutive failing ticks past the configured threshold. Alert on a sustained nonzero value, not on any single scrape. |
+| `ravel_maintain_memo_warm_start_units_total` | Units seeded from a durable memo snapshot on handoff or startup, instead of rescanning cold. |
+| `ravel_maintain_full_sweep_passes_total` | Full (unscoped) sweep passes run, as opposed to a zone-scoped sweep. |
+
+### Merge memory (`ravel_maintain_rlog_merge_peak_bytes`)
+
+Labels: `mode` and `kind`. No `tenant_hash`: the tracker is one process-wide
+handle shared across every tenant's merges.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_maintain_rlog_merge_peak_bytes` | Gauge. High-water mark of RLOG k-way merge memory, by kind. |
+
+The `kind` label carries `transient` (in-flight fetched-minus-released block
+bytes at any instant during a merge) or `total` (transient plus the writer's
+buffered output bytes). This is the gauge to watch when a maintain process is
+under memory pressure during compaction merges.
+
+### At-rest scrubber (`ravel_scrub_*`)
+
+Labels: `mode` and `signal`, plus `reason` on the seal-divergence counter.
+These carry no `tenant_hash` label.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_scrub_checksum_mismatch_total` | Data objects that failed at-rest integrity re-verification (a whole-object blake3 mismatch or a footer or section crc failure), by signal. |
+| `ravel_scrub_postings_disagreement_total` | Objects whose covering name-postings object omitted a `__name__` the object really carries (a false negative), by signal. |
+| `ravel_scrub_seal_divergence_total` | Divergences between the folded snapshot and the re-listed sealed commit history, by signal and reason. |
+| `ravel_scrub_cursor_position` | Gauge. Fraction of the current scrub rotation the content-tier cursor has covered so far, by signal, in [0,1]. |
+
+`ravel_scrub_checksum_mismatch_total` is the one to alert on for any increase:
+there is no redundant copy to repair from, so a nonzero increase is corruption
+an operator must investigate. The `reason` label on
+`ravel_scrub_seal_divergence_total` carries `missing` (a sealed commit record
+absent from the snapshot, an under-count) or `mismatched` (a snapshot entry
+whose content hash disagrees with the sealed record); an orphaned entry, a
+snapshot entry with no surviving commit record, is the expected
+retention-after-fold shape and is never counted. A `ravel_scrub_cursor_position`
+stuck near 0 means scrubbing is not keeping pace with the configured
+`--scrub-period`.
 
 ### Read cache (`ravel_cache_*`)
 
-Labels: `mode`. Absent under `--disable-cache` (ADR-0046).
+Labels: `mode`, `cache`, and `tier`. The `cache` label carries `fetch` (the
+query fetchers' RAM cache) or `catalog` (the catalog's content-addressed byte
+cache), so both caches share one family and are told apart by that label. The
+`tier` label is present only when a family has a local-disk tier configured
+with `--cache-dir`: then its RAM sample carries `tier="ram"` and its disk
+sample `tier="disk"`. With no disk tier, a family renders one sample with no
+`tier` label at all. Absent entirely under `--disable-cache`.
 
 | Metric | Meaning |
 |---|---|
@@ -240,13 +354,13 @@ Labels: `mode`. Absent under `--disable-cache` (ADR-0046).
 | `ravel_cache_bytes_admitted_total` | Bytes admitted into the cache after a miss. |
 | `ravel_cache_evictions_total` | Entries evicted from the read cache by its S3-FIFO policy. |
 | `ravel_cache_disk_errors_degraded_to_misses_total` | Disk-tier reads that found an entry but discarded it as unhealthy rather than a clean miss. |
-| `ravel_cache_disk_entries_expired_max_age_total` | Disk-tier entries dropped for aging past the per-entry max-age (ADR-0064), across the hit check, the startup scan, and the periodic background sweep. A time bound, not the capacity-driven eviction counter above. |
+| `ravel_cache_disk_entries_expired_max_age_total` | Disk-tier entries dropped for aging past the per-entry max-age, across the hit check, the startup scan, and the periodic background sweep. A time bound, not the capacity-driven eviction counter above. |
 
 The request hit rate is `hits / (hits + misses)`. The byte hit rate is
 `bytes_served / (bytes_served + bytes_admitted)`. The renderer leaves both
-ratios for PromQL to compute.
+ratios for PromQL to compute, per `cache` and per `tier`.
 
-### Admission (`ravel_admission_*`)
+### Admission (`ravel_admission_*`, `ravel_ingest_wire_bytes_total`)
 
 Labels: `mode`, `tenant_hash`, `signal`, plus `reason` on the rejection
 counter. This family folds tenants per the rule above. The
@@ -257,13 +371,19 @@ gives its alert rules.
 |---|---|
 | `ravel_admission_active_series` | Gauge. Active series (metrics) or streams (logs) tracked for the active cap, by tenant and signal. |
 | `ravel_admission_admitted_total` | Requests admitted past the ingest byte-rate layer, by tenant and signal. |
-| `ravel_admission_admitted_bytes_total` | Charged (decompressed) bytes admitted past the ingest byte-rate layer, by tenant and signal. For a gzip OTLP request this is the decompressed size (ADR-0084 decision 4); for an uncompressed request it equals the wire size. |
-| `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal (ADR-0084 decision 5). |
+| `ravel_admission_admitted_bytes_total` | Charged (decompressed) bytes admitted past the ingest byte-rate layer, by tenant and signal. For a gzip OTLP request this is the decompressed size; for an uncompressed request it equals the wire size. |
+| `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal. |
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
+| `ravel_admission_reconciliation_failures_total` | Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, by tenant and signal; the last-known soft threshold stays in force. |
 
-The `reason` label carries `byte_rate`, `series_rate`, or `series_cap`. The
-active-streams count for logs renders under `ravel_admission_active_series`
-with `signal="logs"`, not under a separate metric name.
+The `reason` label carries `byte_rate`, `series_rate`, `series_cap`, or
+`clock`. The active-streams count for logs renders under
+`ravel_admission_active_series` with `signal="logs"`, not under a separate
+metric name. A sustained nonzero
+`ravel_admission_reconciliation_failures_total` rate means a process cannot
+read its siblings' snapshots and is falling back to its last-computed soft
+threshold; admission never fails closed on it, so it signals degrading
+fleet-wide accuracy, not that ingest is down.
 
 `ravel_ingest_wire_bytes_total` is emitted from the ingest byte-metrics tracker
 rather than the admission snapshot, so its name carries the `ravel_ingest_`
@@ -276,14 +396,16 @@ ratio holds roughly steady) from one that turned client-side compression off
 (admitted bytes flat, wire bytes jump, ratio falls toward 1). The two need
 different responses, so read the ratio, not either counter alone.
 
-### Per-query cost (`ravel_query_*`)
+### Per-query cost
 
 Labels: `mode`, `tenant_hash`, `workload_class`. Every read surface folds its
-per-query cost into this family (ADR-0044). Coverage spans
+per-query cost into the `ravel_query_*` family. Coverage spans
 `POST /api/v1/sql`, `POST /api/v1/analytics`, the Prometheus-shaped
 `GET /api/v1/query`, `GET /api/v1/query_range`, `GET /api/v1/labels`, and
 `GET /api/v1/series`, and every Flight SQL request. The `workload_class` label
-carries `interactive` or `background`. Only `interactive` occurs today.
+carries `interactive` or `background`. Only `interactive` occurs today. The
+[cost model guide](cost-model.md#per-query-cost-accounting) explains the
+accounting behind these numbers.
 
 | Metric | Meaning |
 |---|---|
@@ -301,9 +423,9 @@ carries `interactive` or `background`. Only `interactive` occurs today.
 
 Labels: `mode` only. This is the per-process cache over each tenant's metric
 metadata record that serves `/api/v1/metadata` at one GET per (tenant, refresh
-horizon, process) (ADR-0085 decision 1). It renders only in a request-serving
-mode that built the cache (`Mode::All`/`Mode::Query`); a gateway- or
-maintain-only process omits the family. All four are cumulative counters.
+horizon, process). It renders only in a request-serving mode that built the
+cache (`all` or `query`); a gateway- or maintain-only process omits the
+family. All four are cumulative counters.
 
 | Metric | Meaning |
 |---|---|
@@ -319,10 +441,10 @@ is still being served, which the operations guide pages on.
 ### Distributed read fan-out (`ravel_distrib_*`)
 
 Labels: `mode` only, plus `le` on the histogram buckets. This family carries no
-per-shard, per-worker, or per-tenant label (ADR-0044 section 4): a fan-out
-spanning many workers and tenants must not turn one query into a cardinality
-explosion. It renders only when the process runs with `--distributed-query`
-(ADR-0071); a local-only process omits the family entirely.
+per-shard, per-worker, or per-tenant label: a fan-out spanning many workers and
+tenants must not turn one query into a cardinality explosion. It renders only
+when the process runs with `--distributed-query`; a local-only process omits
+the family entirely.
 
 | Metric | Meaning |
 |---|---|
@@ -331,10 +453,10 @@ explosion. It renders only when the process runs with `--distributed-query`
 | `ravel_distrib_fragment_inflight` | Gauge. Fragment requests currently holding a fragment-admission permit. |
 | `ravel_distrib_slices_local_total` | Slices this coordinator executed locally because it owns them (self-mapped, no network hop). |
 | `ravel_distrib_slices_remote_total` | Slices this coordinator dispatched to a remote worker and read back over the wire (counts the attempt that produced the usable result, whether the primary or the re-dispatch). |
-| `ravel_distrib_slices_redispatched_total` | Slices whose rendezvous-primary worker was lost at transport or returned `Unavailable`, so the coordinator re-dispatched the slice once to the next rendezvous worker (ADR-0071 deliverable 1). |
+| `ravel_distrib_slices_redispatched_total` | Slices whose rendezvous-primary worker was lost at transport or returned `Unavailable`, so the coordinator re-dispatched the slice once to the next rendezvous worker. |
 | `ravel_distrib_slices_fallback_total` | Slices that fell back to coordinator-local execution after the primary and its one re-dispatch both failed re-dispatchably (transport loss or `Unavailable`), rather than failing the query. |
 | `ravel_distrib_slice_fetch_seconds` | Per-slice fetch latency histogram, covering both locally-run and remote slices. |
-| `ravel_distrib_quarantine_marks_total` | Dead fragment endpoints marked into the coordinator's quarantine map after a re-dispatchable dispatch failure (transport loss or an `Unavailable` summary), cumulative (ADR-0071 amendment decision 3). |
+| `ravel_distrib_quarantine_marks_total` | Dead fragment endpoints marked into the coordinator's quarantine map after a re-dispatchable dispatch failure (transport loss or an `Unavailable` summary), cumulative. |
 | `ravel_distrib_quarantine_readmits_total` | Quarantined endpoints readmitted by a strictly newer worker heartbeat stamp (the half-open probe), cumulative. |
 | `ravel_distrib_quarantine_current` | Gauge. Fragment endpoints currently held in the coordinator's quarantine map. |
 
@@ -353,11 +475,10 @@ over.
 
 ## Reading estimate against actual
 
-The estimate is an upper envelope, never a prediction (ADR-0044 section 3).
-The planner takes the worst case wherever it cannot bound a quantity. A
-correct estimate therefore lands at or above the actual, never below it. The
-estimate and the actual render under separate names, so their ratio is
-directly computable in PromQL.
+The estimate is an upper envelope, never a prediction. The planner takes the
+worst case wherever it cannot bound a quantity. A correct estimate therefore
+lands at or above the actual, never below it. The estimate and the actual
+render under separate names, so their ratio is directly computable in PromQL.
 
 Divide an actual by its matching estimate. The requests ratio is
 `ravel_query_s3_requests_total / ravel_query_estimated_requests_total`. A ratio
@@ -368,8 +489,8 @@ was meant to bound it.
 A ratio above 1 rules in one of two causes. The first cause is a cost-model
 gap, where the estimate omits a real source of spend. The second cause is a
 runaway query pattern the model did not anticipate. Either cause is worth an
-operator's attention, because a later admission ADR could reject queries on
-this envelope. Nothing in this release rejects a query on it. This is
+operator's attention, because a later admission decision could reject queries
+on this envelope. Nothing in this release rejects a query on it. This is
 measurement only.
 
 ## Worked examples
@@ -406,21 +527,19 @@ Each example is a short procedure. Run the PromQL against Ravel's own
 
 ## Known gaps
 
-Three gaps limit what the per-query cost family can show. All three are
-documented in the [operations guide](operations.md#per-query-cost-accounting-adr-0044-issue-425).
+Three gaps limit what the per-query cost family can show: a failed query
+records no cost, a Flight SQL statement records two folds for one logical
+query, and an abandoned Flight fetch still records its partial cost. The
+[cost model guide](cost-model.md#per-query-cost-accounting) sets each one out
+in full, because each is a property of the accounting rather than of the
+metric route.
 
-- A query that fails records no cost. A deadline breach, an admission
-  rejection, and an execution error all return before the fold, and the error
-  type carries no accounting snapshot. Read a sudden drop in
-  `ravel_query_queries_total` against steady request logs as failures, not as
-  idle capacity.
-- A Flight SQL statement records two folds, one per RPC. The plan request
-  records the first fold and the fetch request records the second. The
-  `ravel_query_queries_total` counter therefore counts 2 for one logical query,
-  and the two folds sum to one whole-query estimate beside the summed
-  whole-query actual.
-- A Flight fetch that a client abandons after one batch still records its
-  partial cost. The stream ends when the client disconnects, so the bytes
-  already spent are recorded and count as one query. An unusually low
-  cost-per-query ratio on the Flight path can therefore mean early client
-  disconnects, not cheap queries.
+## Background
+
+The `/metrics` route, the label allowlist, and per-query cost accounting:
+ADR-0044. The `reason` label and the admission usage family: ADR-0051. The
+read caches and their disk tier: ADR-0046, ADR-0064. Maintenance safety,
+ownership, merge memory, and the at-rest scrubber: ADR-0048, ADR-0058,
+ADR-0059, ADR-0065. Log POSTINGS and dynamic columns: ADR-0049, ADR-0100.
+Distributed read fan-out: ADR-0071. Wire-byte accounting: ADR-0084. The metric
+metadata cache: ADR-0085.

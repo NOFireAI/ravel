@@ -1,13 +1,12 @@
 # Predicting the S3 request bill
 
 Storage is a rounding error in Ravel's cost. Request charges dominate: at a
-modeled 100-tenant, 1 TB/day workload, ADR-0076 estimated roughly $7-8k/month
-of request fees against roughly $100-150/month of storage, and at a
-single-tenant deployment request fees run over 98% of the total bill. This
-guide gives an operator the formula and the levers to predict and control
-that bill before deploying, not after the first invoice. The write path sets
-most of it and comes first; the read path adds a request count the engine
-itself chooses, and one flag moves it.
+modeled 100-tenant, 1 TB/day workload, request fees run roughly $7-8k/month
+against roughly $100-150/month of storage, so request fees are over 97% of the
+total bill. This guide gives an operator the formula and the levers to predict
+and control that bill before deploying, not after the first invoice. The write
+path sets most of it and comes first; the read path adds a request count the
+engine itself chooses, and one flag moves it.
 
 ## The formula
 
@@ -34,31 +33,30 @@ covers, in the order that costs the least to use:
    global default is a new-tenant-only change and does not require touching
    any already-onboarded tenant.
 3. **Flush cadence** (`--max-flush-delay`, `--max-flush-delay-idle`,
-   `--min-flush-bytes` on `ravel-server`; ADR-0076 decision 4): the shipped
-   default is 2s / 40s / 256KiB, a 4x reduction from the pre-ADR-0076 500ms /
-   10s / 64KiB defaults. This is the lever of last resort because, unlike the
-   first two, it costs strict-mode acknowledgement latency directly: a
-   strict export waits for the configured `max_flush_delay` plus two PUT
-   round trips before its ack returns. The three knobs must move together
-   (raising one alone does little) and are validated at startup against a
-   derived ceiling: `max_flush_delay` plus the ingest pipeline's flush
-   lifetime must stay under `FLUSH_BOUND_SLACK_HOURS` (the read-side scan
-   slack budget), and the derived strict-visibility budget must stay under a
-   client-timeout-derived ceiling (3s, from the smallest documented OTLP
-   export timeout of 5s minus an assumed 2s PUT tail). A value that violates
-   either is refused at startup, not silently accepted.
+   `--min-flush-bytes` on `ravel-server`): the shipped default is
+   2s / 40s / 256KiB, a 4x reduction from the earlier 500ms / 10s / 64KiB
+   defaults. This is the lever of last resort because, unlike the first two,
+   it costs strict-mode acknowledgement latency directly: a strict export
+   waits for the configured `max_flush_delay` plus two PUT round trips before
+   its ack returns. The three knobs must move together (raising one alone does
+   little) and are validated at startup against a derived ceiling:
+   `max_flush_delay` plus the ingest pipeline's flush lifetime must stay under
+   the read-side scan slack budget, and the derived strict-visibility budget
+   must stay under a client-timeout-derived ceiling (3s, from the smallest
+   documented OTLP export timeout of 5s minus an assumed 2s PUT tail). A value
+   that violates either is refused at startup, not silently accepted.
 
 ## Measured effect of the cadence default
 
 Measured locally with `cargo run --release -p ravel-bench --bin ingest_bench
 -- --store memory --shards 4 --target-series 50000 --points-per-sec 50000
 --duration-secs 30 --batch-size 200 --max-inflight-flushes 1
---flush-delay-policy fixed`, comparing the pre-epic defaults (commit
-`cc5ef36d`, 500ms/10s/64KiB) against the post-epic defaults (commit
-`96158c02`, 2s/40s/256KiB), same workload, in-memory store (isolating the
-ingest pipeline's own flush behavior from real object-store latency, which
-is what this comparison needs to measure — a request-count reduction is a
-property of flush cadence, not of the backing store):
+--flush-delay-policy fixed`, comparing the earlier defaults
+(500ms/10s/64KiB) against the shipped defaults (2s/40s/256KiB), same
+workload, in-memory store. The in-memory store isolates the ingest pipeline's
+own flush behavior from real object-store latency, which is what this
+comparison needs to measure: a request-count reduction is a property of flush
+cadence, not of the backing store.
 
 | | Before (500ms) | After (2s) | Change |
 |---|---|---|---|
@@ -67,17 +65,16 @@ property of flush cadence, not of the backing store):
 | Ack latency p99 | 616.7ms | 2174.4ms | 3.5x higher |
 | Write amplification | 3.44x | 2.16x | lower (fewer, larger objects) |
 
-The measured reduction (3.33x) is close to but under the ADR's steady-state
-4x estimate: a fixed 30-second window ends mid-interval for the slower
-cadence, undercounting its flush count relative to a true steady-state rate.
-A longer-duration run converges closer to 4x. The ack-latency increase is
-the direct, expected, and accepted cost of this decision (ADR-0076 decision
-4's "Expected effect" and "Consequences" sections) — durability itself is
-unchanged; a strict-mode ack still only returns once the commit PUT that
+The measured reduction (3.33x) is close to but under the steady-state 4x
+estimate: a fixed 30-second window ends mid-interval for the slower cadence,
+undercounting its flush count relative to a true steady-state rate. A
+longer-duration run converges closer to 4x. The ack-latency increase is the
+direct, expected, and accepted cost of this decision. Durability itself is
+unchanged: a strict-mode ack still only returns once the commit PUT that
 makes the write durable has landed.
 
 The full committed S3 cost-per-request benchmark (dollar cost against real
-S3/MinIO, not just PUT count) is tracked separately (#79): request-count
+S3 or MinIO, not just PUT count) is tracked separately. Request-count
 reduction is a property of the ingest pipeline alone and is measured here
 without needing real object storage, but a real dollar-cost figure needs a
 real backend and is out of this guide's scope.
@@ -86,25 +83,24 @@ real backend and is out of this guide's scope.
 
 Given a workload, estimate PUTs/day from the formula above using your
 `shards`, `replicas`, `max_flush_delay` (or `max_flush_delay_idle` for a low
-per-tenant volume, since the idle tier's ceiling — not the strict tier's
-floor — bounds a buffer that never crosses `min_flush_bytes` before its
-strict waiter, if any, resolves), and multiply by your object-storage
-provider's per-1k-request price. Keyed log and span requests add a
-per-request idempotency-marker PUT and a dedup-window LIST beyond this
-formula (docs/consistency-model.md); no lever in this guide touches that
-cost, since it is per-request rather than per-flush.
+per-tenant volume, since the idle ceiling, not the strict floor, bounds a
+buffer that never crosses `min_flush_bytes` before its strict waiter, if any,
+resolves), and multiply by your object-storage provider's per-1k-request
+price. Keyed log and span requests add a per-request idempotency-marker PUT
+and a dedup-window LIST beyond this formula (see the
+[consistency model](../consistency-model.md)); no lever in this guide touches
+that cost, since it is per-request rather than per-flush.
 
 Two ceilings this guide's levers do not remove:
 
 - **Per-tenant caps** (200k active series/signal by default) mean a
-  workload beyond that scales as more tenants, not one larger tenant — the
+  workload beyond that scales as more tenants, not one larger tenant: the
   formula's `tenants` term grows, not any single tenant's own shard/PUT
   count.
-- **The read-side request budget** (`docs/adrs/0075`) is derived from shard
-  count and flush cadence together (`derive_max_s3_requests`), so lowering
-  shard count or raising flush delay also lowers the per-query request
-  budget on the read side — cheaper writes and cheaper reads move together,
-  not independently.
+- **The read-side request budget** is derived from shard count and flush
+  cadence together, so lowering shard count or raising flush delay also lowers
+  the per-query request budget on the read side: cheaper writes and cheaper
+  reads move together, not independently.
 
 ## The read side: buying bytes with requests
 
@@ -124,25 +120,25 @@ b < k * request_cost
 
 `--logs-request-cost-bytes <BYTES>` on `ravel-server` is that `request_cost`:
 one saved object-store round trip is worth this many saved transfer bytes.
-Unset, it takes `ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES` (1,887,437 bytes,
-about 1.8 MiB), so an unset deployment behaves exactly as it did before the
-flag existed. The derivation of that number — a latency-bandwidth product
-measured on one in-region S3 configuration, one instance type, one fetch-permit
-count — lives in the constant's doc comment in
-`crates/ravel-query/src/log_fetcher.rs`; read it there rather than assuming the
-default was tuned for your deployment, because it was tuned for that one.
+Unset, it takes the built-in default of 1,887,437 bytes (about 1.8 MiB), so an
+unset deployment behaves exactly as it did before the flag existed. That
+default is a latency-bandwidth product: the transfer volume whose time, at one
+in-region S3 configuration's single-stream bandwidth, equals one request's
+round-trip latency, measured on one instance type at one fetch-permit count.
+It was tuned for that one configuration, so treat the default as a value to
+measure against rather than one known to be correct for your deployment.
 
 Raising the value makes the engine value a request more: fewer segment fetches
 take the ranged route, more read whole objects, request count falls and bytes
 rise. Lowering it does the reverse. The decision is per segment, so one
-statement spanning many segments can take both routes within a single query --
-the counters report opens by shape rather than statements by shape for exactly
+statement spanning many segments can take both routes within a single query.
+The counters report opens by shape rather than statements by shape for exactly
 that reason.
 
 The setting never changes a query's answer. It selects which read path fetches
 the bytes; the rows returned are identical at every value, and only request
-counts, byte counts, and timing differ (ADR-0904 decision 4, pinned by a
-whole-vs-ranged row-equality test).
+counts, byte counts, and timing differ, pinned by a whole-versus-ranged
+row-equality test.
 
 ### Why one knob and not three
 
@@ -167,43 +163,43 @@ one-block GET storm.
 
 Two properties follow from what the number is:
 
-- It is a property of the **store and the instance** — round-trip latency and
-  single-stream bandwidth at the fetch concurrency in use — not of the RLOG
-  format. A different store, a cross-region bucket, or a different
+- It is a property of the **store and the instance**, that is round-trip
+  latency and single-stream bandwidth at the fetch concurrency in use, not of
+  the RLOG format. A different store, a cross-region bucket, or a different
   `--fetch-concurrency` has a different right value, and changing fetch
   concurrency changes this break-even along with it.
 - The `logs-` prefix is literal. Metric (RSEG) reads use fixed gap and
   crossover constants that are not request-cost-derived, and do not respond to
   this flag.
 
-### What the trade costs, in modelled dollars
+### What the trade costs, in modeled dollars
 
-Every dollar figure in this section is list-price modelling, not a measured
+Every dollar figure in this section is list-price modeling, not a measured
 bill: the amounts are computed from counted requests and counted bytes against
 published us-east-1 list prices, never read off an invoice. The absolute
 amounts for a single benchmark pass are small, so they matter as a rate at
 production query volume, not as cents.
 
 The measured example is the ClickBench corpus (42 statements, cold, reference
-box; recorded on issue #680 and quoted in `docs/adrs/0904`, with the pass
-procedure in [clickbench-aws-runbook.md](clickbench-aws-runbook.md)). Turning
-on projection routing moved:
+box, with the pass procedure in
+[clickbench-aws-runbook.md](clickbench-aws-runbook.md)). Turning on projection
+routing moved:
 
 ```text
 cold requests   203,243 -> 751,409    (+270%)
 cold bytes       403.97 -> 194.19 GB  (-52%)
-cold time        324.79 -> 222.19 s   (-31.6%)
 ```
 
-Half the bytes, 3.7x the requests, 31.6% faster. Modelled at us-east-1 list
-prices that pass costs about 2.2x more in request charges than it did before,
-and it is faster.
+Half the bytes and 3.7x the requests. The same pass finished faster despite the
+extra requests, landing at 222.19 s cold. Modeled at us-east-1 list prices that
+pass costs about 2.2x more in request charges than it did before, and it is
+faster.
 
 Both of those can be true at once because of an asymmetry in the price sheet:
 same-region S3-to-EC2 transfer is not billed, so on that deployment shape
 trading bytes for requests spends a billed resource to save a free one. Where
-transfer is billed — cross-region, internet-facing, or an object store that
-charges egress — the sign flips: at list egress near $0.09/GB against GETs near
+transfer is billed (cross-region, internet-facing, or an object store that
+charges egress) the sign flips: at list egress near $0.09/GB against GETs near
 $0.0004/1000, the dollar break-even lands around 4.4 KB per request, three
 orders of magnitude below the 1.8 MiB latency break-even, so the shipped
 default is already the cost-preferring setting there. The right value depends
@@ -223,15 +219,15 @@ constant.
    value worth inventing.
 3. **Raise it on a request-billed, transfer-free backend** (same-region S3).
    Set it at or above the largest segment object *any* tenant this process
-   serves writes: the flag is process-wide, so a single tenant's largest object
-   is the wrong unit, and any tenant holding bigger objects keeps routing
-   ranged. There is no format-level object-size cap to read this from; object
-   size comes from `--batch-rows` and `--target-bytes` at write time and is
-   observable per tenant, so measure it and round up. Overshooting costs
-   nothing, because all three decisions saturate once the value exceeds the
-   largest object: every candidate segment becomes one GET. What it costs is
-   the other column of the table above, roughly twice the bytes and the cold
-   latency win given back.
+   serves writes. The flag is process-wide, so a single tenant's largest
+   object is the wrong unit, and any tenant holding bigger objects keeps
+   routing ranged. There is no format-level object-size cap to read this from;
+   object size comes from `--batch-rows` and `--target-bytes` at write time
+   and is observable per tenant, so measure it and round up. Overshooting
+   costs nothing, because all three decisions saturate once the value exceeds
+   the largest object: every candidate segment becomes one GET. What it costs
+   is the other column of the comparison above, roughly twice the bytes and
+   the cold-latency win given back.
 
 The flag is read at startup only, like the other read-path knobs in
 [query.md](query.md#operator-configurable-budgets-server-flags), and it sits
@@ -249,3 +245,71 @@ above measured the routing change, not this flag, and a high value also
 collapses ranged reads on the predicate path that were active on both sides of
 that comparison. Requests should land at or below 203,243 and bytes at or above
 403.97 GB; the measurement, not this guide, gets to say where.
+
+## Per-query cost accounting
+
+Every accounted read reports what it actually spent on object storage, and
+Ravel exports the running totals in the `ravel_query_*` metric family. The
+[observability guide](observability.md#per-query-cost) catalogs that family and
+shows the PromQL that reads it; this section is the accounting behind the
+numbers.
+
+Each accounted query folds one snapshot at completion: the object-store
+requests it issued, the bytes it transferred, the in-process cache hits and
+misses attributed to it, and the decompressed sample bytes it decoded. Beside
+each actual sits a pre-execution estimate of the same quantity. The estimate is
+an upper envelope, never a prediction: the planner takes the worst case
+wherever it cannot bound a quantity, so a correct estimate lands at or above
+the actual, never below it. Dividing an actual by its matching estimate gives a
+ratio at or below 1 in the healthy case; a ratio above 1 means the actual
+exceeded the envelope meant to bound it, which rules in either a cost-model gap
+(the estimate omits a real source of spend) or a runaway query pattern the
+model did not anticipate. Nothing in this release rejects a query on that
+envelope. It is measurement only.
+
+Three gaps limit what the per-query cost family can show:
+
+- A query that fails records no cost. A deadline breach, an admission
+  rejection, and an execution error all return before the fold, and the error
+  type carries no accounting snapshot. Read a sudden drop in the completed-query
+  count against steady request logs as failures, not as idle capacity.
+- A Flight SQL statement records two folds, one per RPC. The plan request
+  records the first fold and the fetch request records the second, so the
+  completed-query counter counts 2 for one logical query, and the two folds sum
+  to one whole-query estimate beside the summed whole-query actual.
+- A Flight fetch that a client abandons after one batch still records its
+  partial cost. The stream ends when the client disconnects, so the bytes
+  already spent are recorded and count as one query. An unusually low
+  cost-per-query ratio on the Flight path can therefore mean early client
+  disconnects, not cheap queries.
+
+## A modeled cost is a model, not a bill
+
+Every dollar figure in this guide is computed from counted requests and counted
+bytes multiplied by a published list price. None of it is read off an invoice.
+Two assumptions sit under any such figure, and either can move it:
+
+- The **price sheet**. The figures here use us-east-1 list prices for PUT,
+  GET, and transfer. A different region, a negotiated rate, a different
+  provider's per-request price, or an egress charge the list model omits all
+  change the total, sometimes enough to flip which lever is cheapest, as the
+  same-region-versus-egress reversal above shows.
+- The **workload**. Tenant count, signal mix, and query shape are inputs to
+  the formula and the per-query accounting, not constants. A projection tuned
+  for one corpus predicts a different bill on another.
+
+The counted requests and bytes are real: they come from the object-store call
+counters and the per-query fold, not from a guess. The dollars are a model laid
+over those counts. Use a projection to compare levers and to size a deployment
+before the first invoice, then reconcile it against a real bill once traffic is
+flowing, and treat a persistent gap between the two as a signal that one of the
+two assumptions above no longer holds.
+
+## Background
+
+The two-object commit protocol and request-cost reduction through flush
+cadence and ingest affinity: ADR-0076. Per-query cost accounting and the
+`/metrics` cost family: ADR-0044. The read-side request-cost knob and its
+whole-versus-ranged routing: ADR-0904. The read-side request budget derived
+from shard count and cadence: ADR-0075. Fetch concurrency: ADR-0088. The
+dollar-cost-against-real-storage benchmark is tracked as a separate work item.
