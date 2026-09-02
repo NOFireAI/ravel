@@ -129,13 +129,22 @@ Unlike its two siblings this key is **contended**, so it is never written with a
 plain `Overwrite`: it is acquired with `CreateIfAbsent` and every later write --
 renew, steal, mark-completed -- is a `CasVersion` update against the version the
 writer last saw. Expiry is `last_modified + lease_duration` (default 300 s)
-against the store's own server-assigned `last_modified`, never against a node
-clock or the payload's `owner_clock_ns`; a contender that finds the claim held
+against the store's own server-assigned `last_modified` (milliseconds; the
+payload's nanosecond lease is converted to milliseconds for the sum), never
+against a node clock or the payload's `owner_clock_ns`. Every observed lease,
+the holder-declared one and the observer's configured fallback alike, is
+capped at 24 hours (`MAX_OBSERVED_LEASE_MS`), so a decodable-but-absurd lease
+suppresses a bucket for at most a day. A contender that finds the claim held
 does exactly one GET plus one `head()`, reschedules its bucket past expiry with
 deterministic per-contender jitter, and never polls. Nothing deletes these
-objects: an unconditional DELETE by a worker whose claim was already stolen
-would destroy the newer owner's claim, so completion is a CAS state flip and
-reclamation is lifecycle aging. Like the heartbeat and the memo it must sit
+objects PROGRAMMATICALLY: an unconditional DELETE by a worker whose claim was
+already stolen would destroy the newer owner's claim, so completion is a CAS
+state flip and reclamation is lifecycle aging. A claim whose payload no longer
+decodes is observed with the fallback lease and never stolen (never overwrite
+what you cannot read); if one ever wedges a bucket past its expiry, the
+OPERATOR repair is a plain manual delete of that one key, which is safe here
+precisely because the claim is advisory: the worst possible cost of deleting
+any claim is one duplicated merge. Like the heartbeat and the memo it must sit
 outside any WORM-protected prefix, since it is mutated in place.
 
 The claim is **advisory and reconstructible**: it confers zero publication
