@@ -56,14 +56,28 @@ pub fn parse_max_flush_lifetime_ns(s: &str) -> Result<i64, String> {
 /// `1h5m`); the loader plumbs the result straight into
 /// `IngestConfig::max_flush_delay`, which is a `Duration`, so this returns one
 /// rather than an `i64` of nanoseconds. Zero is accepted, mirroring the
-/// `--max-flush-lifetime` flags: `0s` means the age trigger fires on the next
-/// flush tick for any non-empty buffer (its oldest point is always at least
-/// `0s` old), so every buffer flushes by age almost immediately regardless of
-/// `--target-bytes`. Negative values are unrepresentable in humantime, so the
-/// only rejections are an unparseable spelling and a value too large for
-/// `Duration`.
+/// `--max-flush-lifetime` flags: on the loader's path `0s` means the age
+/// trigger fires on the next flush tick for any non-empty buffer (its oldest
+/// point is always at least `0s` old), so every buffer flushes by age almost
+/// immediately regardless of `--target-bytes`. That holds because every loader
+/// write is Strict and therefore leaves a waiter on the buffer it merged into,
+/// which is what makes the shard compare the buffer's age against
+/// `max_flush_delay` rather than against the slower `max_flush_delay_idle`
+/// (`age_threshold_ns`, crates/ravel-ingest/src/log_shard.rs).
+///
+/// The `i64`-nanosecond ceiling is the same rejection the
+/// `--max-flush-lifetime` flags apply, and it is load-bearing here rather than
+/// merely tidy: the shard's age check casts `max_flush_delay.as_nanos() as
+/// i64`, so a `Duration` past 292 years wraps to a negative threshold that
+/// every buffer's age clears on the very next flush tick. The value furthest
+/// from "never age out" would otherwise parse as its exact opposite. Negative
+/// values are unrepresentable in humantime, so the only rejections are an
+/// unparseable spelling and a value too large for `i64` nanoseconds.
 pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
-    humantime::parse_duration(s).map_err(|e| format!("invalid --max-flush-delay '{s}': {e}"))
+    let dur = humantime::parse_duration(s)
+        .map_err(|e| format!("invalid --max-flush-delay '{s}': {e}"))?;
+    i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-flush-delay '{s}' is too large"))?;
+    Ok(dur)
 }
 
 #[cfg(test)]
@@ -103,5 +117,32 @@ mod tests {
             err.contains("--max-flush-delay"),
             "the error names the flag: {err}"
         );
+    }
+
+    /// A duration past the `i64`-nanosecond ceiling is rejected, exactly as
+    /// [`parse_max_flush_lifetime_ns`] rejects it. The shard's age check casts
+    /// `max_flush_delay.as_nanos() as i64`, so an accepted 1000-year delay
+    /// would reach it as a negative threshold and age-flush every buffer on
+    /// every tick: the parse rejection is what keeps the largest expressible
+    /// value from behaving as the smallest.
+    ///
+    /// Prove-the-test: drop the `i64::try_from` line from
+    /// `parse_max_flush_delay` and this fails at `expect_err` with
+    /// `Ok(31557600000s)`.
+    #[test]
+    fn parse_max_flush_delay_rejects_a_value_past_the_i64_nanosecond_ceiling() {
+        // 1000 humantime years is 3.15e19 ns, past i64::MAX (9.22e18), and
+        // well inside what `Duration` itself can hold.
+        let err = parse_max_flush_delay("1000years").expect_err("1000 years is rejected");
+        assert!(
+            err.contains("--max-flush-delay") && err.contains("too large"),
+            "the error names the flag and the reason: {err}"
+        );
+        // The sibling flag rejects the same spelling for the same reason.
+        assert!(parse_max_flush_lifetime_ns("1000years").is_err());
+        // The largest value that still fits is accepted, so the guard rejects
+        // only what the cast would corrupt.
+        let ok = parse_max_flush_delay("292years").expect("292 years still fits in i64 ns");
+        assert!(i64::try_from(ok.as_nanos()).is_ok());
     }
 }

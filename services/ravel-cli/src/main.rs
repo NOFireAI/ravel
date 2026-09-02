@@ -362,9 +362,10 @@ enum Command {
         /// that answers a batch's ack may be triggered by a LATER batch, so
         /// that ack now waits for one; a buffer that never reaches the target
         /// waits for the router's wall-clock age trigger instead
-        /// (`max_flush_delay`, 2s). Set `--pipeline-depth` to at least the
-        /// number of batches that accumulate into one flush, or every flush
-        /// waits out that timer. `0` is rejected.
+        /// (`--max-flush-delay`, 2s by default), or, at the end of the input,
+        /// for the loader's own force-flush. Set `--pipeline-depth` to at
+        /// least the number of batches that accumulate into one flush, or
+        /// every flush waits out that timer. `0` is rejected.
         #[arg(long, value_name = "BYTES", default_value_t = ravel_cli::load::DEFAULT_TARGET_BYTES)]
         target_bytes: usize,
         /// How long a shard buffer may age before the router flushes it,
@@ -392,12 +393,22 @@ enum Command {
         /// the other two leaves the object layout at the `--target-bytes 1`
         /// shape.
         ///
-        /// The trade is ack latency, not durability: above the size trigger a
-        /// tail buffer's Strict ack can now wait up to this delay for the age
-        /// trigger to release it, since no later batch arrives to flush it by
-        /// size. An ack still means durable whenever it arrives. `0s` is
-        /// accepted and means the age trigger fires on the next flush tick for
-        /// any non-empty buffer.
+        /// The trade is ack latency, not durability, and it lands mid-load
+        /// rather than at the tail. At the end of the input the loader force-
+        /// flushes every shard buffer (the load report's flush mix counts those
+        /// under `final`) before waiting on the last batches' acks, so a tail
+        /// buffer left under `--target-bytes` is published there and never
+        /// waits out this delay. Mid-load, a buffer that misses
+        /// `--target-bytes` because a batch's slices fell unevenly waits up to
+        /// this delay for the age trigger, and every write's ack deadline is
+        /// raised to this delay plus one minute so that wait completes instead
+        /// of failing the load. An ack still means durable whenever it arrives.
+        ///
+        /// `0s` is accepted and means the age trigger fires on the next flush
+        /// tick for any non-empty buffer on this path, where every write is
+        /// Strict and so leaves a waiter on the buffer it merged into (a
+        /// buffer with no waiter is judged idle and ages on the router's
+        /// slower idle timer instead).
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_flush_delay)]
         max_flush_delay: Option<Duration>,
     },
