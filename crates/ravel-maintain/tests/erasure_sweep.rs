@@ -265,9 +265,9 @@ async fn rewrite_raw_l0_inputs_swept_only_after_horizon() {
 /// inputs. Proven against a no-hold control that does delete them, and by
 /// asserting the hold was actually consulted.
 ///
-/// Flip-line proof: dropping the `lease.is_protected(k)` guard in
-/// `sweep_superseded_impl`'s delete loop makes the held inputs vanish, failing
-/// the `l0_data_count == 2` assertion.
+/// Flip-line proof: dropping the `group.protected_key(lease)` skip that
+/// `sweep_superseded_impl` applies to a whole chain group before gating it
+/// makes the held inputs vanish, failing the `l0_data_count == 2` assertion.
 #[tokio::test]
 async fn rewrite_superseded_inputs_survive_under_legal_hold() {
     let created = sealed_now_ns();
@@ -334,8 +334,8 @@ async fn rewrite_superseded_inputs_survive_under_legal_hold() {
 /// horizon, while the rewrite's own output parts survive.
 ///
 /// Flip-line proof: replacing the `superseded_record_key` arm's
-/// `gather_superseded_predecessor` call with `(Vec::new(), Vec::new())` leaves
-/// the predecessor compaction record and its L1 parts in place, failing the
+/// `gather_superseded_chain` call with `Ok(Vec::new())` leaves the predecessor
+/// compaction record and its L1 parts in place, failing the
 /// `!present(comp_key)` / `!present(comp_part)` assertions after the horizon.
 #[tokio::test]
 async fn rewrite_predecessor_record_and_parts_swept_after_horizon() {
