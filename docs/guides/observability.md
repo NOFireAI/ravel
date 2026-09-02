@@ -446,8 +446,10 @@ query incurred up to that point, not zeros. This works because an object-store
 request is counted the moment it is issued, so a fetch still outstanding when
 the deadline trips or the caller goes away is already counted; only its
 transferred bytes wait until the fetch returns, since their length is not known
-before then. A query that times out or is cancelled therefore reports the same
-request count a completed run would, and the bytes it had received so far.
+before then. A query that times out or is cancelled therefore reports every
+request it issued before it stopped, including any still outstanding at that
+moment, and the bytes of the fetches that had completed by then. Fetches the
+query would have issued later, had it run on, are not counted.
 
 ### Metric metadata cache (`query_metadata_cache_*`)
 
