@@ -9,7 +9,7 @@
 # finding gets silently un-baselined, so this does it mechanically instead.
 #
 # Usage, from inside the integration worktree mid-conflict:
-#   merge-baseline.sh <base-ref> <ours-ref> <theirs-ref>
+#   merge-docs-baseline.sh <base-ref> <ours-ref> <theirs-ref>
 #
 # It writes the resolved file and stages it. It does NOT commit: the caller
 # still verifies with `make check-docs` and `--strict-baseline` before
@@ -45,50 +45,66 @@ read_side base "$base"
 read_side ours "$ours"
 read_side theirs "$theirs"
 
-# Entries, without the comment header, one per line.
-strip() { grep -v '^#' "$1" | grep -v '^[[:space:]]*$' || true; }
+# Multiset arithmetic, the same Counter the gate loads the file with. The
+# baseline holds one line per finding, so a key fixed in three places is
+# three identical lines. A sort -u over the deletions collapses those to one,
+# and comm then removes one copy per key from the base, leaving the rest in
+# the merged file as entries nobody baselined on purpose. A union of 48 and
+# 223 deletions once came back as 82 that way, and 189 findings both sides
+# had fixed were silently restored.
+python3 - "${tmp}/base" "${tmp}/ours" "${tmp}/theirs" "$file" <<'PY'
+import sys
+from collections import Counter
 
-strip "${tmp}/base"   | sort > "${tmp}/base.s"
-strip "${tmp}/ours"   | sort > "${tmp}/ours.s"
-strip "${tmp}/theirs" | sort > "${tmp}/theirs.s"
 
-# A deletion is a line in base that is absent from a side. The union of both
-# sides' deletions is what leaves base.
-comm -23 "${tmp}/base.s" "${tmp}/ours.s"   > "${tmp}/del.ours"
-comm -23 "${tmp}/base.s" "${tmp}/theirs.s" > "${tmp}/del.theirs"
-sort -u "${tmp}/del.ours" "${tmp}/del.theirs" > "${tmp}/del.all"
+def load(path):
+    header, entries = [], []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh.read().split("\n"):
+            if line.startswith("#"):
+                header.append(line)
+            elif line.strip():
+                entries.append(line)
+    return header, Counter(entries)
 
-# An addition is a line on a side that base does not have. The specs forbid
-# adding entries, so an addition is reported loudly rather than merged
-# silently: it means a task baselined a finding it should have reported.
-comm -13 "${tmp}/base.s" "${tmp}/ours.s"   > "${tmp}/add.ours"
-comm -13 "${tmp}/base.s" "${tmp}/theirs.s" > "${tmp}/add.theirs"
-added=$(sort -u "${tmp}/add.ours" "${tmp}/add.theirs")
 
-comm -23 "${tmp}/base.s" "${tmp}/del.all" > "${tmp}/kept"
+header, base = load(sys.argv[1])
+_, ours = load(sys.argv[2])
+_, theirs = load(sys.argv[3])
+out_path = sys.argv[4]
 
-# Header from base, entries sorted, so the file's diff stays readable.
-grep '^#' "${tmp}/base" > "${tmp}/out"
-if [ -n "$added" ]; then
-  printf '%s\n' "$added" >> "${tmp}/kept"
-fi
-sort "${tmp}/kept" >> "${tmp}/out"
+# A deletion is an entry base has that a side no longer has. Both sides'
+# deletions leave the merged file; an entry both deleted is counted once.
+deleted_ours = base - ours
+deleted_theirs = base - theirs
+kept = base - deleted_ours - deleted_theirs
 
-cp "${tmp}/out" "$file"
+# An addition is an entry a side has that base does not. The task specs
+# forbid adding entries, so it is kept (the gate must stay green) and
+# reported loudly: it is a finding a task chose to silence instead of report.
+added = (ours - base) + (theirs - base)
+
+with open(out_path, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(header) + "\n")
+    for line in sorted((kept + added).elements()):
+        fh.write(line + "\n")
+
+print(
+    f"baseline merge: {sum(base.values())} entries at base, "
+    f"{sum(deleted_ours.values())} deleted by ours and "
+    f"{sum(deleted_theirs.values())} by theirs "
+    f"({sum((deleted_ours & deleted_theirs).values())} by both), "
+    f"{sum(kept.values())} remain"
+)
+if added:
+    print("WARNING: a side ADDED baseline entries, which the task specs forbid:", file=sys.stderr)
+    for line in sorted(added.elements()):
+        print(f"  {line}", file=sys.stderr)
+    print("They are kept so the gate stays green, but each one is a finding a task", file=sys.stderr)
+    print("chose to silence instead of reporting. Review before committing.", file=sys.stderr)
+PY
+
 git add "$file"
-
-base_n=$(wc -l < "${tmp}/base.s" | tr -d ' ')
-del_n=$(wc -l < "${tmp}/del.all" | tr -d ' ')
-kept_n=$(grep -vc '^#' "$file" || true)
-
-echo "baseline merge: ${base_n} entries at base, ${del_n} deleted by the two sides, ${kept_n} remain"
-
-if [ -n "$added" ]; then
-  echo "WARNING: a side ADDED baseline entries, which the task specs forbid:" >&2
-  printf '  %s\n' "$added" >&2
-  echo "They are kept so the gate stays green, but each one is a finding a task" >&2
-  echo "chose to silence instead of reporting. Review before committing." >&2
-fi
 
 echo
 echo "Now verify before committing, each unpiped:"
