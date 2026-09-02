@@ -10,19 +10,22 @@
 //!
 //! # Label allowlist
 //!
-//! [`Label`] is the only way to attach a label to a rendered sample, and its
-//! variants are exhaustively `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, and `tier`
-//! (ADR-0044
+//! [`Label`] is the only way to attach a label to a rendered sample, and it
+//! renders exactly eleven label keys: `tenant_hash`, `signal`, `mode`, `op`,
+//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`, and
+//! `kind` (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
 //! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
 //! `cache` to split the read-cache family into the
 //! fetcher and catalog byte caches, `tier` added by #97 to split each of those
-//! into its RAM and local-disk tiers when a disk tier is configured). Every
-//! variant's payload is a closed enum
+//! into its RAM and local-disk tiers when a disk tier is configured, and `kind`
+//! added by ADR-0065 decision 4 to split the maintenance merge-memory gauge into
+//! its transient and total high-water marks). The eleven keys come from twelve
+//! `Label` variants: `RejectReason` and `ScrubReason` both render `reason`.
+//! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
 //! anywhere on this path an unlisted label could travel through, and adding a
-//! tenth variant is a compile error everywhere this module matches on `Label`
+//! variant is a compile error everywhere this module matches on `Label`
 //! exhaustively. `shard` is
 //! deliberately absent: shard count times tenant count times operation count
 //! is unbounded in the dimension Ravel controls least (ADR-0044, rejected
