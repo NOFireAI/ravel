@@ -561,6 +561,24 @@ def byte_count(v, what):
         return None
     return v
 
+def finite_nonneg(v):
+    """An object-store count or byte field coerced to a finite, non-negative
+    number, or 0 when the report value is not one.
+
+    The class totals below sum these directly rather than gating the whole pass
+    on each field the way `byte_count` does, so an invalid value contributes 0
+    instead of aborting. The three traps `byte_count` documents apply here too:
+    `bool` is an `int` subclass and would add 1; `NaN` poisons every later
+    comparison so a band would read as MET; a negative would drag a total down
+    toward a passing figure. Each such value is worth 0."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return 0
+    if v != v or v in (float("inf"), float("-inf")):      # NaN or +/-inf
+        return 0
+    if v < 0:
+        return 0
+    return v
+
 def scan_wire(acc, q):
     """Scan-phase WIRE bytes for statement `q`, or None with a recorded failure.
 
@@ -664,8 +682,8 @@ for q in CLASS_M:
     acc = cold(q)
     if acc is None:
         m_ok = False; continue
-    m_gets  += acc.get("object_store_get_requests") or 0
-    m_bytes += acc.get("object_store_bytes") or 0
+    m_gets  += finite_nonneg(acc.get("object_store_get_requests"))
+    m_bytes += finite_nonneg(acc.get("object_store_bytes"))
 if m_ok:
     print(f"class M total {m_gets} GETs, {m_bytes/1e9:.2f} GB")
     if m_gets > M_TOTAL_GETS_MAX:
@@ -679,7 +697,7 @@ for q in CLASS_S_EACH:
     acc = cold(q)
     if acc is None:
         continue
-    b = acc.get("object_store_bytes") or 0
+    b = finite_nonneg(acc.get("object_store_bytes"))
     print(f"class S {q} {b/1e9:.2f} GB ({100*b/CORPUS_BYTES:.1f}% of corpus)")
     if b > S_EACH_BYTES_MAX:
         fails.append(f"class S {q} {b/1e9:.2f} GB > {S_EACH_FRAC_MAX*100:.1f}% "
@@ -690,7 +708,7 @@ for q in CLASS_S_GRP:
     acc = cold(q)
     if acc is None:
         s_grp_ok = False; continue
-    s_grp_bytes += acc.get("object_store_bytes") or 0
+    s_grp_bytes += finite_nonneg(acc.get("object_store_bytes"))
 if s_grp_ok:
     print(f"class S q20..q24 group total {s_grp_bytes/1e9:.2f} GB")
     if s_grp_bytes > S_GROUP_BYTES_MAX:
