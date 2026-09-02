@@ -94,8 +94,14 @@ mkdir -p examples
 cargo run --quiet -p ravel-server --example gen_otlp_fixture > "$FIXTURE_PATH"
 
 log "starting ravel-server on ${HTTP_ADDR}"
+# A fresh bucket refuses to start unless a tenant-hash scheme is chosen
+# (keyed is the default for a real deployment; an unspecified scheme is
+# FreshBucketNeedsKey). This is a throwaway dev bucket, so opt out explicitly,
+# exactly as the compose quickstart does. Safe on a reused minio-data/ too: an
+# existing unkeyed marker validates against this flag.
 cargo run --quiet -p ravel-server -- \
   --store s3 \
+  --tenant-hash-unkeyed \
   --listen-http "$HTTP_ADDR" \
   --listen-grpc "$GRPC_ADDR" \
   --tenant-token "${TENANT_TOKEN}=${TENANT_NAME}" &
