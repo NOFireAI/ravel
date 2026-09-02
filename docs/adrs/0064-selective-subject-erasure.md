@@ -452,6 +452,28 @@ can still include a pre-rewrite input by the time the query-time filter
 disappears, closing the §3.5 race window durably. The `.done` record (hash
 only, no PII) is permanent.
 
+## Amendment: the .dreq release rule names completed_unix_ns and holds while a superseded input is still resolvable
+
+2026-09-03. Landing the superseded-input sweep found two mismatches between
+section 5 above and the shipped rule.
+
+The completion record's timestamp field is `completed_unix_ns`, not
+`created_unix_ns`: `ErasureCompletion` carries no `created_unix_ns`. The
+horizon wait in section 5 reads `now >= completed_unix_ns +
+protection_horizon`. The sweep also holds a `.dreq` past that horizon while
+any input a rewrite in the request's supersession chain superseded is still
+resolvable through a HEAD-named snapshot part, and while the sweep holds a
+bucket whose chain it could not walk back to a raw input for the request's
+signal.
+
+The horizon alone proved the query-time filter outlives a resolvable
+pre-rewrite input only for the case where the fold had already reconciled
+the rewrite by the time the horizon elapsed. The added hold closes the case
+where it has not: a chain a snapshot still resolves, or a chain the sweep
+could not walk back to a raw input, keeps its requests' `.dreq`s alive past
+the horizon. docs/deletion-and-gc.md carries the normative wording of the
+rule.
+
 ### 6. Interaction with ADR-0055 (WORM / credential scoping / legal hold) — the landed-second obligation
 
 Stated explicitly, per ADR-0055's own consequence:
