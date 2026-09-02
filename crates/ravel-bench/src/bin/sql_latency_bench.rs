@@ -553,6 +553,18 @@ fn dataset_line(d: &DatasetInfo) -> String {
 /// than printed inline so a test can assert a stamped figure is present and
 /// present exactly once: a knob whose value the header drops, or stamps twice,
 /// leaves a run that cannot say which setting produced it.
+/// Why an effective logs-fetch figure is absent. A Flight run never resolved
+/// one in this process (the server's config governed the read shape); any
+/// other lane records the figure, so its absence means the report predates
+/// the field.
+fn unresolved_effective_label(source: &str) -> &'static str {
+    if source == "flight" {
+        "unknown (server config)"
+    } else {
+        "unknown (not recorded)"
+    }
+}
+
 fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
     let effective =
         parallel_final_aggregation_effective_label(p.parallel_final_aggregation_effective);
@@ -591,8 +603,10 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
             // A Flight run does not send the knob to the server; the routing
             // was governed by the server's own config, which this process
             // cannot name. Printing the requested value here would make a
-            // Flight pass look like it ran at a setting it never applied.
-            None => "unknown (server config)".to_string(),
+            // Flight pass look like it ran at a setting it never applied. A
+            // report from before the field existed is unknown for a different
+            // reason, and says so.
+            None => unresolved_effective_label(&p.source).to_string(),
         }
     ));
     out.push_str(&format!("  logs policy: {}\n", p.logs_fetch_policy));
@@ -602,7 +616,7 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
             Some(v) => format!("{v} bytes"),
             // Same reason as the request cost above: a Flight run resolved
             // nothing the server obeyed, so no threshold can be named here.
-            None => "unknown (server config)".to_string(),
+            None => unresolved_effective_label(&p.source).to_string(),
         }
     ));
     out.push_str(&format!(
@@ -1175,6 +1189,22 @@ mod tests {
     /// Both layout directions must show up verbatim in the printed line
     /// (issue #834): a fix that hardcodes one direction passes only one of
     /// these two assertions.
+    #[test]
+    fn an_absent_effective_figure_names_why_it_is_absent() {
+        assert_eq!(
+            unresolved_effective_label("flight"),
+            "unknown (server config)",
+            "a Flight run's routing was the server's, which this process cannot name"
+        );
+        for lane in ["generate", "tenant"] {
+            assert_eq!(
+                unresolved_effective_label(lane),
+                "unknown (not recorded)",
+                "an in-process lane records the figure, so absence means an older report"
+            );
+        }
+    }
+
     #[test]
     fn dataset_line_reports_both_layout_directions() {
         assert!(dataset_line(&dataset("pre-compaction", None)).contains("layout=pre-compaction"));
