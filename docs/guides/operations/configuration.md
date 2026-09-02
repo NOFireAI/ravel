@@ -512,11 +512,13 @@ per-role storage credentials only the Maintain and Admin roles may create the
 object, so on a fresh bucket start the `maintain` process first, or create it
 with `ravel-cli gc-config set` under Admin; see
 [the first deployment](deployment.md#the-first-deployment-against-a-fresh-bucket).
-The Kubernetes operator applies the gateway and query Deployments before
-maintain and adds no ordering between them, so with per-role credential
-Secrets create `sys/gc` before applying the `RavelCluster`, or expect the
-gateway and query pods to restart until the first maintain pod has created
-it.
+With per-role credential Secrets the Kubernetes operator applies the maintain
+Deployment first on a fresh cluster and holds the gateway and query
+Deployments until maintain reports a ready replica, so no manual step is
+needed; with `maintain.enabled: false` it still applies both, their pods
+restart until `sys/gc` exists, and the cluster reports `Degraded=True` until
+you create the object under Admin. The Kubernetes guide describes the
+conditions the operator records while it waits.
 
 **What each mode validates:**
 
@@ -569,8 +571,9 @@ impossible for any mode to match, so it is rejected.
 The Kubernetes operator exposes no GC-horizon fields: it deploys every pod
 with the shipped defaults. On a fresh bucket with a shared credential the
 first pod bootstraps `sys/gc` from those defaults and every pod validates
-trivially; with per-role credential Secrets the maintain pod or an Admin
-step creates it first, as above. On a bucket whose stored protection horizon
+trivially; with per-role credential Secrets the operator applies the maintain
+Deployment first and its pod creates the object, as above. On a bucket whose
+stored protection horizon
 or grace differs from the shipped defaults (set with `gc-config set`), the
 operator's maintain pods refuse to start, because the must-match rule has no
 operator field to satisfy it; the other two stored values do not affect
