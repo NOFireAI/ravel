@@ -4,9 +4,10 @@
 
 Start here to run Ravel, ingest into it, or query it.
 
-- [guides/getting-started.md](guides/getting-started.md): install
-  prerequisites, bring up MinIO, run `make demo`, and do the same ingest-then-query
-  flow by hand. Read this first.
+- [guides/getting-started.md](guides/getting-started.md): the one recommended
+  path from nothing to a first query, on the container quickstart, with what
+  each response means and when an empty result is the right answer. Building
+  from source sits at the end of the page. Read this first.
 - [guides/ingest.md](guides/ingest.md): OTLP ingest endpoints, authentication,
   strict vs. buffered acknowledgement, every rejection reason, admission
   limits, and commit tokens. Read this to write data into Ravel.

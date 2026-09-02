@@ -125,8 +125,8 @@ Also live:
   it arrives over OTLP or through a collector's Prometheus exporter.
 - Exemplars that link a metric sample to its trace.
 - Alert rules whose every transition is written to object storage as immutable
-  data. Reading those records back needs a query surface Ravel does not ship
-  yet.
+  data. Reading those records back needs a query surface Ravel does not
+  ship.
 - An analytics endpoint for change point detection and summary statistics.
 - Compaction, age-based retention, and garbage collection across all signals.
 - A Kubernetes operator with a `RavelCluster` custom resource.
@@ -136,9 +136,10 @@ Also live:
 
 The [SQL conformance table](docs/sql-conformance.md) and the PromQL conformance
 table in the [query engine spec](docs/query-engine.md) classify every construct
-as supported, intentionally rejected, or unclassified. Both are generated from a
-differential test against a real Prometheus binary, so the gaps are measured
-rather than claimed.
+as supported, intentionally rejected, or unclassified. Both are generated, not
+written: the PromQL table from a differential test against a real Prometheus
+binary, and the SQL table from the conformance suite's recorded verdict for
+each construct. The gaps are measured rather than claimed.
 
 ## Quickstart
 
