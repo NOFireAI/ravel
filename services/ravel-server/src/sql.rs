@@ -62,8 +62,8 @@ use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::QueryAdmissionController;
 use ravel_query::http::TenantResolver;
-use ravel_sql::{ErrorClass, SqlError, SqlExecutor, SqlRequest};
-use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
+use ravel_sql::{ErrorClass, LiveAccounting, SqlError, SqlExecutor, SqlRequest};
+use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot};
 use ravel_types::{CommitToken, TenantHash, TimeRange};
 use serde::Deserialize;
 use serde_json::json;
@@ -161,19 +161,32 @@ struct SqlBody {
 /// the whole `run` future dropped mid-`execute().await` -- `Drop::drop` runs
 /// unconditionally (Rust guarantees this for every value dropped by scope
 /// exit, `return`, `?`, panic, or an abandoned `.await`) and folds a
-/// zero-accounting `Canceled` record instead. There is no path through `run`
-/// that skips both.
+/// `Canceled` record whose cost is read live from the executor's accounting
+/// handle, so a query that fetched objects for two minutes and was then
+/// dropped records what it actually spent, not zeros.
+///
+/// The guard holds a [`LiveAccounting`] handed to `SqlExecutor::execute_accounted`,
+/// which re-points it at the running attempt's counters. Both `finish` and
+/// `drop` snapshot it, so a timeout, a mid-fetch drop, and every error path
+/// record the requests and bytes issued up to that instant with the right
+/// status.
 struct CostGuard<'a> {
     metrics: &'a crate::metrics::QueryAccountingMetrics,
     tenant_hash: TenantHash,
+    live: LiveAccounting,
     finished: bool,
 }
 
 impl<'a> CostGuard<'a> {
-    fn new(metrics: &'a crate::metrics::QueryAccountingMetrics, tenant_hash: TenantHash) -> Self {
+    fn new(
+        metrics: &'a crate::metrics::QueryAccountingMetrics,
+        tenant_hash: TenantHash,
+        live: LiveAccounting,
+    ) -> Self {
         CostGuard {
             metrics,
             tenant_hash,
+            live,
             finished: false,
         }
     }
@@ -195,45 +208,30 @@ impl<'a> CostGuard<'a> {
 impl Drop for CostGuard<'_> {
     fn drop(&mut self) {
         if !self.finished {
+            // The run future was dropped mid-`execute` (a client disconnect
+            // while the query was still doing object-store work). Record the
+            // cost issued up to this instant, read live from the executor's
+            // accounting handle -- not zeros.
             self.metrics.record_outcome(
                 self.tenant_hash,
                 QueryOutcomeStatus::Canceled,
-                &QueryAccountingSnapshot::default(),
+                &self.live.snapshot(),
                 &CostEstimate::new(0, 0, 0, 0, 0),
             );
         }
     }
 }
 
-/// Best-effort outcome status and accounting for a failed query, derived from
-/// the `SqlError` variant alone. Only [`SqlError::TooManyBytesScanned`] and
-/// [`SqlError::RequestBudgetExceeded`] carry the exact counters that tripped
-/// them; every other variant -- including `DeadlineExceeded`, a wall-deadline
-/// timeout -- is recorded with a zero snapshot. This is a real gap, not an
-/// oversight: `SqlExecutor::execute` (crates/ravel-sql/src/executor.rs) owns
-/// its `QueryAccounting` handle entirely internally and exposes it only on
-/// `SqlOutcome` on the success path, so a timeout or any other error variant
-/// without its own embedded figures has no accounting data this module can
-/// reach. Closing that gap needs a ravel-sql API change (out of this task's
-/// `services/ravel-server`-only scope) to expose the live handle, or the
-/// figures, on every error path -- flagged in this task's report rather than
-/// worked around here.
-fn error_cost(err: &SqlError) -> (QueryOutcomeStatus, QueryAccountingSnapshot, CostEstimate) {
-    let status = match err.class() {
+/// The outcome status for a failed query, from the `SqlError` class alone. A
+/// wall-deadline trip is a `Timeout`; every other error is an `Error`. The cost
+/// recorded alongside it is read from the live accounting handle, not derived
+/// from the error variant, so `DeadlineExceeded` and a dropped future carry the
+/// real requests and bytes the query issued rather than zeros.
+fn error_status(err: &SqlError) -> QueryOutcomeStatus {
+    match err.class() {
         ErrorClass::Timeout => QueryOutcomeStatus::Timeout,
         _ => QueryOutcomeStatus::Error,
-    };
-    let mut snapshot = QueryAccountingSnapshot::default();
-    match err {
-        SqlError::TooManyBytesScanned { scanned, .. } => {
-            snapshot.s3_bytes[AccountedOp::Get.index()] = *scanned;
-        }
-        SqlError::RequestBudgetExceeded { requests, .. } => {
-            snapshot.s3_requests[AccountedOp::Get.index()] = *requests;
-        }
-        _ => {}
     }
-    (status, snapshot, CostEstimate::new(0, 0, 0, 0, 0))
 }
 
 async fn handle(State(state): State<SqlState>, req: Request<Body>) -> Response {
@@ -284,10 +282,15 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         s3_bytes = tracing::field::Empty,
     );
 
+    // The live accounting handle: the executor re-points it at the running
+    // query's counters, and the guard snapshots it on every exit -- including
+    // the dropped-future and timeout exits that carry no `SqlOutcome`.
+    let live = LiveAccounting::new();
+
     // Constructed before `execute` is awaited so a dropped `run` future
     // (client disconnect mid-query) still folds a Canceled record through its
     // `Drop` -- see `CostGuard`'s doc comment for the full mechanism.
-    let cost_guard = CostGuard::new(&state.query_accounting, tenant_hash);
+    let cost_guard = CostGuard::new(&state.query_accounting, tenant_hash, live.clone());
 
     // The query has now reached execution for a resolved tenant, so it is
     // auditable (ADR-0042 decision 4, ADR-0062 §2a). Run it, then submit
@@ -298,7 +301,7 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     // are not audited: there is no executed query to attribute.
     let result = state
         .executor
-        .execute(tenant_hash, &request)
+        .execute_accounted(tenant_hash, &request, &live)
         .instrument(span.clone())
         .await;
     let status = match &result {
@@ -319,8 +322,14 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
             );
         }
         Err(err) => {
-            let (outcome_status, snapshot, estimate) = error_cost(err);
-            cost_guard.finish(outcome_status, &snapshot, &estimate);
+            // The live handle carries the requests and bytes the query issued
+            // before it failed, including a fetch still outstanding when a
+            // deadline tripped. The estimate is only known on the success path.
+            cost_guard.finish(
+                error_status(err),
+                &live.snapshot(),
+                &CostEstimate::new(0, 0, 0, 0, 0),
+            );
         }
     }
 

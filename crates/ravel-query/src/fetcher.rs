@@ -713,9 +713,13 @@ impl SegmentFetcher {
     /// `guarded_get`/`ensure_ranges` call, or a query whose in-flight GETs
     /// already fill the pool could wait on itself.
     ///
-    /// Only a successful GET is recorded, matching `QueryAccounting`'s
-    /// "completed store request" wording; a failed GET propagates its error
-    /// unrecorded.
+    /// The request is counted at ISSUE time, once the in-flight permit is held
+    /// and immediately before the backend `get` is awaited, so a future dropped
+    /// or timed out while that `get` is still pending still shows the request it
+    /// started; the transferred bytes are added only at completion, when their
+    /// length is known. Counting on issue rather than completion means a failed
+    /// GET is now counted too (one issued request), which is the honest figure
+    /// for a query that spent a round trip only to error.
     async fn store_get(
         &self,
         key: &str,
@@ -726,8 +730,8 @@ impl SegmentFetcher {
             self.get_semaphore.acquire().await.map_err(|_| {
                 StoreError::Transient("fetch concurrency semaphore closed".to_string())
             })?;
-        let got = self.store.get(key, range).await?;
         accounting.record_s3_request(AccountedOp::Get);
+        let got = self.store.get(key, range).await?;
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
         Ok(got)
     }
@@ -2143,12 +2147,10 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<SeriesEntry>, FetchError> {
-        let phase = PhaseAccounting::new();
-        let result = self
-            .fetch_series_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
-            .await;
-        accounting.merge_snapshot(&phase.snapshot().pooled());
-        result
+        let phase = PhaseAccounting::pooled_over(accounting);
+
+        self.fetch_series_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
+            .await
     }
 
     /// Phase-split counterpart of
@@ -2156,9 +2158,10 @@ impl SegmentFetcher {
     /// same behavior, but every GET is recorded against the phase that
     /// issued it (plan for [`open_segment`](Self::open_segment), probe for
     /// [`decode_selected`](Self::decode_selected)) rather than pooled onto
-    /// one handle. `fetch_series_accounted` is now a thin wrapper over this
-    /// that folds the four phase totals back into its single
-    /// `QueryAccounting` handle, so its own callers (`ravel-sql`'s direct
+    /// one handle. `fetch_series_accounted` is a thin wrapper over this that
+    /// runs it against a [`PhaseAccounting::pooled_over`] its single
+    /// `QueryAccounting` handle, so every GET records straight onto that one
+    /// handle (live, as it is issued) and its callers (`ravel-sql`'s direct
     /// calls included) see unchanged pooled numbers.
     pub(crate) async fn fetch_series_phase_accounted(
         &self,
@@ -2211,11 +2214,10 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<FetchedSeries>, FetchError> {
-        let phase = PhaseAccounting::new();
+        let phase = PhaseAccounting::pooled_over(accounting);
         let result = self
             .fetch_runs(tenant_hash, seg_ref, matchers, false, &phase)
             .await;
-        accounting.merge_snapshot(&phase.snapshot().pooled());
         let (runs, _stats) = result?;
         Ok(runs.into_iter().map(RunDecode::into_aos).collect())
     }
@@ -2245,11 +2247,10 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<(Vec<FetchedSeriesSoa>, FetchStats), FetchError> {
-        let phase = PhaseAccounting::new();
+        let phase = PhaseAccounting::pooled_over(accounting);
         let result = self
             .fetch_runs(tenant_hash, seg_ref, matchers, true, &phase)
             .await;
-        accounting.merge_snapshot(&phase.snapshot().pooled());
         let (runs, stats) = result?;
         Ok((runs.into_iter().map(RunDecode::into_soa).collect(), stats))
     }
@@ -2281,11 +2282,10 @@ impl SegmentFetcher {
         matchers: &[LabelMatcher],
         accounting: &QueryAccounting,
     ) -> Result<Vec<FetchedHistogramSeries>, FetchError> {
-        let phase = PhaseAccounting::new();
+        let phase = PhaseAccounting::pooled_over(accounting);
         let result = self
             .fetch_histogram_runs(tenant_hash, seg_ref, matchers, &phase)
             .await;
-        accounting.merge_snapshot(&phase.snapshot().pooled());
         let runs = result?;
         Ok(runs
             .into_iter()
@@ -2340,12 +2340,10 @@ impl SegmentFetcher {
         ),
         FetchError,
     > {
-        let phase = PhaseAccounting::new();
-        let result = self
-            .fetch_soa_and_histograms_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
-            .await;
-        accounting.merge_snapshot(&phase.snapshot().pooled());
-        result
+        let phase = PhaseAccounting::pooled_over(accounting);
+
+        self.fetch_soa_and_histograms_phase_accounted(tenant_hash, seg_ref, matchers, &phase)
+            .await
     }
 
     /// Phase-split counterpart of
@@ -2354,9 +2352,10 @@ impl SegmentFetcher {
     /// for why both forms exist. `engine.rs` calls this directly with a real,
     /// persistent `PhaseAccounting` for end-to-end phase visibility;
     /// `fetch_soa_and_histograms_accounted` is a thin wrapper over this that
-    /// folds the four phase totals back into its single `QueryAccounting`
-    /// handle, so its own callers (`ravel-sql`'s direct calls included) see
-    /// unchanged pooled numbers.
+    /// runs it against a [`PhaseAccounting::pooled_over`] its single
+    /// `QueryAccounting` handle, so every GET records straight onto that one
+    /// handle (live, as it is issued) and its callers (`ravel-sql`'s direct
+    /// calls included) see unchanged pooled numbers.
     pub(crate) async fn fetch_soa_and_histograms_phase_accounted(
         &self,
         tenant_hash: TenantHash,
@@ -3297,6 +3296,91 @@ mod tests {
         );
         assert_eq!(snapshot.segments_opened, 1);
         assert_eq!(snapshot.series_matched, 2);
+    }
+
+    /// A GET is accounted at issue time: while it is held open inside the
+    /// backend and has not yet returned, it already counts as exactly one
+    /// issued request with zero bytes (the length is unknown until it
+    /// resolves). This is what makes a future dropped or timed out mid-GET
+    /// record the request it started. `FaultStore`'s hold gate parks the GET
+    /// inside the store, so the count is asserted while the call is provably
+    /// pending, not after it completed.
+    #[tokio::test]
+    async fn a_held_get_counts_as_one_issued_request_while_pending() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        // Same fixture object, re-homed into a FaultStore so a hold gate can
+        // park its GET. `write_test_segment`'s object is well under the
+        // whole-object threshold, so the fetch issues a single whole-object
+        // GET -- the one call the gate holds.
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+        let fetcher = SegmentFetcher::new(backend);
+
+        let accounting = QueryAccounting::new();
+        let fetch_accounting = accounting.clone();
+        let seg = seg_ref.clone();
+        let handle = tokio::spawn(async move {
+            fetcher
+                .fetch_soa_accounted(tenant_hash, &seg, &[], &fetch_accounting)
+                .await
+        });
+
+        // Block until the GET is genuinely parked inside the store.
+        gate.wait_until_held(1).await;
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "exactly one GET is held; the fault fired"
+        );
+
+        let pending = accounting.snapshot();
+        assert_eq!(
+            pending.s3_requests(AccountedOp::Get),
+            1,
+            "the in-flight GET is counted as one issued request while still pending"
+        );
+        assert_eq!(
+            pending.s3_bytes(AccountedOp::Get),
+            0,
+            "no bytes are charged until the GET returns and its length is known"
+        );
+
+        // Release the held GET and let the fetch finish: the bytes are now
+        // charged, and the request count does not double.
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        let (soa, _stats) = handle.await.expect("join fetch task").expect("fetch");
+        assert_eq!(soa.len(), 2);
+
+        let done = accounting.snapshot();
+        assert_eq!(
+            done.s3_requests(AccountedOp::Get),
+            1,
+            "the same GET stays one request after it completes"
+        );
+        assert_eq!(
+            done.s3_bytes(AccountedOp::Get),
+            object_bytes.len() as u64,
+            "the whole-object GET charges exactly the object's byte length at completion"
+        );
     }
 
     /// ADR-0044: accounting must be pure observation. The accounted and

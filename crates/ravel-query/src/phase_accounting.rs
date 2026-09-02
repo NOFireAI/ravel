@@ -253,6 +253,30 @@ impl PhaseAccounting {
         PhaseAccounting::default()
     }
 
+    /// A handle whose four phases are all clones of `accounting`, so every
+    /// store call the fetch pipeline charges to any phase lands directly on
+    /// that one shared handle -- live, at the instant it is recorded, not in a
+    /// per-phase buffer folded in only once the fetch returns.
+    ///
+    /// The pooled read entry points (`SegmentFetcher::fetch_*_accounted`) use
+    /// this. They discard the per-phase split anyway -- they immediately
+    /// [`pooled`](Self::pooled) the four handles back into one -- so sharing
+    /// loses nothing, and it lets a query that is timed out or dropped
+    /// mid-fetch still show the requests and bytes the in-flight fetch had
+    /// already issued, instead of recording that cost only if the fetch runs to
+    /// completion. A caller that needs the genuine per-phase split (the PromQL
+    /// engine) threads a persistent [`PhaseAccounting::new`] through the whole
+    /// query instead and never routes through these pooled wrappers.
+    #[must_use]
+    pub fn pooled_over(accounting: &QueryAccounting) -> Self {
+        PhaseAccounting {
+            resolve: accounting.clone(),
+            plan: accounting.clone(),
+            probe: accounting.clone(),
+            scan: accounting.clone(),
+        }
+    }
+
     /// The resolve phase's handle.
     #[must_use]
     pub fn resolve(&self) -> &QueryAccounting {

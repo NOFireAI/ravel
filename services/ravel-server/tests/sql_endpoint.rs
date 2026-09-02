@@ -30,7 +30,7 @@ use ravel_logseg::{
     AttrValue, LogRecord, Predicate, RlogConfig, RlogReader, RlogWriter, stream_attrs_bytes,
 };
 use ravel_maintain::QUERY_AUDIT_SHARD;
-use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_query::http::StaticBearerTokenResolver;
@@ -1615,106 +1615,108 @@ async fn a_query_that_reads_objects_then_fails_records_the_bytes_it_actually_rea
     );
 }
 
-/// A backend wrapping `inner` whose `get` sleeps for `delay` (real tokio
-/// time) before delegating. `MemoryStore`'s own operations never yield to the
-/// executor, so `tokio::time::timeout` (`crates/ravel-sql/src/executor.rs`)
-/// never gets a chance to race a bare `MemoryStore`: the wrapped future
-/// resolves on its very first poll regardless of how small the configured
-/// deadline is, timer included. This wrapper forces a genuine `.await` that
-/// returns `Pending` for real wall-clock time, so a short deadline set below
-/// `delay` deterministically fires while a real GET is outstanding.
-struct DelayedGet<S> {
-    inner: S,
-    delay: Duration,
-}
-
-#[async_trait::async_trait]
-impl<S: ObjectStoreBackend> ObjectStoreBackend for DelayedGet<S> {
-    async fn put(
-        &self,
-        key: &str,
-        data: bytes::Bytes,
-        opts: PutOptions,
-    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
-        self.inner.put(key, data, opts).await
-    }
-
-    async fn get(
-        &self,
-        key: &str,
-        range: GetRange,
-    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
-        tokio::time::sleep(self.delay).await;
-        self.inner.get(key, range).await
-    }
-
-    async fn head(
-        &self,
-        key: &str,
-    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
-        self.inner.head(key).await
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-        page: Option<ravel_object_store::PageToken>,
-    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
-        self.inner.list(prefix, page).await
-    }
-
-    async fn list_delimited(
-        &self,
-        prefix: &str,
-    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
-        self.inner.list_delimited(prefix).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
-        self.inner.delete(key).await
-    }
-
-    fn capabilities(&self) -> ravel_object_store::Capabilities {
-        self.inner.capabilities()
-    }
-}
-
-/// A query that exceeds its wall-clock deadline must record `Timeout`, not
-/// `Error` and not nothing. `DelayedGet` (200ms) plus a 5ms deadline makes the
-/// trip fire deterministically while a real GET is genuinely outstanding, the
-/// same shape issue #809's motivating incident describes.
+/// Publish the single-segment metrics fixture into `store` and run `query`
+/// through a plain (ungated) router to success, returning that run's recorded
+/// total requests and bytes plus the data object's byte size.
 ///
-/// This test proves the STATUS split only: it does NOT prove the recorded
-/// cost reflects that real object-store work, because `SqlExecutor::execute`
-/// (crates/ravel-sql/src/executor.rs, out of this task's
-/// `services/ravel-server`-only scope) keeps its `QueryAccounting` handle
-/// entirely internal and does not expose it, or the figures it holds, on a
-/// `DeadlineExceeded` return -- so `error_cost` in `sql.rs` has no non-zero
-/// figures to record for this variant (see its doc comment). Closing that
-/// gap needs a `ravel-sql` API change, out of scope here and named in this
-/// task's final report.
-#[tokio::test]
-async fn a_query_that_exceeds_its_deadline_records_timeout_status() {
-    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+/// The timeout and cancellation tests hold the data-object GET open with a
+/// `FaultStore` gate, so the query never receives those bytes. Its recorded
+/// cost must then be exactly this success cost with the held object's bytes
+/// subtracted, while the request count is unchanged -- because a GET is counted
+/// at issue, so the held request is counted even though it never completed.
+/// Deriving the expected figures from a real successful run keeps them exact
+/// without a hand-computed magic number.
+async fn baseline_cost_and_object_size(query: &str) -> (u64, u64, u64) {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
-    publish_segment(inner.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
-    let delayed_store: Arc<dyn ObjectStoreBackend> = Arc::new(DelayedGet {
-        inner,
-        delay: Duration::from_millis(200),
-    });
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
 
-    let (app, query_accounting) = build_router_with_config_and_deadline(
-        delayed_store,
+    let (app, accounting) = build_router_with_config(
+        Arc::clone(&store),
         tokens(&[("acme-token", "acme")]),
         SqlConfig::default(),
-        Duration::from_millis(5),
+    );
+    let (status, value) = post_json(&app, "acme-token", query).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "baseline query must succeed: {value}"
+    );
+    let baseline = only_outcome_row(
+        &accounting,
+        ravel_server::metrics::QueryOutcomeStatus::Success,
     );
 
-    let (status, value) = post_json(&app, "acme-token", "SELECT ts, value FROM samples").await;
+    let object_size = data_object_size(store.as_ref()).await;
+    assert!(
+        baseline.counters.s3_bytes > object_size,
+        "the whole-object read's bytes must dominate the recorded total for the \
+         subtraction below to be meaningful"
+    );
+    assert!(
+        baseline.counters.s3_requests >= 1,
+        "the baseline must have issued at least one store request"
+    );
+    (
+        baseline.counters.s3_requests,
+        baseline.counters.s3_bytes,
+        object_size,
+    )
+}
+
+/// Byte size of the single published `.rseg` data object in `store`. The
+/// fixture publishes exactly one data object; catalog records carry no `rseg`
+/// key, so the filter is unambiguous.
+async fn data_object_size(store: &dyn ObjectStoreBackend) -> u64 {
+    let metas = list_all(store, "").await.expect("list objects");
+    let data: Vec<_> = metas.iter().filter(|m| m.key.contains("rseg")).collect();
+    assert_eq!(
+        data.len(),
+        1,
+        "the fixture must publish exactly one data object, found: {:?}",
+        data.iter().map(|m| &m.key).collect::<Vec<_>>()
+    );
+    data[0].size
+}
+
+/// A query that trips its wall deadline while a real GET is outstanding records
+/// `Timeout` with the exact cost it incurred up to that instant, not zeros. A
+/// `FaultStore` gate holds the data-object GET open forever, so the deadline
+/// fires with that GET issued but unfinished. The recorded request count equals
+/// the successful run's (the held GET was counted the moment it was issued),
+/// and the recorded byte count equals the successful run's minus the object's
+/// bytes, which never transferred.
+#[tokio::test]
+async fn a_query_that_exceeds_its_deadline_records_the_cost_it_incurred() {
+    let query = "SELECT ts, value FROM samples ORDER BY ts";
+    let (baseline_requests, baseline_bytes, object_size) =
+        baseline_cost_and_object_size(query).await;
+
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::default()));
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(fault.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    // Hold every data-object GET open forever. Catalog resolve reads no `.rseg`
+    // object, so it completes and the query parks on the one data GET the fetch
+    // issues; the wall deadline then fires while that GET is outstanding.
+    let gate = fault.hold(Op::Get, Some("rseg".to_string()), Occurrence::Always);
+    let store: Arc<dyn ObjectStoreBackend> = fault;
+
+    let (app, query_accounting) = build_router_with_config_and_deadline(
+        store,
+        tokens(&[("acme-token", "acme")]),
+        SqlConfig::default(),
+        Duration::from_millis(500),
+    );
+
+    let (status, value) = post_json(&app, "acme-token", query).await;
     assert_eq!(
         status,
         StatusCode::GATEWAY_TIMEOUT,
         "a deadline trip must reach the client as a timeout status: {value}"
+    );
+    assert!(
+        gate.held_count() >= 1,
+        "the data GET must have been issued and held; the fault fired"
     );
 
     let timed_out = only_outcome_row(
@@ -1722,96 +1724,48 @@ async fn a_query_that_exceeds_its_deadline_records_timeout_status() {
         ravel_server::metrics::QueryOutcomeStatus::Timeout,
     );
     assert_eq!(timed_out.counters.queries, 1);
+    assert_eq!(
+        timed_out.counters.s3_requests, baseline_requests,
+        "the timed-out query counts the GET it issued before the deadline, exactly \
+         as the successful run did"
+    );
+    assert_eq!(
+        timed_out.counters.s3_bytes,
+        baseline_bytes - object_size,
+        "the timed-out query records every byte it read except the held object's, \
+         which never transferred"
+    );
+    // Recorded exactly once, as Timeout: no zero-cost Canceled or Error row.
+    assert!(
+        query_accounting
+            .outcome_snapshot()
+            .iter()
+            .all(|r| r.status == ravel_server::metrics::QueryOutcomeStatus::Timeout)
+    );
 }
 
-/// A backend wrapping `inner` whose `get` signals `entered` the instant it is
-/// called, then blocks on `proceed` before delegating -- so a test can drive
-/// a request until it is genuinely suspended inside a real in-flight GET,
-/// then tear the request future down without ever unblocking it. Every other
-/// method delegates straight through.
-struct BlockingOnFirstGet<S> {
-    inner: S,
-    entered: Arc<tokio::sync::Notify>,
-    proceed: Arc<tokio::sync::Notify>,
-}
-
-#[async_trait::async_trait]
-impl<S: ObjectStoreBackend> ObjectStoreBackend for BlockingOnFirstGet<S> {
-    async fn put(
-        &self,
-        key: &str,
-        data: bytes::Bytes,
-        opts: PutOptions,
-    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
-        self.inner.put(key, data, opts).await
-    }
-
-    async fn get(
-        &self,
-        key: &str,
-        range: GetRange,
-    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
-        self.entered.notify_one();
-        self.proceed.notified().await;
-        self.inner.get(key, range).await
-    }
-
-    async fn head(
-        &self,
-        key: &str,
-    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
-        self.inner.head(key).await
-    }
-
-    async fn list(
-        &self,
-        prefix: &str,
-        page: Option<ravel_object_store::PageToken>,
-    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
-        self.inner.list(prefix, page).await
-    }
-
-    async fn list_delimited(
-        &self,
-        prefix: &str,
-    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
-        self.inner.list_delimited(prefix).await
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
-        self.inner.delete(key).await
-    }
-
-    fn capabilities(&self) -> ravel_object_store::Capabilities {
-        self.inner.capabilities()
-    }
-}
-
-/// Deliverable 5: the request future being DROPPED mid-flight (a client
-/// disconnect while a real GET is outstanding), not merely returning an
-/// error, must still record a `Canceled` cost. This is reachable from a real
-/// caller today: axum drops the whole per-request future, `CostGuard`
-/// included, the instant a client disconnects mid-query, exactly as `.abort()`
-/// drops this test's spawned task below -- `handle`/`run` never gets a chance
-/// to run any code after the dropped `.await`, which is the entire point of
-/// `CostGuard` living in a `Drop` impl rather than at the end of the happy
-/// path.
+/// The request future being DROPPED mid-flight (a client disconnect while a
+/// real GET is outstanding), not merely returning an error, records `Canceled`
+/// with the exact cost it incurred, not zeros. A `FaultStore` gate holds the
+/// data GET open; the test waits until it is genuinely held, then aborts the
+/// request task, dropping the whole `run` future -- `CostGuard`'s `Drop`
+/// records the live cost. axum drops the per-request future the same way the
+/// instant a client disconnects. The counts match the successful run's minus
+/// the held object's bytes, which never transferred.
 #[tokio::test]
-async fn a_dropped_request_future_records_a_canceled_cost() {
-    let inner: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    let tenant = TenantId::new("acme".to_string());
-    publish_segment(inner.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+async fn a_dropped_request_future_records_the_cost_it_incurred() {
+    let query = "SELECT ts, value FROM samples ORDER BY ts";
+    let (baseline_requests, baseline_bytes, object_size) =
+        baseline_cost_and_object_size(query).await;
 
-    let entered = Arc::new(tokio::sync::Notify::new());
-    let proceed = Arc::new(tokio::sync::Notify::new());
-    let blocking_store: Arc<dyn ObjectStoreBackend> = Arc::new(BlockingOnFirstGet {
-        inner,
-        entered: Arc::clone(&entered),
-        proceed: Arc::clone(&proceed),
-    });
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::default()));
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(fault.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let gate = fault.hold(Op::Get, Some("rseg".to_string()), Occurrence::Always);
+    let store: Arc<dyn ObjectStoreBackend> = fault;
 
     let (app, query_accounting) = build_router_with_config(
-        blocking_store,
+        store,
         tokens(&[("acme-token", "acme")]),
         SqlConfig::default(),
     );
@@ -1828,20 +1782,24 @@ async fn a_dropped_request_future_records_a_canceled_cost() {
 
     let task = tokio::spawn(async move { app.oneshot(request).await });
 
-    // Waits until the request is genuinely suspended inside the real GET
-    // (`BlockingOnFirstGet::get` signals `entered` before blocking on
-    // `proceed`), not until some fixed delay has elapsed.
-    // Bounded on purpose. If a future change serves this read without issuing a
-    // `get` (a cache, a range-free plan, an early error), an unbounded wait
-    // would hang until the CI job times out with nothing naming the cause.
-    tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+    // Wait until the data GET is genuinely parked inside the store. Bounded on
+    // purpose: if a future change serves this read without a GET, this fails
+    // loudly instead of hanging until the CI job times out.
+    tokio::time::timeout(Duration::from_secs(30), gate.wait_until_held(1))
         .await
-        .expect("the request must reach BlockingOnFirstGet::get; if it no longer issues a get, this test's premise is stale");
+        .expect(
+            "the request must reach a held data GET; if it no longer issues one, \
+             this test's premise is stale",
+        );
+    assert_eq!(
+        gate.held_count(),
+        1,
+        "exactly one data GET is held; the fault fired"
+    );
 
-    // Abort, never signaling `proceed`: the request future -- including
-    // `run`'s local `cost_guard` -- is dropped mid-`.await`, exactly as a
-    // real client disconnect would drop it. Nothing after the blocked
-    // `.await` ever runs; `entered`/`proceed` are otherwise unused after this.
+    // Abort, never releasing: the run future -- including `run`'s local
+    // `cost_guard` -- is dropped mid-`.await`, exactly as a real client
+    // disconnect would drop it.
     task.abort();
     let joined = task.await;
     assert!(
@@ -1854,7 +1812,18 @@ async fn a_dropped_request_future_records_a_canceled_cost() {
         ravel_server::metrics::QueryOutcomeStatus::Canceled,
     );
     assert_eq!(canceled.counters.queries, 1);
-    // No Success or Error row: the only fold that happened was the Drop path.
+    assert_eq!(
+        canceled.counters.s3_requests, baseline_requests,
+        "the dropped query counts the GET it issued before the drop, exactly as \
+         the successful run did"
+    );
+    assert_eq!(
+        canceled.counters.s3_bytes,
+        baseline_bytes - object_size,
+        "the dropped query records every byte it read except the held object's, \
+         which never transferred"
+    );
+    // The only fold that happened was the Drop path.
     assert!(
         query_accounting
             .outcome_snapshot()

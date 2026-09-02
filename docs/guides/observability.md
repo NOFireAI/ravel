@@ -439,6 +439,16 @@ accounting behind these numbers.
 | `ravel_query_estimated_store_bytes_total` | Pre-execution upper-envelope estimate of object-store bytes. |
 | `ravel_query_estimated_decompressed_bytes_total` | Pre-execution upper-envelope estimate of decompressed sample bytes. |
 
+Alongside the cost, the SQL query endpoint records each query's final outcome:
+success, error, timeout, or cancelled. A timeout or a cancelled outcome (the
+client disconnected while the query was still running) carries the cost the
+query incurred up to that point, not zeros. This works because an object-store
+request is counted the moment it is issued, so a fetch still outstanding when
+the deadline trips or the caller goes away is already counted; only its
+transferred bytes wait until the fetch returns, since their length is not known
+before then. A query that times out or is cancelled therefore reports the same
+request count a completed run would, and the bytes it had received so far.
+
 ### Metric metadata cache (`query_metadata_cache_*`)
 
 Labels: `mode` only. This is the per-process cache over each tenant's metric
