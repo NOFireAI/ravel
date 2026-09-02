@@ -57,8 +57,8 @@
 
 use ravel_logseg::{AttrValue, LogStreamId, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_types::TenantHash;
 use ravel_types::logstream::log_stream_id;
+use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::audit_pipeline::AuditEvent;
@@ -68,6 +68,10 @@ use crate::error::Result;
 /// The [`Signal::Audit`] shard query-audit records are written to. Deliberately
 /// distinct from [`crate::legal_hold::AUDIT_HOLD_SHARD`] - see the module doc.
 pub const QUERY_AUDIT_SHARD: u32 = 1;
+// Moving this writer to a shard outside the reader's floor (ADR-1101
+// decision 2) fails the build here rather than silently dropping every
+// query-audit record from audit queries.
+const _: () = assert!(QUERY_AUDIT_SHARD < Signal::Audit.fixed_read_shards());
 
 /// `attrs` key marking an audit record's kind. A query-audit record carries
 /// [`KIND_QUERY`]; a legal-hold record carries `legal_hold`.

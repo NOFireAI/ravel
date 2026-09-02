@@ -575,6 +575,55 @@ pub fn max_scan_count_over_range(
     }
 }
 
+/// The scan-set width a reader must use over `[start_hour, end_hour]` for
+/// `signal`: [`max_scan_count_over_range`] floored at the signal's
+/// writer-pinned shard count (ADR-1101 decision 2).
+///
+/// Alerts and audit writers pin fixed shard indices by constant
+/// (`ALERT_SHARD`, `AUDIT_HOLD_SHARD`, `QUERY_AUDIT_SHARD`) instead of hashing
+/// a series into `0..shard_count`, and neither signal is ever provisioned, so
+/// both resolve through the implicit generation 0 at the process
+/// `shard_count`. Without the floor a `--shards 1` deployment derives a scan
+/// set of shard 0 alone and silently omits every record the query-audit writer
+/// pinned to shard 1. The floor is a floor, never a cap: a wider generation
+/// history or a larger configured `shard_count` still wins.
+///
+/// This is the ONLY function the catalog's over-a-range scan-set derivations
+/// may call. Calling [`max_scan_count_over_range`] directly from a read path
+/// reintroduces the silent miss, and having each derivation apply its own
+/// floor lets them disagree about how wide the fan-out is; the crossover
+/// decision and the path it selects must agree exactly.
+/// [`scan_shards_for_hour`] is the per-hour sibling.
+pub fn scan_shards_over_range(
+    signal: Signal,
+    generations: &[ShardGeneration],
+    start_hour: u32,
+    end_hour: u32,
+    slack_hours: u32,
+) -> u32 {
+    max_scan_count_over_range(generations, start_hour, end_hour, slack_hours)
+        .max(signal.fixed_read_shards())
+}
+
+/// The scan-set width a reader must use for the single ingest-hour bucket
+/// `hour` for `signal`: [`scan_count`] floored at the signal's writer-pinned
+/// shard count, the per-hour sibling of [`scan_shards_over_range`] and the
+/// same floor for the same reason (ADR-1101 decision 2).
+///
+/// The over-a-range bound and this per-hour bound are two halves of one rule:
+/// a per-shard LIST cannot vary its bound per hour, so it lists up to the
+/// range max and each listed bucket is then re-checked against its own hour.
+/// A floored range bound with an unfloored per-hour check lists the pinned
+/// shard and then discards it, which is the silent miss again one step later.
+pub fn scan_shards_for_hour(
+    signal: Signal,
+    generations: &[ShardGeneration],
+    hour: u32,
+    slack_hours: u32,
+) -> u32 {
+    scan_count(generations, hour, slack_hours).max(signal.fixed_read_shards())
+}
+
 /// The generation that *unambiguously* owns ingest-hour bucket `hour`, or
 /// `None` when more than one generation's shards can hold that hour's data
 /// (ADR-0103 decision 1(b)). The generation-identity sibling of [`scan_count`]:
@@ -2574,6 +2623,78 @@ mod tests {
             ),
             scan_count(&gens, last_covered_hour, DEFAULT_SCAN_SLACK_HOURS),
             "a single-hour range agrees with the per-hour rule"
+        );
+    }
+
+    /// The alerts and audit floor (ADR-1101 decision 2) raises a narrower
+    /// generation history and never caps a wider one.
+    ///
+    /// FLIP (pre-fix demonstration): make `Signal::fixed_read_shards` return
+    /// `0` for `Signal::Audit` (crates/ravel-types/src/lib.rs, the
+    /// `Signal::Audit => 2` arm). The `shard_count` 1 audit assertion then
+    /// reads 1 instead of 2.
+    #[test]
+    fn scan_shards_over_range_floors_at_the_signals_fixed_read_shards() {
+        // A single implicit generation at the process `shard_count`, exactly
+        // what `read_scan_generations` returns for an unprovisioned signal.
+        let narrow = [sg(0, 1, 0)];
+        assert_eq!(
+            scan_shards_over_range(Signal::Audit, &narrow, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            2,
+            "audit pins shards 0 and 1, so a --shards 1 reader must scan both"
+        );
+        assert_eq!(
+            scan_shards_over_range(Signal::Alerts, &narrow, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            1
+        );
+        assert_eq!(
+            scan_shards_over_range(Signal::Logs, &narrow, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            1,
+            "no pinned writers: the history alone decides"
+        );
+        assert_eq!(
+            scan_shards_over_range(Signal::Metrics, &narrow, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+            1
+        );
+
+        // A floor, never a cap: every signal takes the wider history.
+        let wide = [sg(0, 4, 0)];
+        for signal in [Signal::Audit, Signal::Alerts, Signal::Logs, Signal::Metrics] {
+            assert_eq!(
+                scan_shards_over_range(signal, &wide, 0, 1_000, DEFAULT_SCAN_SLACK_HOURS),
+                4,
+                "signal {signal:?} takes the history's wider count, not the floor"
+            );
+        }
+    }
+
+    /// The per-hour sibling floors identically, so the union LIST bound and
+    /// the per-hour re-check in `list_window_bounded` cannot disagree about a
+    /// pinned shard.
+    ///
+    /// FLIP (pre-fix demonstration): the same `Signal::Audit => 2` arm; the
+    /// `shard_count` 1 audit assertion then reads 1.
+    #[test]
+    fn scan_shards_for_hour_floors_at_the_signals_fixed_read_shards() {
+        let narrow = [sg(0, 1, 0)];
+        assert_eq!(
+            scan_shards_for_hour(Signal::Audit, &narrow, 500_000, DEFAULT_SCAN_SLACK_HOURS),
+            2
+        );
+        assert_eq!(
+            scan_shards_for_hour(Signal::Alerts, &narrow, 500_000, DEFAULT_SCAN_SLACK_HOURS),
+            1
+        );
+        assert_eq!(
+            scan_shards_for_hour(Signal::Logs, &narrow, 500_000, DEFAULT_SCAN_SLACK_HOURS),
+            1
+        );
+
+        let wide = [sg(0, 4, 0)];
+        assert_eq!(
+            scan_shards_for_hour(Signal::Audit, &wide, 500_000, DEFAULT_SCAN_SLACK_HOURS),
+            4,
+            "floor, not cap"
         );
     }
 

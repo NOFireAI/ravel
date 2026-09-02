@@ -101,6 +101,10 @@ pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(30);
 /// write-path benefit. Fixed rather than configurable so a reader always knows
 /// where an alert history lives.
 pub const ALERT_SHARD: u32 = 0;
+// Moving this writer to a shard outside the reader's floor (ADR-1101
+// decision 2) fails the build here rather than silently dropping every alert
+// record from alerts queries.
+const _: () = assert!(ALERT_SHARD < Signal::Alerts.fixed_read_shards());
 
 /// The writer epoch every alert record carries. Flush identity is
 /// `(writer_id, epoch, seq)` and each evaluator task mints a fresh v4
