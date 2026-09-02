@@ -1189,8 +1189,9 @@ dedup would collapse the duplicate for metrics but not for logs or spans (which
 have none), so the resolver picks one authoritative record per overlap group by
 the smallest `input_set_hash`, includes that record's segments, serves every
 input the winner does not name as a raw L0 segment, and ignores the other
-records' segments; every input of the bucket is then served exactly once,
-either inside the chosen record's segments or as a raw L0. Either way it raises
+records' segments; every input of the bucket is then served from one place
+only, inside the chosen record's segments or as a raw L0, and none is served
+twice or dropped. Either way it raises
 `ravel_catalog_compaction_input_set_conflicts_total` for a human to look at.
 Durably refusing to publish a second overlapping record is a publish-time step
 in ravel-maintain; the resolve-time tie-break keeps reads correct until then.
