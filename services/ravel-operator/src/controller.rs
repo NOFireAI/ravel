@@ -908,6 +908,12 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
             let (reason, message) = degraded_reason(&err);
             // Best-effort: if even the status write fails, log and still return
             // the original error for retry.
+            // The bootstrap hold, if one is active, is owned by the bootstrap
+            // gate, not by this error path: carry its timestamp through.
+            let waiting_since = obj
+                .status
+                .as_ref()
+                .and_then(|status| status.gc_bootstrap_waiting_since.clone());
             if let Err(status_err) = write_degraded_status(
                 client,
                 &namespace,
@@ -915,6 +921,7 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                 obj.metadata.generation,
                 &reason,
                 &message,
+                waiting_since,
                 extra_conditions,
             )
             .await
@@ -1541,11 +1548,15 @@ fn build_status(
 
 /// Build the failure-path status. Pure counterpart of [`build_status`]. Clears
 /// `gcBootstrapWaitingSince`: a reconcile error is not a bootstrap hold, so it
-/// does not carry the wait timestamp.
+/// neither starts nor ends one; the persisted timestamp is carried through
+/// unchanged. Clearing it here would restart the stall clock on every
+/// transient error, and errors recurring inside the stall window would then
+/// keep a stuck maintain tier from ever reporting as stalled.
 fn build_degraded_status(
     observed_generation: Option<i64>,
     reason: &str,
     message: &str,
+    gc_bootstrap_waiting_since: Option<String>,
     extra_conditions: Vec<Condition>,
 ) -> RavelClusterStatus {
     let mut conditions = vec![
@@ -1558,7 +1569,7 @@ fn build_degraded_status(
         gateway_ready_replicas: None,
         query_ready_replicas: None,
         maintain_ready_replicas: None,
-        gc_bootstrap_waiting_since: None,
+        gc_bootstrap_waiting_since,
         conditions,
     }
 }
@@ -1600,6 +1611,7 @@ async fn write_status(
 /// explanation instead of silently timing out. `extra_conditions` carries the
 /// same spec-derived conditions the success path appends, so a failing
 /// reconcile does not drop them.
+#[allow(clippy::too_many_arguments)]
 async fn write_degraded_status(
     client: &Client,
     namespace: &str,
@@ -1607,9 +1619,16 @@ async fn write_degraded_status(
     observed_generation: Option<i64>,
     reason: &str,
     message: &str,
+    gc_bootstrap_waiting_since: Option<String>,
     extra_conditions: Vec<Condition>,
 ) -> Result<(), Error> {
-    let status = build_degraded_status(observed_generation, reason, message, extra_conditions);
+    let status = build_degraded_status(
+        observed_generation,
+        reason,
+        message,
+        gc_bootstrap_waiting_since,
+        extra_conditions,
+    );
     patch_status(client, namespace, instance, &status).await
 }
 
@@ -2011,7 +2030,8 @@ mod tests {
             deprecated.message
         );
 
-        let degraded = build_degraded_status(Some(7), "SecretNotFound", "no such Secret", extra);
+        let degraded =
+            build_degraded_status(Some(7), "SecretNotFound", "no such Secret", None, extra);
         assert_eq!(
             condition_types(&degraded.conditions),
             vec!["Degraded", "Available", "IngestAffinityBackendDeprecated"]
@@ -2069,12 +2089,33 @@ mod tests {
             );
             let ok = build_status(Some(2), Some(1), Some(1), None, None, None, extra.clone());
             assert_eq!(condition_types(&ok.conditions), vec!["Available"]);
-            let degraded = build_degraded_status(Some(2), "ReconcileError", "boom", extra);
+            let degraded = build_degraded_status(Some(2), "ReconcileError", "boom", None, extra);
             assert_eq!(
                 condition_types(&degraded.conditions),
                 vec!["Degraded", "Available"]
             );
         }
+    }
+
+    /// A reconcile error during a bootstrap hold must not restart the stall
+    /// clock: the persisted timestamp survives the Degraded write unchanged.
+    #[test]
+    fn degraded_status_carries_the_bootstrap_wait_timestamp() {
+        let since = "2026-09-02T18:00:00Z".to_string();
+        let degraded = build_degraded_status(
+            Some(3),
+            "SecretNotFound",
+            "no such Secret",
+            Some(since.clone()),
+            Vec::new(),
+        );
+        assert_eq!(
+            degraded.gc_bootstrap_waiting_since.as_deref(),
+            Some(since.as_str()),
+            "a transient error must leave the stall clock where it was"
+        );
+        let cleared = build_degraded_status(Some(3), "ReconcileError", "boom", None, Vec::new());
+        assert_eq!(cleared.gc_bootstrap_waiting_since, None);
     }
 
     /// The two `sys/gc` bootstrap states the ordering produces, at the status
