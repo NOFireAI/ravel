@@ -191,8 +191,10 @@ To read a whole trace regardless of window, query by `trace_id` and widen or
 drop the time bounds. Ravel does not flag a result as incomplete; it returns
 exactly the spans in view and never waits for a missing root or sibling.
 
-## What Ravel does not store
+## What Ravel does not decode
 
-Span links are not stored. A link points from one span to another span in a
-different trace, and RSPAN has no field for it. A query over the `spans`
-table cannot filter or return links.
+Span links are not decoded into columns. A link points from one span to
+another span in a different trace; RSPAN has no field for it, so the raw link
+bytes ride along as one opaque hex attribute, `attrs['_links_raw']`. A query
+over the `spans` table can return that blob and cannot filter on a link's
+fields. Span events take the same route, as `attrs['_events_raw']`.

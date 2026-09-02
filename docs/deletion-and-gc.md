@@ -14,9 +14,12 @@ docs/guides/operations/maintenance.md.
 
 ## The sweep and its anchors
 
-Deletion is always a durable transaction first (tombstone or compaction
-record), then logical exclusion from new snapshots, then physical removal
-via a sweeper. One sweeper component implements all rules below; all are
+Deletion of published data is always a durable transaction first (a
+retention tombstone, a compaction record, or a rewrite record), then logical
+exclusion from new snapshots, then physical removal via a sweeper. Orphan
+collection, which removes objects no commit record ever published, has no
+record to anchor on and is gated by age and a fresh re-listing instead (the
+first rule below). One sweeper component implements all rules below; all are
 stateless per pass and restartable from zero, and every delete is
 idempotent. Reader leases are not implemented: the "not lease-protected"
 precondition holds trivially everywhere below, because the `LeaseCheck`
@@ -61,7 +64,7 @@ reaches its threshold that much early in true time. So the horizon must budget
 for both: the reader's full hold **and** the sweeper's lead, with `grace`
 absorbing any residual. The bound
 
-```
+```text
 protection_horizon >= max_query_duration + grace + clock_skew_allowance
 ```
 

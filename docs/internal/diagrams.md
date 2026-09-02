@@ -81,7 +81,8 @@ PUT the data object create-if-absent with a checksum, PUT the commit record
 create-if-absent with an idempotency check, then acknowledge with a commit
 token. The three crash points from the crash matrix are marked with what each
 one leaves behind: nothing stored, an invisible orphan, or a visible segment
-where a client retry stores a duplicate.
+whose acknowledgement was lost, where the client's own retry stores a
+duplicate (a writer-side retry of the same flush is idempotent).
 
 Illustrates: docs/guides/ingest.md "Commit tokens and read-your-write";
 the crash matrix is in docs/consistency-model.md.
@@ -136,7 +137,7 @@ Illustrates: docs/guides/tracing.md.
 Selective subject erasure end to end: an erase request excludes matching
 records from queries immediately, a maintain rewrite drops the subject and
 publishes a `.done` record, then a horizon- and hold-gated sweep physically
-deletes the superseded objects, reaching absence in under four days on the
+deletes the superseded objects, reaching absence in about four days on the
 defaults.
 
 Illustrates: docs/deletion-and-gc.md "Selective subject erasure".

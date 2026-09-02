@@ -506,7 +506,11 @@ argument.
 fresh bucket writes `sys/gc` from the maintain defaults, which satisfy the
 constraint by construction, then validates against the object it just wrote. If
 several processes start together against one empty bucket, one wins the create
-and the others read and validate against the winner's object.
+and the others read and validate against the winner's object. Under the
+per-role storage credentials only the Maintain and Admin roles may create the
+object, so on a fresh bucket start the `maintain` process first, or create it
+with `ravel-cli gc-config set` under Admin; see
+[the first deployment](deployment.md#the-first-deployment-against-a-fresh-bucket).
 
 **What each mode validates:**
 
@@ -545,7 +549,7 @@ refuse rather than to run with it.
 
 ```sh
 ravel-cli gc-config show
-ravel-cli gc-config set --protection-horizon 25h --grace 24h \
+ravel-cli gc-config set --protection-horizon 25h5m --grace 24h \
   --max-query-duration 1h --max-flush-lifetime 1h
 ```
 
@@ -581,8 +585,8 @@ process that runs no maintenance loop configures nothing.
 Repeated `--tenant-token TOKEN=TENANT` flags configure tenants entirely. There is
 no tenant database and no admin API. To add, remove or rotate a token, restart
 with a different flag set. That is safe: every process is stateless, so a
-restart has no data migration to do. With no `--tenant-token` at all, every
-request is unauthenticated and rejected.
+restart has no data migration to do. With no `--tenant-token` and no OIDC or
+mTLS resolver configured, every request is unauthenticated and rejected.
 
 Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.

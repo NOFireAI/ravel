@@ -601,8 +601,9 @@ already-sealed hours:
   watermark_hour_old]`, inclusive at both ends. `watermark_hour_old` is the
   boundary the incremental range excludes, so the reconcile window and the
   incremental range are adjacent, never overlapping. `fold_reconcile_window_hours`
-  defaults to 26 hours: `protection_horizon` (24 h, the age gate before the
-  sweeper may physically delete a superseded compaction input) plus slack.
+  defaults to 26 hours: longer than `protection_horizon` (the age gate before
+  the sweeper may physically delete a superseded compaction input, 25 h 5 min
+  on the defaults) by a slack margin.
   Because the sweeper only deletes an input after that horizon, any record
   whose supersession could invalidate a snapshot entry is observed by a
   reconcile pass before its inputs can disappear.
@@ -1169,9 +1170,12 @@ Racing compactors over one sealed bucket are serialized by `CreateIfAbsent`
 picking a single winner; a loser's segments are unreferenced objects that age
 out under the same rule. Two records that legitimately name different input
 sets (rare, from concurrent partial seals) are not reconciled automatically.
-The resolver includes both segment sets plus any L0 input covered by neither,
-which is harmless under the property above, and raises
-`ravel_catalog_compaction_input_set_conflicts_total` for a human to look at.
+The resolver includes both segment sets plus any L0 input covered by neither
+and raises `ravel_catalog_compaction_input_set_conflicts_total` for a human
+to look at. For metrics that is harmless under the property above. Logs and
+spans have no query-time dedup, so where the two input sets overlap a query
+returns the overlapping records twice until a human reconciles the bucket;
+the counter is the signal to do so.
 
 ## Online resharding (ADR-0052)
 
@@ -1184,8 +1188,8 @@ until retention ages their hours out.
 
 Activation lead time. Activation is denominated in ingest-hour buckets and is
 placed `L` hours ahead: `activation_hour = now_hour + L`, with
-`L >= ceil(C) + 1` hours, where `C` is the router's provisioning-record refresh
-interval (default 60 s, so the floor is 2 hours). `ravel-cli provision reshard`
+`L >= ceil(C / 1 h) + 1` hours, where `C` is the router's provisioning-record
+refresh interval (default 60 s, so the floor is 2 hours). `ravel-cli provision reshard`
 refuses a shorter lead. Every live writer re-reads the record at least once per
 `C`, so that floor guarantees each writer either observes the new generation
 before it activates or has already stopped on record staleness. Nothing routes

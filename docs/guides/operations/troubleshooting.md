@@ -99,7 +99,7 @@ breaker tripped. Alert on it sustained:
 
 | Symptom | Likely cause | How to confirm | Corrective action |
 |---|---|---|---|
-| `ravel_maintain_orphans_present > 0` for `12h` | Either a handful of commit records lost for one shard, below both breaker thresholds, or a genuinely stuck abandoned flush. | `ravel-cli maintain status --tenant <t> --signal <s> --shard <n> --hour <n>` reports that bucket's L0 record count against what is present. `ravel-cli maintain sweep ... --dry-run` prints the candidate set without deleting it. | Investigate before the grace window elapses (25h by default). If records really are missing, follow the reconstruction procedure below. |
+| `ravel_maintain_orphans_present > 0` for `12h` | Either a handful of commit records lost for one shard, below both breaker thresholds, or a genuinely stuck abandoned flush. | `ravel-cli maintain status --tenant <t> --signal <s> --shard <n> --hour <n>` reports that bucket's L0 record count against what is present. `ravel-cli maintain sweep ... --dry-run` prints the candidate set without deleting it. | Investigate before `grace + max_flush_lifetime` elapses (25 h on the defaults: 24 h plus 1 h). If records really are missing, follow the reconstruction procedure below. |
 
 Twelve hours is roughly half the grace window: long enough that one normal
 abandoned-flush cleanup between passes does not page, short enough that real

@@ -2,9 +2,11 @@
 
 ![query path](../diagrams/query-path.svg)
 
-Eleven routes are registered under `/api/v1` on `--listen-http`. They require the
-same tenant authentication as ingest (`Authorization: Bearer <token>`, or the
-dev header if `--dev-insecure-tenant-header` is set). The Prometheus-shaped
+Eleven routes are registered under `/api/v1` on `--listen-http`. All but two
+require the same tenant authentication as ingest (`Authorization: Bearer
+<token>`, or the dev header if `--dev-insecure-tenant-header` is set):
+`/api/v1/status/buildinfo` takes no credential, and `/api/v1/metadata` answers
+an empty object to a request it cannot resolve. The Prometheus-shaped
 endpoints below return the Prometheus-compatible JSON envelope; `POST
 /api/v1/sql` and `POST /api/v1/analytics` return a described-schema JSON
 envelope instead, documented with each. This guide covers the query-facing
@@ -475,7 +477,7 @@ the modes that evaluate it, and the sinks are in the
 | 200 | n/a | Success. |
 | 400 | `bad_data` | Bad or missing parameter, PromQL parse error, invalid time range, step <= 0. |
 | 401 | `unauthorized` | Tenant authentication failed or was not provided. |
-| 422 | `execution` | An intentionally rejected PromQL construct (the set listed under PromQL support: `histogram_stddev`/`histogram_stdvar` over native histograms, an or-grouped label matcher, vector-matching fill values, a subquery over native histograms, or the experimental `limitk`/`limit_ratio` operators), or a query budget (segments/series/samples, or the catalog-list window ceiling) exceeded. |
+| 422 | `execution` | An intentionally rejected PromQL construct (the set listed under PromQL support: `histogram_stddev`/`histogram_stdvar` over native histograms, an or-grouped label matcher, vector-matching fill values, a subquery over native histograms, or the experimental `limitk`/`limit_ratio` operators), or a query budget (segments/series/samples, the catalog-list window ceiling, or the SQL memory pool) exceeded. |
 | 500 | `internal` | Permanent data corruption: a corrupt catalog record, segment, field, or key, or a non-monotonic sample sequence. The message is a fixed internal-error string; the storage-layer detail is redacted and logged server-side. |
 | 503 | `unavailable` | Transient catalog or segment fetch failure, an unresolvable `min_commit_token`, or a snapshot invalidated by concurrent GC/compaction. |
 | 504 | `timeout` | Query exceeded its deadline. |

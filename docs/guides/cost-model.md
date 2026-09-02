@@ -202,7 +202,9 @@ constant.
    object size comes from `--batch-rows` and `--target-bytes` at write time
    and is observable per tenant, so measure it and round up. Overshooting
    costs nothing, because all three decisions saturate once the value exceeds
-   the largest object: every candidate segment becomes one GET. What it costs
+   the largest object: every candidate segment at or under
+   `--logs-max-fetch-run-bytes` becomes one GET, and a larger one becomes a
+   few sequential covering GETs. What it costs
    is the other column of the comparison above, roughly twice the bytes and
    the cold-latency win given back.
 

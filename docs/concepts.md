@@ -79,16 +79,19 @@ maintenance work is partitioned over, so a tenant's shard count sets both its
 write throughput ceiling and its per-bucket object count.
 
 A shard count is pinned durably at the tenant's first write for a signal.
-That first write creates a write-once provisioning record per (tenant,
-signal) holding the count, and every later ingest, catalog resolve, and
-maintenance pass validates its configured count against that record. A
+That first write creates a provisioning record per (tenant, signal) holding
+the count as the first entry of a generation history, and every later
+ingest, catalog resolve, and maintenance pass validates its configured count
+against the generation that history makes active for the hour it touches. A
 statically configured tenant whose count disagrees refuses to start; a
 dynamically discovered one fails that one request. The reason is that the
 shard index is part of the object key, so a silently changed count would
 write and read different key sets, and a query would answer from a subset of
 the tenant's data without knowing it. Changing the count is therefore an
-append to a generation history with an activation hour, never an edit, and
-readers derive the shard fan-out of a given hour from that history.
+append to that history with a future activation hour, never an edit: a
+writer routes with the generation active for the hour it writes, and a
+reader derives the shard fan-out of each hour it lists from the same
+history.
 
 ## Segments and commit records
 
@@ -279,14 +282,17 @@ so a listing anomaly that makes half the bucket look unreferenced withholds
 deletions instead of amplifying them. Every sweep pass is stateless and
 restartable from zero, and every delete is idempotent.
 
-None of the three can change a query answer, and that is a design constraint
-rather than a hope. Compaction never deduplicates and conserves the record
-count exactly, and query-time deduplication collapses the duplicate candidates
-if a snapshot happens to include both an L0 input and its L1 replacement, so
-every intermediate state of a compaction is query-correct. Retention and the
-sweep physically remove only what no live snapshot references, and only after
-a protection horizon. A snapshot resolved before, during, or after any of
-these loops returns the same rows. The guarantee is
+Compaction and the sweep cannot change a query answer, and that is a design
+constraint rather than a hope. Compaction never deduplicates and conserves
+the record count exactly; a snapshot that sees a compaction record excludes
+the inputs it names, and for metrics query-time deduplication also collapses
+any duplicate that slips through, so every intermediate state of a
+compaction is query-correct. The sweep physically removes only what no live
+snapshot references, and only after a protection horizon. A snapshot
+resolved before, during, or after either loop returns the same rows.
+Retention is different by design: a tombstoned bucket is excluded from every
+snapshot resolved after the tombstone, while a snapshot pinned before it
+keeps reading the bucket until the horizon passes. The guarantee is
 [Deletion and GC](consistency-model.md#deletion-and-gc) in the consistency
 model, and the mechanics are in
 [deletion and garbage collection](deletion-and-gc.md).
@@ -396,6 +402,9 @@ expanded; other pages use them bare.
   hour has sealed. Aliases: `snapshot`, `compact`. A snapshot is the thing
   published, not the act of publishing it, and compaction is a different
   operation on different objects.
+- **folder**: the background task that runs a fold for one (tenant,
+  signal); every mode except `maintain` runs one. Two folders that race are
+  serialized by the HEAD compare-and-swap.
 - **garbage collection**: the umbrella term for removing data that is no
   longer needed, covering retention, erasure, and the sweep. The physical
   deletion step inside it is the sweep.

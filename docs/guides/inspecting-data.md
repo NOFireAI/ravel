@@ -3,8 +3,9 @@
 `ravel-cli` reads segments and commit records directly from the object
 store. Nothing here needs `ravel-server` running. No published image carries
 `ravel-cli`: build it from source with `cargo build -p ravel-cli --release`,
-which leaves the binary at `target/release/ravel-cli`, and the examples below
-invoke it as `ravel-cli`. They run against the bucket that `make demo` writes
+which leaves the binary at `target/release/ravel-cli`. The examples below
+invoke it as `ravel-cli`, so put `target/release` on your `PATH` or spell the
+path out. They run against the bucket that `make demo` writes
 to ([getting started](getting-started.md#building-from-source)). Every command
 needs the same store flags:
 

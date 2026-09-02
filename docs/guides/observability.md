@@ -356,7 +356,7 @@ sample `tier="disk"`. With no disk tier, a family renders one sample with no
 | `ravel_cache_bytes_admitted_total` | Bytes admitted into the cache after a miss. |
 | `ravel_cache_evictions_total` | Entries evicted from the read cache by its S3-FIFO policy. |
 | `ravel_cache_disk_errors_degraded_to_misses_total` | Disk-tier reads that found an entry but discarded it as unhealthy rather than a clean miss. |
-| `ravel_cache_disk_entries_expired_max_age_total` | Disk-tier entries dropped for aging past the per-entry max-age, across the hit check, the startup scan, and the periodic background sweep. A time bound, not the capacity-driven eviction counter above. |
+| `ravel_cache_disk_entries_expired_max_age_total` | Disk-tier entries dropped for aging past the per-entry max-age, across the hit check, the startup scan, and the periodic background sweep. An age-based expiry, separate from the capacity-driven eviction counter above. |
 
 The request hit rate is `hits / (hits + misses)`. The byte hit rate is
 `bytes_served / (bytes_served + bytes_admitted)`. The renderer leaves both
