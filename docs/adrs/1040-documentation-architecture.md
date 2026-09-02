@@ -220,6 +220,15 @@ standard library, matching the checkers already in `scripts/`. It checks:
     workspace, and the matrix states whether the published image builds
     it. This is the check that would have caught the Flight SQL row.
 
+The two generated flag tables under `docs/reference/` are held to every
+rule except the citation half of rule 3 and rule 5. Their prose is the
+clap help text, so satisfying those two rules would mean rewording doc
+comments in two crates to please a documentation gate, and the page would
+drift from its source at the next regeneration. The help text that still
+carries retired vocabulary is a code follow-up, listed in the epic's final
+report, not a documentation defect. Every other page under
+`docs/reference/` is hand-written and is a user page.
+
 The tree does not pass this on the day the checker lands, and a gate that
 is switched on later is a gate that is never switched on. So the checker
 ships with `scripts/docs_lint_baseline.txt`, a file listing every finding

@@ -430,10 +430,13 @@ def analyze_markdown(rel, repo):
             for is_img, target in _LINK_RE.findall(line):
                 _link_and_anchor(rel, src_dir, is_img, target, scope, repo, findings)
 
-        # Scope-gated prose rules.
+        # Scope-gated prose rules. A generated table's vocabulary is the
+        # code's vocabulary, held to the same posture as its citations: the
+        # gate does not ask for a doc comment to be reworded to satisfy it.
         if scope in ("user", "spec", "generated", "changelog"):
             _provenance(rel, line, findings)
             _superlative(rel, line, findings)
+        if scope in ("user", "spec", "changelog"):
             _term(rel, line, findings)
         if scope == "user":
             _tracker(rel, line, heading, findings)

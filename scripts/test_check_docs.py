@@ -494,6 +494,15 @@ class TestGeneratedScope(RepoCase):
         self.assertTrue(self.rules(f, "SUPERLATIVE"))
         self.assertTrue(self.rules(f, "LINK"))
 
+    def test_terminology_is_exempt_on_generated_only(self):
+        # The vocabulary in a generated table is the code's vocabulary, held
+        # to the same posture as its citations. A guide is not exempt.
+        f = self.findings({
+            self.REF: "# Flags\n\n| `--x` |  |  | Promote a declared column. |\n",
+            "docs/guides/a.md": "# G\n\nPromote a declared column.\n",
+        })
+        self.assertEqual([x.path for x in self.rules(f, "TERM")], ["docs/guides/a.md"])
+
 
 class TestBaselineKeyTolerance(RepoCase):
     """An occurrence count of an already-baselined key is not enforced, so a

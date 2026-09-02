@@ -188,14 +188,6 @@ docs/query-engine.md	TERM	declared column
 docs/query-engine.md	TERM	declared column
 docs/query-engine.md	TERM	exactly once
 docs/query-engine.md	TERM	l1 part
-docs/reference/ravel-cli-flags.md	TERM	declared column
-docs/reference/ravel-cli-flags.md	TERM	declared column
-docs/reference/ravel-cli-flags.md	TERM	l1 part
-docs/reference/ravel-cli-flags.md	TERM	l1 part
-docs/reference/ravel-cli-flags.md	TERM	l1 part
-docs/reference/ravel-cli-flags.md	TERM	l1 part
-docs/reference/ravel-server-flags.md	TERM	declared column
-docs/reference/ravel-server-flags.md	TERM	declared column
 docs/segment-format.md	SUPERLATIVE	em-dash
 docs/segment-format.md	SUPERLATIVE	em-dash
 docs/segment-format.md	SUPERLATIVE	em-dash
