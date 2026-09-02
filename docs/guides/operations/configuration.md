@@ -558,7 +558,11 @@ impossible for any mode to match, so it is rejected.
 
 The Kubernetes operator exposes no GC-horizon fields, and does not need to: it
 deploys every pod with the same shipped defaults, so the first pod bootstraps
-`sys/gc` from those defaults and every pod validates trivially.
+`sys/gc` from those defaults and every pod validates trivially. Under per-role
+credential Secrets, where only the maintain role can write that object, the
+operator applies the maintain Deployment first and holds the gateway and query
+Deployments until it reports a ready replica, so a fresh bucket still needs no
+`gc-config set` before the `RavelCluster` is applied.
 
 ### Age-based retention
 
