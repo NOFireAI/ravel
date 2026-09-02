@@ -1689,9 +1689,16 @@ pub async fn start(
                     &settings.sql_ticket_secret(),
                 )
             });
-        sql_state
+        let service = sql_state
             .as_ref()
-            .map(|state| flight::service(state, ceiling, distributed))
+            .map(|state| flight::service(state, ceiling, distributed));
+        if service.is_some() {
+            tracing::info!(
+                "Flight SQL registered on the gRPC listener; ad-hoc statements are served, \
+                 prepared statements answer UNIMPLEMENTED"
+            );
+        }
+        service
     };
     // The ADR-0071 fragment `SeriesFetch` service is a
     // cluster-internal query surface: it binds this listener too, so a
