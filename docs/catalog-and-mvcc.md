@@ -192,7 +192,9 @@ every observed shard index is below the configured `shard_count`; a higher
 observed index proves the value would hide data and refuses without writing.
 `shard_count` is immutable per generation; the generation history is
 append-only; the shard-index domain of hour `h` is `0..scan_count(h)`
-(ADR-0052, online resharding). A reshard appends a
+(ADR-0052, online resharding), floored at `Signal::fixed_read_shards()` for
+the alerts and audit signals whose writers pin fixed shard indices (ADR-1101
+decision 2; see "Online resharding" below). A reshard appends a
 `(generation, shard_count, activation_hour)` entry to this record under
 `CasVersion` (`ravel_catalog::append_generation`); every existing byte of
 history is immutable, and the scalar `shard_count` field stays equal to
@@ -386,7 +388,9 @@ and the CAS read/write helpers.
 - `shard`: zero-padded 4-digit decimal. `shard_count` is immutable per
   generation; the generation history is append-only; the shard-index domain
   of hour `h` is `0..scan_count(h)` (ADR-0052, superseding ADR-0010 §9's
-  "immutable per (tenant, signal)"). A reshard appends a new generation with
+  "immutable per (tenant, signal)"), floored at `Signal::fixed_read_shards()`
+  for `a` and `u`, whose writers pin fixed shard indices (ADR-1101 decision
+  2). A reshard appends a new generation with
   a future `activation_hour`; existing data is never moved or re-keyed, and
   reads derive the per-hour shard set from the history.
 - `ingest_hour`: `YYYYMMDDTHH` UTC formatted from the pinned

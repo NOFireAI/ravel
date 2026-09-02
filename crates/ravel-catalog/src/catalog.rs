@@ -2389,7 +2389,7 @@ impl Catalog {
         // suffix (ADR-0052 section 4), not the static
         // `self.config.shard_count`, and floored at the signal's
         // writer-pinned shards (ADR-1101 decision 2).
-        // `max_scan_count_over_range` keeps a
+        // `scan_shards_over_range` (through `max_scan_count_over_range`) keeps a
         // retiring larger generation's higher shard indices in scope for
         // `DEFAULT_SCAN_SLACK_HOURS` past its successor's activation, so on a
         // shard-count decrease a straggler routed under the old count into an
