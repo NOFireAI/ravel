@@ -11,6 +11,7 @@
 //! structs directly (see the tests at the bottom of this file).
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
@@ -1677,6 +1678,21 @@ pub const WAITING_FOR_GC_BOOTSTRAP_REASON: &str = "WaitingForGcBootstrap";
 pub const WAITING_FOR_GC_BOOTSTRAP_MESSAGE: &str = "waiting for the maintain Deployment to report a ready replica and create sys/gc; \
      the gateway and query Deployments hold their per-role storage credentials, which \
      carry no write grant on sys/gc, so they are applied only once it exists";
+
+/// `Degraded=True` reason once a `sys/gc` bootstrap hold has continued past
+/// [`GC_BOOTSTRAP_STALL_AFTER`] without maintain reporting a ready replica. The
+/// hold itself continues and keeps requeueing at `BOOTSTRAP_POLL`; this added
+/// condition is the only thing that distinguishes "stuck" from "still
+/// bootstrapping" (a wrong `maintain.credentialsSecretRef`, a bad image), and it
+/// clears on its own once maintain reports ready.
+pub const GC_BOOTSTRAP_STALLED_REASON: &str = "GcBootstrapStalled";
+
+/// How long the gateway and query Deployments may be held for the `sys/gc`
+/// bootstrap before the wait is reported stalled via
+/// [`GC_BOOTSTRAP_STALLED_REASON`]. Five minutes: long enough that an ordinary
+/// maintain rollout does not trip it, short enough that a genuinely stuck
+/// bootstrap surfaces before an operator is left guessing.
+pub const GC_BOOTSTRAP_STALL_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// `Degraded=True` reason when per-role storage credentials are in use and
 /// `maintain.enabled` is false, so no pod the operator renders holds a write
