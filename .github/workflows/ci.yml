@@ -216,8 +216,9 @@ jobs:
 
   # TLA+ fast lane (ADR-1113). Runs only when formal_area is set: a change to
   # formal/ or scripts/check-tla.sh. Exhaustive checking is too slow for the
-  # per-PR budget and runs in tla-nightly.yml instead. Each check is its own
-  # unpiped step so a TLC failure surfaces as the step's own exit code.
+  # per-PR budget and runs in tla-nightly.yml instead. The `ci` subcommand runs
+  # smoke, the negative controls, and traceability under a single run id, and
+  # its own exit code is the gate.
   tla:
     needs: changes
     if: needs.changes.outputs.formal_area == 'true'
@@ -231,12 +232,8 @@ jobs:
         with:
           distribution: temurin
           java-version: "21"
-      - name: Smoke model check
-        run: scripts/check-tla.sh smoke
-      - name: Negative controls
-        run: scripts/check-tla.sh negative
-      - name: Traceability
-        run: scripts/check-tla.sh traceability
+      - name: Fast lane (smoke, negatives, traceability)
+        run: scripts/check-tla.sh ci
       - name: Upload TLC logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

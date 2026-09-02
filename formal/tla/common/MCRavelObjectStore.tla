@@ -11,9 +11,11 @@
 (* CAS applied on a stale version, a lost response that never landed, a        *)
 (* transient failure that changed the store) is what a violation reports.      *)
 (*                                                                           *)
-(* Negative-control switches (LostResponseDropsEffect, CasAcceptsStale) each   *)
-(* break one clause so TLC must reject the broken variant; both default FALSE  *)
-(* (the correct model) and a negative/<name>.cfg flips exactly one.           *)
+(* Negative-control switches each break one clause so TLC must reject the       *)
+(* broken variant; all default FALSE (the correct model) and a negative/<name>  *)
+(* .cfg flips exactly one. LostResponseDropsEffect and CasAcceptsStale break a   *)
+(* safety invariant (exit 12); ListStalls disables the fair list action so the   *)
+(* ListEventuallyComplete liveness property fails (exit 13).                  *)
 (*                                                                           *)
 (* Bounding: `opCount` caps the number of mutating operations (MaxOps) so the  *)
 (* monotonic version counter stays finite. Listing and multipart              *)
@@ -40,7 +42,8 @@ CONSTANTS
     MaxOps,                  \* budget on mutating operations
     NoWrite,                 \* lastWritten sentinel: no claimed content
     LostResponseDropsEffect, \* negative: a lost-response write drops its effect
-    CasAcceptsStale          \* negative: a CAS accepts a stale/absent version
+    CasAcceptsStale,         \* negative: a CAS accepts a stale/absent version
+    ListStalls               \* negative (liveness): the list action never progresses
 
 ASSUME MaxOps \in Nat
 ASSUME NoWrite \notin Content
@@ -221,6 +224,7 @@ DoListReturn(k) ==
     /\ UNCHANGED opGhosts
 
 DoListProgress(k) ==
+    /\ ~ListStalls
     /\ ListProgress(k)
     /\ DeliverGhosts(k)
     /\ UNCHANGED opGhosts
