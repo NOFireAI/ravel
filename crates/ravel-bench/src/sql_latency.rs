@@ -3898,22 +3898,36 @@ mod tests {
         );
     }
 
-    /// `ExecutorSettings::default()` (an unspecified `--logs-request-cost-bytes`)
-    /// must reach `EngineConfig::logs_request_cost_bytes` as the engine's own
-    /// compiled-in default, not some literal the bench keeps in sync by hand.
-    /// Asserting the constant, not a number, means a change to
+    /// The byte-minimal policy with no explicit request cost must reach
+    /// `EngineConfig::logs_request_cost_bytes` as the engine's own compiled-in
+    /// default, not some literal the bench keeps in sync by hand. Asserting the
+    /// constant, not a number, means a change to
     /// `DEFAULT_LOG_REQUEST_COST_BYTES` cannot silently desynchronise the bench
-    /// from the engine.
+    /// from the engine. (`ExecutorSettings::default()` is cost-based and
+    /// resolves to the saturated rate instead; see
+    /// `default_executor_settings_route_the_way_their_policy_says`.)
     #[test]
-    fn cold_executor_defaults_logs_request_cost_to_engine_default() {
+    fn cold_executor_byte_minimal_uses_the_engine_default_request_cost() {
         let store = empty_store();
-        let executor = cold_executor(&store, &[], None, ExecutorSettings::default())
+        let executor = cold_executor(&store, &[], None, byte_minimal_settings())
             .expect("build executor")
             .executor;
         assert_eq!(
             executor.config().engine.logs_request_cost_bytes,
             DEFAULT_LOG_REQUEST_COST_BYTES
         );
+    }
+
+    /// Executor settings pinned to the byte-leaning routing the bench had
+    /// before the fetch policy was reachable: every object above 512 KiB is
+    /// range-read per block, at the engine's compiled-in request cost.
+    fn byte_minimal_settings() -> ExecutorSettings {
+        ExecutorSettings {
+            logs_fetch_policy: LogsFetchPolicy::ByteMinimal,
+            logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
+            logs_block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            ..ExecutorSettings::default()
+        }
     }
 
     /// `--logs-request-cost-bytes` must land on
@@ -4971,7 +4985,9 @@ mod tests {
             Duration::from_secs(30),
             false,
             None,
-            ExecutorSettings::default(),
+            // Byte-minimal routing: the default policy reads every object
+            // whole, and this test is about the ranged path.
+            byte_minimal_settings(),
             false,
             None,
         )
