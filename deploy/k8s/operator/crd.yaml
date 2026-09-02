@@ -583,6 +583,11 @@
                     "nullable": true,
                     "type": "integer"
                   },
+                  "gcBootstrapWaitingSince": {
+                    "description": "RFC 3339 timestamp of the first reconcile pass that began holding the\ngateway and query Deployments for the `sys/gc` bootstrap, set on that\npass and carried unchanged while the hold continues. Cleared once\nmaintain reports a ready replica or either request-serving Deployment\nexists. The operator derives the bootstrap-stall condition from how long\nago this was rather than from a live in-process timer, since every\noperator process is disposable and keeps no such counter across restarts.\n\nUnlike the other optional status fields, this one is serialized even when\nabsent (as an explicit `null`), so the status merge patch clears it when\nthe hold ends; a skipped field would leave a stale timestamp behind and\nmis-report a later, unrelated wait as immediately stalled.",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "maintainReadyReplicas": {
                     "description": "Ready replicas reported by the maintain Deployment.",
                     "format": "int32",
