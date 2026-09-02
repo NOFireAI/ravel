@@ -5,6 +5,8 @@ already exist:
 
 - [Configuration (day 0)](operations/configuration.md): what to decide before
   you start anything.
+- [Deployment (day 1)](operations/deployment.md): bringing a cluster up for the
+  first time.
 
 The sections below are being folded into those pages.
 
