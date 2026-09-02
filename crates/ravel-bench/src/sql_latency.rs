@@ -60,7 +60,8 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
     CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_REQUEST_COST_BYTES,
     DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher,
-    PhaseWireByteCounter, PhaseWireByteCounts, ProbeMissCounter, QueryPhase, SegmentFetcher,
+    LogsFetchPolicy, PhaseWireByteCounter, PhaseWireByteCounts, ProbeMissCounter, QueryPhase,
+    ResolvedLogsFetch, SegmentFetcher, resolve_logs_fetch,
 };
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig,
@@ -240,6 +241,30 @@ pub struct Provenance {
     /// when both ran under the same server config.
     #[serde(default)]
     pub logs_request_cost_bytes_effective: Option<u64>,
+    /// The logs fetch policy this run asked for (`--logs-fetch-policy`,
+    /// ADR-0996 decision 2), as [`ravel_query::LogsFetchPolicy::as_str`] renders
+    /// it. The policy is what selects the read shape: at the default
+    /// `cost-based` against a profile whose bytes are free, the resolution
+    /// saturates both byte quantities and every object is read whole in one
+    /// covering GET, which is what a stock server does.
+    ///
+    /// A report written before this field existed deserializes to
+    /// [`POLICY_NOT_RECORDED`]. Those runs predate the resolution, so no policy
+    /// name describes what they asked for; naming one would claim an intent the
+    /// run never expressed.
+    #[serde(default = "default_logs_fetch_policy")]
+    pub logs_fetch_policy: String,
+    /// The routing threshold that actually governed the logs read shape
+    /// (`EngineConfig::logs_block_range_threshold`), as
+    /// [`resolve_logs_fetch`] resolved it: an object above it is read as
+    /// per-block ranges, one at or below it whole. `u64::MAX` means no object
+    /// takes the ranged path.
+    ///
+    /// `None` when this process cannot know it: the Flight lane, same split and
+    /// same reason as [`Self::logs_request_cost_bytes_effective`], plus a report
+    /// written before this field existed, which recorded no threshold at all.
+    #[serde(default)]
+    pub logs_block_range_threshold_effective: Option<u64>,
     /// The per-query DataFusion memory-pool ceiling this run ASKED for
     /// (`--sql-max-query-bytes`, ADR-0088). A report written before this field
     /// existed deserializes to [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`].
@@ -420,6 +445,43 @@ fn default_fetch_concurrency() -> usize {
 /// field existed deserializes to.
 fn default_logs_request_cost_bytes() -> u64 {
     DEFAULT_LOG_REQUEST_COST_BYTES
+}
+
+/// [`Provenance::logs_fetch_policy`] for a report written before the policy was
+/// stamped: the explicit unknown, never a guessed policy name.
+pub const POLICY_NOT_RECORDED: &str = "unknown (not recorded)";
+
+/// What a report written before the fetch policy was stamped deserializes to.
+fn default_logs_fetch_policy() -> String {
+    POLICY_NOT_RECORDED.to_string()
+}
+
+/// Resolve the bench's logs fetch routing exactly as `ravel-server` resolves
+/// its own (ADR-0996 decision 2): one call into
+/// [`ravel_query::resolve_logs_fetch`] whose two byte quantities are the only
+/// thing the fetch layer is handed, so an in-process figure at default flags is
+/// the shape a stock server produces.
+///
+/// The `Option` arguments carry the same distinction the server's flags do:
+/// `Some` is "the run set this", and the `unwrap_or` fallback is the compiled-in
+/// value the byte-leaning policy resolves to. A run that sets no flag therefore
+/// gets `cost-based` against the reference profile, which saturates the request
+/// cost and with it the routing threshold, rather than the 512 KiB threshold the
+/// bench used before the policy was reachable at all.
+pub fn logs_fetch_resolution(
+    policy: LogsFetchPolicy,
+    profile: &StoreCostProfile,
+    explicit_request_cost_bytes: Option<u64>,
+    explicit_block_range_threshold: Option<u64>,
+) -> ResolvedLogsFetch {
+    resolve_logs_fetch(
+        policy,
+        profile,
+        explicit_request_cost_bytes,
+        explicit_request_cost_bytes.unwrap_or(DEFAULT_LOG_REQUEST_COST_BYTES),
+        explicit_block_range_threshold.unwrap_or(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD),
+        explicit_block_range_threshold,
+    )
 }
 
 /// The deadline every run used before it became configurable (issue #688);
@@ -1048,16 +1110,25 @@ pub struct GenerateConfig {
     /// flag corresponds to it: this is the seam a probe sweep sets the window
     /// through.
     pub logs_suffix_len: Option<u64>,
-    /// Logs per-request byte budget (`--logs-request-cost-bytes`, ADR-0904),
-    /// fed to [`ExecutorSettings::logs_request_cost_bytes`] and so
-    /// [`EngineConfig::logs_request_cost_bytes`]. Defaults to
-    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`], so an unset flag leaves
-    /// logs-scan routing byte-for-byte unchanged.
-    pub logs_request_cost_bytes: u64,
+    /// Explicit logs per-request byte budget (`--logs-request-cost-bytes`,
+    /// ADR-0904). `Some` WINS over [`Self::logs_fetch_policy`] for the rate, the
+    /// expert escape hatch of ADR-0996 decision 2; `None` lets the policy derive
+    /// it. Reaches [`EngineConfig::logs_request_cost_bytes`] and the fetcher's
+    /// request cost through [`logs_fetch_resolution`] only, never directly.
+    pub logs_request_cost_bytes: Option<u64>,
+    /// The logs fetch policy the pass measures (`--logs-fetch-policy`, ADR-0996
+    /// decision 2), resolved with [`Self::store_cost_profile`] into the two byte
+    /// quantities the fetch layer runs on.
+    pub logs_fetch_policy: LogsFetchPolicy,
+    /// Explicit routing threshold (`--logs-block-range-threshold`): object size
+    /// above which a logs read takes the ranged per-block path. `None` leaves
+    /// the compiled-in 512 KiB as the policy's input; a saturated resolution
+    /// overrides either one.
+    pub logs_block_range_threshold: Option<u64>,
     /// The store cost profile the pass is priced at (ADR-0996 decision 1),
-    /// stamped verbatim into provenance and used to model the pass's cost.
-    /// Defaults to [`StoreCostProfile::reference`]; no CLI flag sets it here
-    /// (epic #996 task 996-5 owns the server/CLI surface).
+    /// stamped verbatim into provenance, used to model the pass's cost, and read
+    /// by a `cost-based` [`Self::logs_fetch_policy`] to derive the request cost.
+    /// Defaults to [`StoreCostProfile::reference`].
     pub store_cost_profile: StoreCostProfile,
 }
 
@@ -1182,20 +1253,30 @@ pub struct TenantConfigInput {
     /// through. Reaches the in-process fetcher only; the Flight lane never
     /// applies it (the setting is not on the Flight wire).
     pub logs_suffix_len: Option<u64>,
-    /// Logs per-request byte budget (`--logs-request-cost-bytes`, ADR-0904),
-    /// fed to [`ExecutorSettings::logs_request_cost_bytes`] and so
-    /// [`EngineConfig::logs_request_cost_bytes`]. Reaches the in-process
-    /// executor only; the Flight lane never applies it (no Flight header, and
-    /// the server's own config governs there). Defaults to
-    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`].
-    pub logs_request_cost_bytes: u64,
+    /// Explicit logs per-request byte budget (`--logs-request-cost-bytes`,
+    /// ADR-0904). `Some` WINS over [`Self::logs_fetch_policy`] for the rate, the
+    /// expert escape hatch of ADR-0996 decision 2; `None` lets the policy derive
+    /// it. Reaches the in-process executor only, through
+    /// [`logs_fetch_resolution`]; the Flight lane never applies it (no Flight
+    /// header, and the server's own config governs there).
+    pub logs_request_cost_bytes: Option<u64>,
+    /// The logs fetch policy the pass measures (`--logs-fetch-policy`, ADR-0996
+    /// decision 2), resolved with [`Self::store_cost_profile`] into the two byte
+    /// quantities the fetch layer runs on. In-process lane only, for the same
+    /// reason as the two byte flags.
+    pub logs_fetch_policy: LogsFetchPolicy,
+    /// Explicit routing threshold (`--logs-block-range-threshold`): object size
+    /// above which a logs read takes the ranged per-block path. `None` leaves
+    /// the compiled-in 512 KiB as the policy's input; a saturated resolution
+    /// overrides either one.
+    pub logs_block_range_threshold: Option<u64>,
     /// The store cost profile the pass is priced at (ADR-0996 decision 1),
-    /// stamped verbatim into provenance and used to model the pass's cost. On
-    /// the Flight lane it is stamped as the REQUESTED profile only; the
+    /// stamped verbatim into provenance, used to model the pass's cost, and read
+    /// by a `cost-based` [`Self::logs_fetch_policy`] to derive the request cost.
+    /// On the Flight lane it is stamped as the REQUESTED profile only; the
     /// effective profile is `None`, because the foreign server's own
     /// `--store-cost-profile` governed there. Defaults to
-    /// [`StoreCostProfile::reference`]; no CLI flag sets it here (epic #996
-    /// task 996-5 owns the server/CLI surface).
+    /// [`StoreCostProfile::reference`].
     pub store_cost_profile: StoreCostProfile,
 }
 
@@ -1319,10 +1400,15 @@ pub struct ExecutorSettings {
     /// Per-request byte budget the logs planner charges each object against when
     /// deciding whether to route a scan through the ranged probe-then-fetch path
     /// (ADR-0904), the same knob as `ravel-server --logs-request-cost-bytes`.
-    /// Reaches [`EngineConfig::logs_request_cost_bytes`]. Defaults to
-    /// [`ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES`], so an unset flag leaves
-    /// routing byte-for-byte unchanged.
+    /// Reaches [`EngineConfig::logs_request_cost_bytes`] and, like the server's,
+    /// the fetcher's own request cost. Both this and
+    /// [`Self::logs_block_range_threshold`] are RESOLVED quantities on the
+    /// measurement lanes ([`logs_fetch_resolution`]), never raw flag values.
     pub logs_request_cost_bytes: u64,
+    /// The policy the two byte quantities above were resolved from, carried into
+    /// [`EngineConfig::logs_fetch_policy`] so the engine config the bench builds
+    /// names the same intent the server's would.
+    pub logs_fetch_policy: LogsFetchPolicy,
 }
 
 impl Default for ExecutorSettings {
@@ -1337,6 +1423,7 @@ impl Default for ExecutorSettings {
             logs_block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             logs_suffix_len: None,
             logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
+            logs_fetch_policy: LogsFetchPolicy::default(),
         }
     }
 }
@@ -1373,6 +1460,7 @@ fn cold_executor(
         logs_block_range_threshold,
         logs_suffix_len,
         logs_request_cost_bytes,
+        logs_fetch_policy,
     } = settings;
     let catalog = Arc::new(Catalog::new(
         Arc::clone(store),
@@ -1385,9 +1473,14 @@ fn cold_executor(
     // fetcher's permit pool stays at its compiled-in 16 and a scan planned at
     // more partitions than that queues on it, so the bench would measure a
     // ceiling the flag cannot move.
+    // The request cost has to be handed to the fetcher here, exactly as
+    // `ravel-server` hands it over: the quantity lives on the block-range
+    // fetcher this builder owns, so a fetcher built without it keeps the
+    // compiled-in default and the resolved rate governs nothing (issue #1139).
     let mut log_fetcher = LogSegmentFetcher::new(Arc::clone(store))
         .with_max_concurrent_gets(fetch_concurrency.max(1))
-        .with_block_range_threshold(logs_block_range_threshold);
+        .with_block_range_threshold(logs_block_range_threshold)
+        .with_request_cost_bytes(logs_request_cost_bytes);
     if let Some(n) = logs_suffix_len {
         log_fetcher = log_fetcher.with_suffix_len(n);
     }
@@ -1411,6 +1504,8 @@ fn cold_executor(
                 fetch_concurrency: fetch_concurrency.max(1),
                 max_segments,
                 logs_request_cost_bytes,
+                logs_block_range_threshold,
+                logs_fetch_policy,
                 ..EngineConfig::default()
             },
             parallel_final_aggregation,
@@ -1999,6 +2094,12 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         shard_count,
     )
     .await?;
+    let resolved_logs_fetch = logs_fetch_resolution(
+        cfg.logs_fetch_policy,
+        &cfg.store_cost_profile,
+        cfg.logs_request_cost_bytes,
+        cfg.logs_block_range_threshold,
+    );
     let settings = ExecutorSettings {
         max_query_bytes: cfg.max_query_bytes,
         shard_count,
@@ -2007,8 +2108,9 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
         logs_suffix_len: cfg.logs_suffix_len,
-        logs_request_cost_bytes: cfg.logs_request_cost_bytes,
-        ..ExecutorSettings::default()
+        logs_request_cost_bytes: resolved_logs_fetch.request_cost_bytes,
+        logs_block_range_threshold: resolved_logs_fetch.block_range_threshold,
+        logs_fetch_policy: cfg.logs_fetch_policy,
     };
     let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
@@ -2040,10 +2142,17 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
-            logs_request_cost_bytes_requested: cfg.logs_request_cost_bytes,
-            // In-process lane, same as the ceiling below: the requested budget
-            // reaches the engine, so it is also the effective one.
-            logs_request_cost_bytes_effective: Some(cfg.logs_request_cost_bytes),
+            logs_request_cost_bytes_requested: cfg
+                .logs_request_cost_bytes
+                .unwrap_or(DEFAULT_LOG_REQUEST_COST_BYTES),
+            // In-process lane, same as the ceiling below: the resolved budget
+            // reaches the engine and the fetcher, so it is the effective one. It
+            // is the RESOLVED value, not the requested one: at the default
+            // policy the two differ, and the requested figure describes nothing
+            // that governed.
+            logs_request_cost_bytes_effective: Some(resolved_logs_fetch.request_cost_bytes),
+            logs_fetch_policy: cfg.logs_fetch_policy.as_str().to_string(),
+            logs_block_range_threshold_effective: Some(resolved_logs_fetch.block_range_threshold),
             sql_max_query_bytes_requested: cfg.max_query_bytes,
             // In-process lane: the requested ceiling reaches the executor's
             // `SqlConfig`, so it is also the effective one.
@@ -2089,7 +2198,11 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
 /// mapping being buried inline where only an end-to-end run could catch a
 /// dropped field. `shard_count` is resolved separately (issue #677) and passed
 /// in.
-fn tenant_executor_settings(cfg: &TenantConfigInput, shard_count: u32) -> ExecutorSettings {
+fn tenant_executor_settings(
+    cfg: &TenantConfigInput,
+    shard_count: u32,
+    resolved_logs_fetch: &ResolvedLogsFetch,
+) -> ExecutorSettings {
     ExecutorSettings {
         max_query_bytes: cfg.max_query_bytes,
         shard_count,
@@ -2098,8 +2211,9 @@ fn tenant_executor_settings(cfg: &TenantConfigInput, shard_count: u32) -> Execut
         parallel_final_aggregation: cfg.parallel_final_aggregation,
         max_segments: cfg.max_segments,
         logs_suffix_len: cfg.logs_suffix_len,
-        logs_request_cost_bytes: cfg.logs_request_cost_bytes,
-        ..ExecutorSettings::default()
+        logs_request_cost_bytes: resolved_logs_fetch.request_cost_bytes,
+        logs_block_range_threshold: resolved_logs_fetch.block_range_threshold,
+        logs_fetch_policy: cfg.logs_fetch_policy,
     }
 }
 
@@ -2159,7 +2273,13 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             .into());
         }
     }
-    let settings = tenant_executor_settings(cfg, shard_count);
+    let resolved_logs_fetch = logs_fetch_resolution(
+        cfg.logs_fetch_policy,
+        &cfg.store_cost_profile,
+        cfg.logs_request_cost_bytes,
+        cfg.logs_block_range_threshold,
+    );
+    let settings = tenant_executor_settings(cfg, shard_count, &resolved_logs_fetch);
     // The two lanes measure the same statements over the same dataset stanza
     // and the same declared-column set; they differ only in what executes the
     // SQL, in process or across a gRPC channel to a server.
@@ -2201,7 +2321,9 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             cache_bytes: cfg.cache_bytes,
             deadline_secs: cfg.deadline.as_secs(),
             fetch_concurrency: cfg.fetch_concurrency.max(1),
-            logs_request_cost_bytes_requested: cfg.logs_request_cost_bytes,
+            logs_request_cost_bytes_requested: cfg
+                .logs_request_cost_bytes
+                .unwrap_or(DEFAULT_LOG_REQUEST_COST_BYTES),
             // `settings` is passed only on the in-process arm of the match
             // above, so on the Flight lane this budget never left the process
             // and the server's own config governed the routing. Stamping the
@@ -2209,7 +2331,14 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             // at different knob settings look like a controlled comparison.
             logs_request_cost_bytes_effective: match &cfg.flight {
                 Some(_) => None,
-                None => Some(cfg.logs_request_cost_bytes),
+                None => Some(resolved_logs_fetch.request_cost_bytes),
+            },
+            logs_fetch_policy: cfg.logs_fetch_policy.as_str().to_string(),
+            // The resolved threshold, on the same split and for the same
+            // reason: the Flight lane resolves nothing the server obeys.
+            logs_block_range_threshold_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(resolved_logs_fetch.block_range_threshold),
             },
             sql_max_query_bytes_requested: cfg.max_query_bytes,
             // `settings` is passed only on the in-process arm of the match
@@ -2687,9 +2816,48 @@ mod tests {
             flight: None,
             warm_catalog: false,
             logs_suffix_len: None,
-            logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
+            // The byte-leaning policy, so these tests keep the routing they
+            // were written against: the compiled-in request cost and the
+            // 512 KiB threshold. A lane at default flags resolves both to
+            // whole-object instead, which is what the CLI tests cover.
+            logs_request_cost_bytes: None,
+            logs_fetch_policy: LogsFetchPolicy::ByteMinimal,
+            logs_block_range_threshold: None,
             store_cost_profile: StoreCostProfile::reference(),
         }
+    }
+
+    /// The executor settings the loaded-tenant lane builds from `cfg`, resolved
+    /// through the same [`logs_fetch_resolution`] [`run_tenant`] calls, so a
+    /// test reads the settings that lane would really hand the fetcher.
+    fn tenant_settings_for(cfg: &TenantConfigInput, shard_count: u32) -> ExecutorSettings {
+        let resolved = logs_fetch_resolution(
+            cfg.logs_fetch_policy,
+            &cfg.store_cost_profile,
+            cfg.logs_request_cost_bytes,
+            cfg.logs_block_range_threshold,
+        );
+        tenant_executor_settings(cfg, shard_count, &resolved)
+    }
+
+    /// A loaded-tenant run at the default policy against the reference profile
+    /// hands the fetcher whole-object routing, the shape a stock server has:
+    /// both resolved quantities saturate. Before the policy was reachable the
+    /// threshold stayed at 512 KiB, so every larger object was range-read per
+    /// block (issue #1139).
+    #[test]
+    fn tenant_lane_at_the_default_policy_resolves_whole_object_routing() {
+        let store = empty_store();
+        let mut cfg = tenant_cfg(&store, "default-policy-tenant", None, 0);
+        cfg.logs_fetch_policy = LogsFetchPolicy::default();
+        let settings = tenant_settings_for(&cfg, 1);
+        assert_eq!(settings.logs_block_range_threshold, u64::MAX);
+        assert_eq!(settings.logs_request_cost_bytes, u64::MAX);
+
+        cfg.logs_fetch_policy = LogsFetchPolicy::ByteMinimal;
+        let settings = tenant_settings_for(&cfg, 1);
+        assert_eq!(settings.logs_block_range_threshold, 524_288);
+        assert_eq!(settings.logs_request_cost_bytes, 1_887_437);
     }
 
     /// Every statement outcome is appended to the progress file as a JSON
@@ -4827,7 +4995,7 @@ mod tests {
         cfg.logs_suffix_len = Some(suffix);
         // The seam the loaded-tenant lane builds carries the pinned window
         // verbatim; run_tenant feeds this same value to measure_corpus.
-        let settings = tenant_executor_settings(&cfg, 1);
+        let settings = tenant_settings_for(&cfg, 1);
         assert_eq!(
             settings.logs_suffix_len,
             Some(suffix),
@@ -4902,7 +5070,7 @@ mod tests {
             cfg.logs_suffix_len, None,
             "the default config leaves the probe length unset"
         );
-        let settings = tenant_executor_settings(&cfg, 1);
+        let settings = tenant_settings_for(&cfg, 1);
         assert_eq!(
             settings.logs_suffix_len, None,
             "an unset config leaves the derivation in place"
@@ -5342,7 +5510,13 @@ mod tests {
             explain_dir: None,
             warm_catalog: false,
             logs_suffix_len: None,
-            logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
+            // The byte-leaning policy, so these tests keep the routing they
+            // were written against: the compiled-in request cost and the
+            // 512 KiB threshold. A lane at default flags resolves both to
+            // whole-object instead, which is what the CLI tests cover.
+            logs_request_cost_bytes: None,
+            logs_fetch_policy: LogsFetchPolicy::ByteMinimal,
+            logs_block_range_threshold: None,
             store_cost_profile: StoreCostProfile::reference(),
         };
         let gen_report = run_generated(&gen_cfg).await.expect("generated lane runs");

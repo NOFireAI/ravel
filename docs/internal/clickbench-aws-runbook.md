@@ -389,6 +389,7 @@ Flags that change what is measured:
 | `--cache-bytes` | **Must exceed the corpus.** Smaller and every run re-reads everything, so "warm" numbers are three cold runs. |
 | `--compaction post` | Measures the compacted layout. |
 | `--fetch-concurrency` | Bounds in-flight object-store GETs. |
+| `--logs-fetch-policy` | The logs read shape, resolved the way the server resolves its own flag of the same name. Unset means `cost-based`, which at the reference intra-region profile reads every log object whole in one covering GET, the shape a stock server has. Passes taken before this flag existed range-read every object above 512 KiB per block, so their GET counts are not comparable with a default pass; `byte-minimal` reproduces that older shape. Read the resolved values off the report's `logs_fetch_policy` and `logs_block_range_threshold_effective`. |
 | `--explain --explain-dir` | Captures a plan per statement. A null result cannot be diagnosed without it. |
 | `--continue-on-error` | One failing statement does not abandon the pass. |
 
