@@ -124,3 +124,19 @@ the reservation commit that used to work around it.
 | [0825](0825-grouped-aggregation-accumulator-path.md) | Grouped aggregation accumulator path: flat per-group GroupsAccumulators replace the per-group boxed-accumulator adapter, and integer-input avg moves to exact i128 accumulation, deterministic by construction and admitted to the parallel final | Accepted |
 | [0873](0873-commit-record-declared-min-max.md) | Per-declared-column min/max (and null count) hoisted onto commit records, compaction parts, snapshot entries, and SegmentRef, so DataFusion's stock AggregateStatistics rule answers MIN/MAX/COUNT from statistics on live tails and token-resolved segments; additive fields 20/12/15, no version bump, eligibility allowlisted to I64/Bool with an explicit float gate, union reader over stamps and .cstat | Proposed |
 | [0913](0913-declared-exact-materialisation.md) | Declared exact materialisations: tenant-declared aggregate shapes materialised as immutable, snapshot-bound per-part monoid states under a definition hash, selected only on provable answerability with fail-open fallback to scan, a 64 MiB materialised-plan byte budget, exact-until-budget `COUNT DISTINCT`, and float `SUM`/`AVG` deferred behind ADR-0024 | Proposed |
+| [0098](0098-shared-label-string-representation.md) | Share one label set per series run | proposed |
+| [0103](0103-order-insensitive-aggregation-pushdown.md) | Order-insensitive aggregation pushdown | Accepted (amends ADR-0071) |
+| [0108](0108-range-eval-over-native-histograms.md) | Histogram-aware range evaluation for PromQL | proposed |
+| [0109](0109-columnar-bulk-load-fast-path.md) | Columnar bulk-load fast path for Parquet ingest | Accepted |
+| [0110](0110-columnar-spans-scan.md) | Columnar decode-to-Arrow for the SQL spans scan | Proposed |
+| [0849](0849-snapshot-bound-index-plane.md) | A snapshot-bound index plane on object storage | Accepted |
+| [0850](0850-logs-typed-column-statistics.md) | exact per-object statistics for declared logs columns | Accepted. Builds on ADR-0090 (declared typed attribute columns) |
+| [0892](0892-drop-rlog-version-3-reader.md) | Drop the RLOG version-3 reader | Proposed |
+| [0904](0904-request-cost-latency-knob.md) | an operator knob for the request-cost vs latency trade | Proposed |
+| [0927](0927-metricsbench-benchmark-contract.md) | MetricsBench, a reproducible metrics and PromQL benchmark contract | Proposed. Issue #927, task T1 of the epic. Builds on ADR-0044 |
+| [0942](0942-cstat-snapshot-part-binding.md) | re-key `.cstat` column statistics to snapshot-part binding | Accepted (2026-08-30). Builds on ADR-0850 (logs typed column |
+| [0954](0954-bounded-ephemeral-spill.md) | Bounded ephemeral spill for eligible SQL operators | Accepted (2026-08-30) |
+| [0979](0979-bounded-memory-rlog-compaction-merge.md) | Bounded-memory RLOG compaction merge | Proposed |
+| [0996](0996-request-cost-aware-fetching.md) | request-cost-aware fetching and the S3 request ledger | Proposed |
+| [1029](1029-advisory-compaction-claims.md) | advisory compaction claims over object-store CAS | Proposed |
+| [1040](1040-documentation-architecture.md) | Documentation architecture, canonical vocabulary, and a docs gate | Proposed |
