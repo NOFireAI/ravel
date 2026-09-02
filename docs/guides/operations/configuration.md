@@ -41,8 +41,8 @@ mode does, silently.
 The catalog fold runs in every mode except `maintain`. Every maintenance loop
 runs only in `maintain`. A deployment made of `all` processes alone therefore
 folds its catalog but never compacts, never applies retention and never deletes
-an object. Read the maintenance page before you decide you do not need a
-`maintain` process.
+an object. Read [Maintenance](maintenance.md) before you decide you do not need
+a `maintain` process.
 
 ## Storage backend and credentials
 

@@ -7,6 +7,8 @@ already exist:
   you start anything.
 - [Deployment (day 1)](operations/deployment.md): bringing a cluster up for the
   first time.
+- [Maintenance (day 2)](operations/maintenance.md): compaction, garbage
+  collection, the scrubber, format migration and legal hold.
 
 The sections below are being folded into those pages.
 
