@@ -817,10 +817,13 @@ aws ec2 terminate-instances --instance-ids <id>   # discards everything
 
 Removing the rest:
 
+Read the bucket name out of SSM into `B` **before** deleting anything: the
+parameter is deleted last, so the recursive object removal and the bucket
+delete both have a name to use.
+
 ```sh
-aws ssm delete-parameter --name /ravel-clickbench/access-key
-aws ssm delete-parameter --name /ravel-clickbench/secret-key
-aws ssm delete-parameter --name /ravel-clickbench/bucket
+B=$(aws ssm get-parameter --name /ravel-clickbench/bucket \
+  --query Parameter.Value --output text)
 
 aws iam remove-role-from-instance-profile \
   --instance-profile-name ravel-clickbench-box --role-name ravel-clickbench-box
@@ -834,8 +837,12 @@ aws iam list-access-keys --user-name ravel-clickbench \
   | xargs -n1 -I{} aws iam delete-access-key --user-name ravel-clickbench --access-key-id {}
 aws iam delete-user --user-name ravel-clickbench
 
-aws s3 rm "s3://$BUCKET" --recursive
-aws s3api delete-bucket --bucket "$BUCKET"
+aws s3 rm "s3://$B" --recursive
+aws s3api delete-bucket --bucket "$B"
+
+aws ssm delete-parameter --name /ravel-clickbench/access-key
+aws ssm delete-parameter --name /ravel-clickbench/secret-key
+aws ssm delete-parameter --name /ravel-clickbench/bucket
 ```
 
 An idle instance bills at its full on-demand rate. Stop it when a run finishes.
