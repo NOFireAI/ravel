@@ -1077,7 +1077,7 @@ The `QueryList` statement's `s3:prefix` condition carries the same bare
 `t/` discovery entry:
 
 ```json
-"s3:prefix": ["t/", "t/*/*/c/*", "t/*/catalog/*/*", "admission/query/*"]
+"s3:prefix": ["t/", "t/*/*/c/*", "t/*/catalog/*/*", "admission/query/*", "sys/query/workers/*"]
 ```
 
 `QueryRead` includes `t/*/*/l0/*` and `t/*/*/l1/*`: the query fetchers GET
@@ -1106,13 +1106,27 @@ not one of ADR-0055's six protected prefixes and is absent from
 `2R` staleness window, not a sweep), so no role holds a delete grant for it to
 need denying.
 
+`QueryList`/`QueryRead`/`QueryWrite` also carry `sys/query/workers/*` — the
+distributed-query worker-membership registry (ADR-0071,
+`crates/ravel-fleet/src/query_workers.rs`). Each query-serving process writes
+its own liveness heartbeat to `sys/query/workers/<process_id>` (PutObject,
+`PutMode::Overwrite`) and lists the prefix then GETs its siblings
+(ListBucket/GetObject) to compute the live worker set for read fan-out. Like
+`admission/query/*` it is a bucket-**root** control-plane prefix, not under any
+`t/<hash>/` tenant prefix, and is scoped exactly to `sys/query/workers/`. The
+grant is inert until `--distributed-query` is enabled. The heartbeat is
+self-owned advisory state, reconstructible on restart, so it is not one of
+ADR-0055's protected prefixes and is absent from `DenyDeleteProtected`; a stale
+worker key ages out of the live set rather than being swept, so no role holds a
+delete grant for it.
+
 **Maintain:** [`deploy/iam/maintain.json`](../../deploy/iam/maintain.json).
 
 The `MaintainList` statement's `s3:prefix` condition carries the same bare
 `t/` discovery entry:
 
 ```json
-"s3:prefix": ["t/", "t/*/*/l0/*", "t/*/*/c/*", "t/*/*/l1/*", "t/*/*/idem/*"]
+"s3:prefix": ["t/", "t/*/*/l0/*", "t/*/*/c/*", "t/*/*/l1/*", "t/*/*/idem/*", "sys/maintain/workers/*"]
 ```
 
 Maintain's `MaintainDelete` grants delete on `l0/`, `l1/`, `c/`, `idem/` — the
@@ -1132,6 +1146,24 @@ never delete a legal-hold record.
 HEADs a compacted part to re-verify it exists before retrying a publish) and
 `t/*/*/maint/*` (the advisory scan cursor is read before its own CAS
 mutation).
+
+`MaintainList`/`MaintainRead`/`MaintainWrite` also carry the bucket-**root**
+`sys/maintain/` control-plane prefix, the leased-maintenance coordination
+keyspace (ADR-0065, `crates/ravel-fleet/src/{worker_set,claim}.rs`). Each
+maintain process writes its own liveness heartbeat
+`sys/maintain/workers/<process_id>` and durable memo
+`sys/maintain/memo/<process_id>` (ADR-0065 sections 1 and 3), and the advisory
+compaction claim `sys/maintain/claims/compaction/<work_id_hex>` (ADR-1029
+section 1) — all PutObject. It lists `sys/maintain/workers/` and GETs siblings
+to compute the live worker set (ListBucket on `sys/maintain/workers/*`,
+GetObject on `sys/maintain/*`), and GET/`head()`s a claim under the same read
+grant. `MaintainWrite` and `MaintainRead` therefore add
+`sys/maintain/*`, scoped exactly to that prefix and no wider. These are
+self-owned, overwrite/CAS advisory objects, reconstructible on rescan, so they
+are not one of ADR-0055's protected prefixes and are absent from
+`DenyDeleteProtected`; no role holds a delete grant for them. Without this
+grant every maintain process's first heartbeat PUT fails closed with
+`AccessDenied`.
 
 **Admin (`ravel-cli`):** [`deploy/iam/admin.json`](../../deploy/iam/admin.json).
 
