@@ -723,6 +723,21 @@ pub struct RavelClusterStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maintain_ready_replicas: Option<i32>,
 
+    /// RFC 3339 timestamp of the first reconcile pass that began holding the
+    /// gateway and query Deployments for the `sys/gc` bootstrap, set on that
+    /// pass and carried unchanged while the hold continues. Cleared once
+    /// maintain reports a ready replica or either request-serving Deployment
+    /// exists. The operator derives the bootstrap-stall condition from how long
+    /// ago this was rather than from a live in-process timer, since every
+    /// operator process is disposable and keeps no such counter across restarts.
+    ///
+    /// Unlike the other optional status fields, this one is serialized even when
+    /// absent (as an explicit `null`), so the status merge patch clears it when
+    /// the hold ends; a skipped field would leave a stale timestamp behind and
+    /// mis-report a later, unrelated wait as immediately stalled.
+    #[serde(default)]
+    pub gc_bootstrap_waiting_since: Option<String>,
+
     /// Standard Kubernetes conditions: `Available`, `Progressing`, `Degraded`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,

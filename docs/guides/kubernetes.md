@@ -468,7 +468,23 @@ existing cluster keeps reconciling both tiers through a maintain rollout or
 outage rather than stalling them. While it holds, the cluster carries
 `Available=False` with reason `WaitingForGcBootstrap` and `Degraded=False`, and
 the operator requeues: this is progress, not a failure, and it needs no manual
-bootstrap step. With `maintain.enabled: false` under per-role Secrets the
+bootstrap step. The waiting message names the maintain Deployment's observed
+ready and unavailable replica counts, so you can see whether it is coming up.
+
+If the hold lasts more than five minutes, the wait is reported stalled: the
+operator keeps `Available=False` with `WaitingForGcBootstrap` but adds
+`Degraded=True` with reason `GcBootstrapStalled`, whose message names the
+maintain Deployment and its ready and unavailable replica counts. This is the
+signal that maintain is not merely slow to start but stuck, usually a wrong
+`maintain.credentialsSecretRef` or a bad maintain image; check those and the
+maintain pod's logs. The operator keeps polling throughout and clears the
+`GcBootstrapStalled` condition on its own on the first pass where maintain
+reports a ready replica, so a fixed maintain Deployment recovers with no further
+action. The operator tracks the elapsed time by stamping the first waiting pass
+into `status.gcBootstrapWaitingSince` rather than keeping an in-process timer, so
+the five-minute threshold survives an operator restart.
+
+With `maintain.enabled: false` under per-role Secrets the
 operator still applies the gateway and query Deployments, but their pods restart
 until `sys/gc` exists, and the cluster reports `Degraded=True` with reason
 `GcBootstrapUnavailable` until one of them reports ready. That happens once you
