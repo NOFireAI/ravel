@@ -25,9 +25,10 @@ use ravel_object_store::{
     PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_promql::LabelMatcher;
+use ravel_query::erasure::ErasurePredicate;
 use ravel_query::log_series::{
-    LOG_BYTES_METRIC, LOG_LINES_METRIC, LogMetric, LogSeriesError, LogSeriesRequest,
-    fetch_log_series,
+    BODY_MATCHER_LABEL, LOG_BYTES_METRIC, LOG_LINES_METRIC, LogMetric, LogSeriesError,
+    LogSeriesRequest, SEVERITY_LABEL, fetch_log_series,
 };
 use ravel_query::{ByteLimit, LogSegmentFetcher, PhaseAccounting, QueryPhase};
 use ravel_types::accounting::AccountedOp;
@@ -208,6 +209,121 @@ async fn two_objects(store: &MemoryStore) -> (SegmentRef, SegmentRef) {
     (ref_a, ref_b)
 }
 
+/// A record on an arbitrary resource, for fixtures needing more than the
+/// fixed `service.namespace`/`service.name`/`service.instance.id` shape
+/// [`record`] provides: a resource missing `service.instance.id`, an extra
+/// resource attribute (`k8s.pod.name`), or a non-scalar attribute value
+/// (`tags`, list-valued) that must be excluded from the derived label set
+/// rather than merely renamed.
+fn resource_record(
+    resource: &[(&str, AttrValue)],
+    ts: i64,
+    severity: &str,
+    body: &str,
+    record_attrs: &[(&str, &str)],
+) -> LogRecord {
+    let resource: Vec<(String, AttrValue)> = resource
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let attrs: Vec<(String, AttrValue)> = record_attrs
+        .iter()
+        .map(|(k, v)| (k.to_string(), AttrValue::Str(v.to_string())))
+        .collect();
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: severity.into(),
+        body: body.into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs,
+    }
+}
+
+fn full_window() -> TimeRange {
+    TimeRange {
+        start_ns: 0,
+        end_ns: 1_000,
+    }
+}
+
+/// ADR-1103 decisions 2/3 fixture (issue #1106 Finding 3): two objects, four
+/// streams.
+///
+/// Object A: `s1` (`service.name=api`, `k8s.pod.name=p1`) with 5 ERROR
+/// records at ts 100-103 (ts 102 shared by two of them; ts 100 and 101 carry
+/// `user.id=u1` and a body containing "timeout") and 3 INFO records at ts
+/// 104-106, plus `s2` (`service.name=worker`) with 4 ERROR records at ts
+/// 107-110.
+///
+/// Object B: `s1` continuation with 2 more ERROR records at ts 300-301, `s3`
+/// (`service.namespace=pay`, `service.name=api`, so `job="pay/api"` --
+/// distinct from `s1`'s `job="api"`) with 1 ERROR record at ts 302, and `s4`
+/// (`s1`'s exact resource plus a list-valued `tags` attribute, so its label
+/// set equals `s1`'s even though its stream id -- and hence STREAM_DIR entry
+/// and record count -- differ) with 1 ERROR record at ts 303.
+///
+/// Every body has a known length; the 8 `job="api"`,`severity_text="ERROR"`
+/// bodies (5 from `s1` in A, 2 from `s1` in B, 1 from `s4`) are
+/// "timeout-one" (11), "timeout-two-longer" (18), "err-c" (5), "err-d" (5),
+/// "solo-exact-body" (15, unique across the whole fixture), "b-one" (5),
+/// "b-two" (5), and "s4-body-x" (9) -- summing to exactly 73.
+async fn promql_over_logs_fixture(store: &MemoryStore) -> (SegmentRef, SegmentRef) {
+    let s1 = [
+        ("service.name", AttrValue::Str("api".to_string())),
+        ("k8s.pod.name", AttrValue::Str("p1".to_string())),
+    ];
+    let s2 = [("service.name", AttrValue::Str("worker".to_string()))];
+    let s3 = [
+        ("service.namespace", AttrValue::Str("pay".to_string())),
+        ("service.name", AttrValue::Str("api".to_string())),
+    ];
+    let s4 = [
+        ("service.name", AttrValue::Str("api".to_string())),
+        ("k8s.pod.name", AttrValue::Str("p1".to_string())),
+        (
+            "tags",
+            AttrValue::List(vec![AttrValue::Str("x".to_string())]),
+        ),
+    ];
+
+    let a = vec![
+        resource_record(&s1, 100, "ERROR", "timeout-one", &[("user.id", "u1")]),
+        resource_record(
+            &s1,
+            101,
+            "ERROR",
+            "timeout-two-longer",
+            &[("user.id", "u1")],
+        ),
+        resource_record(&s1, 102, "ERROR", "err-c", &[]),
+        resource_record(&s1, 102, "ERROR", "err-d", &[]),
+        resource_record(&s1, 103, "ERROR", "solo-exact-body", &[]),
+        resource_record(&s1, 104, "INFO", "info-1", &[]),
+        resource_record(&s1, 105, "INFO", "info-2", &[]),
+        resource_record(&s1, 106, "INFO", "info-3", &[]),
+        resource_record(&s2, 107, "ERROR", "work-1", &[]),
+        resource_record(&s2, 108, "ERROR", "work-2", &[]),
+        resource_record(&s2, 109, "ERROR", "work-3", &[]),
+        resource_record(&s2, 110, "ERROR", "work-4", &[]),
+    ];
+    let b = vec![
+        resource_record(&s1, 300, "ERROR", "b-one", &[]),
+        resource_record(&s1, 301, "ERROR", "b-two", &[]),
+        resource_record(&s3, 302, "ERROR", "pay-err-1", &[]),
+        resource_record(&s4, 303, "ERROR", "s4-body-x", &[]),
+    ];
+
+    let ref_a = write_object(store, "logs/fixture-a.rlog", &a).await;
+    let ref_b = write_object(store, "logs/fixture-b.rlog", &b).await;
+    (ref_a, ref_b)
+}
+
 fn lines_request<'a>(matchers: &'a [LabelMatcher], window: TimeRange) -> LogSeriesRequest<'a> {
     LogSeriesRequest {
         metric: LogMetric::Lines,
@@ -223,16 +339,23 @@ fn lines_request<'a>(matchers: &'a [LabelMatcher], window: TimeRange) -> LogSeri
 
 /// Acceptance test: a window overlapping only object A, filtered to stream
 /// `job="pay/api"`, on `ravel_log_lines`. Object B is pruned by ts range
-/// before any GET (zero-GET pruning); object A is fetched once for Plan-phase
-/// stream discovery and once for the Scan-phase read (the documented
-/// double-read, see `log_series.rs`'s module docs), and its 11 records land
-/// in exactly two series (INFO x10, ERROR x1), each sample value `1.0`.
+/// before any GET (zero-GET pruning). Object A's Plan phase reads only its
+/// footer and STREAM_DIR section (ADR-1103 decision 2: no BLOCKS byte), and
+/// its Scan phase then reads the projected column set for its surviving
+/// blocks; no segment is read twice. `with_block_range_threshold(0)` routes
+/// this (small, below the default 512 KiB threshold) fixture through the
+/// same ranged probe-then-section path a production object above the
+/// threshold takes, the way `log_fetcher.rs`'s own tests exercise that path
+/// on small fixtures (e.g. `with_block_range_threshold(0)` at line 5753 and
+/// others in that file).
 #[tokio::test]
 async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     let mem = Arc::new(MemoryStore::new());
     let (ref_a, ref_b) = two_objects(&mem).await;
     let counting = Arc::new(CountingStore::new(mem));
-    let fetcher = LogSegmentFetcher::new(counting.clone() as Arc<dyn ObjectStoreBackend>);
+    let fetcher = LogSegmentFetcher::new(counting.clone() as Arc<dyn ObjectStoreBackend>)
+        .with_block_range_threshold(0)
+        .with_suffix_len(300);
 
     let matchers = [
         LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
@@ -278,23 +401,38 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     assert_eq!(info.labels.get("instance"), Some("i-1"));
     assert_eq!(info.labels.get(METRIC_NAME_LABEL), Some(LOG_LINES_METRIC));
 
-    // Object B was pruned by ts range before any GET; object A cost exactly
-    // two GETs (Plan-phase discovery, Scan-phase read).
+    // Object B was pruned by ts range before any GET. Object A's Plan phase
+    // (footer probe, then a separate range GET for the front STREAM_DIR
+    // section the probe's tail suffix does not cover) and Scan phase (its
+    // own footer probe, then the BLOCKS range reads for the 4 blocks
+    // `small_blocks()` cuts across 11 records) are each pinned exactly, so a
+    // regression that adds or removes a GET on this path is caught by name.
+    // `with_suffix_len(300)` fixes the probe window so these counts do not
+    // depend on the object's incidental total size.
+    let snap = accounting.snapshot();
+    let plan_gets = snap.phase(QueryPhase::Plan).s3_requests(AccountedOp::Get);
+    let scan_gets = snap.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get);
     assert_eq!(
         counting.get_count(),
-        2,
-        "object B pruned pre-GET; object A read twice (Plan + Scan)"
-    );
-    let snap = accounting.snapshot();
-    assert_eq!(
-        snap.phase(QueryPhase::Plan).s3_requests(AccountedOp::Get),
-        1,
-        "Plan-phase discovery issues exactly one GET"
+        plan_gets + scan_gets,
+        "every GET this fetch issues is charged to exactly one of Plan or Scan"
     );
     assert_eq!(
-        snap.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get),
-        1,
-        "Scan-phase read issues exactly one GET"
+        plan_gets, 2,
+        "Plan: one footer probe GET, one STREAM_DIR section GET"
+    );
+    assert_eq!(
+        scan_gets, 6,
+        "Scan: one footer probe GET, plus one BLOCKS range GET per surviving block"
+    );
+
+    let plan_bytes = snap.phase(QueryPhase::Plan).total_s3_bytes();
+    let scan_bytes = snap.phase(QueryPhase::Scan).total_s3_bytes();
+    assert!(
+        plan_bytes < scan_bytes,
+        "Plan reads footer+STREAM_DIR only (no BLOCKS byte); Scan reads the \
+         projected BLOCKS data too, so Plan must move strictly fewer bytes \
+         (plan_bytes={plan_bytes}, scan_bytes={scan_bytes})"
     );
 }
 
@@ -497,5 +635,602 @@ async fn log_series_store_fault_surfaces_as_fetch_error() {
         fault_store.fault_count(Op::Get, ravel_object_store::fault::FaultKind::Transient),
         1,
         "the fault must have fired exactly once"
+    );
+}
+
+/// Finding 3: `s1` (object A + object B) and `s4` (object B) share an
+/// identical label set (`s4`'s only difference, a list-valued `tags`
+/// resource attribute, is excluded from the label set entirely), so a
+/// `job="api"`,`severity_text="ERROR"` selector merges their samples into
+/// one series spanning both segments -- not two series that happen to sort
+/// adjacently. Flip `series.entry(key)` in `fetch_log_series` (log_series.rs)
+/// to key on `record.stream_id` instead of the label-set bytes and this test
+/// fails with `series.len() == 3` (s1-in-A, s1-in-B, s4 no longer merge).
+#[tokio::test]
+async fn log_series_merges_streams_with_identical_label_sets() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "api"),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+    ];
+    let req = lines_request(&matchers, full_window());
+    let accounting = PhaseAccounting::new();
+
+    let out = fetch_log_series(&fetcher, TENANT, &[ref_a, ref_b], &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+
+    assert_eq!(
+        out.segments_fetched, 2,
+        "both objects hold a job=api severity_text=ERROR stream"
+    );
+    assert_eq!(out.segments_pruned, 0);
+    assert_eq!(
+        out.series.len(),
+        1,
+        "s1 (A and B) and s4 (B) share a label set and merge into one series"
+    );
+
+    let series = &out.series[0];
+    assert_eq!(
+        series.samples.len(),
+        8,
+        "5 from s1 in A, 2 from s1 in B, 1 from s4 in B"
+    );
+    let mut tss: Vec<i64> = series.samples.iter().map(|s| s.ts_ns).collect();
+    tss.sort_unstable();
+    assert_eq!(tss, vec![100, 101, 102, 102, 103, 300, 301, 303]);
+
+    let mut names: Vec<&str> = series.labels.iter().map(|l| l.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec![
+            "__name__",
+            "job",
+            "k8s_pod_name",
+            "otel_scope_name",
+            "otel_scope_version",
+            "severity_text",
+        ],
+        "no instance (never set), no tags (list-valued, excluded from the label set)"
+    );
+    assert_eq!(series.labels.get("job"), Some("api"));
+    assert_eq!(series.labels.get("k8s_pod_name"), Some("p1"));
+    assert_eq!(series.labels.get("instance"), None);
+    assert_eq!(series.labels.get("tags"), None);
+}
+
+/// Finding 3: `ravel_log_bytes` over the same 8 records sums to exactly 73
+/// (11 + 18 + 5 + 5 + 15 + 5 + 5 + 9, see [`promql_over_logs_fixture`]'s
+/// doc). Flip `record.body.len() as f64` to `1.0` in `fetch_log_series` (the
+/// `LogMetric::Bytes` arm) and this test fails with `sum == 8.0`.
+#[tokio::test]
+async fn log_series_bytes_metric_sums_all_body_lengths_exactly() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_BYTES_METRIC),
+        LabelMatcher::equal("job", "api"),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+    ];
+    let req = LogSeriesRequest {
+        metric: LogMetric::Bytes,
+        ..lines_request(&matchers, full_window())
+    };
+    let accounting = PhaseAccounting::new();
+
+    let out = fetch_log_series(&fetcher, TENANT, &[ref_a, ref_b], &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+
+    assert_eq!(out.series.len(), 1);
+    assert_eq!(out.series[0].samples.len(), 8);
+    let total: f64 = out.series[0].samples.iter().map(|s| s.value).sum();
+    assert_eq!(
+        total, 73.0,
+        "sum of all 8 job=api severity=ERROR body lengths"
+    );
+}
+
+/// Finding 3 (F2b's severity non-equality post-filter, applied here at
+/// fixture scale): `severity_text=~"ERR.*"` matches all 8 ERROR records
+/// (proving the regex postfilter runs, not just the equality fast path);
+/// `severity_text!="ERROR"` matches `s1`'s 3 INFO records (`s4` carries none).
+/// Flip the postfilter's `.all(...)` to `.any(...)` in `fetch_log_series` and
+/// the `!=` case fails with `total == 11` (every record passes an `any` over
+/// a single always-different-from-"ERROR"-once-negated matcher).
+#[tokio::test]
+async fn log_series_severity_regex_and_negation_counts() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let refs = [ref_a, ref_b];
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "api"),
+        LabelMatcher::regex(SEVERITY_LABEL, "ERR.*").unwrap(),
+    ];
+    let req = lines_request(&matchers, full_window());
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+    let total: usize = out.series.iter().map(|s| s.samples.len()).sum();
+    assert_eq!(
+        total, 8,
+        "severity_text=~\"ERR.*\" matches all 8 ERROR records"
+    );
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "api"),
+        LabelMatcher::not_equal(SEVERITY_LABEL, "ERROR"),
+    ];
+    let req = lines_request(&matchers, full_window());
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+    let total: usize = out.series.iter().map(|s| s.samples.len()).sum();
+    assert_eq!(
+        total, 3,
+        "severity_text!=\"ERROR\" matches s1's 3 INFO records"
+    );
+}
+
+/// Finding 1 (F1), at fixture scale: `__body__=~".*timeout.*"` finds the two
+/// `user.id=u1` records, `!~".*timeout.*"` finds the other 6, an exact match
+/// on the fixture's one unique body finds 1, and an unanchored `"timeout"`
+/// pattern (no wildcards) finds 0 -- proving `__body__` regexes are fully
+/// anchored. Flip `body_matchers` (log_series.rs) back to filtering
+/// `stream_matchers`'s already-`__body__`-excluded list and every assertion
+/// here fails: `.all()` over an empty slice is vacuously true, so all four
+/// become "matches everything" (8, 8, 8, 8).
+#[tokio::test]
+async fn log_series_body_matcher_counts_on_the_fixture() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let refs = [ref_a, ref_b];
+
+    async fn count(
+        fetcher: &LogSegmentFetcher,
+        refs: &[SegmentRef],
+        matchers: &[LabelMatcher],
+    ) -> usize {
+        let req = lines_request(matchers, full_window());
+        let accounting = PhaseAccounting::new();
+        let out = fetch_log_series(fetcher, TENANT, refs, &req, &accounting)
+            .await
+            .expect("fetch_log_series");
+        out.series.iter().map(|s| s.samples.len()).sum()
+    }
+
+    let base = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "api"),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+    ];
+
+    let mut m = base.to_vec();
+    m.push(LabelMatcher::regex(BODY_MATCHER_LABEL, ".*timeout.*").unwrap());
+    assert_eq!(
+        count(&fetcher, &refs, &m).await,
+        2,
+        "__body__=~\".*timeout.*\""
+    );
+
+    let mut m = base.to_vec();
+    m.push(LabelMatcher::not_regex(BODY_MATCHER_LABEL, ".*timeout.*").unwrap());
+    assert_eq!(
+        count(&fetcher, &refs, &m).await,
+        6,
+        "__body__!~\".*timeout.*\""
+    );
+
+    let mut m = base.to_vec();
+    m.push(LabelMatcher::equal(BODY_MATCHER_LABEL, "solo-exact-body"));
+    assert_eq!(
+        count(&fetcher, &refs, &m).await,
+        1,
+        "__body__ exact match on a unique body"
+    );
+
+    let mut m = base.to_vec();
+    m.push(LabelMatcher::regex(BODY_MATCHER_LABEL, "timeout").unwrap());
+    assert_eq!(
+        count(&fetcher, &refs, &m).await,
+        0,
+        "unanchored \"timeout\" pattern requires the whole body to equal it"
+    );
+}
+
+/// Finding 3: a windowless erasure on `user.id=u1` drops both records that
+/// carry it (ts 100 and 101), leaving 6 of the 8 `job=api` ERROR samples, and
+/// the `ravel_log_bytes` sum drops by exactly their two lengths (73 - 11 -
+/// 18 = 44). A predicate windowed to `[101, 102)` erases only the ts=101
+/// record, leaving 7. Flip `retain_log_records`'s `!p.has_window() ||
+/// p.ts_in_window(...)` to `&&` in erasure.rs and the windowless case fails
+/// (a predicate with no window has `has_window() == false`, so `&&` makes
+/// its match always false and nothing is erased: `total == 8`).
+#[tokio::test]
+async fn log_series_erasure_excludes_matching_records_and_their_bytes() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let refs = [ref_a, ref_b];
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "api"),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+    ];
+
+    let windowless = [ErasurePredicate::windowless(vec![(
+        "user.id".to_string(),
+        "u1".to_string(),
+    )])];
+    let req = LogSeriesRequest {
+        erasure: &windowless,
+        ..lines_request(&matchers, full_window())
+    };
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+    let total: usize = out.series.iter().map(|s| s.samples.len()).sum();
+    assert_eq!(total, 6, "windowless erasure drops both user.id=u1 records");
+
+    let bytes_matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_BYTES_METRIC),
+        LabelMatcher::equal("job", "api"),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+    ];
+    let bytes_req = LogSeriesRequest {
+        metric: LogMetric::Bytes,
+        erasure: &windowless,
+        ..lines_request(&bytes_matchers, full_window())
+    };
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &refs, &bytes_req, &accounting)
+        .await
+        .expect("fetch_log_series");
+    let sum: f64 = out
+        .series
+        .iter()
+        .flat_map(|s| &s.samples)
+        .map(|s| s.value)
+        .sum();
+    assert_eq!(
+        sum, 44.0,
+        "73 total minus \"timeout-one\" (11) and \"timeout-two-longer\" (18)"
+    );
+
+    let windowed = [ErasurePredicate::new(
+        vec![("user.id".to_string(), "u1".to_string())],
+        101,
+        102,
+    )];
+    let req = LogSeriesRequest {
+        erasure: &windowed,
+        ..lines_request(&matchers, full_window())
+    };
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+    let total: usize = out.series.iter().map(|s| s.samples.len()).sum();
+    assert_eq!(
+        total, 7,
+        "the [101, 102) window excludes ts=100, so only the ts=101 record is erased"
+    );
+}
+
+/// Finding 3: `job=~"api|worker"` selects `s1`+`s4` (merged, `job="api"`)
+/// and `s2` (`job="worker"`) -- 2 series. `s3` (`job="pay/api"`) does not
+/// match `"api|worker"` and is excluded. With `max_series: 1` the second
+/// distinct series trips `SeriesExceeded`. Flip the anchoring `Self::compiled`
+/// applies to a regex pattern (drop the `^(?:...)$` wrap in
+/// `ravel-promql/src/source.rs`) and `s3` would also match unanchored
+/// `"api|worker"` (its job value contains neither as a full match, so this
+/// particular flip does not change this test's count, but the exact-count
+/// assertion here is what catches a regression that widened the match set).
+#[tokio::test]
+async fn log_series_two_jobs_two_series_and_max_series_trips() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let refs = [ref_a, ref_b];
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::regex("job", "api|worker").unwrap(),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+    ];
+    let req = lines_request(&matchers, full_window());
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+    assert_eq!(
+        out.series.len(),
+        2,
+        "job=api (s1+s4 merged) and job=worker (s2)"
+    );
+
+    let req = LogSeriesRequest {
+        max_series: 1,
+        ..lines_request(&matchers, full_window())
+    };
+    let accounting = PhaseAccounting::new();
+    let err = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+        .await
+        .expect_err("two distinct job series exceed max_series=1");
+    match err {
+        LogSeriesError::SeriesExceeded { count, max } => {
+            assert_eq!(count, 2);
+            assert_eq!(max, 1);
+        }
+        other => panic!("expected SeriesExceeded, got {other:?}"),
+    }
+}
+
+/// Finding 3 (F2b's no-matching-stream segment prune): `job="nomatch"`
+/// matches no stream in either object, so both are pruned after Plan-phase
+/// STREAM_DIR discovery and neither reaches Scan. Every GET this fetch
+/// issues is therefore a Plan-phase STREAM_DIR read (one whole-object GET
+/// per object, both fixture objects being under the default
+/// `block_range_threshold`) and Scan issues none. Flip the `if
+/// matching_streams.is_empty() { segments_pruned += 1; continue; }` guard in
+/// `fetch_log_series` to a no-op and this test fails: `scan_gets` becomes
+/// nonzero (both objects proceed to Scan despite matching no stream).
+#[tokio::test]
+async fn log_series_nomatch_job_prunes_both_segments_with_zero_scan_gets() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let counting = Arc::new(CountingStore::new(mem));
+    let fetcher = LogSegmentFetcher::new(counting.clone() as Arc<dyn ObjectStoreBackend>);
+    let refs = [ref_a, ref_b];
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "nomatch"),
+    ];
+    let req = lines_request(&matchers, full_window());
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+
+    assert!(out.series.is_empty());
+    assert_eq!(
+        out.segments_pruned, 2,
+        "no stream in either object has job=nomatch"
+    );
+    assert_eq!(out.segments_fetched, 0);
+
+    let snap = accounting.snapshot();
+    let plan_gets = snap.phase(QueryPhase::Plan).s3_requests(AccountedOp::Get);
+    let scan_gets = snap.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get);
+    assert_eq!(
+        scan_gets, 0,
+        "Scan phase never runs: both segments pruned in Plan"
+    );
+    assert_eq!(
+        plan_gets, 2,
+        "one whole-object GET per object for STREAM_DIR discovery"
+    );
+    assert_eq!(
+        counting.get_count(),
+        plan_gets,
+        "every GET this fetch issues is a Plan-phase STREAM_DIR read"
+    );
+}
+
+/// Finding 3: a stream matcher on a label no series carries follows PromQL's
+/// absent-as-empty-string rule (`ravel-promql/src/matchers.rs`):
+/// `instance!=""` excludes every `job=api` series (absent reads as `""`, and
+/// `"" != ""` is false), while `instance=""` and `instance!~".+"` keep all 11
+/// `job=api` samples. Flip `LabelMatcher::is_match`'s `labels.get(&self.name)
+/// .unwrap_or("")` to `.unwrap_or("<absent>")` and the `instance=""` case
+/// fails (`"<absent>" == ""` is false, so it would exclude everything
+/// instead of keeping it).
+#[tokio::test]
+async fn log_series_absent_label_matcher_follows_promql_empty_string_rule() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let refs = [ref_a, ref_b];
+
+    let base = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "api"),
+    ];
+
+    for (extra, expect_total, label) in [
+        (LabelMatcher::not_equal("instance", ""), 0, "instance!=\"\""),
+        (LabelMatcher::equal("instance", ""), 11, "instance=\"\""),
+        (
+            LabelMatcher::not_regex("instance", ".+").unwrap(),
+            11,
+            "instance!~\".+\"",
+        ),
+    ] {
+        let mut matchers = base.to_vec();
+        matchers.push(extra);
+        let req = lines_request(&matchers, full_window());
+        let accounting = PhaseAccounting::new();
+        let out = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+            .await
+            .expect("fetch_log_series");
+        let total: usize = out.series.iter().map(|s| s.samples.len()).sum();
+        assert_eq!(
+            total, expect_total,
+            "{label}: instance is absent on every job=api series"
+        );
+    }
+}
+
+/// Finding 3: a window covering only object A's ts range fetches exactly one
+/// segment.
+#[tokio::test]
+async fn log_series_window_covering_only_object_a_fetches_one_segment() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, ref_b) = promql_over_logs_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "api"),
+    ];
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: 200,
+    };
+    let req = lines_request(&matchers, window);
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &[ref_a, ref_b], &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+
+    assert_eq!(out.segments_fetched, 1, "only object A overlaps [0, 200]");
+}
+
+/// Finding 1 (F1), reproducing the review's exact bodies: `ok`, `ok`, `boom`,
+/// `request timeout`. `__body__="ok"` finds the two exact matches,
+/// `=~".*timeout.*"` finds the "request timeout" record, `!~".*timeout.*"`
+/// finds the other three, and an unanchored `=~"timeout"` pattern (no
+/// wildcards) finds none. Flip `body_matches`'s `.all(...)` to `.any(...)`
+/// in log_series.rs and `!~".*timeout.*"` fails: `.any()` over one negated
+/// matcher is the same predicate as `.all()` here (a single matcher), so the
+/// flip that actually changes this test's outcome is the one already named
+/// in `log_series_body_matcher_counts_on_the_fixture`'s doc (restoring the
+/// `stream_matchers`-filtered list, which drops every `__body__` matcher and
+/// makes all four counts here 4 instead of 2/1/3/0).
+#[tokio::test]
+async fn log_series_body_matcher_review_probe_ok_ok_boom_request_timeout() {
+    let mem = Arc::new(MemoryStore::new());
+    let resource = [("service.name", AttrValue::Str("bodyprobe".to_string()))];
+    let records = vec![
+        resource_record(&resource, 1, "INFO", "ok", &[]),
+        resource_record(&resource, 2, "INFO", "ok", &[]),
+        resource_record(&resource, 3, "INFO", "boom", &[]),
+        resource_record(&resource, 4, "INFO", "request timeout", &[]),
+    ];
+    let ref_a = write_object(&mem, "logs/bodyprobe.rlog", &records).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let refs = [ref_a];
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: 10,
+    };
+
+    async fn count(
+        fetcher: &LogSegmentFetcher,
+        refs: &[SegmentRef],
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+    ) -> usize {
+        let req = lines_request(matchers, window);
+        let accounting = PhaseAccounting::new();
+        let out = fetch_log_series(fetcher, TENANT, refs, &req, &accounting)
+            .await
+            .expect("fetch_log_series");
+        out.series.iter().map(|s| s.samples.len()).sum()
+    }
+
+    let base = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "bodyprobe"),
+    ];
+
+    let mut m = base.to_vec();
+    m.push(LabelMatcher::equal(BODY_MATCHER_LABEL, "ok"));
+    assert_eq!(
+        count(&fetcher, &refs, &m, window).await,
+        2,
+        "__body__=\"ok\""
+    );
+
+    let mut m = base.to_vec();
+    m.push(LabelMatcher::regex(BODY_MATCHER_LABEL, ".*timeout.*").unwrap());
+    assert_eq!(
+        count(&fetcher, &refs, &m, window).await,
+        1,
+        "__body__=~\".*timeout.*\""
+    );
+
+    let mut m = base.to_vec();
+    m.push(LabelMatcher::not_regex(BODY_MATCHER_LABEL, ".*timeout.*").unwrap());
+    assert_eq!(
+        count(&fetcher, &refs, &m, window).await,
+        3,
+        "__body__!~\".*timeout.*\""
+    );
+
+    let mut m = base.to_vec();
+    m.push(LabelMatcher::regex(BODY_MATCHER_LABEL, "timeout").unwrap());
+    assert_eq!(
+        count(&fetcher, &refs, &m, window).await,
+        0,
+        "__body__=~\"timeout\" (unanchored) requires the whole body to equal it"
+    );
+}
+
+/// Finding 2b (F3) item 4: `fetch_log_series`'s final per-series
+/// `RlogWriter::finish` sorts every object's own rows by `(stream_ref, ts)`
+/// (crates/ravel-logseg/src/writer.rs), so within one object the scan already
+/// comes back ts-ascending regardless of push order: a single-object fixture
+/// cannot exercise `fetch_log_series`'s own
+/// `samples.sort_by_key(|s| s.ts_ns)`. Two objects for the same stream can:
+/// each object is internally sorted, but the segment loop pushes object A's
+/// records before object B's, so the per-series `Vec<Sample>` accumulates
+/// [50, 60] then [10, 20] before the final sort reorders it. Flip
+/// `samples.sort_by_key(|s| s.ts_ns)` to a no-op and this test fails: the
+/// samples come back in segment-scan order, [50, 60, 10, 20].
+#[tokio::test]
+async fn log_series_samples_come_back_ts_sorted_across_segments() {
+    let mem = Arc::new(MemoryStore::new());
+    let resource = [("service.name", AttrValue::Str("sortcheck".to_string()))];
+    let later = vec![
+        resource_record(&resource, 50, "INFO", "r1", &[]),
+        resource_record(&resource, 60, "INFO", "r2", &[]),
+    ];
+    let earlier = vec![
+        resource_record(&resource, 10, "INFO", "r3", &[]),
+        resource_record(&resource, 20, "INFO", "r4", &[]),
+    ];
+    let ref_a = write_object(&mem, "logs/sort-a.rlog", &later).await;
+    let ref_b = write_object(&mem, "logs/sort-b.rlog", &earlier).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "sortcheck"),
+    ];
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: 100,
+    };
+    let req = lines_request(&matchers, window);
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &[ref_a, ref_b], &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+
+    assert_eq!(out.series.len(), 1);
+    let tss: Vec<i64> = out.series[0].samples.iter().map(|s| s.ts_ns).collect();
+    assert_eq!(
+        tss,
+        vec![10, 20, 50, 60],
+        "ascending, even though segment A (later timestamps) is scanned before segment B"
     );
 }
