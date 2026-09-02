@@ -4601,6 +4601,7 @@ dependencies = [
  "pprof",
  "proptest",
  "prost",
+ "ravel-cache",
  "ravel-catalog",
  "ravel-commit",
  "ravel-ingest",

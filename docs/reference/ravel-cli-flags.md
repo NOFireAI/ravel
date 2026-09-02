@@ -460,6 +460,21 @@ List every entry's tenant id and a short token fingerprint. Never prints a raw t
 | --- | --- | --- | --- |
 | `--deployment-key-file` |  |  | Path to the bucket's 32-byte deployment key (64 hex characters or 32 raw bytes); the same key used for `--tenant-hash-key-file` |
 
+## cache
+
+Operate on a node's local read-cache directory (ADR-0046). A local filesystem tool: it takes no `--store` and never touches object storage
+
+_No flags._
+
+### cache reclaim-legacy
+
+Reclaim pre-namespacing local disk-cache files (issue #826)
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--apply` |  |  | Delete the legacy files. Without this, the command only lists them |
+| `--cache-dir` |  |  | The node's configured read-cache directory (the server's `--read-cache-dir`) |
+
 ## load
 
 Bulk-import a Parquet file into the logs signal (ADR-0089)

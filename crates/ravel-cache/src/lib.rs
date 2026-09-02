@@ -91,7 +91,7 @@ pub mod tiered;
 
 pub use cache::Cache;
 pub use clock::{Clock, SystemClock};
-pub use disk::DiskCache;
+pub use disk::{DiskCache, ReclaimReport, RootEntryKind, classify_root_entry, reclaim_legacy};
 pub use key::CacheKey;
 pub use limits::{CacheLimits, DEFAULT_MAX_ENTRY_AGE_NS, DEFAULT_SWEEP_INTERVAL_NS};
 pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
