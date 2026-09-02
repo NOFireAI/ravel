@@ -1,0 +1,45 @@
+# Nightly TLA+ exhaustive model check (ADR-1113).
+#
+# The per-PR tla job in ci.yml runs the fast lane (smoke + negative +
+# traceability) only when a formal/ or harness change is in the diff. This
+# workflow runs the full exhaustive lane (full safety plus liveness, no
+# symmetry reduction) over every area every night, since exhaustive is too
+# slow for the per-PR budget. A red run here is a real invariant break or a
+# state-count regression, never a retry: TLC is deterministic for a fixed
+# config.
+#
+# workflow_dispatch exists to verify the job on a pushed branch (no local gate
+# can execute a workflow) and to run it ad hoc.
+name: tla-nightly
+
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tla-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  exhaustive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Exhaustive model check
+        run: scripts/check-tla.sh exhaustive
+      - name: Upload TLC logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tla-nightly-logs
+          path: .cache/tla/logs
+          if-no-files-found: ignore
