@@ -96,10 +96,11 @@ OTLP charges the decompressed size so that two tenants
 sending identical telemetry are charged identically regardless of a client-side
 compression setting. Remote Write still charges the compressed body length;
 this asymmetry is deliberate, and the inconsistency is acknowledged
-rather than papered over. The practical effect: a gzip OTLP client's
-effective byte-rate allowance drops relative to an uncompressed client of the
-same nominal rate, because it is now charged for what it actually sent rather
-than what it put on the wire.
+rather than papered over. The practical effect: a gzip OTLP client spends its
+byte-rate allowance at the rate of its decompressed telemetry, so its wire
+rate understates its token spend by its compression ratio; two clients
+sending the same telemetry spend the same tokens whether or not they
+compress.
 
 To keep rejection cheap for an already-over-rate tenant, the gzip path does a
 compressed-size pre-check first: the compressed length is a strict lower bound

@@ -148,8 +148,11 @@ Files move only where the move buys comprehension:
 
 New pages, each of which answers a question the tree cannot answer today:
 `docs/concepts.md`, `docs/guides/alerting.md`,
-`docs/reference/http-api.md`, `docs/reference/cli.md`,
-`docs/reference/metrics.md`, and the troubleshooting page above.
+`docs/reference/http-api.md`, the generated
+`docs/reference/ravel-server-flags.md` and `docs/reference/ravel-cli-flags.md`
+(decision 4), and the troubleshooting page above. The metrics catalog stays
+in `docs/guides/observability.md` rather than becoming a reference page,
+because every metric family there needs its reading, not only its name.
 
 Frozen-format specs (`docs/segment-format.md`,
 `docs/log-segment-format.md`, `docs/span-segment-format.md`,
@@ -241,7 +244,9 @@ ships with `scripts/docs_lint_baseline.txt`, a file listing every finding
 that exists at that moment. The gate fails on any finding not in the
 baseline. Each documentation task deletes the baseline entries it fixes,
 and the final task deletes the file. The baseline's line count is the
-epic's progress measure, and it reaches zero before the epic closes.
+epic's progress measure, and it reaches zero before the epic closes. It
+did: the file was deleted at zero within the epic, and the gate now fails
+every finding.
 
 The starting count, measured on the tree rather than estimated: 382
 decision-record citations and 53 issue references across the user-facing

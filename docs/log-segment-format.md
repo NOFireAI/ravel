@@ -929,14 +929,15 @@ The merge is defined entirely in terms of this format:
   merged into one global sorted stream ordering across all inputs. This
   ordering is used for iteration order (streams are merged in sorted
   `stream_id` order), for the cross-object identity check, and for
-  splitting output on disjoint part boundaries (a stream never straddles
-  two parts). It is not itself written to any object: when the merge
-  splits into multiple parts, each part's own `STREAM_DIR` is built fresh
-  by `RlogWriter` from only the streams that landed in that part, with
-  dense `stream_ref` ordinals starting at zero per part, exactly as an
-  ordinary L0 write already does. So there is no single merged directory
-  shared across the output; the global ordering governs the merge, and
-  each part re-derives its own local `stream_ref` numbering. Because
+  splitting output on disjoint output-segment boundaries (a stream never
+  straddles two output segments). It is not itself written to any object:
+  when the merge splits into multiple output segments, each segment's own
+  `STREAM_DIR` is built fresh by `RlogWriter` from only the streams that
+  landed in it, with dense `stream_ref` ordinals starting at zero per
+  segment, exactly as an ordinary L0 write already does. So there is no
+  single merged directory shared across the output; the global ordering
+  governs the merge, and each output segment re-derives its own local
+  `stream_ref` numbering. Because
   `stream_id` is the canonical hash of a stream's resource+scope blob,
   two inputs may list the same `stream_id` only with byte-identical
   blobs; a disagreement is an upstream identity violation or a hash
@@ -975,8 +976,9 @@ row group is what one ranged GET brings (under version 4 a block's pages
 are spread across the group's column chunks, so no smaller contiguous
 range holds a whole block), and the group's blocks are decoded one at a
 time out of those bytes, each released before the next. The one term that
-scales with the data is the in-progress part's own buffer, bounded by the
-part size cap, because a part's content-addressed key does not exist until
+scales with the data is the in-progress output segment's own buffer, bounded
+by the segment size cap, because a segment's content-addressed key does not
+exist until
 the whole part is encoded.
 
 ## Tokenizer

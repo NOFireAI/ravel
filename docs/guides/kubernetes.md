@@ -376,7 +376,7 @@ Each of the operator's three Deployments maps to one storage credential role:
 |---|---|---|---|
 | `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt) plus catalog fold writes, plus fleet-admission reconciliation snapshots. No delete. |
 | `<name>-query` | `query` | Query | Reads commit and catalog objects, runs fold, appends query audit. No delete. |
-| `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep. The only one granted any delete, and only over `l0/`, `l1/`, `c/`, `idem/`. |
+| `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep. The only one granted any delete, and only over `l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `t/*/u/*/0001/*`. |
 
 A fourth role, **Admin**, backs `ravel-cli` and is deliberately not managed by
 the operator: there is no CRD field for it and no pod runs it. It is used only

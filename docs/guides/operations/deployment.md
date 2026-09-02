@@ -102,9 +102,9 @@ staging profile field to gate on.
 
 ## The first deployment against a fresh bucket
 
-Two control objects are written by whichever process boots first against an
-empty bucket, which is why their write grants are slightly broader than the
-per-role tables imply. Know this before your first deployment:
+Two control objects are created on first contact with an empty bucket, which
+is why their write grants are slightly broader than the per-role tables imply.
+Know this before your first deployment:
 
 - **`sys/tenancy`**, the marker that pins the tenant hash scheme, is created by
   whichever of the three server roles reaches a fresh bucket first. That is why
@@ -113,10 +113,15 @@ per-role tables imply. Know this before your first deployment:
   or delete an existing object, and `sys/tenancy` is deny-delete for every role.
   The effect is only that a fresh operator-managed cluster boots without a
   manual bootstrap step.
-- **`sys/gc`**, the durable garbage-collection configuration, is bootstrapped by
-  Maintain on a fresh bucket, hence Maintain's write grant on it. The mutation
-  path that changes an existing `sys/gc` is Admin-only, matching that it is an
-  explicit operator action rather than something a server does on its own.
+- **`sys/gc`**, the durable garbage-collection configuration, is created by
+  the first process to reach a fresh bucket, and only the Maintain and Admin
+  roles carry a write grant on it. Under per-role credentials, start the
+  `maintain` process first on a fresh bucket, or create the object with
+  `ravel-cli gc-config set` under Admin; a gateway or query process that
+  reaches an empty bucket under its scoped credential cannot create the object
+  and does not start. The mutation path that changes an existing `sys/gc` is
+  Admin-only, matching that it is an explicit operator action rather than
+  something a server does on its own.
 
 `sys/qualification` gets no such exception. It is written by the Admin
 credential running `store qualify`, one time for the life of the bucket, and no

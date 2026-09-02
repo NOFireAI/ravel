@@ -73,9 +73,10 @@ rejected point counts and reasons.
 - A query resolves one snapshot (a logical set of immutable segments) and
   uses it for its entire execution. Commits, compactions, and deletions that
   land mid-query do not affect it.
-- Compaction transactions atomically swap inputs for outputs in new
-  snapshots; both sets remain physically present until GC clears the inputs
-  after the protection horizon.
+- Compaction publishes its outputs beside its inputs. A snapshot resolved
+  after the compaction record exists excludes the inputs it names; both sets
+  remain physically present until GC clears the inputs after the protection
+  horizon.
 
 ## Crash matrix (strict mode)
 
@@ -316,9 +317,12 @@ straggler slack window.
 
 ## Deletion and GC
 
-Every deletion in Ravel is a durable transaction first (a tombstone,
-compaction record, or rewrite record), then logical exclusion from newly
-resolved snapshots, then physical removal by a sweep. Only a `maintain` mode
+Every deletion of published data in Ravel is a durable transaction first (a
+retention tombstone, a compaction record, or a rewrite record), then logical
+exclusion from newly resolved snapshots, then physical removal by a sweep.
+The one deletion with no record is orphan collection, which removes data
+objects no commit record ever published; it is gated by age and by a fresh
+re-listing of the commit records instead. Only a `maintain` mode
 process runs compaction, retention, the sweep, and the scrubber; a deployment
 with no `maintain` process never deletes an object.
 
@@ -350,7 +354,7 @@ are a guarantee, not a target:
 |---|---|---|
 | Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within `max_query_duration` (30 s) |
 | Rewrite complete (`.done`) | Every live commit-record segment a snapshot resolves is free of matching records, verified through the catalog resolver. Index entries and derived datasets carry no subject values, so they are free of matching records by construction | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric |
-| Physical bytes gone from the bucket | Superseded inputs swept | `.done` + `protection_horizon` (default `max_query_duration` + `grace` = 30 s + 24 h) + one sweep interval; with defaults, under 4 days end to end |
+| Physical bytes gone from the bucket | Superseded inputs swept | `.done` + `protection_horizon` (default `max_query_duration` + `grace` + `clock_skew_allowance` = 1 h + 24 h + 5 min) + one sweep interval (default 5 min); with defaults, about four days end to end (72 h + 25 h 5 min + 5 min) |
 | Physical bytes gone from query-node disk caches | Non-durable local copies aged out | sweep + disk-tier entry max-age (24 h); or immediately, by deleting cache directories (ADR-0046: a node with its cache directory deleted mid-flight answers every query correctly) |
 
 The mechanism behind these bounds (the durable predicate record, the

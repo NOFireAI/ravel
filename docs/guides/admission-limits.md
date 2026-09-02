@@ -125,8 +125,9 @@ caps the compressed body at 16 MiB ahead of its 64 MiB decompressed cap.
 
 ### Ingest byte rate
 
-Charged on wire body bytes after tenant resolution and before decode, so
-over-rate bytes cost one buffered body and nothing else. A request whose
+Charged after tenant resolution and before decode, on the decompressed body
+for OTLP and on the compressed body for Remote Write, so over-rate bytes cost
+one buffered body and nothing else. A request whose
 size exceeds the available tokens is rejected whole without consuming any
 tokens; a retry after the bucket refills succeeds. This is why the rejection
 is 429 with `Retry-After` and not a partial success: the same request will

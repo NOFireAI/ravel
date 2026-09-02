@@ -47,7 +47,7 @@ The file is JSON with a top-level `rules` array. Each entry is one rule:
     {
       "tenant": "acme",
       "rule_id": "access-denied-burst",
-      "sql": "select count(*) from logs where has_word(body, 'denied')",
+      "sql": "select 1 from logs where has_word(body, 'denied') limit 1",
       "condition": {"type": "non_empty_result"},
       "annotations": {"summary": "denied access log lines in the lookback window"}
     }
@@ -68,7 +68,9 @@ Fields on a rule:
     rule fires when any series value satisfies `value <op> threshold`. `op` is
     one of `gt`, `ge`, `lt`, `le`, `eq`, `ne`.
   - `{"type": "non_empty_result"}` for a SQL rule. The rule fires when the query
-    returns at least one row.
+    returns at least one row, so write the query to return no rows when
+    nothing matched: a bare aggregate such as `count(*)` always returns one
+    row and would fire on every tick.
   - A PromQL query takes a `threshold` condition and a SQL query takes a
     `non_empty_result` condition. The other pairing fails startup, not once per
     tick.

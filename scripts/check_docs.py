@@ -389,8 +389,11 @@ class Repo:
 
     def read(self, rel):
         if rel not in self._text_cache:
-            with open(os.path.join(REPO_ROOT, rel), "r", encoding="utf-8") as fh:
-                self._text_cache[rel] = fh.read()
+            try:
+                with open(os.path.join(REPO_ROOT, rel), "r", encoding="utf-8") as fh:
+                    self._text_cache[rel] = fh.read()
+            except (OSError, UnicodeDecodeError) as exc:
+                raise CheckError(f"cannot read {rel}: {exc}") from exc
         return self._text_cache[rel]
 
     def anchors(self, rel):
@@ -741,8 +744,11 @@ def _localname(tag):
 def check_svg(rel):
     findings = []
     absp = os.path.join(REPO_ROOT, rel)
-    with open(absp, "r", encoding="utf-8") as fh:
-        raw = fh.read()
+    try:
+        with open(absp, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CheckError(f"cannot read {rel}: {exc}") from exc
     try:
         root = ET.fromstring(raw)
     except ET.ParseError as exc:

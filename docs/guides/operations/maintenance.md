@@ -234,7 +234,9 @@ shows the bucket empty but for its tombstone.
 
 - `grace`, default 24h, is the floor for the orphan and unreferenced-L1 age
   gates.
-- `protection_horizon`, default 25h, is the gap between a deletion anchor (a
+- `protection_horizon`, default 25 h 5 min (`max_query_duration` 1 h plus
+  `grace` 24 h plus the 5 min clock-skew allowance), is the gap between a
+  deletion anchor (a
   compaction record's creation time, or a tombstone's retirement time) and
   physical deletion. A query resolved just before the anchor then still has time
   to read the inputs it pinned.
