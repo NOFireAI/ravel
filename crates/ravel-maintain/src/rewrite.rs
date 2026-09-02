@@ -122,6 +122,41 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         start_ns,
     )
     .await;
+    // ADR-0996 task 996-8: the run's store requests and wire bytes, split by
+    // the phase that issued them, emitted on EVERY outcome. A failed run's
+    // request costs are exactly what an operator wants to see (a conservation
+    // abort still paid for its whole read side), so the report sits here in
+    // the wrapper rather than on the success path. Counters only -- nothing in
+    // this crate reads a figure back to route a fetch. Requests are logical
+    // store calls, not billed attempts (that seam is the S3 adapter's,
+    // ADR-0996 decision 3). Received and sent bytes are different kinds and
+    // are never summed with each other or with the decoded-heap peaks. Only
+    // fires when a ledger is installed (never in production today).
+    if let Some(l) = config.request_ledger.as_ref() {
+        let r = l.report();
+        tracing::info!(
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            outcome = if outcome.is_ok() { "ok" } else { "err" },
+            list_requests = r.list.requests,
+            record_read_requests = r.record_read.requests,
+            record_read_wire_bytes_received = r.record_read.wire_bytes_received,
+            catalog_read_requests = r.catalog_read.requests,
+            catalog_read_wire_bytes_received = r.catalog_read.wire_bytes_received,
+            block_read_requests = r.block_read.requests,
+            block_read_wire_bytes_received = r.block_read.wire_bytes_received,
+            part_put_requests = r.part_put.requests,
+            part_put_wire_bytes_sent = r.part_put.wire_bytes_sent,
+            publish_requests = r.publish.requests,
+            publish_wire_bytes_received = r.publish.wire_bytes_received,
+            publish_wire_bytes_sent = r.publish.wire_bytes_sent,
+            total_requests = r.total_requests(),
+            total_wire_bytes_received = r.total_wire_bytes_received(),
+            total_wire_bytes_sent = r.total_wire_bytes_sent(),
+            "compaction store requests by phase (received and sent bytes are different kinds; do not sum them together)"
+        );
+    }
     if let Some(l) = config.request_ledger.as_ref() {
         l.end_run();
     }
@@ -215,40 +250,6 @@ async fn rewrite_and_publish_scoped<C: SegmentCodec>(
             publish_record_encoded_bytes = peaks.publish_record_encoded_bytes,
             probe_bytes = peaks.probe_bytes,
             "compaction peak memory by phase (byte kinds differ per term; do not sum)"
-        );
-    }
-
-    // ADR-0996 task 996-8: the run's store requests and wire bytes, split by the
-    // phase that issued them. Counters only -- nothing in this crate reads a
-    // figure back to route a fetch. Requests are logical store calls, not billed
-    // attempts (that seam is the S3 adapter's, ADR-0996 decision 3). Received
-    // and sent bytes are different kinds and are never summed with each other or
-    // with the decoded-heap peaks above. Only fires when a ledger is installed
-    // (never in production today); installing one is the same one-line service
-    // change the memory tracker needs.
-    if let Some(l) = config.request_ledger.as_ref() {
-        let r = l.report();
-        tracing::info!(
-            signal = ?bucket.signal,
-            shard = bucket.shard,
-            ingest_hour_bucket = bucket.ingest_hour_bucket,
-            parts = parts.len(),
-            list_requests = r.list.requests,
-            record_read_requests = r.record_read.requests,
-            record_read_wire_bytes_received = r.record_read.wire_bytes_received,
-            catalog_read_requests = r.catalog_read.requests,
-            catalog_read_wire_bytes_received = r.catalog_read.wire_bytes_received,
-            block_read_requests = r.block_read.requests,
-            block_read_wire_bytes_received = r.block_read.wire_bytes_received,
-            part_put_requests = r.part_put.requests,
-            part_put_wire_bytes_sent = r.part_put.wire_bytes_sent,
-            publish_requests = r.publish.requests,
-            publish_wire_bytes_received = r.publish.wire_bytes_received,
-            publish_wire_bytes_sent = r.publish.wire_bytes_sent,
-            total_requests = r.total_requests(),
-            total_wire_bytes_received = r.total_wire_bytes_received(),
-            total_wire_bytes_sent = r.total_wire_bytes_sent(),
-            "compaction store requests by phase (received and sent bytes are different kinds; do not sum them together)"
         );
     }
 
