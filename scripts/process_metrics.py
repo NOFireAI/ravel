@@ -6,9 +6,12 @@ before/after.
 Usage: python3 scripts/process_metrics.py [--repo OWNER/NAME] [--output PATH]
 """
 
+from __future__ import annotations
+
 import json
 import re
 import subprocess
+from typing import Optional
 
 DEFAULT_REPO = "NOFireAI/ravel"
 
@@ -70,7 +73,7 @@ def fetch_main_push_runs(repo: str) -> list[dict]:
 _CONFIRMED_FINDINGS_RE = re.compile(r"Confirmed findings:\s+\*\*(\d+)\*\*")
 
 
-def parse_confirmed_findings_count(report_text: str) -> int | None:
+def parse_confirmed_findings_count(report_text: str) -> Optional[int]:
     """Extract the prose 'Confirmed findings: **N**' summary line."""
     m = _CONFIRMED_FINDINGS_RE.search(report_text)
     return int(m.group(1)) if m else None
