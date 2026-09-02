@@ -289,8 +289,10 @@ the inputs it names, and for metrics query-time deduplication also collapses
 any duplicate that slips through, so every intermediate state of a
 compaction is query-correct. The one exception is two compaction records
 over a logs or spans bucket that name different input sets: where those
-sets overlap, the overlapping records are returned twice until an operator
-reconciles the bucket, and a counter says when to. The sweep physically
+sets overlap, the overlapping records are returned twice;
+`ravel_catalog_compaction_input_set_conflicts_total` counts the buckets in
+that state, and since no command reconciles one, a rise in it is the signal
+to investigate the bucket by hand. The sweep physically
 removes only what no live
 snapshot references, and only after a protection horizon. A snapshot
 resolved before, during, or after either loop returns the same rows.
