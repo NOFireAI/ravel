@@ -69,6 +69,16 @@ pub struct SpanIngestMetrics {
     /// Distinct span shard actors observed dead by the router. Counted once
     /// per shard on the first observation, so it never exceeds `shard_count`.
     shard_deaths: AtomicU64,
+    /// Multi-shard Strict writes that returned
+    /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
+    /// committed durably and at least one sibling then failed in the same
+    /// `write()` call. A nonzero value means some clients saw a retryable error
+    /// for data already durable on the committed shards; a blind retry
+    /// re-ingests those shards' spans, and like logs spans have no read-time
+    /// dedup, so retry duplicates unless the client supplies an idempotency key
+    /// (see docs/consistency-model.md). The metrics and log pipelines keep the
+    /// same counter.
+    partial_writes: AtomicU64,
     /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
     /// the span-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
     stale_provisioning_flushes: AtomicU64,
@@ -108,6 +118,10 @@ pub struct SpanIngestMetricsSnapshot {
     pub acks_ok: u64,
     pub acks_err: u64,
     pub shard_deaths: u64,
+    /// Multi-shard Strict writes returned as
+    /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): a partial
+    /// multi-shard commit. Exported as `ingest_partial_writes_total`.
+    pub partial_writes: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
 }
@@ -175,6 +189,14 @@ impl SpanIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One multi-shard Strict write returned as
+    /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
+    /// committed durably before a sibling failed. Recorded once per such write,
+    /// at the router's error construction site.
+    pub(crate) fn record_partial_write(&self) {
+        self.partial_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Adjusts shard `shard`'s in-flight-flush gauge by `delta` (+1 when a
     /// flush task is spawned, -1 when it ends, including on panic via
     /// `span_shard`'s `InFlightFlushGuard`). Poison recovery rather than a
@@ -230,6 +252,7 @@ impl SpanIngestMetrics {
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            partial_writes: self.partial_writes.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
         }
@@ -306,6 +329,13 @@ mod tests {
             SpanIngestMetrics::record_shard_death,
             SpanIngestMetricsSnapshot {
                 shard_deaths: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            SpanIngestMetrics::record_partial_write,
+            SpanIngestMetricsSnapshot {
+                partial_writes: 1,
                 ..Default::default()
             },
         );

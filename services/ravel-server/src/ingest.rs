@@ -211,7 +211,24 @@ pub async fn handle_export(
         .router
         .write_values_with_exemplars(tenant, points, exemplars, mode, state.ack_deadline)
         .await
-        .map_err(IngestRequestError::Write)?;
+        .map_err(|err| {
+            // A PartialWrite's durable siblings are real, durably committed
+            // data (docs/consistency-model.md). OTLP has no error-response
+            // channel to hand their tokens back to the client, so logging the
+            // count is the only recovery this path offers. The metrics pipeline
+            // has no idempotency marker at all: dedup is by `(series_id, ts)` at
+            // read time, so a retry of these siblings is harmless rather than
+            // duplicating.
+            let durable_shard_count = err.durable_tokens().len();
+            if durable_shard_count > 0 {
+                tracing::warn!(
+                    durable_shard_count,
+                    "metric write partially committed before a sibling shard \
+                     failed"
+                );
+            }
+            IngestRequestError::Write(err)
+        })?;
 
     let partial_success = if rejected_count > 0 {
         let error_message = build_error_message(&normalized.rejected, series_cap_rejected);

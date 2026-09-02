@@ -220,7 +220,28 @@ pub async fn handle_export_traces(
         .router
         .write(tenant.clone(), normalized.spans, mode, state.ack_deadline)
         .await
-        .map_err(SpanIngestRequestError::Write)?;
+        .map_err(|err| {
+            // A PartialWrite's durable siblings are real, durably committed
+            // data (docs/consistency-model.md "Opt-in client idempotency
+            // key"). OTLP has no error-response channel to hand their tokens
+            // back to the client, and no idempotency marker is written for
+            // them: the marker replay path always reports the original commit
+            // token with zero rejections, so marking a partial commit as the
+            // request's receipt would make the next retry skip resending the
+            // shard that never committed and permanently lose it, rather than
+            // the honest at-least-once duplication an unkeyed retry gets today.
+            // Logging the count is the only recovery this path offers.
+            let durable_shard_count = err.durable_tokens().len();
+            if durable_shard_count > 0 {
+                tracing::warn!(
+                    durable_shard_count,
+                    "span write partially committed before a sibling shard \
+                     failed; no idempotency marker written for the durable \
+                     siblings"
+                );
+            }
+            SpanIngestRequestError::Write(err)
+        })?;
 
     // Emit partial-success whenever anything was rejected, not only when a
     // whole span was lost: an attribute-only drop must still be surfaced to the
