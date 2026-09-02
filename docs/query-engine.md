@@ -1257,11 +1257,13 @@ It is recorded at existing funnels only, never at scattered call sites:
   region without a second GET), `decompressed_bytes`, `segments_opened`,
   `series_matched`.
 - `LogSegmentFetcher::fetch_accounted` (crates/ravel-query/src/
-  log_fetcher.rs), so the log path can be accounted like the metric path
-  instead of being silently free. `engine.rs` has no references to
-  `LogSegmentFetcher` at all: the real production callers (ravel-sql's
-  `logs_provider`, `alerts_scan`, `audit_scan`, `audit_provider`) still
-  call the unaccounted `fetch`. Wiring them onto this funnel is future work.
+  log_fetcher.rs), so the log path is accounted like the metric path
+  instead of being silently free. `engine.rs` references
+  `LogSegmentFetcher` nowhere; the production callers are ravel-sql's, and
+  they take the accounted funnels: `logs_scan` through
+  `scan_accounted_with_tenant` and `scan_accounted_with_tenant_subset`,
+  `alerts_scan` and `audit_scan` through `fetch_accounted_with_tenant`.
+  The plain `fetch` remains for callers that pass no accounting handle.
 - `Catalog::guarded_get`/`guarded_list_all` (crates/ravel-catalog), for
   every catalog-side store call `Catalog::resolve` makes on the query's
   behalf: `s3_requests`/`s3_bytes` for the resolve LISTs and GETs, plus
