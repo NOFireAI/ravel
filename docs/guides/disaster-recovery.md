@@ -60,8 +60,8 @@ operator runs outside Ravel. Check off all of these:
 
 | Mechanism | What it does | Coverage window |
 |---|---|---|
-| Event-driven function | A function subscribed to object-created events, filtered to the protected prefixes, calls the per-object retention API in compliance mode. | Each object is locked within seconds of its creation. |
-| Scheduled batch job | An S3 Batch Operations job, run on a schedule and driven by an S3 Inventory manifest filtered to the same prefixes, sets the same retention. | Up to the schedule interval plus the inventory delay. |
+| Event-driven function | A function subscribed to object-created events, filtered to the protected prefixes, calls the per-object retention API in compliance mode. Events can be delayed or lost and objects written before the subscription raise none, so it needs durable retry with a dead-letter queue, a one-time backfill over existing versions, and a periodic reconciliation against an all-versions S3 Inventory. | Each object is locked within seconds of its creation; a missed event is covered at the next reconciliation. |
+| Scheduled batch job | An S3 Batch Operations job, run on a schedule and driven by an all-versions S3 Inventory manifest (`IncludedObjectVersions=All`) filtered to the same prefixes, sets the same retention on every listed version, current and noncurrent. | Up to the schedule interval plus the inventory delay plus the job's own execution and retry time. |
 
 Between an object's creation and the moment the mechanism acts on it, the
 object carries no retention and any credential that can delete can delete it.
@@ -70,13 +70,18 @@ mechanism whose window your compliance regime accepts. The AWS reference for
 both is
 [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html).
 
-`--require-bucket-protection` gates startup on it. With the flag set, a bucket
-reporting Object Lock disabled, or a versioning misconfiguration, refuses to
-start; a backend that cannot disclose its state warns once and raises the
-`ravel_bucket_protection_unknown` gauge; a bucket reporting it enabled starts
-clean. The flag is off by default, so an existing deployment is unchanged
-until an operator turns it on. Enforcement itself stays at the bucket and IAM
-layer either way: nothing in a Ravel process can configure Object Lock.
+`--require-bucket-protection` gates startup on the bucket half of that
+posture only: Object Lock enabled and versioning on. With the flag set, a
+bucket reporting Object Lock disabled, or a versioning misconfiguration,
+refuses to start; a backend that cannot disclose its state warns once and
+raises the `ravel_bucket_protection_unknown` gauge; a bucket reporting it
+enabled starts clean. The flag cannot see whether the retention mechanism is
+running, whether every protected object version carries retention, or whether
+a bucket default retention is set; those are verified out of band with the
+commands under "Verification" below. The flag is off by default, so an
+existing deployment is unchanged until an operator turns it on. Enforcement
+itself stays at the bucket and IAM layer either way: nothing in a Ravel
+process can configure Object Lock.
 
 What the levels below add on top of that baseline is replication, and, at
 level 2, a **bucket default retention** across every object including the data
@@ -214,8 +219,12 @@ aws s3api get-object-lock-configuration --bucket <primary>
 
 # The scoped posture, at every level: a recent object under a protected
 # prefix carries per-object retention in compliance mode. Repeat for one
-# object per protected prefix family.
+# object per protected prefix family, and for one noncurrent version (a
+# superseded catalog HEAD is a good candidate): a mechanism fed by a
+# current-version-only inventory leaves noncurrent versions unlocked.
 aws s3api get-object-retention --bucket <primary> --key <recent-protected-key>
+aws s3api list-object-versions --bucket <primary> --prefix <protected-prefix> --max-keys 5
+aws s3api get-object-retention --bucket <primary> --key <protected-key> --version-id <noncurrent-version-id>
 ```
 
 Confirm in the replication output that `DeleteMarkerReplication` is `Enabled`
@@ -282,17 +291,22 @@ verified operation.
    and only for compaction.
 4. **Verify before serving.** `verify-custody` clean, `catalog verify` clean,
    and a canary query set over known-ingested data.
-5. **Resume.** Start Ravel against the restored bucket. Disposable compute
+5. **Re-protect before the first process starts.** The restore bucket must
+   meet the baseline before Ravel writes to it: versioning on, Object Lock
+   enabled with no default retention, and the retention mechanism pointed at
+   the restore bucket and backfilled over the restored objects. Objects
+   restored before the mechanism runs carry no retention, so run the backfill
+   and confirm one current and one noncurrent version per protected prefix
+   family carries retention, with the commands under "Verification". The
+   startup flag checks only the bucket half of this; the mechanism is verified
+   by hand.
+6. **Resume.** Start Ravel against the restored bucket. Disposable compute
    pays off here: processes mint fresh writer ids and epochs, no local state
    exists to reconcile, and the operator issues fresh per-mode storage
    credentials scoped to the restore bucket.
-6. **Re-protect.** Re-establish versioning, lifecycle rules, Object Lock on
-   the restore bucket, the mechanism that applies per-object retention to the
-   protected prefixes, and replication to a new replica before declaring the
-   incident closed. Objects restored before the mechanism is running stay
-   unlocked, so point it at the restore bucket and confirm one object per
-   protected prefix family carries retention. An unreplicated restored primary
-   is level 0.
+7. **Replicate and close out.** Re-establish the lifecycle rules and
+   replication to a new replica before declaring the incident closed. An
+   unreplicated restored primary is level 0.
 
 ## RPO and RTO: defined here, published only from a rehearsal
 
@@ -360,7 +374,7 @@ record: a real end-to-end run against MinIO is what fills a row.
 
 | Level | Controls | Erasure-bound consequence | RPO/RTO |
 |---|---|---|---|
-| **Every level** | Object Lock enabled on the bucket with no bucket default retention, versioning ON, and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history; `--require-bucket-protection` to gate startup on it | None; those prefixes hold no erasable subject value | Not a recovery control |
+| **Every level** | Object Lock enabled on the bucket with no bucket default retention, versioning ON, and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history; `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism and the absence of a default retention are verified out of band | None; those prefixes hold no erasable subject value | Not a recovery control |
 | **level 0** (default) | No replication | None; bounds as in consistency-model.md | None; bucket loss is total loss |
 | **level 1** (recommended) | Primary: versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup. Replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended, `NoncurrentDays = E_v_r` | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |
