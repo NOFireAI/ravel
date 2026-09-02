@@ -10,7 +10,11 @@ without passing all of them.
 This guide covers what each knob does, its shipped default, and exactly what
 a client sees when it trips one. For the read-side query budgets
 (`max_series`/`max_samples`/`max_segments`), see
-[query.md](query.md#query-budgets); those are a different mechanism.
+[query.md](query.md#query-budgets); those are a different mechanism, and
+several of them (`--max-segments`, `--fetch-concurrency`, the two SQL memory
+ceilings, `--cache-max-bytes`, and the engine deadline) are derived from the
+host at startup rather than fixed, so read the resolved values off the startup
+log, not off a compiled-in number.
 
 ## Where limits are configured
 

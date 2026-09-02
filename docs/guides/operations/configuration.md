@@ -929,17 +929,38 @@ overflow column and lose columnar access. Watch for that in
 
 ## Per-query budgets
 
-Four flags bound what one query may spend. Each defaults to the compiled-in
-value.
+Four flags bound what one query may spend. Unset, each is derived from the host
+at startup; set, the flag value is used verbatim. The reference-host column is a
+16-core, 30 GB host, the shape the published ClickBench run used.
 
-| Flag | Default | Choose against |
-|---|---|---|
-| `--fetch-concurrency` | 8 | Host cores and the store's request budget. One knob with three coupled effects: it also sets the SQL scan partition count and the object-store request concurrency. |
-| `--max-segments` | 1024 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. |
-| `--sql-max-query-bytes` | 256 MiB | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. |
-| `--sql-tenant-max-bytes` | 1 GiB | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
+| Flag | Default (unset) | Reference host | Choose against |
+|---|---|---|---|
+| `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Host cores and the store's request budget. One knob with three coupled effects: it also sets the SQL scan partition count and the object-store request concurrency. |
+| `--max-segments` | derived: 1,000,000 | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
+| `--sql-max-query-bytes` | derived: 25% of MemTotal, 256 MiB if memory is unknown | 8,053,063,680 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. Always clamped to `--sql-tenant-max-bytes`. |
+| `--sql-tenant-max-bytes` | derived: 50% of MemTotal, 1 GiB if memory is unknown | 16,106,127,360 | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
 
-The last two are meaningful only in a build with the `sql` feature. See
+Two more settings are derived the same way: `--cache-max-bytes` (80% of
+MemTotal, 256 MiB if memory is unknown) and `--gc-max-query-duration`
+(11 minutes). Memory is read from `/proc/meminfo`'s `MemTotal` on Linux and is
+"unknown" everywhere else; cores come from the process's available parallelism,
+floored at 1. Percentages truncate.
+
+Every resolved value is logged once at startup with the source it came from
+(`derived`, `flag`, or `fallback`), so `journalctl -u ravel-server | grep
+'performance default resolved'` answers "what is this process actually running
+with" without reading the unit file:
+
+```
+INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO performance default resolved setting="max_segments" value=1000000 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived"
+INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived"
+INFO performance default resolved setting="gc_max_query_duration" value=660 source="derived"
+```
+
+The last two flags are meaningful only in a build with the `sql` feature. See
 [the query guide](../query.md#operator-configurable-budgets-server-flags) for
 worked sizing.
 

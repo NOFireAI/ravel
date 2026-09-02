@@ -522,7 +522,8 @@ async fn tenant_kms_config_routes_each_tenants_puts_to_its_own_key() {
         foreground: store,
         kms,
         ..
-    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    } = build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+        .expect("build_store succeeds against the mock S3 endpoint");
     let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
 
     let tenant_kms_config = cli
@@ -628,7 +629,8 @@ async fn s3_kms_key_applies_to_every_put_with_no_tenant_kms_config() {
         foreground: store,
         kms,
         ..
-    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    } = build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+        .expect("build_store succeeds against the mock S3 endpoint");
     assert!(
         kms.is_none(),
         "--s3-kms-key alone must not construct a KmsRoutingStore; it is a plain S3Config field"
@@ -661,7 +663,8 @@ async fn no_tenant_kms_config_routes_no_puts_through_any_kms_key() {
         foreground: store,
         kms,
         ..
-    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    } = build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+        .expect("build_store succeeds against the mock S3 endpoint");
     assert!(
         kms.is_none(),
         "without --tenant-kms-config, build_store must not construct a KmsRoutingStore"
@@ -705,7 +708,8 @@ async fn multipart_puts_carry_the_configured_tenant_kms_key_on_initiate() {
         foreground: store,
         kms,
         ..
-    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    } = build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+        .expect("build_store succeeds against the mock S3 endpoint");
     let kms = kms.expect("--tenant-kms-config must yield a KmsRoutingStore handle");
 
     let tenant_kms_config = cli
@@ -762,7 +766,8 @@ async fn multipart_puts_carry_the_single_s3_kms_key_on_initiate() {
         foreground: store,
         kms,
         ..
-    } = build_store(&cli).expect("build_store succeeds against the mock S3 endpoint");
+    } = build_store(&cli, ravel_server::config::DEFAULT_CACHE_MAX_BYTES)
+        .expect("build_store succeeds against the mock S3 endpoint");
     assert!(
         kms.is_none(),
         "--s3-kms-key alone must not construct a KmsRoutingStore; it is a plain S3Config field"
