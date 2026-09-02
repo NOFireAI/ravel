@@ -338,9 +338,9 @@ This writes ~104 declared columns (every `[[attribute]]` and
   it against an epoch-day integer, not a `DATE` literal. The corpus flags those
   statements `modified` with the conversion stated (see the gap/modification
   notes below). `#432` tracks the date/time ergonomic gap.
-- **No column is skipped for `f64`.** `ColType::F64` attributes cannot be
-  declared (`DeclaredType` has no F64 variant; ADR-0101 / `#431`), so a float
-  column would be skipped here with a stderr warning and stay queryable only
+- **`f64` columns are skipped, and `hits` has none.** `ColType::F64` attributes
+  cannot be declared (`DeclaredType` has no F64 variant; ADR-0101 / `#431`), so a
+  float column would be skipped here with a stderr warning and stay queryable only
   through `attrs['<key>']`. The `hits` schema has **zero** float columns (77
   integer/date/time, 28 text), so this affects nothing here.
 
