@@ -417,9 +417,11 @@ ravel-cli cache reclaim-legacy --cache-dir <dir> --apply  # deletes
 It is a local filesystem tool: it takes no `--store` and never touches object
 storage. **Dry run by default.** With no `--apply` it prints each legacy file it
 would delete and their total bytes, and deletes nothing. `--apply` deletes the
-legacy shard directories and their entry files, and only those: a current
-namespace directory, a foreign file, and anything outside `--cache-dir` are
-never touched.
+matching entry files, regular files at their own canonical legacy path, and
+then removes a legacy shard directory only when that leaves it empty. A
+current namespace directory, a foreign file (which keeps its shard directory
+in place), a symlink or directory carrying an entry-shaped name, and anything
+outside `--cache-dir` are never touched.
 
 **Safe to run while the node is live.** No live code path reads or writes the
 legacy `<cache-dir>/<shard>` layout, so deleting it races no read, write, or

@@ -934,10 +934,18 @@ fn parse_entry_file_key(path: &Path) -> Option<CacheKey> {
 }
 
 /// Whether a directory-entry file is a legacy entry at its own canonical path:
-/// its name decodes to a [`CacheKey`] and `path_for(root, key)` maps back to
-/// exactly this path (which also proves the shard prefix matches
-/// `content_hash[0]`, since that is how `path_for` derives it).
+/// it is a regular file (not a symlink or a directory that merely carries an
+/// entry-shaped name), its name decodes to a [`CacheKey`], and
+/// `path_for(root, key)` maps back to exactly this path (which also proves the
+/// shard prefix matches `content_hash[0]`, since that is how `path_for`
+/// derives it).
 fn is_legacy_entry_file(root: &Path, path: &Path) -> bool {
+    let is_regular_file = fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false);
+    if !is_regular_file {
+        return false;
+    }
     match parse_entry_file_key(path) {
         Some(key) => path_for(root, &key) == path,
         None => false,
@@ -1026,10 +1034,12 @@ pub fn reclaim_legacy(root: &Path, apply: bool) -> std::io::Result<ReclaimReport
         paths: Vec::new(),
     };
 
+    // A failed directory entry is an error, not a skipped file: a report that
+    // silently omitted entries would claim a smaller reclaim than the truth
+    // and leave legacy files in place under a zero exit.
     let mut top_levels: Vec<PathBuf> = fs::read_dir(root)?
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
     top_levels.sort();
 
     for shard_dir in top_levels {
@@ -1038,14 +1048,15 @@ pub fn reclaim_legacy(root: &Path, apply: bool) -> std::io::Result<ReclaimReport
         }
 
         let mut entry_files: Vec<PathBuf> = fs::read_dir(&shard_dir)?
-            .flatten()
-            .map(|entry| entry.path())
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
             .filter(|path| is_legacy_entry_file(root, path))
             .collect();
         entry_files.sort();
 
         for entry_file in entry_files {
-            let size = fs::metadata(&entry_file)?.len();
+            let size = fs::symlink_metadata(&entry_file)?.len();
             report.files += 1;
             report.bytes += size;
             report.paths.push(entry_file.clone());
@@ -1444,6 +1455,67 @@ mod tests {
         assert_eq!(cache.get(&ns_key).as_deref(), Some(ns_payload.as_slice()));
         assert_eq!(cache.total_bytes(), bytes_before);
         assert_eq!(cache.len(), len_before);
+    }
+
+    /// Only a regular file is a legacy entry. A symlink or a directory that
+    /// carries a canonical entry name inside a legacy shard is neither listed
+    /// nor removed, the symlink's target keeps its bytes, and the shard
+    /// directory stays because it is not empty afterwards.
+    ///
+    /// FLIP (non-vacuity): in `is_legacy_entry_file`, drop the regular-file
+    /// check. The symlink is then counted and unlinked: `report.files` reads 2
+    /// and `report.bytes` 4196, and the `symlink_metadata(&link)` assertion
+    /// fails.
+    #[tokio::test]
+    async fn reclaim_legacy_ignores_a_symlink_and_a_directory_with_entry_names() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let legacy_payload = vec![0xABu8; 100];
+        let legacy_key = test_key_with_len(2, 100);
+        let legacy_path = plant_legacy_entry(&root, &legacy_key, &legacy_payload);
+        let shard_dir = legacy_path.parent().unwrap().to_path_buf();
+
+        // Two canonical-looking siblings in the same shard: the real entry's
+        // name with a different offset field, so the name parses and maps back
+        // to its own path, but one is a symlink and one is a directory.
+        let real_name = legacy_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut fields: Vec<&str> = real_name.trim_end_matches(".rvc").split('-').collect();
+        assert_eq!(fields.len(), 4, "entry name has four fields");
+        fields[2] = "0000000000000001";
+        let link = shard_dir.join(format!("{}.rvc", fields.join("-")));
+        fields[2] = "0000000000000002";
+        let dir = shard_dir.join(format!("{}.rvc", fields.join("-")));
+
+        let foreign_target = root.join("foreign.bin");
+        fs::write(&foreign_target, vec![0x11u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(&foreign_target, &link).unwrap();
+        fs::create_dir(&dir).unwrap();
+
+        let report = reclaim_legacy(&root, true).unwrap();
+
+        assert_eq!(report.files, 1, "only the regular entry file is reclaimed");
+        assert_eq!(report.bytes, 100);
+        assert_eq!(report.paths, vec![legacy_path.clone()]);
+        assert!(!legacy_path.exists());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink is neither unlinked nor followed"
+        );
+        assert_eq!(fs::metadata(&foreign_target).unwrap().len(), 4096);
+        assert!(
+            dir.is_dir(),
+            "the directory with an entry-shaped name survives"
+        );
+        assert!(shard_dir.is_dir(), "a non-empty shard directory is kept");
     }
 
     /// A root that never held the legacy layout reports exactly zero and
