@@ -313,7 +313,7 @@ pipeline cannot accept returns `503`.
 Log records are durable in RLOG objects under the tenant's `l` keyspace after
 the strict ack returns. **Logs are queryable via SQL**: the `logs` table is
 registered on the `POST /api/v1/sql` endpoint (ravel-sql's `LOGS_TABLE`), and
-[query.md](query.md#sql-over-the-logs-table) documents its schema and usage.
+[query.md](query.md#sql-over-samples-logs-and-spans) documents its schema and usage.
 PromQL does not query logs: `ravel-promql` has no logs-reading path, so log
 data is reachable only through SQL. You can also read a log object back
 directly with `ravel-cli rlog inspect`
@@ -403,8 +403,8 @@ buffered-but-unflushed data.
 The Parquet a load reads is already columnar, and the RLOG object it writes is
 columnar too. The loader builds the storage-native columnar batch directly from
 each Arrow `RecordBatch` and hands it to the router through `write_columnar`,
-skipping the per-row `NormalizedLogRecord` pivot the record path built and the
-per-row gather the writer used to undo it. Every Arrow downcast and the
+skipping the per-row `NormalizedLogRecord` pivot the record path builds and the
+per-row gather the writer runs to undo it. Every Arrow downcast and the
 `ts_unit` scaling are resolved once per column, stream identity is hashed once
 per distinct resource-attribute tuple rather than once per row, and admission
 checks (future skew, the length caps) are applied over whole columns while still
