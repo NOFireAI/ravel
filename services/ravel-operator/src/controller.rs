@@ -1180,32 +1180,37 @@ async fn reconcile_inner(
     // Every `ravel-server` mode creates-if-absent and then validates `sys/gc`
     // at startup, but under per-role storage credentials only the maintain (and
     // Admin) role holds a write grant on it. So when the spec sets any
-    // per-Deployment `credentialsSecretRef`, maintain is applied first and the
-    // request-serving tiers are held until it reports a ready replica: applying
-    // them against a fresh bucket first would fail their create with an access
-    // error and crash-loop them until maintain got there. A single shared
+    // per-Deployment `credentialsSecretRef` with maintain enabled, maintain is
+    // applied first and the request-serving tiers are held until maintain
+    // reports a ready replica OR one of them already exists: applying them
+    // against a fresh bucket first would fail their create with an access error
+    // and crash-loop them until maintain got there, but once either exists a
+    // prior pass already got past the gate, so a serving cluster keeps
+    // reconciling both through a maintain rollout or outage. A single shared
     // credential keeps the original gateway-query-maintain order and reads
     // nothing extra, because any tier can create the object there.
     let plan = desired.gc_bootstrap;
     let maintain_name = child(instance, "maintain");
-    let maintain_ready_before = if plan.reads_maintain_ready() {
-        live_ready_replicas(&deployments, &maintain_name).await?
+    let (maintain_ready_before, request_serving_exists) = if plan.reads_live_state() {
+        let ready = live_ready_replicas(&deployments, &maintain_name).await?;
+        let exists = live_deployment_exists(&deployments, &child(instance, "gateway")).await?
+            || live_deployment_exists(&deployments, &child(instance, "query")).await?;
+        (ready, exists)
     } else {
-        None
+        (None, false)
     };
 
     let mut tiers = TierDeployments {
-        gateway: desired.gateway_deployment,
-        query: desired.query_deployment,
+        gateway: Some(desired.gateway_deployment),
+        query: Some(desired.query_deployment),
         maintain: desired.maintain_deployment,
         applied: BTreeMap::new(),
     };
-    // Maintain disabled: converge its Deployment away, whether that is because
-    // the spec turned the tier off or because the render withheld it.
+    // Maintain disabled: converge its Deployment away.
     if tiers.maintain.is_none() {
         delete_if_present(&deployments, &maintain_name).await?;
     }
-    for tier in plan.apply_sequence(maintain_ready_before) {
+    for tier in plan.apply_sequence(maintain_ready_before, request_serving_exists) {
         tiers
             .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
             .await?;
@@ -1218,14 +1223,26 @@ async fn reconcile_inner(
         .applied(DeploymentTier::Maintain)
         .and_then(ready_replicas)
         .or(maintain_ready_before);
-    let waiting = plan.waiting_for_bootstrap(maintain_ready_before);
+    let gateway_ready = tiers
+        .applied(DeploymentTier::Gateway)
+        .and_then(ready_replicas);
+    let query_ready = tiers
+        .applied(DeploymentTier::Query)
+        .and_then(ready_replicas);
+    let waiting = plan.waiting_for_bootstrap(maintain_ready_before, request_serving_exists);
     let available_hold = match plan.gate {
-        GcBootstrapGate::Unavailable => {
-            // No rendered tier can create `sys/gc` at all, so this is a
-            // misconfiguration to surface, not a wait to sit through. It
-            // outranks a router render error for the pass's single `Degraded`
-            // entry: it stops the whole cluster from ever becoming ready,
-            // where a router error stops only ingest routing.
+        GcBootstrapGate::Unavailable
+            if gateway_ready.unwrap_or(0) <= 0 && query_ready.unwrap_or(0) <= 0 =>
+        {
+            // Maintain is disabled and the per-role credentials give neither
+            // request-serving tier a write grant on `sys/gc`, so their pods
+            // restart until `sys/gc` is created out of band. Surface that as a
+            // misconfiguration, but only while neither is serving: once either
+            // reports a ready replica the object exists and the cluster runs,
+            // so record no bootstrap condition at all. This outranks a router
+            // render error for the pass's single `Degraded` entry: it stops the
+            // whole cluster from becoming ready, where a router error stops only
+            // ingest routing.
             degraded = Some((
                 GC_BOOTSTRAP_UNAVAILABLE_REASON.to_string(),
                 GC_BOOTSTRAP_UNAVAILABLE_MESSAGE.to_string(),
@@ -1267,12 +1284,8 @@ async fn reconcile_inner(
         namespace,
         instance,
         obj.metadata.generation,
-        tiers
-            .applied(DeploymentTier::Gateway)
-            .and_then(ready_replicas),
-        tiers
-            .applied(DeploymentTier::Query)
-            .and_then(ready_replicas),
+        gateway_ready,
+        query_ready,
         maintain_ready,
         available_hold,
         extra_conditions,
@@ -1341,6 +1354,16 @@ async fn live_ready_replicas(api: &Api<Deployment>, name: &str) -> Result<Option
     match api.get(name).await {
         Ok(deployment) => Ok(ready_replicas(&deployment)),
         Err(err) if is_not_found(&err) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Whether the live Deployment `name` exists on the cluster. A not-found is
+/// `false` (the fresh-cluster case); any other error propagates.
+async fn live_deployment_exists(api: &Api<Deployment>, name: &str) -> Result<bool, Error> {
+    match api.get(name).await {
+        Ok(_) => Ok(true),
+        Err(err) if is_not_found(&err) => Ok(false),
         Err(err) => Err(err.into()),
     }
 }
@@ -1911,6 +1934,22 @@ mod tests {
             Vec::new(),
         );
         let available = find(&ready.conditions, "Available");
+        assert_eq!(available.status, "True");
+        assert_eq!(available.reason, "MinimumReplicasAvailable");
+    }
+
+    /// Under the Unavailable gate the operator still applies the gateway and
+    /// query Deployments, so once `sys/gc` is created out of band and either
+    /// tier reports a ready replica the pass records NO bootstrap condition at
+    /// all: no `unavailable_reason` and no `Degraded` entry reach the status,
+    /// and the cluster is simply Available. This is the state the reworked
+    /// controller produces once its remedy (create `sys/gc` by hand) takes
+    /// effect, where the old plan withheld the tiers and nothing ever unblocked.
+    #[test]
+    fn gc_bootstrap_unavailable_clears_once_the_request_serving_tiers_report_ready() {
+        let running = build_status(Some(9), Some(1), Some(1), None, None, Vec::new());
+        assert_eq!(condition_types(&running.conditions), vec!["Available"]);
+        let available = find(&running.conditions, "Available");
         assert_eq!(available.status, "True");
         assert_eq!(available.reason, "MinimumReplicasAvailable");
     }
