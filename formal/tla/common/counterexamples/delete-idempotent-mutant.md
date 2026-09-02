@@ -15,7 +15,7 @@ absent key untouched, so a delete of an absent key changes the store record:
 
 ## The run and the TLC line
 
-`scripts/check-tla.sh smoke -a common`, TLC exit 1 (invariant failure), with:
+`scripts/check-tla.sh smoke -a common`, TLC exit 12 (invariant failure), with:
 
     Error: Invariant DeleteIdempotent is violated.
 

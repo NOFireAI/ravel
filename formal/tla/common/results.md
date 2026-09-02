@@ -5,18 +5,30 @@ The per-run figures are written to `.cache/tla/last-run.tsv`; the enforced
 bands live in `bands.tsv` and `scripts/check-tla.sh` fails a PASS run whose
 distinct-state count or depth falls outside them.
 
-Toolchain: TLC 2.19 (tla2tools 1.7.4), Temurin JRE 21, `-workers auto`.
+Toolchain: TLC 2.19 (tla2tools 1.7.4), OpenJDK 25 on an arm64 macOS laptop
+(the fleet executor's earlier run on Temurin JRE 21, x86_64 Linux, produced
+the same distinct-state counts and depths), `-workers auto`.
 Figures below are from run
-`20260902T225258Z-d7b89709fd16350b11ed7006e399a0b9c8934c65`
-(`scripts/check-tla.sh all`).
+`20260902T233208Z-2b36d8d0479151c10e2c6eb77f12451bd90ceb78`
+(`scripts/check-tla.sh all`). Wall times are host-dependent and are not
+banded.
 
 | Config | Spec | Distinct states | Depth | Wall time | Result |
 |---|---|---|---|---|---|
-| smoke.cfg | MCSpec (safety, symmetry-reduced) | 2011892 | 15 | ~36s | PASS |
-| exhaustive.cfg | FairSpec (safety + liveness) | 3845952 | 15 | ~342s | PASS |
-| negative/lost-response-not-applied.cfg | MCSpec | short prefix | n/a | ~1s | LostResponseEffectApplied violated, exit 12 |
-| negative/cas-accepts-stale-version.cfg | MCSpec | short prefix | n/a | ~1s | CasOutcomeMatchesEffect violated, exit 12 |
-| negative/list-never-progresses.cfg | FairSpec (ListStalls) | short prefix | n/a | ~4s | ListEventuallyComplete violated, exit 13 |
+| smoke.cfg | MCSpec (safety, symmetry-reduced) | 2011892 | 15 | 102s | PASS |
+| exhaustive.cfg | FairSpec (safety + liveness) | 3845952 | 15 | 252s | PASS |
+| negative/lost-response-not-applied.cfg | MCSpec | short prefix | n/a | 2s | LostResponseEffectApplied violated, exit 12 |
+| negative/cas-accepts-stale-version.cfg | MCSpec | short prefix | n/a | 3s | CasOutcomeMatchesEffect violated, exit 12 |
+| negative/list-never-progresses.cfg | FairSpec (ListStalls) | short prefix | n/a | 5s | ListEventuallyComplete violated, exit 13 |
+
+Mutants demonstrated against the correct module (each in a scratch copy,
+recorded under `counterexamples/`): CAS on an absent key accepted
+(`CasOutcomeMatchesEffect`), a multipart part published early
+(`MultipartInvisibleUntilComplete`), a delete that returns a non-Ok outcome
+(`DeleteIdempotent`), a delete that resets the version counter
+(`VersionsNeverReused`), and a counting listing consumer that deduplicates
+(`ListingConsumersConsistent`). Each reports TLC exit 12 naming that
+invariant.
 
 Bands (a run outside these is a regression to investigate, not to widen; see
 `bands.tsv`):

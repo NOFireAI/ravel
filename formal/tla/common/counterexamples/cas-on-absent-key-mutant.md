@@ -22,7 +22,7 @@ operator on the branch it had already decided.
 
 ## The run and the TLC line
 
-`scripts/check-tla.sh smoke -a common`, TLC exit 1 (invariant failure), with:
+`scripts/check-tla.sh smoke -a common`, TLC exit 12 (invariant failure), with:
 
     Error: Invariant CasOutcomeMatchesEffect is violated.
 
