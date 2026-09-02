@@ -140,3 +140,4 @@ the reservation commit that used to work around it.
 | [0996](0996-request-cost-aware-fetching.md) | request-cost-aware fetching and the S3 request ledger | Proposed |
 | [1029](1029-advisory-compaction-claims.md) | advisory compaction claims over object-store CAS | Proposed |
 | [1040](1040-documentation-architecture.md) | Documentation architecture, canonical vocabulary, and a docs gate | Proposed |
+| [1101](1101-alerts-and-audit-sql-tables.md) | Register the `alerts` and `audit` SQL tables | Proposed |
