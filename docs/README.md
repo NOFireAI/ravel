@@ -111,6 +111,11 @@ The mental model, in the order it makes sense.
 
 ## Look up
 
+- [reference/http-api.md](reference/http-api.md): every HTTP route the
+  server exposes, with its method, what it accepts and returns, its status
+  codes, whether it needs a bearer token, which modes serve it, and its
+  cargo feature gate where it has one. Derived from the router, not from
+  another page.
 - [reference/ravel-server-flags.md](reference/ravel-server-flags.md):
   every `ravel-server` flag, its environment variable and its default,
   generated from the binary's own definition and checked by a test.
