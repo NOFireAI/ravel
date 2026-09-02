@@ -618,8 +618,8 @@ adapter contract:
 
    | Mechanism | What it does | Coverage window |
    |---|---|---|
-   | Event-driven function | A function subscribed to object-created events, filtered to the protected prefixes, calls the per-object retention API in compliance mode with the chosen retention period. | Each object is locked within seconds of its creation. |
-   | Scheduled batch job | An S3 Batch Operations job, run on a schedule and driven by an S3 Inventory manifest filtered to the same prefixes, sets the same retention. | Up to the schedule interval plus the inventory delay. |
+   | Event-driven function | A function subscribed to object-created events, filtered to the protected prefixes, calls the per-object retention API in compliance mode with the chosen retention period. Notifications can be delayed or lost, and objects written before the subscription existed raise none, so the function needs durable retry with a dead-letter queue, a one-time backfill over every existing version under the prefixes, and a periodic reconciliation against an S3 Inventory of all versions that locks anything missed. | Each object is locked within seconds of its creation; a missed event is covered at the next reconciliation. |
+   | Scheduled batch job | An S3 Batch Operations job, run on a schedule and driven by an S3 Inventory manifest that lists all object versions (`IncludedObjectVersions=All`) filtered to the same prefixes, sets the same retention on every listed version, current and noncurrent. An entry with no version id is rejected before the job is submitted; a current-version-only manifest leaves noncurrent versions unlocked. | Up to the schedule interval plus the inventory delay plus the job's own execution and retry time. |
 
    Between an object's creation and the moment the mechanism acts on it,
    the object carries no retention, and any credential that can delete
