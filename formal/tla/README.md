@@ -29,20 +29,26 @@ Its model-check entry module is the single `MC*.tla` file in the directory
 | Area | Contract modeled | Status |
 |---|---|---|
 | common | object-store put/get/delete/list/multipart | this task (T1) |
-| catalog | commit/manifest MVCC visibility | planned |
-| ingest | acknowledgement and flush ordering | planned |
+| commit | commit publication, acknowledgement, retry, read-your-write | planned (T2) |
+| catalog | catalog fold, snapshots, compaction, MVCC | planned (T3) |
+| lifecycle | retention, erasure, legal holds, physical GC | planned (T4) |
+| resharding | generation-versioned online resharding | planned (T5) |
+| maintenance | maintenance ownership (shipped) and advisory claims (proposed) | planned (T6) |
 
 ## Running
 
 Requires Java 17 or newer (Temurin 21 is what CI uses) and network access on
 first run to fetch the TLC jar. The harness resolves Java from
 `RAVEL_TLA_JAVA` if set, else `java` on `PATH`, and exits 2 if none is usable.
+The per-model wall-clock ceiling needs coreutils `timeout` (`gtimeout` from
+Homebrew coreutils on macOS); without either the run proceeds unbounded and
+the harness says so once. CI and the fleet executors always have `timeout`.
 
 ```sh
 scripts/check-tla.sh smoke            # fast safety, every area (budget 300s/cfg)
 scripts/check-tla.sh negative         # every negative control must fail correctly
 scripts/check-tla.sh traceability     # every traceability.md source ref resolves
-scripts/check-tla.sh all              # smoke + negative + traceability (the CI lane)
+scripts/check-tla.sh all              # smoke + negative + traceability (the CI lane), then exhaustive
 scripts/check-tla.sh exhaustive       # full safety + liveness (nightly, budget 3600s/cfg)
 scripts/check-tla.sh smoke -a common  # scope any subcommand to one area
 ```
