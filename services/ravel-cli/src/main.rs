@@ -1,5 +1,7 @@
 //! ravel-cli: inspect segments, decode commit records, list catalog entries.
 
+use std::time::Duration;
+
 use clap::{Parser, Subcommand};
 use ravel_cli::maintain::SignalArg;
 use ravel_cli::{
@@ -365,6 +367,39 @@ enum Command {
         /// waits out that timer. `0` is rejected.
         #[arg(long, value_name = "BYTES", default_value_t = ravel_cli::load::DEFAULT_TARGET_BYTES)]
         target_bytes: usize,
+        /// How long a shard buffer may age before the router flushes it,
+        /// regardless of `--target-bytes` (issue #801). A humantime duration
+        /// (`2s`, `10m`, `1h5m`). Unset leaves the router's default (2s), so an
+        /// omitted flag changes a load's object layout not at all.
+        ///
+        /// This is the THIRD binding constraint on object size, beside
+        /// `--target-bytes` and one batch's per-shard slice footprint. A shard
+        /// flushes on the first of: its buffer reaches `--target-bytes`, its
+        /// oldest buffered point ages past this delay, or the final drain at
+        /// load close. At the 2s default a buffer that fills slower than one
+        /// target's worth every 2s ages out before it ever reaches a large
+        /// `--target-bytes`, so the size trigger never fires and the target is
+        /// unreachable as a lever no matter how large it is set: the v4 load's
+        /// ~11,871-row objects are about 2s of one shard's ingest rate. To make
+        /// `--target-bytes` bind, raise this past the time one target's worth
+        /// takes to accumulate on a shard.
+        ///
+        /// The interaction is a triangle: `--target-bytes` binds only when the
+        /// buffer both SURVIVES long enough (this flag) and FILLS fast enough
+        /// (`--pipeline-depth` at least the number of batches that accumulate
+        /// into one flush, so a later batch is in flight to push the buffer over
+        /// the target before it ages out). Setting any one of the three without
+        /// the other two leaves the object layout at the `--target-bytes 1`
+        /// shape.
+        ///
+        /// The trade is ack latency, not durability: above the size trigger a
+        /// tail buffer's Strict ack can now wait up to this delay for the age
+        /// trigger to release it, since no later batch arrives to flush it by
+        /// size. An ack still means durable whenever it arrives. `0s` is
+        /// accepted and means the age trigger fires on the next flush tick for
+        /// any non-empty buffer.
+        #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_flush_delay)]
+        max_flush_delay: Option<Duration>,
     },
 }
 
@@ -1526,6 +1561,7 @@ async fn main() -> anyhow::Result<()> {
             max_inflight_flushes,
             decode_queue_batches,
             target_bytes,
+            max_flush_delay,
         } => {
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
@@ -1540,6 +1576,7 @@ async fn main() -> anyhow::Result<()> {
                 max_inflight_flushes,
                 decode_queue_batches,
                 target_bytes,
+                max_flush_delay,
                 now_ns()?,
             )
             .await;
@@ -2472,6 +2509,50 @@ mod tests {
             max_inflight_flushes,
             ravel_cli::load::DEFAULT_MAX_INFLIGHT_FLUSHES,
             "--max-inflight-flushes must default to DEFAULT_MAX_INFLIGHT_FLUSHES"
+        );
+    }
+
+    /// `--max-flush-delay` is absent by default (so the loader keeps the
+    /// router's own age-trigger default) and, when given, parses humantime into
+    /// the `Option<Duration>` the load handler threads on (issue #801).
+    #[test]
+    fn max_flush_delay_flag_is_optional_and_parses_humantime() {
+        let base = [
+            "ravel",
+            "load",
+            "--parquet",
+            "hits.parquet",
+            "--tenant",
+            "acme",
+            "--mapping",
+            "hits.toml",
+        ];
+
+        let Command::Load {
+            max_flush_delay, ..
+        } = Cli::try_parse_from(base)
+            .expect("a load with no --max-flush-delay parses")
+            .command
+        else {
+            panic!("expected the load subcommand");
+        };
+        assert_eq!(
+            max_flush_delay, None,
+            "an omitted --max-flush-delay leaves the router default in place"
+        );
+
+        let Command::Load {
+            max_flush_delay, ..
+        } = Cli::try_parse_from(base.iter().copied().chain(["--max-flush-delay", "10m"]))
+            .expect("a load with --max-flush-delay 10m parses")
+            .command
+        else {
+            panic!("expected the load subcommand");
+        };
+        assert_eq!(
+            max_flush_delay,
+            Some(std::time::Duration::from_secs(600)),
+            "--max-flush-delay 10m reaches the field as 600s"
         );
     }
 

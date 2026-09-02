@@ -49,3 +49,59 @@ pub fn parse_max_flush_lifetime_ns(s: &str) -> Result<i64, String> {
         .map_err(|e| format!("invalid --max-flush-lifetime '{s}': {e}"))?;
     i64::try_from(dur.as_nanos()).map_err(|_| format!("--max-flush-lifetime '{s}' is too large"))
 }
+
+/// Parse a `load --max-flush-delay` value into a [`std::time::Duration`].
+///
+/// Same humantime grammar as [`parse_max_flush_lifetime_ns`] (`2s`, `10m`,
+/// `1h5m`); the loader plumbs the result straight into
+/// `IngestConfig::max_flush_delay`, which is a `Duration`, so this returns one
+/// rather than an `i64` of nanoseconds. Zero is accepted, mirroring the
+/// `--max-flush-lifetime` flags: `0s` means the age trigger fires on the next
+/// flush tick for any non-empty buffer (its oldest point is always at least
+/// `0s` old), so every buffer flushes by age almost immediately regardless of
+/// `--target-bytes`. Negative values are unrepresentable in humantime, so the
+/// only rejections are an unparseable spelling and a value too large for
+/// `Duration`.
+pub fn parse_max_flush_delay(s: &str) -> Result<std::time::Duration, String> {
+    humantime::parse_duration(s).map_err(|e| format!("invalid --max-flush-delay '{s}': {e}"))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// `--max-flush-delay` parses humantime and returns an exact `Duration`
+    /// (issue #801, deliverable 2's parse half).
+    #[test]
+    fn parse_max_flush_delay_reads_humantime_exactly() {
+        assert_eq!(
+            parse_max_flush_delay("10m").expect("10m"),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            parse_max_flush_delay("2s").expect("2s"),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            parse_max_flush_delay("1h5m").expect("1h5m"),
+            Duration::from_secs(3600 + 300)
+        );
+    }
+
+    /// Zero is accepted with a defined meaning, mirroring the sibling
+    /// `--max-flush-lifetime` flags rather than being refused (issue #801,
+    /// deliverable 4). Negative values are unrepresentable in humantime, so the
+    /// grammar cannot express one; a garbage spelling is a typed `Err`, never a
+    /// panic.
+    #[test]
+    fn parse_max_flush_delay_accepts_zero_and_rejects_garbage() {
+        assert_eq!(parse_max_flush_delay("0s").expect("0s"), Duration::ZERO);
+        let err = parse_max_flush_delay("later").expect_err("garbage is rejected");
+        assert!(
+            err.contains("--max-flush-delay"),
+            "the error names the flag: {err}"
+        );
+    }
+}
