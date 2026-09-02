@@ -10,7 +10,7 @@
 #   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg)
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
 #   traceability [-a AREA]   check every traceability.md source ref resolves
-#   all          [-a AREA]   smoke + negative + traceability (the CI lane)
+#   all          [-a AREA]   smoke + negative + traceability (the CI lane), then exhaustive
 #
 # Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java).
 #
@@ -126,8 +126,22 @@ run_tlc() {
     fi
     local metadir="$CACHE_DIR/meta/$area"
     mkdir -p "$metadir"
+    # The wall-clock ceiling needs coreutils timeout (gtimeout from Homebrew
+    # coreutils on macOS). Without either the run is unbounded, announced once;
+    # CI and the fleet executors are Linux and always have timeout.
+    local -a wrap=()
+    if [ -z "${TIMEOUT_BIN+x}" ]; then
+        if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
+        elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
+        else
+            TIMEOUT_BIN=""
+            note "neither timeout nor gtimeout on PATH: running TLC without a wall-clock ceiling"
+        fi
+    fi
+    if [ -n "$TIMEOUT_BIN" ]; then wrap=("$TIMEOUT_BIN" "$budget"); fi
     local code=0
-    ( cd "$area_dir" && timeout "$budget" "$JAVA" -XX:+UseParallelGC \
+    # ${wrap[@]+...}: an empty array is "unbound" under set -u on bash 3.2.
+    ( cd "$area_dir" && ${wrap[@]+"${wrap[@]}"} "$JAVA" -XX:+UseParallelGC \
         -DTLA-Library="$area_dir" -cp "$JAR" tlc2.TLC \
         -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
     return $code
@@ -322,7 +336,7 @@ main() {
         *) ensure_jar ;;
     esac
 
-    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse HEAD^{tree})"
+    RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse 'HEAD^{tree}')"
 
     local records_tsv=0
     case "$cmd" in smoke|exhaustive|negative|all) records_tsv=1 ;; esac
@@ -339,6 +353,7 @@ main() {
                 check_model "$area" smoke || rc=1
                 check_negative "$area" || rc=1
                 check_traceability "$area" || rc=1
+                check_model "$area" exhaustive || rc=1
                 ;;
         esac
     done
