@@ -11,12 +11,16 @@ env:
 
 # Cancel a superseded run for the same ref so a force-push to an open PR does
 # not leave the old run burning coverage/k8s minutes to completion (ADR-0053
-# D3). Keyed on the workflow plus the ref. `cancel-in-progress` is disabled on
-# `main` itself: a push to main is history other things build on, so its run
-# must always finish rather than be cancelled by the next push. It stays true
-# for PR and merge-queue refs, where only the latest run matters.
+# D3). Keyed on the workflow plus the ref for PR and merge-queue refs, where
+# only the latest run matters. A push to main is history other things build
+# on (the coverage lane runs only there, and the publish gate needs a
+# successful run for the tagged SHA), so every main push gets its own group,
+# keyed on the commit SHA: GitHub holds at most one pending run per group and
+# cancels the previous pending run whenever a new one is queued, so a shared
+# main group with `cancel-in-progress` off still lost the run of any push that
+# was queued when the next push arrived (#1145).
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.ref == 'refs/heads/main' && format('ci-main-{0}', github.sha) || format('ci-{0}', github.ref) }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
