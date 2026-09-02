@@ -511,6 +511,11 @@ per-role storage credentials only the Maintain and Admin roles may create the
 object, so on a fresh bucket start the `maintain` process first, or create it
 with `ravel-cli gc-config set` under Admin; see
 [the first deployment](deployment.md#the-first-deployment-against-a-fresh-bucket).
+The Kubernetes operator applies the gateway and query Deployments before
+maintain and adds no ordering between them, so with per-role credential
+Secrets create `sys/gc` before applying the `RavelCluster`, or expect the
+gateway and query pods to restart until the first maintain pod has created
+it.
 
 **What each mode validates:**
 
@@ -586,7 +591,10 @@ Repeated `--tenant-token TOKEN=TENANT` flags configure tenants entirely. There i
 no tenant database and no admin API. To add, remove or rotate a token, restart
 with a different flag set. That is safe: every process is stateless, so a
 restart has no data migration to do. With no `--tenant-token` and no OIDC or
-mTLS resolver configured, every request is unauthenticated and rejected.
+mTLS resolver configured, every request to a tenant-protected route is
+rejected; the health and `/metrics` routes carry no tenant, and
+`--dev-insecure-tenant-header` on a loopback listener is the development
+exception.
 
 Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.

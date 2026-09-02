@@ -74,8 +74,10 @@ rejected point counts and reasons.
   uses it for its entire execution. Commits, compactions, and deletions that
   land mid-query do not affect it.
 - Compaction publishes its outputs beside its inputs. A snapshot resolved
-  after the compaction record exists excludes the inputs it names; both sets
-  remain physically present until GC clears the inputs after the protection
+  before the record is listed holds the inputs alone or, transiently, both
+  sets, which query-time dedup collapses for metrics; a snapshot resolved
+  after the record is listed excludes the inputs it names. Both sets remain
+  physically present until GC clears the inputs after the protection
   horizon.
 
 ## Crash matrix (strict mode)
@@ -347,12 +349,12 @@ tiers) is predicate-granular deletion built on the same durable-transaction,
 logical-exclusion, physical-removal shape as every other deletion. Query
 exclusion is immediate and cache-tight: no query whose snapshot resolves after
 the request ack returns matching records, from store or any cache tier, and
-in-flight queries drain within `max_query_duration`. The erasure stage bounds
-are a guarantee, not a target:
+in-flight queries drain within the query deadline, which is at most
+`max_query_duration`. The erasure stage bounds are a guarantee, not a target:
 
 | Stage | Guarantee | Worst-case bound (defaults) |
 |---|---|---|
-| Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within `max_query_duration` (30 s) |
+| Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within the query deadline (30 s by default, never more than `max_query_duration`, 1 h) |
 | Rewrite complete (`.done`) | Every live commit-record segment a snapshot resolves is free of matching records, verified through the catalog resolver. Index entries and derived datasets carry no subject values, so they are free of matching records by construction | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric |
 | Physical bytes gone from the bucket | Superseded inputs swept | `.done` + `protection_horizon` (default `max_query_duration` + `grace` + `clock_skew_allowance` = 1 h + 24 h + 5 min) + one sweep interval (default 5 min); with defaults, about four days end to end (72 h + 25 h 5 min + 5 min) |
 | Physical bytes gone from query-node disk caches | Non-durable local copies aged out | sweep + disk-tier entry max-age (24 h); or immediately, by deleting cache directories (ADR-0046: a node with its cache directory deleted mid-flight answers every query correctly) |
