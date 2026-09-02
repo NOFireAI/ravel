@@ -26,7 +26,7 @@
 //! `(tenant, signal)` never pays a HEAD GET per candidate (ADR-0076 request
 //! cost).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ravel_catalog::{DecodedPart, PartLimits, decode_head, decode_part};
@@ -76,7 +76,7 @@ pub(crate) enum SnapshotGate {
 /// `writer_epoch` carries the `part_index` (crates/ravel-catalog's
 /// `build_l1_snapshot_entry`). [`snapshot_object`] is the one place that
 /// convention is read here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum SnapshotObject {
     /// A raw L0 flush: the `(writer_id, epoch, seq)` identity its commit
     /// record and its data object share.
@@ -184,7 +184,7 @@ impl SnapshotReachability {
         store: &dyn ObjectStoreBackend,
         bucket: &Bucket,
     ) -> Result<SnapshotGate> {
-        let covering = match self
+        let (covering, skipped) = match self
             .covering_parts(
                 store,
                 &bucket.tenant_hash,
@@ -195,7 +195,7 @@ impl SnapshotReachability {
         {
             Covering::Clear => return Ok(SnapshotGate::Clear),
             Covering::Blocked(reason) => return Ok(SnapshotGate::Blocked(reason)),
-            Covering::Parts(parts) => parts,
+            Covering::Parts { covering, skipped } => (covering, skipped),
         };
 
         for part_ref in &covering {
@@ -216,7 +216,7 @@ impl SnapshotReachability {
                 }
             }
         }
-        Ok(SnapshotGate::Clear)
+        self.clear_or_block_on_skipped(store, &skipped).await
     }
 
     /// Whether the live HEAD snapshot still names any of `objects`, all of
@@ -229,6 +229,11 @@ impl SnapshotReachability {
     /// Same three answers, same cache, same fail-closed direction. An empty
     /// `objects` is [`SnapshotGate::Clear`] without reading anything, so a pass
     /// with no delete candidate issues no HEAD GET at all.
+    ///
+    /// `objects` is indexed into a set once per call, so the cost is one hash
+    /// lookup per snapshot entry rather than a scan of every candidate: a group
+    /// holding a long supersession chain gates in time linear in the covering
+    /// parts' entry count, not in its product with the group's size.
     pub(crate) async fn object_gate(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -240,13 +245,14 @@ impl SnapshotReachability {
         if objects.is_empty() {
             return Ok(SnapshotGate::Clear);
         }
-        let covering = match self
+        let wanted: HashSet<SnapshotObject> = objects.iter().copied().collect();
+        let (covering, skipped) = match self
             .covering_parts(store, tenant, signal, ingest_hour_bucket)
             .await?
         {
             Covering::Clear => return Ok(SnapshotGate::Clear),
             Covering::Blocked(reason) => return Ok(SnapshotGate::Blocked(reason)),
-            Covering::Parts(parts) => parts,
+            Covering::Parts { covering, skipped } => (covering, skipped),
         };
 
         for part_ref in &covering {
@@ -259,18 +265,46 @@ impl SnapshotReachability {
                     // fail-closed answer an unreadable part gets.
                     return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable));
                 };
-                if objects.contains(&named) {
+                if wanted.contains(&named) {
                     return Ok(SnapshotGate::Blocked(SnapshotBlock::Named));
                 }
+            }
+        }
+        self.clear_or_block_on_skipped(store, &skipped).await
+    }
+
+    /// The last step of both gates, reached only when every covering part came
+    /// back clear and the gate is about to permit a delete: prove that the
+    /// parts the hour-range filter skipped really were outside the hour.
+    ///
+    /// [`Self::covering_parts`] reads each part's range from the HEAD-level
+    /// reference, not from the part itself. A reference whose declared range is
+    /// narrower than the part it names would silently exclude a part that does
+    /// hold entries for the gated hour, so a skip is only sound once
+    /// [`Self::ensure_part`] has confirmed the two agree; it returns `None`
+    /// when they do not, and that is the fail-closed answer here too.
+    ///
+    /// Done last, and only on the clearing path, so the ordinary held pass
+    /// still reads nothing beyond HEAD and the covering parts: a delete this
+    /// pass would not have performed anyway never pays for the proof.
+    async fn clear_or_block_on_skipped(
+        &mut self,
+        store: &dyn ObjectStoreBackend,
+        skipped: &[SnapshotPartRef],
+    ) -> Result<SnapshotGate> {
+        for part_ref in skipped {
+            if self.ensure_part(store, part_ref).await?.is_none() {
+                return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable));
             }
         }
         Ok(SnapshotGate::Clear)
     }
 
-    /// Load HEAD once for the pass and return the part refs whose hour range
-    /// covers `ingest_hour_bucket`, or the terminal answer when HEAD is absent
-    /// or unreadable. The refs are owned clones so the borrow of `self.head` is
-    /// released before the callers' part loads borrow `self` mutably.
+    /// Load HEAD once for the pass and split its part refs into the ones whose
+    /// declared hour range covers `ingest_hour_bucket` and the ones it does
+    /// not, or return the terminal answer when HEAD is absent or unreadable.
+    /// The refs are owned clones so the borrow of `self.head` is released
+    /// before the callers' part loads borrow `self` mutably.
     async fn covering_parts(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -282,16 +316,12 @@ impl SnapshotReachability {
             HeadStatus::Absent => Ok(Covering::Clear),
             HeadStatus::Unreadable => Ok(Covering::Blocked(SnapshotBlock::Unreadable)),
             HeadStatus::Present => match &self.head {
-                Some(HeadLoad::Present(head)) => Ok(Covering::Parts(
-                    head.parts
-                        .iter()
-                        .filter(|p| {
-                            p.min_hour <= ingest_hour_bucket
-                                && ingest_hour_bucket <= p.watermark_hour
-                        })
-                        .cloned()
-                        .collect(),
-                )),
+                Some(HeadLoad::Present(head)) => {
+                    let (covering, skipped) = head.parts.iter().cloned().partition(|p| {
+                        p.min_hour <= ingest_hour_bucket && ingest_hour_bucket <= p.watermark_hour
+                    });
+                    Ok(Covering::Parts { covering, skipped })
+                }
                 // Unreachable after `ensure_head` returned `Present`; block
                 // fail-closed rather than panic (no unwrap/expect on a
                 // production path).
@@ -340,10 +370,19 @@ impl SnapshotReachability {
         })
     }
 
-    /// Load, verify (blake3 against the HEAD ref), and decode one snapshot part
-    /// once per pass, caching the result. `Ok(None)` is the fail-closed
-    /// "present but unreadable" case (a missing HEAD-named part, a hash
+    /// Load, verify (blake3 against the HEAD ref, and the ref's hour range
+    /// against the decoded header's), and decode one snapshot part once per
+    /// pass, caching the result. `Ok(None)` is the fail-closed "present but
+    /// unreadable" case (a missing HEAD-named part, a hash mismatch, a bounds
     /// mismatch, or a decode failure); a transient store fault propagates.
+    ///
+    /// The bounds check is what makes [`Self::covering_parts`]' range filter
+    /// safe to trust. That filter skips every part whose
+    /// `[min_hour, watermark_hour]` excludes the hour being gated, reading
+    /// those bounds from the HEAD-level reference; a reference whose range is
+    /// narrower than the part it names would then let the gate skip a part
+    /// that does name the candidate, and clear a delete the snapshot still
+    /// reaches.
     async fn ensure_part(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -366,6 +405,21 @@ impl SnapshotReachability {
                         max_snapshot_part_bytes: ravel_catalog::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
                     };
                     match decode_part(data.as_ref(), &limits) {
+                        Ok(part)
+                            if part.header.min_hour != part_ref.min_hour
+                                || part.header.watermark_hour != part_ref.watermark_hour =>
+                        {
+                            tracing::warn!(
+                                key = %part_ref.key,
+                                ref_min_hour = part_ref.min_hour,
+                                ref_watermark_hour = part_ref.watermark_hour,
+                                header_min_hour = part.header.min_hour,
+                                header_watermark_hour = part.header.watermark_hour,
+                                "maintain sweep: snapshot part reference range disagrees with the \
+                                 part header; blocking deletes fail-closed"
+                            );
+                            None
+                        }
                         Ok(part) => Some(Arc::new(part)),
                         Err(err) => {
                             tracing::warn!(
@@ -404,8 +458,14 @@ enum Covering {
     Clear,
     /// HEAD itself decided the answer (unreadable).
     Blocked(SnapshotBlock),
-    /// The HEAD-named parts whose hour range covers the requested hour.
-    Parts(Vec<SnapshotPartRef>),
+    /// The HEAD-named parts split by the declared hour range: `covering` is
+    /// read for entries naming the candidate, `skipped` only has its declared
+    /// range checked against the part header, and only when the gate is
+    /// otherwise about to clear.
+    Parts {
+        covering: Vec<SnapshotPartRef>,
+        skipped: Vec<SnapshotPartRef>,
+    },
 }
 
 /// Lightweight status returned by [`SnapshotReachability::ensure_head`], so the
@@ -421,8 +481,8 @@ enum HeadStatus {
 /// `t/<tenant_hash_hex>/catalog/<signal>/HEAD` -- the mutable head pointer for
 /// one `(tenant, signal)` (docs/catalog-and-mvcc.md key layout, a frozen
 /// contract). No public builder is exported from ravel-catalog, so it is
-/// constructed here from the same pieces, matching `sweep.rs`'s
-/// `catalog_head_key` precedent.
-fn catalog_head_key(tenant: &TenantHash, signal: Signal) -> String {
+/// constructed here from the same pieces. This is the crate's only copy; the
+/// catalog-object sweep in [`crate::sweep`] uses it too.
+pub(crate) fn catalog_head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
