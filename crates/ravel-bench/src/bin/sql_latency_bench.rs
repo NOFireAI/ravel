@@ -180,6 +180,37 @@ struct Args {
     /// earlier run used; recorded in the report's provenance.
     #[arg(long, default_value_t = ravel_query::DEFAULT_FETCH_CONCURRENCY)]
     fetch_concurrency: usize,
+    /// The logs fetch policy (ADR-0996 decision 2), the same knob and the same
+    /// value names as `ravel-server --logs-fetch-policy`, resolved here through
+    /// the same `ravel_query::resolve_logs_fetch` the server calls at startup.
+    /// This is what selects the read shape: `request-minimal` reads every
+    /// object whole in one covering GET with no probe and no ranged read;
+    /// `byte-minimal` is the byte-leaning shape, ranged reads wherever they save
+    /// more bytes than a request costs; `cost-based` (the default, as on the
+    /// server) derives the rate from the pass's store cost profile, which at the
+    /// reference intra-region profile resolves to request-minimal behaviour.
+    ///
+    /// The default therefore measures the shape a stock server produces. Before
+    /// this flag existed the bench routed at a fixed 512 KiB threshold whatever
+    /// the request cost said, so a full-scan statement range-read every object
+    /// per block while the server read each one whole; pass `byte-minimal` to
+    /// reach that older shape deliberately.
+    ///
+    /// IGNORED WITH `--flight`, like the two byte flags below: the policy is not
+    /// on the Flight wire, so the server's own resolution governs there.
+    #[arg(long = "logs-fetch-policy", value_enum, default_value_t = LogsFetchPolicyArg::CostBased)]
+    logs_fetch_policy: LogsFetchPolicyArg,
+    /// Object size above which a logs read takes the ranged per-block path
+    /// instead of one whole-object GET (ADR-0107), the same knob as
+    /// `ravel-server --logs-block-range-threshold`. Unset, the resolution's
+    /// input is ravel-query's compiled-in 512 KiB.
+    ///
+    /// A saturated policy OVERRIDES this, exactly as on the server: a resolved
+    /// request cost of `u64::MAX` means one covering GET per object always, and
+    /// the report's `logs_block_range_threshold_effective` records what actually
+    /// governed rather than what was asked for.
+    #[arg(long = "logs-block-range-threshold", value_name = "BYTES")]
+    logs_block_range_threshold: Option<u64>,
     /// The logs per-request byte budget (ADR-0904), the same knob as
     /// `ravel-server --logs-request-cost-bytes`: the byte cost the logs planner
     /// charges each object against when deciding whether a scan routes through
@@ -197,10 +228,15 @@ struct Args {
     /// the report records the effective value as unknown there for exactly
     /// that reason.
     ///
-    /// Defaults to ravel-query's compiled-in value, the one every earlier run
-    /// used; recorded in the report header and provenance.
-    #[arg(long, value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES)]
-    logs_request_cost_bytes: u64,
+    /// The expert escape hatch of ADR-0996 decision 2, as on the server: SET,
+    /// it WINS over `--logs-fetch-policy`'s derived rate; UNSET, the policy
+    /// derives it. `Option`-typed for that reason, so "the run asked for this
+    /// many bytes" and "nobody asked, let the policy decide" stay different
+    /// inputs to the one resolution. Unset, the resolution's byte-leaning input
+    /// is ravel-query's compiled-in value; both the requested and the resolved
+    /// figure are recorded in the report header and provenance.
+    #[arg(long, value_name = "BYTES")]
+    logs_request_cost_bytes: Option<u64>,
     /// Append one JSON line per finished statement to this file as the run
     /// goes (`{"outcome":"measured"|"skipped"|"failed", ...}`), flushed per
     /// line. The full report still goes to stdout at the end; this is what
@@ -252,6 +288,37 @@ struct Args {
     /// command line lands in the shell history and in `ps`.
     #[arg(long = "flight-token", value_name = "TOKEN", requires = "flight")]
     flight_token: Option<String>,
+}
+
+/// The `--logs-fetch-policy` values, the CLI-facing mirror of
+/// [`ravel_query::LogsFetchPolicy`] (which lives in a crate that does not depend
+/// on clap). The variant names are the server flag's, so clap derives the same
+/// spellings: `request-minimal`, `byte-minimal`, `cost-based`. No value exists
+/// here that the server's flag does not accept.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+enum LogsFetchPolicyArg {
+    /// Minimize object-store requests: every object is read whole in one
+    /// covering GET, with no probe and no ranged read.
+    RequestMinimal,
+    /// The byte-minimizing shape: ranged reads wherever they save more bytes
+    /// than a request costs.
+    ByteMinimal,
+    /// Derive the request cost from the pass's store cost profile. At the
+    /// reference (intra-region) profile this resolves to request-minimal
+    /// behaviour.
+    #[default]
+    CostBased,
+}
+
+impl LogsFetchPolicyArg {
+    /// The engine-level policy this flag value selects.
+    fn policy(self) -> ravel_query::LogsFetchPolicy {
+        match self {
+            LogsFetchPolicyArg::RequestMinimal => ravel_query::LogsFetchPolicy::RequestMinimal,
+            LogsFetchPolicyArg::ByteMinimal => ravel_query::LogsFetchPolicy::ByteMinimal,
+            LogsFetchPolicyArg::CostBased => ravel_query::LogsFetchPolicy::CostBased,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
@@ -389,6 +456,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
                 logs_request_cost_bytes: args.logs_request_cost_bytes,
+                logs_fetch_policy: args.logs_fetch_policy.policy(),
+                logs_block_range_threshold: args.logs_block_range_threshold,
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
@@ -430,6 +499,8 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 continue_on_error: args.continue_on_error,
                 fetch_concurrency: args.fetch_concurrency,
                 logs_request_cost_bytes: args.logs_request_cost_bytes,
+                logs_fetch_policy: args.logs_fetch_policy.policy(),
+                logs_block_range_threshold: args.logs_block_range_threshold,
                 progress_jsonl: args.progress_jsonl.clone(),
                 tenant_max_bytes: args.sql_tenant_max_bytes,
                 parallel_final_aggregation: args.sql_parallel_final_aggregation,
@@ -521,6 +592,16 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
             // was governed by the server's own config, which this process
             // cannot name. Printing the requested value here would make a
             // Flight pass look like it ran at a setting it never applied.
+            None => "unknown (server config)".to_string(),
+        }
+    ));
+    out.push_str(&format!("  logs policy: {}\n", p.logs_fetch_policy));
+    out.push_str(&format!(
+        "  blk range  : effective={}\n",
+        match p.logs_block_range_threshold_effective {
+            Some(v) => format!("{v} bytes"),
+            // Same reason as the request cost above: a Flight run resolved
+            // nothing the server obeyed, so no threshold can be named here.
             None => "unknown (server config)".to_string(),
         }
     ));
@@ -840,6 +921,12 @@ mod tests {
             fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             logs_request_cost_bytes_requested: cost,
             logs_request_cost_bytes_effective: Some(cost),
+            logs_fetch_policy: ravel_query::LogsFetchPolicy::ByteMinimal
+                .as_str()
+                .to_string(),
+            logs_block_range_threshold_effective: Some(
+                ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            ),
             sql_max_query_bytes_requested: DEFAULT_MAX_QUERY_BYTES,
             sql_max_query_bytes_effective: Some(DEFAULT_MAX_QUERY_BYTES),
             tenant_max_bytes: 1 << 30,
@@ -925,6 +1012,153 @@ mod tests {
         assert!(
             header.contains(&line),
             "an unspecified run stamps the engine default; got:\n{header}"
+        );
+    }
+
+    /// The resolution the argv would feed the measurement lane: the flag values
+    /// this binary copies verbatim into `TenantConfigInput`/`GenerateConfig`,
+    /// run through the one resolution those lanes use.
+    fn resolution_from(argv: &[&str]) -> ravel_query::ResolvedLogsFetch {
+        let args = Args::parse_from(argv);
+        ravel_bench::sql_latency::logs_fetch_resolution(
+            args.logs_fetch_policy.policy(),
+            &StoreCostProfile::reference(),
+            args.logs_request_cost_bytes,
+            args.logs_block_range_threshold,
+        )
+    }
+
+    /// At default flags against the reference (intra-region) profile, the bench
+    /// resolves the server's shape: a saturated request cost AND a saturated
+    /// routing threshold, so every object is read whole in one covering GET.
+    /// Before the policy was reachable the threshold stayed at 512 KiB whatever
+    /// the request cost said, so a full-scan statement range-read every larger
+    /// object per block while a stock server read it whole (issue #1139).
+    #[test]
+    fn default_flags_resolve_whole_object_routing_at_the_reference_profile() {
+        let resolved = resolution_from(&["sql_latency_bench", "--generate"]);
+        assert_eq!(
+            resolved.block_range_threshold,
+            u64::MAX,
+            "the default policy must saturate the routing threshold"
+        );
+        assert_eq!(
+            resolved.request_cost_bytes,
+            u64::MAX,
+            "the reference profile prices bytes at zero, so the rate saturates"
+        );
+        assert_eq!(
+            resolved.saturated_profile.as_deref(),
+            Some("s3-intra-region-2026"),
+            "the saturation is attributed to the profile that produced it"
+        );
+    }
+
+    /// `byte-minimal` is the older byte-leaning shape, reachable explicitly: the
+    /// configured 512 KiB threshold stays in force and the rate is ravel-query's
+    /// compiled-in request cost.
+    #[test]
+    fn byte_minimal_policy_resolves_the_configured_block_range_threshold() {
+        let resolved = resolution_from(&[
+            "sql_latency_bench",
+            "--generate",
+            "--logs-fetch-policy",
+            "byte-minimal",
+        ]);
+        assert_eq!(resolved.block_range_threshold, 524_288);
+        assert_eq!(
+            resolved.block_range_threshold,
+            ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "the literal above is the compiled-in threshold, not a second constant"
+        );
+        assert_eq!(
+            resolved.request_cost_bytes,
+            ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES
+        );
+        assert_eq!(resolved.request_cost_bytes, 1_887_437);
+        assert_eq!(resolved.saturated_profile, None);
+    }
+
+    /// An explicit `--logs-block-range-threshold` is in force under
+    /// `byte-minimal` and overridden (and recorded as overridden) under the
+    /// default policy, exactly as on the server.
+    #[test]
+    fn explicit_threshold_is_honoured_by_byte_minimal_and_overridden_by_default() {
+        let honoured = resolution_from(&[
+            "sql_latency_bench",
+            "--generate",
+            "--logs-fetch-policy",
+            "byte-minimal",
+            "--logs-block-range-threshold",
+            "65536",
+        ]);
+        assert_eq!(honoured.block_range_threshold, 65_536);
+        assert_eq!(honoured.overridden_block_range_threshold, None);
+
+        let overridden = resolution_from(&[
+            "sql_latency_bench",
+            "--generate",
+            "--logs-block-range-threshold",
+            "65536",
+        ]);
+        assert_eq!(overridden.block_range_threshold, u64::MAX);
+        assert_eq!(overridden.overridden_block_range_threshold, Some(65_536));
+    }
+
+    /// The two new provenance fields round-trip through JSON at their exact
+    /// values, and each key appears exactly once: a knob whose stamp the report
+    /// drops, or renames on the way back in, leaves a run that cannot say which
+    /// read shape produced it.
+    #[test]
+    fn provenance_round_trips_the_resolved_policy_and_threshold() {
+        let mut p = provenance_with_cost(u64::MAX);
+        p.logs_fetch_policy = "cost-based".to_string();
+        p.logs_block_range_threshold_effective = Some(u64::MAX);
+
+        let json = serde_json::to_value(&p).expect("Provenance serializes");
+        assert_eq!(json["logs_fetch_policy"], "cost-based");
+        assert_eq!(
+            json["logs_block_range_threshold_effective"],
+            serde_json::json!(18_446_744_073_709_551_615u64)
+        );
+
+        let back: Provenance = serde_json::from_value(json).expect("Provenance deserializes");
+        assert_eq!(back.logs_fetch_policy, "cost-based");
+        assert_eq!(back.logs_block_range_threshold_effective, Some(u64::MAX));
+
+        let text = serde_json::to_string(&p).expect("Provenance serializes");
+        assert_eq!(text.matches("\"logs_fetch_policy\"").count(), 1);
+        assert_eq!(
+            text.matches("\"logs_block_range_threshold_effective\"")
+                .count(),
+            1
+        );
+    }
+
+    /// The header stamps the resolved policy and threshold, and a Flight run
+    /// names neither threshold nor a value it never applied.
+    #[test]
+    fn header_stamps_the_policy_and_the_resolved_threshold() {
+        let d = dataset("pre-compaction", None);
+        let mut p = provenance_with_cost(u64::MAX);
+        p.logs_fetch_policy = "cost-based".to_string();
+        p.logs_block_range_threshold_effective = Some(u64::MAX);
+        let header = provenance_header(&p, &d);
+        assert!(
+            header.contains("  logs policy: cost-based\n"),
+            "header must stamp the policy; got:\n{header}"
+        );
+        assert!(
+            header.contains("  blk range  : effective=18446744073709551615 bytes\n"),
+            "header must stamp the resolved threshold; got:\n{header}"
+        );
+
+        p.source = "flight".to_string();
+        p.logs_block_range_threshold_effective = None;
+        let header = provenance_header(&p, &d);
+        assert!(
+            header.contains("  blk range  : effective=unknown (server config)\n"),
+            "a Flight run resolved no threshold the server obeyed; got:\n{header}"
         );
     }
 

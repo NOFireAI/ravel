@@ -442,6 +442,33 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   with this up to the host's cores; the value is recorded in the report's
   provenance as `fetch_concurrency`, and two tables at different values are
   not comparable without it.
+- `--logs-fetch-policy <policy>` is the logs read shape, the same knob and the
+  same value names as `ravel-server --logs-fetch-policy`, resolved by the bench
+  through the same resolution the server runs at startup. `request-minimal`
+  reads every log object whole in one covering GET, with no tail probe and no
+  ranged read; `byte-minimal` uses ranged reads wherever they save more bytes
+  than a request costs; `cost-based` (the default, as on the server) derives the
+  choice from the pass's store cost profile, which at the shipped reference
+  intra-region profile resolves to request-minimal behaviour. So a bench run at
+  default flags measures the shape a stock server produces: roughly one GET per
+  object for a full-scan statement, not one per block. Before the flag existed
+  the bench routed at a fixed 512 KiB threshold, which range-read every larger
+  object per block and made an in-process table incomparable with the server's;
+  pass `byte-minimal` to reach that older shape deliberately. The requested
+  policy is recorded in the report's provenance as `logs_fetch_policy`.
+- `--logs-block-range-threshold <BYTES>` is the object size above which a logs
+  read takes the ranged per-block path, the same knob as the server flag of that
+  name. Unset, the resolution's input is ravel-query's compiled-in 512 KiB. A
+  policy that resolves to whole-object reads OVERRIDES it, exactly as on the
+  server, so read what actually governed off the report's
+  `logs_block_range_threshold_effective` rather than off the flag. Both figures
+  are null on a `--flight` run, whose routing the server's own config decided.
+- `--logs-request-cost-bytes <BYTES>` is the expert escape hatch under the
+  policy, the same knob as the server flag of that name: set, it wins over the
+  policy's derived rate; unset, the policy derives it. The report records what
+  was asked for as `logs_request_cost_bytes_requested` and what governed as
+  `logs_request_cost_bytes_effective`, and at the default policy those two
+  differ, because the resolution saturates the rate.
 - `--progress-jsonl <PATH>` appends one JSON line per finished statement to
   `PATH` as the run goes (`{"outcome":"measured",...}`, `"skipped"`,
   `"failed"`), flushed per line. The full report still goes to stdout at the
@@ -581,7 +608,10 @@ Dataset-level, independent of any one query:
 - **rows** and the **pre-/post-compaction layout label**.
 
 Provenance (backend, region, endpoint, host logical cores, source, dataset id,
-runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`,
+runs, `cache_bytes`, `deadline_secs`, `fetch_concurrency`, `logs_fetch_policy`
+and `logs_block_range_threshold_effective` (the resolved read shape: two runs at
+different policies are not comparable, and the effective threshold is the one
+the resolution produced, not the one the flag asked for),
 `parallel_final_aggregation_requested` (the local CLI value) and
 `parallel_final_aggregation_effective` (the value that governed execution:
 equal to the request for an in-process lane, null for a `--flight` run whose
