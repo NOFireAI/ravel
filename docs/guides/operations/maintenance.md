@@ -22,6 +22,7 @@ process before anything else.
 - [The at-rest integrity scrubber](#the-at-rest-integrity-scrubber)
 - [Format migration](#format-migration)
 - [Legal hold](#legal-hold)
+- [Reclaiming a pre-namespacing cache directory](#reclaiming-a-pre-namespacing-cache-directory)
 - [The maintenance and inspection commands](#the-maintenance-and-inspection-commands)
 
 ## Running the maintenance loop
@@ -395,6 +396,41 @@ pass has picked it up.
 
 Legal-hold records themselves are undeletable by every role, Maintain included.
 
+## Reclaiming a pre-namespacing cache directory
+
+A node's local read cache once wrote entry files at
+`<cache-dir>/<shard>/<file>`. It now writes them under a per-instance namespace
+subdirectory, `<cache-dir>/<namespace>/<shard>/<file>`, so two caches over one
+directory cannot evict or miscount each other's files. A directory warmed by a
+binary from before that change still holds files at the old rootless layout.
+Those files are inert: nothing seeds, evicts, or counts them, and no live code
+path reads or writes that layout. They occupy disk, up to the old cache budget, on top of the current
+per-namespace budgets, and nothing deletes them implicitly.
+
+`cache reclaim-legacy` is the deliberate operator step that reclaims them:
+
+```sh
+ravel-cli cache reclaim-legacy --cache-dir <dir>          # dry run: lists only
+ravel-cli cache reclaim-legacy --cache-dir <dir> --apply  # deletes
+```
+
+It is a local filesystem tool: it takes no `--store` and never touches object
+storage. **Dry run by default.** With no `--apply` it prints each legacy file it
+would delete and their total bytes, and deletes nothing. `--apply` deletes the
+legacy shard directories and their entry files, and only those: a current
+namespace directory, a foreign file, and anything outside `--cache-dir` are
+never touched.
+
+**Safe to run while the node is live.** No live code path reads or writes the
+legacy `<cache-dir>/<shard>` layout, so deleting it races no read, write, or
+eviction on the running cache.
+
+**Downgrade story.** A binary rolled back to the pre-namespacing layout reads
+`<cache-dir>/<shard>` again and finds whatever reclaim left behind. After
+`--apply` it finds nothing there and starts with an empty disk cache. That is a
+cold start, not data loss: the next reads refetch from object storage, the same
+as any fresh node. The local cache is disposable by construction.
+
 ## The maintenance and inspection commands
 
 Every subcommand shares the same store flags as `ravel-server`. The full flag
@@ -414,6 +450,7 @@ list is in [the generated CLI reference](../../reference/ravel-cli-flags.md).
 | `catalog inspect --tenant <t> [--signal <s>]` | Decodes and prints that signal's HEAD and every referenced snapshot part: watermark, keys, hashes, entry counts. It names the signal both as a word and as the numeric value read off the object, so a HEAD stamped with a different signal than the one asked for is visible. It reports rather than errors when no HEAD exists yet. |
 | `catalog verify` | Diffs the sealed record history against the snapshot. See [routine verification](#routine-verification). |
 | `commit reconstruct` | Rebuilds record-less L0 data objects' commit records from their own footers. Stop maintenance first; see [troubleshooting](troubleshooting.md#commit-records-were-deleted-out-of-band). |
+| `cache reclaim-legacy --cache-dir <dir> [--apply]` | Reclaims pre-namespacing local read-cache files. See [reclaiming a pre-namespacing cache directory](#reclaiming-a-pre-namespacing-cache-directory). Local filesystem only; dry run without `--apply`. |
 | `segment inspect <path-or-key>` | Parses one metric segment: trailer, footer fields, section list, decoded series count. |
 | `commit decode <key>` | Decodes one commit record: identity, referenced data object key, size and hash, sample and series counts, timestamps. |
 | `commit decode-compaction <key>` | Decodes one compaction record: identity, input set hash, each input identity, and each output segment's summary. |

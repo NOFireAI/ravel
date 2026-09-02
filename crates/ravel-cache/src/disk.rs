@@ -104,6 +104,7 @@
 //! S3-FIFO's probation queue absorbs a scan without ever touching entries
 //! already promoted to main.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -839,6 +840,231 @@ impl Inner {
     }
 }
 
+/// How a top-level entry directly under a cache root is classified, using the
+/// same naming rules [`DiskCache`] writes with (issue #826). A directory
+/// warmed by a build from before the per-instance namespace layout (issue
+/// #671) holds entries at the old rootless `dir/<shard>/<file>` layout; those
+/// files are inert (never seeded, evicted, or counted, see the [module
+/// docs](self)) but occupy disk until reclaimed. This is the classification an
+/// operator's explicit reclaim step uses to tell those apart from the current
+/// per-namespace directories, so it never deletes live bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootEntryKind {
+    /// A current per-namespace subdirectory `root/<namespace>` (issue #671): a
+    /// directory that holds shard subdirectories rather than entry files
+    /// directly. Every live path operation (`path_for`, `scan_existing`, the
+    /// age sweep, eviction) is scoped beneath one of these, so reclaim must
+    /// never touch it.
+    Namespace,
+    /// A legacy pre-namespacing shard directory `root/<shard>`: a directory
+    /// that directly holds at least one entry file sitting at its own
+    /// canonical legacy path (`path_for(root, key) == file`). No live code
+    /// path reads or writes this layout after issue #671, so its files are
+    /// safe to delete while a node is live.
+    LegacyShard,
+    /// Anything else under the root: a foreign file, an empty directory, or a
+    /// directory matching neither shape. Never touched by reclaim.
+    Other,
+}
+
+/// The result of a [`reclaim_legacy`] run: exact counts and bytes for the
+/// legacy entry files listed (dry run) or removed (`apply`), and their paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimReport {
+    /// Whether files were actually deleted (`apply = true`) or only listed.
+    pub applied: bool,
+    /// Number of legacy entry files listed or removed.
+    pub files: u64,
+    /// Total physical bytes of those files (`fs::metadata().len()` summed),
+    /// measured before any deletion.
+    pub bytes: u64,
+    /// The canonical paths of those files, sorted, in the order reported.
+    pub paths: Vec<PathBuf>,
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    // Lowercase only: `push_hex` renders with `{:02x}`, so an uppercase name is
+    // not something this cache wrote and must not parse as an entry.
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn hex_to_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != N * 2 {
+        return None;
+    }
+    let bytes = hex.as_bytes();
+    let mut out = [0u8; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let hi = hex_nibble(bytes[2 * i])?;
+        let lo = hex_nibble(bytes[2 * i + 1])?;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+/// Recovers the [`CacheKey`] a file name encodes, or `None` if the name is not
+/// exactly what [`path_for`] renders (extension, four hex fields, canonical
+/// lowercase). This is the inverse of `path_for`'s file-name half; the caller
+/// still confirms the shard prefix by checking `path_for(root, key) == path`,
+/// so the two together accept only a file this cache's own naming rule would
+/// produce, at any format version (the name carries no version, so a
+/// pre-v3 entry is recognised the same as a current one).
+fn parse_entry_file_key(path: &Path) -> Option<CacheKey> {
+    if path.extension().and_then(OsStr::to_str) != Some(ENTRY_EXTENSION) {
+        return None;
+    }
+    let stem = path.file_stem().and_then(OsStr::to_str)?;
+    let mut parts = stem.split('-');
+    let tenant = parts.next()?;
+    let content = parts.next()?;
+    let offset = parts.next()?;
+    let len = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let tenant_hash = hex_to_bytes::<16>(tenant)?;
+    let content_hash = hex_to_bytes::<32>(content)?;
+    let offset = u64::from_be_bytes(hex_to_bytes::<8>(offset)?);
+    let len = u64::from_be_bytes(hex_to_bytes::<8>(len)?);
+    Some(CacheKey::new(tenant_hash, content_hash, offset, len))
+}
+
+/// Whether a directory-entry file is a legacy entry at its own canonical path:
+/// its name decodes to a [`CacheKey`] and `path_for(root, key)` maps back to
+/// exactly this path (which also proves the shard prefix matches
+/// `content_hash[0]`, since that is how `path_for` derives it).
+fn is_legacy_entry_file(root: &Path, path: &Path) -> bool {
+    match parse_entry_file_key(path) {
+        Some(key) => path_for(root, &key) == path,
+        None => false,
+    }
+}
+
+/// Whether `name` is a shard directory name: exactly two lowercase hex
+/// characters, as `path_for` renders `content_hash[..1]`.
+fn is_shard_name(name: &OsStr) -> bool {
+    match name.to_str() {
+        Some(s) => s.len() == 2 && s.bytes().all(|b| hex_nibble(b).is_some()),
+        None => false,
+    }
+}
+
+/// Classifies one top-level entry `path` directly under the cache `root`
+/// (issue #826), using the same naming rules [`DiskCache`] writes with. A
+/// directory is a [`RootEntryKind::LegacyShard`] when it directly holds an
+/// entry file at its own canonical legacy path, a [`RootEntryKind::Namespace`]
+/// when it instead holds shard subdirectories, and [`RootEntryKind::Other`]
+/// otherwise (including any non-directory). The legacy check is decided by the
+/// canonical-path round-trip rather than the directory name alone, so a
+/// namespace that happens to be named like a shard is still classified by its
+/// contents, not misread as legacy.
+pub fn classify_root_entry(root: &Path, path: &Path) -> RootEntryKind {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return RootEntryKind::Other;
+    };
+    if !metadata.is_dir() {
+        return RootEntryKind::Other;
+    }
+    let Ok(children) = fs::read_dir(path) else {
+        return RootEntryKind::Other;
+    };
+    let mut has_legacy_entry = false;
+    let mut has_shard_subdir = false;
+    for child in children.flatten() {
+        let Ok(file_type) = child.file_type() else {
+            continue;
+        };
+        if file_type.is_file() {
+            if is_legacy_entry_file(root, &child.path()) {
+                has_legacy_entry = true;
+            }
+        } else if file_type.is_dir() && is_shard_name(&child.file_name()) {
+            has_shard_subdir = true;
+        }
+    }
+    if has_legacy_entry {
+        RootEntryKind::LegacyShard
+    } else if has_shard_subdir {
+        RootEntryKind::Namespace
+    } else {
+        RootEntryKind::Other
+    }
+}
+
+/// Reclaims pre-namespacing disk-cache files under `root` (issue #826): the
+/// entry files of every legacy `root/<shard>` shard directory (the layout
+/// [`DiskCache`] wrote before the per-instance namespace subdirectory of issue
+/// #671). With `apply = false` it only lists them; with `apply = true` it
+/// deletes each entry file and then removes the shard directory if that leaves
+/// it empty.
+///
+/// **Safe to run while a node is live.** After issue #671 every live path
+/// operation -- `path_for`, `scan_existing`, the background age sweep, and
+/// eviction -- is scoped beneath `root/<namespace>`, so no live code path ever
+/// reads or writes a `root/<shard>` file. Deleting the legacy layout therefore
+/// cannot race any live read, write, seed, or eviction.
+///
+/// It touches nothing else: a current namespace directory
+/// ([`RootEntryKind::Namespace`]), a foreign file, and anything outside `root`
+/// are all left exactly as found. Within a legacy shard directory only files
+/// recognised as entries at their own canonical path are removed, so a foreign
+/// file sitting beside real entries survives (and keeps its shard directory
+/// from being removed).
+///
+/// Returns an error only when `root` cannot be listed or a delete fails; a
+/// `root` that never held the legacy layout returns a zero report and changes
+/// nothing on disk.
+pub fn reclaim_legacy(root: &Path, apply: bool) -> std::io::Result<ReclaimReport> {
+    let mut report = ReclaimReport {
+        applied: apply,
+        files: 0,
+        bytes: 0,
+        paths: Vec::new(),
+    };
+
+    let mut top_levels: Vec<PathBuf> = fs::read_dir(root)?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    top_levels.sort();
+
+    for shard_dir in top_levels {
+        if classify_root_entry(root, &shard_dir) != RootEntryKind::LegacyShard {
+            continue;
+        }
+
+        let mut entry_files: Vec<PathBuf> = fs::read_dir(&shard_dir)?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_legacy_entry_file(root, path))
+            .collect();
+        entry_files.sort();
+
+        for entry_file in entry_files {
+            let size = fs::metadata(&entry_file)?.len();
+            report.files += 1;
+            report.bytes += size;
+            report.paths.push(entry_file.clone());
+            if apply {
+                fs::remove_file(&entry_file)?;
+            }
+        }
+
+        if apply {
+            // Only succeeds if the directory is now empty; a foreign file left
+            // in place keeps it, which is the intended "never touch a foreign
+            // file" behaviour.
+            let _ = fs::remove_dir(&shard_dir);
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1140,6 +1366,185 @@ mod tests {
             fs::write(&path, b"not a cache entry, just noise from somewhere else").unwrap();
             assert!(cache.get(&key).is_none());
         }
+    }
+
+    /// Plants a legacy pre-namespacing entry file of exactly `payload` at its
+    /// own canonical `dir/<shard>/<file>` path (the layout before issue #671),
+    /// returning that path. The bytes need not be a valid entry: reclaim
+    /// recognises a legacy entry by its canonical name, not by decoding a
+    /// header, so a legacy file of any format version is reclaimable.
+    fn plant_legacy_entry(root: &Path, key: &CacheKey, payload: &[u8]) -> PathBuf {
+        let path = path_for(root, key);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, payload).unwrap();
+        path
+    }
+
+    /// Every regular file under `dir`, as (path, byte length) pairs, sorted, so
+    /// a before/after comparison proves nothing on disk changed.
+    fn listing_with_sizes(dir: &Path) -> Vec<(PathBuf, u64)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64)>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_type = entry.file_type().unwrap();
+                if file_type.is_dir() {
+                    walk(&path, out);
+                } else {
+                    out.push((path.clone(), fs::metadata(&path).unwrap().len()));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// `reclaim_legacy(apply)` deletes a legacy shard entry and leaves the
+    /// current namespace's entry and its in-memory budget accounting exact.
+    ///
+    /// FLIP (non-vacuity): in `reclaim_legacy`, remove the
+    /// `if apply { fs::remove_file(&entry_file)?; }` deletion. The legacy file
+    /// then survives and `!legacy_path.exists()` fails.
+    #[tokio::test]
+    async fn reclaim_legacy_apply_removes_legacy_keeps_namespace() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // A current per-namespace entry, with known bytes and accounting.
+        let cache = DiskCache::new(root.clone(), generous_limits());
+        let ns_payload = b"namespace-resident-bytes";
+        let ns_key = test_key_with_len(1, ns_payload.len() as u64);
+        cache.insert(ns_key, ns_payload);
+        let ns_path = path_for(cache.dir(), &ns_key);
+        let ns_on_disk = fs::read(&ns_path).unwrap();
+        let bytes_before = cache.total_bytes();
+        let len_before = cache.len();
+
+        // A legacy entry outside every namespace, of a distinct known size.
+        let legacy_payload = vec![0xABu8; 100];
+        let legacy_key = test_key_with_len(2, 100);
+        let legacy_path = plant_legacy_entry(&root, &legacy_key, &legacy_payload);
+        assert!(legacy_path.exists());
+
+        let report = reclaim_legacy(&root, true).unwrap();
+
+        assert_eq!(report.files, 1);
+        assert_eq!(report.bytes, 100, "exact bytes of the legacy entry");
+        assert_eq!(report.paths, vec![legacy_path.clone()]);
+        assert!(!legacy_path.exists(), "the legacy entry is deleted");
+
+        // The namespace entry is byte-for-byte untouched, on disk and through
+        // the live cache, and the budget accounting has not moved.
+        assert!(ns_path.exists());
+        assert_eq!(fs::read(&ns_path).unwrap(), ns_on_disk);
+        assert_eq!(cache.get(&ns_key).as_deref(), Some(ns_payload.as_slice()));
+        assert_eq!(cache.total_bytes(), bytes_before);
+        assert_eq!(cache.len(), len_before);
+    }
+
+    /// A root that never held the legacy layout reports exactly zero and
+    /// changes nothing: a full before/after listing is identical.
+    ///
+    /// FLIP (non-vacuity): in `classify_root_entry`, return
+    /// `RootEntryKind::LegacyShard` when `has_shard_subdir` is true (swap the
+    /// two branch conditions). The current namespace directory is then
+    /// classified legacy; `reclaim_legacy` reads it and, since its own child
+    /// directories are not entry files, still reports zero -- so to make the
+    /// flip observable also drop the `is_legacy_entry_file` filter in
+    /// `reclaim_legacy` and delete every file it walks. The namespace's entry
+    /// is then removed and both the `report.files == 0` and the
+    /// before/after-listing assertions fail.
+    #[tokio::test]
+    async fn reclaim_legacy_on_clean_root_reports_zero_and_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let cache = DiskCache::new(root.clone(), generous_limits());
+        cache.insert(test_key_with_len(1, 5), b"hello");
+        cache.insert(test_key_with_len(2, 5), b"world");
+
+        let before = listing_with_sizes(&root);
+        assert!(!before.is_empty(), "the namespace layout is present");
+
+        let report = reclaim_legacy(&root, true).unwrap();
+
+        assert_eq!(report.files, 0);
+        assert_eq!(report.bytes, 0);
+        assert!(report.paths.is_empty());
+        assert_eq!(listing_with_sizes(&root), before, "nothing changed on disk");
+    }
+
+    /// A dry run lists the legacy entry with its exact size and deletes
+    /// nothing.
+    ///
+    /// FLIP (non-vacuity): in `reclaim_legacy`, remove the `if apply` guard
+    /// around `fs::remove_file(&entry_file)?` so it always deletes. The dry run
+    /// then removes the file and `legacy_path.exists()` fails.
+    #[test]
+    fn reclaim_legacy_dry_run_lists_without_deleting() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let legacy_payload = vec![0x7u8; 4096];
+        let legacy_key = test_key_with_len(3, 4096);
+        let legacy_path = plant_legacy_entry(&root, &legacy_key, &legacy_payload);
+
+        let report = reclaim_legacy(&root, false).unwrap();
+
+        assert!(!report.applied);
+        assert_eq!(report.files, 1);
+        assert_eq!(report.bytes, 4096, "exact bytes listed");
+        assert_eq!(report.paths, vec![legacy_path.clone()]);
+        assert!(legacy_path.exists(), "a dry run deletes nothing");
+    }
+
+    /// A foreign file is neither listed nor deleted, whether it sits at the
+    /// root or beside real entries inside a legacy shard directory; the shard
+    /// directory survives because it is not empty.
+    ///
+    /// FLIP (non-vacuity): in `reclaim_legacy`, drop the
+    /// `.filter(|path| is_legacy_entry_file(root, path))` on the shard's entry
+    /// files so every file is deleted. The foreign `notes.txt` is then removed
+    /// and appears in `report.paths`, failing both the "not listed" and the
+    /// "still exists" assertions.
+    #[test]
+    fn reclaim_legacy_never_touches_a_foreign_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // A foreign file at the root top level.
+        let root_foreign = root.join("keep-me.txt");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&root_foreign, b"operator notes").unwrap();
+
+        // A real legacy entry, and a foreign file beside it in the same shard.
+        let legacy_key = test_key_with_len(4, 10);
+        let legacy_path = plant_legacy_entry(&root, &legacy_key, &[1u8; 10]);
+        let shard_dir = legacy_path.parent().unwrap().to_path_buf();
+        let shard_foreign = shard_dir.join("notes.txt");
+        fs::write(&shard_foreign, b"not a cache entry").unwrap();
+
+        let report = reclaim_legacy(&root, true).unwrap();
+
+        assert_eq!(report.files, 1, "only the real legacy entry is counted");
+        assert_eq!(report.paths, vec![legacy_path.clone()]);
+        assert!(!legacy_path.exists(), "the legacy entry is deleted");
+        assert!(
+            root_foreign.exists(),
+            "a root-level foreign file is untouched"
+        );
+        assert!(
+            shard_foreign.exists(),
+            "a foreign file inside a legacy shard is untouched"
+        );
+        assert!(
+            shard_dir.exists(),
+            "the shard directory survives because a foreign file remains"
+        );
     }
 
     #[tokio::test]

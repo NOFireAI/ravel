@@ -34,6 +34,9 @@ ravel-commit = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-maintain = { workspace = true }
 ravel-ingest = { workspace = true }
+# `cache reclaim-legacy` calls `ravel_cache::reclaim_legacy` (issue #826).
+# Already a workspace pin; adds no new external crate.
+ravel-cache = { workspace = true }
 # `load --parquet` reuses `NormalizedLogRecord` and the `logs_limits` constants
 # (max_future_skew_ns, the length caps) rather than reimplementing the record
 # shape or re-deriving the bounds (ADR-0089). New dependency of ravel-cli;
