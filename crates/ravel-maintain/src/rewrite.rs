@@ -109,9 +109,10 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     // path, including an error, so a later directly-driven rewrite still starts
     // from zero. Closing leaves the counters readable: a caller inspecting an
     // aborted run's figures reads them after this returns.
-    if let Some(l) = config.request_ledger.as_ref() {
-        l.reset_for_run_unless_open();
-    }
+    let opened = config
+        .request_ledger
+        .as_ref()
+        .is_some_and(|l| l.reset_for_run_unless_open());
     let outcome = rewrite_and_publish_scoped::<C>(
         store,
         clock,
@@ -122,23 +123,38 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         start_ns,
     )
     .await;
-    // ADR-0996 task 996-8: the run's store requests and wire bytes, split by
-    // the phase that issued them, emitted on EVERY outcome. A failed run's
-    // request costs are exactly what an operator wants to see (a conservation
-    // abort still paid for its whole read side), so the report sits here in
-    // the wrapper rather than on the success path. Counters only -- nothing in
-    // this crate reads a figure back to route a fetch. Requests are logical
-    // store calls, not billed attempts (that seam is the S3 adapter's,
-    // ADR-0996 decision 3). Received and sent bytes are different kinds and
-    // are never summed with each other or with the decoded-heap peaks. Only
-    // fires when a ledger is installed (never in production today).
+    // The frame that OPENED the scope emits the run's report, exactly once
+    // (ADR-0996 task 996-8): a directly-driven rewrite reports here; a rewrite
+    // dispatched by `compact_bucket` or `migrate_bucket_format` stays silent
+    // and the outer driver reports every outcome, gate refusals included.
+    if opened {
+        emit_request_report(config, bucket, outcome.is_ok());
+        if let Some(l) = config.request_ledger.as_ref() {
+            l.end_run();
+        }
+    }
+    outcome
+}
+
+/// Emit the run's per-phase request report on the outcome the run actually
+/// had (ADR-0996 task 996-8). A failed run's request costs are exactly what
+/// an operator wants to see (a conservation abort still paid for its whole
+/// read side, and a gate refusal still paid its LIST), so every outermost
+/// driver calls this on success and error alike, before closing the scope.
+/// Counters only -- nothing in this crate reads a figure back to route a
+/// fetch. Requests are logical store calls, not billed attempts (that seam is
+/// the S3 adapter's, ADR-0996 decision 3). Received and sent bytes are
+/// different kinds and are never summed with each other or with the
+/// decoded-heap peaks. Only fires when a ledger is installed (never in
+/// production today).
+pub(crate) fn emit_request_report(config: &CompactorConfig, bucket: &Bucket, ok: bool) {
     if let Some(l) = config.request_ledger.as_ref() {
         let r = l.report();
         tracing::info!(
             signal = ?bucket.signal,
             shard = bucket.shard,
             ingest_hour_bucket = bucket.ingest_hour_bucket,
-            outcome = if outcome.is_ok() { "ok" } else { "err" },
+            outcome = if ok { "ok" } else { "err" },
             list_requests = r.list.requests,
             record_read_requests = r.record_read.requests,
             record_read_wire_bytes_received = r.record_read.wire_bytes_received,
@@ -157,10 +173,6 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
             "compaction store requests by phase (received and sent bytes are different kinds; do not sum them together)"
         );
     }
-    if let Some(l) = config.request_ledger.as_ref() {
-        l.end_run();
-    }
-    outcome
 }
 
 /// [`rewrite_and_publish`]'s body, with the request ledger's run scope already
@@ -313,13 +325,17 @@ pub async fn migrate_bucket_format(
     bucket: &Bucket,
     target_version: u32,
 ) -> Result<MigrateOutcome> {
-    // This is the run's outermost driver, so it opens the request ledger's
-    // scope before the bucket LIST below; the rewrite primitive it dispatches to
-    // keeps that scope and closes it (ADR-0996 task 996-8).
+    // This is the run's outermost driver: it opens the request ledger's scope
+    // before the bucket LIST below and, as the opener, emits the run's report
+    // on EVERY outcome -- the gates that return before any rewrite dispatches
+    // (NotSealed, UpToDate, listing errors) still paid their LIST and report
+    // it. The rewrite primitive it dispatches to sees the open scope and stays
+    // silent (ADR-0996 task 996-8).
     if let Some(l) = config.request_ledger.as_ref() {
         l.reset_for_run();
     }
     let outcome = migrate_bucket_format_scoped(store, clock, config, bucket, target_version).await;
+    emit_request_report(config, bucket, outcome.is_ok());
     if let Some(l) = config.request_ledger.as_ref() {
         l.end_run();
     }
