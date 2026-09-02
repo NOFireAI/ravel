@@ -3883,6 +3883,12 @@ type = "i64"
     /// through the loader deterministically.
     struct TestClock {
         now_ns: std::sync::atomic::AtomicI64,
+        /// Clock reads and sleep registrations since construction. Every shard
+        /// actor loop iteration, every write the actor handles, and every flush
+        /// task reads this clock, so the counter standing still means no task
+        /// in the router is runnable: the progress signal
+        /// [`yield_until_router_is_quiet`] samples.
+        reads: std::sync::atomic::AtomicU64,
         wake_tx: tokio::sync::watch::Sender<()>,
     }
 
@@ -3891,6 +3897,7 @@ type = "i64"
             let (wake_tx, _rx) = tokio::sync::watch::channel(());
             std::sync::Arc::new(TestClock {
                 now_ns: std::sync::atomic::AtomicI64::new(start_ns),
+                reads: std::sync::atomic::AtomicU64::new(0),
                 wake_tx,
             })
         }
@@ -3900,10 +3907,15 @@ type = "i64"
                 .fetch_add(delta_ns, std::sync::atomic::Ordering::SeqCst);
             let _ = self.wake_tx.send(());
         }
+
+        fn reads(&self) -> u64 {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl Clock for TestClock {
         fn now_ns(&self) -> i64 {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.now_ns.load(std::sync::atomic::Ordering::SeqCst)
         }
 
@@ -3925,6 +3937,132 @@ type = "i64"
                     }
                 }
             })
+        }
+    }
+
+    /// Consecutive scheduler rounds [`yield_until_router_is_quiet`] needs to see
+    /// the clock unread before it calls the router quiet. A routed write reaches
+    /// its shard buffer within a handful of rounds, so this is generous rather
+    /// than tuned; it costs nothing, because a round is one `yield_now` and no
+    /// wall-clock wait.
+    const QUIET_ROUNDS: usize = 64;
+
+    /// Nanoseconds [`load_with_released_tail`] advances the injected clock by to
+    /// release a load's tail. Above the router's 2s default `max_flush_delay`,
+    /// so a buffer no size trigger can reach ages out; far below the 60s Strict
+    /// ack deadline ([`WRITE_ACK_DEADLINE_FLOOR`]), so no in-flight write's
+    /// deadline can fire on the same advance.
+    const TAIL_RELEASE_ADVANCE_NS: i64 = 5 * 1_000_000_000;
+
+    /// Yields to the runtime until the router has stopped making progress, so
+    /// the caller can advance the clock knowing every dispatched write is
+    /// already in its shard buffer.
+    ///
+    /// Quiescence is read off `clock.reads()`: with the clock frozen no timer
+    /// can fire, so once nothing reads it for [`QUIET_ROUNDS`] consecutive
+    /// rounds, no task in the router is runnable. Nothing here waits on wall
+    /// time.
+    async fn yield_until_router_is_quiet(clock: &TestClock) {
+        let mut last = clock.reads();
+        let mut still = 0usize;
+        while still < QUIET_ROUNDS {
+            tokio::task::yield_now().await;
+            let reads = clock.reads();
+            if reads == last {
+                still += 1;
+            } else {
+                last = reads;
+                still = 0;
+            }
+        }
+    }
+
+    /// Run one load whose object count is a function of `target_bytes` and the
+    /// input geometry alone, with no wall-clock input at all.
+    ///
+    /// The router gets a frozen [`TestClock`], so neither the age trigger nor
+    /// the drain-time re-flush can fire on their own. Two things then have to be
+    /// arranged by hand, and both are what makes the count exact:
+    ///
+    /// - The end-of-input `flush_all` must not run while a write is still on its
+    ///   way to a shard, or that write lands in a fresh buffer afterwards and
+    ///   gets an object of its own. The last batch's `on_batch_queued` hook
+    ///   blocks the decoder thread, so no `Done` can reach the loader until this
+    ///   driver releases it.
+    /// - The tail still has to be published. Once the router is quiet -- every
+    ///   batch routed and every size-triggered flush finished -- the clock is
+    ///   advanced past `max_flush_delay` exactly once, which ages out whatever
+    ///   no size trigger could reach, one flush per shard.
+    ///
+    /// `pipeline_depth` is one wider than the batch count so the loader never
+    /// parks mid-input on an ack: an ack the size trigger cannot answer would
+    /// otherwise need the age trigger to fire before the input is exhausted,
+    /// which is the layout decision the driver is here to make.
+    #[allow(clippy::too_many_arguments)]
+    async fn load_with_released_tail(
+        store: Arc<dyn ObjectStoreBackend>,
+        pq: &Path,
+        m: &Mapping,
+        shards: u32,
+        batch_rows: usize,
+        read_cursors: usize,
+        batches: usize,
+        target_bytes: usize,
+    ) -> LoadReport {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let clock = TestClock::new(NOW_NS);
+        let queued = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let on_batch_queued: BuildStartHook = Arc::new(move || {
+            if queued.fetch_add(1, Ordering::SeqCst) + 1 == batches {
+                let _ = gate_tx.send(());
+                let guard = release_rx
+                    .lock()
+                    .expect("the release channel is not poisoned");
+                let _ = guard.recv();
+            }
+        });
+
+        let load_fut = load_instrumented(
+            store,
+            pq,
+            "acme",
+            m,
+            shards,
+            batch_rows,
+            Some(read_cursors),
+            batches + 1,
+            DEFAULT_MAX_INFLIGHT_FLUSHES,
+            DEFAULT_DECODE_QUEUE_BATCHES,
+            target_bytes,
+            None,
+            NOW_NS,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+            LoadPath::Columnar,
+            None,
+            Some(on_batch_queued),
+        );
+
+        // The driver never resolves, so the load future is what ends the
+        // `select!`; both are polled on every round, which is what lets the
+        // driver's yields hand the runtime to the writes still in flight.
+        let driver = async {
+            let () = gate_rx.recv().await.expect("the last batch is queued");
+            yield_until_router_is_quiet(&clock).await;
+            clock.advance_ns(TAIL_RELEASE_ADVANCE_NS);
+            yield_until_router_is_quiet(&clock).await;
+            // Releasing the decoder lets `Done` through, and with it the
+            // end-of-input flush and the drain; both find empty buffers.
+            drop(release_tx);
+            std::future::pending::<()>().await
+        };
+
+        tokio::select! {
+            report = load_fut => report.expect("load succeeds"),
+            () = driver => unreachable!("the driver parks once the tail is released"),
         }
     }
 
@@ -5528,9 +5666,10 @@ type = "i64"
     /// At the default `--target-bytes 1` each of those 16 writes flushes inside
     /// its own `handle_write`: 16 objects. At 8 MiB none of them can, because a
     /// shard's whole share of the file is 4 one-row writes, so each shard
-    /// flushes exactly once (released by the router's age trigger once every
-    /// batch has been submitted, which `--pipeline-depth 4` guarantees): 4
-    /// objects, one per shard. Same 16 rows, same decoded records.
+    /// flushes exactly once (released by [`load_with_released_tail`], which
+    /// advances the injected clock past the age trigger once every batch has
+    /// been routed): 4 objects, one per shard. Same 16 rows, same decoded
+    /// records.
     ///
     /// Prove-the-test: hardcode `target_bytes: 1` back into the `IngestConfig`
     /// in `load_instrumented` and the large-target side writes 16 objects, not
@@ -5551,33 +5690,17 @@ type = "i64"
             let m = m.clone();
             async move {
                 let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-                let report = load_instrumented(
+                let report = load_with_released_tail(
                     Arc::clone(&store),
                     &pq,
-                    "acme",
                     &m,
                     shards,
                     rows_per_group,
-                    Some(shards as usize),
-                    // Wide enough to hold every batch that accumulates into one
-                    // flush; below this the loader would block on an ack no
-                    // later batch can release.
+                    shards as usize,
                     rows_per_group,
-                    DEFAULT_MAX_INFLIGHT_FLUSHES,
-                    DEFAULT_DECODE_QUEUE_BATCHES,
                     target_bytes,
-                    None,
-                    NOW_NS,
-                    // A real clock: above target 1 the tail of a load is
-                    // released by the router's wall-clock age trigger, which a
-                    // `FixedClock` can never fire.
-                    Arc::new(SystemClock),
-                    LoadPath::Columnar,
-                    None,
-                    None,
                 )
-                .await
-                .expect("load succeeds");
+                .await;
                 let stored = list_data_objects(store.as_ref()).await.len();
                 (report, stored, decoded_records(store.as_ref()).await)
             }
@@ -5637,7 +5760,12 @@ type = "i64"
     /// - `24576`: above one slice and below two, so each shard flushes on every
     ///   second batch. 4 shards x 2 = 8 objects, exactly half of 16.
     /// - `1 MiB`: above a shard's whole 66 KB share, so each shard flushes once,
-    ///   released by the age trigger. 4 objects, one per shard.
+    ///   released by the tail advance. 4 objects, one per shard.
+    ///
+    /// Every regime runs through [`load_with_released_tail`], so the four counts
+    /// are a function of `target_bytes` and the geometry alone: the router's
+    /// clock is frozen, and the test advances it past `max_flush_delay` once,
+    /// after every batch has been routed, to release the tail (issue #1111).
     ///
     /// Prove-the-test: hardcode `target_bytes: 1` into the `IngestConfig` in
     /// `load_instrumented` and both effective regimes fail (`left: 16, right:
@@ -5663,33 +5791,17 @@ type = "i64"
             let m = m.clone();
             async move {
                 let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-                let report = load_instrumented(
+                let report = load_with_released_tail(
                     Arc::clone(&store),
                     &pq,
-                    "acme",
                     &m,
                     shards,
                     batch_rows,
-                    Some(shards as usize),
-                    // Wide enough to hold every batch that accumulates into one
-                    // flush; below this the loader would block on an ack no
-                    // later batch can release.
+                    shards as usize,
                     batches,
-                    DEFAULT_MAX_INFLIGHT_FLUSHES,
-                    DEFAULT_DECODE_QUEUE_BATCHES,
                     target_bytes,
-                    None,
-                    NOW_NS,
-                    // A real clock: above the size trigger the tail of a load is
-                    // released by the router's wall-clock age trigger, which a
-                    // `FixedClock` can never fire.
-                    Arc::new(SystemClock),
-                    LoadPath::Columnar,
-                    None,
-                    None,
                 )
-                .await
-                .expect("load succeeds");
+                .await;
                 let stored = list_data_objects(store.as_ref()).await.len();
                 (report, stored, decoded_records(store.as_ref()).await)
             }
@@ -5725,6 +5837,55 @@ type = "i64"
             objects_whole, 4,
             "target 1 MiB is above a shard's whole share of the file, so each shard flushes once"
         );
+        // Which trigger opened each object, not only how many there were: the
+        // flake this test used to carry (issue #1111) showed up here first, as
+        // size 4 / final 8 on the mid regime, before it showed up as 12 objects.
+        for (target, report, expected) in [
+            (
+                DEFAULT_TARGET_BYTES,
+                &default,
+                FlushMixCounts {
+                    size: 16,
+                    age: 0,
+                    final_drain: 0,
+                },
+            ),
+            (
+                4096,
+                &below,
+                FlushMixCounts {
+                    size: 16,
+                    age: 0,
+                    final_drain: 0,
+                },
+            ),
+            (
+                24_576,
+                &mid,
+                FlushMixCounts {
+                    size: 8,
+                    age: 0,
+                    final_drain: 0,
+                },
+            ),
+            (
+                1024 * 1024,
+                &whole,
+                FlushMixCounts {
+                    size: 0,
+                    age: 4,
+                    final_drain: 0,
+                },
+            ),
+        ] {
+            assert_eq!(
+                report.flush_mix_report().totals,
+                expected,
+                "target {target}: every object below the target's reach is opened by the tail \
+                 advance and every one at or above it by the size trigger; nothing is left for \
+                 the end-of-input drain to sweep"
+            );
+        }
         for report in [&default, &below, &mid, &whole] {
             assert_eq!(
                 report.tokens.len(),
