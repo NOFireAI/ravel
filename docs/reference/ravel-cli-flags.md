@@ -158,7 +158,7 @@ Run one compaction pass over a single sealed bucket
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--dry-run` |  |  | Compute the plan and report it, but write no L1 parts or record |
+| `--dry-run` |  |  | Compute the plan and report it, but write no L1 segments or record |
 | `--hour` |  |  |  |
 | `--max-flush-lifetime` |  |  | Override the compactor's `max_flush_lifetime` (humantime duration, e.g. `30m`, `0s`; the same grammar and unit as ravel-server's `--gc-max-flush-lifetime`). A bucket seals only at its hour's end plus this plus the clock-skew allowance, so lowering it seals buckets sooner. UNSAFE below the ingest path's real flush lifetime: a bucket a writer is still flushing into can then be sealed and compacted, and that writer's later-published object is missed by the compaction. The default is the safe 1h; use this only for a tenant known quiescent, such as one whose bulk load has finished |
 | `--shard` |  |  |  |
@@ -171,13 +171,13 @@ Compact every sealed bucket of a whole tenant signal: walk each shard's ingest h
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--bucket-concurrency` |  | `1` | Number of buckets to compact CONCURRENTLY. Buckets are independent by construction (disjoint per-(shard, hour) input sets, separate content-addressed parts, separate CAS-published records), so the walk is embarrassingly parallel: N > 1 runs up to N buckets' compactions at once. Default 1, which is today's fully sequential behavior byte-for-byte (report line order included). Refused at 0 |
-| `--dry-run` |  |  | Compute each bucket's plan and report it, but write no L1 parts or records |
+| `--bucket-concurrency` |  | `1` | Number of buckets to compact CONCURRENTLY. Buckets are independent by construction (disjoint per-(shard, hour) input sets, separate content-addressed segments, separate CAS-published records), so the walk is embarrassingly parallel: N > 1 runs up to N buckets' compactions at once. Default 1, which is today's fully sequential behavior byte-for-byte (report line order included). Refused at 0 |
+| `--dry-run` |  |  | Compute each bucket's plan and report it, but write no L1 segments or records |
 | `--from-hour` |  |  | First ingest-hour bucket to consider, inclusive. Omit to start at each shard's oldest present hour |
 | `--input-read-concurrency` |  |  | Number of per-input reads a compaction keeps in flight at once (the commit-record GET and catalog load per input). Raise it to hide store round-trip latency on a many-input bucket; it never changes output bytes. Default 8 (the compactor default); values below 1 act as 1 |
-| `--l1-part-memory-target-bytes` |  |  | The decoded record-heap size at which a merge closes an in-progress L1 part (a split target, not a peak-memory bound: a merge can overshoot it, e.g. by a whole trace on the RSPAN path, so size the host for path-specific overshoot). Lower it for smaller parts on a small host; raise it for fewer, larger parts. Refused at 0. Default 256 MiB (the compactor default) |
+| `--l1-part-memory-target-bytes` |  |  | The decoded record-heap size at which a merge closes an in-progress L1 segment (a split target, not a peak-memory bound: a merge can overshoot it, e.g. by a whole trace on the RSPAN path, so size the host for path-specific overshoot). Lower it for smaller segments on a small host; raise it for fewer, larger segments. Refused at 0. Default 256 MiB (the compactor default) |
 | `--max-flush-lifetime` |  |  | Override the compactor's `max_flush_lifetime` (humantime duration, e.g. `30m`, `0s`; the same grammar and unit as ravel-server's `--gc-max-flush-lifetime`). A bucket seals only at its hour's end plus this plus the clock-skew allowance, so lowering it seals buckets sooner. UNSAFE below the ingest path's real flush lifetime: a bucket a writer is still flushing into can then be sealed and compacted, and that writer's later-published object is missed by the compaction. The default is the safe 1h; use this only for a tenant known quiescent, such as one whose bulk load has finished |
-| `--max-l1-part-bytes` |  |  | Bound the encoded/on-object bytes a merge writes before it closes an L1 part (the stored-size target). A part closes on whichever of this and --l1-part-memory-target-bytes is reached first. Refused at 0. Default 256 MiB (the compactor default) |
+| `--max-l1-part-bytes` |  |  | Bound the encoded/on-object bytes a merge writes before it closes an L1 segment (the stored-size target). A segment closes on whichever of this and --l1-part-memory-target-bytes is reached first. Refused at 0. Default 256 MiB (the compactor default) |
 | `--shards` |  |  | Shard count to walk (shards `0..N`). Omit to resolve it from the tenant's durable shard-count provisioning record; given together with a record, the two must agree. With neither flag nor record the command errors, naming the tenant |
 | `--signal` |  |  |  |
 | `--tenant` |  |  |  |
@@ -185,7 +185,7 @@ Compact every sealed bucket of a whole tenant signal: walk each shard's ingest h
 
 ### maintain sweep
 
-Run one sweep pass (orphan GC, superseded, unreferenced parts) over a shard
+Run one sweep pass (orphan GC, superseded, unreferenced segments) over a shard
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
@@ -398,7 +398,7 @@ Write a full new `sys/gc`, enforcing `protection_horizon >= max_query_duration +
 
 ## typed-attr-column
 
-Show or set a tenant's durable declared typed attribute columns for the `logs` SQL table (ADR-0090 decision 1), in `TenantConfig.typed_attr_columns` at `t/<tenant_hash>/config`. A query-serving process picks a change up within its declared-column staleness horizon; no restart is needed
+Show or set a tenant's durable typed attribute columns for the `logs` SQL table (ADR-0090 decision 1), in `TenantConfig.typed_attr_columns` at `t/<tenant_hash>/config`. A query-serving process picks a change up within its typed-attribute-column staleness horizon; no restart is needed
 
 _No flags._
 
@@ -416,7 +416,7 @@ Replace the tenant's declaration wholesale, validating it first and swapping the
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--from-mapping` |  |  | Derive the declaration from a `load --mapping` TOML instead of positional `KEY:TYPE` specs: every `[[attribute]]` and `[[resource_attribute]]` entry becomes a declared column of the same-named type. `f64`-typed entries are skipped with a per-key warning on stderr (there is no `f64` declared column type); the rest are written through the same CAS whole-list replace. Mutually exclusive with positional `KEY:TYPE` specs |
+| `--from-mapping` |  |  | Derive the declaration from a `load --mapping` TOML instead of positional `KEY:TYPE` specs: every `[[attribute]]` and `[[resource_attribute]]` entry becomes a typed attribute column of the same-named type. `f64`-typed entries are skipped with a per-key warning on stderr (there is no `f64` typed attribute column type); the rest are written through the same CAS whole-list replace. Mutually exclusive with positional `KEY:TYPE` specs |
 | `<KEY:TYPE>` |  |  | The declaration, as `KEY:TYPE` specs in schema-append order, where TYPE is one of str/i64/bool/bytes (case-insensitive). A key may contain `:`; the type is split off the right. Mutually exclusive with `--from-mapping` |
 | `<TENANT>` |  |  | The tenant whose declaration to replace |
 

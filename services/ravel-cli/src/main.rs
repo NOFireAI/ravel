@@ -194,10 +194,10 @@ enum Command {
         #[command(subcommand)]
         command: GcConfigCommand,
     },
-    /// Show or set a tenant's durable declared typed attribute columns for the
+    /// Show or set a tenant's durable typed attribute columns for the
     /// `logs` SQL table (ADR-0090 decision 1), in
     /// `TenantConfig.typed_attr_columns` at `t/<tenant_hash>/config`. A
-    /// query-serving process picks a change up within its declared-column
+    /// query-serving process picks a change up within its typed-attribute-column
     /// staleness horizon; no restart is needed.
     TypedAttrColumn {
         #[command(subcommand)]
@@ -495,9 +495,9 @@ enum TypedAttrColumnCommand {
         columns: Vec<String>,
         /// Derive the declaration from a `load --mapping` TOML instead of
         /// positional `KEY:TYPE` specs: every `[[attribute]]` and
-        /// `[[resource_attribute]]` entry becomes a declared column of the
+        /// `[[resource_attribute]]` entry becomes a typed attribute column of the
         /// same-named type. `f64`-typed entries are skipped with a per-key
-        /// warning on stderr (there is no `f64` declared column type); the rest
+        /// warning on stderr (there is no `f64` typed attribute column type); the rest
         /// are written through the same CAS whole-list replace. Mutually
         /// exclusive with positional `KEY:TYPE` specs.
         #[arg(long, value_name = "TOML")]
@@ -760,7 +760,7 @@ enum MaintainCommand {
         shard: u32,
         #[arg(long)]
         hour: u32,
-        /// Compute the plan and report it, but write no L1 parts or record.
+        /// Compute the plan and report it, but write no L1 segments or record.
         #[arg(long)]
         dry_run: bool,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
@@ -799,7 +799,7 @@ enum MaintainCommand {
         /// current hour.
         #[arg(long)]
         to_hour: Option<u32>,
-        /// Compute each bucket's plan and report it, but write no L1 parts or
+        /// Compute each bucket's plan and report it, but write no L1 segments or
         /// records.
         #[arg(long)]
         dry_run: bool,
@@ -816,15 +816,15 @@ enum MaintainCommand {
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
         /// The decoded record-heap size at which a merge closes an in-progress
-        /// L1 part (a split target, not a peak-memory bound: a merge can
+        /// L1 segment (a split target, not a peak-memory bound: a merge can
         /// overshoot it, e.g. by a whole trace on the RSPAN path, so size the
-        /// host for path-specific overshoot). Lower it for smaller parts on a
-        /// small host; raise it for fewer, larger parts. Refused at 0.
+        /// host for path-specific overshoot). Lower it for smaller segments on a
+        /// small host; raise it for fewer, larger segments. Refused at 0.
         /// Default 256 MiB (the compactor default).
         #[arg(long, value_name = "BYTES")]
         l1_part_memory_target_bytes: Option<u64>,
         /// Bound the encoded/on-object bytes a merge writes before it closes an
-        /// L1 part (the stored-size target). A part closes on whichever of this
+        /// L1 segment (the stored-size target). A segment closes on whichever of this
         /// and --l1-part-memory-target-bytes is reached first. Refused at 0.
         /// Default 256 MiB (the compactor default).
         #[arg(long, value_name = "BYTES")]
@@ -837,7 +837,7 @@ enum MaintainCommand {
         input_read_concurrency: Option<usize>,
         /// Number of buckets to compact CONCURRENTLY. Buckets are independent by
         /// construction (disjoint per-(shard, hour) input sets, separate
-        /// content-addressed parts, separate CAS-published records), so the walk
+        /// content-addressed segments, separate CAS-published records), so the walk
         /// is embarrassingly parallel: N > 1 runs up to N buckets' compactions
         /// at once. Default 1, which is today's fully sequential behavior
         /// byte-for-byte (report line order included). Refused at 0.
@@ -867,7 +867,7 @@ enum MaintainCommand {
         #[arg(long, value_name = "N", default_value_t = 1)]
         bucket_concurrency: usize,
     },
-    /// Run one sweep pass (orphan GC, superseded, unreferenced parts) over a shard.
+    /// Run one sweep pass (orphan GC, superseded, unreferenced segments) over a shard.
     Sweep {
         #[arg(long)]
         tenant: String,
