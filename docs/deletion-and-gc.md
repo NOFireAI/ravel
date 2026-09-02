@@ -259,6 +259,17 @@ window would still call a Hit.
   held or deleted together: dropping the record while a still-named part is
   held would leave that part unreferenced, and the unreferenced-part rule
   would then collect it and undo the hold.
+- **An input is superseded only where the record a query reads names it.**
+  When two compaction records in one bucket name overlapping input sets, the
+  resolver picks one authoritative record per overlap group and serves every
+  input the winner does not name as a raw segment. The sweep applies that same
+  choice: a losing record's inputs count as superseded only where the winner
+  also names them, so an input only a loser names is left in place, because
+  that raw object is where a query still reads those rows from. Deleting it on
+  the strength of the losing record alone would turn duplicated rows into
+  missing rows. The losing record's own parts are nothing but unreferenced
+  objects once the record is gone, and the unreferenced-part rule collects them
+  on age as usual.
 - **A rewrite record outlives every input it superseded.** A whole
   supersession chain, from the live record back to the raw inputs its oldest
   generation superseded, is one indivisible delete unit: the HEAD gate decides
@@ -379,7 +390,11 @@ every bound is measured.
   rewrite pass's own one-hop live-record view instead would let a `.done` land
   while a snapshot still resolves an L0 input the one hop never excluded
   (ADR-0064 §4); the completion gate blocks exactly
-  that.
+  that. Overlapping compaction records are read here under the same
+  authoritative-record rule the resolver and the sweep use: only a winning
+  record's inputs count as compacted away, so a raw L0 that only a losing
+  record names stays in the gate's live set, and a losing record's parts,
+  which no query reads, do not by themselves keep a request blocked.
 
 - **Physical removal reuses the existing sweep.** A rewrite's superseded
   inputs become inputs to the superseded-input sweep, deleted after

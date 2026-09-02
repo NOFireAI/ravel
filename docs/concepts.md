@@ -272,10 +272,14 @@ segments are unreferenced objects that age out. Two records that instead name
 different but overlapping input sets are rarer, and serving both would return
 the overlapping records twice for logs and spans, which have no query-time
 deduplication. The resolver picks one authoritative record per overlap group by
-the smallest input-set hash, with the record key as the tie fallback, serves
-any input the winner does not name as a raw
+the largest input set, then the smallest input-set hash, with the record key
+as the final fallback, serves any input the winner does not name as a raw
 segment, ignores the other records' segments, and raises a metric, so no
 input is served twice or dropped while an operator reconciles the bucket.
+Preferring the largest input set leaves the fewest inputs to serve raw. The
+sweep and the erasure completion gate follow the same choice: an input only a
+losing record names is still the one a query reads, so it is neither deleted
+as superseded nor treated as already rewritten.
 
 Retention expires data by age against the tenant's configured policy. Like
 every deletion in Ravel it is a durable transaction first, a tombstone

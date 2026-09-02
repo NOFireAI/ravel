@@ -105,6 +105,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use prost::Message;
+use ravel_catalog::select_authoritative_compaction_records;
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
@@ -743,6 +744,13 @@ async fn sweep_superseded_impl(
         .map(|r| r.superseded_record_key.as_str())
         .filter(|k| !k.is_empty())
         .collect();
+    // Every compaction record in scope, read once for the pass, and the input
+    // identities the AUTHORITATIVE records of each bucket name. A record whose
+    // inputs overlap another's may be the loser of its overlap component, and
+    // the resolver serves an input only the loser names as a raw L0 segment
+    // rather than from any part: see [`AuthoritativeInputs`].
+    let compactions = load_compaction_records(store, &entries).await?;
+    let authoritative = AuthoritativeInputs::from_records(&compactions);
 
     // Phase A: gather every group this pass could delete, deduplicated by
     // chain identity across the whole pass. Two live rewrites naming the same
@@ -776,7 +784,7 @@ async fn sweep_superseded_impl(
         // group applied themselves.
         let (gathered, applied) = match entry {
             BucketEntry::CompactionRecord(_) => {
-                let Some(record) = get_compaction_record_opt(store, key).await? else {
+                let Some(record) = compactions.get(key) else {
                     continue;
                 };
                 // Horizon gate anchored on the durable created_unix_ns. It
@@ -790,8 +798,9 @@ async fn sweep_superseded_impl(
                 {
                     continue;
                 }
+                let superseded = authoritative.superseded_view(record);
                 (
-                    gather_l0_inputs(store, tenant, signal, shard, &record).await?,
+                    gather_l0_inputs(store, tenant, signal, shard, &superseded).await?,
                     Vec::new(),
                 )
             }
@@ -993,6 +1002,109 @@ async fn load_rewrite_records(
     Ok(out)
 }
 
+/// GET every compaction record among `entries`, keyed by its commit key,
+/// tolerant of a key that vanished between the pass's LIST and now.
+async fn load_compaction_records(
+    store: &dyn ObjectStoreBackend,
+    entries: &[(String, BucketEntry)],
+) -> Result<HashMap<String, CompactionRecord>> {
+    let mut out: HashMap<String, CompactionRecord> = HashMap::new();
+    for (key, entry) in entries {
+        if !matches!(entry, BucketEntry::CompactionRecord(_)) {
+            continue;
+        }
+        if let Some(record) = get_compaction_record_opt(store, key).await? {
+            out.insert(key.clone(), record);
+        }
+    }
+    Ok(out)
+}
+
+/// The input identities the authoritative compaction records of each
+/// ingest-hour bucket name.
+///
+/// Compaction records whose input sets overlap resolve to one authoritative
+/// record per overlap component
+/// ([`select_authoritative_compaction_records`], the same function the
+/// snapshot resolver and the index fold use). The losers' parts are served
+/// from nowhere, and an input only a loser names is served as a raw L0
+/// segment: it is the sole server of its rows. So an input is superseded only
+/// where an authoritative record names it. Treating a loser's whole input set
+/// as superseded deletes that sole server and turns duplicate rows into
+/// missing rows. A loser's own parts become unreferenced instead and fall to
+/// rule 3.
+#[derive(Default)]
+struct AuthoritativeInputs {
+    by_bucket: HashMap<u32, HashSet<(String, u64, u64)>>,
+}
+
+impl AuthoritativeInputs {
+    fn from_records(records: &HashMap<String, CompactionRecord>) -> Self {
+        // Per bucket, because an overlap component is a property of one
+        // ingest-hour bucket: that is the unit the resolver reads.
+        let mut per_bucket: HashMap<u32, Vec<(&str, &CompactionRecord)>> = HashMap::new();
+        for (key, record) in records {
+            per_bucket
+                .entry(record.ingest_hour_bucket)
+                .or_default()
+                .push((key.as_str(), record));
+        }
+        let mut by_bucket: HashMap<u32, HashSet<(String, u64, u64)>> = HashMap::new();
+        for (bucket, in_bucket) in per_bucket {
+            let losing = select_authoritative_compaction_records(&in_bucket);
+            let mut identities: HashSet<(String, u64, u64)> = HashSet::new();
+            for (key, record) in &in_bucket {
+                if losing.contains(key) {
+                    continue;
+                }
+                for input in &record.inputs {
+                    identities.insert((
+                        input.writer_id.clone(),
+                        input.writer_epoch,
+                        input.writer_seq,
+                    ));
+                }
+            }
+            by_bucket.insert(bucket, identities);
+        }
+        Self { by_bucket }
+    }
+
+    /// The subset of `record`'s inputs this rule may treat as superseded: the
+    /// ones an authoritative record of the same bucket also names. For a
+    /// winner that is its whole input set; for a loser it is the overlap with
+    /// its winner.
+    fn superseded_view(&self, record: &CompactionRecord) -> SupersededSubset {
+        let authoritative = self.by_bucket.get(&record.ingest_hour_bucket);
+        let inputs = record
+            .inputs
+            .iter()
+            .filter(|input| {
+                authoritative.is_some_and(|set| {
+                    set.contains(&(
+                        input.writer_id.clone(),
+                        input.writer_epoch,
+                        input.writer_seq,
+                    ))
+                })
+            })
+            .cloned()
+            .collect();
+        SupersededSubset {
+            inputs,
+            ingest_hour_bucket: record.ingest_hour_bucket,
+        }
+    }
+}
+
+/// The superseded-input view of one compaction record: its inputs narrowed to
+/// the ones an authoritative record names. Carries the record's own bucket so
+/// [`gather_l0_inputs`] reconstructs the same keys it would from the record.
+struct SupersededSubset {
+    inputs: Vec<CompactionInputIdentity>,
+    ingest_hour_bucket: u32,
+}
+
 /// One indivisible deletion unit for rule 2: the records to delete first, the
 /// data objects to delete after them, and the snapshot identities those
 /// objects carry so the HEAD-reachability gate can decide the whole unit at
@@ -1191,6 +1303,15 @@ impl SupersededInputs for CompactionRecord {
 }
 
 impl SupersededInputs for RewriteRecord {
+    fn inputs(&self) -> &[CompactionInputIdentity] {
+        &self.inputs
+    }
+    fn ingest_hour_bucket(&self) -> u32 {
+        self.ingest_hour_bucket
+    }
+}
+
+impl SupersededInputs for SupersededSubset {
     fn inputs(&self) -> &[CompactionInputIdentity] {
         &self.inputs
     }

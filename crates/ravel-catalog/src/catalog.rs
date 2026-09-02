@@ -1,6 +1,7 @@
 //! Snapshot resolution: listing-based discovery over commit records
 //! (docs/catalog-and-mvcc.md "Snapshot resolution", ADR-0003, ADR-0010 §2/§10).
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2163,7 +2164,7 @@ impl Catalog {
         let losing_compaction_records =
             select_authoritative_compaction_records(&compaction_records);
         for (ckey, record) in &compaction_records {
-            if losing_compaction_records.contains(ckey) {
+            if losing_compaction_records.contains(ckey.as_str()) {
                 continue;
             }
             for input in &record.inputs {
@@ -2223,7 +2224,9 @@ impl Catalog {
         // (event-bound filtered). A record whose whole output a live rewrite
         // superseded is skipped -- its parts would resurrect erased records.
         for (ckey, record) in &compaction_records {
-            if superseded_records.contains(ckey) || losing_compaction_records.contains(ckey) {
+            if superseded_records.contains(ckey)
+                || losing_compaction_records.contains(ckey.as_str())
+            {
                 continue;
             }
             for part in &record.parts {
@@ -3321,9 +3324,9 @@ fn build_rewrite_l1_segment_ref(
 
 /// Select one authoritative compaction record per *overlap component* of a
 /// bucket, returning the keys of the records whose output parts must be
-/// IGNORED (the losers). Shared by snapshot resolution (`process_bucket`) and
-/// the index fold (`classify_bucket`) so a live resolve and a folded snapshot
-/// derive identical bucket state.
+/// IGNORED (the losers). Shared by snapshot resolution (`process_bucket`), the
+/// index fold (`classify_bucket`), the superseded-input sweep, and the erasure
+/// completion gate, so every one of them derives identical bucket state.
 ///
 /// Two compaction records are in conflict when their input sets overlap (share
 /// at least one L0 input identity). Query-time dedup by `(series_id, ts)`
@@ -3335,12 +3338,18 @@ fn build_rewrite_l1_segment_ref(
 /// (a singleton component) is not in conflict and stays authoritative, so
 /// disjoint records keep today's behaviour (both served).
 ///
-/// Tie-break: the authoritative record is the one with the lexicographically
-/// smallest `input_set_hash`, its key string breaking the impossible
-/// exact-hash tie. `input_set_hash` is a collision-resistant digest of the
-/// record's input identity set, so this is a stable total order every replica
-/// computes identically from the record bytes alone, with no dependence on
-/// wall-clock, listing order, or which compactor won the race.
+/// Tie-break, in order: the LARGEST input set (the count of distinct input
+/// identities the record names), then the lexicographically smallest
+/// `input_set_hash`, then the record key. Preferring the maximal set is what
+/// keeps as much of the bucket as possible inside compacted parts: a record
+/// whose input set is a strict superset of another's always wins, so a
+/// superset/subset pair leaves no input outside the winner at all. The two
+/// fallbacks make the order total; `input_set_hash` is a collision-resistant
+/// digest of the record's input identity set, and the key is the impossible
+/// exact-hash tie. Every term is a pure function of the record bytes, so every
+/// replica, the index fold, the sweep, and the erasure completion gate compute
+/// the same winner, with no dependence on wall-clock, listing order, or which
+/// compactor won the race.
 ///
 /// Coverage (why dropping a loser's parts loses no data): a loser `L` shares a
 /// component with its winner `W`. Each of `L`'s inputs is either also an input
@@ -3349,15 +3358,38 @@ fn build_rewrite_l1_segment_ref(
 /// it cannot be an input of another component's winner, since a shared input
 /// would have merged the two components. So every L0 input of the bucket is
 /// served exactly once: inside exactly one authoritative record's parts, or as
-/// one raw L0 segment. The one residual exposure is a loser input already
-/// swept behind its now-ignored compaction record; publish-time refusal in
-/// ravel-maintain (out of scope here) closes that window durably.
-pub(crate) fn select_authoritative_compaction_records(
-    records: &[(String, Arc<CompactionRecord>)],
-) -> HashSet<String> {
+/// one raw L0 segment. A loser-only input therefore stays load-bearing, which
+/// is why the sweep treats an input as superseded only where an authoritative
+/// record names it, and why the erasure completion gate keeps such an input in
+/// its live view.
+pub fn select_authoritative_compaction_records<K, R>(records: &[(K, R)]) -> HashSet<&str>
+where
+    K: AsRef<str>,
+    R: Borrow<CompactionRecord>,
+{
     if records.len() < 2 {
         return HashSet::new();
     }
+    // Each record's input identities, deduplicated once: the union-find below
+    // walks them, and the tie-break counts them. A malformed record naming the
+    // same input twice must not thereby claim a larger set.
+    let identities: Vec<HashSet<(&str, u64, u64)>> = records
+        .iter()
+        .map(|(_key, record)| {
+            record
+                .borrow()
+                .inputs
+                .iter()
+                .map(|input| {
+                    (
+                        input.writer_id.as_str(),
+                        input.writer_epoch,
+                        input.writer_seq,
+                    )
+                })
+                .collect()
+        })
+        .collect();
 
     // Union-find over record indices: union two records whenever they name the
     // same input identity, so a component is a maximal set of records linked by
@@ -3370,22 +3402,17 @@ pub(crate) fn select_authoritative_compaction_records(
         }
         x
     }
-    let mut owner: HashMap<(String, u64, u64), usize> = HashMap::new();
-    for (i, (_key, record)) in records.iter().enumerate() {
-        for input in &record.inputs {
-            let identity = (
-                input.writer_id.clone(),
-                input.writer_epoch,
-                input.writer_seq,
-            );
-            if let Some(&j) = owner.get(&identity) {
+    let mut owner: HashMap<(&str, u64, u64), usize> = HashMap::new();
+    for (i, inputs) in identities.iter().enumerate() {
+        for identity in inputs {
+            if let Some(&j) = owner.get(identity) {
                 let rj = find(&mut parent, j);
                 let ri = find(&mut parent, i);
                 if ri != rj {
                     parent[ri] = rj;
                 }
             } else {
-                owner.insert(identity, i);
+                owner.insert(*identity, i);
             }
         }
     }
@@ -3397,23 +3424,29 @@ pub(crate) fn select_authoritative_compaction_records(
         components.entry(root).or_default().push(i);
     }
 
-    // Within each multi-record component keep the smallest-`input_set_hash`
-    // record; every other record in that component is a loser.
-    let mut losing: HashSet<String> = HashSet::new();
+    // Within each multi-record component keep the maximal-input-set record;
+    // every other record in that component is a loser.
+    let mut losing: HashSet<&str> = HashSet::new();
     for members in components.values() {
         if members.len() < 2 {
             continue;
         }
         if let Some(&winner) = members.iter().min_by(|&&a, &&b| {
-            records[a]
-                .1
-                .input_set_hash
-                .cmp(&records[b].1.input_set_hash)
-                .then_with(|| records[a].0.cmp(&records[b].0))
+            identities[b]
+                .len()
+                .cmp(&identities[a].len())
+                .then_with(|| {
+                    records[a]
+                        .1
+                        .borrow()
+                        .input_set_hash
+                        .cmp(&records[b].1.borrow().input_set_hash)
+                })
+                .then_with(|| records[a].0.as_ref().cmp(records[b].0.as_ref()))
         }) {
             for &m in members {
                 if m != winner {
-                    losing.insert(records[m].0.clone());
+                    losing.insert(records[m].0.as_ref());
                 }
             }
         }
