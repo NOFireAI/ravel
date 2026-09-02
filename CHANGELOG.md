@@ -16,8 +16,9 @@ falls from 96.40 s to 72.52 s and the cold total from 320.18 s to 222.19 s.
 ### Added
 
 - **Typed column statistics for logs** (ADR-0850). The fold writes exact
-  per-object statistics for declared columns, and `MIN`/`MAX` over a declared
-  column can be answered from the catalog without opening a segment.
+  per-object statistics for typed attribute columns, and `MIN`/`MAX` over a
+  typed attribute column can be answered from the catalog without opening a
+  segment.
 - **SQL surface**: a fail-closed scalar and window function registry
   (ADR-0097), `LIKE`/`NOT LIKE` on the logs table with substring pruning
   (ADR-0105), and typed predicate pushdown for declared logs columns. Functions
@@ -264,8 +265,8 @@ process is disposable.
   compatibility surface for Grafana.
 - SQL query through Apache DataFusion over `samples` and `logs` tables,
   exposed over HTTP and Arrow Flight SQL.
-- A post-evaluation analytics endpoint for change point detection and robust
-  summary statistics.
+- A post-evaluation analytics endpoint for change point detection and
+  robust (median and scaled median absolute deviation) summary statistics.
 - A unified alerting and detection engine that stores every rule transition
   as immutable, queryable data.
 - Compaction, age-based retention, and garbage collection across all signals,
