@@ -171,6 +171,7 @@ Compact every sealed bucket of a whole tenant signal: walk each shard's ingest h
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
+| `--bucket-concurrency` |  | `1` | Number of buckets to compact CONCURRENTLY. Buckets are independent by construction (disjoint per-(shard, hour) input sets, separate content-addressed parts, separate CAS-published records), so the walk is embarrassingly parallel: N > 1 runs up to N buckets' compactions at once. Default 1, which is today's fully sequential behavior byte-for-byte (report line order included). Refused at 0 |
 | `--dry-run` |  |  | Compute each bucket's plan and report it, but write no L1 parts or records |
 | `--from-hour` |  |  | First ingest-hour bucket to consider, inclusive. Omit to start at each shard's oldest present hour |
 | `--input-read-concurrency` |  |  | Number of per-input reads a compaction keeps in flight at once (the commit-record GET and catalog load per input). Raise it to hide store round-trip latency on a many-input bucket; it never changes output bytes. Default 8 (the compactor default); values below 1 act as 1 |
