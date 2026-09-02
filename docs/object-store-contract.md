@@ -600,6 +600,41 @@ adapter contract:
    *values*, never in *object keys or names*, precisely so Object Lock on
    these prefixes never conflicts with a legitimate erasure request.
 
+   **How the prefix scoping is achieved.** Object Lock has no prefix
+   scope of its own. It is enabled once per bucket, at bucket creation,
+   together with versioning. Retention then applies per object version,
+   in one of two ways: a **bucket default retention**, which reaches
+   every object written to the bucket, data objects included, or a
+   **per-object retention** set on an individual object version at write
+   time or afterwards. So "compliance mode on the protected prefixes"
+   means per-object retention on the objects under those prefixes, and
+   **no Ravel process ever sets it**. Every Ravel write path writes
+   plain objects and stays that way. The scoped posture is an
+   operator-run mechanism outside Ravel. Objects under the protected
+   prefixes carry per-object retention applied by that mechanism; the
+   bucket itself does not lock a prefix. Two shapes satisfy the
+   requirement. Both need Object Lock enabled on the bucket with **no
+   default retention**, and versioning ON:
+
+   | Mechanism | What it does | Coverage window |
+   |---|---|---|
+   | Event-driven function | A function subscribed to object-created events, filtered to the protected prefixes, calls the per-object retention API in compliance mode with the chosen retention period. | Each object is locked within seconds of its creation. |
+   | Scheduled batch job | An S3 Batch Operations job, run on a schedule and driven by an S3 Inventory manifest filtered to the same prefixes, sets the same retention. | Up to the schedule interval plus the inventory delay. |
+
+   Between an object's creation and the moment the mechanism acts on it,
+   the object carries no retention, and any credential that can delete
+   can delete it. That window is the residual exposure of the scoped
+   posture. Pick the mechanism whose window your compliance regime
+   accepts. The AWS reference for both is
+   [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html).
+
+   The alternative posture is **whole-bucket**: set a bucket default
+   retention and run no mechanism at all. S3 then applies retention at
+   write time, so there is no window. The cost is that every data object
+   is locked for the retention period, which means selective subject
+   erasure and retention deletion cannot remove an object before that
+   period ends.
+
 Enforcement stays at the bucket/IAM layer (ADR-0042 decision 3): nothing
 in this crate can configure or verify Object Lock or lifecycle policy
 in-process, because `object_store` 0.14 exposes no such API and this crate
