@@ -53,6 +53,7 @@ pub mod provision_audit;
 pub mod publish;
 pub mod query_audit;
 pub mod read;
+pub mod request_ledger;
 pub mod retention;
 pub mod rewrite;
 pub mod rlog;
@@ -102,6 +103,7 @@ pub use publish::{
 };
 pub use query_audit::{QUERY_AUDIT_SHARD, QueryStatus, query_audit_event, write_query_audit};
 pub use ravel_fleet::worker_set::{WorkerSet, owner, owns, run_bounded, unit_key};
+pub use request_ledger::{PhaseRequests, RequestLedger, RequestPhase, RunRequestReport};
 pub use retention::{
     RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket,
     maintain_bucket_with_reach, retention_sweep_bucket, retention_sweep_bucket_with_reach,

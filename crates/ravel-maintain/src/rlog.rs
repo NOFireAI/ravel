@@ -215,11 +215,12 @@ use ravel_proto::commit::v1::CompactionPart;
 use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, DeclaredStatValue};
 
 use crate::bucket::Bucket;
-use crate::build::{BuiltPart, put_part};
+use crate::build::{BuiltPart, put_part_with_ledger};
 use crate::codec::SegmentCodec;
 use crate::config::{AdmissionMode, CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, MergeCursorBudgetSite, Result};
 use crate::read::InputRecord;
+use crate::request_ledger::{RequestLedger, RequestPhase, note_get};
 
 /// The RLOG output trailer version every L1 part carries (currently 3:
 /// ADR-0032 introduced v2, ADR-0095 moved it to v3). Recorded in each part's
@@ -396,20 +397,25 @@ pub(crate) async fn load_catalog_from_object(
     recover_indexed_fields: bool,
 ) -> Result<RlogInputCatalog> {
     let cfg = RlogConfig::default();
+    let ledger = config.request_ledger.as_ref();
 
     // Locate the footer and section directory from a suffix probe: one
     // ranged GET, growing to a second only if the probe missed the footer
     // (the RLOG analogue of the RSEG read path).
     let probe = store
         .get(&object_key, GetRange::Suffix(config.footer_probe_bytes))
-        .await?;
+        .await;
+    note_get(ledger, RequestPhase::CatalogRead, &probe);
+    let probe = probe?;
     let total = probe.total_size;
     let ftr = match footer::open_from_suffix(&probe.data, total)? {
         SuffixOutcome::Ready(f) => f,
         SuffixOutcome::NeedRange { offset, len } => {
             let tail = store
                 .get(&object_key, GetRange::Range(offset, offset + len))
-                .await?;
+                .await;
+            note_get(ledger, RequestPhase::CatalogRead, &tail);
+            let tail = tail?;
             match footer::open_from_suffix(&tail.data, total)? {
                 SuffixOutcome::Ready(f) => f,
                 SuffixOutcome::NeedRange { .. } => {
@@ -425,16 +431,19 @@ pub(crate) async fn load_catalog_from_object(
     // BLOCKS and BLOOM are never fetched here; the merge streams blocks by
     // range one stream at a time. FIELD_DIR is decoded (and validated) even
     // though the merge rebuilds it, so a corrupt input fails loud here.
-    let stream_dir_raw = fetch_section(store, &object_key, &ftr, kind::STREAM_DIR, &cfg).await?;
-    let field_dir_raw = fetch_section(store, &object_key, &ftr, kind::FIELD_DIR, &cfg).await?;
-    let skip_idx_raw = fetch_section(store, &object_key, &ftr, kind::SKIP_IDX, &cfg).await?;
+    let stream_dir_raw =
+        fetch_section(store, &object_key, &ftr, kind::STREAM_DIR, &cfg, ledger).await?;
+    let field_dir_raw =
+        fetch_section(store, &object_key, &ftr, kind::FIELD_DIR, &cfg, ledger).await?;
+    let skip_idx_raw =
+        fetch_section(store, &object_key, &ftr, kind::SKIP_IDX, &cfg, ledger).await?;
 
     // Which fields this input had indexed. Recovered here, while the
     // object's footer and FIELD_DIR bytes are already at hand, and reduced
     // immediately to a name list: the POSTINGS bytes themselves are dropped
     // before this function returns and never take part in the merge.
     let indexed_fields = if recover_indexed_fields {
-        input_indexed_fields(store, &object_key, &ftr, &field_dir_raw, &cfg).await?
+        input_indexed_fields(store, &object_key, &ftr, &field_dir_raw, &cfg, ledger).await?
     } else {
         Vec::new()
     };
@@ -451,7 +460,8 @@ pub(crate) async fn load_catalog_from_object(
             format_version: OUTPUT_FORMAT_VERSION,
         });
     };
-    let page_dir_raw = fetch_section(store, &object_key, &ftr, kind::PAGE_DIR, &cfg).await?;
+    let page_dir_raw =
+        fetch_section(store, &object_key, &ftr, kind::PAGE_DIR, &cfg, ledger).await?;
     // The per-block shape and string-payload figures the bounded merge reserves
     // a cursor's decode against (ADR-0979 decision 4). Decoded here, once, from
     // directory bytes already fetched: these are the same decodes the range
@@ -1017,6 +1027,7 @@ impl PartSink<'_> {
                 self.dry_run,
                 self.retain_bytes,
                 &declared_accum,
+                self.config.request_ledger.as_ref(),
             )
             .await?;
             // Only bytes actually retained past PUT count toward the
@@ -1681,6 +1692,7 @@ impl<'a> StreamCursor<'a> {
         &mut self,
         store: &dyn ObjectStoreBackend,
         tracker: Option<&MergeMemoryTracker>,
+        ledger: Option<&RequestLedger>,
         mut budget: Option<&mut CursorBudget<'_>>,
     ) -> Result<()> {
         loop {
@@ -1700,7 +1712,7 @@ impl<'a> StreamCursor<'a> {
                 continue;
             }
             // The current loc is fully decoded: fetch the next one.
-            match self.next_raw_block(store, tracker).await? {
+            match self.next_raw_block(store, tracker, ledger).await? {
                 Some((loc, data)) => {
                     self.group_raw_bytes = data.len() as u64;
                     self.decoded_in_group = 0;
@@ -1811,6 +1823,7 @@ impl<'a> StreamCursor<'a> {
         &mut self,
         store: &dyn ObjectStoreBackend,
         tracker: Option<&MergeMemoryTracker>,
+        ledger: Option<&RequestLedger>,
     ) -> Result<Option<(StreamBlockLoc, bytes::Bytes)>> {
         if let Some((loc, data)) = self.prefetched.take() {
             return Ok(Some((loc, data)));
@@ -1821,8 +1834,8 @@ impl<'a> StreamCursor<'a> {
         let data = match self.take_next_loc() {
             Some(ahead) => {
                 let (a, b) = futures::try_join!(
-                    fetch_block(store, self.object_key, &loc),
-                    fetch_block(store, self.object_key, &ahead)
+                    fetch_block(store, self.object_key, &loc, ledger),
+                    fetch_block(store, self.object_key, &ahead, ledger)
                 )?;
                 if let Some(t) = tracker {
                     t.block_fetched(b.len() as u64);
@@ -1830,7 +1843,7 @@ impl<'a> StreamCursor<'a> {
                 self.prefetched = Some((ahead, b));
                 a
             }
-            None => fetch_block(store, self.object_key, &loc).await?,
+            None => fetch_block(store, self.object_key, &loc, ledger).await?,
         };
         if let Some(t) = tracker {
             t.block_fetched(data.len() as u64);
@@ -1853,11 +1866,13 @@ async fn fetch_block(
     store: &dyn ObjectStoreBackend,
     object_key: &str,
     loc: &StreamBlockLoc,
+    ledger: Option<&RequestLedger>,
 ) -> Result<bytes::Bytes> {
     let got = store
         .get(object_key, GetRange::Range(loc.start(), loc.end()))
-        .await?;
-    Ok(got.data)
+        .await;
+    note_get(ledger, RequestPhase::BlockRead, &got);
+    Ok(got?.data)
 }
 
 /// One input queued for overlap-gated admission (ADR-0979 decision 2): its
@@ -2062,6 +2077,9 @@ async fn merge_stream_into_parts(
     let concurrency = sink.config.input_read_concurrency.max(1);
     let budget = sink.config.merge_cursor_budget_bytes;
     let mode = sink.config.merge_admission;
+    // Copied out of the sink before its `&mut` borrows begin: `config` is a
+    // shared reference field, so the ledger handle outlives them.
+    let ledger = sink.config.request_ledger.as_ref();
 
     // The admission queue: one entry per input carrying the stream, ordered by
     // (lower_bound, input_index) so opens follow the frontier and ties keep
@@ -2165,6 +2183,7 @@ async fn merge_stream_into_parts(
                         p.input_index,
                         stream_id,
                         tracker,
+                        ledger,
                     )) as CursorFuture<'_, '_>
                 })
                 .collect();
@@ -2245,7 +2264,7 @@ async fn merge_stream_into_parts(
             inputs_carrying_stream: pending.len(),
         };
         open[bi]
-            .refill(store, tracker, Some(&mut cursor_budget))
+            .refill(store, tracker, ledger, Some(&mut cursor_budget))
             .await?;
         // A drained cursor releases its residency (refill already dropped its
         // last block) and its charge, so both the open-cursor high-water and the
@@ -2295,6 +2314,7 @@ async fn open_cursor<'a>(
     input_index: usize,
     stream_id: &LogStreamId,
     tracker: Option<&MergeMemoryTracker>,
+    ledger: Option<&RequestLedger>,
 ) -> Result<Option<StreamCursor<'a>>> {
     let Some(mut cursor) = StreamCursor::open(catalog, input_index, stream_id)? else {
         return Ok(None);
@@ -2302,7 +2322,7 @@ async fn open_cursor<'a>(
     // No budget: the caller reserved this cursor's ceiling before calling, and
     // that reservation is the maximum over every block the cursor can decode,
     // so this first refill is covered whichever blocks it decodes.
-    cursor.refill(store, tracker, None).await?;
+    cursor.refill(store, tracker, ledger, None).await?;
     Ok(cursor.peek_ts().is_some().then_some(cursor))
 }
 
@@ -2341,6 +2361,7 @@ async fn finalize_part(
     dry_run: bool,
     retain_bytes: bool,
     declared_accum: &DeclaredStatAccum,
+    ledger: Option<&RequestLedger>,
 ) -> Result<BuiltPart> {
     if stats.postings_capped_fields > 0 {
         tracing::warn!(
@@ -2401,7 +2422,7 @@ async fn finalize_part(
         put_already_existed: false,
     };
     if !dry_run {
-        match put_part(store, &built).await? {
+        match put_part_with_ledger(store, &built, ledger).await? {
             crate::build::PartPut::Created => {}
             crate::build::PartPut::AlreadyExisted => built.put_already_existed = true,
         }
@@ -2685,6 +2706,7 @@ async fn input_indexed_fields(
     ftr: &footer::LogFooter,
     field_dir_raw: &[u8],
     cfg: &RlogConfig,
+    ledger: Option<&RequestLedger>,
 ) -> Result<Vec<String>> {
     // POSTINGS is optional (ADR-0049 decision 5): no section means the input
     // indexed nothing, so there is nothing to carry forward.
@@ -2696,8 +2718,9 @@ async fn input_indexed_fields(
             object_key,
             GetRange::Range(desc.offset, desc.offset + desc.len),
         )
-        .await?;
-    let raw = decode_section(got.data.as_ref(), desc, cfg)?;
+        .await;
+    note_get(ledger, RequestPhase::CatalogRead, &got);
+    let raw = decode_section(got?.data.as_ref(), desc, cfg)?;
     let section = PostingsSection::parse(&raw)?;
     let field_dir = FieldDir::decode(field_dir_raw, MAX_FIELD_DIR_ENTRIES)?;
     let mut names: BTreeSet<String> = BTreeSet::new();
@@ -2737,6 +2760,7 @@ async fn fetch_section(
     ftr: &footer::LogFooter,
     k: u32,
     cfg: &RlogConfig,
+    ledger: Option<&RequestLedger>,
 ) -> Result<Vec<u8>> {
     let desc = ftr.section(k).ok_or_else(|| {
         MaintainError::Invariant(format!("input .rlog object missing section kind {k}"))
@@ -2746,8 +2770,9 @@ async fn fetch_section(
             object_key,
             GetRange::Range(desc.offset, desc.offset + desc.len),
         )
-        .await?;
-    Ok(decode_section(got.data.as_ref(), desc, cfg)?)
+        .await;
+    note_get(ledger, RequestPhase::CatalogRead, &got);
+    Ok(decode_section(got?.data.as_ref(), desc, cfg)?)
 }
 
 #[cfg(test)]
@@ -6305,7 +6330,7 @@ mod tests {
     ) -> u64 {
         let catalog = stream_catalog(store, writer_id, seq, bytes).await;
         let (stream_id, _) = stream_ident(0);
-        let cursor = open_cursor(store, &catalog, 0, &stream_id, None)
+        let cursor = open_cursor(store, &catalog, 0, &stream_id, None, None)
             .await
             .expect("open cursor")
             .expect("input carries stream 0");
@@ -6348,7 +6373,11 @@ mod tests {
         let mut out: Vec<(usize, u64)> = Vec::new();
         loop {
             let Some(block) = cursor.pending_block_index() else {
-                match cursor.next_raw_block(store, None).await.expect("fetch") {
+                match cursor
+                    .next_raw_block(store, None, None)
+                    .await
+                    .expect("fetch")
+                {
                     Some((loc, data)) => {
                         cursor.group_raw_bytes = data.len() as u64;
                         cursor.decoded_in_group = 0;
@@ -6547,7 +6576,7 @@ mod tests {
         let reservation = cursor_reservation_bytes(&catalog, &stream_id)
             .expect("reservation")
             .expect("input carries stream 0");
-        let mut cursor = open_cursor(&store, &catalog, 0, &stream_id, None)
+        let mut cursor = open_cursor(&store, &catalog, 0, &stream_id, None, None)
             .await
             .expect("open cursor")
             .expect("input carries stream 0");
@@ -6955,7 +6984,7 @@ mod tests {
         // Open the cursor and reconcile it exactly as the merge does after an
         // admission: the charge is now the SMALL first block's residency.
         let tracker = MergeMemoryTracker::new();
-        let mut cursor = open_cursor(&store, &catalog, 0, &stream_id, Some(&tracker))
+        let mut cursor = open_cursor(&store, &catalog, 0, &stream_id, Some(&tracker), None)
             .await
             .expect("open cursor")
             .expect("input carries stream 0");
@@ -7000,7 +7029,7 @@ mod tests {
             inputs_carrying_stream: 1,
         };
         let err = cursor
-            .refill(&store, Some(&tracker), Some(&mut budget))
+            .refill(&store, Some(&tracker), None, Some(&mut budget))
             .await
             .expect_err("a budget below the grown figure must refuse the decode");
         match err {
@@ -7064,7 +7093,7 @@ mod tests {
         // decodes block 1, and the charge at that moment IS the grown figure --
         // the ceiling, held until the caller reconciles it back down.
         let tracker = MergeMemoryTracker::new();
-        let mut cursor = open_cursor(&store, &catalog, 0, &stream_id, Some(&tracker))
+        let mut cursor = open_cursor(&store, &catalog, 0, &stream_id, Some(&tracker), None)
             .await
             .expect("open cursor")
             .expect("input carries stream 0");
@@ -7083,7 +7112,7 @@ mod tests {
             inputs_carrying_stream: 1,
         };
         cursor
-            .refill(&store, Some(&tracker), Some(&mut budget))
+            .refill(&store, Some(&tracker), None, Some(&mut budget))
             .await
             .expect("a budget at the grown figure admits the decode");
         assert_eq!(
@@ -7109,7 +7138,7 @@ mod tests {
         while cursor.peek_ts().is_some() {
             got.push(cursor.next_record().expect("record").expect("a row").ts_ns);
             cursor
-                .refill(&store, Some(&tracker), Some(&mut budget))
+                .refill(&store, Some(&tracker), None, Some(&mut budget))
                 .await
                 .expect("refill");
         }
@@ -7172,11 +7201,11 @@ mod tests {
         let r_b = cursor_reservation_bytes(&cat_b, &stream_id)
             .expect("reservation")
             .expect("B carries stream 0");
-        let cursor_a = open_cursor(&probe, &cat_a, 0, &stream_id, None)
+        let cursor_a = open_cursor(&probe, &cat_a, 0, &stream_id, None, None)
             .await
             .expect("open A")
             .expect("A carries stream 0");
-        let cursor_b = open_cursor(&probe, &cat_b, 1, &stream_id, None)
+        let cursor_b = open_cursor(&probe, &cat_b, 1, &stream_id, None, None)
             .await
             .expect("open B")
             .expect("B carries stream 0");

@@ -79,6 +79,7 @@ use crate::bucket::Bucket;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::read::{InputCatalog, InputRecord, RunPlan, SeriesPlan};
+use crate::request_ledger::{RequestLedger, RequestPhase, note_get, note_put};
 
 /// Maximum concurrent page GETs in flight across a whole `build_parts` call.
 /// A single global cap (one shared [`Semaphore`]) driving
@@ -182,6 +183,7 @@ pub async fn build_parts(
     }
     let ingest_bounds = merged_ingest_bounds(inputs);
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
+    let ledger = config.request_ledger.as_ref();
 
     // Every input's exemplars, grouped by the series they name, in canonical
     // input order then each object's own stored order (ADR-0047 decision 3).
@@ -314,7 +316,7 @@ pub async fn build_parts(
             continue;
         }
         let window = &builds[window_start..=i];
-        let regions = fetch_batch_pages(store, &semaphore, window).await?;
+        let regions = fetch_batch_pages(store, &semaphore, window, ledger).await?;
         for build in window {
             let series_v7 = materialize_series(build, &regions, migrate_keys, limits)?;
             pending_estimate.push_series(&series_v7);
@@ -336,7 +338,7 @@ pub async fn build_parts(
                     std::mem::take(&mut pending_exemplars),
                 )?;
                 if !config.dry_run {
-                    put_part(store, &part).await?;
+                    put_part_with_ledger(store, &part, ledger).await?;
                 }
                 parts.push(part);
                 part_index += 1;
@@ -360,7 +362,7 @@ pub async fn build_parts(
             pending_exemplars,
         )?;
         if !config.dry_run {
-            put_part(store, &part).await?;
+            put_part_with_ledger(store, &part, ledger).await?;
         }
         parts.push(part);
     }
@@ -414,6 +416,7 @@ async fn fetch_batch_pages<'a, 'f>(
     store: &'f dyn ObjectStoreBackend,
     semaphore: &'f Semaphore,
     builds: &[SeriesBuild<'a>],
+    ledger: Option<&'f RequestLedger>,
 ) -> Result<BatchRegions<'a>>
 where
     'a: 'f,
@@ -451,7 +454,8 @@ where
     let futures: Vec<GetFuture<'a, 'f>> = gets
         .into_iter()
         .map(|(key, start, end)| {
-            Box::pin(fetch_one_range(store, semaphore, key, start, end)) as GetFuture<'a, 'f>
+            Box::pin(fetch_one_range(store, semaphore, key, start, end, ledger))
+                as GetFuture<'a, 'f>
         })
         .collect();
     let fetched: Vec<(&'a str, u64, Bytes)> = stream_iter(futures)
@@ -475,13 +479,15 @@ async fn fetch_one_range<'a>(
     key: &'a str,
     start: u64,
     end: u64,
+    ledger: Option<&RequestLedger>,
 ) -> Result<(&'a str, u64, Bytes)> {
     let _permit = semaphore
         .acquire()
         .await
         .map_err(|_| MaintainError::Invariant("page-fetch semaphore closed".into()))?;
-    let got = store.get(key, GetRange::Range(start, end)).await?;
-    Ok((key, start, got.data))
+    let got = store.get(key, GetRange::Range(start, end)).await;
+    note_get(ledger, RequestPhase::BlockRead, &got);
+    Ok((key, start, got?.data))
 }
 
 /// Decode, merge, and re-encode one series into a single run-merged
@@ -1135,6 +1141,19 @@ fn flush_part(
 /// time, before any release, so a `None` here is an internal invariant breach
 /// rather than a store fault.
 pub async fn put_part(store: &dyn ObjectStoreBackend, part: &BuiltPart) -> Result<PartPut> {
+    put_part_with_ledger(store, part, None).await
+}
+
+/// [`put_part`], counting the PUT attempt into `ledger`'s
+/// [`RequestPhase::PartPut`] with the encoded object bytes it offered (ADR-0996
+/// task 996-8). Recorded before the outcome is inspected, so a converging
+/// rerun's `AlreadyExists` still counts as the attempt it was: the request was
+/// issued and the body was sent either way.
+pub async fn put_part_with_ledger(
+    store: &dyn ObjectStoreBackend,
+    part: &BuiltPart,
+    ledger: Option<&RequestLedger>,
+) -> Result<PartPut> {
     use ravel_object_store::{PutOptions, StoreError, UploadChecksum};
     let bytes = part.bytes.as_ref().ok_or_else(|| {
         MaintainError::Invariant(format!(
@@ -1143,14 +1162,15 @@ pub async fn put_part(store: &dyn ObjectStoreBackend, part: &BuiltPart) -> Resul
         ))
     })?;
     let checksum = UploadChecksum::Crc32c(crc32c::crc32c(bytes));
-    match store
+    let result = store
         .put(
             &part.key,
             bytes.clone(),
             PutOptions::create_if_absent().with_checksum(checksum),
         )
-        .await
-    {
+        .await;
+    note_put(ledger, RequestPhase::PartPut, bytes.len() as u64);
+    match result {
         Ok(_) => Ok(PartPut::Created),
         Err(StoreError::AlreadyExists) => Ok(PartPut::AlreadyExisted),
         Err(e) => Err(MaintainError::Store(e)),

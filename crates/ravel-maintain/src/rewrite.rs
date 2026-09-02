@@ -66,7 +66,7 @@ use crate::error::{MaintainError, Result};
 use crate::publish::{
     ConservationPredicate, PublishOutcome, conserve_exact, publish_record_with_conservation,
 };
-use crate::read::{input_set_hash, list_bucket, load_inputs};
+use crate::read::{input_set_hash, list_bucket_with_ledger, load_inputs_with_ledger};
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
 
@@ -102,6 +102,44 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     conservation: impl ConservationPredicate,
     start_ns: i64,
 ) -> Result<RewriteOutcome> {
+    // Request-ledger scope (ADR-0996 task 996-8). A run driven by
+    // `compact_bucket` or `migrate_bucket_format` already opened its scope
+    // before the bucket LIST, and those figures belong to this run's report; a
+    // rewrite driven directly opens its own. The scope closes on EVERY exit
+    // path, including an error, so a later directly-driven rewrite still starts
+    // from zero. Closing leaves the counters readable: a caller inspecting an
+    // aborted run's figures reads them after this returns.
+    if let Some(l) = config.request_ledger.as_ref() {
+        l.reset_for_run_unless_open();
+    }
+    let outcome = rewrite_and_publish_scoped::<C>(
+        store,
+        clock,
+        config,
+        bucket,
+        commit_keys,
+        conservation,
+        start_ns,
+    )
+    .await;
+    if let Some(l) = config.request_ledger.as_ref() {
+        l.end_run();
+    }
+    outcome
+}
+
+/// [`rewrite_and_publish`]'s body, with the request ledger's run scope already
+/// opened and guaranteed to be closed by its caller.
+#[allow(clippy::too_many_arguments)]
+async fn rewrite_and_publish_scoped<C: SegmentCodec>(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    commit_keys: &[String],
+    conservation: impl ConservationPredicate,
+    start_ns: i64,
+) -> Result<RewriteOutcome> {
     // A new run's accounting starts from zero: a tracker left installed in a
     // long-lived config would otherwise carry the previous bucket's peaks
     // into this bucket's emission (serial reuse; concurrent sharing is the
@@ -109,7 +147,14 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     if let Some(t) = config.merge_memory_tracker.as_ref() {
         t.reset_for_run();
     }
-    let inputs = load_inputs(store, bucket, commit_keys, config.input_read_concurrency).await?;
+    let inputs = load_inputs_with_ledger(
+        store,
+        bucket,
+        commit_keys,
+        config.input_read_concurrency,
+        config.request_ledger.as_ref(),
+    )
+    .await?;
     C::validate_rewrite_inputs(&inputs)?;
     let hash = input_set_hash(&inputs);
 
@@ -173,6 +218,40 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         );
     }
 
+    // ADR-0996 task 996-8: the run's store requests and wire bytes, split by the
+    // phase that issued them. Counters only -- nothing in this crate reads a
+    // figure back to route a fetch. Requests are logical store calls, not billed
+    // attempts (that seam is the S3 adapter's, ADR-0996 decision 3). Received
+    // and sent bytes are different kinds and are never summed with each other or
+    // with the decoded-heap peaks above. Only fires when a ledger is installed
+    // (never in production today); installing one is the same one-line service
+    // change the memory tracker needs.
+    if let Some(l) = config.request_ledger.as_ref() {
+        let r = l.report();
+        tracing::info!(
+            signal = ?bucket.signal,
+            shard = bucket.shard,
+            ingest_hour_bucket = bucket.ingest_hour_bucket,
+            parts = parts.len(),
+            list_requests = r.list.requests,
+            record_read_requests = r.record_read.requests,
+            record_read_wire_bytes_received = r.record_read.wire_bytes_received,
+            catalog_read_requests = r.catalog_read.requests,
+            catalog_read_wire_bytes_received = r.catalog_read.wire_bytes_received,
+            block_read_requests = r.block_read.requests,
+            block_read_wire_bytes_received = r.block_read.wire_bytes_received,
+            part_put_requests = r.part_put.requests,
+            part_put_wire_bytes_sent = r.part_put.wire_bytes_sent,
+            publish_requests = r.publish.requests,
+            publish_wire_bytes_received = r.publish.wire_bytes_received,
+            publish_wire_bytes_sent = r.publish.wire_bytes_sent,
+            total_requests = r.total_requests(),
+            total_wire_bytes_received = r.total_wire_bytes_received(),
+            total_wire_bytes_sent = r.total_wire_bytes_sent(),
+            "compaction store requests by phase (received and sent bytes are              different kinds; do not sum them together)"
+        );
+    }
+
     Ok(RewriteOutcome {
         parts: parts.len(),
         publish,
@@ -233,12 +312,34 @@ pub async fn migrate_bucket_format(
     bucket: &Bucket,
     target_version: u32,
 ) -> Result<MigrateOutcome> {
+    // This is the run's outermost driver, so it opens the request ledger's
+    // scope before the bucket LIST below; the rewrite primitive it dispatches to
+    // keeps that scope and closes it (ADR-0996 task 996-8).
+    if let Some(l) = config.request_ledger.as_ref() {
+        l.reset_for_run();
+    }
+    let outcome = migrate_bucket_format_scoped(store, clock, config, bucket, target_version).await;
+    if let Some(l) = config.request_ledger.as_ref() {
+        l.end_run();
+    }
+    outcome
+}
+
+/// [`migrate_bucket_format`]'s body, with the request ledger's run scope
+/// already opened and guaranteed to be closed by its caller.
+async fn migrate_bucket_format_scoped(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    target_version: u32,
+) -> Result<MigrateOutcome> {
     let start_ns = clock.now_ns();
     if !bucket.is_sealed(start_ns, config) {
         return Ok(MigrateOutcome::NotSealed);
     }
 
-    let listing = list_bucket(store, bucket).await?;
+    let listing = list_bucket_with_ledger(store, bucket, config.request_ledger.as_ref()).await?;
     if listing.tombstone_key.is_some() {
         return Ok(MigrateOutcome::Tombstoned);
     }
@@ -254,11 +355,12 @@ pub async fn migrate_bucket_format(
     // version without reading it). `load_inputs` verifies each record's key and
     // bucket, so the eligibility read rides on the same decode the rewrite
     // needs anyway.
-    let inputs = load_inputs(
+    let inputs = load_inputs_with_ledger(
         store,
         bucket,
         &listing.commit_keys,
         config.input_read_concurrency,
+        config.request_ledger.as_ref(),
     )
     .await?;
     let needs_migration = inputs
@@ -366,7 +468,7 @@ mod tests {
 
     use super::*;
     use crate::publish::conserve_exact;
-    use crate::read::{input_set_hash, load_inputs};
+    use crate::read::{input_set_hash, list_bucket, load_inputs};
     use crate::{CompactorConfig, FixedClock};
 
     const TENANT: &str = "acme";
