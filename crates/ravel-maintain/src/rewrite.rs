@@ -248,7 +248,7 @@ async fn rewrite_and_publish_scoped<C: SegmentCodec>(
             total_requests = r.total_requests(),
             total_wire_bytes_received = r.total_wire_bytes_received(),
             total_wire_bytes_sent = r.total_wire_bytes_sent(),
-            "compaction store requests by phase (received and sent bytes are              different kinds; do not sum them together)"
+            "compaction store requests by phase (received and sent bytes are different kinds; do not sum them together)"
         );
     }
 
