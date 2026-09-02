@@ -53,7 +53,12 @@ def classify(rel):
     A file that matches no scope is not checked by the prose rules; the global
     rules (ORPHAN, SVG, ADRINDEX) reach it through their own file sets.
     """
-    if rel in ("README.md", "CHANGELOG.md", "docs/README.md"):
+    if rel == "CHANGELOG.md":
+        # A changelog entry naming the decision or the issue behind a shipped
+        # change is doing its job, so the tracker rule does not apply. Every
+        # other rule does: a source path or a commit hash is still noise here.
+        return "changelog"
+    if rel in ("README.md", "docs/README.md"):
         return "user"
     if rel.startswith("docs/guides/") and rel.endswith(".md"):
         return "user"
@@ -159,8 +164,16 @@ def iter_code_blocks(lines):
 _ANCHOR_TAG_RE = re.compile(r"<a\s+[^>]*?(?:id|name)\s*=\s*[\"']([^\"']+)[\"']", re.I)
 
 
+_MD_LINK_IN_HEADING_RE = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
+
+
 def slugify(text):
-    """GitHub's heading slug: lowercase, drop non-word chars, spaces to hyphens."""
+    """GitHub's heading slug: lowercase, drop non-word chars, spaces to hyphens.
+
+    GitHub slugs the rendered heading text, so a link inside a heading
+    contributes its text and not its URL.
+    """
+    text = _MD_LINK_IN_HEADING_RE.sub(r"\1", text)
     s = text.strip().lower()
     kept = []
     for ch in s:
@@ -254,12 +267,24 @@ _SRC_LINE_REF_RE = re.compile(
 )
 _COMMIT_HASH_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
 _LAST_VERIFIED = "Last verified against the code"
-_AI_PHRASES = ("Generated with", "Co-Authored-By", "As an AI")
+# Agent or AI language. "Generated with" on its own is ordinary English (a
+# fixture "generated with current timestamps"), so it counts only when a tool
+# or an AI is named after it.
+_AI_PHRASE_RE = re.compile(
+    r"Generated with (?:Claude|Copilot|ChatGPT|Cursor|Codex|Gemini|an? AI\b)"
+    r"|Co-Authored-By:"
+    r"|\bAs an AI\b",
+    re.I,
+)
 
 # TRACKER (user)
 _ISSUE_HASH_RE = re.compile(r"(?<![\w#])#\d+\b")
 _TRACKER_URL_RE = re.compile(r"github\.com/[^\s)]+/(?:issues|pull)/\d+")
 _ADR_CITE_RE = re.compile(r"\bADR-\d{3,4}\b")
+# A link to the decision-record INDEX (the directory or its README) is
+# navigation, which the documentation index must do. A link to one record is
+# a citation, which is what TRACKER rejects.
+_ADR_INDEX_TARGET_RE = re.compile(r"(?:^|/)adrs(?:/(?:README\.md)?)?(?:#.*)?$", re.I)
 
 # SRCPATH (user)
 _SRCPATH_RE = re.compile(
@@ -395,15 +420,16 @@ def analyze_markdown(rel, repo):
                 _link_and_anchor(rel, src_dir, is_img, target, scope, repo, findings)
 
         # Scope-gated prose rules.
-        if scope in ("user", "spec", "generated"):
+        if scope in ("user", "spec", "generated", "changelog"):
             _provenance(rel, line, findings)
             _superlative(rel, line, findings)
             _term(rel, line, findings)
         if scope == "user":
             _tracker(rel, line, heading, findings)
+        if scope in ("user", "changelog"):
             _srcpath(rel, line, findings)
 
-    if scope in ("user", "generated"):
+    if scope in ("user", "generated", "changelog"):
         findings.extend(_sqltable(rel, lines, repo))
 
     return findings
@@ -487,9 +513,8 @@ def _provenance(rel, line, findings):
             break
         findings.append(Finding(rel, "PROVENANCE", _LAST_VERIFIED))
         idx = j + len(_LAST_VERIFIED)
-    for phrase in _AI_PHRASES:
-        if phrase.lower() in line.lower():
-            findings.append(Finding(rel, "PROVENANCE", phrase))
+    for m in _AI_PHRASE_RE.finditer(line):
+        findings.append(Finding(rel, "PROVENANCE", m.group(0)))
 
 
 def _tracker(rel, line, heading, findings):
@@ -507,6 +532,8 @@ def _tracker(rel, line, heading, findings):
         if low.startswith(("http://", "https://")):
             continue
         if "docs/adrs/" in low or re.search(r"(^|/)adrs/", low):
+            if _ADR_INDEX_TARGET_RE.search(low):
+                continue
             findings.append(Finding(rel, "TRACKER", target))
 
 
@@ -539,6 +566,16 @@ def _term(rel, line, findings):
 _TABLE_CONST_RE = re.compile(r'pub\s+const\s+\w*TABLE\w*\s*:\s*&str\s*=\s*"([^"]+)"')
 _FROM_RE = re.compile(r"\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", re.I)
 _SQL_INFO_RE = re.compile(r"^(sql|postgresql|postgres)\b", re.I)
+# FROM inside these functions names a field or a position, not a table:
+# EXTRACT(minute FROM ts), SUBSTRING(s FROM 2), TRIM(BOTH x FROM s),
+# OVERLAY(s PLACING t FROM 3). Blanked out before the table scan.
+_FUNC_FROM_RE = re.compile(r"\b(?:EXTRACT|SUBSTRING|TRIM|OVERLAY)\s*\([^()]*\)", re.I)
+# A common table expression is a legitimate FROM target inside its own
+# statement: WITH recent AS (...) SELECT ... FROM recent.
+_CTE_RE = re.compile(
+    r"(?:\bWITH\b(?:\s+RECURSIVE\b)?|,)\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s*\(", re.I
+)
+_SELECT_FROM_RE = re.compile(r"\bSELECT\b.*\bFROM\b", re.I)
 
 
 def registered_tables():
@@ -559,17 +596,18 @@ def _sqltable(rel, lines, repo):
     for info, body in iter_code_blocks(lines):
         is_sql = bool(_SQL_INFO_RE.match(info.strip()))
         is_shell = info.strip().lower() in ("sh", "bash", "shell", "console", "")
+        if not (is_sql or is_shell):
+            continue
+        allowed = tables | set(_CTE_RE.findall("\n".join(body)))
         for bl in body:
-            if is_sql:
-                for name in _FROM_RE.findall(bl):
-                    if name not in tables:
-                        findings.append(Finding(rel, "SQLTABLE", name))
-            elif is_shell and re.search(r"\bSELECT\b.*\bFROM\b", bl, re.I):
-                # A SQL FROM clause inside a shell example, not an English "from"
-                # or a Dockerfile FROM: require SELECT on the same line.
-                for name in _FROM_RE.findall(bl):
-                    if name not in tables:
-                        findings.append(Finding(rel, "SQLTABLE", name))
+            # In a shell example, require SELECT on the same line as FROM so an
+            # English "from" or a Dockerfile FROM is never read as a table.
+            if not is_sql and not _SELECT_FROM_RE.search(bl):
+                continue
+            scan = _FUNC_FROM_RE.sub(" ", bl)
+            for name in _FROM_RE.findall(scan):
+                if name not in allowed:
+                    findings.append(Finding(rel, "SQLTABLE", name))
     return findings
 
 
@@ -828,6 +866,10 @@ def load_baseline():
                 continue
             parts = line.split("\t")
             if len(parts) != 3:
+                # A malformed entry baselines nothing, so its finding surfaces as
+                # NEW below. Say why, rather than failing on a line that looks
+                # baselined to the reader.
+                print(f"check_docs: ignoring malformed baseline line: {line!r}", file=sys.stderr)
                 continue
             counter[tuple(parts)] += 1
     return counter
