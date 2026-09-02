@@ -458,16 +458,20 @@ way as above (`kubectl create secret generic ...`) before applying a
 Setting any per-mode `credentialsSecretRef` also changes the order the operator
 applies the three Deployments in. Every `ravel-server` mode creates the durable
 `sys/gc` object if it is absent and then validates itself against it, but under
-the per-role policies only Maintain and Admin can write it, so on a fresh bucket
-the operator applies the maintain Deployment first and the gateway and query
-Deployments only once maintain reports a ready replica. While it waits, the
-cluster carries `Available=False` with reason `WaitingForGcBootstrap` and
-`Degraded=False`, and the operator requeues: this is progress, not a failure,
-and it needs no manual bootstrap step. With `maintain.enabled: false` no pod can
-create the object at all, so the operator renders no gateway or query Deployment
-and reports `Degraded=True` with reason `GcBootstrapUnavailable`; either enable
-maintain, or create `sys/gc` yourself with `ravel-cli gc-config set` under the
-Admin credential. A `RavelCluster` with only the shared
+the per-role policies only Maintain and Admin can write it. So on a fresh
+cluster the operator applies the maintain Deployment first and holds the gateway
+and query Deployments until maintain reports a ready replica. The hold applies
+only while neither request-serving Deployment exists yet: once either does, an
+existing cluster keeps reconciling both tiers through a maintain rollout or
+outage rather than stalling them. While it holds, the cluster carries
+`Available=False` with reason `WaitingForGcBootstrap` and `Degraded=False`, and
+the operator requeues: this is progress, not a failure, and it needs no manual
+bootstrap step. With `maintain.enabled: false` under per-role Secrets the
+operator still applies the gateway and query Deployments, but their pods restart
+until `sys/gc` exists, and the cluster reports `Degraded=True` with reason
+`GcBootstrapUnavailable` until one of them reports ready. That happens once you
+create `sys/gc` with `ravel-cli gc-config set` under the Admin credential (or
+enable `spec.maintain`). A `RavelCluster` with only the shared
 `spec.storage.s3.credentialsSecretRef` keeps the original order and never waits,
 because any pod holding that credential can create the object.
 

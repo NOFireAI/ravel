@@ -1606,15 +1606,15 @@ pub const WAITING_FOR_GC_BOOTSTRAP_MESSAGE: &str = "waiting for the maintain Dep
      carry no write grant on sys/gc, so they are applied only once it exists";
 
 /// `Degraded=True` reason when per-role storage credentials are in use and
-/// `maintain.enabled` is false, so no pod the operator would render can create
-/// `sys/gc`.
+/// `maintain.enabled` is false, so no pod the operator renders holds a write
+/// grant on `sys/gc`.
 pub const GC_BOOTSTRAP_UNAVAILABLE_REASON: &str = "GcBootstrapUnavailable";
 
 /// Message paired with [`GC_BOOTSTRAP_UNAVAILABLE_REASON`].
 pub const GC_BOOTSTRAP_UNAVAILABLE_MESSAGE: &str = "maintain.enabled is false and the per-role storage credentials give the gateway and \
-     query Deployments no write grant on sys/gc, so no pod can create it and every pod \
-     would crash-loop at startup; enable spec.maintain, or create sys/gc with \
-     \"ravel-cli gc-config set\" under the Admin credential";
+     query Deployments no write grant on sys/gc, so their pods restart until sys/gc \
+     exists; enable spec.maintain, or create sys/gc with \"ravel-cli gc-config set\" \
+     under the Admin credential";
 
 /// Which `sys/gc` bootstrap ordering regime a spec is in.
 ///
@@ -1632,8 +1632,9 @@ pub enum GcBootstrapGate {
     /// wait for it to report a ready replica.
     MaintainFirst,
     /// Per-role credentials with maintain disabled: no tier the operator renders
-    /// can create `sys/gc`, so rendering the request-serving tiers would only
-    /// produce crash-looping pods.
+    /// holds a write grant on `sys/gc`. The request-serving tiers are still
+    /// applied, but their pods restart until `sys/gc` is created out of band,
+    /// so the pass degrades the cluster instead of waiting.
     Unavailable,
 }
 
@@ -1656,12 +1657,28 @@ impl GcBootstrapPlan {
     /// The exact sequence of Deployment applies for one pass, given the
     /// ready-replica count the live maintain Deployment reports at the start of
     /// it (`None` when that Deployment does not exist yet, which is the fresh
-    /// cluster case).
+    /// cluster case) and whether either request-serving Deployment already
+    /// exists on the cluster.
+    ///
+    /// Under [`GcBootstrapGate::MaintainFirst`] the hold on the request-serving
+    /// tiers is only meaningful before either of them exists: once one does,
+    /// its existence proves a prior pass already got past the bootstrap gate
+    /// (or an older operator applied it), so holding it back would stop a
+    /// serving cluster from reconciling through a maintain rollout or outage.
     ///
     /// Under [`GcBootstrapGate::SharedCredential`] this is the order the
-    /// operator has always used, and `maintain_ready` is ignored: any tier can
+    /// operator has always used, and both inputs are ignored: any tier can
     /// create `sys/gc` there, so waiting would only slow a fresh cluster down.
-    pub fn apply_sequence(&self, maintain_ready: Option<i32>) -> Vec<DeploymentTier> {
+    ///
+    /// Under [`GcBootstrapGate::Unavailable`] the request-serving tiers are
+    /// applied unconditionally: maintain is disabled there, so there is no
+    /// maintain Deployment to apply, and the controller degrades the cluster
+    /// until `sys/gc` is created out of band.
+    pub fn apply_sequence(
+        &self,
+        maintain_ready: Option<i32>,
+        request_serving_exists: bool,
+    ) -> Vec<DeploymentTier> {
         match self.gate {
             GcBootstrapGate::SharedCredential => {
                 let mut sequence = vec![DeploymentTier::Gateway, DeploymentTier::Query];
@@ -1672,28 +1689,39 @@ impl GcBootstrapPlan {
             }
             GcBootstrapGate::MaintainFirst => {
                 let mut sequence = vec![DeploymentTier::Maintain];
-                if maintain_ready.unwrap_or(0) > 0 {
+                if maintain_ready.unwrap_or(0) > 0 || request_serving_exists {
                     sequence.push(DeploymentTier::Gateway);
                     sequence.push(DeploymentTier::Query);
                 }
                 sequence
             }
-            GcBootstrapGate::Unavailable => Vec::new(),
+            GcBootstrapGate::Unavailable => {
+                vec![DeploymentTier::Gateway, DeploymentTier::Query]
+            }
         }
     }
 
     /// Whether this pass holds the gateway and query Deployments back waiting
     /// for maintain to create `sys/gc`. The pass records
-    /// [`WAITING_FOR_GC_BOOTSTRAP_REASON`] and requeues when true.
-    pub fn waiting_for_bootstrap(&self, maintain_ready: Option<i32>) -> bool {
-        matches!(self.gate, GcBootstrapGate::MaintainFirst) && maintain_ready.unwrap_or(0) <= 0
+    /// [`WAITING_FOR_GC_BOOTSTRAP_REASON`] and requeues when true. Only a fresh
+    /// [`GcBootstrapGate::MaintainFirst`] cluster with neither request-serving
+    /// Deployment yet and no ready maintain replica waits.
+    pub fn waiting_for_bootstrap(
+        &self,
+        maintain_ready: Option<i32>,
+        request_serving_exists: bool,
+    ) -> bool {
+        matches!(self.gate, GcBootstrapGate::MaintainFirst)
+            && !request_serving_exists
+            && maintain_ready.unwrap_or(0) <= 0
     }
 
-    /// Whether the controller must read the live maintain Deployment's ready
-    /// replicas before it can order this pass. False under the shared
+    /// Whether the controller must read live cluster state (the maintain
+    /// Deployment's ready replicas and whether a request-serving Deployment
+    /// exists) before it can order this pass. False under the shared
     /// credential, so an unchanged single-credential cluster costs no extra
     /// API call.
-    pub fn reads_maintain_ready(&self) -> bool {
+    pub fn reads_live_state(&self) -> bool {
         matches!(self.gate, GcBootstrapGate::MaintainFirst)
     }
 }
@@ -1718,10 +1746,8 @@ pub fn gc_bootstrap_plan(spec: &RavelClusterSpec) -> GcBootstrapPlan {
 /// render path rather than on a helper that nothing calls.
 #[derive(Debug, Clone)]
 pub struct DesiredObjects {
-    /// The gateway Deployment, or `None` under
-    /// [`GcBootstrapGate::Unavailable`], where the tier's credentials cannot
-    /// create `sys/gc` and no other rendered tier will either.
-    pub gateway_deployment: Option<Deployment>,
+    /// The gateway Deployment.
+    pub gateway_deployment: Deployment,
     /// The gateway Service.
     pub gateway_service: Service,
     /// The ingest-affinity Ingress objects; empty when affinity is off.
@@ -1754,10 +1780,8 @@ pub struct DesiredObjects {
     /// abort the whole reconcile (ADR-0080 decision 3; crd.rs documents "renders
     /// no router objects" when misconfigured, i.e. everything else still runs).
     pub router_render_error: Option<RenderError>,
-    /// The query Deployment, or `None` under
-    /// [`GcBootstrapGate::Unavailable`] for the same reason as
-    /// [`Self::gateway_deployment`].
-    pub query_deployment: Option<Deployment>,
+    /// The query Deployment.
+    pub query_deployment: Deployment,
     /// The query Service.
     pub query_service: Service,
     /// The maintain Deployment, or `None` when `maintain.enabled` is false (the
@@ -1813,21 +1837,15 @@ pub fn desired_objects(
     // router render error this pass. See `desired_gateway_routes` for why a static
     // spec check would strand the route at a deleted Service.
     let router_available = router_service.is_some();
-    // Under per-role storage credentials with maintain disabled, nothing the
-    // operator renders holds a write grant on `sys/gc`, and every mode
-    // creates-if-absent then validates it at startup. Rendering the
-    // request-serving tiers there produces two crash-looping Deployments and a
-    // cluster that never becomes ready, so render neither and let the
-    // controller record `GcBootstrapUnavailable` instead (the
-    // `RouterImageMissing` pattern: degrade visibly rather than ship a
-    // Deployment that cannot start). Withholding the render only stops the
-    // operator applying them; a Deployment already running against a bucket
-    // whose `sys/gc` exists is left alone rather than torn down.
+    // The gateway and query Deployments always render; the bootstrap plan only
+    // changes the order the controller applies the three tiers in and, under
+    // `GcBootstrapGate::Unavailable`, records a Degraded condition while their
+    // pods restart waiting on `sys/gc`. Rendering them even there is what lets
+    // the operator's own remedy (create `sys/gc` out of band) unblock the
+    // cluster: the Deployments exist, so they become ready once the object does.
     let gc_bootstrap = gc_bootstrap_plan(spec);
-    let request_serving_renders = !matches!(gc_bootstrap.gate, GcBootstrapGate::Unavailable);
     Ok(DesiredObjects {
-        gateway_deployment: request_serving_renders
-            .then(|| desired_gateway_deployment(spec, instance, ctx)),
+        gateway_deployment: desired_gateway_deployment(spec, instance, ctx),
         gateway_service: desired_gateway_service(spec, instance),
         gateway_ingresses: desired_gateway_ingresses(spec, instance),
         gateway_routes: desired_gateway_routes(spec, instance, router_available),
@@ -1837,8 +1855,7 @@ pub fn desired_objects(
         router_role,
         router_role_binding,
         router_render_error,
-        query_deployment: request_serving_renders
-            .then(|| desired_query_deployment(spec, instance, ctx)),
+        query_deployment: desired_query_deployment(spec, instance, ctx),
         query_service: desired_query_service(spec, instance),
         maintain_deployment: desired_maintain_deployment(spec, instance, ctx),
         gc_bootstrap,
@@ -2766,35 +2783,56 @@ mod tests {
         let plan = objects.gc_bootstrap;
         assert_eq!(plan.gate, GcBootstrapGate::MaintainFirst);
         assert!(
-            plan.reads_maintain_ready(),
-            "the pass must read maintain's live readiness to order itself"
+            plan.reads_live_state(),
+            "the pass must read live cluster state to order itself"
         );
 
-        // A fresh bucket: the maintain Deployment does not exist yet, so this
-        // pass applies maintain and nothing else. The exact sequence, not a
-        // containment check: applying gateway or query here is the bug.
-        assert_eq!(plan.apply_sequence(None), vec![DeploymentTier::Maintain]);
-        assert_eq!(plan.apply_sequence(Some(0)), vec![DeploymentTier::Maintain]);
-        assert!(plan.waiting_for_bootstrap(None));
-        assert!(plan.waiting_for_bootstrap(Some(0)));
+        let both = vec![
+            DeploymentTier::Maintain,
+            DeploymentTier::Gateway,
+            DeploymentTier::Query,
+        ];
+        // A fresh cluster: neither request-serving Deployment exists and
+        // maintain is not ready, so this pass applies maintain and nothing
+        // else. The exact sequence, not a containment check: applying gateway
+        // or query here is the bug.
+        assert_eq!(
+            plan.apply_sequence(None, false),
+            vec![DeploymentTier::Maintain]
+        );
+        assert_eq!(
+            plan.apply_sequence(Some(0), false),
+            vec![DeploymentTier::Maintain]
+        );
+        assert!(plan.waiting_for_bootstrap(None, false));
+        assert!(plan.waiting_for_bootstrap(Some(0), false));
         assert_eq!(WAITING_FOR_GC_BOOTSTRAP_REASON, "WaitingForGcBootstrap");
 
+        // An existing request-serving Deployment proves a prior pass got past
+        // the gate, so the hold lifts even while maintain reports nothing: a
+        // serving cluster keeps reconciling both tiers through a maintain
+        // rollout or outage.
+        assert_eq!(plan.apply_sequence(None, true), both);
+        assert_eq!(plan.apply_sequence(Some(0), true), both);
+        assert!(!plan.waiting_for_bootstrap(None, true));
+        assert!(!plan.waiting_for_bootstrap(Some(0), true));
+
         // Once maintain reports a ready replica it has created `sys/gc`, so the
-        // pass applies maintain first and then both request-serving tiers.
-        assert_eq!(
-            plan.apply_sequence(Some(1)),
-            vec![
-                DeploymentTier::Maintain,
-                DeploymentTier::Gateway,
-                DeploymentTier::Query
-            ]
-        );
-        assert!(!plan.waiting_for_bootstrap(Some(1)));
+        // pass applies maintain first and then both request-serving tiers even
+        // on a fresh cluster.
+        assert_eq!(plan.apply_sequence(Some(1), false), both);
+        assert!(!plan.waiting_for_bootstrap(Some(1), false));
 
         // All three tiers still render; only the order they are applied in
         // changed.
-        assert!(objects.gateway_deployment.is_some());
-        assert!(objects.query_deployment.is_some());
+        assert_eq!(
+            objects.gateway_deployment.metadata.name.as_deref(),
+            Some("prod-gateway")
+        );
+        assert_eq!(
+            objects.query_deployment.metadata.name.as_deref(),
+            Some("prod-query")
+        );
         assert!(objects.maintain_deployment.is_some());
 
         // One override is enough. Whichever tier narrowed its credential, the
@@ -2813,7 +2851,7 @@ mod tests {
             let plan = gc_bootstrap_plan(&spec);
             assert_eq!(plan.gate, GcBootstrapGate::MaintainFirst);
             assert_eq!(
-                plan.apply_sequence(None),
+                plan.apply_sequence(None, false),
                 vec![DeploymentTier::Maintain],
                 "a {} override alone must still hold the request-serving tiers",
                 tier.component()
@@ -2822,7 +2860,8 @@ mod tests {
     }
 
     #[test]
-    fn per_role_credentials_with_maintain_disabled_render_no_request_serving_deployment() {
+    fn per_role_credentials_with_maintain_disabled_still_render_and_apply_the_request_serving_tiers()
+     {
         let mut spec = per_role_spec();
         spec.maintain.enabled = false;
         let objects =
@@ -2830,27 +2869,40 @@ mod tests {
         let plan = objects.gc_bootstrap;
         assert_eq!(plan.gate, GcBootstrapGate::Unavailable);
 
-        // No pod could create `sys/gc`, so rendering the request-serving tiers
-        // would only produce two crash-looping Deployments.
-        assert!(
-            objects.gateway_deployment.is_none(),
-            "no gateway Deployment renders when nothing can create sys/gc"
+        // Both request-serving tiers render: the operator applies them so that
+        // creating `sys/gc` out of band (the remedy its message names) unblocks
+        // the cluster. There is no maintain Deployment to apply here.
+        assert_eq!(
+            objects.gateway_deployment.metadata.name.as_deref(),
+            Some("prod-gateway"),
+            "gateway still renders when maintain is disabled under per-role credentials"
         );
-        assert!(
-            objects.query_deployment.is_none(),
-            "no query Deployment renders when nothing can create sys/gc"
+        assert_eq!(
+            objects.query_deployment.metadata.name.as_deref(),
+            Some("prod-query"),
+            "query still renders when maintain is disabled under per-role credentials"
         );
         assert!(objects.maintain_deployment.is_none());
+
+        // The pass always applies gateway and query, regardless of the live
+        // state inputs, and never waits: this is a Degraded state to surface,
+        // not a wait to sit through.
         for ready in [None, Some(0), Some(1)] {
-            assert_eq!(
-                plan.apply_sequence(ready),
-                Vec::<DeploymentTier>::new(),
-                "nothing is applied for maintain readiness {ready:?}"
-            );
+            for exists in [false, true] {
+                assert_eq!(
+                    plan.apply_sequence(ready, exists),
+                    vec![DeploymentTier::Gateway, DeploymentTier::Query],
+                    "gateway and query always apply for readiness {ready:?} exists {exists}"
+                );
+                assert!(
+                    !plan.waiting_for_bootstrap(ready, exists),
+                    "unavailable is a misconfiguration to report, not a wait"
+                );
+            }
         }
         assert!(
-            !plan.waiting_for_bootstrap(None),
-            "this is a misconfiguration to report, not a wait to sit through"
+            !plan.reads_live_state(),
+            "only MaintainFirst reads live cluster state"
         );
 
         // The named reason and what its message must tell the operator to do.
@@ -2870,25 +2922,33 @@ mod tests {
         let plan = objects.gc_bootstrap;
         assert_eq!(plan.gate, GcBootstrapGate::SharedCredential);
         assert!(
-            !plan.reads_maintain_ready(),
+            !plan.reads_live_state(),
             "a single-credential cluster must cost no extra API read"
         );
-        // The order the operator has always used, independent of maintain
-        // readiness: any tier holding the shared credential can create sys/gc.
+        // The order the operator has always used, independent of both inputs:
+        // any tier holding the shared credential can create sys/gc.
         for ready in [None, Some(0), Some(1)] {
-            assert_eq!(
-                plan.apply_sequence(ready),
-                vec![
-                    DeploymentTier::Gateway,
-                    DeploymentTier::Query,
-                    DeploymentTier::Maintain
-                ],
-                "unchanged order for maintain readiness {ready:?}"
-            );
-            assert!(!plan.waiting_for_bootstrap(ready));
+            for exists in [false, true] {
+                assert_eq!(
+                    plan.apply_sequence(ready, exists),
+                    vec![
+                        DeploymentTier::Gateway,
+                        DeploymentTier::Query,
+                        DeploymentTier::Maintain
+                    ],
+                    "unchanged order for readiness {ready:?} exists {exists}"
+                );
+                assert!(!plan.waiting_for_bootstrap(ready, exists));
+            }
         }
-        assert!(objects.gateway_deployment.is_some());
-        assert!(objects.query_deployment.is_some());
+        assert_eq!(
+            objects.gateway_deployment.metadata.name.as_deref(),
+            Some("prod-gateway")
+        );
+        assert_eq!(
+            objects.query_deployment.metadata.name.as_deref(),
+            Some("prod-query")
+        );
 
         // Maintain off under one shared credential is unchanged too: the
         // gateway or query pod creates sys/gc with the credential it holds.
@@ -2897,11 +2957,17 @@ mod tests {
         let objects = desired_objects(&no_maintain, "prod", "default", &ctx()).expect("render");
         assert_eq!(objects.gc_bootstrap.gate, GcBootstrapGate::SharedCredential);
         assert_eq!(
-            objects.gc_bootstrap.apply_sequence(None),
+            objects.gc_bootstrap.apply_sequence(None, false),
             vec![DeploymentTier::Gateway, DeploymentTier::Query]
         );
-        assert!(objects.gateway_deployment.is_some());
-        assert!(objects.query_deployment.is_some());
+        assert_eq!(
+            objects.gateway_deployment.metadata.name.as_deref(),
+            Some("prod-gateway")
+        );
+        assert_eq!(
+            objects.query_deployment.metadata.name.as_deref(),
+            Some("prod-query")
+        );
         assert!(objects.maintain_deployment.is_none());
     }
 
@@ -4079,18 +4145,12 @@ mod tests {
             assert!(objects.router_role_binding.is_none());
             // Every other tier still renders.
             assert_eq!(
-                objects
-                    .gateway_deployment
-                    .as_ref()
-                    .and_then(|d| d.metadata.name.as_deref()),
+                objects.gateway_deployment.metadata.name.as_deref(),
                 Some("prod-gateway"),
                 "gateway still renders when the router render fails"
             );
             assert_eq!(
-                objects
-                    .query_deployment
-                    .as_ref()
-                    .and_then(|d| d.metadata.name.as_deref()),
+                objects.query_deployment.metadata.name.as_deref(),
                 Some("prod-query"),
                 "query still renders when the router render fails"
             );
