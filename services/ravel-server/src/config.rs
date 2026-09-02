@@ -1449,6 +1449,11 @@ fn detect_mem_total_bytes() -> Option<u64> {
 /// Anything else -- a missing line, a non-numeric count, an unrecognised unit --
 /// is `None` rather than a guess, because a wrong total silently resizes every
 /// memory-derived default.
+///
+/// Only the Linux detector calls this; on other targets it exists for the
+/// tests alone, so it is compiled out of the library there rather than left
+/// as dead code.
+#[cfg(any(target_os = "linux", test))]
 fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
     let line = meminfo.lines().find(|line| line.starts_with("MemTotal:"))?;
     let mut fields = line.split_whitespace().skip(1);
