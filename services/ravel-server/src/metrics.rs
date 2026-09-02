@@ -610,6 +610,15 @@ pub struct IngestPipelineSnapshot {
     pub buffered_items_total: u64,
     pub acks_ok: u64,
     pub acks_err: u64,
+    /// Exemplars written into flushed objects' EXEMPLARS section (ADR-0047).
+    /// A metrics-only concept: only the metrics pipeline stores exemplars, so
+    /// the log and span constructors leave this at zero, and its rendered
+    /// `signal="logs"`/`signal="spans"` samples are constant zeros.
+    pub exemplars_written_total: u64,
+    /// Exemplars discarded at flush rather than written: their parent sample
+    /// was not in this flush, or they lost the flush-scoped per-series window
+    /// cap (ADR-0047). Metrics-only, the same as `exemplars_written_total`.
+    pub exemplars_dropped_total: u64,
     pub collisions: Option<u64>,
     pub shard_deaths: u64,
     /// Flushes failed closed because the router's cached provisioning view for
@@ -675,6 +684,8 @@ impl IngestPipelineSnapshot {
             buffered_items_total: snapshot.buffered_points_total,
             acks_ok: snapshot.acks_ok,
             acks_err: snapshot.acks_err,
+            exemplars_written_total: snapshot.exemplars_written_total,
+            exemplars_dropped_total: snapshot.exemplars_dropped_total,
             collisions: Some(snapshot.series_id_collisions),
             shard_deaths: snapshot.shard_deaths,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
@@ -701,6 +712,10 @@ impl IngestPipelineSnapshot {
             buffered_items_total: snapshot.buffered_records_total,
             acks_ok: snapshot.acks_ok,
             acks_err: snapshot.acks_err,
+            // Exemplars are a metrics-only concept (ADR-0047); the log
+            // pipeline stores none, so both counters are constant zero here.
+            exemplars_written_total: 0,
+            exemplars_dropped_total: 0,
             collisions: Some(snapshot.stream_id_collisions),
             shard_deaths: snapshot.shard_deaths,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
@@ -731,6 +746,10 @@ impl IngestPipelineSnapshot {
             buffered_items_total: snapshot.buffered_spans_total,
             acks_ok: snapshot.acks_ok,
             acks_err: snapshot.acks_err,
+            // Exemplars are a metrics-only concept (ADR-0047); the span
+            // pipeline stores none, so both counters are constant zero here.
+            exemplars_written_total: 0,
+            exemplars_dropped_total: 0,
             collisions: None,
             shard_deaths: snapshot.shard_deaths,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
@@ -892,6 +911,39 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_acks_err_total",
             &labels(mode, pipeline.signal),
             pipeline.acks_err,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_exemplars_written_total",
+        "Exemplars written into flushed objects' EXEMPLARS section (ADR-0047), by signal. \
+         Metrics-only: logs and spans store no exemplars and report zero.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_exemplars_written_total",
+            &labels(mode, pipeline.signal),
+            pipeline.exemplars_written_total,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_exemplars_dropped_total",
+        "Exemplars discarded at flush rather than written: no parent sample in the flush, or \
+         the flush-scoped per-series window cap was hit (ADR-0047), by signal. Metrics-only: \
+         logs and spans store no exemplars and report zero.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_exemplars_dropped_total",
+            &labels(mode, pipeline.signal),
+            pipeline.exemplars_dropped_total,
         );
     }
 
@@ -4219,6 +4271,127 @@ mod tests {
                 "ravel_ingest_metadata_flush_gets_total{mode=\"gateway\",signal=\"spans\""
             ),
             "spans pipeline must render no metadata_sink sample"
+        );
+    }
+
+    /// The two ingest exemplar counters (ADR-0047) render under the ingest
+    /// family, each carrying `{mode, signal}` and its driven value, and each
+    /// exactly once. Built from a struct literal rather than a conversion so
+    /// this pins the render path alone: flipping the `pipeline.exemplars_*`
+    /// argument to `0` in `render_ingest_family` fails this test.
+    #[test]
+    fn exemplar_counters_render_the_exact_two_sample_lines() {
+        let ingest = vec![IngestPipelineSnapshot {
+            signal: Signal::Metrics,
+            flushes_by_size: 0,
+            flushes_by_age: 0,
+            flushes_manual: 0,
+            put_retries: 0,
+            abandoned_retry_exhausted: 0,
+            abandoned_input_rejected: 0,
+            buffered_bytes_total: 0,
+            buffered_items_total: 0,
+            acks_ok: 0,
+            acks_err: 0,
+            exemplars_written_total: 7,
+            exemplars_dropped_total: 3,
+            collisions: Some(0),
+            shard_deaths: 0,
+            stale_provisioning_flushes: 0,
+            postings: None,
+            metadata_sink: None,
+        }];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        let written =
+            "ravel_ingest_exemplars_written_total{mode=\"gateway\",signal=\"metrics\"} 7\n";
+        let dropped =
+            "ravel_ingest_exemplars_dropped_total{mode=\"gateway\",signal=\"metrics\"} 3\n";
+        assert_eq!(
+            body.matches(written).count(),
+            1,
+            "written exemplar sample must appear exactly once:\n{body}"
+        );
+        assert_eq!(
+            body.matches(dropped).count(),
+            1,
+            "dropped exemplar sample must appear exactly once:\n{body}"
+        );
+    }
+
+    /// The exemplar values travel from the ingest crate's counters through
+    /// `IngestPipelineSnapshot::from_metrics` to the rendered text: a snapshot
+    /// converted from an `IngestMetricsSnapshot` carrying written = 7 and
+    /// dropped = 3 renders those values, not zero. This is the test that fails
+    /// if the metrics constructor drops the fields (flipping
+    /// `exemplars_written_total: snapshot.exemplars_written_total` to `0` in
+    /// `from_metrics` fails here while the render test above still passes).
+    #[test]
+    fn exemplar_counters_travel_from_the_ingest_snapshot_not_zeroed() {
+        let ingest = vec![IngestPipelineSnapshot::from_metrics(
+            IngestMetricsSnapshot {
+                exemplars_written_total: 7,
+                exemplars_dropped_total: 3,
+                ..Default::default()
+            },
+        )];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        assert!(
+            body.contains(
+                "ravel_ingest_exemplars_written_total{mode=\"gateway\",signal=\"metrics\"} 7"
+            ),
+            "written exemplar value must survive the conversion, not read zero:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_exemplars_dropped_total{mode=\"gateway\",signal=\"metrics\"} 3"
+            ),
+            "dropped exemplar value must survive the conversion, not read zero:\n{body}"
         );
     }
 

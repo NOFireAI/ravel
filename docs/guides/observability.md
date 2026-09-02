@@ -140,6 +140,8 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_buffered_items_total` | Samples, records, or spans admitted into shard buffers. |
 | `ravel_ingest_acks_ok_total` | Strict-mode waiters acked with a commit token. |
 | `ravel_ingest_acks_err_total` | Strict-mode waiters acked with a write error. |
+| `ravel_ingest_exemplars_written_total` | Exemplars written into flushed objects' EXEMPLARS section. Metrics-only; logs and spans report zero. |
+| `ravel_ingest_exemplars_dropped_total` | Exemplars discarded at flush: no parent sample in the flush, or the per-series window cap was hit. Metrics-only; logs and spans report zero. |
 | `ravel_ingest_collisions_total` | Batches rejected for a series or stream identity collision. |
 | `ravel_ingest_shard_deaths_total` | Distinct shard actors observed dead by the router. |
 

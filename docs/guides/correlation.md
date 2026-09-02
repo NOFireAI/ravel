@@ -78,9 +78,11 @@ The ingest metrics hold two counters. The `exemplars_written_total` counter
 counts stored exemplars. The `exemplars_dropped_total` counter counts dropped
 exemplars. If the cap engages, the `exemplars_dropped_total` counter rises.
 
-`GET /metrics` does not expose these two counters, so an operator cannot see
-the cap engage from outside the process. The drop count appears in the flush
-logs.
+`GET /metrics` exposes these two counters. `ravel_ingest_exemplars_written_total`
+counts exemplars written into flushed objects, and
+`ravel_ingest_exemplars_dropped_total` counts exemplars discarded at flush. A
+rising drop count means the admission cap is engaging, visible from outside the
+process without reading the flush logs.
 
 ## How to query exemplars
 
