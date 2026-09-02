@@ -650,9 +650,16 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
   --fetch-concurrency 8 \
   --sql-max-query-bytes 1073741824 \
   --sql-tenant-max-bytes 2147483648 \
-  --max-segments 1024 \
-  --cache-max-bytes 268435456
+  --max-segments 1000000 \
+  --cache-max-bytes 25769803776
 ```
+
+`--max-segments` and `--cache-max-bytes` here match the in-process pass, so the
+two tables are comparable: a folded ClickBench tenant sits far above the 1024
+default sealed-segment ceiling (step 5), so the server must raise it or every
+statement fails with `8424 exceeds max 1024`; and the cache must exceed the
+~12 GB corpus (`25769803776` is 24 GiB) or every run is cold and there is no
+hot column to compare.
 
 The flags that must mirror the bench's, or the two tables are not comparable:
 
@@ -683,7 +690,8 @@ cargo run -p ravel-bench --features sql-latency,flight-lane --bin sql_latency_be
   --tenant clickbench --store s3 --flight 127.0.0.1:4317 \
   --corpus benchmarks/clickbench/hits.corpus.json \
   --runs 3 --compaction pre --window-hours 200000 \
-  --fetch-concurrency 8 --sql-max-query-bytes 1073741824
+  --fetch-concurrency 8 --sql-max-query-bytes 1073741824 \
+  --cache-bytes 25769803776
 ```
 
 - `--flight <host:port>` is the server's `--listen-grpc` address. It needs the
