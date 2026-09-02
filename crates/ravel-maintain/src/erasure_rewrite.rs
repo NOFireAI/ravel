@@ -2072,8 +2072,22 @@ pub async fn bucket_erasure_completion(
     // Build the query path's two exclusion sets. `excluded` names raw L0
     // identities that a compaction or rewrite superseded; `superseded_records`
     // names whole compaction/rewrite records whose output parts are dropped.
+    //
+    // Overlapping compaction records resolve to one authoritative record per
+    // overlap component, through the same function the snapshot resolver and
+    // the index fold use: only a WINNER's inputs are excluded, so an input
+    // only a loser names stays in `live_l0` because that is where a query
+    // reads it from, and a loser's parts are dropped below. Building the
+    // exclusion set from every record instead would hide a resolvable raw L0
+    // from this gate and let a `.done` be written while the subject is still
+    // returnable.
+    let losing_records =
+        ravel_catalog::select_authoritative_compaction_records(&compaction_records);
     let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
-    for (_, record) in &compaction_records {
+    for (key, record) in &compaction_records {
+        if losing_records.contains(key.as_str()) {
+            continue;
+        }
         for input in &record.inputs {
             excluded.insert((
                 input.writer_id.clone(),
@@ -2082,6 +2096,7 @@ pub async fn bucket_erasure_completion(
             ));
         }
     }
+    let losing_records: HashSet<String> = losing_records.into_iter().map(str::to_owned).collect();
     let mut superseded_records: HashSet<String> = HashSet::new();
     if !rewrite_records.is_empty() {
         let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
@@ -2138,7 +2153,7 @@ pub async fn bucket_erasure_completion(
         .collect();
     let live_compactions: Vec<&CompactionRecord> = compaction_records
         .iter()
-        .filter(|(key, _)| !superseded_records.contains(key))
+        .filter(|(key, _)| !superseded_records.contains(key) && !losing_records.contains(key))
         .map(|(_, record)| record)
         .collect();
     let live_rewrites: Vec<&RewriteRecord> = rewrite_records

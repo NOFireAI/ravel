@@ -894,8 +894,11 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      interlock-violation metric if its created_unix_ns postdates the newest
      compaction/rewrite record (it should have been sealed before that ran).
    Two compaction records in one bucket with different input_set_hash:
-   include both parts sets and all L0s not covered by either (correct
-   under overlap harmlessness; ADR-0018), and alarm loudly.
+   disjoint input sets include both parts sets and all L0s not covered by
+   either (correct under overlap harmlessness; ADR-0018); overlapping input
+   sets resolve to one authoritative record per overlap group, whose parts
+   are included and whose inputs are excluded, with every input only a losing
+   record names served as a raw L0. Either way, alarm loudly.
 4. Filter the remaining L0 commit records: [min_event_ts, max_event_ts]
    overlaps the query range.
 5. For each `min_token`: reconstruct its commit key and GET it directly
@@ -1191,11 +1194,15 @@ input sets are disjoint it includes both segment sets plus any L0 input covered
 by neither, harmless under the property above. When they overlap, query-time
 dedup would collapse the duplicate for metrics but not for logs or spans (which
 have none), so the resolver picks one authoritative record per overlap group by
-the smallest `input_set_hash`, with the record key as the tie fallback,
-includes that record's segments, serves every input the winner does not name
-as a raw L0 segment, and ignores the other records' segments; among the
-compaction records each input is then served from one place, inside the
-chosen record's segments or as a raw L0. Either way it raises
+the largest input set, then the smallest `input_set_hash`, with the record
+key as the final fallback, includes that record's segments, serves every
+input the winner does not name as a raw L0 segment, and ignores the other
+records' segments; among the compaction records each input is then served
+from one place, inside the chosen record's segments or as a raw L0.
+Preferring the largest input set leaves the fewest inputs to serve raw, so
+the bucket reads mostly from compacted parts rather than falling back to the
+L0 objects a smaller winner would not cover. All three keys are computed from
+record bytes alone, so every replica and the index fold pick the same winner. Either way it raises
 `ravel_catalog_compaction_input_set_conflicts_total` for a human to look at.
 Durably refusing to publish a second overlapping record is a publish-time step
 in ravel-maintain; the resolve-time tie-break keeps reads correct until then.

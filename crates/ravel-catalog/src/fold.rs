@@ -2410,7 +2410,7 @@ impl Catalog {
         let losing_compaction_records =
             crate::catalog::select_authoritative_compaction_records(&compaction_records);
         for (ckey, record) in &compaction_records {
-            if losing_compaction_records.contains(ckey) {
+            if losing_compaction_records.contains(ckey.as_str()) {
                 continue;
             }
             for input in &record.inputs {
@@ -2478,7 +2478,7 @@ impl Catalog {
         // but still serves).
         for (ckey, record) in &compaction_records {
             if superseded_records.contains(ckey.as_str())
-                || losing_compaction_records.contains(ckey)
+                || losing_compaction_records.contains(ckey.as_str())
             {
                 continue;
             }
