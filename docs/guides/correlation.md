@@ -23,7 +23,7 @@ exemplars a request carries and then discard them, so a metric ingested over
 those paths has none, whatever the sender attached.
 
 Ravel stores exemplars in the RSEG `EXEMPLARS` section (kind 10). The section
-was added in RSEG v6 (ADR-0047) and is unchanged in the current v7 (ADR-0092).
+was added in RSEG v6 and is unchanged in the current v7.
 Each object holds at most one `EXEMPLARS`
 section. The section is present only when at least one sample in the object
 carried an exemplar. Absence is always legal and means the object has no

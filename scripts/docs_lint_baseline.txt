@@ -127,66 +127,6 @@ docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
 docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
 docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
 docs/guides/coderabbit-runbook.md	TRACKER	ADR-0091
-docs/guides/correlation.md	TRACKER	ADR-0047
-docs/guides/correlation.md	TRACKER	ADR-0092
-docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/limits.rs
-docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/limits.rs
-docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/limits.rs
-docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/limits.rs
-docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/logs_limits.rs
-docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/logs_limits.rs
-docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/logs_limits.rs
-docs/guides/ingest.md	SRCPATH	crates/ravel-otlp/src/logs_limits.rs
-docs/guides/ingest.md	TRACKER	../adrs/0085-metric-metadata-and-otlp-suffixing.md
-docs/guides/ingest.md	TRACKER	ADR-0029
-docs/guides/ingest.md	TRACKER	ADR-0051
-docs/guides/ingest.md	TRACKER	ADR-0051
-docs/guides/ingest.md	TRACKER	ADR-0051
-docs/guides/ingest.md	TRACKER	ADR-0076
-docs/guides/ingest.md	TRACKER	ADR-0084
-docs/guides/ingest.md	TRACKER	ADR-0084
-docs/guides/ingest.md	TRACKER	ADR-0084
-docs/guides/ingest.md	TRACKER	ADR-0084
-docs/guides/ingest.md	TRACKER	ADR-0084
-docs/guides/ingest.md	TRACKER	ADR-0085
-docs/guides/ingest.md	TRACKER	ADR-0085
-docs/guides/ingest.md	TRACKER	ADR-0089
-docs/guides/ingest.md	TRACKER	ADR-0109
-docs/guides/inspecting-data.md	TRACKER	ADR-0027
-docs/guides/inspecting-data.md	TRACKER	ADR-0029
-docs/guides/inspecting-data.md	TRACKER	ADR-0032
-docs/guides/inspecting-data.md	TRACKER	ADR-0041
-docs/guides/inspecting-data.md	TRACKER	ADR-0051
-docs/guides/inspecting-data.md	TRACKER	ADR-0092
-docs/guides/inspecting-data.md	TRACKER	ADR-0095
-docs/guides/inspecting-data.md	TRACKER	ADR-0699
-docs/guides/inspecting-data.md	TRACKER	ADR-0699
-docs/guides/query.md	SRCPATH	crates/ravel-promql-difftest/src/scoring.rs
-docs/guides/query.md	SRCPATH	crates/ravel-promql-difftest/src/scoring.rs
-docs/guides/query.md	SRCPATH	crates/ravel-query/src/config.rs
-docs/guides/query.md	SRCPATH	crates/ravel-query/src/config.rs
-docs/guides/query.md	SRCPATH	crates/ravel-sql/src/session.rs
-docs/guides/query.md	TERM	declared column
-docs/guides/query.md	TERM	declared column
-docs/guides/query.md	TERM	declared column
-docs/guides/query.md	TERM	declared column
-docs/guides/query.md	TERM	declared column
-docs/guides/query.md	TERM	declared column
-docs/guides/query.md	TERM	declared column
-docs/guides/query.md	TRACKER	../adrs/0085-metric-metadata-and-otlp-suffixing.md
-docs/guides/query.md	TRACKER	ADR-0021
-docs/guides/query.md	TRACKER	ADR-0035
-docs/guides/query.md	TRACKER	ADR-0044
-docs/guides/query.md	TRACKER	ADR-0075
-docs/guides/query.md	TRACKER	ADR-0085
-docs/guides/query.md	TRACKER	ADR-0085
-docs/guides/query.md	TRACKER	ADR-0085
-docs/guides/query.md	TRACKER	ADR-0087
-docs/guides/query.md	TRACKER	ADR-0087
-docs/guides/query.md	TRACKER	ADR-0088
-docs/guides/query.md	TRACKER	ADR-0088
-docs/guides/query.md	TRACKER	ADR-0093
-docs/guides/traces.md	TRACKER	ADR-0052
 docs/ingest.md	SUPERLATIVE	em-dash
 docs/ingest.md	SUPERLATIVE	em-dash
 docs/ingest.md	SUPERLATIVE	em-dash

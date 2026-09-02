@@ -25,7 +25,7 @@ underneath. Traces are also ingested, over the same two transports: `POST
 /v1/traces` over HTTP and `opentelemetry.proto.collector.trace.v1.TraceService/Export`
 over gRPC. No transport accepts profiles yet.
 
-## Compressed requests (ADR-0084)
+## Compressed requests
 
 Ravel accepts gzip-compressed OTLP bodies on both transports. A stock
 OpenTelemetry Collector and a stock Grafana Alloy both default to gzip, so no
@@ -39,7 +39,7 @@ client configuration is needed.
   The comparison is case-insensitive: `GZIP`, `gzip`, and `X-Gzip` are the same
   coding.
 - An absent header, an empty value, or `identity` is the body as-is, byte for
-  byte the pre-ADR-0084 path. An uncompressed client sees no change.
+  byte the uncompressed path. An uncompressed client sees no change.
 - Any other single coding (`deflate`, `br`, ...), and any multi-coding list
   (`gzip, gzip`, `deflate, gzip`), is rejected with `415 Unsupported Media
   Type`. Ravel chains no decoders and never guesses at one member of a list.
@@ -74,7 +74,7 @@ decompressed size is bounded at **16 MiB**, not HTTP's 64 MiB. tonic applies
 output (checking the framed length first, then limiting the inflate buffer to
 the same value), so the one 16 MiB knob caps both halves. Raising it to match
 HTTP would also raise the ceiling on uncompressed gRPC messages, which is a
-separate change; ADR-0084 accepts the asymmetry. A batch that inflates to
+separate change; Ravel accepts the asymmetry. A batch that inflates to
 40 MiB is accepted over HTTP and rejected over gRPC with `resource_exhausted`.
 
 Ravel does not compress responses (`send_compressed` is off): OTLP export
@@ -90,11 +90,11 @@ path, and an operator sizing limits must know it:
 | OTLP HTTP / gRPC | Decompressed size |
 | Prometheus Remote Write | Compressed size |
 
-OTLP charges the decompressed size (ADR-0084 decision 4) so that two tenants
+OTLP charges the decompressed size so that two tenants
 sending identical telemetry are charged identically regardless of a client-side
 compression setting. Remote Write still charges the compressed body length;
-ADR-0084 deliberately leaves that alone, and the inconsistency is recorded
-there rather than papered over. The practical effect: a gzip OTLP client's
+this asymmetry is deliberate, and the inconsistency is acknowledged
+rather than papered over. The practical effect: a gzip OTLP client's
 effective byte-rate allowance drops relative to an uncompressed client of the
 same nominal rate, because it is now charged for what it actually sent rather
 than what it put on the wire.
@@ -143,8 +143,7 @@ Every write has a mode. The default is strict:
 - **Buffered**: the call returns as soon as Ravel validates the request and
   enqueues it into its shard's in-memory buffer, before any flush. This is
   lower latency but not durable. A crash between the ack and the next flush
-  loses that buffered window, bounded by `max_flush_delay` (2s default,
-  ADR-0076 decision 4).
+  loses that buffered window, bounded by `max_flush_delay` (2s default).
   Ravel issues no commit token, because there is nothing yet to point one at.
 
 To use buffered mode for one request, send `x-ravel-ingest-mode: buffered` on
@@ -162,7 +161,7 @@ point (or group of points) and returns it in the OTLP
 combined `error_message`. Ravel still ingests and acknowledges the admitted
 points normally.
 
-Every rejection reason ([crates/ravel-otlp/src/limits.rs](../../crates/ravel-otlp/src/limits.rs)):
+Every rejection reason:
 
 | Rejection | Meaning |
 |---|---|
@@ -208,9 +207,8 @@ through a collector lands under one series name. The unit is mapped and appended
 `_total`: a monotonic counter named `foo` with `unit: "By"` ingests as
 `foo_bytes_total`. This is an ingest-time transform on the name string only; it
 does not touch series identity or any stored format. It is a one-time,
-intentional naming change for dashboards built directly against pre-ADR-0085
-OTLP names. See [ADR-0085](../adrs/0085-metric-metadata-and-otlp-suffixing.md)
-for the full unit table and the metadata record format.
+intentional naming change for dashboards built directly against the unsuffixed
+OTLP names.
 
 ## Job and instance labels
 
@@ -240,8 +238,7 @@ that predates your write.
 
 ## Admission limits
 
-Defaults ([crates/ravel-otlp/src/limits.rs](../../crates/ravel-otlp/src/limits.rs)).
-`ravel-server` flags cannot currently configure them:
+Defaults. `ravel-server` flags cannot currently configure them:
 
 | Limit | Default |
 |---|---|
@@ -274,16 +271,16 @@ event time close enough to ingest time for this to hold:
 Both bounds are inclusive. A skew or lag exactly equal to the limit is
 accepted; one nanosecond past it is rejected.
 
-Logs and spans enforce the same window at admission (ADR-0051 §4). For a
+Logs and spans enforce the same window at admission. For a
 **span**, the bounded timestamp is its **end** (`end_ts_ns`), on both edges,
 and `end_ts < start_ts` is rejected outright. The lag bound anchors on the
-end, not the start (ADR-0051 amendment, 2026-08-13): a long-running span that
+end, not the start: a long-running span that
 started more than `max_ingest_lag_ns` ago but ended within the window is
 admitted; only a span reported more than `max_ingest_lag_ns` after it *ended*
 is `TooOld`. The listing window stays sound because any span overlapping a
 query range has its end at or after the range start.
 
-Ravel also checks its own receiver clock at admission (ADR-0051): a reading
+Ravel also checks its own receiver clock at admission: a reading
 below a compiled floor (2020-01-01T00:00:00Z) or one that
 yields no representable ingest-hour bucket rejects the whole request with
 `503` / gRPC `UNAVAILABLE`, counted under
@@ -321,8 +318,7 @@ directly with `ravel-cli rlog inspect`
 
 ### Log admission limits
 
-Defaults ([crates/ravel-otlp/src/logs_limits.rs](../../crates/ravel-otlp/src/logs_limits.rs)).
-`ravel-server` flags cannot currently configure them:
+Defaults. `ravel-server` flags cannot currently configure them:
 
 | Limit | Default |
 |---|---|
@@ -352,7 +348,7 @@ The partial-success contract is the same as metrics, with
 length is capped. A request rejected wholesale therefore does not produce a
 response string proportional to its record count.
 
-Every rejection reason ([crates/ravel-otlp/src/logs_limits.rs](../../crates/ravel-otlp/src/logs_limits.rs)):
+Every rejection reason:
 
 | Rejection | Meaning |
 |---|---|
@@ -379,7 +375,7 @@ not pad or truncate them. Padding would fabricate an id that never existed.
 A record with neither `time_unix_nano` nor `observed_time_unix_nano` set
 (legal OTLP) takes the server's ingest timestamp for both.
 
-## Bulk import (`ravel-cli load --parquet`, ADR-0089)
+## Bulk import (`ravel-cli load --parquet`)
 
 OTLP is the only *networked* way to write logs. For loading an existing
 structured dataset offline (a Parquet export, an archive migration, a
@@ -398,7 +394,7 @@ the server does at first touch) and writes with strict acknowledgement, awaiting
 every write before it exits, so a run that returns success has no
 buffered-but-unflushed data.
 
-### The columnar fast path (ADR-0109)
+### The columnar fast path
 
 The Parquet a load reads is already columnar, and the RLOG object it writes is
 columnar too. The loader builds the storage-native columnar batch directly from
@@ -425,7 +421,7 @@ the per-row string path; both produce identical output.
 ### The `--mapping` TOML
 
 The mapping declares how source Parquet columns become record fields. Resource
-attributes determine stream identity (ADR-0029) and are declared separately from
+attributes determine stream identity and are declared separately from
 record attributes, which never enter identity:
 
 ```toml
