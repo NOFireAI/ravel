@@ -8,9 +8,11 @@
 //! and the sum over phases equals the wrapper's grand total exactly -- no
 //! request uncounted, none counted twice.
 //!
-//! Every figure asserted here is exact, not a floor: a test that only checked
-//! `> 0` would pass on a ledger that double-counts, which is the failure this
-//! seam exists to make impossible.
+//! Every request count asserted here is exact; ranged-read byte figures use
+//! per-object proportional bands (backed by the oracle's exact grand-total
+//! reconciliation), never flat floors. A suite that only checked `> 0` would
+//! pass on a ledger that double-counts, which is the failure this seam
+//! exists to make impossible.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
