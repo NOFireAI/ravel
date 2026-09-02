@@ -2,10 +2,15 @@
 
 ![query path](../diagrams/query-path.svg)
 
-All five endpoints live under `/api/v1` on `--listen-http`. They require the
+Eleven routes are registered under `/api/v1` on `--listen-http`. They require the
 same tenant authentication as ingest (`Authorization: Bearer <token>`, or the
-dev header if `--dev-insecure-tenant-header` is set). They return the same
-Prometheus-compatible JSON envelope:
+dev header if `--dev-insecure-tenant-header` is set). The Prometheus-shaped
+endpoints below return the Prometheus-compatible JSON envelope; `POST
+/api/v1/sql` and `POST /api/v1/analytics` return a described-schema JSON
+envelope instead, documented with each. This guide covers the query-facing
+routes; the maintenance route `POST /api/v1/admin/fold` is triggered by
+operators, not queried, and the exemplar and analytics routes have their own
+guides linked below.
 
 ```json
 {"status": "success", "data": {...}}
@@ -126,7 +131,7 @@ Two routes Grafana's built-in Prometheus datasource probes on every datasource
 save. They take no parameters.
 
 ```json
-{"status": "success", "data": {"version": "0.1.0", "revision": "", "branch": "", "buildUser": "", "buildDate": "", "goVersion": ""}}
+{"status": "success", "data": {"version": "0.11.0", "revision": "", "branch": "", "buildUser": "", "buildDate": "", "goVersion": ""}}
 ```
 
 `version` is Ravel's own version, not a Prometheus one. `revision` is the
@@ -144,6 +149,22 @@ ADR-0085, or over a path that sent no type/help/unit, has no entry, and a reques
 that carries no resolvable tenant still gets `{"status": "success", "data": {}}`
 (this endpoint never returns `401`). See [ADR-0085](../adrs/0085-metric-metadata-and-otlp-suffixing.md)
 for the record format and the OTLP name suffixing that decides the family names.
+
+### `GET/POST /api/v1/query_exemplars`
+
+Prometheus exemplar lookup: the trace references a metric sample carried, for a
+metric selector over a `start`/`end` window. It takes the Prometheus `query`,
+`start`, and `end` parameters and returns the Prometheus exemplar shape. Ravel
+stores exemplars only from OTLP ingest. The full walkthrough, including the
+Grafana metric-to-trace link, is in [correlation.md](correlation.md).
+
+### `POST /api/v1/analytics`
+
+A JSON-body endpoint that runs a range evaluation and applies one analytic to
+each series of the result. It accepts exactly two operations: change point
+detection and summary statistics. It shares the query listener and needs no
+cargo feature. The request and response schema, the operations, and the status
+table are in [analytics.md](../analytics.md#endpoint).
 
 ## PromQL support
 
@@ -301,7 +322,7 @@ change `end`.
 
 ## SQL over `samples`, `logs`, and `spans`
 
-`POST /api/v1/sql` (see README "SQL") serves three tables from one endpoint:
+`POST /api/v1/sql` serves three tables from one endpoint:
 `samples` (metrics), `logs`, and `spans`. The server parses the query's `FROM`
 clause before it plans, and registers only that one table for the query. A
 single query may reference exactly one of the three; naming two or more of
@@ -343,7 +364,7 @@ re-applied above the scan, so the `IN` envelope's coarser range and any
 type-mismatched shape (`!=`, a range on a `str` column, a float compared to an
 `i64` column) never change which rows return, only which blocks the fetch reads.
 Two caveats carry over unchanged: the `str`/`bytes` equality half sees no
-pruning benefit on a POSTINGS section written before the #333 write-path fix, and
+pruning benefit on a POSTINGS section written before the write-path fix, and
 a name that also carries a non-`str` column anywhere declines equality pruning
 for that name. See
 [operations.md](operations.md#declared-typed-attribute-columns-adr-0090) and
@@ -444,6 +465,13 @@ the `spans` table on the same endpoint: span rows are at-least-once with no
 query-time dedup either, so a `COUNT` over `spans` is a lower-bounded count on
 the same terms.
 
+## Alerting on these queries
+
+Alert rules run these same PromQL and SQL queries on a schedule and notify a
+sink when a threshold trips or a detection query returns rows. The rules file,
+the modes that evaluate it, and the sinks are in the
+[alerting guide](alerting.md).
+
 ## HTTP status codes
 
 | Status | `errorType` | When |
@@ -451,6 +479,7 @@ the same terms.
 | 200 | n/a | Success. |
 | 400 | `bad_data` | Bad or missing parameter, PromQL parse error, invalid time range, step <= 0. |
 | 401 | `unauthorized` | Tenant authentication failed or was not provided. |
-| 422 | `execution` | PromQL construct outside the Phase 1 subset, or a query budget (segments/series/samples, or the catalog-list window ceiling) exceeded. |
-| 503 | `unavailable` | Catalog or segment fetch failed, an unresolvable `min_commit_token`, or a snapshot invalidated by concurrent GC/compaction. |
+| 422 | `execution` | An intentionally rejected PromQL construct (the set listed under PromQL support: `histogram_stddev`/`histogram_stdvar` over native histograms, an or-grouped label matcher, vector-matching fill values, a subquery over native histograms, or the experimental `limitk`/`limit_ratio` operators), or a query budget (segments/series/samples, or the catalog-list window ceiling) exceeded. |
+| 500 | `internal` | Permanent data corruption: a corrupt catalog record, segment, field, or key, or a non-monotonic sample sequence. The message is a fixed internal-error string; the storage-layer detail is redacted and logged server-side. |
+| 503 | `unavailable` | Transient catalog or segment fetch failure, an unresolvable `min_commit_token`, or a snapshot invalidated by concurrent GC/compaction. |
 | 504 | `timeout` | Query exceeded its deadline. |
