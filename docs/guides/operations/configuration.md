@@ -566,11 +566,14 @@ conflict rather than a silent overwrite. Every value must be strictly positive:
 an all-zero configuration would satisfy the inequality trivially and be
 impossible for any mode to match, so it is rejected.
 
-The Kubernetes operator exposes no GC-horizon fields, and does not need to: it
-deploys every pod with the same shipped defaults, so with a shared credential
-the first pod bootstraps `sys/gc` from those defaults and every pod validates
-trivially. With per-role credential Secrets the maintain pod or an Admin step
-creates it first, as above.
+The Kubernetes operator exposes no GC-horizon fields: it deploys every pod
+with the shipped defaults. On a fresh bucket with a shared credential the
+first pod bootstraps `sys/gc` from those defaults and every pod validates
+trivially; with per-role credential Secrets the maintain pod or an Admin
+step creates it first, as above. On a bucket whose `sys/gc` was set to other
+values with `gc-config set`, the operator's maintain pods refuse to start,
+because the must-match rule has no operator field to satisfy it; keep such a
+bucket on the shipped values, or run maintenance outside the operator.
 
 ### Age-based retention
 
