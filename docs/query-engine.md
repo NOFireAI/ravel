@@ -522,15 +522,27 @@ and passes through bit-exactly.
 1. Segment level: commit-record event-time bounds vs padded range (already
    done by Catalog::resolve).
 2. Series level: SERIES_META entry ts bounds vs padded range, then matcher
-   evaluation against the decoded LabelSet. Every matcher kind, equality
-   included, evaluates on materialized label sets: `SegmentFetcher` decodes
-   the catalog and filters with `matches_series`, which reads each label's
-   value as a string. A reader that resolves an equality value to a
-   LABEL_DICT ordinal once and compares ordinals exists
-   (`decode_catalog_matching_v4`), but no production fetch path calls it;
-   its callers are the read-path accounting benchmark and a fuzz target. So
-   an equality matcher costs a label-set materialization per candidate
-   series, the same as a regex or negative matcher.
+   evaluation against the LabelSet. Two paths, chosen by matcher shape and
+   segment layout:
+   - Ordinal equality path. When the segment carries the whole SERIES_META
+     (below the 4096-series sparse threshold) and every matcher in the set is
+     a non-empty positive equality, `SegmentFetcher::decode_selected` resolves
+     each equality value to its LABEL_DICT ordinal once
+     (`decode_catalog_matching_v4`) and materializes a LabelSet only for a
+     series that already matched, not one per candidate. The catalog sections
+     fetched and decoded are the same, so the fetched-byte cost is unchanged;
+     the saving is one label-set materialization per selected series instead
+     of per candidate, which dominates at low selectivity. A non-empty
+     equality value that is absent from the dictionary resolves to nothing and
+     yields zero series, the correct result, with no materialization.
+   - Materializing path. Every other case decodes the catalog and filters with
+     `matches_series`, which reads each label's value as a string, costing one
+     materialization per candidate series. This path takes: any set containing
+     a regex or negated matcher; an empty-value equality (`l=""`, which means
+     "absent or empty", a series shape the dictionary has no ordinal for); and
+     every at-or-above-threshold (sparse) object, which carries no whole
+     SERIES_META for the ordinal decoder and reads its catalog through the
+     chunked or whole-object path.
 3. Page level: v1 has one page pair per series; nothing further to prune.
 
 ## Segment catalog fetch: whole-object vs sparse catalog-probe
