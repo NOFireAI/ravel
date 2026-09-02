@@ -110,6 +110,13 @@ aws iam create-role --role-name ravel-clickbench-box \
   --assume-role-policy-document file:///tmp/trust.json
 
 ACCT=$(aws sts get-caller-identity --query Account --output text)
+
+# The SecureStrings are encrypted under the account's default SSM KMS key
+# unless you created them with a customer-managed key. Set KMS_KEY_ID to that
+# key's id (the default key's id is what `aws kms describe-key --key-id
+# alias/aws/ssm --query KeyMetadata.KeyId --output text` prints).
+KMS_KEY_ID=<ssm-kms-key-id>
+
 cat > /tmp/ssm-read.json <<EOF
 {
   "Version": "2012-10-17",
@@ -122,8 +129,17 @@ cat > /tmp/ssm-read.json <<EOF
     {
       "Effect": "Allow",
       "Action": "kms:Decrypt",
-      "Resource": "*",
-      "Condition": {"StringEquals": {"kms:ViaService": "ssm.$AWS_REGION.amazonaws.com"}}
+      "Resource": "arn:aws:kms:$AWS_REGION:$ACCT:key/$KMS_KEY_ID",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ssm.$AWS_REGION.amazonaws.com",
+          "kms:EncryptionContext:PARAMETER_ARN": [
+            "arn:aws:ssm:$AWS_REGION:$ACCT:parameter/ravel-clickbench/access-key",
+            "arn:aws:ssm:$AWS_REGION:$ACCT:parameter/ravel-clickbench/secret-key",
+            "arn:aws:ssm:$AWS_REGION:$ACCT:parameter/ravel-clickbench/bucket"
+          ]
+        }
+      }
     }
   ]
 }
