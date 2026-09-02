@@ -261,18 +261,6 @@ docs/guides/query.md	TRACKER	ADR-0087
 docs/guides/query.md	TRACKER	ADR-0088
 docs/guides/query.md	TRACKER	ADR-0088
 docs/guides/query.md	TRACKER	ADR-0093
-docs/guides/shard-overrides.md	SUPERLATIVE	em-dash
-docs/guides/shard-overrides.md	SUPERLATIVE	em-dash
-docs/guides/shard-overrides.md	SUPERLATIVE	em-dash
-docs/guides/shard-overrides.md	SUPERLATIVE	em-dash
-docs/guides/shard-overrides.md	SUPERLATIVE	em-dash
-docs/guides/shard-overrides.md	TERM	maintain tier
-docs/guides/shard-overrides.md	TRACKER	ADR-0034
-docs/guides/shard-overrides.md	TRACKER	ADR-0052
-docs/guides/shard-overrides.md	TRACKER	ADR-0052
-docs/guides/shard-overrides.md	TRACKER	ADR-0065
-docs/guides/shard-overrides.md	TRACKER	ADR-0076
-docs/guides/shard-overrides.md	TRACKER	ADR-0076
 docs/guides/traces.md	TRACKER	ADR-0052
 docs/guides/tracing.md	SRCPATH	crates/ravel-catalog/src/catalog.rs
 docs/guides/tracing.md	SRCPATH	crates/ravel-query/src/engine.rs
