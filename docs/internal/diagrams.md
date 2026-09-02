@@ -1,172 +1,213 @@
-# Ravel architecture diagrams
+# Ravel diagrams
 
-Hand-authored SVGs. Each file has its own legend. Colors: mid blue for
-services and actors, amber for immutable objects in the object store, green
-for checksum-verified regions, purple/lavender for `tracing` spans, dashed
-gray/blue/purple for reserved or planned items. All diagrams use plain SVG
-shapes and text, no embedded images, and stay under 60 KB.
+Every diagram under `docs/diagrams/` is a hand-authored SVG, embedded in one
+page with an image link so it renders wherever the markdown does. This page
+says what each one shows and which page it illustrates, so a diagram is
+never reachable from nowhere and a page that changes can find the drawing
+that has to change with it.
+
+## The visual language
+
+The diagrams share one style, so a reader who has learned one can read the
+rest:
+
+- Mid blue (`#a9c9e6` fill, `#1f4e79` stroke) for services, actors, and
+  anything that runs as a process.
+- Amber (`#f4c869` fill, `#8a5a10` stroke) for immutable objects in the
+  object store and for the steps that write them.
+- Green (`#a9dcae` fill, `#2f6b34` stroke) for checksum-verified regions.
+- Lavender for `tracing` spans.
+- Neutral grey (`#eceef1` or `#dde1e7` fill, `#383e46` stroke) for
+  everything else, and white for plain boxes.
+- Dashed strokes for optional or conditional paths; solid strokes for the
+  paths every request takes.
+- Text in the page's own sans-serif at 12 to 13 px, in near-black ink
+  (`#17191c`), with a muted grey (`#4a4f57`) for captions.
+
+Every file declares a `viewBox` so it scales, `role="img"` with an
+`aria-label` that states what the drawing shows, embeds no raster image, and
+references nothing outside itself. The documentation gate checks all four,
+and that at least one page links each file.
 
 ## architecture.svg
 
-Shows the full system: OTLP gRPC and OTLP HTTP clients plus the planned
-OTAP path on the ingest side, Prometheus API consumers on the query side.
-Ingest flows through the gateway, ingest router, and shard actors down to
-L0 RSEG objects and commit records. Query flows from the /api/v1 surface
+The whole system on one page: OTLP and OTAP clients ingest through the
+gateway, the ingest router, and the shard actors down to immutable segments
+and commit records in object storage, and Prometheus API consumers read back
 through the PromQL evaluator, query workers, and catalog resolution. The
-object store sits in the middle as the single durable center; every box
-above it is disposable and stateless.
+object store sits in the middle as the single durable center; every box above
+it is disposable.
 
-Illustrates: docs/architecture.md, docs/adrs/0001-object-native-l0.md.
-
-The SQL query path (ravel-sql, DataFusion, ADR-0013) is shipped: served at
-`POST /api/v1/sql` under the `sql` cargo feature and over Flight SQL under
-`flight-sql`, both off by default. OTAP ingest is likewise shipped behind a
-cargo feature. The three architecture-*.svg diagrams below supersede this
-file's system overview for the current shapes.
+Illustrates: README.md "How it fits together".
 
 ## architecture-write-path.svg
 
-The write path as docs/architecture.md describes it today: clients through
-the gateway (auth, tenant, admission), the ingest router's shard hash, the
-single-threaded shard actors building one immutable columnar object per
-flush, the two-PUT publish (data object, then commit record), and the
-strict acknowledgement that answers only after both are durable.
+The write path: clients through the gateway (authentication, tenant
+resolution, admission), the ingest router's shard hash, the single-threaded
+shard actors building one immutable columnar segment per flush, the two-PUT
+publish (data object, then commit record), and the strict acknowledgement
+that answers only after both are durable.
 
-Illustrates: docs/architecture.md "The write path",
-docs/consistency-model.md.
+Illustrates: docs/architecture.md "How ingest, query, and maintenance
+interact".
 
 ## architecture-read-path.svg
 
-Commit records fold into snapshot parts and a HEAD published by CAS; a
-query pins one snapshot with a single GET, prunes with the snapshot's
-bounds, skip indexes, blooms, and exact column statistics, fetches by
-ranged or whole-object GETs through the read cache, and evaluates through
-PromQL or SQL (SQL behind the `sql`/`flight-sql` cargo features).
+Commit records fold into snapshot parts and a HEAD published by
+compare-and-swap; a query pins one snapshot with a single GET, prunes with the
+snapshot's bounds, skip indexes, bloom filters, and exact column statistics,
+fetches by ranged or whole-object GETs through the read cache, and evaluates
+through PromQL or SQL.
 
-Illustrates: docs/architecture.md "The catalog and the read path",
-docs/catalog-and-mvcc.md.
+Illustrates: docs/architecture.md "How ingest, query, and maintenance
+interact".
 
 ## architecture-cluster-topology.svg
 
-Symmetric distributed query nodes over one shared bucket (the only durable
-state), heartbeat-registered workers with rendezvous hashing, and remote
-clusters as separate trust domains reached only through their own API.
-Moved out of the inline form docs/architecture.md previously carried, so
-GitHub renders it.
+Symmetric query nodes over one shared bucket, heartbeat-registered workers
+placed by rendezvous hashing, and remote clusters as separate trust domains
+reached only through their own API.
 
-Illustrates: docs/architecture.md "Distributed reads and cross-cluster
-federation", docs/query-engine.md.
+Illustrates: docs/architecture.md "What happens when processes run
+concurrently".
 
 ## ingest-commit-sequence.svg
 
-A vertical sequence diagram of one strict-mode flush: pin the flush
-identity, PUT the data object with create-if-absent and a checksum, PUT the
-commit record with create-if-absent and an idempotency check on
-AlreadyExists, then ack with a commit token. Marks the three crash points
-from the crash matrix and what each one leaves behind: nothing stored, an
-invisible orphan, or a visible segment where a client retry stores a
-duplicate.
+A vertical sequence diagram of one strict-mode flush: pin the flush identity,
+PUT the data object create-if-absent with a checksum, PUT the commit record
+create-if-absent with an idempotency check, then acknowledge with a commit
+token. The three crash points from the crash matrix are marked with what each
+one leaves behind: nothing stored, an invisible orphan, or a visible segment
+where a client retry stores a duplicate.
 
-Illustrates: docs/ingest.md, docs/catalog-and-mvcc.md (commit sequence),
-docs/consistency-model.md (crash matrix), docs/adrs/0002-commit-protocol.md.
-
-Last verified against the code: 2026-07-27 (Phase 1 complete; ingest and
-commit crates match this sequence end to end against MinIO/S3).
+Illustrates: docs/guides/ingest.md "Commit tokens and read-your-write";
+the crash matrix is in docs/consistency-model.md.
 
 ## rseg-layout.svg
 
-The byte layout of an RSEG v7 object (the only supported version,
-ADR-0027 and ADR-0092). The main drawing is the v7 layout: LABEL_DICT and SERIES_IDS,
-the run-major SERIES_META catalog (or, at/above the 4096-series threshold,
-the sparse SERIES_IDX kind 8 + chunked SERIES_META_CHUNKS kind 9 pair),
-the TS_PAGES / VAL_PAGES / HIST_PAGES containers with per-page headers
-(enc, comp, and a crc computed over series_id plus enc plus comp plus
-payload), the protobuf footer, and the 16-byte trailer with its field
-breakdown. Brackets show exactly what footer_crc32c, a section's crc32c,
-each sparse partial-fetch crc32c (id window, meta chunk frame), and a
-page's crc each cover. A short history note points at the ADRs that built
-up the layout.
+The byte layout of an RSEG v7 object: the label dictionary and series ids,
+the series-metadata catalog (or its sparse index and chunked form above the
+4096-series threshold), the timestamp, value, and histogram page containers
+with per-page headers, the protobuf footer, and the 16-byte trailer, with
+brackets showing what each checksum covers.
 
-Illustrates: docs/segment-format.md (the self-contained v7 spec),
-docs/adrs/0004-rseg-format.md,
-docs/adrs/0010-spec-amendments-review-1.md (§4, checksum coverage),
-docs/adrs/0017, 0018, 0026, 0027.
-
-Last verified against the code: 2026-07-28 (v5 is the only readable and
-writable version, ADR-0027; frozen and proved byte-identical by the
-golden_bytes_v5 test; the sparse sections are byte-gated < 1% of object at
-the 10k shape by the deterministic catalog_byte_gates test in ravel-bench).
+Illustrates: docs/segment-format.md; docs/guides/inspecting-data.md
+"segment inspect".
 
 ## query-path.svg
 
-The query path from an incoming PromQL request to the JSON response:
-catalog snapshot resolution (the listing window plus exact-key token
-reads), a suffix GET of each segment's footer, series pruning through
-SERIES_META and LABEL_DICT, range coalescing into a small number of GETs,
-page decode, cross-segment dedup order, the PromQL evaluator, and the
-Prometheus JSON envelope.
+The query path from an incoming PromQL request to the JSON response: catalog
+snapshot resolution (the listing window plus exact-key token reads), a suffix
+GET of each segment's footer, series pruning through the series metadata and
+label dictionary, range coalescing into a few GETs, page decode,
+cross-segment deduplication, the PromQL evaluator, and the Prometheus JSON
+envelope.
 
-Illustrates: docs/query-engine.md, docs/catalog-and-mvcc.md (snapshot
-resolution, dedup order), docs/segment-format.md (reader protocol).
-
-Last verified against the code: 2026-07-27 (Phase 1 complete; this is the
-live `/api/v1` PromQL path. A second, SQL query path over the same segments
-now exists in `ravel-sql` -- see architecture.svg's SQL query path panel --
-but it is not yet wired to a request-response diagram of its own since it
-has no HTTP/Flight endpoint yet).
+Illustrates: docs/guides/query.md.
 
 ## tenancy-key-layout.svg
 
-The bucket key tree under t/<tenant_hash>/: the metrics signal prefix with
-its l0 data keys and commit keys, the reserved logs/spans/profiles
-prefixes, and the future catalog snapshot and HEAD locations. Breaks down
-each key's components: writer id, epoch, seq, and the blake3-derived
-hash16 for data keys; the ingest hour bucket for commit keys.
+The object-store key tree under `t/<tenant_hash>/`: the metrics, logs, and
+spans signal prefixes with their L0 data keys and commit keys, and the catalog
+snapshot and HEAD objects the fold writes. Each key's components are broken
+down: writer id, epoch, sequence, and the hash for data keys; the ingest-hour
+bucket for commit keys.
 
-Illustrates: docs/catalog-and-mvcc.md (key layout), docs/adrs/0009 (not
-read directly; referenced by docs/catalog-and-mvcc.md for tenant_hash),
-docs/adrs/0010-spec-amendments-review-1.md (§3 writer identity, §13 tenant
-hash).
-
-Last verified against the code: 2026-07-27 (Phase 1 complete; this is the
-live object-store key layout).
+Illustrates: docs/guides/inspecting-data.md "Key layout"; the normative
+layout is docs/catalog-and-mvcc.md.
 
 ## tracing-export.svg
 
-Two panels. The first nests the six query-path phase spans (`catalog_resolve`,
-`segment_open`, `catalog_decode`, `page_fetch`, `decode`, `evaluate`) inside
-the request-level span (`sql_query`, `analytics_query`, or
-`flight_sql_statement`), with each phase span's recorded fields and level
-(`info` for the request span, `debug` for every phase span), including the
-field-set the logs-signal `page_fetch`/`decode` spans carry instead of the
-metric path's. The second panel shows the subscriber: one `EnvFilter` gating
-both the always-on `fmt` layer (to the local log stream) and the
-off-by-default `OpenTelemetryLayer` (through a `BatchSpanProcessor` to an
-OTLP/gRPC collector), plus a panel on the two export-failure modes and what
-each does today.
+Two panels. The first nests the six query-path phase spans inside the
+request-level span, with each span's recorded fields and level, including the
+field set the logs-signal `page_fetch` and `decode` spans carry instead of the
+metric path's. The second shows the subscriber: one `EnvFilter` gating both
+the always-on `fmt` layer and the off-by-default OpenTelemetry layer through
+a batch span processor to an OTLP gRPC collector, plus the two export-failure
+modes.
 
-Illustrates: docs/guides/tracing.md, docs/adrs/0044-query-cost-accounting.md
-(decision 5), docs/adrs/0060-query-path-otlp-trace-export.md.
+Illustrates: docs/guides/tracing.md.
 
-Last verified against the code: 2026-08-08 (the OTLP export crate and both
-binaries' wiring landed, along with the runtime-export-failure warning and
-the logs-decode-span field parity this diagram documents).
+## erasure-lifecycle.svg
+
+Selective subject erasure end to end: an erase request excludes matching
+records from queries immediately, a maintain rewrite drops the subject and
+publishes a `.done` record, then a horizon- and hold-gated sweep physically
+deletes the superseded objects, reaching absence in under four days on the
+defaults.
+
+Illustrates: docs/deletion-and-gc.md "Selective subject erasure".
 
 ## ingest-plausibility-window.svg
 
-The fail-closed ingest-timestamp plausibility window from the ADR-0051
-amendment (2026-08-13): the accept region
-`[now - max_ingest_lag, now + max_future_skew]` on the event-time axis,
-with both reject zones and the typed rejections they produce (`TooOld`,
-`FutureSkew`), the per-signal bounded timestamps (metric sample ts, log
-record ts, span end), and a long-running span whose start precedes the
-window but is admitted because only its end is bounded. Footnotes carry
-the boundary-inclusivity rule (equality admits) and the receiver-clock
-floor (`MIN_PLAUSIBLE_INGEST_CLOCK_NS`, whole-request 503 on failure).
+The ingest-timestamp plausibility window: the accept region between
+`now - max_ingest_lag` and `now + max_future_skew` on the event-time axis,
+the `TooOld` and `FutureSkew` reject zones, the per-signal bounded timestamps
+(metric sample time, log record time, span end), and a long-running span
+admitted because only its end is bounded.
 
-Illustrates: docs/adrs/0051-tenant-admission-control.md (amendment
-2026-08-13), docs/adrs/0010-spec-amendments-review-1.md (item 8),
-docs/consistency-model.md "Late and skewed data".
+Illustrates: docs/adrs/0051-tenant-admission-control.md; the rule it draws
+is stated in docs/consistency-model.md "Late and skewed data" and
+docs/guides/admission-limits.md "Event-time skew".
 
-Drawn 2026-08-13 against the amendment's decision; the span-end rule and
-clock floor describe the decided and implemented behavior.
+## query-request-budget.svg
+
+Why a flat per-query request cap is dimensionally wrong: one cold query over
+a tenant's open hour fetches every shard's segments, so cost scales with
+shard count while a flat cap does not, and the default is derived from the
+shard count instead.
+
+Illustrates: docs/adrs/0075-shard-aware-query-request-budget.md.
+
+## request-cost-levers.svg
+
+Where the object-store request bill comes from and which levers reach it:
+PUTs per day scale with tenants, signals, shards, replicas, and flush cadence;
+replica affinity, shard count, log and span pipelining, and flush cadence are
+the levers, and the commit protocol stays.
+
+Illustrates: docs/adrs/0076-reducing-s3-request-cost.md; the operator's
+view of the same levers is docs/guides/cost-model.md.
+
+## distributed-query-lifecycle.svg
+
+The lifecycle of one distributed query: the request, the single pinned
+snapshot, the cost gate, shard-major slices dispatched to rendezvous-mapped
+workers or run coordinator-local, the k-way merge under one total order, the
+unchanged evaluator, and the response with one `stats.fragments[]` entry per
+slice, with the cross-cluster federation path alongside.
+
+Illustrates: docs/guides/distributed-query.md "The lifecycle of a
+distributed query".
+
+## distributed-query-failure.svg
+
+The failure flow: an intra-cluster slice is re-dispatched once, then run on
+the coordinator, then failed typed, never merged partially; corruption is
+terminal; and the cross-cluster path is the only source of partial coverage,
+under `skip-unavailable`.
+
+Illustrates: docs/guides/distributed-query.md "Failure behavior".
+
+## k8s-operator-reconcile.svg
+
+The operator reconcile loop: one `RavelCluster` resource reconciles into the
+gateway, query, and maintain Deployments and their Services.
+
+Illustrates: docs/guides/kubernetes.md; docs/adrs/0034-k8s-operator.md.
+
+## k8s-dev-environment.svg
+
+The kind development environment: the ordered steps `scripts/kind-up.sh`
+runs to create a cluster, build and load the container images, and bring up
+Ravel.
+
+Illustrates: docs/guides/kubernetes.md "The kind development environment".
+
+## k8s-ci-integration.svg
+
+The `k8s-integration` CI job against the local environment: the two paths
+build container images differently and converge on identical `kind-up.sh`,
+`kind-demo.sh`, and `kind-down.sh` calls.
+
+Illustrates: docs/guides/kubernetes.md "The same environment in CI".

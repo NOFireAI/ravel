@@ -1,0 +1,83 @@
+<svg viewBox="0 0 980 720" width="980" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Lifecycle of a distributed query: request, resolve, cost gate, slice dispatch, merge, evaluate, respond">
+  <style>
+    .b{fill:#ffffff;stroke:#383e46;stroke-width:1.2;}
+    .g{fill:#eceef1;stroke:#383e46;stroke-width:1.2;}
+    .s{fill:#f4c869;stroke:#8a5a10;stroke-width:1.2;}
+    .r{fill:#a9c9e6;stroke:#1f4e79;stroke-width:1.2;}
+    .t{font-size:12px;fill:#17191c;}
+    .h{font-size:12px;font-weight:bold;fill:#17191c;}
+    .a{stroke:#383e46;stroke-width:1.2;fill:none;marker-end:url(#arL);}
+    .d{stroke:#1f4e79;stroke-width:1.2;fill:none;marker-end:url(#arLd);stroke-dasharray:5 3;}
+  </style>
+  <defs>
+    <marker id="arL" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#383e46"/></marker>
+    <marker id="arLd" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 z" fill="#1f4e79"/></marker>
+  </defs>
+  <rect class="b" x="330" y="8" width="220" height="30"/><text class="h" x="384" y="28">Client request</text>
+  <path class="a" d="M440,38 L440,60"/>
+  <rect class="b" x="140" y="60" width="600" height="46"/>
+  <text class="h" x="156" y="78">ravel-server (mode all|query)</text>
+  <text class="t" x="156" y="94">auth, tenant resolve, client-query admission permit, deadline</text>
+  <path class="a" d="M440,106 L440,128"/>
+  <rect class="s" x="140" y="128" width="600" height="62"/>
+  <text class="h" x="156" y="146">Plan, then Catalog::resolve -- ONE pinned snapshot</text>
+  <text class="t" x="156" y="162">PromQL: plan_selectors; SQL: DataFusion plan, widen-only pushdown</text>
+  <text class="t" x="156" y="178">output: Vec&lt;SegmentRef&gt; + pending erasure predicates</text>
+  <path class="a" d="M440,190 L440,212"/>
+  <rect class="s" x="280" y="212" width="320" height="46"/>
+  <text class="h" x="296" y="230">cost gate: should_distribute</text>
+  <text class="t" x="296" y="246">bytes &gt;= 256 MiB OR segments &gt;= 256</text>
+  <path class="a" d="M280,235 L234,235"/>
+  <rect class="b" x="30" y="212" width="200" height="46"/>
+  <text class="h" x="42" y="230">below gate: local path</text>
+  <text class="t" x="42" y="246">byte-identical fetch</text>
+  <path class="a" d="M130,258 L130,493 L176,493"/>
+  <path class="a" d="M440,258 L440,282"/>
+  <rect class="b" x="140" y="282" width="600" height="32"/>
+  <text class="t" x="156" y="303">partition_snapshot: shard-major slices, rendezvous-mapped to workers</text>
+  <path class="a" d="M300,314 L300,344"/>
+  <path class="a" d="M470,314 L470,344"/>
+  <path class="a" d="M660,314 L660,344"/>
+  <rect class="b" x="210" y="346" width="180" height="88"/>
+  <text class="h" x="222" y="364">worker (slice 1)</text>
+  <text class="t" x="222" y="380">verify capability</text>
+  <text class="t" x="222" y="396">FragmentAdmission</text>
+  <text class="t" x="222" y="412">windowed resolve</text>
+  <text class="t" x="222" y="428">fetch/decode/prune</text>
+  <rect class="b" x="380" y="346" width="180" height="88"/>
+  <text class="h" x="392" y="364">worker (slice 2)</text>
+  <text class="t" x="392" y="380">erasure applied</text>
+  <text class="t" x="392" y="396">pre-merge slice</text>
+  <text class="t" x="392" y="412">stream series runs</text>
+  <text class="t" x="392" y="428">+ summary frame</text>
+  <rect class="b" x="570" y="346" width="180" height="88"/>
+  <text class="h" x="582" y="364">coordinator-local</text>
+  <text class="t" x="582" y="380">slice it owns by</text>
+  <text class="t" x="582" y="396">rendezvous: no hop</text>
+  <text class="t" x="582" y="412">same code path</text>
+  <text class="t" x="582" y="428">no capability needed</text>
+  <path class="a" d="M300,434 L300,468"/>
+  <path class="a" d="M470,434 L470,468"/>
+  <path class="a" d="M660,434 L660,468"/>
+  <rect class="b" x="180" y="470" width="520" height="46"/>
+  <text class="h" x="196" y="488">k-way merge over the flat run pool (one total order)</text>
+  <text class="t" x="196" y="504">coordinator re-enforces max_series and max_bytes_scanned</text>
+  <path class="a" d="M440,516 L440,538"/>
+  <rect class="b" x="180" y="538" width="520" height="46"/>
+  <text class="h" x="196" y="556">unchanged evaluator / single-partition SQL aggregation</text>
+  <text class="t" x="196" y="572">the distributed result is bit-for-bit equal to local execution</text>
+  <path class="a" d="M440,584 L440,606"/>
+  <rect class="b" x="280" y="606" width="320" height="46"/>
+  <text class="h" x="296" y="624">JSON / Arrow response</text>
+  <text class="t" x="296" y="640">stats.fragments[]: one entry per slice</text>
+  <path class="d" d="M740,159 L865,159 L865,342"/>
+  <rect class="r" x="770" y="346" width="190" height="88"/>
+  <text class="h" x="782" y="364">remote cluster</text>
+  <text class="t" x="782" y="380">Resolve scope:</text>
+  <text class="t" x="782" y="396">matchers + window</text>
+  <text class="t" x="782" y="412">own snapshot, own</text>
+  <text class="t" x="782" y="428">auth/erasure/limits</text>
+  <path class="d" d="M865,434 L865,493 L704,493"/>
+  <text class="t" x="20" y="678">Federation runs whether or not the intra-cluster cost gate trips; a skipped remote sets partial: true plus one warning.</text>
+  <text class="t" x="20" y="696">Below the gate, or on an Unsupported worker answer, the whole query runs the local path with no partial result.</text>
+</svg>
