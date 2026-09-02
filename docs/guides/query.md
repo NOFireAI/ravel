@@ -236,11 +236,11 @@ truncation:
 
 | Budget | Default | Error when exceeded |
 |---|---|---|
-| Segments touched | 1,024 | `query matched {count} segments, exceeding the limit of {max}` |
+| Segments touched | derived: 1,000,000 (`--max-segments`) | `query matched {count} segments, exceeding the limit of {max}` |
 | Distinct series | 10,000 | `query matched {count} series, exceeding the limit of {max}` |
 | Samples materialized | 10,000,000 | `query matched {count} samples, exceeding the limit of {max}` |
-| Concurrent segment fetches | 8 | (not user-visible; throughput knob only) |
-| Wall-clock deadline | 30s | `query exceeded its deadline of {deadline}` |
+| Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--fetch-concurrency`) | (not user-visible; throughput knob only) |
+| Wall-clock deadline | derived: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
 | Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
 
 `timeout` (Prometheus duration syntax like `30s`/`5m`, or bare float
@@ -248,8 +248,9 @@ seconds) lowers the deadline per request. It cannot raise it above the
 server's configured default.
 
 SQL queries carry one more bound, a per-query byte ceiling on the DataFusion
-memory pool (256 MiB by default). It bounds the memory the query *holds at one
-instant* -- what a scan currently has decoded, plus the batch it is handing
+memory pool (by default 25% of the host's memory, ~8 GiB on a 30 GB host; see
+[Operator-configurable budgets](#operator-configurable-budgets-server-flags)).
+It bounds the memory the query *holds at one instant* -- what a scan currently has decoded, plus the batch it is handing
 downstream, plus whatever aggregate state the operators above it accumulate --
 not the number of bytes the query has produced over its lifetime. A full-table
 scan over `logs` therefore does not exhaust it merely by being large: the logs
@@ -261,15 +262,29 @@ naming the pool, never a truncated result.
 
 ### Operator-configurable budgets (server flags)
 
-Four of these budgets are process-wide server flags. Each default is the
-compiled-in value. All four are process-wide, not per-tenant.
+Four of these budgets are process-wide server flags. Unset, each is **derived
+from the host** at startup; set, the flag value is used verbatim. All four are
+process-wide, not per-tenant. The "reference host" column is what a 16-core,
+30 GB host resolves to, the settings the published ClickBench run used.
 
-| Flag | Reaches | Default |
-|---|---|---|
-| `--fetch-concurrency <N>` | `EngineConfig::fetch_concurrency` | 8 |
-| `--max-segments <N>` | `EngineConfig::max_segments` | 1024 |
-| `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | 256 MiB |
-| `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | 1 GiB |
+| Flag | Reaches | Default (unset) | Reference host |
+|---|---|---|---|
+| `--fetch-concurrency <N>` | `EngineConfig::fetch_concurrency` | derived: `max(8, 2 x cores)` | 32 |
+| `--max-segments <N>` | `EngineConfig::max_segments` | derived: 1,000,000 | 1,000,000 |
+| `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 25% of MemTotal (256 MiB if unknown) | 8,053,063,680 |
+| `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
+
+The per-query SQL pool is always clamped to the per-tenant ceiling: setting
+`--sql-tenant-max-bytes` below the derived per-query pool lowers the per-query
+pool to it, and never the other way around.
+
+Every resolved value is logged at startup, one line per setting with its source
+(`derived`, `flag`, or `fallback`):
+
+```
+INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+```
 
 `--fetch-concurrency` is a single knob with three coupled effects: it governs
 the PromQL/analytics per-query segment fetch fan-out, the SQL scan partition
@@ -285,8 +300,9 @@ raise this flag for such a workload.
 
 `--sql-max-query-bytes` bounds a single SQL query's DataFusion memory pool;
 `--sql-tenant-max-bytes` bounds the memory one tenant may hold across its
-concurrent SQL queries (the multi-tenant isolation ceiling, defaulting to four
-times the per-query pool). Both apply only in a build with the `sql` feature.
+concurrent SQL queries (the multi-tenant isolation ceiling, twice the per-query
+pool at the derived defaults). Both apply only in a build with the `sql`
+feature.
 Per-tenant SQL budgets are **not** configurable in the `--limits-file`: its
 per-tenant query overrides are not consulted at query time and are inert, so
 these ceilings are process-wide flags.
@@ -296,8 +312,10 @@ these ceilings are process-wide flags.
 [admission-limits.md](admission-limits.md). `--max-s3-requests`
 is a flag; omitted, it is derived from `--shards` and the flush cadence.
 
-`--gc-max-query-duration` sets the engine's enforced wall-clock deadline. It
-must be **`<=`** the tenant's durable `sys/gc.max_query_duration` (default 1h).
+`--gc-max-query-duration` sets the engine's enforced wall-clock deadline.
+Unset, it is derived: **11 minutes**, the deadline the published ClickBench run
+needed for its longest statement. It must be **`<=`** the tenant's durable
+`sys/gc.max_query_duration` (default 1h), which the derived value satisfies.
 A value above it is **rejected at startup** (a hard error), not clamped: raise
 `sys/gc.max_query_duration` first (`ravel-cli gc-config set`) if you need a
 longer engine deadline.

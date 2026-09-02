@@ -53,6 +53,18 @@ async fn main() -> anyhow::Result<()> {
 
     ravel_server::warn_dev_insecure_tenant_header(cli.dev_insecure_tenant_header);
 
+    // Host-derived performance defaults (ADR-0088 as amended by issue #1141).
+    // The host is read exactly once, here, and the six settings are resolved
+    // from it once; every consumer below takes the resolved value, so no later
+    // code re-reads the host and nothing can enforce a number the startup log
+    // did not name. An explicit flag wins over every derived value, unchanged
+    // in meaning.
+    let host = ravel_server::config::HostProfile::detect();
+    let performance = cli
+        .resolve_performance(host)
+        .context("failed to resolve the host-derived performance defaults")?;
+    performance.emit(host);
+
     // OTAP (ADR-0011) is opt-in even in a build with the `otap` feature: the
     // feature links the arrow decode stack, `--otap` decides whether this
     // process registers the ArrowMetricsService (ServerConfig::otap, read by
@@ -83,7 +95,8 @@ async fn main() -> anyhow::Result<()> {
         cache,
         kms: tenant_kms,
         classed: _classed,
-    } = ravel_server::store::build_store(&cli).context("failed to build object store backend")?;
+    } = ravel_server::store::build_store(&cli, performance.cache_max_bytes)
+        .context("failed to build object store backend")?;
 
     // Store-backend qualification gate (ADR-0050 section 6, EC7). On any
     // production store kind, refuse to start unless a `sys/qualification` record
@@ -239,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
     // any set to non-default values permanently bricked those modes; these are
     // the documented remediation (docs/guides/operations.md).
     let gc_runtime = cli
-        .resolve_gc_runtime()
+        .resolve_gc_runtime(performance.query_deadline)
         .context("failed to parse the --gc-* GC-config flags")?;
     let interior_reverify_ns = cli
         .parse_maintain_interior_reverify()
@@ -461,7 +474,7 @@ async fn main() -> anyhow::Result<()> {
             .resolve_max_s3_requests()
             .context("failed to resolve --max-s3-requests")?,
         query_budgets: cli
-            .query_budgets()
+            .query_budgets(&performance)
             .context("failed to resolve the query budgets and logs fetch policy")?,
         scrub_period: cli
             .parse_scrub_period()
@@ -469,7 +482,7 @@ async fn main() -> anyhow::Result<()> {
         indexed_fields,
         typed_attr_columns,
         disable_cache: cli.disable_cache,
-        cache_max_bytes: cli.cache_max_bytes,
+        cache_max_bytes: performance.cache_max_bytes,
         cache_dir: cli.cache_dir.clone(),
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
