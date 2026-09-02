@@ -58,17 +58,18 @@ pub async fn compact_bucket(
     // primitive it later dispatches to therefore must not reset (ADR-0996 task
     // 996-8). The scope is closed on every exit path, including the gates that
     // return before any rewrite runs.
-    if let Some(l) = config.request_ledger.as_ref() {
+    let scope = config.request_ledger.as_ref().map(|l| {
         l.reset_for_run();
-    }
+        l.run_scope_guard()
+    });
     let outcome = compact_bucket_scoped(store, clock, config, bucket).await;
     // As the opener, this driver emits the run's report on EVERY outcome: the
     // gates that return before any rewrite (NotSealed, AlreadyCompacted,
     // Tombstoned, BelowMinInputs) still paid their LIST and report it
-    // (ADR-0996 task 996-8).
+    // (ADR-0996 task 996-8). The guard closes the scope even on cancellation.
     crate::rewrite::emit_request_report(config, bucket, outcome.is_ok());
-    if let Some(l) = config.request_ledger.as_ref() {
-        l.end_run();
+    if let Some(scope) = scope {
+        scope.close();
     }
     outcome
 }

@@ -310,13 +310,38 @@ impl RequestLedger {
     /// Returns whether THIS call opened the scope: the opener is the frame
     /// that must emit the run's report exactly once, so a rewrite dispatched by
     /// an outer driver (which opened first) stays silent and the outer driver
-    /// reports.
+    /// reports. The open is a compare-exchange, so of two racing direct
+    /// callers exactly one becomes the opener and only that one clears the
+    /// counters -- though sharing one ledger across CONCURRENT runs remains a
+    /// misuse (the counters are one pool; see the module doc's one-ledger-per-
+    /// run contract), the flag itself cannot elect two openers.
     pub fn reset_for_run_unless_open(&self) -> bool {
-        if !self.inner.run_open.load(Ordering::Relaxed) {
-            self.reset_for_run();
+        if self
+            .inner
+            .run_open
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            for counters in &self.inner.phases {
+                counters.requests.store(0, Ordering::Relaxed);
+                counters.wire_bytes_received.store(0, Ordering::Relaxed);
+                counters.wire_bytes_sent.store(0, Ordering::Relaxed);
+            }
             return true;
         }
         false
+    }
+
+    /// RAII closer for a run scope: closes the scope on drop unless disarmed,
+    /// so a driver future cancelled mid-run cannot leave a stale open scope
+    /// that would silence the next direct rewrite's report. The normal path
+    /// emits its report first, then calls [`RunScopeGuard::close`], which
+    /// disarms the drop path.
+    pub fn run_scope_guard(&self) -> RunScopeGuard<'_> {
+        RunScopeGuard {
+            ledger: self,
+            armed: true,
+        }
     }
 
     /// Close the run's scope. The counters are left intact (a caller reads the
@@ -349,6 +374,31 @@ impl RequestLedger {
             block_read: read(RequestPhase::BlockRead),
             part_put: read(RequestPhase::PartPut),
             publish: read(RequestPhase::Publish),
+        }
+    }
+}
+
+/// RAII closer for a run scope (see [`RequestLedger::run_scope_guard`]).
+/// Dropping it while armed closes the scope, so a cancelled driver future
+/// cannot leave a stale open flag behind; the normal path emits its report
+/// and then calls [`Self::close`].
+pub struct RunScopeGuard<'a> {
+    ledger: &'a RequestLedger,
+    armed: bool,
+}
+
+impl RunScopeGuard<'_> {
+    /// Close the scope on the normal path, disarming the drop closer.
+    pub fn close(mut self) {
+        self.armed = false;
+        self.ledger.end_run();
+    }
+}
+
+impl Drop for RunScopeGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.ledger.end_run();
         }
     }
 }

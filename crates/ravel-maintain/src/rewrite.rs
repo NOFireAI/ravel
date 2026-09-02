@@ -109,10 +109,12 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     // path, including an error, so a later directly-driven rewrite still starts
     // from zero. Closing leaves the counters readable: a caller inspecting an
     // aborted run's figures reads them after this returns.
-    let opened = config
+    // The guard closes the scope even if this future is cancelled mid-run, so
+    // a stale open flag cannot silence a later direct rewrite's report.
+    let scope = config
         .request_ledger
         .as_ref()
-        .is_some_and(|l| l.reset_for_run_unless_open());
+        .and_then(|l| l.reset_for_run_unless_open().then(|| l.run_scope_guard()));
     let outcome = rewrite_and_publish_scoped::<C>(
         store,
         clock,
@@ -127,11 +129,9 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
     // (ADR-0996 task 996-8): a directly-driven rewrite reports here; a rewrite
     // dispatched by `compact_bucket` or `migrate_bucket_format` stays silent
     // and the outer driver reports every outcome, gate refusals included.
-    if opened {
+    if let Some(scope) = scope {
         emit_request_report(config, bucket, outcome.is_ok());
-        if let Some(l) = config.request_ledger.as_ref() {
-            l.end_run();
-        }
+        scope.close();
     }
     outcome
 }
@@ -331,13 +331,14 @@ pub async fn migrate_bucket_format(
     // (NotSealed, UpToDate, listing errors) still paid their LIST and report
     // it. The rewrite primitive it dispatches to sees the open scope and stays
     // silent (ADR-0996 task 996-8).
-    if let Some(l) = config.request_ledger.as_ref() {
+    let scope = config.request_ledger.as_ref().map(|l| {
         l.reset_for_run();
-    }
+        l.run_scope_guard()
+    });
     let outcome = migrate_bucket_format_scoped(store, clock, config, bucket, target_version).await;
     emit_request_report(config, bucket, outcome.is_ok());
-    if let Some(l) = config.request_ledger.as_ref() {
-        l.end_run();
+    if let Some(scope) = scope {
+        scope.close();
     }
     outcome
 }
