@@ -489,12 +489,6 @@ async fn main() -> anyhow::Result<()> {
     let running =
         ravel_server::start(config, store, store_background, store_metrics, cache).await?;
     tracing::info!(http = %running.http_addr, grpc = ?running.grpc_addr, "ravel-server listening");
-    if cfg!(feature = "flight-sql") {
-        tracing::info!(
-            "Flight SQL is registered on the gRPC listener, but every method answers \
-             UNIMPLEMENTED because the service is not yet implemented"
-        );
-    }
 
     wait_for_shutdown_signal().await;
     tracing::info!("shutdown signal received, draining");
