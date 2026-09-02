@@ -215,7 +215,7 @@ pub struct ResolvedRow {
     /// [`ResolvedRow::columns`] (ADR-0095). The value is the one the read side
     /// reports for the name: the record's resource and scope layer, then its
     /// own attributes overriding, and within its own attributes the two-tier
-    /// winner `writer::record_level_winners` computes when it carries the name
+    /// winner `writer::StampScratch::finish` computes when it carries the name
     /// more than once (two types, or a same-type duplicate that spilled into
     /// `attrs_raw`). A declared typed column materializes a value only when
     /// that resolved value's type matches, so a row whose resolved value for a

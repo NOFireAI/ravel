@@ -46,3 +46,10 @@ harness = false
 [[bench]]
 name = "wide_gather"
 harness = false
+
+# Not a criterion target: it times the pre- and post-#1135 stamp itself so it
+# can fail when the speedup it prints leaves its band. It ignores the flags the
+# criterion targets take rather than rejecting them.
+[[bench]]
+name = "stamp_declared"
+harness = false
