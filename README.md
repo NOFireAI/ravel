@@ -279,7 +279,7 @@ See the [Kubernetes guide](docs/guides/kubernetes.md).
 GitHub Container Registry on every `vX.Y.Z` release tag, built from the root
 `Dockerfile`. Both `linux/amd64` and `linux/arm64` are published. Each published
 object is an OCI image index that carries an SBOM and full build provenance. The
-quickstart pins `ghcr.io/nofireai/ravel-server:0.11.0`. Override it with
+quickstart pins `ghcr.io/nofireai/ravel-server:0.12.0`. Override it with
 `RAVEL_IMAGE`.
 
 ```sh
@@ -303,12 +303,12 @@ so that is the identity in the certificate:
 
 ```sh
 cosign verify \
-  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.11.0' \
+  --certificate-identity 'https://github.com/NOFireAI/ravel/.github/workflows/publish-images.yml@refs/tags/v0.12.0' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-  ghcr.io/nofireai/ravel-server:0.11.0
+  ghcr.io/nofireai/ravel-server:0.12.0
 ```
 
-Replace `v0.11.0` and `0.11.0` with the release you are verifying. The tag ref in
+Replace `v0.12.0` and `0.12.0` with the release you are verifying. The tag ref in
 `--certificate-identity` must be the exact tag that produced the image.
 
 ## How Ravel is verified

@@ -6,6 +6,88 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0]
+
+Object-store request cost becomes an input that the logs read path and
+compaction plan against, typed attribute column statistics ride on commit
+records so aggregates over the live tail are answered without a scan, and the
+RLOG compaction merge runs under a memory budget. The RLOG version 3 reader is
+removed.
+
+### Added
+
+- **Request-cost-aware logs fetching** (ADR-0996). `--logs-fetch-policy`
+  (`request-minimal`, `byte-minimal`, or the default `cost-based`) is resolved
+  at startup into the byte quantities the fetch layer runs on, and
+  `--logs-max-fetch-run-bytes` bounds one covering GET (default 64 MiB).
+  `--logs-request-cost-bytes` states what one saved object-store round trip is
+  worth in saved transfer bytes, and `--store-cost-profile` loads this
+  deployment's per-request and per-GiB prices; a profile that fails to parse
+  is refused at startup.
+- **An S3 request ledger.** Billed HTTP requests are counted below the retry
+  loop, so a GET that retried nine times counts ten attempts instead of one
+  call, and KMS-routed traffic is counted too. GET requests are split per phase
+  beside the wire bytes, the number of distinct data objects a query touched
+  rides on the distributed query protocol as an additive field, and PromQL
+  `query` and `query_range` responses render the per-phase split under
+  `stats.phases`. Bench reports model request cost from the same ledger on the
+  instrumented lanes; the Flight lane reports no cost rather than a false zero.
+- **Typed attribute column statistics on commit records** (ADR-0873). Log
+  ingest stamps each typed attribute column's exact min, max, and null count on
+  the commit record, the catalog carries the stamps onto the segment reference,
+  and compaction recomputes them for the segments it writes. SQL `MIN`/`MAX`
+  over a typed attribute column is answered from the union of those stamps and
+  the fold-built `.cstat` statistics with zero data GETs, which covers the live
+  tail and token-resolved segments for the first time. Column statistics also
+  carry an exact per-object integer sum, so `SUM(col + k)` and `AVG` over an
+  integer column are answered from statistics as well.
+- **`.cstat` re-keyed to snapshot-part binding** (ADR-0942): an envelope
+  version 2 keyed by data-object content hash, and an additive snapshot HEAD
+  field that references it. The column-statistics cache runs under a byte
+  budget.
+- **Bounded ephemeral spill** (ADR-0954). An opt-in, bounded scratch area for
+  SQL operators whose exactness does not depend on holding the whole input,
+  configured with `RAVEL_SQL_SPILL_DIR` and `RAVEL_SQL_SPILL_MAX_BYTES`. Off by
+  default; a statement that exceeds its memory budget without it is still
+  refused rather than approximated.
+- **Advisory compaction claims** (ADR-1029). One small advisory object per unit
+  of compaction work under `sys/maintain/claims/compaction/`, so two processes
+  that would merge the same sealed bucket do not both pay for the whole merge.
+  Correctness still rests on the compaction record's create-if-absent publish;
+  a claim only saves cost.
+- **MetricsBench** (ADR-0927): a versioned metrics workload and PromQL corpus,
+  a Remote Write 1.0 ingest lane that replays one sample stream into Ravel and
+  into config-supplied comparators, pinned comparator deployments, and a
+  request-cost regression gate that fails a candidate report outside its
+  per-figure bands.
+- **Operator surfaces**: `spec.gc.protectionHorizon` and `spec.gc.grace` render
+  the GC horizon flags on the maintain Deployment, so a bucket whose `sys/gc`
+  holds non-default values no longer crash-loops. On a fresh cluster under
+  per-role credentials the operator applies maintain first and holds the
+  request-serving Deployments until `sys/gc` exists; a cluster whose
+  request-serving Deployments already exist is never held. A bootstrap that
+  has stalled for five minutes is reported on the cluster's conditions.
+- **`ravel-cli` levers**: `maintain compact-tenant --bucket-concurrency`
+  compacts independent buckets at once, its memory knobs
+  (`--l1-part-memory-target-bytes`, `--max-l1-part-bytes`,
+  `--input-read-concurrency`) are reachable, and its report attributes peak
+  memory by phase. `load --max-flush-delay` raises the age trigger so a large
+  `--target-bytes` is reachable, a `--target-bytes` that changed no object
+  layout is reported rather than silently ignored, and the load report counts
+  each shard's flushes by trigger (size, age, final).
+- **`/metrics`** renders the ingest exemplar counters and the remaining flush
+  counters (adaptive age flushes, grace-extended stale flushes, in-flight
+  flushes).
+- **Server-verified upload checksums** in the object-store crate. The S3
+  backend can attach an `x-amz-checksum` value (CRC64-NVME or SHA-256) on
+  single-part writes so the store verifies or rejects the bytes it received.
+  Multipart uploads are excluded, and no `ravel-server` or `ravel-cli` flag
+  exposes the setting yet, so the shipped binaries still write without one.
+- **Documentation** (ADR-1040): a documentation architecture with a docs gate
+  in CI, an HTTP API reference, generated `ravel-server` and `ravel-cli` flag
+  references, a concepts page, an alerting guide, and operations pages for
+  configuration, deployment, maintenance, and troubleshooting.
+
 ### Changed
 
 - **The published `ravel-server` image builds every opt-in surface.** It is now
@@ -13,6 +95,100 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   listener and `--otap` is accepted at startup without a source build. OTAP
   ingest is still registered only when `--otap` is given. The CI lanes that
   assemble images from host-built binaries build the same feature set.
+- **Bounded-memory RLOG compaction merge** (ADR-0979). The merge opens an
+  input's cursor only once its timestamp range can overlap the record about to
+  be emitted, holds decoded blocks in their columnar form and charges them at
+  their heap estimate, prices cursor admission from block shape and reconciles
+  after decode, releases each closed segment's bytes at PUT, and runs under a
+  merge budget; `compact-tenant` divides the budget across concurrent buckets
+  only while it still carries the box-sized default. The admission change
+  emits the same records and the same segment boundaries as opening every
+  cursor at once; the number of open cursors becomes the input overlap depth
+  rather than the input count.
+- **`--max-l1-part-bytes` bounds encoded object bytes** (#872). The RLOG
+  merge closed an L1 segment against a pre-compression payload proxy, so
+  stored sizes missed the target in both directions, by several times on a
+  compressible schema. The merge now encodes to measure the real object bytes
+  and closes on that count, with the probe step capped so overshoot past the
+  target is bounded. For the same inputs, segment boundaries differ from
+  those 0.11.0 wrote.
+- **Equality matchers resolve by dictionary ordinal.** Below the sparse-series
+  threshold, a metrics catalog decode whose matchers are all positive
+  equalities resolves each value to its dictionary ordinal once and
+  materializes a label set only for a series that matched. Fetched bytes are
+  unchanged; on a deterministic in-memory fixture of 4000 series the decode
+  took 38.1 percent less wall time at 1 percent selectivity.
+- **The catalog fold** reads each covered object once in the dual publish and
+  keeps its statistics tally cache across HEAD CAS retries, so a lost CAS no
+  longer refetches every object.
+- **Typed attribute column reads** in SQL build their resolvers once per block
+  rather than once per chunk.
+- **Distributed query protocol**: the data-objects-touched count is an
+  additive slice field. An older peer omits it and the merged figure degrades
+  to the coordinator's own count. The protocol version is unchanged.
+
+### Removed
+
+- **The RLOG version 3 reader** (ADR-0892). RLOG now accepts exactly one
+  trailer version, as RSEG and RSPAN already did under ADR-0027 decision 7 and
+  ADR-0066 decision 1. Log objects written by releases before 0.11.0 are no
+  longer readable, and `maintain migrate` reads the same single-version window,
+  so a tenant that still holds them is wiped or re-ingested.
+
+### Fixed
+
+- Column-statistics objects a resolvable snapshot still referenced were
+  treated as orphans by the unreferenced-catalog-object sweep and deleted once
+  past the protection horizon, which broke queries that resolve typed-column
+  statistics through the snapshot. Both statistics carriers on HEAD are now in
+  the sweep's reachability set.
+- Three SQL exact-aggregate paths (`COUNT` under a not-equal predicate,
+  `GROUP BY` counts, and `SUM`/`AVG`) answered from a `.cstat` entry whose row
+  accounting had not been reconciled against the segment it was joined to. All
+  four readers now go through one reconciliation.
+- The shipped IAM templates granted the maintain role no write on
+  `sys/maintain/` and the query role nothing under `sys/query/`, so a maintain
+  process failed closed with `AccessDenied` on its first liveness heartbeat,
+  and a query worker on its membership heartbeat.
+- On a fresh bucket with per-role credential Secrets, gateway and query pods
+  raced maintain to create `sys/gc`, failed the create, and crash-looped. The
+  operator now orders the bootstrap, and validates `spec.gc` even when
+  maintain is disabled.
+- Compaction convergence reported a bucket converged while the winner record
+  referenced a segment that was absent and could not be re-put from this run;
+  it now fails so the bucket is retried. The scope opener emits its request
+  report on every outcome, and opener election is atomic and
+  cancellation-safe.
+- A refused row-major write into a columnar ingest buffer still left its
+  records' extrema in the typed attribute column statistics accumulator, so
+  the next flush stamped min, max, and non-null count for records the object
+  does not hold. A refused write no longer contributes.
+- `make demo` had failed on a fresh bucket since the keyed-tenancy gate
+  landed; the dev bucket is pinned unkeyed, as the compose quickstart already
+  was.
+- The startup log reported a Flight SQL listener state the build was not in.
+- A `load` at a raised `--max-flush-delay` did not complete at its own
+  settings; the drain now sweeps tail stragglers with a re-flush ticker and
+  leaves reserve headroom in the delay ceiling.
+- `ravel-cli` walk-shaped commands name the effective store in their header
+  and refuse a defaulted in-memory walk that reaches no data, instead of
+  reporting zero counters at exit 0.
+
+### Known limitations
+
+- Query latency still depends on the tenant's working set fitting in the read
+  cache; removing the full-scan floor is tracked in #849. ClickBench `q33`
+  still exceeds the per-query memory budget (#837): the bounded spill relieves
+  the aggregate, and the scan's share of the memory remains.
+- Logs and spans return overlapping records twice when two compaction records
+  with overlapping input sets are published for one bucket (#1070). Metrics
+  are unaffected, because query-time dedup collapses the overlap. A fix is in
+  review.
+- After a selective-erasure rewrite lands in a sealed hour outside the fold's
+  reconcile window, the superseded-input sweep can delete inputs a HEAD-named
+  snapshot part still resolves, and queries over that hour then fail closed
+  with `SnapshotInvalidated` until the fold reconciles the hour (#1085).
+  Subject erasure stays correct throughout. A fix is in review.
 
 ## [0.11.0]
 
