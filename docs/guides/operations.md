@@ -9,6 +9,8 @@ already exist:
   first time.
 - [Maintenance (day 2)](operations/maintenance.md): compaction, garbage
   collection, the scrubber, format migration and legal hold.
+- [Troubleshooting](operations/troubleshooting.md): symptom, likely cause, how
+  to confirm, corrective action.
 
 The sections below are being folded into those pages.
 
