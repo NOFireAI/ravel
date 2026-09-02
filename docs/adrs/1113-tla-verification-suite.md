@@ -428,14 +428,21 @@ The smoke and negative suites run as a job named `tla` inside
 `.github/workflows/ci.yml`, in the same shape as the other lanes:
 
 - The `changes` job gains a `formal_area` output. It is true when any
-  changed path is under `formal/`, is `scripts/check-tla.sh`, or is under
-  one of the implementation paths the traceability tables cite
+  changed path is under `formal/`, is `scripts/check-tla.sh`, is under
+  one of the implementation paths the traceability tables and D3 cite
   (`crates/ravel-object-store/`, `crates/ravel-commit/`,
   `crates/ravel-catalog/`, `crates/ravel-ingest/`, `crates/ravel-maintain/`,
-  `crates/ravel-fleet/`, `services/ravel-server/`), and it is forced true
-  by the existing workspace-level rule. A change that touches only
-  `formal/**` and `scripts/check-tla.sh` is classified like a docs-only
-  change for the cargo lanes: they skip, and `tla` runs.
+  `crates/ravel-fleet/`, `crates/ravel-query/`, `services/ravel-server/`),
+  or is one of the normative documents the models are derived from
+  (`docs/object-store-contract.md`, `docs/consistency-model.md`,
+  `docs/catalog-and-mvcc.md`, `docs/deletion-and-gc.md`,
+  `docs/ingest.md`), and it is forced true by the existing
+  workspace-level rule. A change that touches only `formal/**`,
+  `scripts/check-tla.sh`, or markdown is classified docs-only for the
+  cargo lanes: they skip, and `tla` runs whenever `formal_area` is true.
+  Running the suite on a normative-doc change does not check that the
+  model still matches the prose; it puts the suite in front of the
+  reviewer of that change, which is the most CI can do for a prose edit.
 - `tla` runs when `formal_area` is true: `actions/setup-java` (Temurin
   21, pinned by commit SHA like every other action here), then
   `check-tla.sh smoke`, `check-tla.sh negative`, and `check-tla.sh
@@ -455,9 +462,11 @@ The smoke and negative suites run as a job named `tla` inside
 
 What this enforces and what it does not: a change under `formal/` that
 breaks a model blocks its own pull request; a change under a protocol
-crate runs the smoke suite and the name-freshness check, so a renamed or
-removed symbol that a traceability table cites blocks the change. A
-semantic protocol change behind unchanged names is not detected by CI.
+crate or a normative document runs the smoke suite and the name-freshness
+check, so a renamed or removed symbol that a traceability table cites
+blocks the change. A semantic protocol change behind unchanged names,
+and a prose change that the model no longer matches, are not detected
+by CI.
 Keeping the model in step with such a change is a reviewer duty, and the
 traceability table is the reviewer's map from the changed symbol to the
 model action that must be re-examined.
