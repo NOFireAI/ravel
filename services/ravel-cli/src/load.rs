@@ -1641,10 +1641,12 @@ async fn drain_inflight(
 /// it is bounded: the remaining writes were submitted before the failing one and
 /// run concurrently, so this waits at most one [`write_ack_deadline`], which at
 /// a raised `--max-flush-delay` is that delay plus its margin rather than a flat
-/// minute. Reached from the clean-exhaustion drain the wait is short whatever
-/// the delay, because the tail buffers were already published by the `flush_all`
-/// that precedes that drain; only a mid-load failure can leave an outstanding
-/// write waiting on the age trigger here.
+/// minute. Reached from the clean-exhaustion drain the wait is usually short,
+/// because the tail buffers were already published by the `flush_all` that
+/// precedes that drain -- with one exception either path shares: a write whose
+/// task had not yet reached its channel send when the flush ran lands in a
+/// fresh buffer afterward and waits on the age trigger, which the scaled
+/// deadline outlasts by construction.
 ///
 /// A later write's own error is deliberately discarded apart from its recovered
 /// tokens: the returned error stays the first failure in submission order, which
