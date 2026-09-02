@@ -265,7 +265,13 @@ publish time. Before that put, the run checks that the record counts of its
 inputs and its outputs are exactly equal and aborts if they are not, because
 publish is the point of no return. Two compactors racing on one bucket
 converge: create-if-absent picks one record as the winner, and the loser's
-segments are unreferenced objects that age out.
+segments are unreferenced objects that age out. Two records that instead name
+different but overlapping input sets are rarer, and serving both would return
+the overlapping records twice for logs and spans, which have no query-time
+deduplication. The resolver picks one authoritative record per overlap group by
+a deterministic tie-break, serves any input the winner does not name as a raw
+segment, ignores the other records' segments, and raises a metric, so every
+input is served exactly once while an operator reconciles the bucket.
 
 Retention expires data by age against the tenant's configured policy. Like
 every deletion in Ravel it is a durable transaction first, a tombstone

@@ -1168,10 +1168,19 @@ of a bucket that would trip it reports the violation.
 Racing compactors over one sealed bucket are serialized by `CreateIfAbsent`
 picking a single winner; a loser's segments are unreferenced objects that age
 out under the same rule. Two records that legitimately name different input
-sets (rare, from concurrent partial seals) are not reconciled automatically.
-The resolver includes both segment sets plus any L0 input covered by neither,
-which is harmless under the property above, and raises
+sets (rare, from concurrent partial seals) are not reconciled automatically,
+and the resolver derives an identical answer on every replica. When the two
+input sets are disjoint it includes both segment sets plus any L0 input covered
+by neither, harmless under the property above. When they overlap, query-time
+dedup would collapse the duplicate for metrics but not for logs or spans (which
+have none), so the resolver picks one authoritative record per overlap group by
+the smallest `input_set_hash`, includes that record's segments, serves every
+input the winner does not name as a raw L0 segment, and ignores the other
+records' segments; every input of the bucket is then served exactly once,
+either inside the chosen record's segments or as a raw L0. Either way it raises
 `ravel_catalog_compaction_input_set_conflicts_total` for a human to look at.
+Durably refusing to publish a second overlapping record is a publish-time step
+in ravel-maintain; the resolve-time tie-break keeps reads correct until then.
 
 ## Online resharding (ADR-0052)
 
