@@ -158,7 +158,7 @@ choice for a development or single-operator deployment.
 | Gateway | `--mode gateway`, and the ingest half of `--mode all` | Writes L0 segments and their commit records, idempotency markers, and a tenant's provisioning record on adopt. Runs the catalog fold, so it also writes catalog snapshot parts, `HEAD`, and name-postings objects. |
 | Query | `--mode query`, and the query half of `--mode all` | Lists and reads commit records, catalog objects and segment data. Runs the catalog fold too, and appends query-audit records. |
 | Maintain | `--mode maintain` | Compaction, retention and the sweeper. The only role that may delete anything, and only under the L0, L1, commit and idempotency prefixes plus the query-audit shard. |
-| Admin | `ravel-cli` | One-off bootstrap and mutation commands. Invoked by an operator or a CI job, never by a long-running server. The broadest of the four, and the one to treat as a privileged operator credential rather than a service credential. |
+| Admin | `ravel-cli` | One-off bootstrap and mutation commands. Invoked by an operator or a CI job, never by a long-running server. The broadest of the four. See [the Admin credential](deployment.md#the-admin-credential). |
 
 Gateway and Query both run the catalog fold, which is why both hold the same
 catalog write grants. That is not an artifact of the split; it is what the
@@ -587,9 +587,12 @@ Two additive resolvers join the same first-success chain. Enabling them does not
 disable the bearer resolver, which stays the local and development path.
 
 **OIDC.** Set `--oidc-issuer` and `--oidc-jwks-url` together; setting one
-without the other refuses to start. Every request's bearer token is verified
-against the issuer's key set: signature, issuer and expiry, plus audience if any
-`--oidc-audience` is set. The signature algorithm is pinned from the key that
+without the other refuses to start. At least one `--oidc-audience` is also
+required, and OIDC with none set fails startup: without an audience, any
+correctly signed unexpired token from that issuer authenticates regardless of
+which relying party it was minted for. Every request's bearer token is verified
+against the issuer's key set: signature, issuer, expiry and audience. The
+signature algorithm is pinned from the key that
 verifies the token, never from the token's own header, so `alg: none` and
 algorithm-confusion tokens are rejected. A symmetric key in the key set is
 rejected outright, because a key set is a public document and a symmetric key
@@ -608,18 +611,23 @@ certificates itself. `--mtls-enabled` reads a header (default
 `x-ravel-client-cert-cn`, override with `--mtls-header`) that a TLS-terminating
 reverse proxy sets to the already-verified certificate CN or SAN. This is a
 forwarded-header trust boundary: it is authoritative only because a trusted hop
-set it, and forgeable by anyone if that hop is absent. Enable it only behind a
-proxy that both performs client-certificate verification and strips or
-overwrites any client-supplied value of the header **on every ingress this
-process exposes**, the HTTP listener and the gRPC listener alike. Flight SQL and
-OTLP over gRPC read the same header, because gRPC metadata is copied into the
-same header map, so sanitizing only the HTTP virtual host leaves a live bypass.
-It is off by default for exactly this reason, and enabling it logs a startup
-warning naming the trusted header.
+set it, and forgeable by anyone if that hop is absent.
+
+The resolver is installed on its own dedicated listener and nowhere else, so
+`--mtls-enabled` requires `--mtls-listener <addr>` and refuses to start without
+it. The public HTTP and gRPC listeners never consult the header at all, and the
+mTLS address must differ from every other listener address, which is checked at
+startup. Put the verifying proxy in front of the mTLS listener only, and have it
+strip or overwrite any client-supplied value of the header before forwarding.
+Binding `--mtls-listener` to the same address as a `--listen-http` that has
+`--dev-insecure-tenant-header` set is also refused, so the mTLS surface cannot
+inherit the development bypass. Enabling mTLS logs a startup warning naming the
+trusted header.
 
 Dependent flags fail fast: `--oidc-tenant-claim` or `--oidc-audience` without
-OIDC enabled, or `--mtls-header` without `--mtls-enabled`, refuse to start
-rather than quietly doing nothing.
+OIDC enabled, `--mtls-header` or `--mtls-listener` without `--mtls-enabled`, and
+`--mtls-enabled` without `--mtls-listener`, all refuse to start rather than
+quietly doing nothing.
 
 ### The tenant hash scheme is permanent per bucket
 
