@@ -1,5 +1,13 @@
 # Operations
 
+This guide is being split into one page per operational phase. Pages that
+already exist:
+
+- [Configuration (day 0)](operations/configuration.md): what to decide before
+  you start anything.
+
+The sections below are being folded into those pages.
+
 ## `ravel-server` flags
 
 All flags, verified against [services/ravel-server/src/config.rs](../../services/ravel-server/src/config.rs):
