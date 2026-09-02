@@ -345,6 +345,9 @@ HEAD_SHA=$(cat /root/CLONE_SHA) && [ -n "$HEAD_SHA" ] \
   || { echo "no /root/CLONE_SHA: the bootstrap did not finish"; exit 1; }
 git checkout -q --detach "$HEAD_SHA" || { echo "cannot check out $HEAD_SHA"; exit 1; }
 [ "$(git rev-parse HEAD)" = "$HEAD_SHA" ] || { echo "HEAD is not $HEAD_SHA"; exit 1; }
+# A checkout can match HEAD_SHA and still carry edits; a binary built from
+# them would not be the commit its pinned name claims.
+[ -z "$(git status --porcelain)" ] || { echo "checkout is dirty; reset it before building"; exit 1; }
 
 export CARGO_TARGET_DIR=/root/target-fp
 RUSTFLAGS="-C force-frame-pointers=yes" \
