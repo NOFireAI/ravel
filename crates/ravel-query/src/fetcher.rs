@@ -4511,6 +4511,28 @@ mod tests {
         );
     }
 
+    /// `__name__` is an ordinary dictionary label on the ordinal path (the
+    /// writer stores it at ordinal 0), so an equality on it selects exactly the
+    /// one series carrying that metric name and materializes exactly one label
+    /// set.
+    #[tokio::test]
+    async fn ordinal_equality_on_metric_name_selects_one_series() {
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(500, 4, 50);
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher = fetcher.with_whole_object_threshold(0);
+        let eq = [LabelMatcher::equal("__name__", "m7")];
+        let (soa, _) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &eq)
+            .await
+            .expect("fetch");
+        assert_eq!(soa.len(), 1, "one series carries __name__=m7");
+        assert_eq!(
+            fetcher.label_sets_materialized(),
+            1,
+            "the ordinal path materializes only the matched series"
+        );
+    }
+
     /// A negated equality falls back to the materializing path (it materializes
     /// the whole catalog) and returns the correct complement; an equality on the
     /// same label takes the ordinal path over the same fixture.
