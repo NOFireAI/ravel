@@ -17,9 +17,17 @@
 //!    out-of-band commit-record loss, not routine cleanup.
 //! 2. **Superseded-input sweep** (ADR-0018): the L0 commit records and data
 //!    objects a compaction record names in its input list, once
-//!    `now >= record.created_unix_ns + protection_horizon`. Records are
+//!    `now >= record.created_unix_ns + protection_horizon` AND the live catalog
+//!    HEAD snapshot no longer names the input (the ADR-0020 delete blocker,
+//!    the same gate retention uses, [`crate::reachability`]). Records are
 //!    deleted before data objects, so a crash mid-sweep never leaves a commit
-//!    record pointing at a deleted data object visible to a resolver.
+//!    record pointing at a deleted data object visible to a resolver. The
+//!    horizon alone is not enough: a selective-erasure rewrite record can land
+//!    in any sealed hour, including one the fold's fixed reconcile window and
+//!    retention-frontier band both miss, and the snapshot part covering that
+//!    hour then keeps naming the pre-rewrite inputs. Deleting them on schedule
+//!    would fail every query over that hour closed until the fold caught up, so
+//!    a still-named input is held for a later pass instead.
 //! 3. **Unreferenced-part cleanup**: an `l1/` object referenced by no
 //!    compaction record in its bucket, once the object is older than `grace +
 //!    max_compaction_lifetime` and one of two branch conditions holds:
@@ -100,13 +108,16 @@ use prost::Message;
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
-use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionRecord, RewriteRecord};
+use ravel_proto::commit::v1::{
+    CompactionInputIdentity, CompactionRecord, ErasureCompletion, RewriteRecord,
+};
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
 use crate::clock::Clock;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
+use crate::reachability::{SnapshotBlock, SnapshotGate, SnapshotObject, SnapshotReachability};
 use crate::read::verify_commit_key;
 
 use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
@@ -187,8 +198,8 @@ pub async fn sweep_shard(
     signal: Signal,
     shard: u32,
 ) -> Result<SweepReport> {
-    let (superseded_records_deleted, superseded_data_deleted) =
-        sweep_superseded(store, clock, config, lease, tenant, signal, shard).await?;
+    let superseded = sweep_superseded(store, clock, config, lease, tenant, signal, shard).await?;
+    log_superseded_holds(tenant, signal, shard, &superseded);
     let unreferenced_parts_deleted =
         sweep_unreferenced_parts(store, clock, config, lease, tenant, signal, shard).await?;
     let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
@@ -201,8 +212,8 @@ pub async fn sweep_shard(
         };
     Ok(SweepReport {
         orphans_deleted,
-        superseded_records_deleted,
-        superseded_data_deleted,
+        superseded_records_deleted: superseded.records_deleted,
+        superseded_data_deleted: superseded.data_deleted,
         unreferenced_parts_deleted,
         orphan_breaker_tripped,
         orphans_withheld,
@@ -240,7 +251,9 @@ pub async fn sweep_shard_zoned(
     shard: u32,
     hours: &[u32],
 ) -> Result<SweepReport> {
-    let (superseded_records_deleted, superseded_data_deleted) = sweep_superseded_impl(
+    let mut reach = SnapshotReachability::new();
+    let superseded = sweep_superseded_impl(
+        &mut reach,
         store,
         clock,
         config,
@@ -251,6 +264,7 @@ pub async fn sweep_shard_zoned(
         Some(hours),
     )
     .await?;
+    log_superseded_holds(tenant, signal, shard, &superseded);
     let unreferenced_parts_deleted = sweep_unreferenced_parts_impl(
         store,
         clock,
@@ -272,14 +286,41 @@ pub async fn sweep_shard_zoned(
         };
     Ok(SweepReport {
         orphans_deleted,
-        superseded_records_deleted,
-        superseded_data_deleted,
+        superseded_records_deleted: superseded.records_deleted,
+        superseded_data_deleted: superseded.data_deleted,
         unreferenced_parts_deleted,
         orphan_breaker_tripped,
         orphans_withheld,
         orphan_breaker_overridden,
         full_pass: false,
     })
+}
+
+/// Surface a superseded-input hold to an operator running the combined
+/// [`sweep_shard`] / [`sweep_shard_zoned`] pass. [`SweepReport`] itself is
+/// unchanged: the structured counters live on [`SupersededSweepOutcome`], which
+/// [`sweep_superseded`] returns directly, and this log line is what a caller
+/// that only has the combined report sees. Silent on a pass that held nothing,
+/// which is every ordinary pass.
+fn log_superseded_holds(
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    outcome: &SupersededSweepOutcome,
+) {
+    if outcome.held() == 0 {
+        return;
+    }
+    tracing::warn!(
+        tenant_hash = %tenant.to_hex(),
+        signal = signal.key_prefix(),
+        shard,
+        held_by_snapshot = outcome.held_by_snapshot,
+        held_by_unreadable_head = outcome.held_by_unreadable_head,
+        "superseded-input sweep: held inputs the live catalog HEAD snapshot still names \
+         (or could not be read); they are collected once the fold reconciles their hour or \
+         HEAD is rebuilt"
+    );
 }
 
 // --- Rule 1: orphan GC (ADR-0010 §11) --------------------------------------
@@ -427,9 +468,45 @@ async fn referenced_l0_identities(
 
 // --- Rule 2: superseded-input sweep (ADR-0018) -----------------------------
 
+/// What one superseded-input sweep pass did.
+///
+/// The two `held_*` counters are the object-granular counterpart of
+/// retention's [`crate::retention::RetentionOutcome::BlockedBySnapshot`]: a
+/// count plus the blocked reason, so an operator watching inputs pile up can
+/// tell the ordinary lagging-fold case ([`SnapshotBlock::Named`]) from an
+/// unreadable HEAD or snapshot part ([`SnapshotBlock::Unreadable`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SupersededSweepOutcome {
+    /// Superseded commit, compaction, and rewrite records deleted (or, under
+    /// `dry_run`, that would have been).
+    pub records_deleted: usize,
+    /// Superseded data objects and L1 parts deleted (or, under `dry_run`, that
+    /// would have been).
+    pub data_deleted: usize,
+    /// Objects (records plus data) held this pass because the live catalog HEAD
+    /// snapshot still names them: a query over that hour would fail closed if
+    /// they were deleted now. Counter seam for
+    /// `ravel_maintain_superseded_inputs_held_total{reason="named"}`.
+    pub held_by_snapshot: usize,
+    /// Objects held this pass because HEAD, or a snapshot part covering the
+    /// record's hour, was present but could not be read: fail-closed, since
+    /// non-reachability cannot be proven from data that cannot be read. A
+    /// persistent nonzero value here is an operator signal, not the ordinary
+    /// lagging-fold case. Counter seam for
+    /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
+    pub held_by_unreadable_head: usize,
+}
+
+impl SupersededSweepOutcome {
+    /// Objects held this pass for any reason.
+    pub fn held(&self) -> usize {
+        self.held_by_snapshot + self.held_by_unreadable_head
+    }
+}
+
 /// Delete the L0 commit records and data objects named in each horizon-passed
-/// compaction record's input list, records before data objects. Returns
-/// `(records_deleted, data_deleted)`.
+/// compaction record's input list, records before data objects, skipping any
+/// the live catalog HEAD snapshot still names (the ADR-0020 delete blocker).
 pub async fn sweep_superseded(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -438,14 +515,23 @@ pub async fn sweep_superseded(
     tenant: &TenantHash,
     signal: Signal,
     shard: u32,
-) -> Result<(usize, usize)> {
-    sweep_superseded_impl(store, clock, config, lease, tenant, signal, shard, None).await
+) -> Result<SupersededSweepOutcome> {
+    let mut reach = SnapshotReachability::new();
+    sweep_superseded_impl(
+        &mut reach, store, clock, config, lease, tenant, signal, shard, None,
+    )
+    .await
 }
 
 /// Shared implementation behind [`sweep_superseded`] (whole-shard, `hours:
 /// None`) and [`sweep_shard_zoned`] (hour-scoped, `hours: Some(_)`).
+///
+/// `reach` is the pass's [`SnapshotReachability`] cache: HEAD is read at most
+/// once for the pass and each covering snapshot part at most once, never once
+/// per input, and a pass with no horizon-passed record reads neither.
 #[allow(clippy::too_many_arguments)]
 async fn sweep_superseded_impl(
+    reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     config: &CompactorConfig,
@@ -454,12 +540,11 @@ async fn sweep_superseded_impl(
     signal: Signal,
     shard: u32,
     hours: Option<&[u32]>,
-) -> Result<(usize, usize)> {
+) -> Result<SupersededSweepOutcome> {
     let now = clock.now_ns();
     let entries = list_commit_entries_scoped(store, tenant, signal, shard, hours).await?;
 
-    let mut records_deleted = 0usize;
-    let mut data_deleted = 0usize;
+    let mut outcome = SupersededSweepOutcome::default();
     for (key, entry) in &entries {
         // Both a compaction record and a selective-erasure rewrite record
         // (ADR-0064 decision 3 point 6) render their superseded inputs
@@ -470,7 +555,7 @@ async fn sweep_superseded_impl(
         // predecessor may also appear as its own entry in this listing, so its
         // fetch can legitimately miss once a superseding generation processed
         // earlier in this pass already removed it.
-        let (record_keys, data_keys) = match entry {
+        let groups = match entry {
             BucketEntry::CompactionRecord(_) => {
                 let Some(record) = get_compaction_record_opt(store, key).await? else {
                     continue;
@@ -516,39 +601,103 @@ async fn sweep_superseded_impl(
             BucketEntry::CommitRecord(_) | BucketEntry::Tombstone(_) => continue,
         };
 
-        // Records first, then data objects (docs/consistency-model.md):
-        // a crash between the two phases leaves record-less data (orphan GC) or
-        // an unreferenced part (rule 3), never a record pointing at a deleted
-        // object.
-        for k in &record_keys {
-            if lease.is_protected(k) {
-                continue;
+        // HEAD-reachability gate (ADR-0020 delete blocker), object-granular
+        // because this rule deletes individual objects out of a bucket whose
+        // surviving compaction or rewrite outputs the snapshot legitimately
+        // still names. A group is indivisible: a predecessor record must
+        // outlive every part it names, or rule 3 would collect those parts on
+        // the next pass and undo the hold.
+        let mut cleared: Vec<&SupersededGroup> = Vec::with_capacity(groups.len());
+        for group in &groups {
+            match reach
+                .object_gate(
+                    store,
+                    tenant,
+                    signal,
+                    group.ingest_hour_bucket,
+                    &group.objects,
+                )
+                .await?
+            {
+                SnapshotGate::Clear => cleared.push(group),
+                SnapshotGate::Blocked(SnapshotBlock::Named) => {
+                    outcome.held_by_snapshot += group.object_count();
+                }
+                SnapshotGate::Blocked(SnapshotBlock::Unreadable) => {
+                    outcome.held_by_unreadable_head += group.object_count();
+                }
             }
-            if !config.dry_run {
-                store.delete(k).await?;
-            }
-            records_deleted += 1;
         }
-        for k in &data_keys {
-            if lease.is_protected(k) {
-                continue;
+
+        // Every cleared group's records first, then every cleared group's data
+        // objects (docs/consistency-model.md): a crash between the two phases
+        // leaves record-less data (orphan GC) or an unreferenced part (rule 3),
+        // never a record pointing at a deleted object. The gate runs entirely
+        // ahead of both phases so a held group never splits that order.
+        for group in &cleared {
+            for k in &group.record_keys {
+                if lease.is_protected(k) {
+                    continue;
+                }
+                if !config.dry_run {
+                    store.delete(k).await?;
+                }
+                outcome.records_deleted += 1;
             }
-            if !config.dry_run {
-                store.delete(k).await?;
+        }
+        for group in &cleared {
+            for k in &group.data_keys {
+                if lease.is_protected(k) {
+                    continue;
+                }
+                if !config.dry_run {
+                    store.delete(k).await?;
+                }
+                outcome.data_deleted += 1;
             }
-            data_deleted += 1;
         }
     }
-    Ok((records_deleted, data_deleted))
+    Ok(outcome)
 }
 
-/// Gather `(commit record key, data object key)` pairs for every input a
-/// compaction or rewrite record names in its `inputs` list. Shared by rule 2's
-/// compaction and rewrite-RawL0 arms (ADR-0018, ADR-0064 decision 3 point 6):
-/// both name the same raw-L0 input shape. The data key needs each input
-/// record's content hash, so each input record is read before it is deleted; an
-/// input already gone (a crash-interrupted prior pass) is skipped and its data
-/// object, if any, is collected by orphan GC (row 8).
+/// One indivisible deletion unit for rule 2: the records to delete first, the
+/// data objects to delete after them, and the snapshot identities those
+/// objects carry so the HEAD-reachability gate can decide the whole unit at
+/// once.
+///
+/// A raw-L0 input is its own group (one commit record plus one data object),
+/// so a still-named input holds only itself. A superseded predecessor record
+/// and every L1 part it names form one group, because deleting the record
+/// without the parts would expose the parts to rule 3.
+struct SupersededGroup {
+    /// The ingest hour every object in the group sits in: the parent record's
+    /// own bucket, which is also the hour whose covering snapshot parts the
+    /// gate must read.
+    ingest_hour_bucket: u32,
+    record_keys: Vec<String>,
+    data_keys: Vec<String>,
+    objects: Vec<SnapshotObject>,
+}
+
+impl SupersededGroup {
+    /// Objects this group would delete, for the held counters.
+    fn object_count(&self) -> usize {
+        self.record_keys.len() + self.data_keys.len()
+    }
+}
+
+/// Gather one [`SupersededGroup`] per input a compaction or rewrite record
+/// names in its `inputs` list: the input's commit record, its data object, and
+/// the level-0 snapshot identity both share. Shared by rule 2's compaction and
+/// rewrite-RawL0 arms (ADR-0018, ADR-0064 decision 3 point 6): both name the
+/// same raw-L0 input shape. The data key needs each input record's content
+/// hash, so each input record is read before it is deleted; an input already
+/// gone (a crash-interrupted prior pass) yields no group and its data object,
+/// if any, is collected by orphan GC (row 8).
+///
+/// One group per input, not one for the whole record: an input the live HEAD
+/// no longer names is still collectable in a pass where a sibling input is
+/// held.
 async fn gather_l0_inputs(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -560,9 +709,8 @@ async fn gather_l0_inputs(
     // and unspawnable from the server's maintain loop. A concrete `&R` over the
     // two `Sync` proto record types is `Send`.
     record: &impl SupersededInputs,
-) -> Result<(Vec<String>, Vec<String>)> {
-    let mut record_keys: Vec<String> = Vec::new();
-    let mut data_keys: Vec<String> = Vec::new();
+) -> Result<Vec<SupersededGroup>> {
+    let mut groups: Vec<SupersededGroup> = Vec::new();
     for commit_key in superseded_input_commit_keys(tenant, signal, shard, record)? {
         match store.get(&commit_key, GetRange::Full).await {
             Ok(got) => {
@@ -574,14 +722,27 @@ async fn gather_l0_inputs(
                 // read::load_inputs).
                 verify_commit_key(&rec, &commit_key)?;
                 let data_key = keys::reconstruct_data_key(&rec)?;
-                record_keys.push(commit_key);
-                data_keys.push(data_key);
+                let writer_id = Uuid::parse_str(&rec.writer_id).map_err(|_| {
+                    MaintainError::Key(KeyError::InvalidWriterId(rec.writer_id.clone()))
+                })?;
+                groups.push(SupersededGroup {
+                    ingest_hour_bucket: rec.ingest_hour_bucket,
+                    record_keys: vec![commit_key],
+                    data_keys: vec![data_key],
+                    objects: vec![SnapshotObject::L0 {
+                        shard: rec.shard,
+                        ingest_hour_bucket: rec.ingest_hour_bucket,
+                        writer_id: writer_id.into_bytes(),
+                        writer_epoch: rec.writer_epoch,
+                        writer_seq: rec.writer_seq,
+                    }],
+                });
             }
             Err(StoreError::NotFound) => {}
             Err(e) => return Err(MaintainError::Store(e)),
         }
     }
-    Ok((record_keys, data_keys))
+    Ok(groups)
 }
 
 /// Reconstruct the commit key of every raw-L0 input a compaction or rewrite
@@ -658,33 +819,47 @@ impl SupersededInputs for RewriteRecord {
 /// Gather the deletion targets for a rewrite record that superseded a whole
 /// prior compaction/rewrite record (ADR-0064 amendment: `superseded_record_key`
 /// names either an `l1.<hash>.cmt` compaction record or an `rw.<hash>.cmt`
-/// rewrite record, recursive supersession included). Returns
-/// `([predecessor record key], [predecessor part keys...])`: the record is
-/// deleted first (records-before-data), then every L1 part it named.
+/// rewrite record, recursive supersession included). Returns one group holding
+/// the predecessor record (deleted first, records-before-data) and every L1
+/// part it named, plus each part's level-1 snapshot identity.
+///
+/// One group, not one per part: deleting the record while a still-named part
+/// is held would leave that part unreferenced, and rule 3 would then collect
+/// it on the next pass, undoing the hold.
 ///
 /// A predecessor already gone (swept by an earlier iteration of this same pass
 /// when the predecessor also appeared as its own entry, or by a crash-
-/// interrupted prior pass) yields empty lists: any of its parts that survive
+/// interrupted prior pass) yields no group: any of its parts that survive
 /// become unreferenced under the live rewrite record and are collected by rule
 /// 3.
 async fn gather_superseded_predecessor(
     store: &dyn ObjectStoreBackend,
     predecessor_key: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<Vec<SupersededGroup>> {
     let got = match store.get(predecessor_key, GetRange::Full).await {
         Ok(got) => got,
-        Err(StoreError::NotFound) => return Ok((Vec::new(), Vec::new())),
+        Err(StoreError::NotFound) => return Ok(Vec::new()),
         Err(e) => return Err(MaintainError::Store(e)),
     };
     let mut data_keys: Vec<String> = Vec::new();
+    let mut objects: Vec<SnapshotObject> = Vec::new();
+    let ingest_hour_bucket;
     match keys::partition_bucket_entry(predecessor_key) {
         Ok(BucketEntry::CompactionRecord(_)) => {
             let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
                 MaintainError::Invariant(format!("superseded compaction record decode failed: {e}"))
             })?;
             keys::verify_compaction_record_key(&record, predecessor_key)?;
+            ingest_hour_bucket = record.ingest_hour_bucket;
+            let input_set_hash = input_set_hash_array(&record.input_set_hash)?;
             for part in &record.parts {
                 data_keys.push(keys::reconstruct_l1_part_key(&record, part)?);
+                objects.push(SnapshotObject::L1 {
+                    shard: record.shard,
+                    ingest_hour_bucket: record.ingest_hour_bucket,
+                    input_set_hash,
+                    part_index: part.part_index,
+                });
             }
         }
         Ok(BucketEntry::RewriteRecord(_)) => {
@@ -692,8 +867,16 @@ async fn gather_superseded_predecessor(
                 MaintainError::Invariant(format!("superseded rewrite record decode failed: {e}"))
             })?;
             keys::verify_rewrite_record_key(&record, predecessor_key)?;
+            ingest_hour_bucket = record.ingest_hour_bucket;
+            let input_set_hash = input_set_hash_array(&record.input_set_hash)?;
             for part in &record.parts {
                 data_keys.push(keys::reconstruct_rewrite_part_key(&record, part)?);
+                objects.push(SnapshotObject::L1 {
+                    shard: record.shard,
+                    ingest_hour_bucket: record.ingest_hour_bucket,
+                    input_set_hash,
+                    part_index: part.part_index,
+                });
             }
         }
         Ok(BucketEntry::CommitRecord(_) | BucketEntry::Tombstone(_)) => {
@@ -707,7 +890,24 @@ async fn gather_superseded_predecessor(
         }
         Err(e) => return Err(MaintainError::Key(e)),
     }
-    Ok((vec![predecessor_key.to_string()], data_keys))
+    Ok(vec![SupersededGroup {
+        ingest_hour_bucket,
+        record_keys: vec![predecessor_key.to_string()],
+        data_keys,
+        objects,
+    }])
+}
+
+/// A record's `input_set_hash` as the 32-byte array a level-1 snapshot entry
+/// carries in its `writer_id` slot. A wrong length is the same fatal invariant
+/// breach `reconstruct_l1_part_key` reports for it.
+fn input_set_hash_array(bytes: &[u8]) -> Result<[u8; 32]> {
+    bytes.try_into().map_err(|_| {
+        MaintainError::Invariant(format!(
+            "superseded record input_set_hash is {} bytes, expected 32",
+            bytes.len()
+        ))
+    })
 }
 
 /// [`get_compaction_record`] tolerant of a NotFound (Ok(None)): the record was
@@ -1314,9 +1514,18 @@ pub struct ErasureRequestSweepOutcome {
     /// `.dreq` objects deleted (or, under `dry_run`, that would have been).
     pub deleted: usize,
     /// `.dreq` objects left in place: no `.done` yet (erasure not complete),
-    /// still inside the post-completion protection horizon, or lease/legal-hold
-    /// protected.
+    /// still inside the post-completion protection horizon, lease/legal-hold
+    /// protected, or held because an input one of its rewrites superseded is
+    /// still in the store (`held_by_superseded_inputs` below counts that
+    /// subset).
     pub kept: usize,
+    /// The subset of `kept` held past their horizon because an input a rewrite
+    /// applying that request superseded is still physically present. Retiring
+    /// the query-time exclusion filter while such an input exists would let a
+    /// snapshot that still resolves it serve the erased subject again, so the
+    /// `.dreq` outlives every input its own rewrites superseded. Counter seam
+    /// for `ravel_maintain_dreq_held_by_superseded_inputs_total`.
+    pub held_by_superseded_inputs: usize,
 }
 
 /// Delete every erasure request `t/<tenant_hash>/<signal>/del/<request_id>.dreq`
@@ -1339,6 +1548,20 @@ pub struct ErasureRequestSweepOutcome {
 ///   because after the horizon no resolvable snapshot can still reference a
 ///   pre-rewrite input (ADR-0064 §3.5 race window, closed durably). Deleting
 ///   the `.dreq` a nanosecond early would reopen exactly that window.
+/// - no input a rewrite applying this request superseded is still physically
+///   present. The horizon on its own does not imply that: rule 2 holds an
+///   input the live HEAD snapshot still names, and a legal hold over the
+///   shard's data prefixes (which does not cover `del/`) holds it too. In both
+///   cases a snapshot can still resolve the pre-rewrite input, so retiring the
+///   filter would serve the erased subject again. The check reads the
+///   `.done`'s own `bucket_drops` for the buckets this request touched, so it
+///   costs one LIST per touched bucket and runs only for a `.dreq` that has
+///   already cleared its horizon; in the ordinary case rule 2 collected the
+///   inputs long before, so the first such pass finds nothing and removes the
+///   request. An input whose commit record is already gone but whose data
+///   object survives (the window between rule 2's two delete phases) is not
+///   counted: it is a record-less orphan awaiting rule 1, discovered from no
+///   durable record.
 /// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
 ///   request exactly as it pins any other object.
 ///
@@ -1370,10 +1593,10 @@ pub async fn sweep_erasure_requests(
     let prefix = keys::del_prefix(tenant, signal);
     let objects = list_all(store, &prefix).await?;
 
-    // One LIST, split into pending requests and their completion timestamps.
-    // Both suffixes share the `del/` prefix, so this needs no second listing.
+    // One LIST, split into pending requests and their completions. Both
+    // suffixes share the `del/` prefix, so this needs no second listing.
     let mut dreq_keys: Vec<(Uuid, String)> = Vec::new();
-    let mut done_completed_ns: HashMap<Uuid, i64> = HashMap::new();
+    let mut completions: HashMap<Uuid, ErasureCompletion> = HashMap::new();
     for meta in &objects {
         if let Ok(parsed) = keys::parse_erasure_request_key(&meta.key) {
             dreq_keys.push((parsed.request_id, meta.key.clone()));
@@ -1383,7 +1606,7 @@ pub async fn sweep_erasure_requests(
                 MaintainError::Invariant(format!("erasure completion decode failed: {e}"))
             })?;
             keys::verify_erasure_completion_key(&completion, &meta.key)?;
-            done_completed_ns.insert(parsed.request_id, completion.completed_unix_ns);
+            completions.insert(parsed.request_id, completion);
         } else {
             return Err(MaintainError::UnknownBucketEntry(meta.key.clone()));
         }
@@ -1391,13 +1614,15 @@ pub async fn sweep_erasure_requests(
 
     let mut deleted = 0usize;
     let mut kept = 0usize;
+    let mut held_by_superseded_inputs = 0usize;
     for (request_id, dreq_key) in &dreq_keys {
-        let Some(&completed_ns) = done_completed_ns.get(request_id) else {
+        let Some(completion) = completions.get(request_id) else {
             // No `.done`: the erasure is not verified complete, so the request
             // (and its query-time exclusion filter) must stay live.
             kept += 1;
             continue;
         };
+        let completed_ns = completion.completed_unix_ns;
         // Fail-safe: a zero completion timestamp is not a valid horizon anchor.
         if completed_ns == 0 {
             kept += 1;
@@ -1411,13 +1636,88 @@ pub async fn sweep_erasure_requests(
             kept += 1;
             continue;
         }
+        // The horizon has elapsed, but an input one of this request's rewrites
+        // superseded may still be in the store (held by rule 2's HEAD gate, or
+        // by a legal hold over the data prefixes that does not cover `del/`).
+        // A snapshot can still resolve such an input, so the filter stays.
+        if superseded_inputs_outstanding(store, tenant, signal, completion, &request_id.to_string())
+            .await?
+        {
+            tracing::warn!(
+                tenant_hash = %tenant.to_hex(),
+                signal = signal.key_prefix(),
+                request_id = %request_id,
+                "erasure-request sweep: holding a .dreq past its horizon because an input its \
+                 rewrite superseded is still in the store; the query-time exclusion filter must \
+                 outlive it"
+            );
+            kept += 1;
+            held_by_superseded_inputs += 1;
+            continue;
+        }
         if !config.dry_run {
             store.delete(dreq_key).await?;
         }
         deleted += 1;
     }
 
-    Ok(ErasureRequestSweepOutcome { deleted, kept })
+    Ok(ErasureRequestSweepOutcome {
+        deleted,
+        kept,
+        held_by_superseded_inputs,
+    })
+}
+
+/// Whether any input superseded by a rewrite that applied `request_id` is still
+/// physically present, across every bucket the request's `.done` records a drop
+/// for in `signal`.
+///
+/// Anchored on durable records only: the `.done`'s `bucket_drops` name the
+/// buckets, each bucket's own listing names its rewrite records, and each
+/// rewrite record names the inputs it superseded. A superseded input that is
+/// still present yields a group from the same gather helpers rule 2 uses, so
+/// the two rules agree on what "superseded input" means by construction rather
+/// than by restatement.
+async fn superseded_inputs_outstanding(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    completion: &ErasureCompletion,
+    request_id: &str,
+) -> Result<bool> {
+    for drop in &completion.bucket_drops {
+        // A `.done` is per (tenant, signal); a drop for another signal cannot
+        // appear, but the sweep never widens its own scope on a field it did
+        // not write.
+        if ravel_commit::signal::from_proto(drop.signal) != Ok(signal) {
+            continue;
+        }
+        let prefix =
+            keys::commit_shard_hour_prefix(tenant, signal, drop.shard, drop.ingest_hour_bucket)?;
+        for meta in list_all(store, &prefix).await? {
+            if !matches!(
+                keys::partition_bucket_entry(&meta.key),
+                Ok(BucketEntry::RewriteRecord(_))
+            ) {
+                continue;
+            }
+            let Some(record) = get_rewrite_record_opt(store, &meta.key).await? else {
+                continue;
+            };
+            if !record.drops.iter().any(|d| d.request_id == request_id) {
+                continue;
+            }
+            let groups = if !record.inputs.is_empty() {
+                gather_l0_inputs(store, tenant, signal, drop.shard, &record).await?
+            } else {
+                gather_superseded_predecessor(store, &record.superseded_record_key).await?
+            };
+            if groups.iter().any(|g| g.object_count() > 0) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 // --- shared helpers --------------------------------------------------------

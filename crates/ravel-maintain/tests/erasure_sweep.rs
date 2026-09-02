@@ -23,9 +23,9 @@ use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::{erasure, signal};
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, ErasureRewriteOutcome, FixedClock, LeaseCheck,
-    LegalHoldCheck, MaintainMemo, NoLeases, PendingErasureRequest, compact_bucket,
-    erasure_rewrite_bucket, shard_hold_scopes, sweep_erasure_requests, sweep_superseded,
-    write_hold_set,
+    LegalHoldCheck, MaintainMemo, NoLeases, PendingErasureRequest, SupersededSweepOutcome,
+    compact_bucket, erasure_rewrite_bucket, shard_hold_scopes, sweep_erasure_requests,
+    sweep_superseded, write_hold_set,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
@@ -125,6 +125,15 @@ async fn sweep(
     clock: &FixedClock,
     lease: &dyn LeaseCheck,
 ) -> (usize, usize) {
+    let out = sweep_full(store, clock, lease).await;
+    (out.records_deleted, out.data_deleted)
+}
+
+async fn sweep_full(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    lease: &dyn LeaseCheck,
+) -> SupersededSweepOutcome {
     let b = bucket();
     sweep_superseded(
         store,

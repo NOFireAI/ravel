@@ -111,7 +111,7 @@ own parameters, not gaps a correctly declared config leaves open.
 | rule | targets | preconditions (ALL must hold) | anchor |
 |---|---|---|---|
 | orphan (first implementation, ADR-0010 §11; batched re-verify and breaker, ADR-0048 decisions 4-5) | data object with no commit record | age > grace + max_flush_lifetime (default 1 h); record absence re-verified by one fresh LIST shared by every candidate in the pass; the mass-orphan circuit breaker not tripped (or deliberately overridden) | object last_modified |
-| superseded input (ADR-0018) | L0 commit records + data objects named in a compaction record's input list | now >= record.created_unix_ns + protection_horizon | compaction record created_unix_ns |
+| superseded input (ADR-0018, HEAD-reachability gate ADR-0020) | L0 commit records + data objects named in a compaction or rewrite record's input list, or a whole superseded predecessor record together with the parts it names | now >= record.created_unix_ns + protection_horizon; the live catalog HEAD snapshot names none of the objects the delete would remove (delete blocker, see below) | compaction or rewrite record created_unix_ns |
 | unreferenced part | `l1/` object referenced by no compaction record in its bucket | a compaction record OR a retention tombstone exists for the bucket (a tombstone makes future compaction impossible, so a record-less part can never be re-referenced); age > grace + max_compaction_lifetime; the branch condition (non-reference, or record-absent-and-tombstoned) re-verified immediately before delete | part last_modified |
 | retention (ADR-0019, HEAD-reachability gate ADR-0020) | everything in a tombstoned bucket, tombstone deleted last | now >= tombstone.retired_at_ns + protection_horizon; the live catalog HEAD snapshot names no object inside the bucket (delete blocker, see below); bucket LIST-verified empty before the tombstone itself is deleted | tombstone retired_at_ns |
 | idempotency marker (ADR-0051 §5; logs and spans only, run once per signal rather than per shard) | `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` marker object | marker's `<ingest_hour>` older than `now_hour - idem_dedup_window_hours - IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`; a key that fails to parse as `<keyhash32>.<ingest_hour>.idm` is skipped, never deleted | marker key's own `<ingest_hour>` |
@@ -141,15 +141,31 @@ retention still completes (it is not permanently blocked). Without the
 blocker, a query that resolved a stale snapshot naming an already-deleted
 object would fail permanently with `SnapshotInvalidated` (503).
 
+**The superseded-input sweep is gated the same way.** The same blocker, the
+same three answers, and the same per-pass cache apply to a compaction or
+rewrite record's superseded inputs, with the question asked per object rather
+than per bucket: after a compaction or a rewrite the snapshot legitimately
+names the output parts sitting in the same bucket, so only the specific objects
+a delete would remove may be tested. The horizon alone is not enough there for
+the same reason it is not enough for retention. A selective-erasure rewrite
+record can land in any sealed hour, including one both the fold's fixed
+reconcile window and its retention-frontier band miss, and the snapshot part
+covering that hour then keeps naming the pre-rewrite inputs. An input the live
+HEAD still names is held for a later pass instead of deleted, and the pass
+reports how many objects it held under each of the two reasons below.
+
 HEAD read failures are explicit. An **absent** HEAD is NOT a block: with no
 snapshot naming anything, the sweep proceeds (ADR-0020: the catalog index is a
 pure optimization; a missing HEAD degrades to listing). A HEAD, or a covering
 part, that is **present but unreadable** (undecodable, checksum/blake3 mismatch,
-an unsupported newer format, or a HEAD-named part that is missing) blocks the
+an unsupported newer format, a HEAD-named part that is missing, or a snapshot
+entry whose identity fields do not fit the shape a fold writes) blocks the
 sweep **fail-closed**: non-reachability cannot be proven from data that cannot
 be read, and a wrongly-permitted delete is unrecoverable while a delayed one is
 not. HEAD and each covering part are read at most once per sweep pass (cached
-across the pass's buckets), not once per bucket.
+across the pass's buckets and, for superseded inputs, across the pass's
+records), never once per bucket or once per input. A pass that finds nothing
+past its horizon reads neither.
 
 The idempotency-marker rule's age gate subtracts
 `IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` (1 h) from its lower bound, the
@@ -224,6 +240,20 @@ window would still call a Hit.
   input, and orphan-GC-style convergence handles crash remnants (a
   compactor that died mid-publish leaves record-less parts, which the
   unreferenced-part rule collects once old enough).
+- Superseded-input deletion is gated on HEAD reachability exactly as
+  retention is (ADR-0020, "HEAD-referenced snapshot delete blocker" above),
+  asked per object rather than per bucket. The horizon bounds a pinned
+  in-flight reader; it does not prove the *current* snapshot has stopped
+  naming the input. An input a part named by the live HEAD still references
+  is skipped, and the record that superseded it stays in place so the next
+  pass retries. A superseded predecessor record and the parts it names are
+  held or deleted together: dropping the record while a still-named part is
+  held would leave that part unreferenced, and the unreferenced-part rule
+  would then collect it and undo the hold.
+- A held input costs storage until the fold reconciles its hour or an
+  operator rebuilds HEAD; nothing else about the hour changes, and every
+  query over it keeps resolving normally. That is the deliberate trade
+  against the alternative, a permanently failing query.
 
 ## Retention sweep order
 
@@ -326,17 +356,25 @@ every bound is measured.
   that.
 
 - **Physical removal reuses the existing sweep.** A rewrite's superseded
-  inputs become inputs to `sweep_superseded`, deleted after
+  inputs become inputs to the superseded-input sweep, deleted after
   `protection_horizon`, under the same `LegalHoldCheck` gate as every other
-  delete. That sweep carries no HEAD-reachability blocker: unlike retention,
-  it deletes an input on schedule even when a snapshot part the fold has not
-  reconciled still names it (see "Scope and interactions" below for what a
-  query then sees). The `.dreq` itself contains the subject
+  delete. That sweep is gated on HEAD reachability the same way retention is
+  (ADR-0020, "HEAD-referenced snapshot delete blocker" above): an input a
+  snapshot part the fold has not reconciled still names is held rather than
+  deleted, and collected once the fold reconciles the hour or an operator
+  rebuilds HEAD (see "Scope and interactions" below for what a query sees
+  meanwhile). The `.dreq` itself contains the subject
   identifier and is therefore not kept forever: a sweep rule deletes it once
-  its `.done` exists, `now >= done.created_unix_ns + protection_horizon`, and
-  the legal-hold check passes; the horizon wait guarantees the query-time
-  filter only disappears after no resolvable snapshot can still include a
-  pre-rewrite input. The `.done` record carries only a hash of the canonical
+  its `.done` exists, `now >= done.completed_unix_ns + protection_horizon`, no
+  input a rewrite applying that request superseded is still in the store, and
+  the legal-hold check passes. The horizon and the outstanding-input check
+  together are what guarantee the query-time filter only disappears after no
+  resolvable snapshot can still include a pre-rewrite input: the horizon
+  covers the ordinary case, and the check covers the two cases that outlive
+  it, an input the HEAD gate is holding and an input a legal hold over the
+  data prefixes preserves (such a hold does not cover the request keyspace,
+  so it would otherwise retire the filter over data it is preserving). The
+  `.done` record carries only a hash of the canonical
   predicate, per-bucket dropped counts, and timestamps, no subject
   identifier, and is permanent, deny-delete audit evidence for every role
   (ADR-0055 amendment).
@@ -418,14 +456,16 @@ into them. An operator with erasure obligations must budget them deliberately.
     superseded is refreshed only when the fold reconciles that hour, through
     the fixed window or the retention-frontier band (docs/catalog-and-mvcc.md,
     "Fold reconcile pass"), or when a HEAD rebuild re-derives every hour.
-    Until then a query over that hour resolves the
-    pre-rewrite inputs from the stale part, and the query-time predicate
-    removes the erased records after fetch. Once `sweep_superseded` has
-    deleted those inputs, the same query fails closed with
-    `SnapshotInvalidated` on every attempt, because a re-resolve reads the
-    same stale HEAD, until the fold reconciles the hour or an operator
-    rebuilds HEAD. That is an availability cost, never a served pre-rewrite
-    record: the `.dreq` outlives the inputs by construction.
+    Until then the superseded-input sweep holds those inputs rather than
+    deleting them, because the live HEAD still names them. A query over that
+    hour keeps resolving the pre-rewrite inputs from the stale part and the
+    query-time predicate removes the erased records after fetch, exactly as it
+    did before the horizon elapsed; the request stays live for as long as any
+    held input does, so the filter never retires under a snapshot that can
+    still resolve one. The cost is the held storage, not a failed query, and
+    it ends when the fold reconciles the hour or an operator rebuilds HEAD:
+    the next sweep deletes the inputs, and the request becomes removable
+    behind them.
   - **ADR-0028 analytics/derived datasets are a pure query-time stage, not a
     persisted store.** `ravel-analytics` carries no clock, IO, object-store,
     or catalog (docs/analytics.md): every analytic runs in memory over query
