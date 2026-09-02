@@ -442,15 +442,27 @@ if __name__ == "__main__":
 
 
 class TestGeneratedScope(RepoCase):
-    """docs/reference/* is generated from the clap definitions, so its prose is
-    the code's prose. TRACKER and SRCPATH would demand editing doc comments to
-    satisfy a documentation gate, and the page would drift from the definition
-    at the next regeneration. Every other rule still applies."""
+    """The two flag tables are generated from the clap definitions, so their
+    prose is the code's prose. TRACKER and SRCPATH would demand editing doc
+    comments to satisfy a documentation gate, and the page would drift from
+    the definition at the next regeneration. Every other rule still applies,
+    and every other page under docs/reference/ is a hand-written user page."""
 
     REF = "docs/reference/ravel-server-flags.md"
 
     def test_scope_is_generated_not_user(self):
         self.assertEqual(check_docs.classify(self.REF), "generated")
+        self.assertEqual(check_docs.classify("docs/reference/ravel-cli-flags.md"), "generated")
+
+    def test_hand_written_reference_page_is_user(self):
+        # Only the two named generated pages get the exemption; a hand-written
+        # reference such as the HTTP API page is held to the user rules.
+        self.assertEqual(check_docs.classify("docs/reference/http-api.md"), "user")
+        f = self.findings({
+            "docs/reference/http-api.md": "# Routes\n\nSee ADR-0044 and crates/x/src/y.rs.\n",
+        })
+        self.assertTrue(self.rules(f, "TRACKER"))
+        self.assertTrue(self.rules(f, "SRCPATH"))
 
     def test_citations_and_source_paths_are_allowed(self):
         f = self.findings({
