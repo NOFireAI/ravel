@@ -138,8 +138,10 @@ Replication to a replica bucket:
 - Replication **v2 configuration** with `DeleteMarkerReplication` **enabled**,
   RTC **recommended**.
 - The replica lives in a **different region** and a **different account**,
-  encrypted under a **different KMS key** (`ReplicaKmsKeyID`), and holds its
-  own `NoncurrentDays = E_v_r` expiration rule.
+  encrypted under a **different KMS key** (`ReplicaKmsKeyID`). Replication
+  requires versioning on both buckets, so the replica is versioned too, and
+  it carries its own `NoncurrentDays = E_v_r` expiration rule and
+  expired-delete-marker cleanup.
 - Ravel processes never hold replica-account credentials; the replication
   channel is the only writer to the replica.
 
@@ -198,7 +200,9 @@ is one knob controlling two windows.**
 
 - It is the **disaster-detection budget**: after an accidental or malicious
   mass delete, the operator has `E_v` to notice and restore the noncurrent
-  versions on the primary, plus `E_v_r` on the replica at level 1.
+  versions on the primary. At level 1 the replica has its own window,
+  replication lag plus `E_v_r`; the two windows run side by side and do not
+  add up.
 - It is simultaneously the **erasure-residue window**: erased bytes persist as
   noncurrent versions for `E_v`.
 
@@ -210,26 +214,36 @@ service level agreement. This runbook refuses to pick a number for you.
 
 Ravel cannot enforce most of this and does not pretend to. `ravel-cli store
 qualify` probes whether Object Lock and versioning appear enabled and reports
-lifecycle-rule state, but **replication configuration is invisible to the
-object-store layer**, so verification of the replication controls is an
+whether a lifecycle rule is present, not what the rule says, and
+**replication configuration is invisible to the object-store layer**, so
+verification of the lifecycle values and the replication controls is an
 explicit platform-CLI step and not something Ravel checked. The versioning
 and `NoncurrentDays = E_v` lifecycle checks apply at level 0 and level 1
-alike; the replication checks are level 1 only. Run these against the actual
-buckets:
+alike; the replication and replica checks are level 1 only. Run these against
+the actual buckets, and treat a missing row or a differing value as a failed
+check:
 
 ```sh
 # Primary: versioning ON
 aws s3api get-bucket-versioning --bucket <primary>
 
-# Primary: NoncurrentDays = E_v expiration + expired-delete-marker cleanup
-aws s3api get-bucket-lifecycle-configuration --bucket <primary>
+# Primary: the enabled lifecycle rules. Pass only when one row carries
+# noncurrent_days equal to E_v, one carries expired_delete_markers true,
+# and one carries abort_mpu_days of 7 or less (the contract's required
+# AbortIncompleteMultipartUpload rule).
+aws s3api get-bucket-lifecycle-configuration --bucket <primary> \
+  --query 'Rules[?Status==`Enabled`].{id:ID,noncurrent_days:NoncurrentVersionExpiration.NoncurrentDays,expired_delete_markers:Expiration.ExpiredObjectDeleteMarker,abort_mpu_days:AbortIncompleteMultipartUpload.DaysAfterInitiation}' \
+  --output table
 
 # Primary: replication v2, DeleteMarkerReplication enabled, RTC (if required)
 aws s3api get-bucket-replication --bucket <primary>
 
-# Replica: versioning ON, NoncurrentDays = E_v_r expiration
+# Replica: versioning ON, and the same rule check with noncurrent_days
+# equal to E_v_r and expired_delete_markers true.
 aws s3api get-bucket-versioning --bucket <replica>
-aws s3api get-bucket-lifecycle-configuration --bucket <replica>
+aws s3api get-bucket-lifecycle-configuration --bucket <replica> \
+  --query 'Rules[?Status==`Enabled`].{id:ID,noncurrent_days:NoncurrentVersionExpiration.NoncurrentDays,expired_delete_markers:Expiration.ExpiredObjectDeleteMarker}' \
+  --output table
 
 # Object Lock enabled on the bucket, and whether a bucket default
 # retention D is set (a default retention is level 2; the scoped posture
@@ -397,7 +411,7 @@ record: a real end-to-end run against MinIO is what fills a row.
 |---|---|---|---|
 | **Every level** | Object Lock enabled on the bucket and versioning ON; at levels 0 and 1, no bucket default retention and an operator-run mechanism applying per-object retention in compliance mode to `sys/`, provisioning records, commit records and catalog HEAD history (level 2 replaces the mechanism with its bucket default retention); `--require-bucket-protection` gates startup on the bucket half (Object Lock enabled, versioning on), and the mechanism or the default retention is verified out of band | None; those prefixes hold no erasable subject value | Not a recovery control |
 | **level 0** (default) | Versioning + `NoncurrentDays = E_v` + expired-delete-marker cleanup; no replica | Primary `+E_v` | None; bucket loss is total loss |
-| **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended, `NoncurrentDays = E_v_r` | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
+| **level 1** (recommended) | Level 0 plus a replica: different region/account/KMS key, replication v2 with `DeleteMarkerReplication`, RTC recommended; the replica versioned with `NoncurrentDays = E_v_r` and expired-delete-marker cleanup | Primary `+E_v`; replica residue is replication lag + `E_v_r` (requires `DeleteMarkerReplication`) | Defined here; **unmeasured** until a rehearsal record exists. RTC gives RPO a 15-minute ceiling; without RTC, unbounded |
 | **level 2** (optional) | level 1 plus a bucket default retention `D`, which S3 applies to every object including the data objects | `max(bound, D)`; query-time exclusion still immediate | As level 1 |
 
 `DeleteMarkerReplication` is mandatory for any erasure-obligated deployment;
