@@ -502,8 +502,9 @@ horizon that does not cover the sweeper's clock skew can neither be written nor
 run against. [Deletion and garbage collection](../../deletion-and-gc.md) has the
 argument.
 
-**Bootstrap never blocks a fresh deployment.** The first process to touch a
-fresh bucket writes `sys/gc` from the maintain defaults, which satisfy the
+**Bootstrap never blocks a fresh deployment under a credential that may
+create the object.** The first such process to touch a fresh bucket writes
+`sys/gc` from the maintain defaults, which satisfy the
 constraint by construction, then validates against the object it just wrote. If
 several processes start together against one empty bucket, one wins the create
 and the others read and validate against the winner's object. Under the
@@ -566,8 +567,10 @@ an all-zero configuration would satisfy the inequality trivially and be
 impossible for any mode to match, so it is rejected.
 
 The Kubernetes operator exposes no GC-horizon fields, and does not need to: it
-deploys every pod with the same shipped defaults, so the first pod bootstraps
-`sys/gc` from those defaults and every pod validates trivially.
+deploys every pod with the same shipped defaults, so with a shared credential
+the first pod bootstraps `sys/gc` from those defaults and every pod validates
+trivially. With per-role credential Secrets the maintain pod or an Admin step
+creates it first, as above.
 
 ### Age-based retention
 
