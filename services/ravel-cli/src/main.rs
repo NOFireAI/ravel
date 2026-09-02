@@ -119,7 +119,10 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // the same shape: deployment-wide, at the bucket root, never under a
         // tenant prefix, so `tenant token` never hashes a tenant either.
         | Command::GcConfig { .. }
-        | Command::Tenant { .. } => false,
+        | Command::Tenant { .. }
+        // `cache reclaim-legacy` operates on a local directory, not object
+        // storage: no tenant prefix, no store built.
+        | Command::Cache { .. } => false,
     }
 }
 
@@ -208,6 +211,12 @@ enum Command {
     Tenant {
         #[command(subcommand)]
         command: TenantCommand,
+    },
+    /// Operate on a node's local read-cache directory (ADR-0046). A local
+    /// filesystem tool: it takes no `--store` and never touches object storage.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
     },
     /// Bulk-import a Parquet file into the logs signal (ADR-0089).
     ///
@@ -411,6 +420,40 @@ enum Command {
         /// slower idle timer instead).
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_flush_delay)]
         max_flush_delay: Option<Duration>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CacheCommand {
+    /// Reclaim pre-namespacing local disk-cache files (issue #826).
+    ///
+    /// `DiskCache` used to write entry files at `<cache-dir>/<shard>/<file>`;
+    /// since the per-instance namespace layout (issue #671) it writes under
+    /// `<cache-dir>/<namespace>/<shard>/<file>`. Files left at the old
+    /// rootless layout are inert: never seeded, never evicted, counted in no
+    /// budget, so a directory warmed before that upgrade keeps up to the old
+    /// budget on disk forever. Nothing deletes them implicitly; this is the
+    /// deliberate operator step that does.
+    ///
+    /// Safe to run while a node is live: no live code path reads or writes the
+    /// legacy `<cache-dir>/<shard>` layout, so deleting it races nothing.
+    ///
+    /// Dry run by default: it prints the legacy files it would delete and their
+    /// total bytes, and deletes nothing. Pass `--apply` to delete them.
+    ///
+    /// Downgrade story: a binary rolled back to the pre-namespacing layout
+    /// reads `<cache-dir>/<shard>` again and finds whatever reclaim left. After
+    /// `--apply` it finds nothing there and starts with an empty disk cache,
+    /// which is a cold start (the next reads refetch from object storage), not
+    /// data loss: the cache is disposable by construction.
+    ReclaimLegacy {
+        /// The node's configured read-cache directory (the server's
+        /// `--read-cache-dir`).
+        #[arg(long, value_name = "DIR")]
+        cache_dir: std::path::PathBuf,
+        /// Delete the legacy files. Without this, the command only lists them.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -1561,6 +1604,9 @@ async fn main() -> anyhow::Result<()> {
             print!("{report}");
             Ok(())
         }
+        Command::Cache {
+            command: CacheCommand::ReclaimLegacy { cache_dir, apply },
+        } => cache_reclaim_legacy(&cache_dir, apply),
         Command::Load {
             parquet,
             tenant,
@@ -2439,6 +2485,32 @@ async fn catalog_list(
     Ok(())
 }
 
+/// Reclaim pre-namespacing local disk-cache files under `cache_dir` (issue
+/// #826). Dry run by default; `apply` deletes. Prints the report in the CLI's
+/// existing `key: value` plus indented-list style, then the exit status is the
+/// `Result`: an unlistable directory or a failed delete is a nonzero exit.
+fn cache_reclaim_legacy(cache_dir: &std::path::Path, apply: bool) -> anyhow::Result<()> {
+    let report = ravel_cache::reclaim_legacy(cache_dir, apply).map_err(|err| {
+        anyhow::anyhow!(
+            "reclaiming legacy cache files under {}: {err}",
+            cache_dir.display()
+        )
+    })?;
+    let verb = if report.applied {
+        "deleted"
+    } else {
+        "would delete"
+    };
+    println!("cache_dir: {}", cache_dir.display());
+    println!("apply: {}", report.applied);
+    println!("legacy files ({verb}): {}", report.files);
+    println!("legacy bytes ({verb}): {}", report.bytes);
+    for path in &report.paths {
+        println!("  {}", path.display());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -2701,6 +2773,51 @@ mod tests {
             config.input_read_concurrency, 0,
             "zero passes through unchanged; the merge clamps below-1 to 1 itself"
         );
+    }
+
+    /// `cache reclaim-legacy` parses its `--cache-dir` and defaults `--apply`
+    /// to false (dry run), flipping to true when the flag is given (issue
+    /// #826).
+    ///
+    /// Non-vacuity (prove-the-test): add `default_value_t = true` to the
+    /// `apply` arg, and the no-`--apply` assertion (`apply == false`) fails.
+    #[test]
+    fn cache_reclaim_legacy_parses_cache_dir_and_apply() {
+        use super::CacheCommand;
+
+        let Command::Cache {
+            command: CacheCommand::ReclaimLegacy { cache_dir, apply },
+        } = Cli::try_parse_from([
+            "ravel",
+            "cache",
+            "reclaim-legacy",
+            "--cache-dir",
+            "/var/cache/rv",
+        ])
+        .expect("a reclaim-legacy invocation parses")
+        .command
+        else {
+            panic!("expected the cache reclaim-legacy subcommand");
+        };
+        assert_eq!(cache_dir, std::path::PathBuf::from("/var/cache/rv"));
+        assert!(!apply, "--apply defaults to false (dry run)");
+
+        let Command::Cache {
+            command: CacheCommand::ReclaimLegacy { apply, .. },
+        } = Cli::try_parse_from([
+            "ravel",
+            "cache",
+            "reclaim-legacy",
+            "--cache-dir",
+            "/var/cache/rv",
+            "--apply",
+        ])
+        .expect("a reclaim-legacy --apply invocation parses")
+        .command
+        else {
+            panic!("expected the cache reclaim-legacy subcommand");
+        };
+        assert!(apply, "--apply flips to true when given");
     }
 
     #[test]
