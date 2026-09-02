@@ -4513,23 +4513,45 @@ mod tests {
 
     /// `__name__` is an ordinary dictionary label on the ordinal path (the
     /// writer stores it at ordinal 0), so an equality on it selects exactly the
-    /// one series carrying that metric name and materializes exactly one label
-    /// set.
+    /// one series carrying that metric name, the same series the materializing
+    /// path selects for the anchored regex `__name__=~"m7"`, and materializes
+    /// exactly one label set where the materializing path builds all 500.
     #[tokio::test]
     async fn ordinal_equality_on_metric_name_selects_one_series() {
-        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(500, 4, 50);
-        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
-        let fetcher = fetcher.with_whole_object_threshold(0);
+        const N: usize = 500;
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(N, 4, 50);
+
+        let (fetcher_ord, _m1) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher_ord = fetcher_ord.with_whole_object_threshold(0);
         let eq = [LabelMatcher::equal("__name__", "m7")];
-        let (soa, _) = fetcher
+        let (soa_ord, _) = fetcher_ord
             .fetch_soa(tenant_hash, &seg_ref, &eq)
             .await
-            .expect("fetch");
-        assert_eq!(soa.len(), 1, "one series carries __name__=m7");
+            .expect("ordinal fetch");
+
+        let (fetcher_mat, _m2) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher_mat = fetcher_mat.with_whole_object_threshold(0);
+        let re = [LabelMatcher::regex("__name__", "m7").expect("regex")];
+        let (soa_mat, _) = fetcher_mat
+            .fetch_soa(tenant_hash, &seg_ref, &re)
+            .await
+            .expect("materializing fetch");
+
+        assert_eq!(soa_ord.len(), 1, "one series carries __name__=m7");
+        assert_eq!(soa_mat.len(), 1, "the anchored regex selects the same one");
         assert_eq!(
-            fetcher.label_sets_materialized(),
+            soa_ord[0].series_id, soa_mat[0].series_id,
+            "the ordinal path selects the series the materializing path selects"
+        );
+        assert_eq!(
+            fetcher_ord.label_sets_materialized(),
             1,
             "the ordinal path materializes only the matched series"
+        );
+        assert_eq!(
+            fetcher_mat.label_sets_materialized(),
+            N as u64,
+            "the materializing path materializes every candidate series"
         );
     }
 
