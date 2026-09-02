@@ -688,8 +688,8 @@ suite runs its full assertion set through the decorator to prove transparency.
 `calls` is completions, not attempts: it counts one per logical operation, so
 the `object_store` retry loop that runs *below* this decorator (`RetryConfig`,
 default `max_retries = 10`) is invisible to it: one `get()` that retried nine
-times is one `calls`/`get` while the provider bills ten HTTP requests (issue
-#928). The billed count is carried in a separate per-operation `attempts`
+times is one `calls`/`get` while the provider bills ten HTTP requests. The
+billed count is carried in a separate per-operation `attempts`
 counter on the same `StoreMetrics` block, filled in by the S3 adapter's counting
 HTTP connector (`S3Store::with_metrics`, installed via
 `AmazonS3Builder::with_http_connector`), which records one attempt per HTTP
@@ -702,7 +702,7 @@ decorator. `ravel-server` establishes it for the whole S3 chain by handing one
 handle to the base `S3Store` and, under `--tenant-kms-config`, to every
 per-tenant KMS-routed store (`KmsRoutingStore::new`); a store built without the
 handle would make `ravel_store_attempts_total` under-report for the traffic it
-serves (issue #928).
+serves.
 
 `attempts` is the billed HTTP request count, not a retry counter. Retries are
 one reason it exceeds `calls`, and not the only one: a whole-object read and a

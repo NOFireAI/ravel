@@ -6,18 +6,18 @@ applies a set of rules that hold the documentation to the architecture ADR-1040
 decides. Python 3 standard library only, matching scripts/check_readme_commands.py:
 CI's ``doc-scripts`` job installs no toolchain beyond the interpreter.
 
-The tree does not pass on the day this lands, so the checker ships with a
-baseline (scripts/docs_lint_baseline.txt) listing every finding that exists at
-that moment. A finding present in the baseline is a note; a finding absent from
-it fails. Each documentation task deletes the baseline entries it fixes; the
-final task deletes the file. See ADR-1040 D3.
+Every finding fails the gate. A baseline file (scripts/docs_lint_baseline.txt)
+exists only while a newly added rule is being burned down: while it exists, a
+finding it lists is a note rather than a failure, and --strict-baseline fails on
+an entry that matches nothing, so the file shrinks to zero and is then deleted.
+No baseline file is checked in today. See ADR-1040 D3.
 
 Usage:
-    python3 scripts/check_docs.py                 # gate: exit 1 on a new finding
-    python3 scripts/check_docs.py --update-baseline
+    python3 scripts/check_docs.py                    # gate: exit 1 on any finding
+    python3 scripts/check_docs.py --update-baseline  # start a burn-down
     python3 scripts/check_docs.py --strict-baseline  # unused baseline entry fails
 
-Exit codes: 0 clean, 1 findings not in the baseline (or unused entries under
+Exit codes: 0 clean, 1 findings (or unused baseline entries under
 --strict-baseline), 2 the checker could not run (an unreadable file, a missing
 source constant).
 """
@@ -416,6 +416,29 @@ def gather(repo):
     repo.svg_files.sort()
 
 
+_GENERATED_BEGIN = "<!-- BEGIN GENERATED"
+_GENERATED_END = "<!-- END GENERATED"
+
+
+def generated_block_lines(lines):
+    """1-based line numbers inside a `<!-- BEGIN GENERATED ... -->` block.
+
+    A generated block is a generator's text, not the page's: a citation inside
+    it is fixed at the generator, and the block is regenerated as a unit. The
+    markers themselves count as inside.
+    """
+    inside = False
+    out = set()
+    for i, line in enumerate(lines, start=1):
+        if _GENERATED_BEGIN in line:
+            inside = True
+        if inside:
+            out.add(i)
+        if _GENERATED_END in line:
+            inside = False
+    return out
+
+
 def analyze_markdown(rel, repo):
     """Run the per-file rules for one markdown file. Returns a list of Findings."""
     findings = []
@@ -423,6 +446,7 @@ def analyze_markdown(rel, repo):
     text = repo.read(rel)
     lines = text.split("\n")
     src_dir = os.path.dirname(os.path.join(REPO_ROOT, rel))
+    generated = generated_block_lines(lines)
 
     for lineno, line, heading in iter_prose_lines(lines):
         # ---- LINK / ANCHOR (all scopes) plus SVG reference + alt-text tracking.
@@ -438,8 +462,11 @@ def analyze_markdown(rel, repo):
             _superlative(rel, line, findings)
         if scope in ("user", "spec", "changelog"):
             _term(rel, line, findings)
-        if scope == "user":
-            _tracker(rel, line, heading, findings)
+        if scope in ("user", "spec") and lineno not in generated:
+            # An implementer contract cites the decision records that govern
+            # it, so a spec page keeps its ADR citations. An issue or
+            # pull-request number is repository archaeology on either page.
+            _tracker(rel, line, heading, findings, adrs=(scope == "user"))
         if scope in ("user", "changelog"):
             _srcpath(rel, line, findings)
 
@@ -531,13 +558,15 @@ def _provenance(rel, line, findings):
         findings.append(Finding(rel, "PROVENANCE", m.group(0)))
 
 
-def _tracker(rel, line, heading, findings):
+def _tracker(rel, line, heading, findings, adrs=True):
     if heading is not None and heading == "Background":
         return
     for m in _ISSUE_HASH_RE.finditer(line):
         findings.append(Finding(rel, "TRACKER", m.group(0)))
     for m in _TRACKER_URL_RE.finditer(line):
         findings.append(Finding(rel, "TRACKER", m.group(0)))
+    if not adrs:
+        return
     for m in _ADR_CITE_RE.finditer(line):
         findings.append(Finding(rel, "TRACKER", m.group(0)))
     for m in _LINK_RE.findall(line):
@@ -944,7 +973,10 @@ def run(update_baseline=False, strict=False, out=sys.stdout):
     if strict and unused:
         out.write(f"\n{len(unused)} unused baseline entr(y/ies) under --strict-baseline.\n")
         return 1
-    out.write("docs gate: clean against baseline.\n")
+    if baseline:
+        out.write("docs gate: clean against baseline.\n")
+    else:
+        out.write("docs gate: clean.\n")
     return 0
 
 

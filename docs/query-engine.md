@@ -21,7 +21,7 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
            (`GetRange::Full`) -- footer, sections and pages all resolve from
            that single buffer, so there is no second probe
          - object size known and above the threshold: absolute 64 KiB footer
-           tail range, cache-eligible (issue #811)
+           tail range, cache-eligible
          - object size absent: suffix GET, which cannot be cached because the
            cache key is content hash plus absolute range. Counted by
            `SegmentFetcher::suffix_fallbacks`; no production RSEG ref
@@ -109,9 +109,9 @@ rule rewrites the aggregate into a literal and the scan is never executed:
 the plan contains no `LogsScanExec` and the query issues zero object-store
 GETs. Every `sample_count` is written by the commit record, so the sum is
 known the moment `Catalog::resolve` returns; before this, counting the full
-ClickBench tenant (issue #680, 8424 objects, 100M rows) took 142 s and moved
+ClickBench tenant (8424 objects, 100M rows) took 142 s and moved
 23 GB from object storage to add up numbers the resolve already had. The leaf
-also reports an `Exact` `num_rows`/`ts` span (issue #723) when a `ts` bound is
+also reports an `Exact` `num_rows`/`ts` span when a `ts` bound is
 present but fully CONTAINS every resolved segment -- the bound removes no
 row, so the sum is still exact -- not only in the no-bound case. The leaf
 falls back to `Absent` (the rule does not fire on it, `LogsScanExec` stays in
@@ -126,7 +126,7 @@ it, because a `FilterExec` reports its own (non-exact) statistics rather
 than passing the leaf's `Exact` count through. So
 `LogsTableProvider::supports_filters_pushdown` (crates/ravel-sql/src/
 logs_provider.rs) reports `Exact` for a filter that resolves purely to a
-`ts` bound and/or a `has_word` content predicate (issue #733), which
+`ts` bound and/or a `has_word` content predicate, which
 deletes it from the plan: both land in the channel the RLOG reader
 re-verifies against each decoded row's own value (`ravel_logseg`'s `eval`,
 its `Predicate::TsRange` and `Predicate::HasWord` arms), so no residual is
@@ -235,20 +235,17 @@ Two carriers feed it, unioned per segment and per column (ADR-0873 decision
   carrier for pre-stamp sealed history and the only carrier for `Str`/`Bytes`
   extrema.
 
-**The write side of the stamp carrier does not exist yet.** Nothing in the
+**The write side of the stamp carrier does not exist.** Nothing in the
 flush or compaction path calls the stamp writers in
 `ravel_commit::declared_stats` (`stamp_commit_record`,
-`stamp_compaction_part`); their only callers are tests.
-Issue #1022 (ADR-0873 wave 5) is where the writers start emitting stamps. Until
-it lands, every record a real tenant has ever written carries an empty list, so
+`stamp_compaction_part`); their only callers are tests. Every record a real
+tenant has written carries an empty list, so
 the stamp half of the union is empty for every segment of every tenant, every
 answer above comes from `.cstat` alone, and the stamp path is exercised only by
 tests that stamp a record directly and by the fold's carriage of whatever a
-record happens to carry. The read side landed first on purpose (a reader that
-refuses a defective stamp has to exist before any writer can emit one), but the
-consequence is worth stating plainly: on today's deployments this shortcut is
-inert on the stamp side, and no coverage change is observable from it
-until issue #1022 ships.
+record happens to carry. The reader that refuses a defective stamp has to exist
+before any writer can emit one, so on today's deployments this shortcut is
+inert on the stamp side, and no coverage change is observable from it.
 
 Stamp eligibility is an allowlist, `I64` and `BOOL`
 (`ravel_types::declared_stats`). `Str`/`Bytes` are excluded because a stamped
@@ -329,14 +326,14 @@ deliberately not built here.
 Every OTHER predicate-free, full-window logs statement (`SUM`, `AVG`,
 `GROUP BY`, `ORDER BY ... LIMIT` over the whole table) still executes
 `LogsScanExec`, but issues exactly one whole-object GET per relevant segment and
-ZERO suffix probes (#693 part 3). When the query carries no block-level
+ZERO suffix probes. When the query carries no block-level
 predicate and no pending erasure, its window fully contains every relevant
 segment, and there are at least `target_partitions` of them, `LogsScanExec`
 skips its plan phase entirely: no block can be pruned,
 so it assigns whole segments round-robin (one owner per segment) and reads each
-in a single `GetRange::Full`. That removes both probe classes the pre-#693-part-3
-path paid above the block-range threshold (the plan-phase footer probe and the
-per-open scan-side re-probe), which on the 8424-object ClickBench tenant (#680)
+in a single `GetRange::Full`. That removes both probe classes the plan-then-stripe
+path pays above the block-range threshold (the plan-phase footer probe and the
+per-open scan-side re-probe), which on the 8424-object ClickBench tenant
 were a combined ~24,700 probes on top of the 8,424 whole-object reads for one
 `SELECT`. When any of those conditions fails the unchanged plan-then-stripe path
 runs (its plan phase probes each segment once), and the scan publishes a
@@ -345,11 +342,11 @@ read there is carried to the per-partition subset opens so they skip re-probing
 (ADR-0107 amendment 2026-08-26). Object size is not one of the conditions: a
 segment at or below the block-range threshold is read whole by the whole-segment
 entry and by the striped path alike, on the same `(0, object_size)` cache key,
-so it joins the assignment rather than vetoing it (ADR-0102 amendment
-2026-08-26, #739 -- as a query-wide conjunct the threshold let one small tail
-object per `(shard, hour)` disqualify an entire 8,424-object snapshot).
+so it joins the assignment rather than vetoing it (ADR-0102 amendment: as a
+query-wide conjunct the threshold let one small tail object per `(shard, hour)`
+disqualify an entire 8,424-object snapshot).
 
-### Which read shape each assigned segment takes (#862)
+### Which read shape each assigned segment takes
 
 The conjuncts above decide the ASSIGNMENT: no plan phase, one owner per
 segment. They say nothing about the read, because every one of them is about
@@ -398,20 +395,21 @@ pages turn out to cover the object after all. `LogsScanExec` publishes
 A statement with a block-level predicate (a declared-column or `attrs`
 numeric comparison, the ClickBench q20 and q37-q43 shapes; a text
 `has_word`; a stream filter) is not block-predicate-free, so it takes the
-plan-then-stripe path, never the whole-segment fast path above. Before #761
-that path read every relevant object WHOLE twice over: the plan phase opened
+plan-then-stripe path, never the whole-segment fast path above. Without the
+numeric prune arms below, that path read every relevant object WHOLE twice
+over: the plan phase opened
 each segment to count survivors, and the scan's `fetch_object_with_footer`
 resolved candidate blocks by `SkipIndex::candidate_blocks(ts, ts, None, &[])`
 with no numeric arms, so every block was a ts candidate, the coverage crossover
 (`candidate_bytes / BLOCKS-section bytes >= 0.75`) fired, and the read
 collapsed to one whole-object GET. The predicate pruned blocks only at decode,
 shrinking `blocks_scanned` but not the bytes moved. On the 8,424-object
-ClickBench tenant (#680) q37 moved 19,690 GETs and 11.7 GB to decode 144 of
+ClickBench tenant q37 moved 19,690 GETs and 11.7 GB to decode 144 of
 17,731 blocks, and q20 moved 29,614 GETs and 17.9 GB, more than the 11.1 GB
 of objects on disk, because a cold cache re-read each surviving segment once
 per owning partition.
 
-Issue #761 makes the prune-only `NumRange` arms drive candidate selection. Each arm
+The prune-only `NumRange` arms drive candidate selection. Each arm
 is resolved against the object's own FIELD_DIR
 (`FieldDir::numeric_range_arms`) to its column id, then applied to
 `candidate_blocks` in two places:
@@ -430,7 +428,7 @@ is resolved against the object's own FIELD_DIR
 - **Plan side.** `plan_segment` counts survivors from the skip index alone
   (footer + SKIP_IDX via the 256 KiB suffix probe, plus the object's FIELD_DIR
   to resolve the arms) and fetches no block, carrying the footer forward so
-  each per-partition subset open skips its own probe (#693 part 3). This is
+  each per-partition subset open skips its own probe. This is
   sound because for a query the skip index can decide (ts bounds and NumRange
   arms only) the reader's full prune reduces to its skip step, so the count
   equals the survivor list the scan stripes. It takes at least one NumRange arm
@@ -438,11 +436,11 @@ is resolved against the object's own FIELD_DIR
   already fetches only the ts-candidate blocks and warms exactly the extents the
   subset opens stripe, so planning it this way would trade one shared read for
   N per-partition ones over the same bytes. This branch's `fetch_plan_sections`
-  read is wrapped in its own `page_fetch` span (#782), recording the probe and
+  read is wrapped in its own `page_fetch` span, recording the probe and
   section GET count and `BlockRangeStats::block_bytes_fetched` on it, the same
-  way `plan_segment_fast` and `plan_segment_block_stats` already do. Before
-  #782 this branch's read was the one plan-phase GET on the query path with no
-  span at all, invisible to a trace over a statement that took it.
+  way `plan_segment_fast` and `plan_segment_block_stats` do, so no plan-phase
+  GET on the query path is invisible to a trace over the statement that took
+  it.
 
 A predicate the skip index cannot decide (a `has_word`/text arm, which bloom
 prunes only at decode; an `attrs['k']='v'` POSTINGS equality; a stream filter)
@@ -468,14 +466,14 @@ projected_columns` rather than with the object's block count.
 The pieces, and why each is where it is:
 
 - The 256 KiB suffix probe brings the footer, SKIP_IDX and PAGE_DIR in one GET.
-  It was 64 KiB until issue #766: BLOOM (86 KB mean on the reference tenant)
-  sits between SKIP_IDX and the footer, so the shorter probe missed SKIP_IDX on
+  A 64 KiB probe would not: BLOOM (86 KB mean on the reference tenant) sits
+  between SKIP_IDX and the footer, so the shorter probe missed SKIP_IDX on
   68.8% of above-threshold objects and cost 4,415 extra GETs per predicated
   statement. A probe that still falls short costs one extra GET, not one per
   section: SKIP_IDX and PAGE_DIR are adjacent and are fetched as one range, and
   `BlockRangeStats::probe_misses` reports the residual rate. That per-read
   figure is also accumulated per phase on the `LogSegmentFetcher` that served
-  the read (`LogSegmentFetcher::probe_miss_counter`, issue #883), which is how
+  the read (`LogSegmentFetcher::probe_miss_counter`), which is how
   it reaches a caller that measures whole statements: `BlockRangeStats` is
   dropped at the fetch boundary, and the `page_fetch` span field beside
   `s3_requests`/`s3_bytes` is not aggregated anywhere. The SQL latency bench
@@ -763,7 +761,7 @@ data, not the syntactic shape: a float-only subquery, including
 support is future work.
 
 Range evaluation carries native-histogram elements end to end inside the
-evaluator (ADR-0108, issue #577). The internal range result is a
+evaluator (ADR-0108). The internal range result is a
 histogram-aware matrix (`RangeSample`, a per-step float-or-histogram element
 mirroring the instant `InstantSample`), filled by three paths: a bare
 histogram selector fetches its series once per query window via
@@ -782,7 +780,7 @@ aggregation"), never a silent drop. `by`/`without` grouping preserves
 element type.
 
 The range counter functions and the `_over_time` family carry histograms too
-(ADR-0108 decisions 4/5, issue #578). `rate`/`increase`/`delta` reduce a
+(ADR-0108 decisions 4/5). `rate`/`increase`/`delta` reduce a
 histogram window to a histogram element through the same
 `histogram_extrapolated_rate` reducer the instant arm uses.
 `sum_over_time`/`avg_over_time` produce a histogram element,
@@ -941,10 +939,10 @@ already spent, never dropped) and falls back to raw fetch.
 
 Reachable end to end: `QueryEngine::prefetch` runs the eligibility gate,
 computes the pushdown target, and sends the resulting request live on the
-wire for the one eligible plan (epic #64 T4c/T4d); `MergedSource` overrides
+wire for the one eligible plan; `MergedSource` overrides
 `SeriesSource::query_precomputed_count` to serve the collected partials back
-to the PromQL fast path (T4b), with `PROTOCOL_VERSION` bumped to 4 in the
-same commit as the wire opt-in. A worker's `count: Some(0)` (a real,
+to the PromQL fast path, and `PROTOCOL_VERSION` 4 carries the wire opt-in. A
+worker's `count: Some(0)` (a real,
 correctly-computed zero-in-window count) is dropped before it reaches
 `MergedSource`, never surfaced as a phantom zero-valued series, the same
 absence-of-output-sample contract the raw path already has.
@@ -1010,8 +1008,7 @@ distributed slice set against a local read of the same segments.
 
 The two sections above describe the engine-level (queryfrag) machinery. The SQL
 surface has its own distributed scan that drives log and trace *search* over the
-`logs`, `alerts`, `audit`, and `spans` tables (ADR-0071 task T6, shipped
-as T6a #326 for the RLOG family and T6b #327 for spans;
+`logs`, `alerts`, `audit`, and `spans` tables (ADR-0071;
 `crates/ravel-sql/src/distributed_rlog.rs`). It fans a table scan out to worker
 slices instead of scanning the local snapshot, then merges the per-slice streams
 at the coordinator.
@@ -1277,15 +1274,15 @@ attached to `QueryStats` alongside the existing `segments_fetched`/
 `segments_pruned`/per-run `FetchStats` (`raw_f64_pages`/`raw_f64_bytes`,
 narrower than `decompressed_bytes`: only `ValPageKind::RawF64` pages).
 
-### Per-phase split (issue #796)
+### Per-phase split
 
 The pooled `QueryAccountingSnapshot` above sums every GET a statement
 issues into one counter: the resolve's commit-record reads, the
 plan-phase footer/skip-index probe, the segment catalog fetch, and the
 actual block/page data reads all land in the same number, so a pooled
 figure alone cannot say which stage is responsible for a runaway
-request count (#835: one statement issued 18,937 GETs against a
-3,469-object tenant, and the pooled counter could not localize them).
+request count (one statement issued 18,937 GETs against a 3,469-object
+tenant, and the pooled counter could not localize them).
 
 `crates/ravel-query/src/phase_accounting.rs`'s `PhaseAccounting` wraps
 four independent `QueryAccounting` handles, one per phase, using this
@@ -1312,20 +1309,20 @@ whichever handle its call site is passed -- by convention the `scan`
 handle, since decode always follows a scan in this crate's fetch
 pipelines.
 
-`PhaseAccountingSnapshot::pooled()` sums all four phases back to exactly
-the pre-#796 pooled number: `QueryStats::accounting` is computed as
+`PhaseAccountingSnapshot::pooled()` sums all four phases back to one
+pooled number: `QueryStats::accounting` is computed as
 `phase_accounting.pooled()`, so every existing reader of that field keeps
 seeing the same number, unchanged. `QueryStats` additionally carries the
 full `phase_accounting: PhaseAccountingSnapshot` for callers that want
 the split.
 
-Two entry points issue GETs the phase split cannot yet attribute without
-a change outside this crate's issue #796 scope:
+Two entry points issue GETs the phase split cannot attribute without a
+change outside this crate:
 
 - Federation and distributed fan-out (`federate_discovery`,
   `federate_scalar`, `distrib::client`'s `SliceFetcher`) cross a wire
   boundary as one pooled `QueryAccountingSnapshot`
-  (`SliceResponse.accounting`) that predates #796; a worker's per-slice
+  (`SliceResponse.accounting`); a worker's per-slice
   spend is charged to `scan` on the coordinator side rather than left
   unaccounted. Splitting it for real would need a wire-format version
   bump to the coordinator/worker protobuf.
@@ -1343,8 +1340,8 @@ a change outside this crate's issue #796 scope:
 
 `ravel-sql`'s `SqlExecutor` builds its own `QueryAccounting` per attempt
 (`SqlOutcome.accounting`) entirely inside that crate, so the phase split
-does not yet reach `ravel-bench`'s `sql_latency_bench` report: doing so
-needs a `ravel-sql` change outside this crate's scope for issue #796.
+does not reach `ravel-bench`'s `sql_latency_bench` report: doing so needs
+a `ravel-sql` change outside this crate.
 
 ### Pre-execution cost estimate
 
@@ -1474,7 +1471,7 @@ thus the whole `segment_open` cost) are zero on a fully warm cache. A
 segment above the threshold reads its footer as an absolute tail range
 (`GetRange::Range(object_size - suffix_len, object_size)`), which
 `guarded_get`'s `cacheable_range` routes through the cache keyed by content
-hash plus absolute range (issue #811), so that GET too is zero on a warm
+hash plus absolute range, so that GET too is zero on a warm
 cache and `segment_open`'s cost reaches zero for such a segment. The one
 exception is a segment ref with no `object_size`, which cannot form an
 absolute range and falls back to a `GetRange::Suffix` first GET that
@@ -1527,8 +1524,8 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
 - `stats.phases`: the same GETs and bytes `stats.accounting` pools, split
-  by phase (issue #935 exposing issue #796's `PhaseAccounting`; ADR-0927
-  decision 7). An array of one object per `QueryPhase`, in
+  by phase (`PhaseAccounting`, ADR-0927 decision 7). An array of one object
+  per `QueryPhase`, in
   `QueryPhase::ALL` order, each phase present one time only: `resolve` (catalog
   snapshot resolve), `plan` (footer and skip-index probing), `probe`
   (segment catalog fetch), `scan` (block and page data reads). The
@@ -1814,8 +1811,8 @@ never drop a true result):
   the tenant's declared vocabulary and dispatches on the declared type:
   - `i64`/`bool` with `<`, `<=`, `>`, `>=`, `=`, or `BETWEEN` against a
     matching-type literal → a prune-only `Predicate::NumRange` with bit-pattern
-    bounds, driving the RLOG skip index's per-block `NumStat` min/max (ADR-0095,
-    #331). `status_code > 500` and `is_active = true` now skip blocks that
+    bounds, driving the RLOG skip index's per-block `NumStat` min/max
+    (ADR-0095). `status_code > 500` and `is_active = true` skip blocks that
     provably hold no matching value.
   - `i64` `IN (v1, v2, ...)` → ONE envelope `NumRange` spanning `[min, max]`, not
     one arm per value (the reader intersects prune arms, so a per-value arm would
@@ -1830,9 +1827,9 @@ never drop a true result):
   `OR`, a range operator on a `str`/`bytes` column, a `str`/`bytes` `IN`, or a
   type-mismatched literal, including one DataFusion coercion has already wrapped
   in a `Cast`, which is no longer a bare column) is not extracted and scans as
-  before. Two soundness caveats are inherited, not new: the equality half
-  declines all pruning on a POSTINGS section written before the #333 write-path
-  fix (a section-version gate, so no per-predicate code carries it), and inherits
+  before. Two soundness caveats: the equality half declines all pruning on a
+  POSTINGS section that predates the current writer (a section-version gate,
+  so no per-predicate code carries it), and inherits
   the over-conservative rule that a name also carrying a non-`str` column
   anywhere declines equality pruning entirely (a performance no-op, not a
   correctness gap). The `NumRange` half has no version gate: under ADR-0095's
@@ -1864,11 +1861,11 @@ envelope's declared `columns[].type` changes from `Utf8` to
 `Dictionary(Int32, Utf8)`, and the Arrow IPC schema and batch columns carry the
 dictionary type verbatim (`to_arrow_ipc` hands the schema and batches to the
 writer unchanged). Both are client-visible: a consumer reading the reported
-column type or the IPC schema must expect the dictionary type. `f64` is deferred
-(a declared float aggregate is
-order-sensitive under ADR-0013/ADR-0022, which #277 decides), and so are date
-and timestamp (they need a lifting rule from `i64` storage plus a declared
-unit); the four shipped types all aggregate exactly under any partitioning.
+column type or the IPC schema must expect the dictionary type. There is no
+`f64` column type (a declared float aggregate is order-sensitive under
+ADR-0013/ADR-0022), and no date or timestamp type (they would need a lifting
+rule from `i64` storage plus a declared unit); the four types that exist all
+aggregate exactly under any partitioning.
 
 A declared key stays in `attrs` too, so `SELECT attrs` and `SELECT *` keep
 working for a tenant that adopts typed columns after querying through the map.
@@ -1891,7 +1888,7 @@ nothing". A query process reads that override cache-aside on a 60s staleness
 horizon and never fails a query on an unreadable config object; it serves the
 last resolved declaration instead and counts
 `ravel_typed_attr_columns_stale_fallback_total`. See
-[guides/operations.md](guides/operations.md#declared-typed-attribute-columns-adr-0090)
+[typed attribute columns](guides/operations/configuration.md#typed-attribute-columns)
 for the operator-facing contract.
 
 Predicates on a typed attribute column are pushed down as prune-only arms
@@ -1974,12 +1971,12 @@ applies: each row carries reads per segment and bytes fetched over dataset
 bytes, derived in the report rather than left to the reader. For a
 block-predicate-free statement whose window contains every relevant segment
 (the report's `SELECT ts, body FROM logs`, and the shape the whole-segment fast
-path serves, #693 part 3, amended by #739) those two figures are about 1
+path serves) those two figures are about 1
 (the reads figure divides every accounted GET by the segment count, so the
 resolve's one catalog probe lifts it slightly above 1: 1.03 on the 32-segment
 fixture) and 1.0 at every partition count that fits inside the segment count,
-on both read shapes and with or without a cache: since #739 dropped the block-range-threshold
-conjunct, object size no longer gates the fast path, so the plan phase is skipped
+on both read shapes and with or without a cache: object size does not gate
+the fast path, so the plan phase is skipped
 and each segment is read whole once, and there is nothing left for the cache to
 absorb. The multiplier reappears only on the cache-wired row whose partition
 count exceeds the segment count, which falls back to plan-then-stripe, and even
@@ -2057,47 +2054,44 @@ the decode actually needed. The instrument predates the version-4 fetcher and
 was what measured whether block-level pruning alone captured enough before
 PAGE_DIR shrank the wire fetch to columns.
 
-The predicate-free full-window whole-segment fast path (#693 part 3, above)
-was, until #862, the one shape where the two axes never moved together, by
-design (#790). It issued exactly one whole-object `GetRange::Full` GET per
-segment regardless of projection, so `page_bytes_fetched` always equalled the
-object's full stored page bytes, on every projection. Since #862 that holds
-only for the projections the fast path still routes to the whole-object read
-(a wide one; see "Which read shape each assigned segment takes" above). A
-narrow projection now takes the ranged entry from inside the fast path, and
-the two axes move together there exactly as they do on every other ranged
-read. The paragraphs below describe the whole-object branch.
+On the predicate-free full-window whole-segment fast path (above), the two
+axes never move together for a projection the fast path routes to the
+whole-object read (a wide one; see "Which read shape each assigned segment
+takes" above): it issues exactly one whole-object `GetRange::Full` GET per
+segment, so `page_bytes_fetched` equals the object's full stored page bytes.
+A narrow projection takes the ranged entry from inside the fast path, and the
+two axes move together there exactly as they do on every other ranged read.
+The paragraphs below describe the whole-object branch.
 
-What #790 fixed is `page_bytes_decoded`: `scan_whole_accounted_with_tenant`
-already threaded the caller's `ColumnSelection` into the same
-`decode_v4_block` page-level skip every other read path uses, so a one-column
-scan (`SELECT ts, body FROM logs`, the report's own statement shape) was
-already decoding only that column's pages on a version-4 object -- but
-nothing pinned it, so the fast path's decode-time narrowing had no regression
-coverage and could have silently regressed to decoding every page without
-any test failing. `narrow_projection_decodes_only_wanted_columns`
-(`crates/ravel-query/src/log_fetcher.rs`) now pins it: a one-column
+`page_bytes_decoded` narrows with the projection:
+`scan_whole_accounted_with_tenant` threads the caller's `ColumnSelection`
+into the same `decode_v4_block` page-level skip every other read path uses,
+so a one-column scan (`SELECT ts, body FROM logs`, the report's own statement
+shape) decodes only that column's pages on a version-4 object.
+`narrow_projection_decodes_only_wanted_columns`
+(`crates/ravel-query/src/log_fetcher.rs`) pins it: a one-column
 projection over a 6-block, 8-column-per-block fixture decodes exactly 3
 pages per block (`ts`, `stream_ref`, `body`) against 8 for
 `ColumnSelection::all()` on the same object, and the difference matches
-`pages_skipped` exactly. A user observes the effect in `pages_decoded`/
-`page_bytes_decoded` on `ScanStats` (`EXPLAIN ANALYZE`'s per-partition page
-counters) and in reduced peak decode memory, never in request count or wire
-bytes -- those stay exactly where the #693-part-3 fast path already put them. The
+`pages_skipped` exactly. A user observes the effect in `pages_decoded` on
+`ScanStats` (`EXPLAIN ANALYZE`'s per-partition page counters), in
+`page_bytes_decoded` on the query's accounting, and in reduced peak decode
+memory, never in request count or wire bytes -- those stay exactly where the
+fast path already put them. The
 "one GET per segment" figure counts one logical `GetRange::Full` read; a warm
 read cache serves it with zero store requests and zero wire bytes, as the
 tracing section states.
 Reachable from any predicate-free, fully-contained, narrow-projection
-statement whose segments the fast path still routes to the whole-object read
--- since #862 that means one whose saving does not clear the request-cost
-break-even, typically a small object. `SELECT ts, body FROM logs` is the
+statement whose segments the fast path routes to the whole-object read, one
+whose saving does not clear the request-cost break-even, typically a small
+object. `SELECT ts, body FROM logs` is the
 worked example below: two selected SQL columns, and the reader also decodes
 the required `stream_ref`, which is why three pages per block survive and not
 one. The same page-level narrowing applies unchanged on the ranged branch,
 where it also shrinks the wire fetch.
-Object size does not gate it: since #739 the fast path is chosen for a
-segment at or below the block-range threshold too, which is what the
-request-count paragraph above already states.
+Object size does not gate it: the fast path is chosen for a segment at or
+below the block-range threshold too, as the request-count paragraph above
+states.
 
 The per-query DataFusion memory pool now bounds concurrently-held scan memory:
 the reservation grows when a decoded block and the batch built from it are held
@@ -2148,12 +2142,12 @@ LogsRowFetchExec: row_ref=__ravel_row_ref, restored_columns=41
         LogsScanExec: partitions=1, content=0, prune=0, projection=[ts, body, __ravel_row_ref]
 ```
 
-Both phases are visible in one `EXPLAIN`. Phase 1 is the scan line: the same
+Both phases are visible in one `EXPLAIN`. The first phase is the scan line: the same
 TopK over the same filter, but over a scan projecting only `ts` and `body` plus
 `__ravel_row_ref`, a synthetic non-nullable `UInt64` column packing each row's
 `(segment ordinal, surviving-block position, surviving-row position)` -- all
 three cursor state the scan already holds, so nothing is decoded to produce
-them. Phase 2 is `LogsRowFetchExec`: it groups the at-most-`k` surviving row
+them. The second phase is `LogsRowFetchExec`: it groups the at-most-`k` surviving row
 refs by block, re-opens exactly those blocks with the original column selection
 through the same accounted fetch entry point the striped scan path uses, and
 emits the rows in phase-1 order under the original schema. `restored_columns`
@@ -2377,9 +2371,7 @@ happened, and `EXPLAIN ANALYZE` prints them:
   top of the row decode. Those pages were really decompressed -- the query's
   `page_bytes_decoded` counts them too -- so the totals are the partition's
   decode work, not one arm's. A zero therefore always means the decode did that
-  much, never that the arm did not count (the row arm left both unwritten before
-  issue #669, and an attrs-including `EXPLAIN ANALYZE` read as a decode that
-  touched nothing).
+  much, never that the arm did not count.
 
 The page-byte counters on `QueryAccounting` (`page_bytes_fetched` /
 `page_bytes_decoded`, ADR-0107 decision 4) sit next to these on both paths, as
@@ -2399,9 +2391,9 @@ result. The single-partition plan keeps float aggregation bit-exact against the
 differential gate (ADR-0013), whose reference depends on a deterministic fold
 order.
 
-This behavior is on by default (`SqlConfig::parallel_final_aggregation`, amended
-to `true` on 2026-08-26 by issue #741; see the ADR-0094 amendment for the
-ClickBench measurement that motivated it). It is process-wide with no
+This behavior is on by default (`SqlConfig::parallel_final_aggregation`; see
+the ADR-0094 amendment for the ClickBench measurement that motivated the
+default). It is process-wide with no
 live-reload, so flipping it needs a restart, and
 `--sql-parallel-final-aggregation=false` is the operator opt-out that restores
 the pre-amendment single-partition final for every query (the bare
@@ -2410,7 +2402,7 @@ is per-query and decided from the query's fully type-coerced (analyzed) plan:
 
 - **Eligible:** `count(...)` and `count(DISTINCT ...)` over any type; `sum`,
   `min`, `max` over a resolved **non-float** input; `avg`/`mean` over a
-  resolved **integer** input (ADR-0825, amending the `#771` rejection below).
+  resolved **integer** input (ADR-0825).
 - **Never eligible:** `avg`/`mean` over a resolved **Float64** input (its UDAF
   runs plain IEEE f64 addition for that kind, which is not associative once a
   running sum exceeds 2^53, so it depends on the single-partition fold order);
@@ -2420,18 +2412,15 @@ is per-query and decided from the query's fully type-coerced (analyzed) plan:
   merge-order-stable representative bit pattern for a float group key is
   proven.
 
-Originally `avg` over an **integer** column was excluded by the same
-fold-order rule that excludes Float64 `avg`, for a reason the ADR-0094
-amendment for issue `#771` describes at length: DataFusion's built-in `avg`
-coerces every non-decimal, non-duration argument to `Float64` before planning
-finishes, so an integer argument never reached an accumulator as an integer,
-and the classifier had no resolved type by which it could tell `avg(int_col)`
-from `avg(float_col)` apart. ADR-0825 changes the premise: the `avg`/`mean`
-UDAF (`crate::avg`) now coerces an admitted integer argument (`Int8`-`Int64`,
-`UInt8`-`UInt32`) to `Int64` and keeps it there instead of widening to
-`Float64`, and sums it exactly in `i128` with checked addition. That partial
-state is the real `(exact sum, count)` pair issue `#771` found missing --
-carried as `(Decimal128(38, 0), Int64)` -- and integer addition is
+DataFusion's built-in `avg` coerces every non-decimal, non-duration argument
+to `Float64` before planning finishes, so an integer argument would never
+reach an accumulator as an integer, and the classifier would have no resolved
+type by which to tell `avg(int_col)` from `avg(float_col)` apart. The
+`avg`/`mean` UDAF (`crate::avg`) therefore coerces an admitted integer
+argument (`Int8`-`Int64`, `UInt8`-`UInt32`) to `Int64` and keeps it there
+instead of widening to `Float64` (ADR-0825), and sums it exactly in `i128`
+with checked addition. That partial state is an exact `(sum, count)` pair,
+carried as `(Decimal128(38, 0), Int64)`, and integer addition is
 associative, so merging it across partitions in any order reproduces the
 single-partition result exactly. `avg(int_col)` and `avg(float_col)` are
 therefore no longer the same analyzed node: the integer argument keeps its
@@ -2454,9 +2443,9 @@ the **final** stage only. It does not address the **partial** stage: a
 high-cardinality `GROUP BY` can still exhaust the per-query memory pool at the
 `Partial` `AggregateExec` -- the `partitions x distinct` pre-final state
 materialized per scan partition -- even with the final repartitioned. That
-partial-stage memory problem is a separate concern, tracked as issue #737 (the
-`skip_partial_aggregation` mitigation); it is why some high-cardinality
-statements still fail with parallel final aggregation on. Do not read this
+partial-stage memory problem is a separate concern; it is why some
+high-cardinality statements still fail with parallel final aggregation on. Do
+not read this
 feature as making every high-cardinality `GROUP BY` complete.
 
 Row order is unaffected. A `GROUP BY` without an explicit `ORDER BY` has **no

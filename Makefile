@@ -41,8 +41,7 @@ doc-drift:
 # Documentation gate (ADR-1040 decision 3): links, anchors, terminology,
 # provenance, orphaned pages, SVG validity, and index completeness. Python
 # stdlib only, so like test-python and doc-drift it is cheap enough to run
-# before a commit. Findings tolerated today live in scripts/docs_lint_baseline.txt;
-# a finding not in the baseline fails the gate.
+# before a commit. Every finding fails the gate; there is no baseline file.
 check-docs:
 	python3 scripts/check_docs.py
 
