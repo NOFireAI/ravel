@@ -3,10 +3,11 @@
 //! input sets overlap, query-time dedup by `(series_id, ts)` collapses the
 //! overlap for metrics, but logs and spans have no query-time dedup and would
 //! return the overlapping records twice. The resolver picks one authoritative
-//! record per overlap component (smallest `input_set_hash`), serves its parts,
-//! and serves any input the winner does not name as a raw L0 segment.
+//! record per overlap component (largest input set, then smallest
+//! `input_set_hash`, then the record key), serves its parts, and serves any
+//! input the winner does not name as a raw L0 segment.
 //!
-//! Every test drives a resolve through the real `Catalog` against a
+//! Every test drives a resolve or a fold through the real `Catalog` against a
 //! `MemoryStore`, the same reachability the fix has (the resolver runs on
 //! every query). No segment bytes are needed: resolution reads only records.
 
@@ -76,6 +77,14 @@ async fn put_l0(store: &dyn ObjectStoreBackend, record: &CommitRecord) {
 }
 
 fn part(part_index: u32, seed: u8) -> CompactionPart {
+    part_with_rows(part_index, seed, 10)
+}
+
+/// A part carrying an exact row count, for the tests that assert the resolved
+/// snapshot's rows equal the union of the inputs' rows. A compaction of logs
+/// or spans concatenates its inputs, so a part's `sample_count` is the sum of
+/// the rows of the inputs the record names.
+fn part_with_rows(part_index: u32, seed: u8, sample_count: u64) -> CompactionPart {
     let start = i64::from(HOUR) * NS_PER_HOUR;
     CompactionPart {
         part_index,
@@ -83,7 +92,7 @@ fn part(part_index: u32, seed: u8) -> CompactionPart {
         last_series_id: vec![0xff; 16],
         content_hash: vec![seed; 32],
         object_size: 4096,
-        sample_count: 10,
+        sample_count,
         series_count: 2,
         run_count: 3,
         min_event_ts_ns: start,
@@ -95,8 +104,9 @@ fn part(part_index: u32, seed: u8) -> CompactionPart {
 
 /// Build and PUT a compaction record naming `inputs` for `signal`. `seed`
 /// drives the record's `input_set_hash` (and thus its key and the resolver's
-/// tie-break) independently of `inputs`, so a test can pin which of two
-/// overlapping records wins.
+/// hash tie-break) independently of `inputs`, so a test can pin which of two
+/// equal-cardinality overlapping records wins. Returns the record so a test
+/// can reconstruct its part keys.
 async fn put_compaction_record(
     store: &dyn ObjectStoreBackend,
     signal: Signal,
@@ -104,7 +114,7 @@ async fn put_compaction_record(
     parts: Vec<CompactionPart>,
     created_unix_ns: i64,
     seed: &[u8],
-) {
+) -> CompactionRecord {
     let input_set_hash = *blake3::hash(seed).as_bytes();
     let record = CompactionRecord {
         format_version: 1,
@@ -138,6 +148,7 @@ async fn put_compaction_record(
         )
         .await
         .expect("put compaction record");
+    record
 }
 
 fn hour_range_and_now() -> (TimeRange, i64) {
@@ -171,8 +182,10 @@ fn l0_keys(snapshot: &ravel_catalog::Snapshot) -> Vec<String> {
 }
 
 /// Order two seeds by their `input_set_hash`, returning
-/// `(smaller_hash_seed, larger_hash_seed)`. The resolver's tie-break keeps the
-/// smaller-hash record, so a test hands the winning role the smaller seed.
+/// `(smaller_hash_seed, larger_hash_seed)`. Between records of EQUAL input-set
+/// cardinality the resolver keeps the smaller-hash one, so such a test hands
+/// the winning role the smaller seed. Where the cardinalities differ the hash
+/// does not decide, and a test pins the winner by input count instead.
 fn order_by_hash<'a>(x: &'a [u8], y: &'a [u8]) -> (&'a [u8], &'a [u8]) {
     if blake3::hash(x).as_bytes() <= blake3::hash(y).as_bytes() {
         (x, y)
@@ -286,8 +299,10 @@ async fn overlapping_spans_records_resolve_to_one_authoritative() {
 }
 
 /// An L0 named only by the LOSING record (not by the winner) is not lost: it
-/// falls through to the raw-L0 pass and is served as an L0 segment. The winner
-/// names `[a]`; the loser names `[a, c]`, overlapping on `a` but adding `c`.
+/// falls through to the raw-L0 pass and is served as an L0 segment. The two
+/// records have equal input-set cardinality and neither set contains the
+/// other, so the hash decides: the winner names `[a, b]` and the loser names
+/// `[a, c]`, overlapping on `a`.
 ///
 /// Flipped to watch it fail before the fix: the change that builds `excluded`
 /// from WINNING records only (catalog.rs). Before the fix `excluded` unions
@@ -301,17 +316,20 @@ async fn losing_records_uncovered_l0_input_is_served_as_raw_l0() {
     let (range, now) = hour_range_and_now();
 
     let a = l0_record(Signal::Logs, Uuid::new_v4(), 1, now);
-    let c = l0_record(Signal::Logs, Uuid::new_v4(), 2, now);
+    let b = l0_record(Signal::Logs, Uuid::new_v4(), 2, now);
+    let c = l0_record(Signal::Logs, Uuid::new_v4(), 3, now);
     put_l0(store.as_ref(), &a).await;
+    put_l0(store.as_ref(), &b).await;
     put_l0(store.as_ref(), &c).await;
 
-    // Winner names [a] (smaller seed); loser names [a, c] (overlap on a, extra
-    // c). c is named by no winner, so it must be served as a raw L0.
+    // Winner names [a, b] (smaller seed); loser names [a, c] (overlap on a,
+    // extra c). Same cardinality, so the hash decides. c is named by no
+    // winner, so it must be served as a raw L0.
     let (win_seed, lose_seed) = order_by_hash(b"set-1", b"set-2");
     put_compaction_record(
         store.as_ref(),
         Signal::Logs,
-        &[&a],
+        &[&a, &b],
         vec![part(0, 1)],
         now,
         win_seed,
@@ -459,4 +477,374 @@ async fn overlapping_conflicts_counter_increments_exactly_once() {
         "resolved to one authoritative record"
     );
     assert_eq!(snapshot.segments.len(), 1);
+}
+
+/// Rows a resolve serves, summed over its segments. Logs and spans have no
+/// query-time dedup (docs/consistency-model.md): the distributed merge
+/// concatenates the per-slice results and sorts them, so the rows a query
+/// returns are exactly the rows of the resolved segments.
+fn served_rows(snapshot: &ravel_catalog::Snapshot) -> u64 {
+    snapshot.segments.iter().map(|s| s.sample_count).sum()
+}
+
+/// The three seeds ordered by their `input_set_hash`, ascending. A test that
+/// needs the maximal-cardinality record to lose the hash comparison hands it
+/// the last one.
+fn seeds_by_hash(seeds: [&[u8]; 3]) -> [&[u8]; 3] {
+    let mut ordered = seeds;
+    ordered.sort_by_key(|s| *blake3::hash(s).as_bytes());
+    ordered
+}
+
+fn sorted(mut keys: Vec<String>) -> Vec<String> {
+    keys.sort();
+    keys
+}
+
+/// A logs bucket with two overlapping records serves the UNION of the inputs'
+/// rows, not their sum. `a`, `b` and `c` carry one row each; the winner's part
+/// carries the two rows of `[a, b]` and the loser's the two rows of `[a, c]`.
+/// The union is three rows: two inside the winner's part plus the one row of
+/// the uncovered input `c`, served raw.
+///
+/// Flipped to watch it fail: make `select_authoritative_compaction_records`
+/// return an empty set (catalog.rs), which is how the resolver behaved before
+/// issue #1070. Both parts are then served and `a`'s row is counted twice, so
+/// `served_rows` is 4 and the `== 3` assertion below fails.
+#[tokio::test]
+async fn overlapping_logs_rows_equal_the_union_not_the_sum() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+
+    let a = l0_record(Signal::Logs, Uuid::new_v4(), 1, now);
+    let b = l0_record(Signal::Logs, Uuid::new_v4(), 2, now);
+    let c = l0_record(Signal::Logs, Uuid::new_v4(), 3, now);
+    put_l0(store.as_ref(), &a).await;
+    put_l0(store.as_ref(), &b).await;
+    put_l0(store.as_ref(), &c).await;
+
+    let (win_seed, lose_seed) = order_by_hash(b"rows-1", b"rows-2");
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&a, &b],
+        vec![part_with_rows(0, 1, 2)],
+        now,
+        win_seed,
+    )
+    .await;
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&a, &c],
+        vec![part_with_rows(0, 2, 2)],
+        now,
+        lose_seed,
+    )
+    .await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[], now)
+        .await
+        .expect("resolve");
+
+    assert_eq!(
+        served_rows(&snapshot),
+        3,
+        "the union of a, b and c, with a served once"
+    );
+    assert_eq!(l1_keys(&snapshot).len(), 1, "only the winner's part");
+    assert_eq!(l0_keys(&snapshot).len(), 1, "the uncovered input c, raw");
+}
+
+/// The same for spans, which have no query-time dedup either.
+///
+/// Flipped to watch it fail: the same empty-set flip as above; `served_rows`
+/// becomes 4.
+#[tokio::test]
+async fn overlapping_spans_rows_equal_the_union_not_the_sum() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+
+    let a = l0_record(Signal::Spans, Uuid::new_v4(), 1, now);
+    let b = l0_record(Signal::Spans, Uuid::new_v4(), 2, now);
+    let c = l0_record(Signal::Spans, Uuid::new_v4(), 3, now);
+    put_l0(store.as_ref(), &a).await;
+    put_l0(store.as_ref(), &b).await;
+    put_l0(store.as_ref(), &c).await;
+
+    let (win_seed, lose_seed) = order_by_hash(b"rows-1", b"rows-2");
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Spans,
+        &[&a, &b],
+        vec![part_with_rows(0, 1, 2)],
+        now,
+        win_seed,
+    )
+    .await;
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Spans,
+        &[&a, &c],
+        vec![part_with_rows(0, 2, 2)],
+        now,
+        lose_seed,
+    )
+    .await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Spans, range, &[], now)
+        .await
+        .expect("resolve");
+
+    assert_eq!(
+        served_rows(&snapshot),
+        3,
+        "the union of a, b and c, with a served once"
+    );
+    assert_eq!(l1_keys(&snapshot).len(), 1, "only the winner's part");
+    assert_eq!(l0_keys(&snapshot).len(), 1, "the uncovered input c, raw");
+}
+
+/// The folded index names exactly what a live resolve serves: the winner's L1
+/// entry and, as a raw L0 entry, the input only the loser names. The winner
+/// names the three-input set `[a, b, c]` and carries the LARGER hash, so the
+/// maximal-set tie-break is what selects it.
+///
+/// Fails on the branch before the tie-break change: the smaller-hash record
+/// `[a, d]` wins there, so the folded snapshot names that record's part and
+/// carries `b` and `c` as raw L0 entries. The `l1_keys` equality below fails
+/// (it names the loser's part key), and so does the `l0_keys` equality (two
+/// entries, `b` and `c`, instead of the one entry `d`).
+#[tokio::test]
+async fn fold_of_overlapping_records_names_the_winner_and_the_uncovered_input() {
+    let store = Arc::new(MemoryStore::new());
+    let hour_start = i64::from(HOUR) * NS_PER_HOUR;
+    let created = hour_start + 60_000_000_000;
+    // Six hours past the bucket, so the fold's watermark seals it.
+    let now = hour_start + 6 * NS_PER_HOUR;
+    let range = TimeRange {
+        start_ns: hour_start,
+        end_ns: now,
+    };
+
+    let a = l0_record(Signal::Logs, Uuid::new_v4(), 1, created);
+    let b = l0_record(Signal::Logs, Uuid::new_v4(), 2, created);
+    let c = l0_record(Signal::Logs, Uuid::new_v4(), 3, created);
+    let d = l0_record(Signal::Logs, Uuid::new_v4(), 4, created);
+    for record in [&a, &b, &c, &d] {
+        put_l0(store.as_ref(), record).await;
+    }
+
+    // The maximal set takes the LARGER hash, so only cardinality can select
+    // it. The two records overlap on a.
+    let (lose_seed, win_seed) = order_by_hash(b"fold-1", b"fold-2");
+    let winner = put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&a, &b, &c],
+        vec![part_with_rows(0, 1, 3)],
+        created,
+        win_seed,
+    )
+    .await;
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&a, &d],
+        vec![part_with_rows(0, 2, 2)],
+        created,
+        lose_seed,
+    )
+    .await;
+
+    let winner_part_key =
+        keys::reconstruct_l1_part_key(&winner, &winner.parts[0]).expect("winner part key");
+    let d_key = keys::reconstruct_data_key(&d).expect("d data key");
+
+    // Resolve from the direct listing first, then fold and resolve again: the
+    // index fold and the resolver must derive the same bucket state.
+    let before_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let before = before_catalog
+        .resolve(&tenant(), Signal::Logs, range, &[], now)
+        .await
+        .expect("resolve before fold");
+
+    let fold_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let report = fold_catalog
+        .fold(&tenant(), Signal::Logs, Uuid::new_v4(), now, &[], None)
+        .await
+        .expect("fold");
+    assert!(!report.no_op, "the fold sealed the bucket");
+
+    let after_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let after = after_catalog
+        .resolve(&tenant(), Signal::Logs, range, &[], now)
+        .await
+        .expect("resolve after fold");
+
+    assert_eq!(
+        l1_keys(&after),
+        vec![winner_part_key.clone()],
+        "the folded snapshot names only the winner's L1 entry"
+    );
+    assert_eq!(
+        l0_keys(&after),
+        vec![d_key.clone()],
+        "and the loser's uncovered input as a raw L0 entry"
+    );
+    assert_eq!(after.segments.len(), 2);
+    assert_eq!(
+        before, after,
+        "a live resolve returns the identical segment set"
+    );
+}
+
+/// A transitive component: A overlaps B on `b`, B overlaps C on `d`, and A and
+/// C are disjoint. All three are one component, and the maximal record B wins
+/// even though it carries the largest hash. The inputs only A and C name (`a`
+/// and `e`) are served raw; the inputs B names (`b`, `c`, `d`) are served
+/// inside B's part, once each.
+///
+/// Fails on the branch before the tie-break change: the smallest-hash record A
+/// wins there, so `l1_keys` names A's part and `l0_keys` is `[c, d, e]`. Both
+/// equalities below fail.
+#[tokio::test]
+async fn transitive_overlap_component_resolves_to_the_maximal_record() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+
+    let a = l0_record(Signal::Logs, Uuid::new_v4(), 1, now);
+    let b = l0_record(Signal::Logs, Uuid::new_v4(), 2, now);
+    let c = l0_record(Signal::Logs, Uuid::new_v4(), 3, now);
+    let d = l0_record(Signal::Logs, Uuid::new_v4(), 4, now);
+    let e = l0_record(Signal::Logs, Uuid::new_v4(), 5, now);
+    for record in [&a, &b, &c, &d, &e] {
+        put_l0(store.as_ref(), record).await;
+    }
+
+    // A takes the smallest hash and B the largest, so only cardinality can
+    // select B.
+    let [a_seed, c_seed, b_seed] = seeds_by_hash([b"tri-1", b"tri-2", b"tri-3"]);
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&a, &b],
+        vec![part_with_rows(0, 1, 2)],
+        now,
+        a_seed,
+    )
+    .await;
+    let winner = put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&b, &c, &d],
+        vec![part_with_rows(0, 2, 3)],
+        now,
+        b_seed,
+    )
+    .await;
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&d, &e],
+        vec![part_with_rows(0, 3, 2)],
+        now,
+        c_seed,
+    )
+    .await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[], now)
+        .await
+        .expect("resolve");
+
+    let winner_part_key =
+        keys::reconstruct_l1_part_key(&winner, &winner.parts[0]).expect("winner part key");
+    let a_key = keys::reconstruct_data_key(&a).expect("a data key");
+    let e_key = keys::reconstruct_data_key(&e).expect("e data key");
+
+    assert_eq!(
+        l1_keys(&snapshot),
+        vec![winner_part_key],
+        "the maximal record of the component serves its part"
+    );
+    assert_eq!(
+        sorted(l0_keys(&snapshot)),
+        sorted(vec![a_key, e_key]),
+        "the inputs no winner names are served raw"
+    );
+    assert_eq!(snapshot.segments.len(), 3);
+    assert_eq!(
+        served_rows(&snapshot),
+        5,
+        "each of the five inputs' rows served once"
+    );
+    assert_eq!(catalog.compaction_input_set_conflicts(), 1);
+}
+
+/// A strict superset wins over a smaller-hash subset, and leaves nothing
+/// outside the winner: every input of the component is named by the winner, so
+/// the snapshot is exactly one L1 part.
+///
+/// Fails on the branch before the tie-break change: the smaller-hash subset
+/// `[a, b]` wins there, `c` is served as a raw L0, and the `l0_keys().is_empty
+/// ()` and `segments.len() == 1` assertions below fail (one raw L0, two
+/// segments).
+#[tokio::test]
+async fn strict_superset_input_set_wins_over_the_smaller_hash() {
+    let store = Arc::new(MemoryStore::new());
+    let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+    let (range, now) = hour_range_and_now();
+
+    let a = l0_record(Signal::Logs, Uuid::new_v4(), 1, now);
+    let b = l0_record(Signal::Logs, Uuid::new_v4(), 2, now);
+    let c = l0_record(Signal::Logs, Uuid::new_v4(), 3, now);
+    for record in [&a, &b, &c] {
+        put_l0(store.as_ref(), record).await;
+    }
+
+    let (lose_seed, win_seed) = order_by_hash(b"sup-1", b"sup-2");
+    let winner = put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&a, &b, &c],
+        vec![part_with_rows(0, 1, 3)],
+        now,
+        win_seed,
+    )
+    .await;
+    put_compaction_record(
+        store.as_ref(),
+        Signal::Logs,
+        &[&a, &b],
+        vec![part_with_rows(0, 2, 2)],
+        now,
+        lose_seed,
+    )
+    .await;
+
+    let snapshot = catalog
+        .resolve(&tenant(), Signal::Logs, range, &[], now)
+        .await
+        .expect("resolve");
+
+    let winner_part_key =
+        keys::reconstruct_l1_part_key(&winner, &winner.parts[0]).expect("winner part key");
+    assert_eq!(
+        l1_keys(&snapshot),
+        vec![winner_part_key],
+        "the superset record serves its part"
+    );
+    assert_eq!(
+        l0_keys(&snapshot),
+        Vec::<String>::new(),
+        "the superset leaves no input outside itself"
+    );
+    assert_eq!(snapshot.segments.len(), 1);
+    assert_eq!(served_rows(&snapshot), 3);
 }
