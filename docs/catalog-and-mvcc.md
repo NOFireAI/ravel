@@ -605,7 +605,18 @@ already-sealed hours:
   sweeper may physically delete a superseded compaction input) plus slack.
   Because the sweeper only deletes an input after that horizon, any record
   whose supersession could invalidate a snapshot entry is observed by a
-  reconcile pass before its inputs can disappear.
+  reconcile pass before its inputs can disappear, provided the record lands
+  inside this window. Compaction does: it targets hours near the watermark.
+  A selective-erasure rewrite record can land in any sealed hour, and this
+  window and the retention-frontier band below are the fold's only
+  reconciliation of a late record; no hook lets a rewrite pass force one
+  hour. A rewrite whose hour is older than this window and newer than the
+  retirement frontier is re-listed by neither pass, so its covering part
+  keeps naming the pre-rewrite inputs until the frontier band reaches that
+  hour, or until an operator rebuilds HEAD. Subject erasure stays correct
+  meanwhile (the query-time predicate outlives the inputs); the availability
+  cost once the sweeper deletes those inputs is stated in
+  docs/deletion-and-gc.md, "Selective subject erasure".
 - **Skipped when redundant.** The pass does not run on the first fold for a
   tenant (no previous watermark exists) or on a rebuilt fold (absent, corrupt,
   or unreadable-part HEAD): a rebuild already re-derives every hour from the
@@ -659,7 +670,10 @@ normally days) behind the watermark, so the fixed window alone would never
 observe it, and the snapshot would keep naming the retired bucket's segments
 forever. The retention-frontier reconcile below covers exactly that case.
 (This closes a latent correctness gap; see ADR-0063 Consequences and
-ADR-0020.)
+ADR-0020.) A rewrite record takes the same two routes and no third: inside
+the fixed window it is applied on the next fold, in an hour at or
+approaching the retirement frontier it is applied by the frontier band, and
+in between it waits for the frontier band to reach its hour.
 
 ## Retention-frontier reconcile (ADR-0020 delete blocker)
 

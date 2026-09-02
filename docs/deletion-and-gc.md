@@ -325,7 +325,10 @@ every bound is measured.
 - **Physical removal reuses the existing sweep.** A rewrite's superseded
   inputs become inputs to `sweep_superseded`, deleted after
   `protection_horizon`, under the same `LegalHoldCheck` gate as every other
-  delete. The `.dreq` itself contains the subject
+  delete. That sweep carries no HEAD-reachability blocker: unlike retention,
+  it deletes an input on schedule even when a snapshot part the fold has not
+  reconciled still names it (see "Scope and interactions" below for what a
+  query then sees). The `.dreq` itself contains the subject
   identifier and is therefore not kept forever: a sweep rule deletes it once
   its `.done` exists, `now >= done.created_unix_ns + protection_horizon`, and
   the legal-hold check passes; the horizon wait guarantees the query-time
@@ -408,9 +411,17 @@ into them. An operator with erasure obligations must budget them deliberately.
     erasure by construction. This holds *only if* subject identifiers appear
     as label/attribute values and never inside metric names (a documented
     requirement; see docs/object-store-contract.md "Required bucket
-    configuration" point 5). Superseded catalog entries resolve to NotFound,
-    then SnapshotInvalidated, then re-resolve, and the next fold rebuilds over the
-    rewrite outputs.
+    configuration" point 5). A snapshot entry whose object a rewrite
+    superseded is refreshed only when the fold reconciles that hour, through
+    the fixed window or the retention-frontier band (docs/catalog-and-mvcc.md,
+    "Fold reconcile pass"). Until then a query over that hour resolves the
+    pre-rewrite inputs from the stale part, and the query-time predicate
+    removes the erased records after fetch. Once `sweep_superseded` has
+    deleted those inputs, the same query fails closed with
+    `SnapshotInvalidated` on every attempt, because a re-resolve reads the
+    same stale HEAD, until the fold reconciles the hour or an operator
+    rebuilds HEAD. That is an availability cost, never a served pre-rewrite
+    record: the `.dreq` outlives the inputs by construction.
   - **ADR-0028 analytics/derived datasets are a pure query-time stage, not a
     persisted store.** `ravel-analytics` carries no clock, IO, object-store,
     or catalog (docs/analytics.md): every analytic runs in memory over query
