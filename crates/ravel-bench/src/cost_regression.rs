@@ -328,8 +328,13 @@ impl Band {
 /// - `cold_gets_max` / `modeled_cost_max_nanodollars`: corpus-scale absolutes.
 ///   Corpus-specific, so the checked-in defaults leave them unset (`None`) and
 ///   the TOML ships them commented out with the corpus named; setting one gates
-///   the [`FigureClass::DataGets`] / [`FigureClass::ModeledRequestCost`]
-///   figures against that ceiling.
+///   exactly the AGGREGATE figure it was measured for (`data_gets` /
+///   `modeled_request_cost`, by name). Class siblings are deliberately outside
+///   it: the calls diagnostic and the transfer/retrieval cost terms measure
+///   different quantities, and a statement-scoped figure such as
+///   `q07.data_gets` is a per-statement quantity a corpus-scale ceiling has no
+///   basis to judge; per-statement ceilings would be different numbers under a
+///   different key.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Absolutes {
     /// Upper bound on any range-amplification figure. `None` disables.

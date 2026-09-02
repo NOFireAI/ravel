@@ -108,5 +108,8 @@ ranged_opens_max = 0.0
 # Corpus-scale ceilings, left UNSET here on purpose: they are figures of one
 # corpus and would fail any other. The values below are the cb-bigbatch corpus
 # ceilings; uncomment them only in a bands document used against cb-bigbatch.
+# Each judges exactly the aggregate figure it was measured for (data_gets /
+# modeled_request_cost); statement-scoped figures like q07.data_gets are
+# per-statement quantities these run-scale ceilings have no basis to judge.
 # cold_gets_max = 160000.0
 # modeled_cost_max_nanodollars = 64000000.0
