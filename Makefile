@@ -16,6 +16,9 @@ test:
 # tests deliberately take no third-party dependency, and CI has no Python
 # environment beyond the interpreter. Run from scripts/ so the tests'
 # `from process_metrics import ...` resolves without a package layout.
+# Supported interpreter floor: Python 3.9 or newer (fleet executors run
+# 3.9.25). Keep the scripts import-clean on 3.9: `from __future__ import
+# annotations` plus typing.Optional[...] rather than the 3.10 `X | None` form.
 test-python:
 	cd scripts && python3 -m unittest discover -p 'test_*.py' -v
 
