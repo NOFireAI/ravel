@@ -481,3 +481,44 @@ class TestGeneratedScope(RepoCase):
         })
         self.assertTrue(self.rules(f, "SUPERLATIVE"))
         self.assertTrue(self.rules(f, "LINK"))
+
+
+class TestBaselineKeyTolerance(RepoCase):
+    """An occurrence count of an already-baselined key is not enforced, so a
+    concurrent pull request adding a 148th citation to a file with 147
+    baselined ones cannot fail a branch that never touched it. A key the file
+    has not carried before is still NEW."""
+
+    def test_another_occurrence_of_a_baselined_key_passes(self):
+        self.write({"docs/guides/a.md": "# A\n\nSee ADR-0001.\n"})
+        self.assertEqual(self.update_baseline(), 0)
+        # The same citation again, as a concurrent branch would add it.
+        self.write({
+            "docs/guides/a.md": "# A\n\nSee ADR-0001.\n\nAnd ADR-0001 again.\n",
+        })
+        code, out = self.gate()
+        self.assertEqual(code, 0, out)
+
+    def test_a_different_key_same_rule_still_fails(self):
+        # This is the distinction: same rule, key the file never carried.
+        self.write({"docs/guides/a.md": "# A\n\nSee ADR-0001.\n"})
+        self.assertEqual(self.update_baseline(), 0)
+        self.write({"docs/guides/a.md": "# A\n\nSee ADR-0001 and ADR-0002.\n"})
+        code, out = self.gate()
+        self.assertEqual(code, 1, out)
+        self.assertIn("ADR-0002", out)
+        self.assertNotIn("NEW  docs/guides/a.md\tTRACKER\tADR-0001", out)
+
+    def test_a_baselined_key_does_not_leak_to_another_file(self):
+        self.write({
+            "docs/guides/a.md": "# A\n\nSee ADR-0001.\n",
+            "docs/guides/b.md": "# B\n\nClean.\n",
+        })
+        self.assertEqual(self.update_baseline(), 0)
+        self.write({
+            "docs/guides/a.md": "# A\n\nSee ADR-0001.\n",
+            "docs/guides/b.md": "# B\n\nSee ADR-0001.\n",
+        })
+        code, out = self.gate()
+        self.assertEqual(code, 1, out)
+        self.assertIn("docs/guides/b.md", out)

@@ -530,6 +530,7 @@ docs/guides/operations.md	SRCPATH	crates/ravel-catalog/src/config.rs
 docs/guides/operations.md	SRCPATH	crates/ravel-catalog/src/key_epoch.rs
 docs/guides/operations.md	SRCPATH	crates/ravel-commit/tests/iam_templates.rs
 docs/guides/operations.md	SRCPATH	crates/ravel-failure-tests/tests/folder_crash_matrix.rs
+docs/guides/operations.md	SRCPATH	crates/ravel-fleet/src/query_workers.rs
 docs/guides/operations.md	SRCPATH	crates/ravel-object-store/src/kms_routing.rs
 docs/guides/operations.md	SRCPATH	crates/ravel-query/src/fetcher.rs
 docs/guides/operations.md	SRCPATH	services/ravel-cli/src/store.rs
@@ -743,6 +744,7 @@ docs/guides/operations.md	TRACKER	ADR-0904
 docs/guides/operations.md	TRACKER	ADR-0904
 docs/guides/operations.md	TRACKER	ADR-0979
 docs/guides/operations.md	TRACKER	ADR-0996
+docs/guides/operations.md	TRACKER	ADR-1029
 docs/guides/query.md	SRCPATH	crates/ravel-promql-difftest/src/scoring.rs
 docs/guides/query.md	SRCPATH	crates/ravel-promql-difftest/src/scoring.rs
 docs/guides/query.md	SRCPATH	crates/ravel-query/src/config.rs
