@@ -1446,21 +1446,45 @@ async fn load_instrumented(
     // each shard's own channel, so it merges behind the writes already queued
     // there, publishes whatever they buffered, and answers their waiters; the
     // drain below then resolves at PUT speed instead of on the age clock. A
-    // write whose task has not yet reached its channel send is the case
-    // `write_ack_deadline` covers: it is released by the age trigger and its
-    // ack is awaited long enough to arrive.
+    // write whose task had not yet reached its channel send when this flush
+    // ran lands in a fresh buffer afterward; without help it would wait out
+    // the age trigger (up to the whole raised delay of silent tail stall,
+    // inside the scaled ack deadline but ugly), so a re-flush ticker below
+    // sweeps such stragglers every few seconds while the drain runs. Sends
+    // are FIFO per shard, so re-flushing never splits a dispatched write's
+    // records; at most a straggler gets its own object, exactly as
+    // `--target-bytes 1` would have laid it out.
     router.flush_all().await;
 
     // Drain every write still in the window in the same oldest-first order
-    // before reporting success.
-    drain_inflight(
-        &mut inflight,
-        &mut report,
-        &mut shards_seen,
-        &mut data_batches_flushed,
-        shards,
-    )
-    .await?;
+    // before reporting success, with the straggler re-flush ticker running
+    // alongside and stopped (and its task reaped) as soon as the drain ends.
+    let drain_result = {
+        let ticker_router = Arc::clone(&router);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    () = tokio::time::sleep(Duration::from_secs(2)) => {
+                        ticker_router.flush_all().await;
+                    }
+                }
+            }
+        });
+        let result = drain_inflight(
+            &mut inflight,
+            &mut report,
+            &mut shards_seen,
+            &mut data_batches_flushed,
+            shards,
+        )
+        .await;
+        let _ = stop_tx.send(());
+        let _ = ticker.await;
+        result
+    };
+    drain_result?;
 
     // Snapshot the router's cumulative counters before it drops: the caller
     // reads the dynamic-column figures to warn on overflow or near-cap pressure
