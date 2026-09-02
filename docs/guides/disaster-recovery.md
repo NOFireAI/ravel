@@ -230,19 +230,23 @@ aws s3api get-bucket-versioning --bucket <primary>
 # Primary: the enabled lifecycle rules. Pass only when one row carries
 # noncurrent_days equal to E_v, one carries expired_delete_markers true,
 # and one carries abort_mpu_days of 7 or less (the contract's required
-# AbortIncompleteMultipartUpload rule).
+# AbortIncompleteMultipartUpload rule), AND each of those rows has an
+# empty scope (both scope columns null: the rule covers the whole bucket)
+# or a scope that, across the rows, covers every t/ prefix. A rule scoped
+# to one prefix leaves noncurrent versions elsewhere unbounded, and the
+# +E_v bound does not hold.
 aws s3api get-bucket-lifecycle-configuration --bucket <primary> \
-  --query 'Rules[?Status==`Enabled`].{id:ID,noncurrent_days:NoncurrentVersionExpiration.NoncurrentDays,expired_delete_markers:Expiration.ExpiredObjectDeleteMarker,abort_mpu_days:AbortIncompleteMultipartUpload.DaysAfterInitiation}' \
+  --query 'Rules[?Status==`Enabled`].{id:ID,scope:Filter.Prefix,legacy_scope:Prefix,noncurrent_days:NoncurrentVersionExpiration.NoncurrentDays,expired_delete_markers:Expiration.ExpiredObjectDeleteMarker,abort_mpu_days:AbortIncompleteMultipartUpload.DaysAfterInitiation}' \
   --output table
 
 # Primary: replication v2, DeleteMarkerReplication enabled, RTC (if required)
 aws s3api get-bucket-replication --bucket <primary>
 
-# Replica: versioning ON, and the same rule check with noncurrent_days
-# equal to E_v_r and expired_delete_markers true.
+# Replica: versioning ON, and the same rule and scope check with
+# noncurrent_days equal to E_v_r and expired_delete_markers true.
 aws s3api get-bucket-versioning --bucket <replica>
 aws s3api get-bucket-lifecycle-configuration --bucket <replica> \
-  --query 'Rules[?Status==`Enabled`].{id:ID,noncurrent_days:NoncurrentVersionExpiration.NoncurrentDays,expired_delete_markers:Expiration.ExpiredObjectDeleteMarker}' \
+  --query 'Rules[?Status==`Enabled`].{id:ID,scope:Filter.Prefix,legacy_scope:Prefix,noncurrent_days:NoncurrentVersionExpiration.NoncurrentDays,expired_delete_markers:Expiration.ExpiredObjectDeleteMarker}' \
   --output table
 
 # Object Lock enabled on the bucket, and whether a bucket default
@@ -325,8 +329,12 @@ verified operation.
 4. **Verify before serving.** `verify-custody` clean, `catalog verify` clean,
    and a canary query set over known-ingested data.
 5. **Re-protect before the first process starts.** The restore bucket must
-   meet the baseline before Ravel writes to it: versioning on and Object Lock
-   enabled. At levels 0 and 1 that means no default retention and the
+   meet the baseline before Ravel writes to it: versioning on with the
+   primary's `NoncurrentDays = E_v` rule and expired-delete-marker cleanup
+   installed (a promoted replica still carries `E_v_r`; replace it), and
+   Object Lock enabled. Without the lifecycle rules the erasure bound does
+   not hold for anything written from this point. At levels 0 and 1 that
+   also means no default retention and the
    retention mechanism pointed at the restore bucket and backfilled over the
    restored objects: objects restored before the mechanism runs carry no
    retention, so run the backfill and confirm one current and one noncurrent
@@ -339,9 +347,9 @@ verified operation.
    pays off here: processes mint fresh writer ids and epochs, no local state
    exists to reconcile, and the operator issues fresh per-mode storage
    credentials scoped to the restore bucket.
-7. **Replicate and close out.** Re-establish the lifecycle rules and
-   replication to a new replica before declaring the incident closed. An
-   unreplicated restored primary is level 0.
+7. **Replicate and close out.** Re-establish replication to a new replica,
+   with the replica's own versioning and lifecycle rules, before declaring
+   the incident closed. Until that is done the deployment is level 0.
 
 ## RPO and RTO: defined here, published only from a rehearsal
 
