@@ -1031,8 +1031,10 @@ async fn load_compaction_records(
 /// segment: it is the sole server of its rows. So an input is superseded only
 /// where an authoritative record names it. Treating a loser's whole input set
 /// as superseded deletes that sole server and turns duplicate rows into
-/// missing rows. A loser's own parts become unreferenced instead and fall to
-/// rule 3.
+/// missing rows. A loser's own parts stay referenced for as long as the losing
+/// record exists (the reference map does not distinguish winners from losers,
+/// and a node that has not adopted this rule may still serve them), so this
+/// pass reclaims nothing of the loser's.
 #[derive(Default)]
 struct AuthoritativeInputs {
     by_bucket: HashMap<u32, HashSet<(String, u64, u64)>>,

@@ -2472,10 +2472,11 @@ impl Catalog {
         // conflict would ever be observed for the ordinary case.
         self.check_rewrite_siblings(shard, hour, &rewrite_records, &superseded_records);
 
-        // Compaction parts: contribute each non-superseded record's parts as
-        // level-1 entries. Two records with different input sets in one
-        // bucket both contribute (a harmless overlap the resolver alarms on
-        // but still serves).
+        // Compaction parts: contribute each non-superseded, authoritative
+        // record's parts as level-1 entries. Records whose input sets overlap
+        // resolve to one winner per overlap component, exactly as the live
+        // resolver picks it; a loser's parts are skipped and any input only
+        // the loser names stays a raw level-0 entry.
         for (ckey, record) in &compaction_records {
             if superseded_records.contains(ckey.as_str())
                 || losing_compaction_records.contains(ckey.as_str())
