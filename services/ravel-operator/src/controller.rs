@@ -34,10 +34,11 @@ use crate::crd::{
     RavelClusterSpec, RavelClusterStatus, ShardOverridesSpec,
 };
 use crate::reconcile::{
-    DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE,
-    GC_BOOTSTRAP_UNAVAILABLE_REASON, GcBootstrapGate, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY,
-    S3_SECRET_ACCESS_KEY_KEY, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
-    desired_objects, grpcroute_api_resource, httproute_api_resource, possible_gateway_route_names,
+    DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_STALL_AFTER,
+    GC_BOOTSTRAP_STALLED_REASON, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE, GC_BOOTSTRAP_UNAVAILABLE_REASON,
+    GcBootstrapGate, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
+    WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON, desired_objects,
+    grpcroute_api_resource, httproute_api_resource, possible_gateway_route_names,
     possible_ingest_ingress_names, possible_router_object_names,
 };
 
@@ -1191,14 +1192,15 @@ async fn reconcile_inner(
     // nothing extra, because any tier can create the object there.
     let plan = desired.gc_bootstrap;
     let maintain_name = child(instance, "maintain");
-    let (maintain_ready_before, request_serving_exists) = if plan.reads_live_state() {
-        let ready = live_ready_replicas(&deployments, &maintain_name).await?;
-        let exists = live_deployment_exists(&deployments, &child(instance, "gateway")).await?
-            || live_deployment_exists(&deployments, &child(instance, "query")).await?;
-        (ready, exists)
-    } else {
-        (None, false)
-    };
+    let (maintain_ready_before, maintain_unavailable_before, request_serving_exists) =
+        if plan.reads_live_state() {
+            let (ready, unavailable) = live_replica_counts(&deployments, &maintain_name).await?;
+            let exists = live_deployment_exists(&deployments, &child(instance, "gateway")).await?
+                || live_deployment_exists(&deployments, &child(instance, "query")).await?;
+            (ready, unavailable, exists)
+        } else {
+            (None, None, false)
+        };
 
     let mut tiers = TierDeployments {
         gateway: Some(desired.gateway_deployment),
@@ -1230,54 +1232,81 @@ async fn reconcile_inner(
         .applied(DeploymentTier::Query)
         .and_then(ready_replicas);
     let waiting = plan.waiting_for_bootstrap(maintain_ready_before, request_serving_exists);
-    let available_hold = match plan.gate {
-        GcBootstrapGate::Unavailable
-            if gateway_ready.unwrap_or(0) <= 0 && query_ready.unwrap_or(0) <= 0 =>
-        {
-            // Maintain is disabled and the per-role credentials give neither
-            // request-serving tier a write grant on `sys/gc`, so their pods
-            // restart until `sys/gc` is created out of band. Surface that as a
-            // misconfiguration, but only while neither is serving: once either
-            // reports a ready replica the object exists and the cluster runs,
-            // so record no bootstrap condition at all. This outranks a router
-            // render error for the pass's single `Degraded` entry: it stops the
-            // whole cluster from becoming ready, where a router error stops only
-            // ingest routing.
-            degraded = Some((
-                GC_BOOTSTRAP_UNAVAILABLE_REASON.to_string(),
-                GC_BOOTSTRAP_UNAVAILABLE_MESSAGE.to_string(),
-            ));
-            Some((
-                GC_BOOTSTRAP_UNAVAILABLE_REASON,
-                GC_BOOTSTRAP_UNAVAILABLE_MESSAGE,
-            ))
-        }
-        _ if waiting => Some((
-            WAITING_FOR_GC_BOOTSTRAP_REASON,
-            WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
-        )),
-        _ => None,
+
+    // Bootstrap-wait stall tracking (#1097). The operator is disposable, so it
+    // cannot keep a live counter of how long the hold has lasted; it persists
+    // the first-waiting timestamp in status and derives the stall from it. The
+    // clock is read once here (the wiring layer); the stall DECISION is a pure
+    // function of that value and the persisted timestamp. When the hold ends,
+    // `wait_status` is `None`, which clears both the condition and the field.
+    let existing_waiting_since = obj
+        .status
+        .as_ref()
+        .and_then(|status| status.gc_bootstrap_waiting_since.as_deref())
+        .and_then(parse_rfc3339_utc);
+    let wait_status = waiting.then(|| {
+        gc_bootstrap_wait_status(
+            &maintain_name,
+            existing_waiting_since,
+            now_unix_secs(),
+            maintain_ready_before,
+            maintain_unavailable_before,
+            obj.metadata.generation,
+        )
+    });
+
+    // Maintain is disabled and the per-role credentials give neither
+    // request-serving tier a write grant on `sys/gc`, so their pods restart
+    // until `sys/gc` is created out of band. Surface that as a misconfiguration,
+    // but only while neither is serving: once either reports a ready replica the
+    // object exists and the cluster runs, so record no bootstrap condition at
+    // all. This outranks a router render error for the pass's single `Degraded`
+    // entry: it stops the whole cluster from becoming ready, where a router
+    // error stops only ingest routing.
+    let unavailable_gate = matches!(plan.gate, GcBootstrapGate::Unavailable)
+        && gateway_ready.unwrap_or(0) <= 0
+        && query_ready.unwrap_or(0) <= 0;
+    if unavailable_gate {
+        degraded = Some((
+            GC_BOOTSTRAP_UNAVAILABLE_REASON.to_string(),
+            GC_BOOTSTRAP_UNAVAILABLE_MESSAGE.to_string(),
+        ));
+    }
+    let available_hold: Option<(&str, String)> = if unavailable_gate {
+        Some((
+            GC_BOOTSTRAP_UNAVAILABLE_REASON,
+            GC_BOOTSTRAP_UNAVAILABLE_MESSAGE.to_string(),
+        ))
+    } else {
+        wait_status
+            .as_ref()
+            .map(|w| (w.available_reason, w.available_message.clone()))
     };
-    if let Some((reason, message)) = &degraded {
-        extra_conditions.push(condition(
+
+    // Resolve the pass's single `Degraded` entry (the conditions array is keyed
+    // by type). A stalled wait is `Degraded=True` on `GcBootstrapStalled` and
+    // outranks a concurrent router render error, since the whole cluster is
+    // held, not just ingest routing; the Unavailable gate never coincides with a
+    // wait. A progressing wait is an explicit `Degraded=False`, so
+    // `kubectl wait --for=condition=Degraded=false` succeeds while the bootstrap
+    // is still in flight and only `Available` reports the wait.
+    let stalled = wait_status.as_ref().is_some_and(|w| w.stalled);
+    let degraded_condition = match (&degraded, &wait_status) {
+        (Some((reason, message)), _) if !stalled => Some(condition(
             "Degraded",
             true,
             obj.metadata.generation,
             reason,
             message,
-        ));
-    } else if waiting {
-        // Held back, not broken. An explicit `Degraded=False` says so, so
-        // `kubectl wait --for=condition=Degraded=false` succeeds while the
-        // bootstrap is still in flight and only `Available` reports the wait.
-        extra_conditions.push(condition(
-            "Degraded",
-            false,
-            obj.metadata.generation,
-            WAITING_FOR_GC_BOOTSTRAP_REASON,
-            WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
-        ));
+        )),
+        (_, Some(w)) => Some(w.degraded.clone()),
+        _ => None,
+    };
+    if let Some(c) = degraded_condition {
+        extra_conditions.push(c);
     }
+
+    let gc_bootstrap_waiting_since = wait_status.as_ref().map(|w| w.waiting_since.clone());
 
     write_status(
         client,
@@ -1287,7 +1316,8 @@ async fn reconcile_inner(
         gateway_ready,
         query_ready,
         maintain_ready,
-        available_hold,
+        available_hold.as_ref().map(|(r, m)| (*r, m.as_str())),
+        gc_bootstrap_waiting_since,
         extra_conditions,
     )
     .await?;
@@ -1348,12 +1378,20 @@ impl TierDeployments {
     }
 }
 
-/// Ready replicas the live Deployment `name` reports, or `None` when it does not
-/// exist yet (the fresh-cluster case) or reports none.
-async fn live_ready_replicas(api: &Api<Deployment>, name: &str) -> Result<Option<i32>, Error> {
+/// The live Deployment `name`'s `(ready, unavailable)` replica counts, or
+/// `(None, None)` when it does not exist yet (the fresh-cluster case). Read in
+/// one GET so the bootstrap-wait status can name both counts without a second
+/// round trip.
+async fn live_replica_counts(
+    api: &Api<Deployment>,
+    name: &str,
+) -> Result<(Option<i32>, Option<i32>), Error> {
     match api.get(name).await {
-        Ok(deployment) => Ok(ready_replicas(&deployment)),
-        Err(err) if is_not_found(&err) => Ok(None),
+        Ok(deployment) => Ok((
+            ready_replicas(&deployment),
+            unavailable_replicas(&deployment),
+        )),
+        Err(err) if is_not_found(&err) => Ok((None, None)),
         Err(err) => Err(err.into()),
     }
 }
@@ -1374,6 +1412,14 @@ fn ready_replicas(deployment: &Deployment) -> Option<i32> {
         .status
         .as_ref()
         .and_then(|status| status.ready_replicas)
+}
+
+/// Unavailable-replica count from a Deployment's status, if reported yet.
+fn unavailable_replicas(deployment: &Deployment) -> Option<i32> {
+    deployment
+        .status
+        .as_ref()
+        .and_then(|status| status.unavailable_replicas)
 }
 
 /// Whether a kube error is a 404 Not Found.
@@ -1451,12 +1497,14 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
 /// pass knows one better than "not ready yet": today the `sys/gc` bootstrap
 /// hold and its unavailable case. It cannot make a ready cluster unavailable,
 /// only explain an unready one.
+#[allow(clippy::too_many_arguments)]
 fn build_status(
     observed_generation: Option<i64>,
     gateway_ready: Option<i32>,
     query_ready: Option<i32>,
     maintain_ready: Option<i32>,
     unavailable_reason: Option<(&str, &str)>,
+    gc_bootstrap_waiting_since: Option<String>,
     extra_conditions: Vec<Condition>,
 ) -> RavelClusterStatus {
     let available = gateway_ready.unwrap_or(0) > 0 && query_ready.unwrap_or(0) > 0;
@@ -1486,11 +1534,14 @@ fn build_status(
         gateway_ready_replicas: gateway_ready,
         query_ready_replicas: query_ready,
         maintain_ready_replicas: maintain_ready,
+        gc_bootstrap_waiting_since,
         conditions,
     }
 }
 
-/// Build the failure-path status. Pure counterpart of [`build_status`].
+/// Build the failure-path status. Pure counterpart of [`build_status`]. Clears
+/// `gcBootstrapWaitingSince`: a reconcile error is not a bootstrap hold, so it
+/// does not carry the wait timestamp.
 fn build_degraded_status(
     observed_generation: Option<i64>,
     reason: &str,
@@ -1507,6 +1558,7 @@ fn build_degraded_status(
         gateway_ready_replicas: None,
         query_ready_replicas: None,
         maintain_ready_replicas: None,
+        gc_bootstrap_waiting_since: None,
         conditions,
     }
 }
@@ -1526,6 +1578,7 @@ async fn write_status(
     query_ready: Option<i32>,
     maintain_ready: Option<i32>,
     unavailable_reason: Option<(&str, &str)>,
+    gc_bootstrap_waiting_since: Option<String>,
     extra_conditions: Vec<Condition>,
 ) -> Result<(), Error> {
     let status = build_status(
@@ -1534,6 +1587,7 @@ async fn write_status(
         query_ready,
         maintain_ready,
         unavailable_reason,
+        gc_bootstrap_waiting_since,
         extra_conditions,
     );
     patch_status(client, namespace, instance, &status).await
@@ -1601,14 +1655,21 @@ fn degraded_reason(err: &Error) -> (String, String) {
     }
 }
 
+/// Current Unix time in seconds. The wiring-layer clock read (like [`now_ns`]);
+/// the bootstrap-stall DECISION derived from it is a pure function of this value
+/// and the persisted timestamp (see [`gc_bootstrap_wait_status`]), never a
+/// wall-clock read inside the function under test.
+fn now_unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Current UTC time as an RFC3339 string for a status Condition's
 /// `lastTransitionTime`. Uses the system clock directly (see [`condition`]).
 fn now_rfc3339() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    format_rfc3339_utc(secs)
+    format_rfc3339_utc(now_unix_secs())
 }
 
 /// Format a Unix timestamp (seconds) as an RFC3339 UTC string
@@ -1635,6 +1696,157 @@ fn format_rfc3339_utc(unix_secs: i64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { year + 1 } else { year };
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// Parse the fixed `YYYY-MM-DDThh:mm:ssZ` form [`format_rfc3339_utc`] emits back
+/// to a Unix timestamp (seconds). Returns `None` for anything not in that exact
+/// shape, so a corrupt persisted timestamp restarts the bootstrap clock rather
+/// than panicking. The inverse `days_from_civil` (Howard Hinnant) mirrors the
+/// formatter so a round trip is the identity across the range it produces.
+fn parse_rfc3339_utc(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let field = |lo: usize, hi: usize| -> Option<i64> {
+        let mut value: i64 = 0;
+        for &c in &b[lo..hi] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            value = value * 10 + i64::from(c - b'0');
+        }
+        Some(value)
+    };
+    let year = field(0, 4)?;
+    let month = field(5, 7)?;
+    let day = field(8, 10)?;
+    let hour = field(11, 13)?;
+    let minute = field(14, 16)?;
+    let second = field(17, 19)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    // days_from_civil: (year, month, day) -> days since 1970-01-01.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// The `Available=False` bootstrap-wait message, extended with the maintain
+/// Deployment's observed ready/unavailable replica counts so the wait names the
+/// state it is watching. Reused for the `Degraded=False` condition while the
+/// wait is still progressing.
+fn gc_bootstrap_waiting_message(ready: Option<i32>, unavailable: Option<i32>) -> String {
+    format!(
+        "{WAITING_FOR_GC_BOOTSTRAP_MESSAGE}; maintain reports {} ready and {} unavailable replicas",
+        ready.unwrap_or(0),
+        unavailable.unwrap_or(0),
+    )
+}
+
+/// The `Degraded=True` message once a bootstrap wait is stalled, naming the
+/// maintain Deployment and its observed replica counts.
+fn gc_bootstrap_stalled_message(
+    maintain_deployment: &str,
+    ready: Option<i32>,
+    unavailable: Option<i32>,
+) -> String {
+    format!(
+        "the maintain Deployment {maintain_deployment} has not reported a ready replica after {} \
+         minutes of sys/gc bootstrap wait: {} ready, {} unavailable replicas; the gateway and \
+         query Deployments remain held until sys/gc exists. Check maintain.credentialsSecretRef \
+         and the maintain pod's image and logs",
+        GC_BOOTSTRAP_STALL_AFTER.as_secs() / 60,
+        ready.unwrap_or(0),
+        unavailable.unwrap_or(0),
+    )
+}
+
+/// The status contributions of one `sys/gc` bootstrap-waiting pass (#1097).
+///
+/// Built purely from the persisted first-waiting timestamp and the injected
+/// `now`, so the stall decision is testable without a cluster or a wall clock.
+struct GcBootstrapWaitStatus {
+    /// RFC3339 timestamp to persist in `status.gcBootstrapWaitingSince`: the
+    /// existing one when the wait continues, or `now` on the first waiting pass.
+    waiting_since: String,
+    /// Reason for the `Available=False` hold (`WaitingForGcBootstrap`), kept
+    /// even once stalled so recovery is a single condition flip.
+    available_reason: &'static str,
+    /// Message for the `Available=False` hold, carrying the observed counts.
+    available_message: String,
+    /// The single `Degraded` condition: `False` while progressing, `True` with
+    /// reason `GcBootstrapStalled` once the wait passes the threshold.
+    degraded: Condition,
+    /// Whether the wait is now reported stalled.
+    stalled: bool,
+}
+
+/// Decide the bootstrap-wait status for a pass that is holding the
+/// request-serving tiers.
+///
+/// `existing_since_secs` is the persisted `gcBootstrapWaitingSince` (parsed to
+/// Unix seconds) or `None` on the first waiting pass; `now_secs` is the injected
+/// clock. The timestamp is set on the first pass and carried unchanged
+/// thereafter, and the wait is reported stalled once it has continued for at
+/// least [`GC_BOOTSTRAP_STALL_AFTER`].
+fn gc_bootstrap_wait_status(
+    maintain_deployment: &str,
+    existing_since_secs: Option<i64>,
+    now_secs: i64,
+    maintain_ready: Option<i32>,
+    maintain_unavailable: Option<i32>,
+    observed_generation: Option<i64>,
+) -> GcBootstrapWaitStatus {
+    let since = existing_since_secs.unwrap_or(now_secs);
+    let stalled = now_secs.saturating_sub(since) >= GC_BOOTSTRAP_STALL_AFTER.as_secs() as i64;
+    let available_message = gc_bootstrap_waiting_message(maintain_ready, maintain_unavailable);
+    let degraded = if stalled {
+        condition(
+            "Degraded",
+            true,
+            observed_generation,
+            GC_BOOTSTRAP_STALLED_REASON,
+            &gc_bootstrap_stalled_message(
+                maintain_deployment,
+                maintain_ready,
+                maintain_unavailable,
+            ),
+        )
+    } else {
+        condition(
+            "Degraded",
+            false,
+            observed_generation,
+            WAITING_FOR_GC_BOOTSTRAP_REASON,
+            &available_message,
+        )
+    };
+    GcBootstrapWaitStatus {
+        waiting_since: format_rfc3339_utc(since),
+        available_reason: WAITING_FOR_GC_BOOTSTRAP_REASON,
+        available_message,
+        degraded,
+        stalled,
+    }
 }
 
 /// Requeue with a fixed backoff on reconcile failure.
@@ -1774,7 +1986,15 @@ mod tests {
             vec!["IngestAffinityBackendDeprecated"]
         );
 
-        let ok = build_status(Some(7), Some(3), Some(2), Some(1), None, extra.clone());
+        let ok = build_status(
+            Some(7),
+            Some(3),
+            Some(2),
+            Some(1),
+            None,
+            None,
+            extra.clone(),
+        );
         assert_eq!(
             condition_types(&ok.conditions),
             vec!["Available", "IngestAffinityBackendDeprecated"]
@@ -1847,7 +2067,7 @@ mod tests {
                 "no spec-derived condition, got {:?}",
                 condition_types(&extra)
             );
-            let ok = build_status(Some(2), Some(1), Some(1), None, None, extra.clone());
+            let ok = build_status(Some(2), Some(1), Some(1), None, None, None, extra.clone());
             assert_eq!(condition_types(&ok.conditions), vec!["Available"]);
             let degraded = build_degraded_status(Some(2), "ReconcileError", "boom", extra);
             assert_eq!(
@@ -1875,6 +2095,7 @@ mod tests {
                 WAITING_FOR_GC_BOOTSTRAP_REASON,
                 WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
             )),
+            None,
             vec![condition(
                 "Degraded",
                 false,
@@ -1907,6 +2128,7 @@ mod tests {
                 GC_BOOTSTRAP_UNAVAILABLE_REASON,
                 GC_BOOTSTRAP_UNAVAILABLE_MESSAGE,
             )),
+            None,
             vec![condition(
                 "Degraded",
                 true,
@@ -1932,6 +2154,7 @@ mod tests {
                 WAITING_FOR_GC_BOOTSTRAP_REASON,
                 WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
             )),
+            None,
             Vec::new(),
         );
         let available = find(&ready.conditions, "Available");
@@ -1948,11 +2171,188 @@ mod tests {
     /// effect, where the old plan withheld the tiers and nothing ever unblocked.
     #[test]
     fn gc_bootstrap_unavailable_clears_once_the_request_serving_tiers_report_ready() {
-        let running = build_status(Some(9), Some(1), Some(1), None, None, Vec::new());
+        let running = build_status(Some(9), Some(1), Some(1), None, None, None, Vec::new());
         assert_eq!(condition_types(&running.conditions), vec!["Available"]);
         let available = find(&running.conditions, "Available");
         assert_eq!(available.status, "True");
         assert_eq!(available.reason, "MinimumReplicasAvailable");
+    }
+
+    /// The stall threshold as a signed second count, the unit
+    /// [`gc_bootstrap_wait_status`] compares against.
+    fn stall_after_secs() -> i64 {
+        GC_BOOTSTRAP_STALL_AFTER.as_secs() as i64
+    }
+
+    /// Below the threshold a continuous wait is progressing, not stalled:
+    /// `Degraded=False` with the waiting reason and a message carrying the
+    /// observed maintain replica counts (#1097 deliverable 3).
+    #[test]
+    fn gc_bootstrap_wait_below_threshold_is_progressing_with_counts() {
+        let start = 1_000_000;
+        let w = gc_bootstrap_wait_status(
+            "dev-maintain",
+            Some(start),
+            start + stall_after_secs() - 1,
+            Some(0),
+            Some(1),
+            Some(3),
+        );
+        assert!(!w.stalled, "threshold minus one second is not stalled");
+        assert_eq!(w.degraded.status, "False");
+        assert_eq!(w.degraded.reason, WAITING_FOR_GC_BOOTSTRAP_REASON);
+        assert_eq!(w.available_reason, WAITING_FOR_GC_BOOTSTRAP_REASON);
+        assert!(
+            w.available_message.contains("0 ready and 1 unavailable"),
+            "waiting message carries the observed counts: {}",
+            w.available_message
+        );
+        assert!(
+            w.degraded.message.contains("0 ready and 1 unavailable"),
+            "progressing Degraded=False carries the counts too: {}",
+            w.degraded.message
+        );
+        assert_eq!(
+            w.waiting_since,
+            format_rfc3339_utc(start),
+            "the persisted timestamp is carried unchanged"
+        );
+    }
+
+    /// At or past the threshold the wait is stalled: `Degraded=True` with reason
+    /// `GcBootstrapStalled`, a message naming the maintain Deployment and its
+    /// counts, while `Available=False` still holds `WaitingForGcBootstrap`
+    /// (#1097 deliverable 3).
+    #[test]
+    fn gc_bootstrap_wait_at_threshold_is_stalled_with_counts() {
+        let start = 1_000_000;
+        let w = gc_bootstrap_wait_status(
+            "dev-maintain",
+            Some(start),
+            start + stall_after_secs(),
+            Some(0),
+            Some(2),
+            Some(4),
+        );
+        assert!(w.stalled, "the threshold reached is stalled");
+        assert_eq!(w.degraded.status, "True");
+        assert_eq!(w.degraded.reason, GC_BOOTSTRAP_STALLED_REASON);
+        assert!(
+            w.degraded.message.contains("dev-maintain"),
+            "the stall message names the maintain Deployment: {}",
+            w.degraded.message
+        );
+        assert!(
+            w.degraded.message.contains("0 ready, 2 unavailable"),
+            "the stall message carries the observed counts: {}",
+            w.degraded.message
+        );
+        assert_eq!(
+            w.available_reason, WAITING_FOR_GC_BOOTSTRAP_REASON,
+            "Available keeps the waiting reason so recovery is one condition flip"
+        );
+    }
+
+    /// The stall boundary is exact: threshold minus one second is not stalled,
+    /// the threshold is (#1097 deliverable 3).
+    #[test]
+    fn gc_bootstrap_wait_stall_boundary_is_exact() {
+        let start = 42;
+        let just_under = gc_bootstrap_wait_status(
+            "m",
+            Some(start),
+            start + stall_after_secs() - 1,
+            None,
+            None,
+            None,
+        );
+        let at = gc_bootstrap_wait_status(
+            "m",
+            Some(start),
+            start + stall_after_secs(),
+            None,
+            None,
+            None,
+        );
+        assert!(
+            !just_under.stalled,
+            "threshold minus one second is not stalled"
+        );
+        assert!(at.stalled, "the threshold itself is stalled");
+    }
+
+    /// The timestamp is set to `now` on the first waiting pass and carried
+    /// unchanged across consecutive passes at later clocks (#1097 deliverable 3).
+    #[test]
+    fn gc_bootstrap_wait_since_is_set_once_and_carried_unchanged() {
+        let start = 500_000;
+        let first = gc_bootstrap_wait_status("m", None, start, Some(0), Some(0), Some(1));
+        assert_eq!(
+            first.waiting_since,
+            format_rfc3339_utc(start),
+            "the first waiting pass stamps `now`"
+        );
+        let persisted = parse_rfc3339_utc(&first.waiting_since).expect("timestamp round trips");
+        assert_eq!(persisted, start);
+        for later in [start + 1, start + 60, start + (stall_after_secs() - 1)] {
+            let next =
+                gc_bootstrap_wait_status("m", Some(persisted), later, Some(0), Some(0), Some(1));
+            assert_eq!(
+                next.waiting_since, first.waiting_since,
+                "the timestamp survives unchanged while waiting continues"
+            );
+            assert!(!next.stalled, "still below the threshold at {later}");
+        }
+    }
+
+    /// Once maintain reports a ready replica the plan stops waiting, so the
+    /// reconcile produces no wait status: the persisted status clears the
+    /// timestamp and writes no `GcBootstrapStalled` condition (#1097
+    /// deliverables 2 and 3).
+    #[test]
+    fn gc_bootstrap_wait_clears_when_maintain_reports_ready() {
+        let plan = crate::reconcile::GcBootstrapPlan {
+            gate: GcBootstrapGate::MaintainFirst,
+            maintain_enabled: true,
+        };
+        assert!(
+            !plan.waiting_for_bootstrap(Some(1), false),
+            "a ready maintain replica stops the wait"
+        );
+        // reconcile therefore builds the status with no wait timestamp and no
+        // stall condition.
+        let status = build_status(Some(2), Some(1), Some(1), Some(1), None, None, Vec::new());
+        assert_eq!(
+            status.gc_bootstrap_waiting_since, None,
+            "the timestamp is cleared once not waiting"
+        );
+        assert!(
+            !status
+                .conditions
+                .iter()
+                .any(|c| c.reason == GC_BOOTSTRAP_STALLED_REASON),
+            "no GcBootstrapStalled condition once maintain is ready"
+        );
+    }
+
+    /// The RFC3339 formatter and parser round trip, so a persisted timestamp is
+    /// carried back to the exact second it was stamped at.
+    #[test]
+    fn rfc3339_round_trips_through_parse() {
+        for secs in [
+            0_i64,
+            1_785_414_896,
+            500_000,
+            1_000_000 + stall_after_secs(),
+        ] {
+            assert_eq!(
+                parse_rfc3339_utc(&format_rfc3339_utc(secs)),
+                Some(secs),
+                "round trip for {secs}"
+            );
+        }
+        assert_eq!(parse_rfc3339_utc("not-a-timestamp"), None);
+        assert_eq!(parse_rfc3339_utc("2026-13-01T00:00:00Z"), None);
     }
 
     #[test]
