@@ -186,9 +186,9 @@ tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 # OTAP (OpenTelemetry Arrow) metrics ingest on the gRPC listener: registers
 # `ArrowMetricsService` alongside the OTLP gRPC services. Off by default so the
 # default server build links neither `ravel-otap` nor the arrow dependency tree
-# it carries (docs/otap-ingest.md: "the gateway builds without it by default
-# until the bench panel justifies default-on"). Metrics only for now; the OTAP
-# logs and traces services are follow-up work.
+# it carries; the published image turns it on, and `--otap` stays the runtime
+# opt-in that registers the service (docs/otap-ingest.md). Metrics only for
+# now; the OTAP logs and traces services are follow-up work.
 otap = ["dep:ravel-otap"]
 
 # `POST /api/v1/sql`. Off by default: enabling it links datafusion into the
@@ -198,10 +198,9 @@ sql = ["dep:ravel-sql"]
 
 # Flight SQL on the gRPC listener. Implies `sql`: both surfaces execute through
 # ravel-sql, so there is no deployment that wants Flight without it
-# (the ravel-sql feature matrix). Off by default for
-# the same reason `sql` is. Today this registers an unimplemented service so
-# the wiring and the version pairing are proven; the real methods arrive with
-# ravel-sql's `flight` module.
+# (the ravel-sql feature matrix). Off by default for the same reason `sql` is;
+# the published image turns it on. Ad-hoc statements are served by ravel-sql's
+# `flight` module, and the prepared-statement methods answer UNIMPLEMENTED.
 flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
 
 [dev-dependencies]

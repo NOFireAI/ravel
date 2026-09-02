@@ -6,8 +6,10 @@ ADR-0011 records the decisions.
 Enabling OTAP takes two things, not one: `ravel-server` must be built with
 the `otap` cargo feature, which links the arrow decode stack, and the
 process must be started with `--otap`, which registers the service. Either
-alone serves nothing, the flag does not exist in a build without the
-feature, and no published image builds it.
+alone serves nothing, and the flag does not exist in a build without the
+feature. The published `ravel-server` image is built with the feature, so
+there `--otap` is the only step; a source build passes `--features otap`
+to cargo (the workspace declares no default features).
 
 OTAP here is metrics only. The vendored protos declare `ArrowLogsService`
 and `ArrowTracesService`, but the tree implements neither: `ravel-server`
@@ -27,7 +29,7 @@ The receiver replies per batch with `BatchStatus` (ack/nack + retry hint).
 This is NOT generic Arrow Flight. Flight's `DoPut` could carry the same
 batches, but the OTel collector ecosystem speaks OTAP (`otelarrow`
 exporter), so OTAP is the interoperable surface. Flight SQL is a query
-surface and it ships, behind the `flight-sql` cargo feature that no
+surface and it ships, behind the `flight-sql` cargo feature, which the
 published image builds (ADR-0006, docs/query-engine.md). No Flight ingest
 path exists; if one is ever wanted, it reuses everything below except the
 stream state machine.

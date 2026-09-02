@@ -6,6 +6,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The published `ravel-server` image builds every opt-in surface.** It is now
+  built with `--features sql,flight-sql,otap`, so Flight SQL answers on the gRPC
+  listener and `--otap` is accepted at startup without a source build. OTAP
+  ingest is still registered only when `--otap` is given. The CI lanes that
+  assemble images from host-built binaries build the same feature set.
+
 ## [0.11.0]
 
 The log segment format moves to RLOG v4 and the logs query path becomes

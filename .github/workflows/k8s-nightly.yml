@@ -55,7 +55,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build the release binaries on the host
         run: |
-          cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-server --features sql,flight-sql,otap
           cargo build --release --locked -p ravel-cli
           cargo build --release --locked -p ravel-operator
       - name: Assemble both images from the prebuilt binaries

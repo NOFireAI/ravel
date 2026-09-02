@@ -29,9 +29,15 @@ WORKDIR /app
 # keeps the build context small.
 COPY . .
 
-# ravel-server with the `sql` feature (POST /api/v1/sql). `flight-sql` stays
-# off while unimplemented (ADR-0034 decision 5). ravel-cli has no feature flags
-# and is built plain. --locked builds against the committed Cargo.lock.
+# ravel-server with every opt-in surface the workspace ships: `sql` (POST
+# /api/v1/sql), `flight-sql` (Flight SQL on the gRPC listener), and `otap`
+# (OpenTelemetry Arrow metrics ingest, registered only when the process is
+# started with `--otap`). ADR-0034 decision 5 kept `flight-sql` off while the
+# service was unimplemented; it serves ad-hoc statements now. The README
+# support matrix names this feature set, and the CI lanes that assemble images
+# from host-built binaries (ci.yml k8s-integration and quickstart-verify,
+# k8s-nightly.yml) build the same one. ravel-cli has no feature flags and is
+# built plain. --locked builds against the committed Cargo.lock.
 #
 # CARGO_BUILD_JOBS is capped, not left at cargo's default (one job per host
 # core): the root Cargo.toml's release profile (lto = "thin", codegen-units =
@@ -44,7 +50,7 @@ COPY . .
 # since this Dockerfile has to build on whatever the CI runner and every
 # developer's machine actually provide, not just the box this was measured on.
 ENV CARGO_BUILD_JOBS=2
-RUN cargo build --release --locked -p ravel-server --features sql \
+RUN cargo build --release --locked -p ravel-server --features sql,flight-sql,otap \
     && cargo build --release --locked -p ravel-cli \
     && cargo build --release --locked -p ravel-operator \
     && cargo build --release --locked -p ravel-ingest-router
@@ -52,8 +58,9 @@ RUN cargo build --release --locked -p ravel-server --features sql \
 # Split debug info out of each binary (ADR-0086 decision 3). The four cargo
 # invocations above stay four and stay separate: this workspace is
 # resolver = "3", so collapsing them into one -p ... -p ... --features
-# ravel-server/sql would unify the DataFusion feature tree into the other three
-# binaries and silently change what ships. [profile.release] debug = 1 also
+# ravel-server/sql,ravel-server/flight-sql,ravel-server/otap would unify the
+# DataFusion and arrow feature trees into the other three binaries and silently
+# change what ships. [profile.release] debug = 1 also
 # stays (ADR-0036 depends on it for line-level profiling); rather than dropping
 # symbols to shrink the artifact, we separate them here and strip the shipped
 # copy. Order matters: extract the .debug copy FIRST, then strip and link, or
