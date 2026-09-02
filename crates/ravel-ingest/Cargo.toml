@@ -30,7 +30,7 @@ ravel-catalog = { workspace = true }
 # [workspace.dependencies]; the root Cargo.toml is out of this task's scope, so
 # this is a version-pinned path dependency (the pin keeps cargo-deny from
 # counting it as a wildcard, matching the workspace's path-dep convention).
-ravel-rspan = { path = "../ravel-rspan", version = "0.11.0" }
+ravel-rspan = { path = "../ravel-rspan", version = "0.12.0" }
 # The router live switch (ADR-0052) decodes the provisioning record read for a
 # generation refresh; prost's Message trait provides `decode`.
 prost = { workspace = true }
@@ -54,7 +54,7 @@ ravel-promql = { workspace = true }
 # zero data GETs. ravel-sql depends on ravel-catalog/ravel-query/ravel-commit/
 # ravel-logseg, none of which depend on ravel-ingest, so this dev-only edge adds
 # no cycle. No feature flag: ravel-sql's SQL surface is unconditional.
-ravel-sql = { path = "../ravel-sql", version = "0.11.0" }
+ravel-sql = { path = "../ravel-sql", version = "0.12.0" }
 # Match ravel-sql's datafusion pin exactly (same arrow 58 line) so the test's
 # SessionContext/collect interop with ravel-sql's plan types.
 datafusion = { version = "54", default-features = false, features = ["sql"] }
