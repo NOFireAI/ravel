@@ -105,9 +105,11 @@
 //!
 //! Expiry is `last_modified + lease_duration`, where `last_modified` is the
 //! store's own server-generated timestamp read by `head()` on the contention
-//! path. Node clocks never enter the decision (ADR-1029 rejected alternative
-//! 5): the store is the one time base every contender shares, whereas node
-//! clocks are not. `last_modified`'s 1-second granularity is noise against the
+//! path. The expiry BASE is store time (ADR-1029 rejected alternative 5): the
+//! store is the one time base every contender shares. The observer still
+//! compares that base against its own clock, so skew can steal early, which
+//! the ADR accepts as safe-but-wasteful (advisory layer). `last_modified`'s
+//! 1-second granularity is noise against the
 //! 300 s default lease, and early stealing from residual skew is safe (the
 //! claim is advisory), merely wasteful. `CompactionClaim::owner_clock_ns`
 //! exists for operator forensics and is never read here.
@@ -137,6 +139,14 @@ pub const WORK_ID_DOMAIN_TAG: &str = "ravel-compaction-claim-v1";
 /// understand: it is observed and rescheduled around, but never stolen and
 /// never overwritten.
 pub const CLAIM_FORMAT_VERSION: u32 = 1;
+
+/// Ceiling on the holder-declared lease an observer will honor: 24 hours,
+/// far above any real merge stage and far below "forever". Nothing ever
+/// deletes a claim, so an unclamped absurd lease (misconfiguration, or
+/// corruption that still decodes) would suppress claimed compaction of its
+/// bucket indefinitely; the clamp bounds the outage to one day per incident
+/// on the advisory layer.
+pub const MAX_OBSERVED_LEASE_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// The prefix every compaction claim lives under: a new additive advisory
 /// control-plane prefix beside `sys/maintain/workers/` and `sys/maintain/memo/`.
@@ -557,13 +567,19 @@ async fn observe(
     // Expiry uses the lease the OWNER declared when it is readable and sane, so
     // an observer configured with a shorter lease does not steal out from under
     // a longer-leased owner. The base is always the store's timestamp.
+    // Clamped above by MAX_OBSERVED_LEASE_MS: nothing ever deletes a claim, so
+    // trusting an absurd holder-declared lease (misconfiguration, or decodable
+    // corruption) would suppress claimed compaction of the bucket until the
+    // heat death of i64. The clamp is an availability guard on the advisory
+    // layer; correctness never depended on the lease.
     let lease_ms = holder
         .as_ref()
         .map(|h| h.lease_duration_ns)
         .filter(|ns| *ns > 0)
         .map(|ns| ns / 1_000_000)
         .filter(|ms| *ms > 0)
-        .unwrap_or_else(|| cfg.lease_ms());
+        .unwrap_or_else(|| cfg.lease_ms())
+        .min(MAX_OBSERVED_LEASE_MS);
     let expiry_unix_ms = meta.last_modified_unix_ms.saturating_add(lease_ms);
     let jitter = jitter_ms(&work_id, observer_process_id, cfg);
     // Strictly after expiry even when the jitter draw is 0: retrying in the
@@ -827,6 +843,36 @@ mod tests {
         assert_eq!(payload.state, ClaimState::Running as i32);
         assert_eq!(payload.renewed_count, 0);
         assert_eq!(counts(&store), (1, 0, 0), "one PUT, zero reads");
+    }
+
+    /// An absurd holder-declared lease is clamped to [`MAX_OBSERVED_LEASE_MS`]:
+    /// nothing ever deletes a claim, so an unclamped ten-year lease would
+    /// suppress claimed compaction of the bucket for ten years. Demonstrated
+    /// failing by removing the `.min(MAX_OBSERVED_LEASE_MS)` in `observe`.
+    #[tokio::test]
+    async fn an_absurd_declared_lease_is_clamped() {
+        let store = instrumented();
+        store.inner().set_clock_ms(1_700_000_000_000);
+        let ten_years = ClaimConfig {
+            lease_duration: Duration::from_secs(10 * 365 * 24 * 60 * 60),
+            ..ClaimConfig::default()
+        };
+        let owner = owner_at(1);
+        acquired(
+            acquire(&store, &identity(), &owner, &ten_years)
+                .await
+                .expect("acquire"),
+        );
+        let observed = held(
+            acquire(&store, &identity(), &owner_at(2), &ClaimConfig::default())
+                .await
+                .expect("observe"),
+        );
+        assert_eq!(
+            observed.expiry_unix_ms,
+            1_700_000_000_000 + MAX_OBSERVED_LEASE_MS,
+            "the declared ten-year lease is honored only up to the 24 h ceiling"
+        );
     }
 
     /// A second contender does NOT take the claim: it observes the holder,
@@ -1277,6 +1323,30 @@ mod tests {
 
         assert_eq!(key_a, observed.key, "one key, whatever each node listed");
         assert_eq!(observed.holder_process_id(), Some(a.process_id));
+    }
+
+    /// Golden vector pinning the byte-level derivation the key layout doc
+    /// freezes: 16 raw tenant-hash bytes, the one-byte signal prefix, shard
+    /// and hour as little-endian u32, under the v1 domain tag. The proptest
+    /// below proves stability and collision-freedom but survives a field
+    /// reorder or an endianness flip; this exact hex does not.
+    #[test]
+    fn work_id_matches_the_frozen_golden_vector() {
+        let id = WorkIdentity::new(
+            TenantHash([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]),
+            Signal::Logs,
+            3,
+            491_000,
+        );
+        assert_eq!(
+            id.work_id().hex(),
+            "9dce3a3a7f3fbda97c47741ec90e0e09f91a4140bd6303967a8cfdcf3c816039",
+            "the work-id derivation is frozen by docs/catalog-and-mvcc.md; a \
+             field reorder, endianness flip, or domain-tag edit lands here"
+        );
     }
 
     proptest::proptest! {

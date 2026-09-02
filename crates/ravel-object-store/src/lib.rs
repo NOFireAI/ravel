@@ -124,8 +124,8 @@ pub struct ObjectMeta {
     pub size: u64,
     pub etag: Etag,
     pub version: Version,
-    /// May have 1-second granularity on real backends. GC age checks only;
-    /// never order commits by it.
+    /// May have 1-second granularity on real backends. Advisory age decisions
+    /// only (GC age checks, claim expiry); never order commits by it.
     pub last_modified_unix_ms: i64,
 }
 
