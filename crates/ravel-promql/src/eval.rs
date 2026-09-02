@@ -2217,6 +2217,53 @@ mod tests {
     }
 
     #[test]
+    fn range_query_over_equal_timestamp_samples_steps_exactly() {
+        // ADR-1103: a log-derived series can carry several samples at one
+        // timestamp. One lone sample at 500ms plus three samples sharing
+        // 6000ms, `count_over_time(x[10s])` stepped every 5s from 1000ms to
+        // 16000ms:
+        //   t=1000ms:  window (-9000, 1000]  -> the lone sample only:      1
+        //   t=6000ms:  window (-4000, 6000]  -> lone + all 3 duplicates:   4
+        //     (right-open boundary lands exactly on the duplicated
+        //     timestamp, 6000; inclusive, so all three count)
+        //   t=11000ms: window (1000, 11000]  -> the 3 duplicates only:     3
+        //   t=16000ms: window (6000, 16000]  -> nothing:                  0
+        //     (left-open boundary lands exactly on the duplicated
+        //     timestamp, 6000; exclusive, so all three are dropped)
+        // Demonstrated failing by dropping the second and third duplicate
+        // samples before storing them (`with_series` keeping only one
+        // sample per timestamp): every non-zero step count above would be
+        // off by 2 at t=6000ms and by 2 at t=11000ms.
+        let lone_ns = ms_to_ns(500).expect("no overflow");
+        let dup_ns = ms_to_ns(6_000).expect("no overflow");
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "x")],
+                &[(lone_ns, 1.0), (dup_ns, 2.0), (dup_ns, 3.0), (dup_ns, 4.0)],
+            )
+            .expect("valid series");
+
+        let value = Evaluator::new()
+            .eval_range(&source, "count_over_time(x[10s])", 1_000, 16_000, 5_000)
+            .expect("range evaluates");
+        let Value::Matrix(matrix) = value else {
+            panic!("count_over_time is a matrix");
+        };
+        assert_eq!(matrix.len(), 1, "one series");
+        let samples = &matrix[0].1;
+        let got: Vec<(i64, f64)> = samples.iter().map(|s| (s.ts_ns, s.value)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (ms_to_ns(1_000).expect("no overflow"), 1.0),
+                (ms_to_ns(6_000).expect("no overflow"), 4.0),
+                (ms_to_ns(11_000).expect("no overflow"), 3.0),
+            ],
+            "the t=16000ms step has zero count and emits no sample at all"
+        );
+    }
+
+    #[test]
     fn lookback_boundary_excludes_exactly_5m_before_t() {
         // Sample exactly 5m before T is excluded (lookback start is
         // exclusive); a sample exactly at T is included.
@@ -2336,6 +2383,32 @@ mod tests {
             .expect("evaluates");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].value, 9.0);
+    }
+
+    #[test]
+    fn equal_timestamp_instant_selection_picks_greatest_value_bits() {
+        // ADR-1103: unlike `duplicate_timestamp_resolves_by_normative_order_not_vec_position`
+        // above (a source violating the SHOULD-dedup contract), these three
+        // samples are legitimate distinct log records that happen to share a
+        // timestamp. Instant selection still applies exactly one rule
+        // regardless of why the samples it is choosing among share a
+        // timestamp: pick the greatest `value.to_bits()`, never vector
+        // position. Demonstrated failing by making `pick_sample` return the
+        // last sample in the slice instead of the greatest-bits one (e.g.
+        // reverting eval.rs's `pick_sample` to `samples.last()`), which would
+        // pick 4.0 here instead of the correct 9.0.
+        let ts_ns = ms_to_ns(minutes(1)).expect("no overflow");
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "x")],
+                &[(ts_ns, 4.0), (ts_ns, 9.0), (ts_ns, 2.0)],
+            )
+            .expect("valid series");
+        let result = Evaluator::new()
+            .instant(&source, "x", minutes(1))
+            .expect("evaluates");
+        assert_eq!(result.len(), 1, "exactly one sample per series");
+        assert_eq!(result[0].value, 9.0, "greatest value.to_bits() wins");
     }
 
     #[test]
@@ -2567,6 +2640,42 @@ mod tests {
         // -120 is itself a multiple; left-open means the result still
         // advances past it, landing on the same -60 as the -90 case above.
         assert_eq!(align_up_to_step(-120, 60).expect("fits"), -60);
+    }
+
+    #[test]
+    fn subquery_over_duplicate_timestamp_samples_steps_exactly() {
+        // ADR-1103: `count_over_time(x[5m])[10m:5m]` evaluated at t=12m.
+        // Grid step is 5m; the subquery window is (2m, 12m], and the
+        // left-open epoch-aligned grid (see `align_up_to_step` above) yields
+        // exactly two points, 5m and 10m:
+        //   t=5m:  inner window (0m, 5m]   -> the lone sample at 1m only: 1
+        //   t=10m: inner window (5m, 10m]  -> all 3 duplicates at 6m:      3
+        // Demonstrated failing the same way as
+        // `range_query_over_equal_timestamp_samples_steps_exactly`: dropping
+        // the second and third duplicate sample before storing them would
+        // read 1 instead of 3 at t=10m.
+        let lone_ns = ms_to_ns(minutes(1)).expect("no overflow");
+        let dup_ns = ms_to_ns(minutes(6)).expect("no overflow");
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "x")],
+                &[(lone_ns, 1.0), (dup_ns, 2.0), (dup_ns, 3.0), (dup_ns, 4.0)],
+            )
+            .expect("valid series");
+
+        let value = Evaluator::new()
+            .eval_instant(&source, "count_over_time(x[5m])[10m:5m]", minutes(12))
+            .expect("subquery evaluates");
+        let Value::Matrix(matrix) = value else {
+            panic!("expected a matrix, got {value:?}");
+        };
+        assert_eq!(matrix.len(), 1);
+        let (_, samples) = &matrix[0];
+        let got: Vec<(i64, f64)> = samples
+            .iter()
+            .map(|s| (s.ts_ns / NS_PER_MS, s.value))
+            .collect();
+        assert_eq!(got, vec![(minutes(5), 1.0), (minutes(10), 3.0)]);
     }
 
     #[test]

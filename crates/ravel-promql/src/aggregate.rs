@@ -815,6 +815,57 @@ mod tests {
     }
 
     #[test]
+    fn sum_by_job_aggregates_exact_total_over_duplicate_timestamp_series() {
+        // ADR-1103: two series under the same `job`, each carrying
+        // equal-timestamp duplicates within the range window, so the total
+        // only comes out right if `count_over_time` counts every duplicate
+        // record and `sum by (job)` then adds both series' exact counts.
+        // Demonstrated failing by dropping the second and third duplicate
+        // samples from either series before storing them (see
+        // `range_query_over_equal_timestamp_samples_steps_exactly` in
+        // eval.rs, same underlying bug): the total would read 4 instead of
+        // 6.
+        use crate::eval::ms_to_ns;
+        let m = |ms: i64| ms_to_ns(ms).expect("no overflow");
+        let src = TestSource::new()
+            .with_series(
+                &[("__name__", "x"), ("job", "a"), ("region", "us")],
+                &[
+                    (m(8 * 60_000), 1.0),
+                    (m(8 * 60_000), 2.0),
+                    (m(9 * 60_000), 3.0),
+                ],
+            )
+            .expect("valid series")
+            .with_series(
+                &[("__name__", "x"), ("job", "a"), ("region", "eu")],
+                &[
+                    (m(7 * 60_000), 4.0),
+                    (m(7 * 60_000), 5.0),
+                    (m(7 * 60_000), 6.0),
+                ],
+            )
+            .expect("valid series");
+
+        let v = Evaluator::new()
+            .instant(&src, "sum by (job) (count_over_time(x[5m]))", 10 * 60_000)
+            .expect("must evaluate");
+        let result: Vec<(Vec<(String, String)>, f64)> = v
+            .into_iter()
+            .map(|s| {
+                (
+                    s.labels
+                        .iter()
+                        .map(|l| (l.name.clone(), l.value.clone()))
+                        .collect(),
+                    s.value,
+                )
+            })
+            .collect();
+        assert_eq!(result, vec![(labels(&[("job", "a")]), 6.0)]);
+    }
+
+    #[test]
     fn sum_with_no_modifier_collapses_to_one_group() {
         assert_eq!(eval_vector("sum(m)"), vec![(vec![], 6.0)]);
     }
