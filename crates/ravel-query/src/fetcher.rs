@@ -7,12 +7,12 @@ use futures::future::join_all;
 use ravel_cache::{Cache, CacheKey, SingleFlightError, Source, TieredCache};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError, Version};
-use ravel_promql::{LabelMatcher, matches_series};
+use ravel_promql::{LabelMatcher, MatchOp, matches_series};
 use ravel_segment::{
     ExpectedIdentity, Footer, FooterOutcome, HistogramValue, ReaderLimits, RunEntry,
     SampleProvenance, SeriesEntry, SeriesEntryV4, ValPageKind, ValueKind, check_identity,
-    decode_catalog_v4, decode_catalog_v5, decode_catalog_v5_chunked, decode_run_histogram_pages,
-    decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
+    decode_catalog_matching_v4, decode_catalog_v4, decode_catalog_v5, decode_catalog_v5_chunked,
+    decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
@@ -67,6 +67,42 @@ fn section_range(footer: &Footer, kind: u32) -> Option<(u64, u64)> {
         .iter()
         .find(|s| s.kind == kind)
         .map(|s| (s.offset, s.len))
+}
+
+/// If every matcher is a non-empty positive equality (`label = "value"`),
+/// returns the `(name, value)` pairs for the dictionary-ordinal catalog decode
+/// ([`decode_catalog_matching_v4`]); otherwise `None`, and the caller keeps the
+/// materialize-then-filter path (issue #1076).
+///
+/// Excluded shapes, each of which must materialize:
+/// - A regex or negated matcher (`=~`, `!~`, `!=`). The ordinal decoder only
+///   resolves positive equality by dictionary ordinal, so any other operator in
+///   the set falls back.
+/// - An empty-value equality (`label = ""`). Prometheus reads this as "the
+///   label is absent or empty", which `matches_series` honors by treating a
+///   missing label as `""`. The ordinal decoder resolves the operand against
+///   the LABEL_DICT, where the empty string is not an entry, so it would return
+///   zero series where the materializing path returns every series lacking the
+///   label. Falling back keeps the two paths identical.
+///
+/// A non-empty value simply absent from the dictionary needs no special case:
+/// `decode_catalog_matching_v4` cannot resolve it and returns zero series,
+/// which is exactly what an equality on a value no series carries must yield.
+/// An empty matcher set also returns `None`: it matches every series, so there
+/// is nothing to prune and the ordinal path would materialize all of them
+/// anyway.
+fn ordinal_equals(matchers: &[LabelMatcher]) -> Option<Vec<(&str, &str)>> {
+    if matchers.is_empty() {
+        return None;
+    }
+    let mut equals = Vec::with_capacity(matchers.len());
+    for m in matchers {
+        match m.op {
+            MatchOp::Eq if !m.value.is_empty() => equals.push((m.name.as_str(), m.value.as_str())),
+            _ => return None,
+        }
+    }
+    Some(equals)
 }
 
 /// Default suffix length fetched on the first GET of a segment object.
@@ -564,6 +600,16 @@ pub struct SegmentFetcher {
     /// `crates/ravel-ingest/src/shard.rs` and every compaction part), so a
     /// nonzero count flags a ref built without one.
     suffix_fallbacks: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Count of catalog label sets materialized during `decode_selected`
+    /// (issue #1076). The materializing path builds one `LabelSet` per
+    /// candidate series before `matches_series` filters, so it adds the whole
+    /// decoded series count; the dictionary-ordinal path
+    /// (`decode_catalog_matching_v4`) builds one only for a series that already
+    /// matched, so it adds just the selected count. This is the counter that
+    /// makes the ordinal path's saving observable: same fetched bytes, fewer
+    /// materializations. Shared across clones (an `Arc`), never reset, read the
+    /// same way as [`suffix_fallbacks`](Self::suffix_fallbacks).
+    label_sets_materialized: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl SegmentFetcher {
@@ -579,7 +625,26 @@ impl SegmentFetcher {
             )),
             cache: None,
             suffix_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            label_sets_materialized: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Number of catalog label sets materialized across every
+    /// `decode_selected` this fetcher (or a clone) has run (issue #1076).
+    /// A materializing decode adds its whole candidate-series count; a
+    /// dictionary-ordinal decode adds only the matched count. Exposed so a
+    /// test can pin the ordinal path's materialization saving exactly, and so
+    /// the saving is observable rather than silent.
+    #[must_use]
+    pub fn label_sets_materialized(&self) -> u64 {
+        self.label_sets_materialized
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Adds `n` to the running materialization count (issue #1076).
+    fn record_materialized(&self, n: usize) {
+        self.label_sets_materialized
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Number of first-GET footer reads that took the uncacheable suffix
@@ -1173,7 +1238,8 @@ impl SegmentFetcher {
         );
         async {
             let key = seg_ref.data_object_key.as_str();
-            let entries = if let Some((sm_off, sm_len)) = section_range(footer, SECTION_SERIES_META)
+            let matched: Vec<SeriesEntryV4> = if let Some((sm_off, sm_len)) =
+                section_range(footer, SECTION_SERIES_META)
             {
                 let (ld_off, ld_len) =
                     section_range(footer, SECTION_LABEL_DICT).ok_or_else(|| {
@@ -1211,19 +1277,50 @@ impl SegmentFetcher {
                 let meta = regions
                     .slice(sm_off, sm_len)
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-                decode_catalog_v4(footer, &dict, &ids, &meta, self.limits)
-                    .map_err(|source| corrupt(key, source))?
+                // Whole SERIES_META present (below the sparse threshold). When
+                // every matcher is a non-empty positive equality, resolve them
+                // to dictionary ordinals and let the catalog decoder skip the
+                // label-set materialization of every non-matching series
+                // (issue #1076); otherwise materialize the whole catalog and
+                // filter it.
+                if let Some(equals) = ordinal_equals(matchers) {
+                    let matched = decode_catalog_matching_v4(
+                        footer,
+                        &dict,
+                        &ids,
+                        &meta,
+                        &equals,
+                        self.limits,
+                    )
+                    .map_err(|source| corrupt(key, source))?;
+                    self.record_materialized(matched.len());
+                    matched
+                } else {
+                    let entries = decode_catalog_v4(footer, &dict, &ids, &meta, self.limits)
+                        .map_err(|source| corrupt(key, source))?;
+                    self.record_materialized(entries.len());
+                    entries
+                        .into_iter()
+                        .filter(|e| matches_series(matchers, &e.entry.labels))
+                        .collect()
+                }
             } else if let Some(sparse) = self.sparse_probe_qualifies(footer, total_size, matchers) {
-                self.decode_sparse_catalog(
-                    seg_ref,
-                    tenant_hash,
-                    footer,
-                    suffix_etag,
-                    regions,
-                    &sparse,
-                    accounting,
-                )
-                .await?
+                let entries = self
+                    .decode_sparse_catalog(
+                        seg_ref,
+                        tenant_hash,
+                        footer,
+                        suffix_etag,
+                        regions,
+                        &sparse,
+                        accounting,
+                    )
+                    .await?;
+                self.record_materialized(entries.len());
+                entries
+                    .into_iter()
+                    .filter(|e| matches_series(matchers, &e.entry.labels))
+                    .collect()
             } else {
                 self.ensure_ranges(
                     seg_ref,
@@ -1237,13 +1334,14 @@ impl SegmentFetcher {
                 let object = regions
                     .slice(0, total_size)
                     .ok_or_else(|| corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds))?;
-                decode_catalog_v5(footer, &object, self.limits)
-                    .map_err(|source| corrupt(key, source))?
+                let entries = decode_catalog_v5(footer, &object, self.limits)
+                    .map_err(|source| corrupt(key, source))?;
+                self.record_materialized(entries.len());
+                entries
+                    .into_iter()
+                    .filter(|e| matches_series(matchers, &e.entry.labels))
+                    .collect()
             };
-            let matched: Vec<SeriesEntryV4> = entries
-                .into_iter()
-                .filter(|e| matches_series(matchers, &e.entry.labels))
-                .collect();
             accounting.add_series_matched(matched.len() as u64);
             // The catalog decode fetches only catalog sections, not page bytes, so
             // series matched is the meaningful count here rather than decompressed
@@ -4192,6 +4290,369 @@ mod tests {
             let av: Vec<u64> = a.values.iter().map(|v| v.to_bits()).collect();
             let bv: Vec<u64> = b.values.iter().map(|v| v.to_bits()).collect();
             assert_eq!(av, bv);
+        }
+    }
+
+    // ------------------------------------------------ issue #1076: ordinal path
+
+    /// Builds an 8-label below-threshold RSEG object (whole SERIES_META present,
+    /// so `decode_selected` takes its branch-1). `l0` is `"hot"` on every
+    /// `sel_mod`-th series and a per-series unique value otherwise, so an
+    /// equality on `l0="hot"` selects exactly `n / sel_mod` series. The other
+    /// seven labels give every series a realistic multi-label set. `samples_per`
+    /// incompressible samples per series keep the page sections large so the
+    /// catalog is a small fraction of the object.
+    fn write_ordinal_fixture(
+        n: usize,
+        samples_per: usize,
+        sel_mod: usize,
+    ) -> (Bytes, TenantHash, SegmentRef) {
+        let tenant_hash = TenantHash([6u8; 16]);
+        let writer_id = Uuid::from_u128(1076);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let bounds = IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        };
+        let tenant_id = TenantId::new("t".to_string());
+        const NS: i64 = 1_000_000_000;
+        let mut inputs = Vec::with_capacity(n);
+        for i in 0..n {
+            let name = format!("m{i}");
+            let l0 = if i % sel_mod == 0 {
+                "hot".to_string()
+            } else {
+                format!("c{i}")
+            };
+            let pairs = [
+                ("__name__", name.clone()),
+                ("l0", l0),
+                ("l1", format!("a{}", i % 8)),
+                ("l2", format!("b{}", i % 16)),
+                ("l3", "const".to_string()),
+                ("l4", format!("d{}", i % 4)),
+                ("l5", format!("e{}", i % 32)),
+                ("l6", format!("f{}", i % 3)),
+            ];
+            let label_set = LabelSet::new(
+                pairs
+                    .iter()
+                    .map(|(k, v)| Label {
+                        name: (*k).to_string(),
+                        value: v.clone(),
+                    })
+                    .collect(),
+            )
+            .expect("valid labels");
+            let series_id =
+                ravel_types::SeriesId::compute(&tenant_id, &name, &label_set).expect("series id");
+            let samples: Vec<ravel_types::Sample> = (0..samples_per)
+                .map(|j| {
+                    let bits = (i as u64)
+                        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                        .wrapping_add((j as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+                    ravel_types::Sample {
+                        ts_ns: (1_000 + j as i64) * NS,
+                        value: f64::from_bits(bits),
+                    }
+                })
+                .collect();
+            inputs.push(SeriesInput {
+                series_id,
+                labels: label_set,
+                samples,
+            });
+        }
+        let written = SegmentWriter::write(inputs, identity, bounds).expect("write fixture");
+        let seg_ref = SegmentRef {
+            data_object_key: "test/ordinal-fixture.rseg".to_string(),
+            object_size: written.bytes.len() as u64,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            ingest_hour_bucket: 0,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            shard: 0,
+            content_hash: written.summary.blake3,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 99,
+            level: ravel_catalog::SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_segment::SUPPORTED_VERSIONS.newest()),
+            declared_column_stats: Default::default(),
+        };
+        (written.bytes, tenant_hash, seg_ref)
+    }
+
+    /// `ordinal_equals` accepts exactly the shape the ordinal decoder can
+    /// answer: a non-empty set of non-empty positive equalities. Every other
+    /// shape falls back.
+    #[test]
+    fn ordinal_equals_admits_only_nonempty_positive_equality() {
+        assert_eq!(
+            ordinal_equals(&[]),
+            None,
+            "empty set matches all -> fallback"
+        );
+        assert_eq!(
+            ordinal_equals(&[LabelMatcher::equal("a", "b")]),
+            Some(vec![("a", "b")])
+        );
+        assert_eq!(
+            ordinal_equals(&[LabelMatcher::equal("a", "b"), LabelMatcher::equal("c", "d")]),
+            Some(vec![("a", "b"), ("c", "d")])
+        );
+        assert_eq!(
+            ordinal_equals(&[LabelMatcher::equal("a", "")]),
+            None,
+            "empty-value equality means 'absent or empty' -> fallback"
+        );
+        assert_eq!(
+            ordinal_equals(&[
+                LabelMatcher::equal("a", "b"),
+                LabelMatcher::not_equal("c", "d")
+            ]),
+            None,
+            "a negated matcher in the set -> fallback"
+        );
+        assert_eq!(
+            ordinal_equals(&[LabelMatcher::regex("a", "b").expect("regex")]),
+            None,
+            "a regex matcher -> fallback"
+        );
+    }
+
+    /// An equality-only matcher set takes the ordinal path and materializes
+    /// exactly the selected series; a same-result regex or negated set takes
+    /// the materializing path and materializes the whole catalog. Both return
+    /// the identical series set and move the identical fetched bytes: the
+    /// ordinal path's only difference is the materialization count.
+    #[tokio::test]
+    async fn ordinal_and_materializing_agree_on_series_and_bytes() {
+        const N: usize = 1000;
+        const SEL_MOD: usize = 50; // 20 series carry l0="hot"
+        const MATCHED: usize = N / SEL_MOD;
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(N, 8, SEL_MOD);
+
+        // Ordinal path: equality on l0.
+        let (fetcher_ord, metrics_ord) =
+            metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher_ord = fetcher_ord.with_whole_object_threshold(0);
+        let eq = [LabelMatcher::equal("l0", "hot")];
+        let (soa_ord, _) = fetcher_ord
+            .fetch_soa(tenant_hash, &seg_ref, &eq)
+            .await
+            .expect("ordinal fetch");
+
+        // Materializing path: an anchored regex selecting exactly l0="hot".
+        let (fetcher_mat, metrics_mat) =
+            metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher_mat = fetcher_mat.with_whole_object_threshold(0);
+        let re = [LabelMatcher::regex("l0", "hot").expect("regex")];
+        let (soa_mat, _) = fetcher_mat
+            .fetch_soa(tenant_hash, &seg_ref, &re)
+            .await
+            .expect("materializing fetch");
+
+        // Identical series set (exact count and identities).
+        assert_eq!(soa_ord.len(), MATCHED);
+        assert_eq!(soa_mat.len(), MATCHED);
+        let ids_ord: std::collections::BTreeSet<_> = soa_ord.iter().map(|s| s.series_id).collect();
+        let ids_mat: std::collections::BTreeSet<_> = soa_mat.iter().map(|s| s.series_id).collect();
+        assert_eq!(ids_ord, ids_mat, "both paths select the identical series");
+
+        // Materialization counts, exact: ordinal builds only the matched label
+        // sets, the materializing path builds one per candidate series.
+        assert_eq!(
+            fetcher_ord.label_sets_materialized(),
+            MATCHED as u64,
+            "ordinal path materializes only the matched series"
+        );
+        assert_eq!(
+            fetcher_mat.label_sets_materialized(),
+            N as u64,
+            "materializing path materializes every candidate series"
+        );
+
+        // Fetched bytes are identical: same catalog sections, same matched
+        // pages. The saving is materializations, not bytes.
+        assert_eq!(
+            metrics_ord.snapshot().get.bytes,
+            metrics_mat.snapshot().get.bytes,
+            "both paths move the identical fetched bytes"
+        );
+    }
+
+    /// An equality on a value no series carries (absent from the LABEL_DICT)
+    /// selects zero series on the ordinal path, matching the materializing
+    /// path, and materializes nothing.
+    #[tokio::test]
+    async fn ordinal_equality_on_absent_value_selects_zero() {
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(500, 4, 50);
+        let (fetcher, _metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher = fetcher.with_whole_object_threshold(0);
+        let eq = [LabelMatcher::equal("l0", "ghost")];
+        let (soa, _) = fetcher
+            .fetch_soa(tenant_hash, &seg_ref, &eq)
+            .await
+            .expect("fetch");
+        assert_eq!(soa.len(), 0, "absent equality value selects zero series");
+        assert_eq!(
+            fetcher.label_sets_materialized(),
+            0,
+            "no series matched, so none is materialized"
+        );
+    }
+
+    /// A negated equality falls back to the materializing path (it materializes
+    /// the whole catalog) and returns the correct complement; an equality on the
+    /// same label takes the ordinal path over the same fixture.
+    #[tokio::test]
+    async fn negated_equality_falls_back_and_stays_correct() {
+        const N: usize = 400;
+        const SEL_MOD: usize = 40; // 10 series carry l0="hot"
+        let (bytes, tenant_hash, seg_ref) = write_ordinal_fixture(N, 4, SEL_MOD);
+
+        let (fetcher_ne, _m1) = metered_fetcher(&seg_ref.data_object_key, bytes.clone()).await;
+        let fetcher_ne = fetcher_ne.with_whole_object_threshold(0);
+        let ne = [LabelMatcher::not_equal("l0", "hot")];
+        let (soa_ne, _) = fetcher_ne
+            .fetch_soa(tenant_hash, &seg_ref, &ne)
+            .await
+            .expect("ne fetch");
+        assert_eq!(
+            soa_ne.len(),
+            N - N / SEL_MOD,
+            "negated equality returns the complement"
+        );
+        assert_eq!(
+            fetcher_ne.label_sets_materialized(),
+            N as u64,
+            "negated equality materializes the whole catalog (fallback)"
+        );
+
+        let (fetcher_eq, _m2) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher_eq = fetcher_eq.with_whole_object_threshold(0);
+        let eq = [LabelMatcher::equal("l0", "hot")];
+        let (soa_eq, _) = fetcher_eq
+            .fetch_soa(tenant_hash, &seg_ref, &eq)
+            .await
+            .expect("eq fetch");
+        assert_eq!(soa_eq.len(), N / SEL_MOD);
+        assert_eq!(
+            fetcher_eq.label_sets_materialized(),
+            (N / SEL_MOD) as u64,
+            "equality takes the ordinal path (materializes only matches)"
+        );
+    }
+
+    /// Differential property test: over random label sets and random
+    /// equality-only matcher sets, the ordinal decoder
+    /// (`decode_catalog_matching_v4`) and the materialize-then-filter path
+    /// (`decode_catalog_v4` + `matches_series`) return the identical series set.
+    mod ordinal_differential {
+        use super::{Label, SegmentWriter, SeriesInput};
+        use proptest::prelude::*;
+        use ravel_promql::{LabelMatcher, matches_series};
+        use ravel_segment::{
+            ReaderLimits, decode_catalog_matching_v4, decode_catalog_v4, open_from_full,
+        };
+        use ravel_types::{LabelSet, TenantId};
+
+        const LABEL_DICT: u32 = 1;
+        const SERIES_IDS: u32 = 5;
+        const SERIES_META: u32 = 6;
+        const NAMES: [&str; 3] = ["l0", "l1", "l2"];
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            #[test]
+            fn ordinal_equals_materializing(
+                // Per series: for each of l0/l1/l2, 0 => omit, else value index.
+                series in prop::collection::vec((0u8..4, 0u8..4, 0u8..4), 1..15usize),
+                // Matchers: (name index 0..4, value index 0..3), all positive
+                // equality with a non-empty value. Name index 3 is a label no
+                // series carries.
+                matchers in prop::collection::vec((0u8..4, 0u8..3), 1..4usize),
+            ) {
+                let tenant_id = TenantId::new("t".to_string());
+                let mut inputs = Vec::with_capacity(series.len());
+                for (i, (c0, c1, c2)) in series.iter().enumerate() {
+                    let name = format!("m{i}");
+                    let mut pairs = vec![Label { name: "__name__".to_string(), value: name.clone() }];
+                    for (choice, lname) in [(*c0, NAMES[0]), (*c1, NAMES[1]), (*c2, NAMES[2])] {
+                        if choice % 4 != 0 {
+                            pairs.push(Label {
+                                name: lname.to_string(),
+                                value: format!("v{}", choice % 3),
+                            });
+                        }
+                    }
+                    let label_set = LabelSet::new(pairs).expect("labels");
+                    let series_id =
+                        ravel_types::SeriesId::compute(&tenant_id, &name, &label_set).expect("id");
+                    inputs.push(SeriesInput {
+                        series_id,
+                        labels: label_set,
+                        samples: vec![ravel_types::Sample { ts_ns: 1_000_000_000, value: i as f64 }],
+                    });
+                }
+                let identity = ravel_segment::SegmentIdentity {
+                    tenant_hash: [3u8; 16],
+                    shard: 0,
+                    writer_id: "p".to_string(),
+                    writer_epoch: 1,
+                    writer_seq: 1,
+                };
+                let bounds = ravel_segment::IngestBounds { min_ingest_ts_ns: 0, max_ingest_ts_ns: 0 };
+                let written = SegmentWriter::write(inputs, identity, bounds).expect("write");
+                let bytes = written.bytes;
+
+                let limits = ReaderLimits::default();
+                let loc = open_from_full(&bytes, limits).expect("open");
+                let footer = &loc.footer;
+                let slice = |kind: u32| -> Vec<u8> {
+                    let s = footer.sections.iter().find(|s| s.kind == kind).expect("section");
+                    bytes[s.offset as usize..(s.offset + s.len) as usize].to_vec()
+                };
+                let dict = slice(LABEL_DICT);
+                let ids = slice(SERIES_IDS);
+                let meta = slice(SERIES_META);
+
+                let owned: Vec<(String, String)> = matchers
+                    .iter()
+                    .map(|(ni, vi)| {
+                        let name = if *ni == 3 { "absent".to_string() } else { NAMES[*ni as usize].to_string() };
+                        (name, format!("v{vi}"))
+                    })
+                    .collect();
+                let equals: Vec<(&str, &str)> =
+                    owned.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+                let label_matchers: Vec<LabelMatcher> =
+                    owned.iter().map(|(n, v)| LabelMatcher::equal(n, v)).collect();
+
+                let ord = decode_catalog_matching_v4(footer, &dict, &ids, &meta, &equals, limits)
+                    .expect("ordinal");
+                let ord_ids: std::collections::BTreeSet<[u8; 16]> =
+                    ord.iter().map(|e| e.entry.series_id.0).collect();
+
+                let all = decode_catalog_v4(footer, &dict, &ids, &meta, limits).expect("v4");
+                let mat_ids: std::collections::BTreeSet<[u8; 16]> = all
+                    .iter()
+                    .filter(|e| matches_series(&label_matchers, &e.entry.labels))
+                    .map(|e| e.entry.series_id.0)
+                    .collect();
+
+                prop_assert_eq!(ord_ids, mat_ids);
+            }
         }
     }
 }
