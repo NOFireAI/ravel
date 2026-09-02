@@ -154,6 +154,15 @@ covering that hour then keeps naming the pre-rewrite inputs. An input the live
 HEAD still names is held for a later pass instead of deleted, and the pass
 reports how many objects it held under each of the two reasons below.
 
+A rewrite record can itself be superseded by a later rewrite applying a
+different erasure request, so the objects one delete unit covers are a whole
+supersession chain, not a single record's own outputs. The gate is asked over
+the entire chain at once, down to the raw inputs the oldest generation
+superseded: a HEAD naming anything in the chain holds all of it. Asking per
+generation would clear on a stale HEAD, which names the raw inputs rather than
+any generation's outputs, and would delete a record while the inputs it erased
+a subject out of were still resolvable.
+
 HEAD read failures are explicit. An **absent** HEAD is NOT a block: with no
 snapshot naming anything, the sweep proceeds (ADR-0020: the catalog index is a
 pure optimization; a missing HEAD degrades to listing). A HEAD, or a covering
@@ -250,6 +259,15 @@ window would still call a Hit.
   held or deleted together: dropping the record while a still-named part is
   held would leave that part unreferenced, and the unreferenced-part rule
   would then collect it and undo the hold.
+- **A rewrite record outlives every input it superseded.** A whole
+  supersession chain, from the live record back to the raw inputs its oldest
+  generation superseded, is one indivisible delete unit: the HEAD gate decides
+  it all at once, and within a pass the superseded inputs and each
+  generation's parts are deleted before the records that superseded them,
+  oldest generation first. A record is the only durable statement that a
+  subject was erased out of a particular set of inputs, so a record that
+  disappeared while one of those inputs remained would leave that input
+  present with nothing naming it as erased.
 - A held input costs storage until the fold reconciles its hour or an
   operator rebuilds HEAD; nothing else about the hour changes, and every
   query over it keeps resolving normally. That is the deliberate trade
@@ -366,8 +384,9 @@ every bound is measured.
   meanwhile). The `.dreq` itself contains the subject
   identifier and is therefore not kept forever: a sweep rule deletes it once
   its `.done` exists, `now >= done.completed_unix_ns + protection_horizon`, no
-  input a rewrite applying that request superseded is still in the store, and
-  the legal-hold check passes. The horizon and the outstanding-input check
+  input any rewrite in that request's supersession chain superseded is still
+  in the store, and the legal-hold check passes. The horizon and the
+  outstanding-input check
   together are what guarantee the query-time filter only disappears after no
   resolvable snapshot can still include a pre-rewrite input: the horizon
   covers the ordinary case, and the check covers the two cases that outlive
@@ -378,6 +397,25 @@ every bound is measured.
   predicate, per-bucket dropped counts, and timestamps, no subject
   identifier, and is permanent, deny-delete audit evidence for every role
   (ADR-0055 amendment).
+
+- **An erasure request's `.dreq` outlives every input any rewrite in its
+  supersession chain superseded.** The outstanding-input check does not look
+  only for the record that applied this request. It walks each touched
+  bucket's supersession chain from the live record back to the raw inputs at
+  its end, collecting the requests every generation applied, and holds the
+  `.dreq` when anything any generation on that chain superseded is still
+  present. A superseded generation's own parts count: they still carry
+  whatever the generation above them erased. If the walk hits a
+  generation whose record is already gone, the request that generation applied
+  is no longer named anywhere, so the check falls back to asking whether the
+  bucket still holds anything that generation could have superseded (a raw
+  input's commit record, or a part no surviving record references) and holds
+  the `.dreq` while it does. That fallback is what makes the check independent
+  of delete ordering: the filter outlives the data even on a store where an
+  older sweep already removed a record it would otherwise have needed. Both
+  conditions clear once the superseded-input and unreferenced-part rules have
+  finished the bucket, so the hold ends rather than pinning the request
+  forever.
 
 ### Modifiers to the bound
 
@@ -462,10 +500,14 @@ into them. An operator with erasure obligations must budget them deliberately.
     query-time predicate removes the erased records after fetch, exactly as it
     did before the horizon elapsed; the request stays live for as long as any
     held input does, so the filter never retires under a snapshot that can
-    still resolve one. The cost is the held storage, not a failed query, and
-    it ends when the fold reconciles the hour or an operator rebuilds HEAD:
-    the next sweep deletes the inputs, and the request becomes removable
-    behind them.
+    still resolve one. That holds however many rewrite generations the hour has
+    accumulated: each rewrite record stays in place behind the inputs it
+    superseded, and each request's filter stays live behind the whole chain,
+    not just behind the one generation that applied it. The cost is the held
+    storage, not a failed query, and it ends when the fold reconciles the hour
+    or an operator rebuilds HEAD: the next sweep deletes the inputs, then the
+    records that superseded them, and the requests become removable behind
+    both.
   - **ADR-0028 analytics/derived datasets are a pure query-time stage, not a
     persisted store.** `ravel-analytics` carries no clock, IO, object-store,
     or catalog (docs/analytics.md): every analytic runs in memory over query
