@@ -18,6 +18,10 @@ exemplar is a sampled signal, not a complete record of every request.
 
 ## How Ravel stores an exemplar
 
+Exemplars are stored only from OTLP ingest. Remote Write and OTAP decode any
+exemplars a request carries and then discard them, so a metric ingested over
+those paths has none, whatever the sender attached.
+
 Ravel stores exemplars in the RSEG `EXEMPLARS` section (kind 10). The section
 was added in RSEG v6 (ADR-0047) and is unchanged in the current v7 (ADR-0092).
 Each object holds at most one `EXEMPLARS`
