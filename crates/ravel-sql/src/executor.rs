@@ -259,6 +259,55 @@ pub struct SqlOutcome {
     pub spill_by_operator: Vec<OperatorSpill>,
 }
 
+/// A shared, cloneable view of the [`QueryAccounting`] for the query currently
+/// running under [`SqlExecutor::execute_accounted`]. It lets a caller snapshot
+/// the cost incurred so far at any instant, including on the two exits that
+/// never yield a [`SqlOutcome`]: a wall-deadline trip (the `execute` timeout
+/// wrapper drops the run future and returns [`SqlError::DeadlineExceeded`]) and
+/// the whole execute future being dropped mid-fetch (a client disconnect). On
+/// the success path the snapshot equals the returned [`SqlOutcome::accounting`].
+///
+/// The executor re-points this at each attempt's own handle: the snapshot retry
+/// builds a fresh [`QueryAccounting`] per attempt, and installing the live view
+/// on each keeps a discarded first attempt's counters from lingering in a later
+/// read, matching how [`SqlOutcome::accounting`] reports only the successful
+/// attempt.
+#[derive(Clone, Default)]
+pub struct LiveAccounting(Arc<Mutex<QueryAccounting>>);
+
+impl LiveAccounting {
+    /// A live view whose counters are all zero until an execution installs the
+    /// first attempt's handle.
+    pub fn new() -> Self {
+        LiveAccounting::default()
+    }
+
+    /// Snapshot the current attempt's counters. Safe from any thread at any
+    /// time, including a `Drop` running after the execute future was dropped
+    /// mid-await: the attempt's counter block lives behind an `Arc` this view
+    /// shares, so it outlives the dropped future.
+    pub fn snapshot(&self) -> QueryAccountingSnapshot {
+        self.lock().snapshot()
+    }
+
+    /// Point this view at `accounting` (the attempt about to run). Clones the
+    /// handle, so the two share one atomic counter block and every increment
+    /// the attempt makes is visible through [`Self::snapshot`].
+    fn install(&self, accounting: &QueryAccounting) {
+        *self.lock() = accounting.clone();
+    }
+
+    /// Lock the inner slot, recovering a poisoned guard. The slot holds one
+    /// cheap-to-clone handle and no torn state, so recovering is safe and
+    /// strictly better than failing every later snapshot.
+    fn lock(&self) -> std::sync::MutexGuard<'_, QueryAccounting> {
+        match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
 /// Executes SQL for any tenant against one catalog and object store.
 ///
 /// The executor holds no DataFusion state: it is the per-tenant memory
@@ -453,17 +502,40 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         req: &SqlRequest,
     ) -> Result<SqlOutcome, SqlError> {
+        self.execute_accounted(tenant_hash, req, &LiveAccounting::new())
+            .await
+    }
+
+    /// [`Self::execute`], with a caller-owned [`LiveAccounting`] the caller can
+    /// snapshot at any instant, independent of how the query ends.
+    ///
+    /// The server's cost guard passes one so a timed-out or dropped query still
+    /// records the requests and bytes it actually issued: neither a
+    /// [`SqlError::DeadlineExceeded`] nor the run future being dropped mid-fetch
+    /// carries those figures otherwise. On the success path the returned
+    /// [`SqlOutcome::accounting`] equals `live.snapshot()`.
+    pub async fn execute_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
         // Step 1: the security gate runs before any catalog or plan work.
         validate(&req.sql)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
-        tokio::time::timeout(req.deadline, self.run(tenant_hash, req))
+        tokio::time::timeout(req.deadline, self.run(tenant_hash, req, live))
             .await
             .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
     }
 
     /// The resolve/plan/execute loop, minus validation and the deadline.
-    async fn run(&self, tenant_hash: TenantHash, req: &SqlRequest) -> Result<SqlOutcome, SqlError> {
+    async fn run(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
         let mut stats = SqlStats::default();
 
         // Resolve the tenant's declared typed attribute columns once for the
@@ -482,6 +554,11 @@ impl SqlExecutor {
         // into the retry's.
         for attempt in 0..2u32 {
             let accounting = QueryAccounting::new();
+            // Re-point the caller's live view at this attempt's handle before
+            // any store call, so a snapshot taken from a `Drop` or after a
+            // deadline trip reflects exactly this attempt's issued cost and
+            // never a discarded prior attempt's.
+            live.install(&accounting);
             let (snapshot, estimate) = self.resolve(tenant_hash, req, &accounting).await?;
             stats.resolves += 1;
             stats.attempts += 1;

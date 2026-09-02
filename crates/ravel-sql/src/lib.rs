@@ -124,7 +124,9 @@ pub use error::{
     ErrorClass, MSG_CORRUPT, MSG_EXECUTION, MSG_INTERNAL, MSG_PLAN, MSG_SPILL_DISABLED_MARKER,
     MSG_SPILL_QUOTA_MARKER, MSG_SPILL_UNAVAILABLE, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, SqlError,
 };
-pub use executor::{PinnedQuery, PinnedStream, SqlExecutor, SqlOutcome, SqlRequest, SqlStats};
+pub use executor::{
+    LiveAccounting, PinnedQuery, PinnedStream, SqlExecutor, SqlOutcome, SqlRequest, SqlStats,
+};
 #[cfg(feature = "flight-sql")]
 pub use flight::{
     DEFAULT_GC_PROTECTION_HORIZON, FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService,
