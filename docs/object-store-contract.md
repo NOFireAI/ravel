@@ -179,8 +179,8 @@ Every mode requires these; production startup fails if any is false.
 
 | Capability | Flag | Used by |
 |---|---|---|
-| Strongly consistent create + read-after-write | consistent_read | commit visibility |
-| Strongly consistent list-after-write | consistent_list | commit discovery |
+| Create + read-after-write consistency | consistent_read | commit visibility |
+| List-after-write consistency | consistent_list | commit discovery |
 | `CreateIfAbsent` conditional put | create_if_absent | commit records, data objects |
 | Version CAS put | cas_version | catalog HEAD pointers |
 | Byte-range + suffix reads | suffix_range | footer-first segment reads |
@@ -217,7 +217,7 @@ that is a size-driven implementation detail of `put`, not a caller reaching for
 
 `ObjectStoreBackend::put_multipart(key)` returns a `MultipartUpload` handle: a
 sequence of `put_part` calls followed by exactly one `complete` or `abort`. The
-flag and the method must agree — a backend reporting `multipart: false` MUST
+flag and the method must agree: a backend reporting `multipart: false` MUST
 refuse `put_multipart` with `Permanent`, which is what the default trait
 implementation does, and the contract suite asserts both directions.
 
@@ -227,7 +227,7 @@ them, rather than deferred to the server's `CompleteMultipartUpload`:
 | Rule | Value | Constant |
 |---|---|---|
 | Minimum size, any part but the last | 5 MiB | `MULTIPART_MIN_PART_SIZE` |
-| Minimum size, last part | 1 byte (no part may be empty) | — |
+| Minimum size, last part | 1 byte (no part may be empty) | n/a |
 | Maximum parts per upload | 10 000 | `MULTIPART_MAX_PARTS` |
 
 These are S3's own limits. A short part is legal while it is the last one, so
@@ -274,7 +274,7 @@ required rather than advisory.
 Read both as **outcomes that were not confirmed**, not as a count of billable
 orphans. An abort can return an error after S3 has already applied the
 operation, and in particular an abort issued after an ambiguous `complete()`
-error can fail precisely *because the upload already completed* — leaving a
+error can fail precisely *because the upload already completed*, leaving a
 visible object and nothing to reap, while both counters rise. So a non-zero
 value means "reconcile against S3's own list of open uploads", not "this many
 orphans exist". Both read a
@@ -313,7 +313,7 @@ parts are content-addressed, so they are.
 upload above `s3::MULTIPART_THRESHOLD` (16 MiB), cutting the payload into
 `s3::MULTIPART_PART_SIZE` (8 MiB) parts with at most 4 in flight. The
 threshold is two whole parts, so the multipart path never produces a
-degenerate single-part upload, and every part but the last is exactly 8 MiB —
+degenerate single-part upload, and every part but the last is exactly 8 MiB:
 uniform non-final part sizes, which the strictest S3-compatible backends (R2)
 require. 8 MiB parts keep the 10 000-part ceiling at 80 GiB, far above any
 object Ravel writes. The switch is invisible to callers: same `PutOutcome`,
@@ -325,7 +325,7 @@ same bytes back. It applies to `Overwrite` only; a `CreateIfAbsent` or
 **Checksum coverage.** `put_part`'s optional `UploadChecksum` is verified
 per part, before the part is sent, with exactly the reach `PutOptions::checksum`
 has on the same backend: a real check on `MemoryStore`, a local pre-flight
-against the caller's buffer on `S3Store` (see "Upload checksums" — nothing can
+against the caller's buffer on `S3Store` (see "Upload checksums": nothing can
 be put on the wire through `object_store` 0.14). A mismatch fails that
 `put_part` with `Corrupted`, does not count as a part, and leaves the upload
 open, so the caller may re-send the same bytes with a correct checksum. There
@@ -490,7 +490,7 @@ calls.
 
 `Capabilities` is self-reported: a backend declares `consistent_list: true`
 because its adapter believes the vendor provides it, not because anything
-checked. The problem is that nothing did — a backend
+checked. The problem is that nothing did: a backend
 that advertises S3 compatibility but actually delivers eventually consistent
 listing was trusted silently, and the resulting failures at the commit layer
 looked like data loss rather than a misconfigured store.
@@ -500,22 +500,22 @@ a suite that empirically probes a live backend rather than reading its
 declared flags. `run_conformance_suite(store, scratch_prefix)` runs, under a
 throwaway key prefix:
 
-- `ConditionalWriteCreateIfAbsent` — two concurrent `CreateIfAbsent` puts to
+- `ConditionalWriteCreateIfAbsent`: two concurrent `CreateIfAbsent` puts to
   the same key: exactly one must win and the loser must observe
   `AlreadyExists` (the losing-writer outcome the "Semantics adapters MUST
   honor" section above requires).
-- `ConditionalWriteCasVersion` — a `CasVersion` put against a stale version
+- `ConditionalWriteCasVersion`: a `CasVersion` put against a stale version
   must fail `PreconditionFailed`, not silently overwrite.
-- `ConsistentReadAfterWrite` — a `get` immediately following a `put` returns
+- `ConsistentReadAfterWrite`: a `get` immediately following a `put` returns
   the just-written bytes, repeated over several keys to catch a
   read-your-writes gap that only shows up intermittently.
-- `ConsistentListAfterWrite` — a `list` immediately following a `put`
+- `ConsistentListAfterWrite`: a `list` immediately following a `put`
   includes the new key, repeated the same way, to catch eventual-consistency
   listing rather than trusting the `consistent_list` flag.
 
 Each probe returns a `ProbeResult` naming which `Property` it checked, so a
 failure reads "this backend cannot do conditional writes" or "this backend's
-listing is eventually consistent" instead of a bare pass/fail — an operator
+listing is eventually consistent" instead of a bare pass/fail, so an operator
 does not have to guess which mandatory capability the backend actually
 lacks.
 
@@ -525,11 +525,12 @@ implemented yet. `CONFORMANCE_SUITE_VERSION` exists precisely so a later
 addition can be told apart from the four probes qualifying a bucket today.
 
 This is a runtime, once-per-bucket check, not a replacement for the
-compile-time contract suite below: `tests/contract.rs` is a development-time
+compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`
+is a development-time
 proof that each adapter *implementation* honors the trait, run in CI against
 all three backends including a real MinIO endpoint. `conformance.rs` is an
-operator-facing probe of one specific *deployment* — the actual configured
-endpoint and bucket — because the adapter can be correct while the vendor
+operator-facing probe of one specific *deployment*, the actual configured
+endpoint and bucket, because the adapter can be correct while the vendor
 serving it is not (a misconfigured storage class, a proxy in front of the
 bucket, a non-S3 vendor's compatibility gap).
 
@@ -552,7 +553,7 @@ untouched and reports it instead of overwriting it, per ADR-0050 section 6.
 A failing run writes nothing new to `sys/qualification`; its process exit
 names every failing property. The command only ever writes under
 `sys/qualify/<run-id>/` (a handful of small scratch objects the suite does
-not delete afterward — each run's key is unique, so this is unbounded
+not delete afterward: each run's key is unique, so this is unbounded
 untracked storage a runbook should sweep periodically, not a correctness
 issue) and the single `sys/qualification` key; it never reads, lists, or
 writes any tenant-prefixed key, so it is safe to run against a bucket that
@@ -578,7 +579,7 @@ adapter contract:
    a manifest, or provenance data outside any path Ravel's own retention
    logic controls.
 3. **Two sanctioned lifecycle rules**, and only these:
-   - `AbortIncompleteMultipartUpload` (REQUIRED, 7 days or less) — cleans up
+   - `AbortIncompleteMultipartUpload` (REQUIRED, 7 days or less) cleans up
      abandoned multipart uploads. **Its absence violates the bucket
      configuration contract**, because nothing in Ravel reaps abandoned
      uploads: a failed abort or a future dropped mid-upload leaves billable
@@ -589,7 +590,7 @@ adapter contract:
    `t/*/*/prov`, commit records `t/*/*/c/*`, and `t/*/catalog/*/*` HEAD
    history. These are the objects whose immutability the commit and
    catalog layers assume as a given (see "Data objects, commit records,
-   manifests, and index objects are immutable" — this section is that
+   manifests, and index objects are immutable"; this section is that
    invariant's bucket-level enforcement point). Object Lock is what makes
    that assumption hold even against a compromised or misconfigured
    credential that can otherwise issue deletes: compliance mode refuses
@@ -616,8 +617,8 @@ this crate calls no vendor API that can observe the rule, so the probe cannot
 determine compliance either way. The prefix reflects the limits of the probe,
 never a weaker requirement. Every production backend reports
 [`ObjectLockStatus::Unknown`] and every `BucketConfigProbe` field
-`Unknown` through these traits today — there is no vendor API this crate
-calls to populate anything else — so today these probes are informational
+`Unknown` through these traits today, since there is no vendor API this crate
+calls to populate anything else, so today these probes are informational
 only, exactly as ADR-0055 §3 designed them, and their reporting stays
 that way regardless of the flag below.
 
@@ -629,9 +630,9 @@ production silently unprotected:
 - `ObjectLockStatus::Disabled`, or a `bucket_config_alarms` `"ALARM:"`
   entry (the versioning-without-expiration misconfiguration), is fatal:
   the server refuses to start with a typed error.
-- `ObjectLockStatus::Unknown` — the case every backend reachable only
+- `ObjectLockStatus::Unknown`, the case every backend reachable only
   through `ObjectStoreBackend` reports today, since no adapter can
-  actually answer this query — logs one warning and sets the
+  actually answer this query, logs one warning and sets the
   `ravel_bucket_protection_unknown` gauge to `1`, so a fleet can alarm on
   it without being blocked by it.
 - `ObjectLockStatus::Enabled` with no alarms starts clean, gauge at `0`.
@@ -639,7 +640,7 @@ production silently unprotected:
 With the flag off (the default), none of this runs, and startup behavior
 is unchanged from before this gate existed. The flag makes an
 unprotected production deployment *visible and refusable*; it does not
-and cannot make Object Lock or lifecycle policy real in-process — that
+and cannot make Object Lock or lifecycle policy real in-process: that
 capability is still reserved for its own trait-extending ADR per
 ADR-0042 decision 3.
 
