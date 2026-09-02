@@ -3974,9 +3974,20 @@ mod tests {
     /// ambient one. Before the fix, this test fails: the collector observes
     /// `s3_requests`/`s3_bytes` recorded on `"request_span"`.
     #[tokio::test]
+    // Holds the test_tracing serialization guard across `.await`; the
+    // current-thread test runtime runs this future to completion with no other
+    // task, so there is no deadlock risk the lint guards against.
+    #[allow(clippy::await_holding_lock)]
     async fn phase_spans_never_record_onto_the_ambient_span_when_disabled() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
+
+        // This installs an INFO-only subscriber, whose max-level hint is
+        // process-global: while it is the default it disables every
+        // `debug_span!` on every thread. A concurrent test that counts such
+        // spans would silently miss them. Hold the shared guard so this test
+        // never overlaps those (see `crate::test_tracing`).
+        let _serial = crate::test_tracing::guard();
 
         let collector = RecordCollector::default();
         let subscriber = tracing_subscriber::registry()

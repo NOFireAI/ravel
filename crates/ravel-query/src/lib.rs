@@ -15,6 +15,8 @@ mod phase_accounting;
 mod query_admission;
 mod segment_admission;
 pub mod span_fetcher;
+#[cfg(test)]
+pub(crate) mod test_tracing;
 
 pub use config::{
     ByteLimit, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
