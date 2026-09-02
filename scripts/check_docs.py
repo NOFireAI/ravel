@@ -851,10 +851,23 @@ def run(update_baseline=False, strict=False, out=sys.stdout):
         (f.path, f.rule, f.key) for f in findings
     )
 
+    # Occurrence counts of an ALREADY-BASELINED (path, rule, key) are not
+    # enforced: docs/guides/operations.md holds 147 decision citations, and
+    # while this epic is in flight other pull requests keep adding to it. A
+    # 148th `ADR-0055` arriving from elsewhere would otherwise fail this gate on
+    # a branch that never touched the file.
+    #
+    # A key the file has not carried before is still NEW, so a genuinely new
+    # defect fails even in a file full of tolerated debt: a second, different
+    # vocabulary error is caught while another `ADR-0055` is not. Deleting a
+    # key's entries as a task fixes them restores exact enforcement for that
+    # key, which is what keeps the baseline a debt counter rather than a
+    # blanket exemption.
     new = []
     for key, count in current.items():
-        extra = count - baseline.get(key, 0)
-        for _ in range(max(0, extra)):
+        if key in baseline:
+            continue
+        for _ in range(count):
             new.append(key)
     unused = []
     for key, count in baseline.items():
