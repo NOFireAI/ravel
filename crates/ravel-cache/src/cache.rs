@@ -259,8 +259,10 @@ impl<E> Drop for Cache<E> {
 
 impl Inner {
     /// Look up `key`, aging it out if it is past `max_entry_age_ns`. Records a
-    /// hit, or a miss (plus an expiry, when the miss is because the entry aged
-    /// out), matching the disk tier's `get`/expiry accounting.
+    /// hit on a live entry, or a miss otherwise. An over-age entry is dropped
+    /// and reported as an ordinary miss: unlike the disk tier, the RAM tier has
+    /// no max-age expiry counter, so an aged-out read moves the same `misses`
+    /// counter a cold miss does and nothing else.
     fn get(&self, key: &CacheKey) -> Option<Bytes> {
         let mut fifo = self.fifo.lock();
         let Some(entry) = fifo.get(key) else {
