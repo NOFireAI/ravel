@@ -33,27 +33,28 @@
 //! declines when it lists a tombstone, but ADR-0019 calls that "an efficiency
 //! measure only": its absence would only waste work, never corrupt data.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use prost::Message;
-use ravel_catalog::{DecodedPart, PartLimits, decode_head, decode_part};
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
 };
-use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef};
 use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone};
-use ravel_types::{Signal, TenantHash};
 
 use crate::bucket::Bucket;
 use crate::clock::Clock;
 use crate::compact::{CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
+use crate::reachability::SnapshotGate;
 use crate::read::{BucketListing, list_bucket, verify_commit_key};
 use crate::sweep::LeaseCheck;
+
+/// The HEAD-reachability delete blocker, shared with the superseded-input
+/// sweep (see [`crate::reachability`]). Re-exported at this path because
+/// retention was its first caller and the maintain crate's public surface
+/// names it here.
+pub use crate::reachability::{SnapshotBlock, SnapshotReachability};
 
 /// The outcome of one retention pass over a bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,258 +85,6 @@ pub enum RetentionOutcome {
     /// retention-frontier reconcile, crates/ravel-catalog). The [`SnapshotBlock`]
     /// says why the block fired.
     BlockedBySnapshot(SnapshotBlock),
-}
-
-/// Why the physical sweep was blocked by HEAD reachability (ADR-0020
-/// delete-blocker). Both variants leave the tombstone in place and delete
-/// nothing; they are distinguished so each is separately observable in the
-/// maintain counters (a persistent [`SnapshotBlock::Unreadable`] is an
-/// operator signal that HEAD or a part cannot be read, not the ordinary
-/// lagging-fold case).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotBlock {
-    /// A decoded snapshot entry names an object physically inside this bucket
-    /// (same shard and ingest hour). The ordinary case: the fold has not yet
-    /// dropped the tombstoned bucket from the snapshot.
-    Named,
-    /// HEAD, or a snapshot part covering this bucket's hour, was present but
-    /// could not be read (undecodable, checksum/hash mismatch, unsupported
-    /// version, or a HEAD-named part that is missing). Blocked fail-closed:
-    /// non-reachability cannot be proven from data that cannot be read, and a
-    /// wrongly-permitted delete is unrecoverable while a delayed one is not
-    /// (deliverable 3).
-    Unreadable,
-}
-
-/// Per-sweep-pass cache of the catalog HEAD and the snapshot parts it names,
-/// so a retention pass that walks many buckets of one `(tenant, signal)` reads
-/// HEAD at most once and each covering part at most once, rather than once per
-/// bucket (a per-bucket HEAD GET would be an S3-request-cost regression against
-/// the live cost-reduction epic, ADR-0076). Created once per
-/// [`crate::scan::scan_and_maintain_with_memo`] call and threaded through
-/// [`maintain_bucket_with_reach`] into [`physical_sweep`]; the public
-/// [`maintain_bucket`] / [`retention_sweep_bucket`] entry points create a fresh
-/// one per call.
-///
-/// The cache is read-once-per-pass, not a durable cache: it is safe precisely
-/// because a retention tombstone is irreversible (ADR-0019 decision 2), so a
-/// bucket the fold has already dropped from HEAD is never re-added, and a HEAD
-/// read at the start of a pass that does NOT name a bucket cannot later start
-/// naming it. A HEAD read that DOES name a bucket only ever delays a delete by
-/// one pass, the fail-safe direction.
-#[derive(Default)]
-pub struct SnapshotReachability {
-    head: Option<HeadLoad>,
-    /// Decoded snapshot parts by object key. `None` = present but unreadable
-    /// (fail-closed); `Some` = decoded and usable.
-    parts: HashMap<String, Option<Arc<DecodedPart>>>,
-}
-
-/// The catalog HEAD as read once for a sweep pass.
-enum HeadLoad {
-    /// HEAD is absent: no snapshot names anything, so no bucket is blocked
-    /// (ADR-0020: the index is a pure optimization; a missing HEAD degrades to
-    /// listing).
-    Absent,
-    /// HEAD is present but undecodable (or a newer format this build cannot
-    /// read): fail-closed, every bucket is blocked.
-    Unreadable,
-    /// HEAD is present and decoded. Boxed so this large variant does not
-    /// inflate every `HeadLoad` (`clippy::large_enum_variant`): `SnapshotHead`
-    /// grew past 300 bytes when ADR-0850 added `column_stats`, while the other
-    /// variants are unit-sized.
-    Present(Box<SnapshotHead>),
-}
-
-/// The result of gating one bucket on HEAD reachability.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotGate {
-    /// No snapshot entry names an object in this bucket: the sweep may proceed.
-    Clear,
-    /// The sweep is blocked; the reason distinguishes the counters.
-    Blocked(SnapshotBlock),
-}
-
-impl SnapshotReachability {
-    /// A fresh, empty cache for one sweep pass.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether the live HEAD snapshot still reaches an object inside `bucket`
-    /// (ADR-0020 delete-blocker). HEAD and each covering part are loaded at
-    /// most once per pass and cached. HEAD absent -> [`SnapshotGate::Clear`];
-    /// HEAD or any covering part unreadable -> fail-closed
-    /// [`SnapshotBlock::Unreadable`]; a decoded entry naming this bucket's
-    /// shard+hour -> [`SnapshotBlock::Named`].
-    async fn bucket_gate(
-        &mut self,
-        store: &dyn ObjectStoreBackend,
-        bucket: &Bucket,
-    ) -> Result<SnapshotGate> {
-        // Load HEAD once, then take the covering part refs out (owned clones)
-        // so the borrow of `self.head` is released before the part loads below
-        // borrow `self` mutably.
-        let covering: Vec<SnapshotPartRef> = match self
-            .ensure_head(store, &bucket.tenant_hash, bucket.signal)
-            .await?
-        {
-            HeadStatus::Absent => return Ok(SnapshotGate::Clear),
-            HeadStatus::Unreadable => {
-                return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable));
-            }
-            HeadStatus::Present => match &self.head {
-                Some(HeadLoad::Present(head)) => head
-                    .parts
-                    .iter()
-                    .filter(|p| {
-                        p.min_hour <= bucket.ingest_hour_bucket
-                            && bucket.ingest_hour_bucket <= p.watermark_hour
-                    })
-                    .cloned()
-                    .collect(),
-                // Unreachable after `ensure_head` returned `Present`; block
-                // fail-closed rather than panic (no unwrap/expect on a
-                // production path).
-                _ => return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable)),
-            },
-        };
-
-        for part_ref in &covering {
-            match self.ensure_part(store, part_ref).await? {
-                // A covering part could not be read: cannot prove
-                // non-reachability, fail closed (deliverable 3).
-                None => return Ok(SnapshotGate::Blocked(SnapshotBlock::Unreadable)),
-                Some(part) => {
-                    // An object is physically inside this bucket iff its entry's
-                    // shard and ingest hour match the bucket. Any such entry
-                    // means the snapshot still names an object the sweep would
-                    // delete.
-                    if part.entries.iter().any(|e| {
-                        e.shard == bucket.shard && e.ingest_hour_bucket == bucket.ingest_hour_bucket
-                    }) {
-                        return Ok(SnapshotGate::Blocked(SnapshotBlock::Named));
-                    }
-                }
-            }
-        }
-        Ok(SnapshotGate::Clear)
-    }
-
-    /// Load HEAD once for the pass, caching the result. Returns a lightweight
-    /// status; the decoded HEAD itself stays in `self.head` for the covering
-    /// part-ref extraction in [`Self::bucket_gate`].
-    async fn ensure_head(
-        &mut self,
-        store: &dyn ObjectStoreBackend,
-        tenant: &TenantHash,
-        signal: Signal,
-    ) -> Result<HeadStatus> {
-        if self.head.is_none() {
-            let head_key = catalog_head_key(tenant, signal);
-            let load = match store.get(&head_key, GetRange::Full).await {
-                Ok(got) => match decode_head(got.data.as_ref()) {
-                    Ok(head) => HeadLoad::Present(Box::new(head)),
-                    Err(err) => {
-                        // Present but undecodable/newer: fail-closed. Cannot
-                        // prove non-reachability from a HEAD we cannot read.
-                        tracing::warn!(
-                            error = %err,
-                            key = %head_key,
-                            "retention sweep: catalog HEAD failed to decode; blocking deletes \
-                             fail-closed this pass rather than proving non-reachability from an \
-                             unreadable HEAD"
-                        );
-                        HeadLoad::Unreadable
-                    }
-                },
-                Err(StoreError::NotFound) => HeadLoad::Absent,
-                Err(err) => return Err(MaintainError::Store(err)),
-            };
-            self.head = Some(load);
-        }
-        Ok(match &self.head {
-            Some(HeadLoad::Absent) => HeadStatus::Absent,
-            Some(HeadLoad::Unreadable) => HeadStatus::Unreadable,
-            Some(HeadLoad::Present(_)) => HeadStatus::Present,
-            None => HeadStatus::Unreadable,
-        })
-    }
-
-    /// Load, verify (blake3 against the HEAD ref), and decode one snapshot part
-    /// once per pass, caching the result. `Ok(None)` is the fail-closed
-    /// "present but unreadable" case (a missing HEAD-named part, a hash
-    /// mismatch, or a decode failure); a transient store fault propagates.
-    async fn ensure_part(
-        &mut self,
-        store: &dyn ObjectStoreBackend,
-        part_ref: &SnapshotPartRef,
-    ) -> Result<Option<Arc<DecodedPart>>> {
-        if let Some(cached) = self.parts.get(&part_ref.key) {
-            return Ok(cached.clone());
-        }
-        let load: Option<Arc<DecodedPart>> = match store.get(&part_ref.key, GetRange::Full).await {
-            Ok(got) => {
-                let data = got.data;
-                if blake3::hash(&data).as_bytes().as_slice() != part_ref.blake3.as_slice() {
-                    tracing::warn!(
-                        key = %part_ref.key,
-                        "retention sweep: snapshot part hash mismatch; blocking deletes fail-closed"
-                    );
-                    None
-                } else {
-                    let limits = PartLimits {
-                        max_snapshot_part_bytes: ravel_catalog::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
-                    };
-                    match decode_part(data.as_ref(), &limits) {
-                        Ok(part) => Some(Arc::new(part)),
-                        Err(err) => {
-                            tracing::warn!(
-                                error = %err,
-                                key = %part_ref.key,
-                                "retention sweep: snapshot part failed to decode; blocking deletes \
-                                 fail-closed"
-                            );
-                            None
-                        }
-                    }
-                }
-            }
-            // HEAD names a part that is not present. Anomalous (a HEAD-named
-            // part is only deleted after HEAD stops naming it plus the
-            // horizon): cannot read its entries, so fail closed.
-            Err(StoreError::NotFound) => {
-                tracing::warn!(
-                    key = %part_ref.key,
-                    "retention sweep: HEAD-named snapshot part is missing; blocking deletes \
-                     fail-closed"
-                );
-                None
-            }
-            Err(err) => return Err(MaintainError::Store(err)),
-        };
-        self.parts.insert(part_ref.key.clone(), load.clone());
-        Ok(load)
-    }
-}
-
-/// Lightweight status returned by [`SnapshotReachability::ensure_head`], so the
-/// decoded HEAD can stay owned in the cache while the caller decides how to
-/// proceed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeadStatus {
-    Absent,
-    Unreadable,
-    Present,
-}
-
-/// `t/<tenant_hash_hex>/catalog/<signal>/HEAD` -- the mutable head pointer for
-/// one `(tenant, signal)` (docs/catalog-and-mvcc.md key layout, a frozen
-/// contract). No public builder is exported from ravel-catalog, so it is
-/// constructed here from the same pieces, matching `sweep.rs`'s
-/// `catalog_head_key` precedent.
-fn catalog_head_key(tenant: &TenantHash, signal: Signal) -> String {
-    format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
 
 /// Run one retention pass over a single sealed bucket (ADR-0019):
