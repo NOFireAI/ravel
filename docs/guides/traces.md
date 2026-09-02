@@ -169,6 +169,14 @@ with a status, service, name, or duration prune. Each `WHERE` clause is also
 re-applied exactly above the scan, so every result is correct whether or not a
 block was pruned.
 
+The 32-character hex form of the `trace_id` literal in the first query is
+handled by the block-pruning path, which is unit-tested for it. What is not
+proven anywhere is the residual filter that re-applies the predicate above the
+scan against a text literal: the column is `FixedSizeBinary(16)` and a hex
+string is text, and the only end-to-end test of that residual uses a binary
+literal. Treat the hex-string form as illustrative, and supply a 16-byte binary
+literal where you need the whole comparison proven end to end.
+
 ## Incomplete traces
 
 A trace is incomplete when the query does not see all of its spans. This happens
@@ -192,5 +200,3 @@ Span links are not stored. A link points from one span to another span in a
 different trace. Ravel deliberately keeps links out of RSPAN; they will get
 their own design decision when a query needs them. A query over the `spans`
 table cannot filter or return links.
-</content>
-</invoke>
