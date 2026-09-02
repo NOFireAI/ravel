@@ -466,6 +466,7 @@ impl LogIngestRouter {
             let error = if durable.is_empty() {
                 inner
             } else {
+                self.metrics.record_partial_write();
                 LogWriteError::PartialWrite {
                     inner: Box::new(inner),
                     durable,
