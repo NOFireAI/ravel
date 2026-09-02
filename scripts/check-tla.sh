@@ -2,21 +2,25 @@
 # TLA+ verification harness (ADR-1113 task T1).
 #
 # Runs TLC over every formal/tla area, or one named area. An "area" is any
-# directory under formal/tla that contains a smoke.cfg; its model-check entry
-# module is the single MC*.tla file in that directory (naming convention).
+# directory under formal/tla that carries a smoke config, either a bare
+# smoke.cfg or a per-module MC<Spec>.smoke.cfg. Each MC*.tla in the area is a
+# model-check entry module; an area may hold more than one.
 #
 # Subcommands:
 #   smoke        [-a AREA]   fast reachability + safety (budget 300s per cfg)
 #   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg)
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
 #   traceability [-a AREA]   check every traceability.md source ref resolves
-#   all          [-a AREA]   smoke + negative + traceability (the CI lane), then exhaustive
+#   ci           [-a AREA]   smoke + negative + traceability under one run id
+#   all          [-a AREA]   ci, then exhaustive, under one run id
 #
 # Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java).
 #
-# The TLC jar is fetched once into .cache/tla (gitignored) and checksum-pinned;
-# a mismatch refuses to run. Java is taken from RAVEL_TLA_JAVA if set, else the
-# `java` on PATH; version 17 or newer is required.
+# The TLC jar is resolved once and checksum-pinned. Set RAVEL_TLA_TOOLS_JAR to
+# an operator-supplied jar (verified against the pin, never downloaded); else it
+# is fetched once into .cache/tla (gitignored). A checksum mismatch refuses to
+# run. Java is taken from RAVEL_TLA_JAVA if set, else the `java` on PATH;
+# version 17 or newer is required.
 set -u
 
 TLA_VERSION="1.7.4"
@@ -46,8 +50,10 @@ resolve_java() {
         note "no Java found (set RAVEL_TLA_JAVA or install a JDK 17+)"
         exit 2
     }
+    # Read the line that actually carries the version, not line 1: a
+    # JAVA_TOOL_OPTIONS "Picked up ..." banner is printed before it.
     local ver
-    ver="$("$java" -version 2>&1 | head -1 | grep -oE '[0-9]+' | head -1)"
+    ver="$("$java" -version 2>&1 | grep -iE 'version' | head -1 | grep -oE '[0-9]+' | head -1)"
     [ -n "$ver" ] || { note "cannot read Java version from '$java'"; exit 2; }
     if [ "$ver" -lt 17 ]; then
         note "Java $ver is too old; TLC needs 17 or newer"
@@ -58,6 +64,20 @@ resolve_java() {
 
 ensure_jar() {
     mkdir -p "$CACHE_DIR"
+    # RAVEL_TLA_TOOLS_JAR (ADR-1113 D9): an operator-supplied jar. Use it as-is,
+    # verify its sha256 against the pin, and refuse on mismatch. Never download
+    # in this mode: an air-gapped or reproducible build supplies the jar and a
+    # silent fetch would defeat the point.
+    if [ -n "${RAVEL_TLA_TOOLS_JAR:-}" ]; then
+        [ -f "$RAVEL_TLA_TOOLS_JAR" ] \
+            || die "RAVEL_TLA_TOOLS_JAR=$RAVEL_TLA_TOOLS_JAR does not exist"
+        local supplied
+        supplied="$(sha256sum "$RAVEL_TLA_TOOLS_JAR" | awk '{print $1}')"
+        [ "$supplied" = "$TLA_JAR_SHA256" ] \
+            || die "RAVEL_TLA_TOOLS_JAR sha256 $supplied != expected $TLA_JAR_SHA256; refusing to run (not downloading)"
+        JAR="$RAVEL_TLA_TOOLS_JAR"
+        return 0
+    fi
     if [ -f "$JAR" ]; then
         local got
         got="$(sha256sum "$JAR" | awk '{print $1}')"
@@ -87,18 +107,41 @@ ensure_jar() {
 # --- area discovery ---------------------------------------------------------
 
 discover_areas() {
+    # An area is a directory under formal/tla holding at least one smoke config,
+    # either the bare smoke.cfg (single-spec area) or a per-module MC*.smoke.cfg.
     local d
     for d in "$FORMAL_DIR"/*/; do
-        [ -f "${d}smoke.cfg" ] && basename "$d"
+        if [ -f "${d}smoke.cfg" ] || ls "${d}"MC*.smoke.cfg >/dev/null 2>&1; then
+            basename "$d"
+        fi
     done
 }
 
-area_module() {
-    # The model-check entry module: the single MC*.tla in the area directory.
-    local area_dir="$1" m
-    m="$(ls "$area_dir"/MC*.tla 2>/dev/null | head -1)" || true
-    [ -n "$m" ] || die "no MC*.tla entry module in $area_dir"
-    basename "$m" .tla
+area_modules() {
+    # Every model-check entry module in the area: each MC*.tla, one per line.
+    # An area may hold several (e.g. maintenance). Per-module cfg files
+    # MC<Spec>.smoke.cfg / MC<Spec>.<kind>.cfg are NOT modules and are excluded.
+    local area_dir="$1" m base
+    local found=0
+    for m in "$area_dir"/MC*.tla; do
+        [ -e "$m" ] || continue
+        base="$(basename "$m" .tla)"
+        echo "$base"
+        found=1
+    done
+    [ "$found" = 1 ] || die "no MC*.tla entry module in $area_dir"
+}
+
+module_cfg() {
+    # The cfg for one module and kind: prefer the per-module MC<Spec>.<kind>.cfg,
+    # else fall back to the bare <kind>.cfg (valid only for a single-spec area).
+    # Prints the cfg path, or nothing if neither exists.
+    local area_dir="$1" module="$2" kind="$3"
+    if [ -f "$area_dir/$module.$kind.cfg" ]; then
+        echo "$area_dir/$module.$kind.cfg"
+    elif [ -f "$area_dir/$kind.cfg" ]; then
+        echo "$area_dir/$kind.cfg"
+    fi
 }
 
 # --- TSV --------------------------------------------------------------------
@@ -139,10 +182,14 @@ run_tlc() {
         fi
     fi
     if [ -n "$TIMEOUT_BIN" ]; then wrap=("$TIMEOUT_BIN" "$budget"); fi
+    # The library path carries the shared common/ module first, then the area
+    # dir, so any area can EXTEND or INSTANCE RavelObjectStore. The area dir
+    # comes second so a same-named module in the area still wins locally.
+    local libpath="$FORMAL_DIR/common:$area_dir"
     local code=0
     # ${wrap[@]+...}: an empty array is "unbound" under set -u on bash 3.2.
     ( cd "$area_dir" && ${wrap[@]+"${wrap[@]}"} "$JAVA" -XX:+UseParallelGC \
-        -DTLA-Library="$area_dir" -cp "$JAR" tlc2.TLC \
+        -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
         -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
     return $code
 }
@@ -202,17 +249,16 @@ check_bands() {
     return $rc
 }
 
-check_model() {
-    # check_model <area> <kind: smoke|exhaustive>
-    local area="$1" kind="$2"
+# check_one_model <area> <module> <kind> <cfg>
+check_one_model() {
+    local area="$1" module="$2" kind="$3" cfg="$4"
     local area_dir="$FORMAL_DIR/$area"
-    local cfg="$area_dir/${kind}.cfg"
-    [ -f "$cfg" ] || { note "$area: no ${kind}.cfg, skipping"; return 0; }
-    local module budget logfile
-    module="$(area_module "$area_dir")"
+    local cfg_name budget logfile
+    cfg_name="$(basename "$cfg")"
     if [ "$kind" = exhaustive ]; then budget=$EXHAUSTIVE_BUDGET; else budget=$SMOKE_BUDGET; fi
     mkdir -p "$LOG_DIR"
-    logfile="$LOG_DIR/${area}-${kind}.log"
+    logfile="$LOG_DIR/${area}-${module}-${kind}.log"
+    local label="$area/$module ${kind}"
 
     local start=$SECONDS code=0
     run_tlc "$area" "$module" "$cfg" "$budget" "$logfile" || code=$?
@@ -224,24 +270,84 @@ check_model() {
     depth="$(log_field "$logfile" 'search is [0-9]+')"
 
     if [ "$code" -eq 124 ]; then
-        record_row "$area" "${kind}.cfg" "$states" "$distinct" "$depth" "$secs" "TIMEOUT"
-        note "$area ${kind}: TIMEOUT after ${budget}s (log: $logfile)"
+        record_row "$area" "$cfg_name" "$states" "$distinct" "$depth" "$secs" "TIMEOUT"
+        note "$label: TIMEOUT after ${budget}s (log: $logfile)"
         return 1
     fi
     if [ "$code" -ne 0 ]; then
-        record_row "$area" "${kind}.cfg" "$states" "$distinct" "$depth" "$secs" "FAIL"
-        note "$area ${kind}: TLC exit $code (log: $logfile)"
+        record_row "$area" "$cfg_name" "$states" "$distinct" "$depth" "$secs" "FAIL"
+        note "$label: TLC exit $code (log: $logfile)"
         grep -iE 'is violated|Error:' "$logfile" | head -3 >&2
         return 1
     fi
-    if ! check_bands "$area" "${kind}.cfg" "$distinct" "$depth"; then
-        record_row "$area" "${kind}.cfg" "$states" "$distinct" "$depth" "$secs" "BAND"
-        note "$area ${kind}: figures outside declared band (log: $logfile)"
+    if ! check_bands "$area" "$cfg_name" "$distinct" "$depth"; then
+        record_row "$area" "$cfg_name" "$states" "$distinct" "$depth" "$secs" "BAND"
+        note "$label: figures outside declared band (log: $logfile)"
         return 1
     fi
-    record_row "$area" "${kind}.cfg" "$states" "$distinct" "$depth" "$secs" "PASS"
-    note "$area ${kind}: PASS  states=$states distinct=$distinct depth=$depth ${secs}s"
+    record_row "$area" "$cfg_name" "$states" "$distinct" "$depth" "$secs" "PASS"
+    note "$label: PASS  states=$states distinct=$distinct depth=$depth ${secs}s"
     return 0
+}
+
+check_model() {
+    # check_model <area> <kind: smoke|exhaustive>
+    # Runs every MC*.tla module in the area against its cfg for this kind.
+    local area="$1" kind="$2"
+    local area_dir="$FORMAL_DIR/$area"
+    local rc=0 module cfg
+    while IFS= read -r module; do
+        [ -n "$module" ] || continue
+        cfg="$(module_cfg "$area_dir" "$module" "$kind")"
+        if [ -z "$cfg" ]; then
+            if [ "$kind" = smoke ]; then
+                note "$area/$module: no ${kind}.cfg or ${module}.${kind}.cfg"; rc=1
+            else
+                note "$area/$module: no ${kind} cfg, skipping"
+            fi
+            continue
+        fi
+        check_one_model "$area" "$module" "$kind" "$cfg" || rc=1
+    done < <(area_modules "$area_dir")
+    return $rc
+}
+
+# negative_module <area-dir> <cfg>
+# The module a negative cfg drives: its first line may name one with the
+# `\* module: MC<Spec>` convention. Otherwise the area must hold exactly one
+# MC*.tla and that module is used.
+negative_module() {
+    local area_dir="$1" cfg="$2"
+    local first named
+    first="$(head -1 "$cfg")"
+    named="$(printf '%s\n' "$first" | grep -oE 'module:[[:space:]]*MC[A-Za-z0-9_]+' | head -1 | sed 's/.*module:[[:space:]]*//')"
+    if [ -n "$named" ]; then
+        echo "$named"; return 0
+    fi
+    local mods count
+    mods="$(area_modules "$area_dir")"
+    count="$(printf '%s\n' "$mods" | grep -c . )"
+    if [ "$count" = 1 ]; then
+        printf '%s\n' "$mods"; return 0
+    fi
+    die "negative $(basename "$cfg"): area has $count MC modules; first line must name one with '\\* module: MC<Spec>'"
+}
+
+# liveness_single_property_cfg <src-cfg> <property> -> path of a generated cfg
+# For an exit=13 (temporal) negative, TLC 1.7.4 prints only "Temporal
+# properties were violated." with no name, so a bare property= check is
+# vacuous. Generate a cfg that declares EXACTLY the expected property (every
+# other PROPERTY line stripped, the expected one appended): then a violation
+# can only be that property, and a wrong property= name makes TLC fail to
+# resolve the operator instead of reporting exit 13.
+liveness_single_property_cfg() {
+    local src="$1" prop="$2"
+    local gen="$CACHE_DIR/negcfg"
+    mkdir -p "$gen"
+    local out="$gen/$(basename "$src" .cfg).$prop.cfg"
+    grep -vE '^[[:space:]]*PROPERTY[[:space:]]' "$src" > "$out"
+    printf 'PROPERTY %s\n' "$prop" >> "$out"
+    echo "$out"
 }
 
 check_negative() {
@@ -249,8 +355,7 @@ check_negative() {
     local area_dir="$FORMAL_DIR/$area"
     local negdir="$area_dir/negative"
     [ -d "$negdir" ] || { note "$area: no negative/ directory, skipping"; return 0; }
-    local module logfile rc=0
-    module="$(area_module "$area_dir")"
+    local logfile rc=0
     mkdir -p "$LOG_DIR"
 
     local cfg
@@ -268,21 +373,24 @@ check_negative() {
             note "$area negative $name: .expect must set exit= and property="; rc=1; continue
         }
 
+        local module run_cfg viol_re
+        module="$(negative_module "$area_dir" "$cfg")" || { rc=1; continue; }
+        if [ "$want_exit" = 13 ]; then
+            # Temporal: run a generated cfg declaring only the expected property.
+            run_cfg="$(liveness_single_property_cfg "$cfg" "$want_prop")"
+            viol_re="Temporal properties were violated"
+        else
+            run_cfg="$cfg"
+            viol_re="Invariant $want_prop is violated"
+        fi
+
         logfile="$LOG_DIR/${area}-negative-${name}.log"
         local start=$SECONDS code=0
-        run_tlc "$area" "$module" "$cfg" "$SMOKE_BUDGET" "$logfile" || code=$?
+        run_tlc "$area" "$module" "$run_cfg" "$SMOKE_BUDGET" "$logfile" || code=$?
         local secs=$((SECONDS - start))
         local states distinct
         states="$(log_field "$logfile" '[0-9]+ states generated')"
         distinct="$(log_field "$logfile" '[0-9]+ distinct states found')"
-
-        # exit 12 = safety (invariant) violation; 13 = temporal (property).
-        local viol_re
-        if [ "$want_exit" = 13 ]; then
-            viol_re="property $want_prop is violated|Temporal properties were violated"
-        else
-            viol_re="Invariant $want_prop is violated"
-        fi
 
         if [ "$code" = "$want_exit" ] && grep -qE "$viol_re" "$logfile"; then
             record_row "$area" "negative/$name.cfg" "$states" "$distinct" "-" "$secs" "VIOLATED"
@@ -304,23 +412,23 @@ check_negative() {
 # via echo of a diagnostic; returns non-zero on failure.
 resolve_rust_ref() {
     local area="$1" ref="$2"
-    local path="${ref%%::*}"
-    case "$path" in
+    local ref_path="${ref%%::*}"
+    case "$ref_path" in
         *.tla) note "$area traceability: ref '$ref' points at a .tla file, not Rust source"; return 1 ;;
         *.rs) : ;;
         *) note "$area traceability: ref '$ref' is not a Rust (.rs) path"; return 1 ;;
     esac
-    if [ ! -e "$REPO_ROOT/$path" ]; then
-        note "$area traceability: missing source '$path'"; return 1
+    if [ ! -e "$REPO_ROOT/$ref_path" ]; then
+        note "$area traceability: missing source '$ref_path'"; return 1
     fi
     # Walk each ::-separated symbol after the path.
-    local rest="${ref#"$path"}"
+    local rest="${ref#"$ref_path"}"
     rest="${rest#::}"
     local sym
     while [ -n "$rest" ]; do
         sym="${rest%%::*}"
-        if [ -n "$sym" ] && ! grep -qF "$sym" "$REPO_ROOT/$path"; then
-            note "$area traceability: symbol '$sym' not found in '$path'"; return 1
+        if [ -n "$sym" ] && ! grep -qF "$sym" "$REPO_ROOT/$ref_path"; then
+            note "$area traceability: symbol '$sym' not found in '$ref_path'"; return 1
         fi
         if [ "$rest" = "$sym" ]; then rest=""; else rest="${rest#*::}"; fi
     done
@@ -385,14 +493,20 @@ main() {
     local only_area=""
     while [ $# -gt 0 ]; do
         case "$1" in
-            -a) only_area="${2:-}"; shift 2 ;;
+            -a)
+                # Fail closed: -a must carry a value, and a value that looks
+                # like the next flag ('-a -h') is a missing value, not an area.
+                case "${2:-}" in
+                    ''|-*) die "-a requires an AREA value" ;;
+                esac
+                only_area="$2"; shift 2 ;;
             -h|--help) usage 0 ;;
             *) die "unexpected argument: $1" ;;
         esac
     done
 
     case "$cmd" in
-        smoke|exhaustive|negative|traceability|all) : ;;
+        smoke|exhaustive|negative|traceability|ci|all) : ;;
         ""|-h|--help) usage 0 ;;
         *) die "unknown subcommand: $cmd" ;;
     esac
@@ -417,9 +531,12 @@ main() {
     RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse 'HEAD^{tree}')"
 
     local records_tsv=0
-    case "$cmd" in smoke|exhaustive|negative|all) records_tsv=1 ;; esac
+    case "$cmd" in smoke|exhaustive|negative|ci|all) records_tsv=1 ;; esac
     [ "$records_tsv" -eq 1 ] && truncate_tsv
 
+    # ci and all record every model under ONE run id, so last-run.tsv is a
+    # single coherent run: the smoke, negative, and (for all) exhaustive rows
+    # all carry the same run-id column.
     local rc=0 area
     for area in $areas; do
         case "$cmd" in
@@ -427,6 +544,11 @@ main() {
             exhaustive)   check_model "$area" exhaustive || rc=1 ;;
             negative)     check_negative "$area" || rc=1 ;;
             traceability) check_traceability "$area" || rc=1 ;;
+            ci)
+                check_model "$area" smoke || rc=1
+                check_negative "$area" || rc=1
+                check_traceability "$area" || rc=1
+                ;;
             all)
                 check_model "$area" smoke || rc=1
                 check_negative "$area" || rc=1
