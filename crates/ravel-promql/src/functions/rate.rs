@@ -111,10 +111,16 @@ fn histogram_extrapolated_rate(
     is_counter: bool,
     is_rate: bool,
 ) -> Option<FloatHistogram> {
-    let mut reduced = histogram::histogram_rate(samples, is_counter)?;
-
     let first_ts = samples[0].0;
     let last_ts = samples[samples.len() - 1].0;
+    // See the matching guard in `extrapolated_rate`: a zero-duration window
+    // (every sample sharing one timestamp) has no defined rate and returns
+    // no sample rather than a NaN-producing division.
+    if last_ts == first_ts {
+        return None;
+    }
+
+    let mut reduced = histogram::histogram_rate(samples, is_counter)?;
 
     let duration_to_start = ns_diff_to_seconds(first_ts, w.start_ns);
     let duration_to_end = ns_diff_to_seconds(w.end_ns, last_ts);
@@ -182,6 +188,15 @@ fn deriv(samples: &[Sample], _w: RangeWindow) -> Option<f64> {
     if samples.len() < 2 {
         return None;
     }
+    // ADR-1103: every sample sharing one timestamp makes every regression `x`
+    // value identical, so `var_x` is exactly zero and the slope is a 0.0/0.0
+    // NaN rather than a defined value; standard Prometheus storage dedups to
+    // one sample per timestamp so this state has no oracle behavior to match
+    // (same reasoning as `extrapolated_rate`'s zero-duration guard), so this
+    // drops the window instead of returning NaN.
+    if samples[samples.len() - 1].ts_ns == samples[0].ts_ns {
+        return None;
+    }
     // Anchored to the window's first sample (not the query's evaluation
     // instant) purely for floating-point accuracy: Prometheus does the same
     // to keep `x` values small (prometheus/prometheus#2674). `predict_linear`
@@ -193,6 +208,11 @@ fn deriv(samples: &[Sample], _w: RangeWindow) -> Option<f64> {
 
 fn predict_linear(samples: &[Sample], w: RangeWindow, duration_seconds: f64) -> Option<f64> {
     if samples.len() < 2 {
+        return None;
+    }
+    // See `deriv`'s matching guard: a zero-duration window has no defined
+    // slope.
+    if samples[samples.len() - 1].ts_ns == samples[0].ts_ns {
         return None;
     }
     let (slope, intercept) = linear_regression(samples, w.eval_ts_ns);
@@ -216,6 +236,17 @@ fn extrapolated_rate(
     }
     let first = samples[0];
     let last = samples[samples.len() - 1];
+    // ADR-1103: a log-derived series can deliver every sample in the window
+    // at one timestamp (`first == last`). Standard Prometheus storage dedups
+    // to one sample per timestamp, so this state cannot arise there and the
+    // ported formula below (which divides by `sampled_interval`) has no
+    // oracle behavior to match; a zero-duration window has no defined rate,
+    // mirroring `instant_value`'s existing `sampledInterval == 0` drop, so
+    // this returns no sample rather than the 0.0/0.0 NaN the division would
+    // otherwise produce.
+    if last.ts_ns == first.ts_ns {
+        return None;
+    }
 
     let mut result_value = last.value - first.value;
     if is_counter {
@@ -588,6 +619,30 @@ mod tests {
     }
 
     #[test]
+    fn rate_over_all_equal_timestamp_samples_is_none_not_nan() {
+        // ADR-1103: a log-derived series can deliver every sample in the
+        // window at one timestamp. Standard Prometheus storage dedups to one
+        // sample per timestamp, so `first == last` cannot arise there and
+        // the ported formula (which divides by `sampled_interval`) has no
+        // oracle behavior to match; a zero-duration window is defined here
+        // to have no rate, mirroring `instant_value`'s existing
+        // `sampledInterval == 0` drop. Demonstrated failing by deleting the
+        // `if last.ts_ns == first.ts_ns { return None; }` guard at the top
+        // of `extrapolated_rate` in this file: without it, `last.value -
+        // first.value == 0.0` divided by a zero `sampled_interval` produces
+        // `NaN`, not a dropped sample.
+        let samples = [
+            sample(60_000, 1.0),
+            sample(60_000, 2.0),
+            sample(60_000, 3.0),
+        ];
+        let w = window(0, 300_000, 300_000);
+        assert_eq!(rate(&samples, w), None);
+        assert_eq!(increase(&samples, w), None);
+        assert_eq!(delta(&samples, w), None);
+    }
+
+    #[test]
     fn rate_extrapolates_to_the_window_boundary() {
         // Four samples, evenly spaced 60s apart, starting exactly at the
         // window's left edge and ending exactly at its right edge: no
@@ -793,6 +848,27 @@ mod tests {
     fn predict_linear_single_sample_is_none() {
         let samples = [sample(0, 1.0)];
         assert_eq!(predict_linear(&samples, window(0, 0, 300_000), 60.0), None);
+    }
+
+    #[test]
+    fn deriv_and_predict_linear_over_all_equal_timestamp_samples_are_none_not_nan() {
+        // ADR-1103 audit finding beyond the named test list: every sample
+        // sharing one timestamp makes every regression `x` value identical,
+        // so `var_x` (and `cov_xy`) are exactly zero and the slope is a
+        // 0.0/0.0 NaN, not caught by `linear_regression`'s existing
+        // `const_y` special case (which only handles identical *values*, not
+        // identical *timestamps*). Demonstrated failing by deleting the
+        // `if samples[samples.len() - 1].ts_ns == samples[0].ts_ns { return
+        // None; }` guard in `deriv` (and the matching one in
+        // `predict_linear`) in this file.
+        let samples = [
+            sample(60_000, 1.0),
+            sample(60_000, 2.0),
+            sample(60_000, 3.0),
+        ];
+        let w = window(0, 300_000, 300_000);
+        assert_eq!(deriv(&samples, w), None);
+        assert_eq!(predict_linear(&samples, w, 60.0), None);
     }
 
     #[test]
