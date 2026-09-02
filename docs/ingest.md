@@ -1,4 +1,4 @@
-# Ingest Pipeline Design (Phase 1)
+# Ingest Pipeline Design
 
 Implementer contract for `ravel-ingest` and the ingest side of
 `ravel-server`. See ADR-0001/0002 and docs/consistency-model.md for the
@@ -200,7 +200,7 @@ shard_deaths counter. Surviving shards keep working.
 
 Flush (still inside the actor; ingest-ordering per shard is the point):
 1. Build RSEG via `ravel-segment::SegmentWriter` (one segment per tenant in
-   the buffer; Phase 1 actors buffer per tenant already, key the buf map by
+   the buffer; actors buffer per tenant already, key the buf map by
    (tenant, series_id)).
 2. blake3 -> data key -> data PUT (Overwrite) with bounded retries on
    retryable errors.
@@ -444,7 +444,7 @@ Commit-record fields the span flush fills differently: `sample_count` is the
 span count, `series_count` is the number of distinct `trace_id`s in the batch
 (tracked in the actor), `segment_format_version` is
 `SPAN_SEGMENT_FORMAT_VERSION`, and the event-time bounds are the batch's
-interval — the minimum `start_ts_ns` and the maximum `end_ts_ns` — so a
+interval (the minimum `start_ts_ns` and the maximum `end_ts_ns`), so a
 commit record advertises the same interval RSPAN's skip index prunes with.
 
 `SpanIngestMetrics` mirrors `LogIngestMetrics` counter for counter, minus
@@ -587,7 +587,7 @@ terms:
    points reach a buffer. This is bounded by
    `--max-inflight-ingest-requests` (default 1024) times the largest
    per-request decoded size (Remote Write's 64 MiB post-decompression cap, or
-   OTLP's 16 MiB) — the same worst case the concurrency limit already
+   OTLP's 16 MiB), the same worst case the concurrency limit already
    documents above. It is *not* covered by the buffer budget, which is
    charged post-decode.
 3. **Fixed overhead**: shard-actor and router state, the admission
@@ -611,20 +611,20 @@ background sweep bounds all three. Every `--idle-tenant-state-ttl` (default
 that long ago, on a jittered cadence, from the same worker-loop shape every
 other background task uses:
 
-- **Generation views** — re-read from the provisioning record on the tenant's
+- **Generation views**: re-read from the provisioning record on the tenant's
   next write (the evicted view reports stale exactly as a first-touch tenant
   does), so the cost is one provisioning-record GET on the next write.
-- **Catalog per-tenant caches** — the decoded commit-record, compaction-record,
+- **Catalog per-tenant caches**: the decoded commit-record, compaction-record,
   HEAD, part, and postings caches; all immutable, content-addressed, or
   TTL-revalidated, so an evicted entry is re-read on the next resolve.
-- **SQL memory accountants** — only those with zero outstanding reservations
+- **SQL memory accountants**: only those with zero outstanding reservations
   (an accountant backing a live query is never evicted); a re-created one is a
   byte-for-byte-equivalent counter.
 
 "Last touched" is stamped from an injected clock at each tenant's write
 (generation views), resolve (catalog caches), or query resolve (SQL
 accountants), so eviction is deterministic and reads no clock in the library
-layers — only the sweep loop reads the wall clock.
+layers: only the sweep loop reads the wall clock.
 
 **Admission-controller state is explicitly excluded.** Its active-series and
 active-stream counts are correctness-bearing caps; silently resetting a
@@ -962,7 +962,7 @@ double-counting -- no sampled interval lands in two counters.
 
 The interval an actor spends parked in `flush_permit_wait_ns` is wall-time
 concurrent with a *prior* flush's `off_actor_ns`, and it is charged to the actor
-side exactly once, as permit wait, never as actor work. Folding it into
+side once and once only, as permit wait, never as actor work. Folding it into
 `on_actor_ns` instead (as the first cut of this metric did) both double-counts
 that interval and inverts the reading: the actor reports busy precisely when the
 truth is that flushes are backed up. `crates/ravel-ingest/tests/shard_skew.rs`

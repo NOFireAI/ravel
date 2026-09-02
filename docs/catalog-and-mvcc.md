@@ -22,7 +22,7 @@ t/<tenant_hash>/m/meta                                                  per-tena
 t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempotency marker (logs/spans; additive)
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
-t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable, phase 5)
+t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942)
 sys/qualification                                                       store qualification record (write-once, additive)
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
@@ -50,7 +50,7 @@ resource). It is deliberately a **root-level** key, outside any tenant's
 `t/<tenant_hash>/` space and carrying no tenant dimension at all, because the
 ceiling is fleet-global rather than per-tenant: the resource it bounds is
 aggregate query fan-out across all tenants, which has no single tenant to scope
-under — unlike ADR-0057's ingest admission snapshot, which is per-(tenant,
+under, unlike ADR-0057's ingest admission snapshot, which is per-(tenant,
 signal) and lives under `t/<tenant_hash>/<signal>/admission/`. The key is
 owned exclusively by the one process that names it, so it is written with a
 plain `Overwrite` (no CAS, no concurrent writer to race); a stale or missing
@@ -319,7 +319,7 @@ and the CAS read/write helpers.
   body layout" below.
 - `input_set_hash16`: first 16 hex chars of the blake3 digest over the
   compaction record's sorted `inputs` list (canonical encoding, sorted by
-  `(writer_id, writer_epoch, writer_seq)`). `hash16` on an L1 part is the
+  `(writer_id, writer_epoch, writer_seq)`). `hash16` on an L1 segment is the
   part object's own blake3, same convention as an L0 data key. `part` is
   zero-padded 4 digits.
 - Compaction records, rewrite records, and the retention tombstone live in
@@ -379,7 +379,8 @@ and the CAS read/write helpers.
   The v2-keyed variant described above (ADR-0050 §3) is the real, default,
   durable design. There is no re-key migration between schemes (ADR-0050 §3;
   docs/guides/operations.md).
-- `m` = metrics signal. Logs `l`, spans `s`, profiles `p` reserved.
+- `m` = metrics signal, `l` = logs, `s` = spans; all three carry data today.
+  `p` is reserved for profiles, which no ingest or query path builds.
   Alerts `a` and audit `u` (ADR-0040) share `l`'s RLOG segment format
   verbatim - no new byte layout, only two new signal-keyspace prefixes.
 - `shard`: zero-padded 4-digit decimal. `shard_count` is immutable per
@@ -467,7 +468,7 @@ frame, header then payload:
 | 20.. | token set | UTF-8, the `x-ravel-commit-token` header value: one `CommitToken::encode()` output per shard the request's points flushed through, comma-separated |
 
 Checksum coverage: the crc32c at bytes 6..10 covers `magic || version ||
-payload` (bytes 0..6 followed by everything from byte 10 onward) — the crc
+payload` (bytes 0..6 followed by everything from byte 10 onward): the crc
 field itself is excluded, same as any self-describing checksum has to
 exclude its own bytes. Folding the header into the checksum means a
 corrupted `magic` or `version` byte is caught here rather than surfacing
@@ -512,10 +513,10 @@ from the writer's clock ("Pinned flush identity"); a flush older than
 interlock, ADR-0010 §11); so the last possible publish for bucket H happens
 before `end(H) + max_flush_lifetime` on the writer's clock, which is within
 `clock_skew_allowance` of true time. `fold_safety_margin` absorbs the
-folder's own clock error. Therefore one strongly consistent LIST of a
-sealed bucket (the store contract's listing guarantee, the same one orphan
-GC relies on, docs/consistency-model.md "Deletion and GC") observes the
-full and final set.
+folder's own clock error. Therefore one LIST of a sealed bucket, under the
+store contract's list-after-write guarantee (the same one orphan GC relies
+on, docs/consistency-model.md "Deletion and GC"), observes the full and
+final set.
 
 Clock assumption, stated plainly: the folder's clock error must be smaller
 than `fold_safety_margin`. This is the same class of assumption the system
@@ -549,11 +550,11 @@ yields a wrong answer, which is the same reasoning ADR-0063 applied to
 `SnapshotPartHeader.min_hour`. Entries grow by roughly `name_len + 25` bytes
 per stamped column, so a part's `entries_uncompressed_len` and the resolve
 path's per-record cache sizing note below grow by that order for a tenant with
-declared columns. `verify_seal_divergence`
+typed attribute columns. `verify_seal_divergence`
 (`crates/ravel-catalog/src/seal_divergence.rs`) therefore compares only the
 level-0 entries against the L0 commit history, and mirrors the fold's
 supersession exclusion on the ground-truth side: an L0 commit record named in a
-compaction or rewrite record's `inputs` is folded into an L1 part and dropped
+compaction or rewrite record's `inputs` is folded into an L1 segment and dropped
 from the snapshot, yet its commit record stays on the store until a later sweep,
 so a superseded L0 record is excluded from the ground truth rather than reported
 missing. Level-1 entries are counted but not diffed, since they have no L0
@@ -623,9 +624,10 @@ already-sealed hours:
   contribute. That is compared, ignoring order, against what the in-progress
   entry set already reflects for that `(shard, hour)` (found by each entry's
   own `ingest_hour_bucket`; those entries were seeded from the previous fold's
-  own output). If they differ — a late compaction supersedes L0 inputs
-  previously folded in directly, or a late tombstone means the hour now
-  contributes nothing — exactly that bucket's entries are replaced and every
+  own output). If they differ, whether because a late compaction supersedes
+  L0 inputs previously folded in directly or because a late tombstone means
+  the hour now
+  contributes nothing, exactly that bucket's entries are replaced and every
   other entry is left untouched.
 - **Dirty parts rebuild, never carry forward.** A previous HEAD's sealed part
   whose `[min_hour, watermark_hour]` range covers a changed hour is marked
@@ -643,17 +645,17 @@ already-sealed hours:
   introduces an L1 entry suppresses postings entirely, as elsewhere.)
 
 Invariant this closes: a compaction record or retention tombstone landing in
-an already-folded hour is now eventually applied — once that hour's own
+an already-folded hour is now eventually applied, once that hour's own
 bucket falls within `[watermark_hour_old - fold_reconcile_window_hours,
 watermark_hour_old]` on some later fold, OR (for a tombstone) within the
-retention-frontier band below — rather than never. The fixed window is
+retention-frontier band below, rather than never. The fixed window is
 on the *target hour bucket*, not on how recently the late record was
 published: a compaction landing hours after its bucket sealed is caught on
 the very next fold (this is the common case the window is sized for). A
 retention tombstone's bucket, by contrast, is typically far outside the
-fixed window by the time retention runs — a tombstone is written at its
+fixed window by the time retention runs: a tombstone is written at its
 bucket's ingest-hour key, which is `R` (the tenant's retention window,
-normally days) behind the watermark — so the fixed window alone would never
+normally days) behind the watermark, so the fixed window alone would never
 observe it, and the snapshot would keep naming the retired bucket's segments
 forever. The retention-frontier reconcile below covers exactly that case.
 (This closes a latent correctness gap; see ADR-0063 Consequences and
@@ -676,7 +678,7 @@ of snapshot-named hours at or approaching the tenant's retirement frontier:
   admission limits: the durable per-tenant config record
   (`t/<tenant_hash>/config`, `retention_ns`) when it exists and carries a value,
   otherwise the deployment-wide default the caller resolves from the CLI-derived
-  `RetentionConfig` (`--retention-default` / `--retention-tenant`) — the same
+  `RetentionConfig` (`--retention-default` / `--retention-tenant`), the same
   source the physical sweep uses. A `TenantConfig` read failure or an absent
   record falls back to that deployment default, not to "skip"; only a tenant with
   neither a per-tenant override nor a deployment default gets no frontier
@@ -685,13 +687,13 @@ of snapshot-named hours at or approaching the tenant's retirement frontier:
   tombstones a bucket once its newest event is older than `R`, so every hour
   whose end is at or before `now - R` may already be tombstoned, and the
   `+ protection_horizon` look-ahead pre-lists hours approaching the frontier so
-  an appearing tombstone is caught the fold it lands — a full horizon before the
+  an appearing tombstone is caught the fold it lands, a full horizon before the
   sweep may delete the objects that hour still names. Candidates are the
   snapshot-named hours at or below `frontier_hi` and below the fixed window
   (which already covers the near-watermark region).
 - **Bounded per fold.** In steady state the frontier advances one hour per hour
   and folds run far more often than hourly, so this is a handful of buckets. On
-  a jump — a shortened retention window, or a folder stopped for a long time —
+  a jump (a shortened retention window, or a folder stopped for a long time),
   the candidate set is capped at `frontier_reconcile_max_hours` (default 168,
   seven days), reconciled oldest-first (an object is physically deletable
   `protection_horizon` after its tombstone, so the oldest still-named hours are
@@ -753,7 +755,7 @@ exact whole-object min, max, and null count for each stamp-eligible declared
 typed attribute column (I64 and BOOL only; STR, BYTES, and ADR-0101's `f64`
 are refused by the allowlist in `ravel-types::declared_stats`). It is
 additive and permanently optional, and `format_version` stays 1: an empty
-list means the object is uncovered for every declared column, which is the
+list means the object is uncovered for every typed attribute column, which is the
 normal state of every record written before ADR-0873, of every
 metrics/spans record, and of any column declared after the flush opened.
 Absence costs a reader the statistics shortcut and never yields a wrong
@@ -780,7 +782,7 @@ A token fully determines its commit-record key. Ingest acks return one
 token per shard the request's points flushed through; the HTTP/gRPC surface
 carries them as a comma-separated list in `x-ravel-commit-token`.
 
-## Snapshot resolution (Phase 1)
+## Snapshot resolution by listing
 
 `Catalog::resolve(tenant, signal, range, min_tokens, now_ns) -> Snapshot`
 
@@ -835,7 +837,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    every resolve -- it is what discovers records published since the last one
    -- and only the per-record GET and decode are skipped. A record the LIST
    names and the cache does not hold is fetched; a cached record the LIST no
-   longer names is simply never consulted, since the resolve builds its
+   longer names is never consulted, since the resolve builds its
    segment set from the LIST (retention and GC remove records only after
    their bucket is sealed and folded). A hit is counted as a cache hit with
    the cached object's byte size and issues no GET; a miss is counted as a
@@ -895,7 +897,7 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    `unsatisfiable token`, surfaced as 5xx.
 6. Attach pending selective-erasure predicates (ADR-0064 decision 2). Once
    per resolve -- independent of whether any physical rewrite has run -- LIST
-   `t/<th>/<sig>/del/` exactly once. This LIST is started before the shard
+   `t/<th>/<sig>/del/` one time only. This LIST is started before the shard
    fan-out and joined with it, so its round trip overlaps the bucket LISTs in
    one wave rather than following them (issue #730); it still completes before
    the snapshot is constructed, so the visibility bound below is unchanged. For
@@ -918,11 +920,11 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
    and retries the query once (ADR-0010 §11).
 
 `SegmentRef` carries a level discriminator. L0 refs keep the existing
-commit-record provenance fields. L1 part refs carry (ingest_hour,
+commit-record provenance fields. L1 segment refs carry (ingest_hour,
 input_set_hash, part_index, content_hash, object_size, event bounds) and
 reconstruct the part key from those fields rather than trusting any
 stored string (ADR-0010 §7, same discipline as the L0 data key). Snapshot
-ordering stays a deterministic total order across mixed levels: L1 parts
+ordering stays a deterministic total order across mixed levels: L1 segments
 sort into the same (provenance, shard, writer_id) tiebreak chain as L0
 segments (see "Cross-segment duplicate samples" below) using the
 compaction record's created_unix_ns in place of a commit record's, and
@@ -971,11 +973,11 @@ by default). The typed error carries the count and the limit so the caller
 can narrow its own range and retry; it maps to HTTP 422 on every query
 endpoint.
 
-## Snapshot resolution (Phase 2)
+## Snapshot resolution from a folded snapshot
 
-Once folding is live, step 1 of the Phase 1
+Folding ships, so step 1 of the listing
 algorithm above is replaced by a snapshot-backed lookup that degrades to
-Phase 1 listing on any index failure; min-token resolution and snapshot
+full listing on any index failure; min-token resolution and snapshot
 pinning are unchanged:
 
 1. Attempt snapshot read: GET HEAD (cached with a short TTL, default 30 s,
@@ -991,7 +993,7 @@ pinning are unchanged:
    entries are trusted.
 2. On any other failure in step 1 (HEAD absent, corrupt, part missing or
    hash-mismatched, postings content-hash or entry-count mismatch): log,
-   fall back to Phase 1 full listing for the whole window. Queries never
+   fall back to full listing for the whole window. Queries never
    fail and never silently narrow because of index state. A part GET
    NotFound races GC of a just-superseded part; re-read HEAD once before
    falling back. tenant_hash and shard_count mismatches are excluded from
@@ -999,9 +1001,9 @@ pinning are unchanged:
    §9).
 3. With a snapshot at watermark W: for window buckets with `hour <= W`,
    take entries from the parts (hour-major sort makes this a contiguous
-   range scan per part), filter by event-time overlap exactly as Phase 1
-   does. For window buckets with `hour > W`, LIST and GET-decode as in
-   Phase 1.
+   range scan per part), filter by event-time overlap exactly as the
+   listing path does. For window buckets with `hour > W`, LIST and
+   GET-decode as that path does.
 4. min-token resolution: unchanged, exact commit-key GETs, never through
    the snapshot.
 5. Build `SegmentRef`s from snapshot entries by reconstructing the data key
@@ -1012,7 +1014,7 @@ pinning are unchanged:
 
 `SegmentRef.declared_column_stats` is filled on every catalog route
 (ADR-0873 decision 4): from the commit record for a listed or token-resolved
-segment, from the compaction part for a listed L1 part, and from
+segment, from the compaction part for a listed L1 segment, and from
 `SnapshotEntry.declared_column_stats` (field 15) for a sealed entry. Two
 routes are deliberately always empty: a rewrite output's parts (the rewrite
 dropped rows, so a pre-drop stamp is stale; ADR-0873 decision 3), and a
@@ -1042,13 +1044,39 @@ increment of the isolation-breach counter corresponds to a failed query.
 
 Soundness rests entirely on the seal lemma above: for sealed buckets, the
 fold's LIST equals any later LIST, so serving them from the snapshot
-returns exactly what Phase 1 listing would; open buckets keep Phase 1
-listing verbatim, so the window formula, the event-overlap filter, and the
+returns exactly what full listing would; open buckets keep the listing path
+verbatim, so the window formula, the event-overlap filter, and the
 admission-time skew bounds that make it sound (ADR-0010 §8) are untouched.
 An index failure degrades performance only, never correctness: this is a
 derived, rebuildable index, never a durability or correctness dependency.
 
 (ADR-0020.)
+
+## Catalog snapshot staleness
+
+Folding is a cost optimization and nothing else: it changes which objects a
+resolve reads, never which commits a query sees. Without a `min_commit_token`,
+freshness above the watermark is whatever listing returns, which is
+listing-immediate for a just-published commit record, and sealed history below
+the watermark is complete by the seal lemma, so its staleness there is zero in
+healthy operation.
+
+Every index failure mode degrades to wider listing rather than to missing or
+wrong data. An absent or corrupt HEAD, a missing or hash-mismatched snapshot
+part, a stale cached HEAD, a folder stopped for hours, and two folders racing
+the HEAD CAS all take the step 2 fallback above. The index adds no false
+positive beyond what MVCC already handles: a snapshot entry whose object was
+since retired resolves to NotFound, raises SnapshotInvalidated, and the
+frontend re-resolves.
+
+One exception is narrow and documented. A folder whose clock runs fast beyond
+`fold_safety_margin` can seal an hour before every writer's flush for it has
+landed, and a commit published into that already-sealed bucket is invisible to
+non-token queries until an operator forces a HEAD rebuild (`ravel-cli catalog
+verify` finds the divergence; docs/guides/operations.md "Catalog fold and
+verify" carries the procedure). Read-your-write is unaffected: the
+`min_commit_token` path GETs its exact commit key directly and never consults
+the snapshot.
 
 ## Query cost accounting
 
@@ -1105,9 +1133,98 @@ bound (`head_cache_capacity`, default 10,000 (tenant, signal) entries, FIFO
 eviction), closing the one cache of the five that previously had a TTL but
 no bound on the number of tenants it could grow to hold.
 
+## Compaction protocol (ADR-0018)
+
+Publish-then-supersede. A compaction run writes its L1 segments, then
+publishes one `CompactionRecord` with `PutMode::CreateIfAbsent`. The record
+names its exact input set (the sorted `(writer_id, writer_epoch, writer_seq)`
+list, hashed as `input_set_hash`), and nothing about the inputs is mutated or
+removed at publish time. The only ordering the protocol depends on is that the
+record becomes visible before any input is physically removed, and that
+removal is a separate, later, horizon-gated step (the MVCC rules below and
+docs/consistency-model.md "Deletion and GC").
+
+Overlap harmlessness is what makes every intermediate state query-correct
+without locking. As long as a compaction record's segments carry every sample
+of every input it names, a resolved snapshot holding both the record's segments
+and some or all of its listed inputs answers a query exactly as one holding
+only the segments does, because query-time dedup ("Cross-segment duplicate
+samples" below) collapses the duplicate candidates. So no dedup runs at
+compaction time, and a reader may transiently see an L0 input and its L1
+replacement together and still get exact answers.
+
+Record-count conservation is enforced, not assumed (ADR-0048). Before the
+record PUT, the run checks that the sum of `sample_count` over its input set
+equals the sum over its built segments (`conserve_exact`, the exact predicate
+compaction and the format-migration rewrite share; a selective-erasure rewrite
+plugs in "inputs minus the erased count" instead). Compaction never dedups, so
+any inequality means the merge dropped or invented records; the run aborts with
+a typed error and publishes nothing. The L0 inputs stay live and queryable, and
+the abandoned segments age out under the unreferenced-object rule. The check
+runs pre-publish because publish is the point of no return: once the record is
+visible the resolver excludes the inputs, and after the protection horizon the
+sweep removes them physically. The gate also runs under dry run, so a dry run
+of a bucket that would trip it reports the violation.
+
+Racing compactors over one sealed bucket are serialized by `CreateIfAbsent`
+picking a single winner; a loser's segments are unreferenced objects that age
+out under the same rule. Two records that legitimately name different input
+sets (rare, from concurrent partial seals) are not reconciled automatically.
+The resolver includes both segment sets plus any L0 input covered by neither,
+which is harmless under the property above, and raises
+`ravel_catalog_compaction_input_set_conflicts_total` for a human to look at.
+
+## Online resharding (ADR-0052)
+
+`shard_count` is changeable online, with ingest running. A reshard never moves,
+rewrites, or re-keys existing data: it appends a
+`(generation, shard_count, activation_hour)` entry to the tenant's provisioning
+record, and only data ingested from `activation_hour` onward routes with the
+new count. Old generations stay readable under their original shard indices
+until retention ages their hours out.
+
+Activation lead time. Activation is denominated in ingest-hour buckets and is
+placed `L` hours ahead: `activation_hour = now_hour + L`, with
+`L >= ceil(C) + 1` hours, where `C` is the router's provisioning-record refresh
+interval (default 60 s, so the floor is 2 hours). `ravel-cli provision reshard`
+refuses a shorter lead. Every live writer re-reads the record at least once per
+`C`, so that floor guarantees each writer either observes the new generation
+before it activates or has already stopped on record staleness. Nothing routes
+past an activation a writer has not seen.
+
+What a writer observes. A writer routes new data with the count of the latest
+generation whose `activation_hour <= hour(now)`, and refreshes its view of the
+record on the bounded interval `C`. A writer whose cached view is older than
+`C` and cannot re-read the record fails the flush closed with a typed error and
+a metrics counter rather than routing on a stale view, so a writer in the
+transition either sees the new generation before it activates or stops. It
+never silently writes to the wrong shard set.
+
+What a reader observes. A reader derives its per-hour scan set from the
+generation history, read fresh on every resolve, so its fan-out widens on an
+increase or narrows on a decrease once its own record view is current, with no
+coordination with writers. A query spanning the activation hour returns
+complete results from both the old and the new shard range, because the engine
+merges a series' samples from any set of segments by series identity and the
+scan rule lists every written shard index for each hour. A snapshot HEAD folded
+before the reshard, carrying a lower generation count than the reader's, is
+accepted when its watermark predates the activation of the first generation it
+did not know about: the reader lists the newer hours the HEAD predates. A
+pre-reshard HEAD whose watermark instead reaches into hours an unknown
+generation was already active for is rejected loudly with a fail-closed
+`FieldMismatch`, because its parts cannot carry the wider shard range those
+hours were written under, and serving it would silently omit data below its own
+watermark.
+
+Commit tokens are unaffected. A token minted under any generation resolves
+forever, because token resolution reconstructs the exact key from the token's
+own fields and never consults `shard_count` (ADR-0052 section 6).
+Read-your-write holds across a reshard in either direction. docs/ingest.md
+carries the decrease-specific straggler slack window.
+
 ## MVCC rules
 
-- Snapshots are logical sets of immutable segments. Compaction (Phase 2)
+- Snapshots are logical sets of immutable segments. Compaction
   publishes a transaction adding outputs and removing inputs; running
   queries keep their pinned set.
 - GC deletes an object only when all hold: unreachable from any snapshot
