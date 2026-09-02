@@ -112,7 +112,10 @@ heartbeat and memo prefixes above. One small mutable object per unit of
 expensive merge work, so two processes do not both pay for compacting the same
 sealed bucket. `work_id` is
 `blake3::derive_key("ravel-compaction-claim-v1", tenant_hash || signal ||
-shard || ingest_hour_bucket)`, hex-encoded: exactly the four fields of a
+shard || ingest_hour_bucket)`, hex-encoded, where `tenant_hash` is the raw 16
+bytes, `signal` is the one-byte signal key prefix (`l`, `m`, `s`, ...), and
+`shard` and `ingest_hour_bucket` are little-endian u32s (a fixed 25-byte
+body): exactly the four fields of a
 compaction bucket, the same granularity the commit-record key prefix is built
 from, and deliberately **not** including the input-set hash or any policy or
 geometry knob, so two nodes whose listings diverge on one bucket collide on one
