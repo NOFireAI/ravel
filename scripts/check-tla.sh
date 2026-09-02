@@ -344,7 +344,9 @@ liveness_single_property_cfg() {
     local src="$1" prop="$2"
     local gen="$CACHE_DIR/negcfg"
     mkdir -p "$gen"
-    local out="$gen/$(basename "$src" .cfg).$prop.cfg"
+    local base out
+    base="$(basename "$src" .cfg)"
+    out="$gen/$base.$prop.cfg"
     grep -vE '^[[:space:]]*PROPERTY[[:space:]]' "$src" > "$out"
     printf 'PROPERTY %s\n' "$prop" >> "$out"
     echo "$out"
