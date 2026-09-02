@@ -624,6 +624,22 @@ pub struct IngestPipelineSnapshot {
     /// concepts, so logs and spans render no sample for this family, the
     /// same structural-absence convention `collisions` and `postings` use.
     pub metadata_sink: Option<MetadataSinkCounters>,
+    /// Exemplar admission counters. `Some` only for the metrics pipeline:
+    /// exemplars ride on metric points, so logs and spans render no sample
+    /// for this family rather than a zero that would read as "the cap never
+    /// engaged".
+    pub exemplars: Option<ExemplarCounters>,
+}
+
+/// Exemplar admission counters, mirroring
+/// [`ravel_ingest::IngestMetricsSnapshot`]'s two `exemplars_*` fields. Grouped
+/// in one struct for the same reason [`MetadataSinkCounters`] is: they are
+/// always present or always absent together, which `Option<Self>` says once
+/// instead of twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExemplarCounters {
+    pub written_total: u64,
+    pub dropped_total: u64,
 }
 
 /// Metric metadata sink counters (ADR-0085 decision 1), mirroring
@@ -685,6 +701,10 @@ impl IngestPipelineSnapshot {
                 flush_dropped_total: snapshot.metadata_flush_dropped_total,
                 entries_dropped_total: snapshot.metadata_entries_dropped_total,
             }),
+            exemplars: Some(ExemplarCounters {
+                written_total: snapshot.exemplars_written_total,
+                dropped_total: snapshot.exemplars_dropped_total,
+            }),
         }
     }
 
@@ -715,6 +735,7 @@ impl IngestPipelineSnapshot {
                 dynamic_columns_used_max: snapshot.dynamic_columns_used_max,
             }),
             metadata_sink: None,
+            exemplars: None,
         }
     }
 
@@ -736,6 +757,7 @@ impl IngestPipelineSnapshot {
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
             metadata_sink: None,
+            exemplars: None,
         }
     }
 }
@@ -1020,6 +1042,45 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
                 "ravel_ingest_metadata_entries_dropped_total",
                 &labels(mode, pipeline.signal),
                 counters.entries_dropped_total,
+            );
+        }
+    }
+
+    // Exemplars ride on metric points, so only the metrics pipeline sets
+    // `exemplars` and the family is empty in a logs- or spans-only process.
+    let with_exemplars: Vec<_> = pipelines
+        .iter()
+        .filter_map(|pipeline| pipeline.exemplars.map(|counters| (pipeline, counters)))
+        .collect();
+    if !with_exemplars.is_empty() {
+        write_header(
+            out,
+            "ravel_ingest_exemplars_written_total",
+            "Exemplars stored on flushed objects, by signal.",
+            "counter",
+        );
+        for (pipeline, counters) in &with_exemplars {
+            write_sample(
+                out,
+                "ravel_ingest_exemplars_written_total",
+                &labels(mode, pipeline.signal),
+                counters.written_total,
+            );
+        }
+
+        write_header(
+            out,
+            "ravel_ingest_exemplars_dropped_total",
+            "Exemplars discarded by the per-series admission cap, by signal. A rising figure \
+             says the cap is engaging; the points themselves are still ingested.",
+            "counter",
+        );
+        for (pipeline, counters) in &with_exemplars {
+            write_sample(
+                out,
+                "ravel_ingest_exemplars_dropped_total",
+                &labels(mode, pipeline.signal),
+                counters.dropped_total,
             );
         }
     }
@@ -4219,6 +4280,129 @@ mod tests {
                 "ravel_ingest_metadata_flush_gets_total{mode=\"gateway\",signal=\"spans\""
             ),
             "spans pipeline must render no metadata_sink sample"
+        );
+    }
+
+    /// The two exemplar counters render one sample each, with the family's
+    /// `{mode, signal}` labels and the driven values. Built by setting
+    /// `exemplars` directly, so this test pins the rendering alone; the
+    /// conversion from the ingest crate's snapshot is pinned by
+    /// `exemplar_counters_survive_conversion_from_ingest_snapshot` below.
+    #[test]
+    fn exemplar_counters_render_under_the_ingest_family() {
+        let mut pipeline = IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot::default());
+        pipeline.exemplars = Some(ExemplarCounters {
+            written_total: 7,
+            dropped_total: 3,
+        });
+        let ingest = vec![
+            pipeline,
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        let written = "ravel_ingest_exemplars_written_total{mode=\"gateway\",signal=\"metrics\"} 7";
+        let dropped = "ravel_ingest_exemplars_dropped_total{mode=\"gateway\",signal=\"metrics\"} 3";
+        assert_eq!(
+            body.matches(written).count(),
+            1,
+            "written counter must render exactly once:\n{body}"
+        );
+        assert_eq!(
+            body.matches(dropped).count(),
+            1,
+            "dropped counter must render exactly once:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_exemplars_written_total counter"),
+            "written counter must carry a TYPE line:\n{body}"
+        );
+        assert!(
+            body.contains("# TYPE ravel_ingest_exemplars_dropped_total counter"),
+            "dropped counter must carry a TYPE line:\n{body}"
+        );
+        assert!(
+            !body.contains("ravel_ingest_exemplars_written_total{mode=\"gateway\",signal=\"logs\""),
+            "logs pipeline must render no exemplar sample:\n{body}"
+        );
+        assert!(
+            !body
+                .contains("ravel_ingest_exemplars_dropped_total{mode=\"gateway\",signal=\"spans\""),
+            "spans pipeline must render no exemplar sample:\n{body}"
+        );
+    }
+
+    /// The values travel from the ingest crate's counters to the rendered
+    /// text: a constructor that leaves `exemplars` at zero (or `None`) while
+    /// the source snapshot carries them fails here, not in the render test
+    /// above.
+    #[test]
+    fn exemplar_counters_survive_conversion_from_ingest_snapshot() {
+        let ingest = vec![IngestPipelineSnapshot::from_metrics(
+            IngestMetricsSnapshot {
+                exemplars_written_total: 7,
+                exemplars_dropped_total: 3,
+                ..Default::default()
+            },
+        )];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        assert!(
+            body.contains(
+                "ravel_ingest_exemplars_written_total{mode=\"gateway\",signal=\"metrics\"} 7"
+            ),
+            "conversion must carry the written count, not zero:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_ingest_exemplars_dropped_total{mode=\"gateway\",signal=\"metrics\"} 3"
+            ),
+            "conversion must carry the dropped count, not zero:\n{body}"
         );
     }
 

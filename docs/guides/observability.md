@@ -142,9 +142,15 @@ Labels: `mode` and `signal`. The `signal` label carries `metrics`, `logs`, or
 | `ravel_ingest_acks_err_total` | Strict-mode waiters acked with a write error. |
 | `ravel_ingest_collisions_total` | Batches rejected for a series or stream identity collision. |
 | `ravel_ingest_shard_deaths_total` | Distinct shard actors observed dead by the router. |
+| `ravel_ingest_exemplars_written_total` | Exemplars stored on flushed objects. |
+| `ravel_ingest_exemplars_dropped_total` | Exemplars discarded by the per-series admission cap. |
 
 The collisions family carries no `signal="spans"` series. Spans derive no
 identity that can collide, so that sample is structurally absent, not zero.
+
+The two exemplar families carry only the `signal="metrics"` series. Exemplars
+ride on metric points, so those samples are structurally absent for logs and
+spans, not zero.
 
 #### Per-tenant PUT attribution (`ravel_ingest_attribution_puts_total`)
 
