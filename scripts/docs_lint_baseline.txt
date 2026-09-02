@@ -7,8 +7,6 @@
 # Delete the entry as a finding is fixed; NEVER regenerate the file wholesale.
 # The line count is ADR-1040's epic progress measure and reaches zero before
 # the epic closes.
-CHANGELOG.md	TERM	declared column
-CHANGELOG.md	TERM	robust
 docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
