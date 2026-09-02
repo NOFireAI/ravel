@@ -64,7 +64,7 @@ bucket-wide Object Lock extends the physical erasure bound, and the tension
 between disaster recovery and the erasure guarantee is resolved by stating
 that cost, never by hiding it. Do not soften or omit it. The bounds the
 modifiers apply to are in
-[consistency-model.md](../consistency-model.md#modifiers-to-the-bound).
+[deletion-and-gc.md](../deletion-and-gc.md#modifiers-to-the-bound).
 
 ### Tier 0, no replication (default)
 
@@ -133,7 +133,7 @@ non-negotiable consequence: **erased bytes persist on the replica
 indefinitely**, because the delete marker that would reap them never arrives.
 That configuration is **unsupported** for any deployment with erasure
 obligations, and
-[consistency-model.md](../consistency-model.md#modifiers-to-the-bound) says
+[deletion-and-gc.md](../deletion-and-gc.md#modifiers-to-the-bound) says
 the same.
 
 Note the deliberate asymmetry this buys: version-id permanent deletes are
