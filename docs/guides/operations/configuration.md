@@ -570,10 +570,12 @@ The Kubernetes operator exposes no GC-horizon fields: it deploys every pod
 with the shipped defaults. On a fresh bucket with a shared credential the
 first pod bootstraps `sys/gc` from those defaults and every pod validates
 trivially; with per-role credential Secrets the maintain pod or an Admin
-step creates it first, as above. On a bucket whose `sys/gc` was set to other
-values with `gc-config set`, the operator's maintain pods refuse to start,
-because the must-match rule has no operator field to satisfy it; keep such a
-bucket on the shipped values, or run maintenance outside the operator.
+step creates it first, as above. On a bucket whose stored protection horizon
+or grace differs from the shipped defaults (set with `gc-config set`), the
+operator's maintain pods refuse to start, because the must-match rule has no
+operator field to satisfy it; the other two stored values do not affect
+startup. Keep such a bucket on the shipped horizon and grace, or run
+maintenance outside the operator.
 
 ### Age-based retention
 
