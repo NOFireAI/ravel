@@ -307,10 +307,16 @@ impl RequestLedger {
     /// is what [`crate::rewrite::rewrite_and_publish`] calls: driven under
     /// `compact_bucket` it must keep that run's already-counted LIST and
     /// record reads, and driven directly it must still start from zero.
-    pub fn reset_for_run_unless_open(&self) {
+    /// Returns whether THIS call opened the scope: the opener is the frame
+    /// that must emit the run's report exactly once, so a rewrite dispatched by
+    /// an outer driver (which opened first) stays silent and the outer driver
+    /// reports.
+    pub fn reset_for_run_unless_open(&self) -> bool {
         if !self.inner.run_open.load(Ordering::Relaxed) {
             self.reset_for_run();
+            return true;
         }
+        false
     }
 
     /// Close the run's scope. The counters are left intact (a caller reads the

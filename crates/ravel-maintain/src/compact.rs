@@ -62,6 +62,11 @@ pub async fn compact_bucket(
         l.reset_for_run();
     }
     let outcome = compact_bucket_scoped(store, clock, config, bucket).await;
+    // As the opener, this driver emits the run's report on EVERY outcome: the
+    // gates that return before any rewrite (NotSealed, AlreadyCompacted,
+    // Tombstoned, BelowMinInputs) still paid their LIST and report it
+    // (ADR-0996 task 996-8).
+    crate::rewrite::emit_request_report(config, bucket, outcome.is_ok());
     if let Some(l) = config.request_ledger.as_ref() {
         l.end_run();
     }
