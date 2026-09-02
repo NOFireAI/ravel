@@ -2,7 +2,10 @@
 
 Every command-line flag `ravel-server` accepts, with its environment variable,
 default, and the first line of its help. The table is generated from the
-binary's clap definition, sorted by flag name.
+binary's clap definition, sorted by flag name. It is rendered from a build
+with no optional cargo features, so `--otap`, which exists only in an `otap`
+build (the published image is one), is not in the table;
+[otap-ingest.md](../otap-ingest.md) documents it.
 
 For the routes the server exposes rather than the flags that configure it, see
 [the HTTP API reference](http-api.md).

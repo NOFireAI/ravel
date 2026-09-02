@@ -456,7 +456,11 @@ jobs:
   # any of them -- an unreachable e2e test path, four bench binaries that
   # never link -- ships undetected. This lane proves each combination still
   # compiles (`cargo check`), and for one of them also runs its tests:
-  #   - ravel-server --features otap            (links ravel-otap + arrow tree)
+  #   - ravel-server --features otap            (links ravel-otap + arrow tree;
+  #                                              the image lanes build it in
+  #                                              release together with sql and
+  #                                              flight-sql, this is the fast
+  #                                              probe of the feature alone)
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
   #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
@@ -1032,7 +1036,7 @@ jobs:
       # server image, so it can no longer be left out (see Dockerfile.prebuilt).
       - name: Build the release binaries on the host
         run: |
-          cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-server --features sql,flight-sql,otap
           cargo build --release --locked -p ravel-cli
           cargo build --release --locked -p ravel-operator
       - name: Assemble both images from the prebuilt binaries
@@ -1395,7 +1399,8 @@ jobs:
           fail_ci_if_error: false
 
   # Container-first quickstart verification (ADR-0081 decisions 5, 6, 7). Builds
-  # the pull request's OWN ravel-server (--features sql) and ravel-cli on the
+  # the pull request's OWN ravel-server (the shipping `--features
+  # sql,flight-sql,otap`) and ravel-cli on the
   # runner with the shared sccache/rust-cache, assembles a runtime image from
   # them via Dockerfile.prebuilt (both binaries, because that file's `server`
   # target COPYs ravel-cli for the store-qualification path too), brings up
@@ -1481,10 +1486,10 @@ jobs:
         if: steps.filter.outputs.run == 'true'
       # Both binaries: Dockerfile.prebuilt's `server` target COPYs ravel-server
       # AND ravel-cli, so a context missing the CLI fails the docker build.
-      - name: Build ravel-server (sql) and ravel-cli on the host
+      - name: Build ravel-server (sql,flight-sql,otap) and ravel-cli on the host
         if: steps.filter.outputs.run == 'true'
         run: |
-          cargo build --release --locked -p ravel-server --features sql
+          cargo build --release --locked -p ravel-server --features sql,flight-sql,otap
           cargo build --release --locked -p ravel-cli
       - name: Assemble the runtime image from the prebuilt binaries
         if: steps.filter.outputs.run == 'true'

@@ -11,8 +11,8 @@ Two scope limits before anything else. On the engine's own fan-out lane only
 the metrics signal distributes: a slice for logs or spans is answered
 `Unsupported` and the whole query runs on the coordinator. The SQL lane has a
 separate distributed scan, installed on the Flight SQL service, so it exists
-only in a build carrying the `flight-sql` cargo feature, which no published
-image builds.
+only in a build carrying the `flight-sql` cargo feature. The published image
+is such a build.
 
 For the engine-internal specification (slice partitioning, the merge order,
 the budget re-enforcement rules, the credential model) read
@@ -468,11 +468,11 @@ Deliberately:
 - **Logs and spans, on the engine's fan-out lane.** Only the metrics signal
   distributes there. A slice for any other signal is answered `Unsupported`,
   and the whole query runs locally.
-- **Anything at all, in a default build's SQL lane.** The SQL-lane distributed
-  scan is installed on the Flight SQL service, which only exists behind the
-  `flight-sql` cargo feature. In a build without that feature, and therefore in
-  every published image, no SQL statement distributes regardless of the
-  `--distributed-query` flags.
+- **Anything at all, in a build without `flight-sql`.** The SQL-lane
+  distributed scan is installed on the Flight SQL service, which only exists
+  behind the `flight-sql` cargo feature. The published image builds it; a
+  source build that leaves the feature off distributes no SQL statement
+  regardless of the `--distributed-query` flags.
 - **Straggler hedging and slice rebalancing.** A slow-but-alive worker is
   waited on; only a failed or unavailable one is re-dispatched. An oversized
   ingest shard makes an oversized slice, because a shard is never split.

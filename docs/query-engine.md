@@ -966,7 +966,7 @@ Logs/Alerts/Audit/Spans distributed *search* is the SQL surface (log and trace
 search runs through the `logs`/`alerts`/`audit`/`spans` tables, not PromQL); the
 PromQL engine's own fetch/federation flow drives `Signal::Metrics` only today.
 The SQL-lane distributed scan that drives that log and trace search is a
-separate step, and it exists only in a `flight-sql` build, which no published
+separate step, and it exists only in a `flight-sql` build, which the published
 image is; see "The SQL-lane distributed scan" below.
 
 ### The log/span coordinator merge: order-independent, no dedup
@@ -1050,9 +1050,8 @@ query-worker roster and the same cost thresholds the PromQL distributed lane
 uses, whenever `--distributed-query` is on in `all` or `query` mode. Absent
 that flag the service runs every statement whole-set on the coordinator.
 
-The whole seam sits behind the `flight-sql` cargo feature, and no published
-image builds that feature, so reaching this code takes a build that asks for
-it.
+The whole seam sits behind the `flight-sql` cargo feature. The published image
+builds that feature; a source build reaches this code only by asking for it.
 
 ### Budgets and the fault matrix
 

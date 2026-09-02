@@ -65,16 +65,12 @@ management service (SSE-KMS), legal hold, and admission limits.
   endpoint, and no Jaeger or Tempo API.
 - Alert rule transitions and audit records are written to object storage, and no
   shipped query surface can read them back.
-- Flight SQL and OTAP (OpenTelemetry Arrow) ingest exist in the source and no
-  published image builds them. Both need a source build with their cargo
-  feature turned on.
 - Profiles are a reserved object-key prefix only. No ingest, no query.
 - Exemplars are stored from the OpenTelemetry Protocol (OTLP) only. Remote Write
   and OTAP decode exemplars and then discard them.
 - Distributed read fan-out is off unless `--distributed-query` and
-  `--fragment-key-file` are both given. The PromQL lane is in the published
-  image; the SQL lane exists only in a `flight-sql` build, which no published
-  image is.
+  `--fragment-key-file` are both given. The PromQL lane and the SQL lane (on
+  the Flight SQL service) are both in the published image.
 
 **Who should wait.** If your dashboards range over months of high-cardinality
 metrics, the missing downsampled storage will cost you on every panel. If your
@@ -97,20 +93,22 @@ matrix says which.
 |---|---|---|---|
 | OTLP ingest, HTTP and gRPC | metrics, logs, traces | `none` | yes |
 | Prometheus Remote Write 1.0 and 2.0 ingest | metrics | `none` | yes |
-| OTAP ingest, gRPC | metrics | `otap` | no |
+| OTAP ingest, gRPC | metrics | `otap` | yes |
 | PromQL HTTP API | metrics | `none` | yes |
 | SQL over `POST /api/v1/sql` | metrics as `samples`, logs as `logs`, traces as `spans` | `sql` | yes |
-| Flight SQL | the same three tables | `flight-sql` | no |
+| Flight SQL | the same three tables | `flight-sql` | yes |
 
 <!-- END SUPPORT MATRIX -->
 
 No crate in the workspace declares a default feature set, so `sql`,
 `flight-sql`, and `otap` are off in any build that does not ask for them. The
-published `ravel-server` image is built with `--features sql`, so
-`POST /api/v1/sql` answers there. OTAP ingest needs the `otap` feature at build
-time and the `--otap` flag at startup, and Flight SQL needs the `flight-sql`
-feature; no published image carries either. Flight SQL runs ad-hoc statements,
-and prepared statements return `unimplemented`.
+published `ravel-server` image is built with `--features sql,flight-sql,otap`,
+so all three are compiled in. `POST /api/v1/sql` and Flight SQL answer as soon
+as the server is up; Flight SQL is a gRPC service on the gRPC listener, runs
+ad-hoc statements, and returns `unimplemented` for prepared statements. OTAP
+ingest is registered only when the process is started with `--otap`
+([docs/otap-ingest.md](docs/otap-ingest.md)). A source build gets the same
+surfaces by passing the same `--features` list to cargo.
 
 Exactly three SQL tables are registered: `samples`, `logs`, and `spans`. SQL is
 the only way to query logs and traces.
@@ -165,7 +163,7 @@ curl -s -H "Authorization: Bearer demo-token" \
   'http://127.0.0.1:4318/api/v1/query?query=system_cpu_load_average_1m'
 ```
 
-The published image is built with `--features sql`, so `POST /api/v1/sql` answers
+The published image carries the `sql` feature, so `POST /api/v1/sql` answers
 by default. The registered tables are `samples`, `logs`, and `spans`:
 
 <!-- ravel:run status=200; nonempty:.data.rows -->

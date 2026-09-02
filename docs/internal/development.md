@@ -22,11 +22,12 @@ generated OTLP export, and queries it back by commit token
 ([scripts/demo.sh](../../scripts/demo.sh)).
 
 One capability difference to keep in mind: the published image is built with
-`--features sql`, so `POST /api/v1/sql` works in the compose quickstart. `make
-demo` builds the default feature set and does **not** enable `sql`, so the SQL
-endpoint is unavailable on the from-source path. PromQL, ingest, and the rest
-are identical on both. To exercise the SQL surface from source, run
-`ravel-server` yourself with `--features sql`, or use the compose quickstart.
+`--features sql,flight-sql,otap`, so `POST /api/v1/sql` and Flight SQL work in
+the compose quickstart and `--otap` is accepted there. `make demo` builds the
+default feature set and enables none of the three, so those surfaces are
+unavailable on the from-source path. PromQL, ingest, and the rest are identical
+on both. To exercise them from source, run `ravel-server` yourself with the
+same `--features` list, or use the compose quickstart.
 
 ## Fast local iteration
 

@@ -152,8 +152,8 @@ exact protocol or byte layout, or when you are changing the code.
 - [analytics.md](analytics.md): the analytics stage behind
   `POST /api/v1/analytics`: change point detection and summary statistics
   with a robust (median and scaled median absolute deviation) centre.
-- [otap-ingest.md](otap-ingest.md): OpenTelemetry Arrow ingest, behind a
-  cargo feature and a runtime flag, metrics only.
+- [otap-ingest.md](otap-ingest.md): OpenTelemetry Arrow ingest, metrics only,
+  compiled into the published image and registered by the `--otap` flag.
 - [explorer/](explorer/index.html): an interactive map of the crates and
   the flows that cross them. Open the file in a browser.
 

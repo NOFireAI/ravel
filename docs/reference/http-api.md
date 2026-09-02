@@ -192,9 +192,9 @@ per-tenant labels on the admission and query families are opt-in
 ## Not on this HTTP surface
 
 - Flight SQL is behind the `flight-sql` cargo feature and is a gRPC service on
-  the gRPC listener, not an HTTP route. No published image builds that feature.
+  the gRPC listener, not an HTTP route. The published image builds that feature.
 - OTAP (OpenTelemetry Arrow Protocol) metrics ingest is a gRPC service that
-  needs both the `otap` cargo feature and the `--otap` runtime flag. No published
-  image builds it.
+  needs both the `otap` cargo feature and the `--otap` runtime flag. The
+  published image builds the feature; the flag is still required.
 - OTLP ingest for metrics, logs, and traces is additionally available over
   gRPC on the gRPC listener; this page documents the HTTP form.

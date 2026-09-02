@@ -41,7 +41,7 @@
   <rect x="40" y="300" width="280" height="70" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="180" y="322" font-size="12.5" font-weight="bold" text-anchor="middle" fill="#17191c">cargo build --release</text>
   <text x="180" y="338" font-size="10.5" text-anchor="middle" fill="#17191c">on the runner (host), sccache-warmed;</text>
-  <text x="180" y="352" font-size="10.5" text-anchor="middle" fill="#17191c">--features sql for server, matching the shipping build</text>
+  <text x="180" y="352" font-size="10.5" text-anchor="middle" fill="#17191c">--features sql,flight-sql,otap, as the shipping build</text>
 
   <line x1="320" y1="335" x2="360" y2="335" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 
