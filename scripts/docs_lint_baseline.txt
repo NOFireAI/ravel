@@ -104,15 +104,6 @@ docs/adrs/README.md	ADRINDEX	0979
 docs/adrs/README.md	ADRINDEX	0996
 docs/adrs/README.md	ADRINDEX	1029
 docs/adrs/README.md	ADRINDEX	1040
-docs/adrs/assets/0037-multiarch-publish.svg	SVG	docs/adrs/assets/0037-multiarch-publish.svg (missing role=img/aria-label)
-docs/adrs/assets/0070-request-classes.svg	SVG	docs/adrs/assets/0070-request-classes.svg (missing role=img/aria-label)
-docs/adrs/assets/0072-trust-boundary.svg	SVG	docs/adrs/assets/0072-trust-boundary.svg (missing role=img/aria-label)
-docs/adrs/assets/0073-recent-hours.svg	SVG	docs/adrs/assets/0073-recent-hours.svg (missing role=img/aria-label)
-docs/adrs/assets/0080-architecture.svg	SVG	docs/adrs/assets/0080-architecture.svg (missing role=img/aria-label)
-docs/adrs/assets/0080-hrw-flow.svg	SVG	docs/adrs/assets/0080-hrw-flow.svg (missing role=img/aria-label)
-docs/adrs/assets/0081-quickstart-paths.svg	SVG	docs/adrs/assets/0081-quickstart-paths.svg (missing role=img/aria-label)
-docs/adrs/assets/0081-readme-gate.svg	SVG	docs/adrs/assets/0081-readme-gate.svg (missing role=img/aria-label)
-docs/adrs/assets/0084-gzip-admission.svg	SVG	docs/adrs/assets/0084-gzip-admission.svg (missing role=img/aria-label)
 docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
 docs/analytics.md	TERM	robust
@@ -155,19 +146,6 @@ docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
 docs/diagrams/README.md	PROVENANCE	Last verified against the code
-docs/diagrams/architecture.svg	SVG	docs/diagrams/architecture.svg (missing role=img/aria-label)
-docs/diagrams/erasure-lifecycle.svg	SVG	docs/diagrams/erasure-lifecycle.svg (missing role=img/aria-label)
-docs/diagrams/ingest-commit-sequence.svg	SVG	docs/diagrams/ingest-commit-sequence.svg (missing role=img/aria-label)
-docs/diagrams/ingest-plausibility-window.svg	SVG	docs/diagrams/ingest-plausibility-window.svg (missing role=img/aria-label)
-docs/diagrams/k8s-ci-integration.svg	SVG	docs/diagrams/k8s-ci-integration.svg (missing role=img/aria-label)
-docs/diagrams/k8s-dev-environment.svg	SVG	docs/diagrams/k8s-dev-environment.svg (missing role=img/aria-label)
-docs/diagrams/k8s-operator-reconcile.svg	SVG	docs/diagrams/k8s-operator-reconcile.svg (missing role=img/aria-label)
-docs/diagrams/query-path.svg	SVG	docs/diagrams/query-path.svg (missing role=img/aria-label)
-docs/diagrams/query-request-budget.svg	SVG	docs/diagrams/query-request-budget.svg (missing role=img/aria-label)
-docs/diagrams/request-cost-levers.svg	SVG	docs/diagrams/request-cost-levers.svg (missing role=img/aria-label)
-docs/diagrams/rseg-layout.svg	SVG	docs/diagrams/rseg-layout.svg (missing role=img/aria-label)
-docs/diagrams/tenancy-key-layout.svg	SVG	docs/diagrams/tenancy-key-layout.svg (missing role=img/aria-label)
-docs/diagrams/tracing-export.svg	SVG	docs/diagrams/tracing-export.svg (missing role=img/aria-label)
 docs/guides/admission-limits.md	SRCPATH	crates/ravel-catalog/src/config.rs
 docs/guides/admission-limits.md	TRACKER	../adrs/0051-tenant-admission-control.md
 docs/guides/admission-limits.md	TRACKER	../adrs/0057-fleet-global-admission-reconciliation.md
@@ -763,6 +741,7 @@ docs/guides/operations.md	TRACKER	ADR-0904
 docs/guides/operations.md	TRACKER	ADR-0904
 docs/guides/operations.md	TRACKER	ADR-0904
 docs/guides/operations.md	TRACKER	ADR-0904
+docs/guides/operations.md	TRACKER	ADR-0979
 docs/guides/operations.md	TRACKER	ADR-0996
 docs/guides/query.md	SRCPATH	crates/ravel-promql-difftest/src/scoring.rs
 docs/guides/query.md	SRCPATH	crates/ravel-promql-difftest/src/scoring.rs
