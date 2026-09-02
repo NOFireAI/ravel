@@ -240,24 +240,44 @@ naming the pool, never a truncated result.
 
 ### Operator-configurable budgets (server flags)
 
-Four of these budgets are process-wide server flags (ADR-0088). Each default is
+These budgets are process-wide server flags (ADR-0088). Each default is
 exactly the compiled-in value, so a server started with none of the flags
-behaves byte-for-byte as before they existed. All four are process-wide, not
+behaves byte-for-byte as before they existed. All of them are process-wide, not
 per-tenant.
 
 | Flag | Reaches | Default |
 |---|---|---|
-| `--fetch-concurrency <N>` | `EngineConfig::fetch_concurrency` | 8 |
+| `--max-concurrent-gets <N>` | `EngineConfig::fetch_concurrency` | 8 |
+| `--scan-partitions <N>` | `EngineConfig::scan_partitions` | couples to `--max-concurrent-gets` |
+| `--fetch-concurrency <N>` | deprecated alias of `--max-concurrent-gets` | (unset) |
 | `--max-segments <N>` | `EngineConfig::max_segments` | 1024 |
 | `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | 256 MiB |
 | `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | 1 GiB |
 
-`--fetch-concurrency` is a single knob with three coupled effects, **not**
-decoupled by this change: it governs the PromQL/analytics per-query segment
-fetch fan-out, the SQL scan partition count (`target_partitions` in
-`crates/ravel-sql/src/session.rs`), and object-store GET concurrency (ADR-0087).
-Raising it widens all three together; size it against the host's cores and the
-store's request budget.
+`--max-concurrent-gets` and `--scan-partitions` are two independent knobs that
+issue #846 split out of the single `--fetch-concurrency`. They bound different
+resources:
+
+- `--max-concurrent-gets` bounds concurrency at the **store**: the permit pool
+  the fetch layer acquires against, which caps the PromQL/analytics per-query
+  segment fetch fan-out and sizes the logs read path's GET semaphore
+  (ADR-0087). Size it against the store's per-connection bandwidth and
+  round-trip latency.
+- `--scan-partitions` bounds parallelism in the **plan**: DataFusion's
+  `target_partitions` (`crates/ravel-sql/src/session.rs`), how many independent
+  scan streams a tenant's segment list is fanned across. Size it against the
+  host's cores. Unset, it couples to `--max-concurrent-gets`, which is exactly
+  the pre-split behavior.
+
+They compose as parallelism times a shared per-store bound, not
+multiplicatively: every partition's fetches draw from the one permit pool, so a
+scan planned at more partitions than `--max-concurrent-gets` has permits only
+queues the surplus GETs on that pool.
+
+`--fetch-concurrency` set both at once, so no tuning result taken with it was
+attributable to one or the other. It is kept as a deprecated alias of
+`--max-concurrent-gets` (the meaning it dominantly governed), warns at startup,
+and conflicts with `--max-concurrent-gets`.
 
 `--max-segments` caps how many segments a single query fans out over. Only the
 narrow recent set (`SegmentOrigin::Recent`, roughly the last couple of hours) is

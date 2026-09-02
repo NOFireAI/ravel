@@ -13,7 +13,12 @@ pub const DEFAULT_MAX_SERIES: usize = 10_000;
 pub const DEFAULT_MAX_SAMPLES: usize = 10_000_000;
 /// Default wall-clock deadline for a single query.
 pub const DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
-/// Default bound on concurrent in-flight segment fetches per query.
+/// Default bound on concurrent in-flight object-store GETs per query
+/// ([`EngineConfig::fetch_concurrency`]), and, when
+/// [`EngineConfig::scan_partitions`] is unset, the default SQL scan partition
+/// count it couples to. The two were one knob before issue #846; both still
+/// default to this value, so a run that sets neither is byte-for-byte
+/// unchanged.
 pub const DEFAULT_FETCH_CONCURRENCY: usize = 8;
 /// Default step for a subquery that omits its own (`expr[5m:]`), matching
 /// Prometheus' global `evaluation_interval` default.
@@ -364,7 +369,45 @@ pub struct EngineConfig {
     /// no-deployment-context fallback.
     pub max_s3_requests: RequestLimit,
     pub deadline: Duration,
+    /// Bound on concurrent in-flight object-store GETs a single query may hold:
+    /// the size of the permit pool the fetch layer acquires against. Two fetch
+    /// surfaces share this one bound. The PromQL/analytics engine caps its
+    /// per-query segment fetch fan-out here (`buffer_unordered(fetch_concurrency)`
+    /// in [`crate::QueryEngine`]), and the logs read path sizes
+    /// [`crate::LogSegmentFetcher`]'s GET permit pool from it (via
+    /// `with_max_concurrent_gets`, wired at the server), overriding that
+    /// fetcher's compiled-in [`crate::DEFAULT_LOG_MAX_CONCURRENT_GETS`].
+    ///
+    /// This bounds concurrency at the store, NOT parallelism in the plan: it is
+    /// distinct from [`Self::scan_partitions`]. A SQL scan planned at N
+    /// partitions still issues no more than `fetch_concurrency` GETs at once,
+    /// because every partition's fetches draw from this same pool; raising the
+    /// partition count past this value only queues the surplus on the permit
+    /// pool. Sizing it is a throughput-vs-memory trade against the store's
+    /// per-connection bandwidth and round-trip latency (issue #845). Defaults to
+    /// [`DEFAULT_FETCH_CONCURRENCY`].
+    ///
+    /// This is the meaning `--fetch-concurrency` dominantly controlled before
+    /// issue #846 split the knob (ADR-0088 documented it as "the knob that bounds
+    /// S3 GET concurrency"); the honest successor flag is `--max-concurrent-gets`.
     pub fetch_concurrency: usize,
+    /// The SQL scan partition count (`target_partitions`), or `None` to couple it
+    /// to [`Self::fetch_concurrency`] (the pre-issue-#846 behavior, kept so an
+    /// unset value is byte-for-byte identical to before the split).
+    ///
+    /// This bounds parallelism in the plan: how many independent scan streams
+    /// DataFusion fans a tenant's segment list across. It does NOT bound
+    /// concurrency at the store; the partitions issuing fetches all share
+    /// [`Self::fetch_concurrency`]'s permit pool, so this and that knob compose
+    /// as `parallelism x per-store-bound`, not multiplicatively against the
+    /// store. Resolve the effective value through
+    /// [`Self::effective_scan_partitions`], never by reading this field raw.
+    ///
+    /// Split out from `fetch_concurrency` by issue #846 so a tuning result names
+    /// which resource it moved: the honest flag is `--scan-partitions`. `None`
+    /// resolves to `fetch_concurrency`, so a run that sets neither, or only the
+    /// GET bound, keeps today's coupled behavior.
+    pub scan_partitions: Option<usize>,
     /// Step for a subquery that does not specify its own (`expr[5m:]`).
     pub default_evaluation_interval: Duration,
     /// Object size above which a logs scan reads only the pruning-relevant
@@ -415,6 +458,16 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    /// The effective SQL scan partition count: [`Self::scan_partitions`] when the
+    /// operator set it, otherwise [`Self::fetch_concurrency`] (the pre-issue-#846
+    /// coupling). Every reader that turns this config into a plan's
+    /// `target_partitions` MUST go through here, so an unset partition count
+    /// resolves to today's behavior byte for byte and a set one decouples the two
+    /// knobs.
+    pub fn effective_scan_partitions(&self) -> usize {
+        self.scan_partitions.unwrap_or(self.fetch_concurrency)
+    }
+
     /// Refuse a configuration the fetch layer cannot run on (ADR-0996 decision
     /// 2). Called at startup resolution; a bad value is a typed
     /// [`EngineConfigError`], never a silent clamp.
@@ -439,6 +492,7 @@ impl Default for EngineConfig {
             )),
             deadline: DEFAULT_DEADLINE,
             fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            scan_partitions: None,
             default_evaluation_interval: DEFAULT_EVALUATION_INTERVAL,
             logs_block_range_threshold: crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             logs_request_cost_bytes: crate::DEFAULT_LOG_REQUEST_COST_BYTES,
@@ -792,6 +846,45 @@ mod tests {
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
         );
         assert_eq!(cb.saturated_profile, None);
+    }
+
+    /// Issue #846: the two split knobs both default to the one value the single
+    /// pre-split knob had, so a default run is byte-for-byte unchanged, and an
+    /// unset partition count couples to the GET bound exactly as before.
+    ///
+    /// Prove-the-test: change [`EngineConfig::effective_scan_partitions`] to
+    /// return `self.scan_partitions.unwrap_or(DEFAULT_FETCH_CONCURRENCY)` (a
+    /// fixed default instead of coupling to `fetch_concurrency`) and the coupled
+    /// assertion below reads 8 against the expected 40.
+    #[test]
+    fn split_knobs_default_to_todays_single_effective_value() {
+        let cfg = EngineConfig::default();
+        // Knob 1, the in-flight GET permit pool: today's compiled-in value.
+        assert_eq!(cfg.fetch_concurrency, DEFAULT_FETCH_CONCURRENCY);
+        assert_eq!(DEFAULT_FETCH_CONCURRENCY, 8);
+        // Knob 2, the scan partition count: unset, and its effective value is the
+        // same pre-split value the SQL layer read before the split.
+        assert_eq!(cfg.scan_partitions, None);
+        assert_eq!(cfg.effective_scan_partitions(), DEFAULT_FETCH_CONCURRENCY);
+
+        // An unset partition count couples to the GET bound: moving only the GET
+        // bound still fans out that many partitions, exactly as the single knob
+        // did. 40 differs from the default so an ignored coupling cannot pass.
+        let coupled = EngineConfig {
+            fetch_concurrency: 40,
+            ..EngineConfig::default()
+        };
+        assert_eq!(coupled.effective_scan_partitions(), 40);
+
+        // Setting the partition count decouples the two: the GET bound is not
+        // touched, and the partition count is the value set, not the GET bound.
+        let split = EngineConfig {
+            fetch_concurrency: 40,
+            scan_partitions: Some(4),
+            ..EngineConfig::default()
+        };
+        assert_eq!(split.fetch_concurrency, 40);
+        assert_eq!(split.effective_scan_partitions(), 4);
     }
 
     #[test]

@@ -523,7 +523,7 @@ pub fn session_config(
     let repartition_free = repartition_free(spill);
     let mut session = SessionConfig::new()
         .with_information_schema(false)
-        .with_target_partitions(config.engine.fetch_concurrency.max(1))
+        .with_target_partitions(config.engine.effective_scan_partitions().max(1))
         // ADR-0094: the only knob that is ever true, and only for a query whose
         // aggregates and group keys are all exact-typed. See the module docs.
         // ADR-0954 takes it back for a spill-enabled query.
@@ -895,6 +895,38 @@ mod tests {
         assert!(!options.optimizer.repartition_sorts);
         assert!(!options.optimizer.repartition_windows);
         assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// Issue #846: the plan's partition count (`target_partitions`) is the
+    /// scan-partition knob resolved through
+    /// `EngineConfig::effective_scan_partitions`, NOT the in-flight GET bound
+    /// (`fetch_concurrency`). A run can therefore pin one and sweep the other,
+    /// which is what makes a tuning result attributable.
+    ///
+    /// Prove-the-test: revert the `session_config` builder to
+    /// `.with_target_partitions(config.engine.fetch_concurrency.max(1))` and the
+    /// decoupled assertion reads 4 (the GET bound) against the expected 16.
+    #[test]
+    fn target_partitions_follows_scan_partitions_not_the_get_bound() {
+        // Decouple: a small GET bound, a large explicit partition count. The
+        // plan's partition count is the partition knob, not the GET bound.
+        let mut config = SqlConfig::default();
+        config.engine.fetch_concurrency = 4;
+        config.engine.scan_partitions = Some(16);
+        let session = session_config(&config, false, SpillDecision::Disabled);
+        assert_eq!(
+            session.options().execution.target_partitions,
+            16,
+            "target_partitions is the scan-partition knob, independent of the GET bound"
+        );
+
+        // Unset partition count couples to the GET bound (the pre-split
+        // behavior), so a run that sets neither is byte-for-byte unchanged.
+        let mut config = SqlConfig::default();
+        config.engine.fetch_concurrency = 7;
+        config.engine.scan_partitions = None;
+        let session = session_config(&config, false, SpillDecision::Disabled);
+        assert_eq!(session.options().execution.target_partitions, 7);
     }
 
     /// ADR-0094 decision 2: `exact_typed_aggregates = true` flips ONLY

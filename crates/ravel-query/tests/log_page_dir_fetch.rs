@@ -33,7 +33,8 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use ravel_cache::{Cache, CacheLimits};
@@ -359,6 +360,131 @@ async fn store_with(bytes: &[u8]) -> Arc<MemoryStore> {
     .await
     .expect("put");
     mem
+}
+
+/// Measures the peak number of interior-range (chunk) GETs in flight at once.
+/// Each `Range` GET increments an in-flight counter, records the running peak,
+/// then sleeps so concurrently-issued GETs actually overlap before any
+/// releases; the suffix probe and whole-object reads pass straight through and
+/// are never counted. What the peak measures is therefore the block-range GET
+/// fan-out the permit pool bounds (issue #846): the pool's own accounting,
+/// observed under a fetch that issues more chunk GETs than a small pool admits.
+struct ConcurrencyStore {
+    inner: Arc<MemoryStore>,
+    in_flight: AtomicUsize,
+    peak: AtomicUsize,
+}
+
+impl ConcurrencyStore {
+    fn new(inner: Arc<MemoryStore>) -> Arc<Self> {
+        Arc::new(ConcurrencyStore {
+            inner,
+            in_flight: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        })
+    }
+    fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for ConcurrencyStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        if matches!(range, GetRange::Range(_, _)) {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            // Long enough that every GET the permit pool admits is parked here at
+            // once before the first releases, so `peak` reflects the pool size,
+            // not scheduling. `sleep` yields, so this is reliable on the
+            // current-thread test runtime too.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let out = self.inner.get(key, range).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            out
+        } else {
+            self.inner.get(key, range).await
+        }
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Issue #846: the in-flight GET bound (`with_max_concurrent_gets`, the permit
+/// pool `--max-concurrent-gets` sizes) caps concurrent store GETs independently
+/// of how many chunk runs the scan fans out. The projected read of three
+/// columns over three row groups issues nine chunk GETs (pinned by
+/// [`version_4_projected_read_fetches_one_range_per_group_and_column`]); a pool
+/// of three admits at most three at once, while a pool wide enough for all nine
+/// lets every one run concurrently.
+///
+/// Prove-the-test: drop the `.with_max_concurrent_gets(3)` builder call (or
+/// raise its argument to `>= 9`) and the bounded assertion reads 9 against the
+/// expected 3.
+#[tokio::test]
+async fn permit_pool_bounds_concurrent_chunk_gets_below_the_run_count() {
+    let recs = records();
+    let bytes = build_object(&recs);
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let sel = ColumnSelection::fixed_only().with_flags();
+
+    // Nine chunk runs, three permits: the pool is the bound.
+    let mem = store_with(&bytes).await;
+    let bounded = ConcurrencyStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&bounded) as Arc<dyn ObjectStoreBackend>;
+    let acc = QueryAccounting::new();
+    let (_got, stats) = ranged(store, &bytes)
+        .with_max_concurrent_gets(3)
+        .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &acc)
+        .await
+        .expect("projected fetch (pool of 3)");
+    assert_eq!(
+        stats.block_range_gets, 9,
+        "the fixture issues nine chunk GETs"
+    );
+    assert_eq!(
+        bounded.peak(),
+        3,
+        "a permit pool of three admits at most three chunk GETs at once"
+    );
+
+    // Same nine runs, a pool wide enough for all of them: no bound bites.
+    let mem = store_with(&bytes).await;
+    let wide = ConcurrencyStore::new(mem);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&wide) as Arc<dyn ObjectStoreBackend>;
+    let acc = QueryAccounting::new();
+    let (_got, stats) = ranged(store, &bytes)
+        .with_max_concurrent_gets(16)
+        .fetch_object_projected(&seg, TENANT, i64::MIN, i64::MAX, &sel, &acc)
+        .await
+        .expect("projected fetch (pool of 16)");
+    assert_eq!(stats.block_range_gets, 9);
+    assert_eq!(
+        wide.peak(),
+        9,
+        "a pool wider than the run count lets every chunk GET run at once"
+    );
 }
 
 /// A block-range fetcher forced onto the ranged path on this small fixture,

@@ -650,9 +650,11 @@ impl LogSegmentFetcher {
 
     /// Bounds the in-flight object-store GETs of the block-range path (ADR-0107
     /// decision 1's permit pool, [`DEFAULT_LOG_MAX_CONCURRENT_GETS`] by
-    /// default). This is the seam `--fetch-concurrency` (ADR-0088) reaches the
-    /// logs signal through; a scan planned at more partitions than this pool
-    /// has permits queues on it (issue #700).
+    /// default). This is the seam `--max-concurrent-gets` (issue #846's honest
+    /// successor to `--fetch-concurrency`, ADR-0088) reaches the logs signal
+    /// through; a scan planned at more partitions than this pool has permits
+    /// queues on it (issue #700), which is exactly why the partition count is a
+    /// separate knob (`--scan-partitions`) rather than this one.
     #[must_use]
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
         self.block_range = self.block_range.with_max_concurrent_gets(n);

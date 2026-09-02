@@ -308,11 +308,12 @@ pub fn build_sql_state(
     // `QueryBudgets::apply_to_engine`. This is the single wiring point for it, so
     // an operator who sets the flag to `u64::MAX` gets whole-object logs reads
     // (the pre-ADR-0107 shape) on every SQL logs scan this process serves.
-    // `--fetch-concurrency` is documented (ADR-0088) as the knob that bounds
-    // S3 GET concurrency; the logs fetcher keeps its own permit pool (ADR-0107
-    // decision 1, separate from RSEG's), so the bound has to be handed to it
-    // here or the pool stays at its compiled-in 16 whatever the flag says
-    // (issue #700).
+    // `EngineConfig::fetch_concurrency` bounds S3 GET concurrency
+    // (`--max-concurrent-gets`, the successor to `--fetch-concurrency` after
+    // issue #846 split the partition count out into `--scan-partitions`); the
+    // logs fetcher keeps its own permit pool (ADR-0107 decision 1, separate from
+    // RSEG's), so the bound has to be handed to it here or the pool stays at its
+    // compiled-in 16 whatever the flag says (issue #700).
     // `--logs-request-cost-bytes` (ADR-0904) reaches the same fetcher the same
     // way: the request cost lives on the block-range fetcher this builder owns,
     // so the flag has to be handed over here or the fetcher keeps its
