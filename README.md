@@ -8,20 +8,34 @@
 
 **The write is acknowledged when S3 has it. Not before.**
 
-Ravel is an OpenTelemetry-native database for metrics, logs, and traces where
-object storage is the only durable component. No write-ahead log. No ingester
+Ravel is a database for OpenTelemetry metrics, logs, and traces where object
+storage is the only durable component. No write-ahead log. No replicated ingest
 quorum. No StatefulSet. Kill any Ravel process at any instant, and every
-acknowledged write is still there.
+strictly acknowledged write is still there.
 
 ![Ingesting one sample under strict acknowledgement, SIGKILLing the ravel-server container, replacing it with a fresh one, and reading the pre-kill sample back by its commit token.](docs/demo.gif)
+
+Strict acknowledgement is the default. A request is acknowledged only after
+every batch its points contributed to has its data object durably stored and
+its commit record created, and the response carries one commit token per shard
+those points flushed through. After a strict acknowledgement, no crash of any
+Ravel process loses that data.
+
+Buffered acknowledgement is the opt-out, set per tenant or per request. It
+acknowledges after admission and enqueue to a shard actor, and it returns no
+commit token: it trades the guarantee above for write latency. A crash between
+that acknowledgement and the flush loses the buffered window, bounded by the
+maximum flush delay. A clean shutdown drains the window, so the loss is
+specific to a crash. The [consistency model](docs/consistency-model.md) is
+normative for both modes.
 
 ## Why it is built this way
 
 Every self-hosted observability stack ends up storing data on object storage.
 Almost none of them start there. Mimir, Loki, Tempo, and Thanos buffer writes in
-a replicated ingest tier with local disks, then ship to object storage later.
-That is why running them means running a write-ahead log, PersistentVolumeClaims,
-replication factors, and rollout ordering.
+a replicated ingest layer with local disks, then ship to object storage later.
+That is why running them means running a write-ahead log,
+PersistentVolumeClaims, replication factors, and rollout ordering.
 
 Ravel makes the object store the first stop. An ingest shard builds an immutable
 columnar segment in memory, PUTs it, PUTs a commit record, and only then answers
@@ -29,48 +43,96 @@ the exporter. The response carries a commit token. Pass that token back to a
 query and you read your own write, with no listing race.
 
 The trade is explicit. You pay object-store latency on the write path, and you
-delete the entire stateful tier. Ravel's job is to make that a good trade.
+delete the entire replicated stateful layer. Ravel's job is to make that a good
+trade.
+
+## Is Ravel a fit
+
+**What it is for.** Metrics, logs, and traces on any S3-compatible object store,
+with no stateful ingest layer to operate and no local disk in the durability
+path. A Prometheus-compatible query API, so existing Grafana dashboards work
+against it. Read-your-write on an object store: a strict acknowledgement hands
+back a commit token, and a query that carries the token back reads exactly that
+write. Multi-tenancy with per-tenant server-side encryption using a key
+management service (SSE-KMS), legal hold, and admission limits.
+
+**What it does not do.**
+
+- No downsampled or pre-aggregated rollups. A wide-range metrics query reads
+  every raw hour it covers.
+- Logs and traces are queryable over SQL only, as the `logs` and `spans` tables.
+  There is no LogQL, no PromQL surface for logs, no TraceQL, no trace-by-ID
+  endpoint, and no Jaeger or Tempo API.
+- Alert rule transitions and audit records are written to object storage, and no
+  shipped query surface can read them back.
+- Flight SQL and OTAP (OpenTelemetry Arrow) ingest exist in the source and no
+  published image builds them. Both need a source build with their cargo
+  feature turned on.
+- Profiles are a reserved object-key prefix only. No ingest, no query.
+- Exemplars are stored from the OpenTelemetry Protocol (OTLP) only. Remote Write
+  and OTAP decode exemplars and then discard them.
+- Distributed read fan-out is off unless `--distributed-query` and
+  `--fragment-key-file` are both given, and the lane it drives is metrics only.
+  The SQL distributed scan is not wired into a running server's coordinator and
+  worker paths.
+
+**Who should wait.** If your dashboards range over months of high-cardinality
+metrics, the missing downsampled storage will cost you on every panel. If your
+logs or traces workflow depends on LogQL, TraceQL, or the Jaeger UI, there is
+nothing here to point them at. If you need alert history to be queryable, it is
+not. If you need write acknowledgement in single-digit milliseconds, strict mode
+pays an object-store round trip and buffered mode gives up the crash guarantee
+above. Ravel is pre-1.0: the persistent formats are versioned contracts, and the
+surfaces around them still move.
 
 ## What works today
 
-| Signal | Ingest | Query |
-|---|---|---|
-| Metrics | OTLP (HTTP, gRPC), Prometheus Remote Write 1.0 and 2.0 | PromQL, SQL (`samples`), Flight SQL |
-| Logs | OTLP (HTTP, gRPC) | SQL (`logs`), Flight SQL |
-| Traces | OTLP (HTTP, gRPC) | SQL (`spans`) |
+Ravel ingests OTLP natively and answers PromQL and SQL. Everything below is
+either in the published container image or behind a named cargo feature, and the
+matrix says which.
+
+<!-- BEGIN SUPPORT MATRIX -->
+
+| Surface | Signals | Feature gate | In published image |
+|---|---|---|---|
+| OTLP ingest, HTTP and gRPC | metrics, logs, traces | `none` | yes |
+| Prometheus Remote Write 1.0 and 2.0 ingest | metrics | `none` | yes |
+| OTAP ingest, gRPC | metrics | `otap` | no |
+| PromQL HTTP API | metrics | `none` | yes |
+| SQL over `POST /api/v1/sql` | metrics as `samples`, logs as `logs`, traces as `spans` | `sql` | yes |
+| Flight SQL | the same three tables | `flight-sql` | no |
+
+<!-- END SUPPORT MATRIX -->
+
+No crate in the workspace declares a default feature set, so `sql`,
+`flight-sql`, and `otap` are off in any build that does not ask for them. The
+published `ravel-server` image is built with `--features sql`, so
+`POST /api/v1/sql` answers there. OTAP ingest needs the `otap` feature at build
+time and the `--otap` flag at startup, and Flight SQL needs the `flight-sql`
+feature; no published image carries either. Flight SQL runs ad-hoc statements,
+and prepared statements return `unimplemented`.
+
+Exactly three SQL tables are registered: `samples`, `logs`, and `spans`. SQL is
+the only way to query logs and traces.
 
 Also live:
 
 - A Prometheus-compatible HTTP API, so existing Grafana dashboards work.
   `/api/v1/metadata` returns real per-metric type, help, and unit for metrics
-  ingested after ADR-0085, and OTLP metric names get the standard
+  whose ingest carried that metadata, and OTLP metric names get the standard
   Prometheus-style unit and `_total` suffixes at ingest (a monotonic `foo` with
   `unit: "By"` lands as `foo_bytes_total`), so the same metric matches whether
   it arrives over OTLP or through a collector's Prometheus exporter.
 - Exemplars that link a metric sample to its trace.
-- Alerting that stores every rule transition as immutable, queryable data.
+- Alert rules whose every transition is written to object storage as immutable
+  data. Reading those records back needs a query surface Ravel does not ship
+  yet.
 - An analytics endpoint for change point detection and summary statistics.
 - Compaction, age-based retention, and garbage collection across all signals.
-- Multi-tenancy with per-tenant SSE-KMS encryption, legal hold, and admission
-  limits.
 - A Kubernetes operator with a `RavelCluster` custom resource.
-- Distributed read fan-out and cross-cluster federation, off by default and
-  byte-identical to local execution.
-- OTAP (OpenTelemetry Arrow) ingest, behind a cargo feature.
-- Per-tenant typed attribute columns on the `logs` SQL table: an operator
-  declares an attribute key (`ravel-cli typed-attr-column set acme
-  http.duration_ms:i64`, or the `--typed-attr-column` server flags) and it
-  becomes a native `Int64`/`Boolean`/`Binary` column, or
-  `Dictionary(Int32, Utf8)` for a declared string, so typed comparisons and
-  aggregates need no `CAST` over the stringified `attrs` map. A declared
-  string column keeps its dictionary encoding through Flight SQL and Arrow
-  IPC rather than being expanded per row; JSON row values are unchanged, but
-  the JSON envelope reports the dictionary type.
-
-Not there yet:
-
-- No downsampled tier. A wide-range query reads every raw hour ([#118](https://github.com/NOFireAI/ravel/issues/118)).
-- Flight SQL runs ad-hoc statements. Prepared statements return `unimplemented`.
+- Per-tenant typed attribute columns on the `logs` SQL table, so typed
+  comparisons and aggregates need no `CAST` over the stringified `attrs` map.
+  See the [query guide](docs/guides/query.md).
 
 The [SQL conformance table](docs/sql-conformance.md) and the PromQL conformance
 table in the [query engine spec](docs/query-engine.md) classify every construct
@@ -123,8 +185,9 @@ Stop the stack:
 docker compose -f deploy/docker-compose/ravel.yml down
 ```
 
-The [getting started guide](docs/guides/getting-started.md) walks the same path
-with expected output.
+The [getting started guide](docs/guides/getting-started.md) walks this same path
+with what each response means, how long to wait for data, and what an empty
+result looks like when it is expected.
 
 ### Kill the server, keep the data
 
@@ -147,13 +210,6 @@ token comes back unsatisfiable. A passing run is evidence, not a demonstration
 you have to watch closely. CI runs it against a live stack on every change to the
 quickstart.
 
-### The from-source path
-
-`make demo` builds Ravel from source and runs the same round trip. It does not
-build the `sql` feature, so `POST /api/v1/sql` is unavailable there. PromQL,
-ingest, and the rest work on both paths. Use `make demo` when you are changing
-Ravel's code. See the [development guide](docs/guides/development.md).
-
 ### Security of the demo stack
 
 Every credential in [deploy/docker-compose/ravel.yml](deploy/docker-compose/ravel.yml)
@@ -162,69 +218,47 @@ is a fixed development value: the `demo-token` bearer token and the MinIO
 (`127.0.0.1`) only, so the checked-in token never fronts an ingest endpoint on
 your network. None of these values are for a deployment that a network can reach.
 
-### Storage beyond the demo stack
+### Beyond the demo stack
 
-A real deployment points `--store s3` at any S3-compatible store with static
-keys, exactly as the quickstart points it at MinIO. On EC2 you can drop the
-static keys entirely: attach an IAM role to the instance and start with
+A real deployment points `--store s3` at any S3-compatible store, exactly as the
+quickstart points it at MinIO, and on EC2 it can drop static keys entirely with
+`--s3-auth instance-role`. The [operations guide](docs/guides/operations.md)
+documents every storage flag, including temporary session tokens and a rotating
+credentials file.
 
-    ravel-server --store s3 --s3-bucket my-bucket --s3-region us-east-1 --s3-auth instance-role
+Every query byte comes from object storage, so a read cache sits in front of it.
+The RAM tier is on by default, bounded by `--cache-max-bytes` and switched off
+with `--disable-cache`; `--cache-dir <path>` adds a second, disposable disk
+tier. Neither tier holds durable state. See the
+[caching guide](docs/guides/caching.md).
 
-Credentials are fetched from the instance metadata service at startup and
-refreshed before they expire, so nothing long-lived is stored on the instance.
-The [operations guide](docs/guides/operations.md) documents every storage flag,
-including temporary session tokens and a rotating credentials file for
-non-EC2 deployments (ADR-0106, ADR-0072).
-
-### Read cache
-
-Every query byte comes from object storage, so Ravel has an ADR-0046 read cache
-in front of it. The RAM tier is always on (bounded by `--cache-max-bytes`, or
-turned off entirely with `--disable-cache`). Adding `--cache-dir <path>` attaches
-a second, local-disk tier at that directory, so a RAM eviction is served from
-disk instead of re-paying the S3 round trip:
-
-    ravel-server --store s3 --s3-bucket my-bucket --cache-dir /var/cache/ravel
-
-The disk tier is opt-in and disposable: with no `--cache-dir` behavior is exactly
-as before, and a missing, full, or corrupt cache directory degrades to a store
-read, never a query error. Bytes written to the cache directory are **not**
-encrypted by Ravel, even with SSE-KMS configured for object storage (ADR-0046
-decision 7): SSE-KMS protects object bytes at rest in the store, not the local
-cache. If you need bytes-at-rest encryption for the cache directory, provide it
-at the filesystem/volume layer. `/metrics` splits each cache's `ravel_cache_*`
-counters by a `tier="ram"`/`tier="disk"` label once a disk tier is configured.
-See the [caching guide](docs/guides/caching.md).
+Changing Ravel's code? `make demo` builds from source and runs the same round
+trip. It does not build the `sql` feature, so `POST /api/v1/sql` is unavailable
+on that path while PromQL and ingest behave the same. The
+[development guide](docs/guides/development.md) covers the source workflow.
 
 ## How it fits together
 
-![architecture](docs/diagrams/architecture.svg)
+![Ravel architecture: OTLP clients ingest through the gateway, the ingest router, and shard actors down to L0 segments and commit records, while Prometheus API consumers query through the PromQL evaluator, query workers, and catalog resolution. The object store sits in the middle as the single durable center, and every box above it is disposable.](docs/diagrams/architecture.svg)
 
 A write is durable once its commit record is on the object store. A reader sees
 it once the catalog resolves that commit into a snapshot. The
-[ingest guide](docs/guides/ingest.md) covers the write path and the
-[query guide](docs/guides/query.md) covers the read path. The
-[consistency model](docs/consistency-model.md) is normative for what
-acknowledgement, visibility, and crash recovery mean.
-
-![ingest and commit sequence](docs/diagrams/ingest-commit-sequence.svg)
+[ingest guide](docs/guides/ingest.md) covers the write path, the
+[query guide](docs/guides/query.md) covers the read path, and
+[architecture](docs/architecture.md) is the one-page overview.
 
 All query endpoints live under `/api/v1` on the HTTP listener, which binds
 `127.0.0.1:4318` by default. They need `Authorization: Bearer <token>`, the same
-as ingest. The [query guide](docs/guides/query.md) and the
-[distributed query guide](docs/guides/distributed-query.md) cover PromQL, SQL,
-Flight SQL, exemplars, alerting, and analytics. The
-[traces guide](docs/guides/traces.md) covers querying spans over the `spans`
-SQL table.
+as ingest.
 
-One maintenance route sits alongside them: `POST /api/v1/admin/fold` triggers
-a catalog fold for the authenticated tenant and one named signal, instead of
-waiting for the background fold's next tick. It takes the same bearer token
-the query routes take, and its response says which of three things happened --
-a snapshot was `published`, `nothing_eligible` was found to fold, or a
-concurrent fold won the `HEAD` compare-and-swap (`lost_cas`). Right after a
-load the honest answer is `nothing_eligible`: an ingest hour is not foldable
-until the sealing window behind it has elapsed. See
+One maintenance route sits alongside them: `POST /api/v1/admin/fold` triggers a
+catalog fold for the authenticated tenant and one named signal, instead of
+waiting for the background fold's next tick. It takes the same bearer token the
+query routes take, and its response says which of four things happened: a
+snapshot was `published`, `nothing_eligible` was found to fold, a concurrent fold
+won the `HEAD` compare-and-swap (`lost_cas`), or the call was `throttled`. Right
+after a load the honest answer is `nothing_eligible`: an ingest hour is not
+foldable until the sealing window behind it has elapsed. See
 [architecture](docs/architecture.md#on-demand-catalog-fold).
 
 ## Kubernetes
@@ -234,7 +268,7 @@ needs `docker`, `kind`, and `kubectl`:
 
 ```sh
 scripts/kind-up.sh     # cluster, images, fake S3, operator, RavelCluster
-scripts/kind-demo.sh   # ingest via the gateway, query via the query tier
+scripts/kind-demo.sh   # ingest through gateway mode, query through query mode
 scripts/kind-down.sh
 ```
 
@@ -244,12 +278,10 @@ See the [Kubernetes guide](docs/guides/kubernetes.md).
 
 `ravel-server`, `ravel-operator`, and `ravel-ingest-router` publish to the
 GitHub Container Registry on every `vX.Y.Z` release tag, built from the root
-`Dockerfile`
-(see [ADR-0037](docs/adrs/0037-container-image-ci-registry.md)). Both
-`linux/amd64` and `linux/arm64` are published.
-Each published object is an OCI image index that carries an SBOM and full build
-provenance. The quickstart pins `ghcr.io/nofireai/ravel-server:0.11.0`. Override
-it with `RAVEL_IMAGE`.
+`Dockerfile`. Both `linux/amd64` and `linux/arm64` are published. Each published
+object is an OCI image index that carries an SBOM and full build provenance. The
+quickstart pins `ghcr.io/nofireai/ravel-server:0.11.0`. Override it with
+`RAVEL_IMAGE`.
 
 ```sh
 docker pull ghcr.io/nofireai/ravel-server:latest
@@ -285,12 +317,11 @@ Replace `v0.9.0` and `0.9.0` with the release you are verifying. The tag ref in
 Durability claims are cheap to write and hard to keep. These are the checks that
 hold Ravel to them:
 
-- A [deterministic simulation harness](docs/adrs/0068-deterministic-simulation-harness.md)
-  drives the full ingest, fold, compact, sweep, and query cycle under injected
-  faults. It checks read-your-write, strict-ack durability, compaction
-  equivalence, record-count conservation, and orphan-free sweeps every cycle.
-  Any violation prints its master seed and a one-command replay. A nightly job
-  sweeps 200 seeds.
+- A deterministic simulation harness drives the full ingest, fold, compact,
+  sweep, and query cycle under injected faults. It checks read-your-write,
+  strict-ack durability, compaction equivalence, record-count conservation, and
+  orphan-free sweeps every cycle. Any violation prints its master seed and a
+  one-command replay. A nightly job sweeps 200 seeds.
 - The PromQL evaluator is differentially tested against a pinned real Prometheus
   binary, and the per-construct result is published as a conformance table.
 - `unsafe` is forbidden workspace-wide, at the compiler rather than by review.
@@ -301,31 +332,31 @@ hold Ravel to them:
 - The [consistency model](docs/consistency-model.md) is normative, and its crash
   matrix is test-asserted.
 
-## Where things live
+## Repository layout
 
-- `crates/` contains types, the object store, the segment formats (RSEG for
-  metrics, RLOG for logs, RSPAN for spans), the commit protocol, the catalog,
-  OTLP, OTAP and Remote Write decode, ingest actors, PromQL, the query engine,
-  and DataFusion-backed SQL.
-- `services/` contains `ravel-server` (gateway, ingest, query, and maintain modes
-  in one binary), `ravel-cli` (a segment, commit, and catalog inspector, and the
+- `crates/` holds the types, the object store, the segment formats (RSEG for
+  metrics, RLOG for logs, RSPAN for spans), the commit protocol, the catalog, the
+  decoders, the ingest actors, PromQL, the query engine, and DataFusion-backed
+  SQL.
+- `services/` holds `ravel-server` (gateway, ingest, query, and maintain modes in
+  one binary), `ravel-cli` (a segment, commit, and catalog inspector, and the
   Parquet bulk loader), and the Kubernetes operator.
-- `docs/` contains specs, decision records, diagrams, and guides.
-- `deploy/` contains the quickstart compose stack, the Collector and Grafana
-  provisioning, and Kubernetes manifests.
+- `docs/` holds the guides, the specs, the decision records, and the diagrams.
+- `deploy/` holds the quickstart compose stack, the Collector and Grafana
+  provisioning, and the Kubernetes manifests.
 
 ## Documentation
 
-- [Guides](docs/guides/) cover getting started, ingest, query, distributed query,
-  operations, observability, tracing, admission limits, caching, correlation,
-  disaster recovery, inspecting data, Kubernetes, and development.
-- [Documentation index](docs/README.md) lists every guide and spec.
-- [Architecture](docs/architecture.md) and the
-  [consistency model](docs/consistency-model.md).
+- [Getting started](docs/guides/getting-started.md) is the recommended path from
+  nothing to a first query.
+- The [documentation index](docs/README.md) lists every guide, spec, and decision
+  record.
+- [Architecture](docs/architecture.md) is the mental model, and the
+  [consistency model](docs/consistency-model.md) is normative for
+  acknowledgement, visibility, and crash behavior.
 - Formats: [RSEG](docs/segment-format.md) for metrics,
   [RLOG](docs/log-segment-format.md) for logs, and
   [RSPAN](docs/span-segment-format.md) for spans.
-- [Decision records](docs/adrs/), one per architectural choice.
 - [Contributing](CONTRIBUTING.md), the [changelog](CHANGELOG.md), and the
   [AI policy](AI_POLICY.md).
 
