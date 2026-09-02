@@ -45,10 +45,12 @@
 //! RSEG builder does not read it. The trait-wide claim is about not holding the
 //! bucket's inputs at once; it is not a ceiling on the output part.
 //!
-//! [`RsegCodec`] wraps the existing `read.rs`/`build.rs` RSEG logic: the
-//! verbatim page-copy merge for current-version inputs, plus ADR-0066 decision
-//! 5's decode-and-re-encode path for an input recorded below the current output
-//! version; [`crate::rlog::RlogCodec`] is the RLOG
+//! [`RsegCodec`] wraps the existing `read.rs`/`build.rs` RSEG logic: since the
+//! run-merged rewrite the verbatim page copy is taken only by a single-run
+//! series at the current output version; a multi-run series is decoded and
+//! re-encoded into one run regardless of version, and ADR-0066 decision 5's
+//! decode-and-re-encode path always runs for an input recorded below the current
+//! output version; [`crate::rlog::RlogCodec`] is the RLOG
 //! implementation; [`crate::rspan_codec::SpanCodec`] is the RSPAN
 //! implementation. [`crate::compact::compact_bucket`] dispatches on
 //! `bucket.signal` to whichever of the three it picked and runs the identical
@@ -117,12 +119,16 @@ pub trait SegmentCodec {
     }
 }
 
-/// The metrics codec: the RSEG half of the seam over `read.rs`/`build.rs`. For
-/// current-version inputs it is a behavior-preserving wrapper (the verbatim
-/// page-copy merge, unchanged). For an input recorded below the current output
-/// version it drives ADR-0066 decision 5's decode-and-re-encode rewrite: it
-/// marks that input's object key so [`crate::build::build_parts`] decodes and
-/// re-encodes its runs at the current version instead of copying them verbatim.
+/// The metrics codec: the RSEG half of the seam over `read.rs`/`build.rs`.
+/// Since the run-merged rewrite ([`crate::build`]) the verbatim page copy is
+/// per series, not per input: only a series that contributes exactly one run at
+/// the current output version is copied verbatim (byte-identical, no provenance
+/// column). A multi-run series is decoded and re-encoded into a single run
+/// regardless of its inputs' versions. For an input recorded below the current
+/// output version it drives ADR-0066 decision 5's decode-and-re-encode rewrite:
+/// it marks that input's object key (`migrate_keys`) so
+/// [`crate::build::build_parts`] always decodes and re-encodes that input's runs
+/// at the current version instead of copying them verbatim.
 pub struct RsegCodec;
 
 impl SegmentCodec for RsegCodec {
