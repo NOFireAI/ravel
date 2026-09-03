@@ -108,7 +108,16 @@ pub const LOGS_ORDER_COLS: &[&str] = &[
 
 /// The `alerts` table's total-order key: the orderable public columns in schema
 /// order (ADR-0040). `attrs` excluded, as above.
-pub const ALERTS_ORDER_COLS: &[&str] = &["ts_ns", "alert_id", "rule_id", "state", "generation"];
+pub const ALERTS_ORDER_COLS: &[&str] = &[
+    "ts_ns",
+    "alert_id",
+    "rule_id",
+    "state",
+    "generation",
+    "writer_id",
+    "writer_epoch",
+    "writer_seq",
+];
 
 /// The `audit` table's total-order key: the orderable public columns in schema
 /// order (ADR-0040). `attrs` excluded, as above.

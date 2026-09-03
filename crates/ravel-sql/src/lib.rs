@@ -94,7 +94,7 @@ pub use alerts_provider::AlertsTableProvider;
 pub use alerts_pushdown::{AlertsPushdown, extract_alerts};
 pub use alerts_schema::{
     ALERT_COL_ALERT_ID, ALERT_COL_ATTRS, ALERT_COL_GENERATION, ALERT_COL_RULE_ID, ALERT_COL_STATE,
-    ALERT_COL_TS, alerts_schema,
+    ALERT_COL_TS, ALERT_COL_WRITER_EPOCH, ALERT_COL_WRITER_ID, ALERT_COL_WRITER_SEQ, alerts_schema,
 };
 pub use audit_provider::AuditTableProvider;
 pub use audit_pushdown::{AuditPushdown, extract_audit};
@@ -157,10 +157,11 @@ pub use pushdown::Pushdown;
 pub use redact::{RedactError, redact};
 pub use schema::{internal_schema, public_schema};
 pub use session::{
-    ADMITTED_SCALARS, ADMITTED_TABLE_FUNCTIONS, ADMITTED_WINDOWS, EXCLUDED_SCALARS,
-    EXCLUDED_TABLE_FUNCTIONS, EXCLUDED_WINDOWS, EmptyObjectStoreRegistry, LOGS_TABLE,
-    SAMPLES_TABLE, SKIP_PARTIAL_AGGREGATION_PROBE_RATIO, SKIP_PARTIAL_AGGREGATION_PROBE_ROWS,
-    SPANS_TABLE, SessionTable, SpillDecision, build_session, session_config,
+    ADMITTED_SCALARS, ADMITTED_TABLE_FUNCTIONS, ADMITTED_WINDOWS, ALERTS_TABLE, AUDIT_TABLE,
+    EXCLUDED_SCALARS, EXCLUDED_TABLE_FUNCTIONS, EXCLUDED_WINDOWS, EmptyObjectStoreRegistry,
+    LOGS_TABLE, SAMPLES_TABLE, SKIP_PARTIAL_AGGREGATION_PROBE_RATIO,
+    SKIP_PARTIAL_AGGREGATION_PROBE_ROWS, SPANS_TABLE, SessionTable, SpillDecision, build_session,
+    session_config,
 };
 pub use spans_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
 pub use spans_provider::SpansTableProvider;

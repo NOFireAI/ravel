@@ -347,7 +347,9 @@ pub fn build_sql_state(
     // The metrics fetcher (RSEG), the logs fetcher (RLOG), and the spans
     // fetcher (RSPAN) all read the same object store; the executor uses
     // whichever the query's target table needs (ADR-0033, extended to `spans`
-    // by ADR-0045 decision 5).
+    // by ADR-0045 decision 5). The `alerts` and `audit` tables (ADR-1101
+    // decision 1) need no fetcher of their own: their records ride RLOG, so
+    // they read through the logs fetcher above, cache included.
     let executor = SqlExecutor::new(
         catalog,
         metrics_fetcher,

@@ -113,8 +113,10 @@ builds that feature, so the route is available there. Its response envelope is
 with one array per row under `data.rows`. A non-finite float comes back as a
 string: `NaN`, `+Inf`, and `-Inf`. Sending `Accept:
 application/vnd.apache.arrow.stream` yields an Arrow IPC stream instead, which is
-bit-exact for every float. The SQL surface registers exactly three tables, one
-per signal: `samples`, `logs`, and `spans`.
+bit-exact for every float. The SQL surface registers exactly five tables, one
+per signal: `samples` (metrics), `logs`, `spans` (traces), `alerts` (alert
+state transitions), and `audit` (audit records, including the query-audit
+trail).
 
 For the query routes, the status codes come from one shared error mapping:
 

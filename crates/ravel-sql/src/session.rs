@@ -119,6 +119,8 @@ use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use url::Url;
 
+use crate::alerts_provider::AlertsTableProvider;
+use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
@@ -141,11 +143,17 @@ pub const LOGS_TABLE: &str = "logs";
 /// The spans table name (`Signal::Spans`, ADR-0045 decision 5).
 pub const SPANS_TABLE: &str = "spans";
 
+/// The alerts table name (`Signal::Alerts`, ADR-1101 decision 1).
+pub const ALERTS_TABLE: &str = "alerts";
+
+/// The audit table name (`Signal::Audit`, ADR-1101 decision 1).
+pub const AUDIT_TABLE: &str = "audit";
+
 /// The single table a query's session registers. ADR-0033 decision C admits
 /// exactly one signal per query in v1, so the executor resolves one snapshot
 /// and hands [`build_session`] one provider; the enum keeps the provider
-/// types (metrics vs logs vs spans) apart without a `dyn TableProvider`
-/// erasure.
+/// types (metrics vs logs vs spans vs alerts vs audit) apart without a
+/// `dyn TableProvider` erasure.
 pub enum SessionTable {
     /// The `samples` table over a resolved `Signal::Metrics` snapshot.
     Metrics(Arc<RavelTableProvider>),
@@ -157,6 +165,12 @@ pub enum SessionTable {
     /// this ships (ts, trace_id, duration, status_code, service_name) is a
     /// plain column comparison.
     Spans(Arc<SpansTableProvider>),
+    /// The `alerts` table over a resolved `Signal::Alerts` snapshot (ADR-1101
+    /// decision 1).
+    Alerts(Arc<AlertsTableProvider>),
+    /// The `audit` table over a resolved `Signal::Audit` snapshot (ADR-1101
+    /// decision 1).
+    Audit(Arc<AuditTableProvider>),
 }
 
 /// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
@@ -776,6 +790,16 @@ pub fn build_session(
         SessionTable::Spans(provider) => {
             ctx.register_table(SPANS_TABLE, provider)?;
         }
+        // Neither RLOG-backed table registers a scalar UDF: every predicate
+        // their pushdown extractors accept is a plain column comparison or an
+        // `attrs['k']` subscript, which the map-field planner registered above
+        // already serves.
+        SessionTable::Alerts(provider) => {
+            ctx.register_table(ALERTS_TABLE, provider)?;
+        }
+        SessionTable::Audit(provider) => {
+            ctx.register_table(AUDIT_TABLE, provider)?;
+        }
     }
     Ok(ctx)
 }
@@ -1111,6 +1135,24 @@ mod tests {
         )))
     }
 
+    fn alerts_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store.clone()),
+            QueryAccounting::new(),
+        )))
+    }
+
+    fn audit_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Audit(Arc::new(AuditTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store.clone()),
+            QueryAccounting::new(),
+        )))
+    }
+
     /// ADR-0097 decisions 2, 3, 4, 6: the fail-closed boundary now covers all
     /// four registries, not aggregates alone. For every table variant and every
     /// registry, the admitted and excluded name sets must be disjoint, must
@@ -1217,6 +1259,11 @@ mod tests {
             ),
             ("logs", logs_table(&store), set(["has_word"].iter())),
             ("spans", spans_table(&store), empty.clone()),
+            // ADR-1101 decision 1: neither RLOG-backed table registers a scalar
+            // UDF of its own, so a leaked `has_word` (or any other per-table
+            // addendum) on one of them fails here.
+            ("alerts", alerts_table(&store), empty.clone()),
+            ("audit", audit_table(&store), empty.clone()),
         ] {
             let ctx = build_session(
                 &SqlConfig::default(),
