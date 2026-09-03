@@ -1,0 +1,10 @@
+# cfg	min_distinct	max_distinct	min_depth	max_depth
+# smoke.cfg: measured distinct=958804 depth=18 (states=7809360, 26s) on tla2tools 1.7.4.
+# The band brackets that measurement with margin; a silent state-space collapse
+# (a broken guard, a dropped action) falls outside it and fails the smoke gate.
+# exhaustive.cfg: UNVERIFIED estimate. The executor does not run the exhaustive
+# lane, so these bounds are a wide placeholder derived by scaling the smoke
+# figures for CasAttempts 1->2, MaxAdmitsPerWriter 1->2 and MaxHour 3->4. Tighten
+# from the orchestrator first real run.
+smoke.cfg	900000	1000000	17	19
+exhaustive.cfg	1000000	300000000	18	50
