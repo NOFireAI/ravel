@@ -60,20 +60,35 @@ pub(crate) fn retain_unerased(
     records: &mut Vec<LogRecord>,
     erasure: &[ErasurePredicate],
 ) -> DFResult<()> {
+    retain_unerased_by(records, erasure, |r| r)
+}
+
+/// [`retain_unerased`] over items that carry a [`LogRecord`] alongside other
+/// per-record state, `record` selecting the record to match. The `alerts` scan
+/// pairs each record with the write identity of the object it was read from
+/// (crate::alerts_scan), and that pair must survive or be dropped as one unit;
+/// running the exclusion over a detached copy of the records would be a second
+/// implementation of the same rule, free to disagree with this one.
+pub(crate) fn retain_unerased_by<T>(
+    items: &mut Vec<T>,
+    erasure: &[ErasurePredicate],
+    record: impl Fn(&T) -> &LogRecord,
+) -> DFResult<()> {
     if erasure.is_empty() {
         return Ok(());
     }
-    let mut survivors = Vec::with_capacity(records.len());
-    for r in std::mem::take(records) {
-        let merged = merged_attrs(&r)?;
+    let mut survivors = Vec::with_capacity(items.len());
+    for item in std::mem::take(items) {
+        let r = record(&item);
+        let merged = merged_attrs(r)?;
         let erased = erasure
             .iter()
             .any(|p| p.matches_log_attrs(&merged) && (!p.has_window() || p.ts_in_window(r.ts_ns)));
         if !erased {
-            survivors.push(r);
+            survivors.push(item);
         }
     }
-    *records = survivors;
+    *items = survivors;
     Ok(())
 }
 

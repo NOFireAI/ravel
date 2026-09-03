@@ -17,13 +17,15 @@
 //!
 //! # Why generic, not legal-hold-specific
 //!
-//! The one audit record kind shipped so far is the legal-hold record
-//! (`kind=legal_hold`, `hold.op`, `hold.scope`, `hold.reason`), but audit is a
-//! general signal: query-audit and admin-action records (ADR-0042) will land
-//! later and write the same table. Modelling the table on the generic RLOG
-//! record shape -- every record-specific field flowing through the `attrs` map
-//! rather than a fixed set of legal-hold columns -- means those later kinds need
-//! no schema change. A predicate over a specific kind's fields
+//! Three record kinds write this signal today, all from `ravel-maintain`: the
+//! legal-hold record (`kind=legal_hold`, `hold.op`, `hold.scope`,
+//! `hold.reason`), the query-audit record (`kind=query`, `query.text`,
+//! `query.status`, `query.tenant`, the resolved window), and the reshard record
+//! (`kind=reshard`). Modelling the table on the generic RLOG record shape --
+//! every record-specific field flowing through the `attrs` map rather than a
+//! fixed set of per-kind columns -- is what let the second and third kinds land
+//! with no schema change, and what lets a fourth. A predicate over a specific
+//! kind's fields
 //! (`attrs['kind'] = 'legal_hold'`, `attrs['hold.scope'] = '...'`) is evaluated
 //! by DataFusion's residual over the `attrs` column, exactly as an arbitrary
 //! attribute predicate is on the `logs` table.

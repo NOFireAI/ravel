@@ -27,7 +27,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, Int64Array, MapArray, StringArray, StructArray, TimestampNanosecondArray,
+    Array, Int64Array, MapArray, StringArray, StructArray, TimestampNanosecondArray, UInt64Array,
 };
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::TaskContext;
@@ -122,8 +122,25 @@ fn alert_record_on_resource(
 }
 
 /// Write one RLOG object from `records`, put it at `key`, and return a matching
-/// L0 [`SegmentRef`] carrying the object's true ts span.
+/// L0 [`SegmentRef`] carrying the object's true ts span, under the default
+/// write identity.
 async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> SegmentRef {
+    write_object_with_identity(store, key, records, Uuid::from_u128(1), 1, 1).await
+}
+
+/// [`write_object`] with the returned [`SegmentRef`]'s write identity chosen by
+/// the caller. The `alerts` table stamps `writer_id`/`writer_epoch`/
+/// `writer_seq` from the segment a record was read from (ADR-1101 decision 1),
+/// so a test that varies them per object can assert the stamp is per record and
+/// not a constant.
+async fn write_object_with_identity(
+    store: &MemoryStore,
+    key: &str,
+    records: &[LogRecord],
+    writer_id: Uuid,
+    writer_epoch: u64,
+    writer_seq: u64,
+) -> SegmentRef {
     let mut w = RlogWriter::new(small_blocks(), identity());
     for r in records {
         w.push(r.clone()).expect("push");
@@ -147,9 +164,9 @@ async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> 
         series_count: 0,
         shard: 0,
         content_hash: [0u8; 32],
-        writer_id: Uuid::from_u128(1),
-        writer_epoch: 1,
-        writer_seq: 1,
+        writer_id,
+        writer_epoch,
+        writer_seq,
         created_unix_ns: 0,
         level: SegmentLevel::L0,
         segment_format_version: u32::from(ravel_logseg::footer::VERSION),
@@ -408,6 +425,93 @@ async fn alert_id_and_rule_id_equality_fast_paths() {
     assert!(batches_to_rows(&collect_plan(plan).await).is_empty());
 }
 
+/// ADR-1101 decision 1's row contract: every row carries the write identity of
+/// the object it was read from, exactly. Two objects with distinct identities
+/// are scanned in one plan, and each returned row's `writer_id`/`writer_epoch`/
+/// `writer_seq` must equal the identity of the `SegmentRef` its record came
+/// from. A stamp taken per partition rather than per object, or read from a
+/// record attribute, gives one of these rows the other object's identity.
+#[tokio::test]
+async fn identity_columns_are_stamped_from_the_records_own_segment() {
+    let store = MemoryStore::new();
+
+    let first = alert_record(1, "id-a", "cpu-high", "firing", 1, &[]);
+    let second = alert_record(2, "id-b", "cpu-high", "resolved", 2, &[]);
+    let seg_a = write_object_with_identity(
+        &store,
+        "alerts/id-a.rlog",
+        std::slice::from_ref(&first),
+        Uuid::from_u128(11),
+        3,
+        4,
+    )
+    .await;
+    let seg_b = write_object_with_identity(
+        &store,
+        "alerts/id-b.rlog",
+        std::slice::from_ref(&second),
+        Uuid::from_u128(22),
+        5,
+        6,
+    )
+    .await;
+
+    // One partition, so both objects are fetched and merged by the same scan:
+    // a per-partition stamp would collapse the two identities into one.
+    let provider = provider(store, vec![seg_a.clone(), seg_b.clone()]);
+    let batches = collect_plan(provider.plan(1).expect("build plan")).await;
+
+    let mut got: Vec<(String, (String, u64, u64))> = Vec::new();
+    for batch in &batches {
+        let alert_id = col_str(batch, ravel_sql::ALERT_COL_ALERT_ID);
+        let writer_id = col_str(batch, ravel_sql::ALERT_COL_WRITER_ID);
+        let writer_epoch = batch
+            .column(ravel_sql::ALERT_COL_WRITER_EPOCH)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("writer_epoch col");
+        let writer_seq = batch
+            .column(ravel_sql::ALERT_COL_WRITER_SEQ)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("writer_seq col");
+        for i in 0..batch.num_rows() {
+            got.push((
+                alert_id.value(i).to_string(),
+                (
+                    writer_id.value(i).to_string(),
+                    writer_epoch.value(i),
+                    writer_seq.value(i),
+                ),
+            ));
+        }
+    }
+    got.sort();
+
+    let want = vec![
+        (
+            "id-a".to_string(),
+            (
+                seg_a.writer_id.to_string(),
+                seg_a.writer_epoch,
+                seg_a.writer_seq,
+            ),
+        ),
+        (
+            "id-b".to_string(),
+            (
+                seg_b.writer_id.to_string(),
+                seg_b.writer_epoch,
+                seg_b.writer_seq,
+            ),
+        ),
+    ];
+    assert_eq!(
+        got, want,
+        "each row carries its own object's write identity, hyphenated uuid included"
+    );
+}
+
 /// The `attrs` column carries the whole record attribute map (the promoted keys
 /// plus every `label.<name>`), stringified into `Map(Utf8, Utf8)`.
 #[tokio::test]
@@ -639,7 +743,7 @@ async fn pending_erasure_excludes_resource_attribute_rows() {
 /// The `(key, value)` pairs of one row's `attrs` map cell.
 fn attrs_map(batch: &RecordBatch, row: usize) -> Vec<(String, String)> {
     let map = batch
-        .column(5)
+        .column(ravel_sql::ALERT_COL_ATTRS)
         .as_any()
         .downcast_ref::<MapArray>()
         .expect("attrs map col");
