@@ -144,8 +144,9 @@ pub enum SqlError {
     /// server state -- so it is safe to return verbatim, like a validation
     /// error, and maps to HTTP 400.
     #[error(
-        "a SQL query may reference either the samples table or the logs table, \
-         not both; metrics and logs cannot be scanned or joined together in v1"
+        "a SQL query may reference exactly one of the samples, logs, spans, \
+         alerts and audit tables; two signals cannot be scanned or joined \
+         together in v1"
     )]
     CrossSignalQuery,
 
@@ -410,7 +411,7 @@ impl SqlError {
     pub fn client_message(&self) -> String {
         match self {
             SqlError::Validation(e) => e.to_string(),
-            // Safe to echo: the text names only the two fixed table names.
+            // Safe to echo: the text names only the fixed table names.
             SqlError::CrossSignalQuery => self.to_string(),
             // Safe to echo: `WindowTooWide` carries only the estimate and the
             // limit (counts, no object key or tenant identity), and its text
@@ -670,10 +671,15 @@ mod tests {
     fn cross_signal_query_is_a_bad_request_that_keeps_its_own_text() {
         let err = SqlError::CrossSignalQuery;
         assert_eq!(err.class(), ErrorClass::BadRequest);
-        // Its own text is returned verbatim and names both tables.
+        // Its own text is returned verbatim and names every real table, so a
+        // client that named two of them learns which set the rule covers.
         assert_eq!(err.client_message(), err.to_string());
-        assert!(err.client_message().contains("samples"));
-        assert!(err.client_message().contains("logs"));
+        for table in ["samples", "logs", "spans", "alerts", "audit"] {
+            assert!(
+                err.client_message().contains(table),
+                "the cross-signal message must name {table}"
+            );
+        }
         // It carries no server state to redact.
         assert_redacted(&err.client_message());
     }
