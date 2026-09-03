@@ -396,6 +396,7 @@ async fn write_batch(
             let durable_shard_count = err.durable_tokens().len();
             if durable_shard_count > 0 {
                 tracing::warn!(
+                    tenant_hash = %tenant.hash().to_hex(),
                     durable_shard_count,
                     "metric write partially committed before a sibling shard \
                      failed"

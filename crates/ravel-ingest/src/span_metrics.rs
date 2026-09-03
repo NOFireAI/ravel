@@ -72,12 +72,14 @@ pub struct SpanIngestMetrics {
     /// Multi-shard Strict writes that returned
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
-    /// `write()` call. A nonzero value means some clients saw a retryable error
-    /// for data already durable on the committed shards; a retry re-ingests
-    /// those shards' spans, and like logs spans have no read-time dedup, so
-    /// the retry duplicates them. An idempotency key does not help here: a
-    /// partial commit writes no marker (see docs/consistency-model.md). The
-    /// metrics and log pipelines keep the same counter.
+    /// `write()` call. A nonzero value means some clients saw an error,
+    /// retryable exactly when the wrapped `SpanWriteError` is, for data
+    /// already durable on the committed shards; a client that does retry
+    /// re-ingests those shards' spans, and like logs spans have no read-time
+    /// dedup, so that retry duplicates them. An idempotency key does not help
+    /// here: a partial commit writes no marker (see
+    /// docs/consistency-model.md). The metrics and log pipelines keep the
+    /// same counter.
     partial_writes: AtomicU64,
     /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
     /// the span-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.

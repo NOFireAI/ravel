@@ -86,9 +86,10 @@ rejected point counts and reasons.
 |---|---|---|---|---|
 | Before data PUT | absent | absent | no | client retries; nothing stored |
 | After data PUT, before commit PUT | present (orphan) | absent | no | invisible; GC after grace; client retries |
-| After commit PUT, before ack | present | present | no | visible; unkeyed client retry stores a duplicate (see above); a keyed retry replays the marker and stores nothing new, since the marker PUT precedes the ack |
+| After commit PUT, before marker PUT | present | present | no | visible; any client retry stores a duplicate (see above), keyed or not, because no marker exists yet |
+| After marker PUT, before ack (keyed logs and spans only) | present | present | no | visible; a keyed retry replays the marker and stores nothing new, since the marker PUT precedes the ack; an unkeyed retry stores a duplicate |
 | After ack | present | present | yes | durable and visible |
-| Ack round times out (flush still running) | eventually present | eventually present | no (retryable timeout) | client gets a retryable timeout with no token; each shard's flush keeps running and can commit *after* the client gave up, so the commit is durable and query-visible but its token is unobservable to that client. The retry relies on dedup, not on the ack: metrics collapse the re-ingest by `(series_id, ts)`; logs and spans have no query-time dedup, so a retry duplicates the rows/spans. An idempotency key does not cover this commit either: the marker is written only after a write the router acknowledged in full, so a keyed retry of a timed-out write re-ingests exactly like an unkeyed one, and the key starts deduplicating only from the first retry that fully succeeds (metrics have no key). |
+| Ack round times out (flush still running) | present if the flush later succeeds | present if the flush later succeeds | no (retryable timeout) | client gets a retryable timeout with no token; each shard's flush keeps running and may commit *after* the client gave up, or may still fail or be abandoned. If it commits, the data is durable and query-visible but its token is unobservable to that client. The retry relies on dedup, not on the ack: metrics collapse the re-ingest by `(series_id, ts)`; logs and spans have no query-time dedup, so a retry duplicates the rows/spans. An idempotency key does not cover this commit either: the marker is written only after a write the router acknowledged in full, so a keyed retry of a timed-out write re-ingests exactly like an unkeyed one, and the key starts deduplicating only from the first retry that fully succeeds (metrics have no key). |
 
 ## Partial multi-shard commits
 
@@ -100,18 +101,20 @@ every shard that did commit, in shard order. This holds for all three signals
 -- metrics, logs, and spans alike; the durable siblings are real, query-visible
 data, not rolled back.
 
-The error is exactly as retryable as its underlying cause, so a client may
-retry the whole write. The retry re-ingests the shards that already committed,
-and dedup is what keeps that honest: metrics collapse the re-ingest by
-`(series_id, ts)`, so it is harmless; logs and spans have no query-time dedup,
-so the retry duplicates the durable siblings' rows/spans, with or without an
-idempotency key: a partial multi-shard commit writes no idempotency marker even
-on logs and spans, for the reason given under "Opt-in client idempotency key"
-below, so the key begins deduplicating only from the first retry that commits
-in full (metrics have no key). Whichever gateway path took the write
-logs the durable-sibling count at `warn`; the OTLP protocol has no
-error-response channel to hand the recovered tokens back, and the bulk `load`
-path reports them in its residual token list instead.
+The error is exactly as retryable as its underlying cause: a client may retry
+the whole write only when that cause is retryable, and when it is not, the
+durable siblings still stand. A retry re-ingests the shards that already
+committed, and dedup is what keeps that honest: metrics collapse the re-ingest
+by `(series_id, ts)`, so it is harmless; logs and spans have no query-time
+dedup, so the retry duplicates the durable siblings' rows/spans, with or
+without an idempotency key: a partial multi-shard commit writes no idempotency
+marker even on logs and spans, for the reason given under "Opt-in client
+idempotency key" below, so the key begins deduplicating only from the first
+retry that commits in full (metrics have no key). The durable tokens reach a
+client only where the transport can carry them: the OTLP, remote-write, and
+OTAP gateways have no error-response channel for them, so each logs the
+durable-sibling count at `warn` with the tenant hash instead, and the bulk
+`load` path reports them in its residual token list.
 
 ## Duplicates and idempotency
 
