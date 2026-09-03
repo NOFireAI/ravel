@@ -4292,11 +4292,29 @@ mod tests {
     /// record's own generation history. Before this change the enforcement gate
     /// returned `CatalogError::Provisioning` and the `.expect(...)` on the `Ok`
     /// value below panicked.
+    ///
+    /// A segment is published on shard 3, outside the configured `shard_count`
+    /// (2), and the snapshot is asserted to contain it: `resolve_fanout`
+    /// derives its scan width from the record's generation history
+    /// (`read_scan_generations`), not from the live config, so a resolver that
+    /// (bug) only scans the configured `0..2` shards would still pass a
+    /// weaker assertion that just checks the shard-0 segment or the segment
+    /// count. FLIP (pre-fix demonstration): in `read_scan_generations`
+    /// (this file), replace the `Some(generations) => Ok(generations)` arm's
+    /// body with `Ok(vec![implicit_generation_zero(self.config.shard_count)])`,
+    /// so a decoded generation history is discarded in favor of the live
+    /// `shard_count` (2). The GET for shard 3's segment then never happens,
+    /// `shard_3` below is `None`, and the `assert_eq!` on `segments.len()`
+    /// fails (1 vs the expected 2).
     #[tokio::test]
     async fn resolve_tolerates_provisioning_record_drift() {
         let store = Arc::new(MemoryStore::new());
         let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
         publish_segment(&store, 0, 1, 500_000, now, now - 1_000, now).await;
+        // Also published on shard 3, at or above the configured shard_count
+        // (2) and reachable only because the record's own generation history
+        // (recorded shard_count 4) widens the scan.
+        publish_segment(&store, 3, 1, 500_000, now, now - 1_000, now).await;
         // The tenant's data was written under shard_count=4.
         seed_provisioning_record(&store, 4).await;
 
@@ -4314,8 +4332,19 @@ mod tests {
             .expect("a drifted-but-decodable record must be tolerated (ADR-0082)");
         assert_eq!(
             snapshot.segments.len(),
-            1,
-            "the resolve serves the published segment rather than refusing"
+            2,
+            "the resolve serves both published segments rather than refusing"
+        );
+        let shard_3 = snapshot.segments.iter().find(|s| s.shard == 3);
+        assert!(
+            shard_3.is_some(),
+            "shard 3 is outside the configured shard_count (2); it is only reachable by \
+             scanning the record's own generation history (ADR-0082), got shards: {:?}",
+            snapshot
+                .segments
+                .iter()
+                .map(|s| s.shard)
+                .collect::<Vec<_>>()
         );
     }
 
