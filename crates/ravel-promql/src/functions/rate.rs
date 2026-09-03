@@ -3,16 +3,19 @@
 //! `predict_linear`. Every formula is a direct, bit-exact-oriented port of
 //! Prometheus' own `promql/functions.go` (`extrapolatedRate`,
 //! `instantValue`, `linearRegression`, `funcResets`, `funcChanges`), down to
-//! its operation order and the millisecond-domain duration arithmetic
-//! (Prometheus samples and range/matrix bounds are millisecond-quantized;
-//! this evaluator's nanoseconds are always an exact multiple of that, so
-//! converting to milliseconds before dividing to seconds reproduces
-//! Prometheus' own rounding instead of introducing new rounding of its own).
+//! its operation order.
 //!
-//! One exception: a *duration* literal (e.g. `[5m]`) is a Go
-//! `time.Duration`, already nanosecond-valued, and Prometheus takes its
-//! `.Seconds()` directly (`ns / 1e9`), never routed through milliseconds;
-//! `rate`'s final per-second division mirrors that directly.
+//! Timestamps are nanoseconds and every interval this family divides by is
+//! computed directly in nanoseconds (`(a - b) as f64 / 1e9`), never via an
+//! intermediate millisecond value: a log-derived series (ADR-1103) can
+//! carry two distinct samples less than one millisecond apart, and flooring
+//! through milliseconds first turns a nonzero nanosecond gap into a zero
+//! divisor. For a millisecond-quantized timestamp pair (every value
+//! Prometheus itself produces), `(a - b)` is already an exact multiple of
+//! 1_000_000, so this direct formula is the same real-valued quotient as
+//! the old two-step one and, since both are single correctly-rounded IEEE
+//! 754 divisions of exactly-representable operands, bit-identical to it
+//! (see `ms_quantized_inputs_are_unchanged` below).
 
 use ravel_types::Sample;
 
@@ -113,10 +116,13 @@ fn histogram_extrapolated_rate(
 ) -> Option<FloatHistogram> {
     let first_ts = samples[0].0;
     let last_ts = samples[samples.len() - 1].0;
+    let sampled_interval = ns_diff_to_seconds(last_ts, first_ts);
     // See the matching guard in `extrapolated_rate`: a zero-duration window
-    // (every sample sharing one timestamp) has no defined rate and returns
-    // no sample rather than a NaN-producing division.
-    if last_ts == first_ts {
+    // has no defined rate and returns no sample rather than a
+    // NaN-producing division. Guarding on `sampled_interval` itself (rather
+    // than `last_ts == first_ts`) ties the guard to the exact quantity the
+    // division below uses, so the two can never disagree.
+    if sampled_interval == 0.0 {
         return None;
     }
 
@@ -124,7 +130,6 @@ fn histogram_extrapolated_rate(
 
     let duration_to_start = ns_diff_to_seconds(first_ts, w.start_ns);
     let duration_to_end = ns_diff_to_seconds(w.end_ns, last_ts);
-    let sampled_interval = ns_diff_to_seconds(last_ts, first_ts);
     let average_duration_between_samples = sampled_interval / (samples.len() - 1) as f64;
 
     let extrapolation_threshold = average_duration_between_samples * 1.1;
@@ -236,6 +241,7 @@ fn extrapolated_rate(
     }
     let first = samples[0];
     let last = samples[samples.len() - 1];
+    let sampled_interval = ns_diff_to_seconds(last.ts_ns, first.ts_ns);
     // ADR-1103: a log-derived series can deliver every sample in the window
     // at one timestamp (`first == last`). Standard Prometheus storage dedups
     // to one sample per timestamp, so this state cannot arise there and the
@@ -243,8 +249,13 @@ fn extrapolated_rate(
     // oracle behavior to match; a zero-duration window has no defined rate,
     // mirroring `instant_value`'s existing `sampledInterval == 0` drop, so
     // this returns no sample rather than the 0.0/0.0 NaN the division would
-    // otherwise produce.
-    if last.ts_ns == first.ts_ns {
+    // otherwise produce. Guarding on `sampled_interval` itself (rather than
+    // `last.ts_ns == first.ts_ns`) ties the guard to the exact quantity the
+    // division below uses, so the two can never disagree: #1136 found two
+    // distinct timestamps less than a millisecond apart used to floor to a
+    // zero millisecond interval and pass this guard while still dividing by
+    // zero.
+    if sampled_interval == 0.0 {
         return None;
     }
 
@@ -262,7 +273,6 @@ fn extrapolated_rate(
     let mut duration_to_start = ns_diff_to_seconds(first.ts_ns, w.start_ns);
     let duration_to_end = ns_diff_to_seconds(w.end_ns, last.ts_ns);
 
-    let sampled_interval = ns_diff_to_seconds(last.ts_ns, first.ts_ns);
     let average_duration_between_samples = sampled_interval / (samples.len() - 1) as f64;
 
     if is_counter && result_value > 0.0 && first.value >= 0.0 {
@@ -320,7 +330,7 @@ fn instant_value(samples: &[Sample], is_rate: bool) -> Option<f64> {
     }
 
     if is_rate {
-        result_value /= ms_to_seconds(ns_to_ms(sampled_interval_ns));
+        result_value /= sampled_interval_ns as f64 / 1_000_000_000.0;
     }
     Some(result_value)
 }
@@ -410,7 +420,7 @@ pub(crate) fn instant_value_hist(
     }
     result.counter_reset_hint = ResetHint::Gauge;
     if is_rate {
-        result.div(ms_to_seconds(ns_to_ms(sampled_interval_ns)));
+        result.div(sampled_interval_ns as f64 / 1_000_000_000.0);
     }
     Some(result)
 }
@@ -548,7 +558,7 @@ fn linear_regression(samples: &[Sample], intercept_time_ns: i64) -> (f64, f64) {
             const_y = false;
         }
         n += 1.0;
-        let x = ms_to_seconds(ns_to_ms(s.ts_ns - intercept_time_ns));
+        let x = (s.ts_ns - intercept_time_ns) as f64 / 1_000_000_000.0;
         sum_x += x;
         sum_y += s.value;
         sum_xy += x * s.value;
@@ -570,21 +580,15 @@ fn linear_regression(samples: &[Sample], intercept_time_ns: i64) -> (f64, f64) {
     (slope, intercept)
 }
 
-/// `(a - b)` converted from nanoseconds to seconds via an intermediate
-/// millisecond value, matching Prometheus' own millisecond-timestamp
-/// duration arithmetic exactly (see the module doc).
+/// `(a - b)` converted from nanoseconds to seconds directly, with no
+/// intermediate millisecond value: timestamps are nanoseconds, and every
+/// interval this family divides by is computed in nanoseconds so a
+/// sub-millisecond, non-equal-timestamp pair (ADR-1103 log-derived series)
+/// never floors to a zero-length interval. Millisecond-quantized inputs
+/// (everything Prometheus itself produces) are unaffected: see the module
+/// doc and `ms_quantized_inputs_are_unchanged`.
 fn ns_diff_to_seconds(a: i64, b: i64) -> f64 {
-    ms_to_seconds(ns_to_ms(a - b))
-}
-
-/// Exact (the evaluator's own invariant: every nanosecond value it produces
-/// is already an exact multiple of one millisecond).
-fn ns_to_ms(ns: i64) -> i64 {
-    ns / 1_000_000
-}
-
-fn ms_to_seconds(ms: i64) -> f64 {
-    ms as f64 / 1000.0
+    (a - b) as f64 / 1_000_000_000.0
 }
 
 #[cfg(test)]
@@ -609,6 +613,19 @@ mod tests {
             end_ns: ms(end_ms),
             range_ns: ms(range_ms),
             eval_ts_ns: ms(end_ms),
+        }
+    }
+
+    fn sample_ns(ts_ns: i64, value: f64) -> Sample {
+        Sample { ts_ns, value }
+    }
+
+    fn window_ns(start_ns: i64, end_ns: i64, range_ns: i64, eval_ts_ns: i64) -> RangeWindow {
+        RangeWindow {
+            start_ns,
+            end_ns,
+            range_ns,
+            eval_ts_ns,
         }
     }
 
@@ -1025,5 +1042,180 @@ mod tests {
         ];
         assert_eq!(resets_hist(&constant), 0.0);
         assert_eq!(changes_hist(&constant), 0.0);
+    }
+
+    /// #1136: two DISTINCT timestamps less than one millisecond apart used
+    /// to floor to a zero-length interval (`ns_to_ms` truncates), so
+    /// `sampled_interval == 0.0` while `last.ts_ns != first.ts_ns`: the
+    /// equal-timestamp guard did not fire and every division below produced
+    /// NaN (`rate`/`increase`/`delta`/`deriv`/`predict_linear`) or Inf
+    /// (`irate`/`idelta`). Demonstrated failing against the pre-fix code by
+    /// reverting `ns_diff_to_seconds` to `ms_to_seconds(ns_to_ms(a - b))`
+    /// and the two inlined ms-based divisions this test also exercises (in
+    /// `instant_value` and `linear_regression`'s `x` computation): every
+    /// `assert!(...is_finite())` below then fails.
+    #[test]
+    fn sub_millisecond_windows_never_yield_nan_or_inf() {
+        check_sub_millisecond_pair(0, 500_000); // 500 microseconds apart
+        check_sub_millisecond_pair(0, 1); // 1 nanosecond apart: the tightest possible gap
+    }
+
+    fn check_sub_millisecond_pair(first_ts: i64, last_ts: i64) {
+        let samples = [sample_ns(first_ts, 1.0), sample_ns(last_ts, 2.0)];
+        let range_ns = last_ts - first_ts;
+        let w = window_ns(first_ts, last_ts, range_ns, last_ts);
+        let interval_s = range_ns as f64 / 1_000_000_000.0;
+
+        let got_rate = rate(&samples, w).expect("2 distinct-timestamp samples");
+        assert!(got_rate.is_finite(), "rate must not be NaN/Inf: {got_rate}");
+        assert_eq!(got_rate, 1.0 / interval_s);
+
+        let got_increase = increase(&samples, w).expect("2 distinct-timestamp samples");
+        assert!(got_increase.is_finite(), "increase must not be NaN/Inf");
+        assert_eq!(got_increase, 1.0);
+
+        let got_delta = delta(&samples, w).expect("2 distinct-timestamp samples");
+        assert!(got_delta.is_finite(), "delta must not be NaN/Inf");
+        assert_eq!(got_delta, 1.0);
+
+        let got_irate = irate(&samples, w).expect("2 distinct-timestamp samples");
+        assert!(
+            got_irate.is_finite(),
+            "irate must not be NaN/Inf: {got_irate}"
+        );
+        assert_eq!(got_irate, 1.0 / interval_s);
+
+        let got_idelta = idelta(&samples, w).expect("2 distinct-timestamp samples");
+        assert!(got_idelta.is_finite(), "idelta must not be NaN/Inf");
+        assert_eq!(got_idelta, 1.0);
+
+        let got_deriv = deriv(&samples, w).expect("2 distinct-timestamp samples");
+        assert!(
+            got_deriv.is_finite(),
+            "deriv must not be NaN/Inf: {got_deriv}"
+        );
+        let x0 = 0.0_f64;
+        let x1 = (last_ts - first_ts) as f64 / 1_000_000_000.0;
+        let expected_deriv = {
+            let sum_x = x0 + x1;
+            let sum_y = 1.0 + 2.0;
+            let sum_xy = x0 * 1.0 + x1 * 2.0;
+            let sum_x2 = x0 * x0 + x1 * x1;
+            let n = 2.0;
+            let cov_xy = sum_xy - sum_x * sum_y / n;
+            let var_x = sum_x2 - sum_x * sum_x / n;
+            cov_xy / var_x
+        };
+        assert_eq!(got_deriv, expected_deriv);
+
+        let got_predict = predict_linear(&samples, w, 1.0).expect("2 distinct-timestamp samples");
+        assert!(
+            got_predict.is_finite(),
+            "predict_linear must not be NaN/Inf: {got_predict}"
+        );
+        let x0p = (first_ts - last_ts) as f64 / 1_000_000_000.0;
+        let x1p = 0.0_f64;
+        let expected_predict = {
+            let sum_x = x0p + x1p;
+            let sum_y = 1.0 + 2.0;
+            let sum_xy = x0p * 1.0 + x1p * 2.0;
+            let sum_x2 = x0p * x0p + x1p * x1p;
+            let n = 2.0;
+            let cov_xy = sum_xy - sum_x * sum_y / n;
+            let var_x = sum_x2 - sum_x * sum_x / n;
+            let slope = cov_xy / var_x;
+            let intercept = sum_y / n - slope * sum_x / n;
+            slope * 1.0 + intercept
+        };
+        assert_eq!(got_predict, expected_predict);
+    }
+
+    /// #1136: the new nanosecond-direct interval formula must not move any
+    /// conformance row for millisecond-quantized timestamps (everything
+    /// Prometheus' own storage produces). This pins the algebraic argument
+    /// in the module doc with a bit-for-bit check against the old two-step
+    /// (nanoseconds -> milliseconds -> seconds) formula, reusing the
+    /// millisecond-quantized `(a, b)` pairs that already drive
+    /// `rate_extrapolates_to_the_window_boundary` and
+    /// `increase_compensates_for_a_counter_reset` above.
+    #[test]
+    fn ms_quantized_inputs_are_unchanged() {
+        fn old_ns_diff_to_seconds(a: i64, b: i64) -> f64 {
+            ((a - b) / 1_000_000) as f64 / 1000.0
+        }
+
+        let pairs = [
+            (ms(180_000), 0),
+            (ms(180_000), ms(60_000)),
+            (ms(120_000), ms(0)),
+            (ms(150_000), ms(90_000)),
+            (ms(65_000), ms(5_000)),
+            (ms(120_000), ms(120_000)),
+            (ms(300_000), ms(0)),
+        ];
+        for (a, b) in pairs {
+            let old = old_ns_diff_to_seconds(a, b);
+            let new = ns_diff_to_seconds(a, b);
+            assert_eq!(
+                old.to_bits(),
+                new.to_bits(),
+                "ns_diff_to_seconds({a}, {b}): old={old:?} new={new:?}"
+            );
+        }
+
+        // End-to-end: the same millisecond-quantized samples used by
+        // `rate_extrapolates_to_the_window_boundary` and
+        // `increase_compensates_for_a_counter_reset`, checked bit-for-bit
+        // against those tests' own already-pinned expected values.
+        let samples = [
+            sample(0, 10.0),
+            sample(60_000, 20.0),
+            sample(120_000, 30.0),
+            sample(180_000, 40.0),
+        ];
+        let w = window(0, 180_000, 180_000);
+        let got = rate(&samples, w).expect("2+ samples");
+        assert_eq!(got.to_bits(), (30.0_f64 / 180.0).to_bits());
+
+        let samples = [sample(0, 0.0), sample(60_000, 10.0), sample(120_000, 2.0)];
+        let w = window(0, 120_000, 120_000);
+        let got = increase(&samples, w).expect("2+ samples");
+        assert_eq!(got.to_bits(), 12.0_f64.to_bits());
+
+        let samples = [sample(0, 10.0), sample(10_000, 20.0), sample(20_000, 30.0)];
+        let got = deriv(&samples, window(0, 20_000, 20_000)).expect("2+ samples");
+        assert_eq!(got.to_bits(), 1.0_f64.to_bits());
+
+        let samples = [sample(0, 10.0), sample(10_000, 20.0), sample(20_000, 30.0)];
+        let w = window(0, 20_000, 20_000);
+        let got = predict_linear(&samples, w, 30.0).expect("2+ samples");
+        assert_eq!(got.to_bits(), 60.0_f64.to_bits());
+
+        let samples = [sample(0, 100.0), sample(30_000, 5.0), sample(60_000, 25.0)];
+        let got = irate(&samples, window(0, 60_000, 300_000)).expect("2+ samples");
+        assert_eq!(got.to_bits(), (20.0_f64 / 30.0).to_bits());
+    }
+
+    /// #1136: two histogram samples 500 microseconds apart is the native-
+    /// histogram counterpart of `sub_millisecond_windows_never_yield_nan_or_inf`
+    /// above. Demonstrated failing the same way: pre-fix, `histogram_extrapolated_rate`
+    /// guarded on `last_ts == first_ts` while dividing by a `sampled_interval`
+    /// that floored to zero for this pair, producing NaN buckets via `mul`.
+    #[test]
+    fn histogram_rate_over_sub_millisecond_window_is_finite() {
+        let samples = [
+            (0i64, nh_counter(2.0, 10.0)),
+            (500_000i64, nh_counter(6.0, 30.0)),
+        ];
+        let w = window_ns(0, 500_000, 500_000, 500_000);
+        let got = rate_hist(&samples, w).expect("2 histogram samples, distinct timestamps");
+        assert!(got.count.is_finite(), "count must not be NaN/Inf");
+        assert!(got.sum.is_finite(), "sum must not be NaN/Inf");
+        for b in &got.positive_buckets {
+            assert!(b.is_finite(), "positive bucket must not be NaN/Inf");
+        }
+        for b in &got.negative_buckets {
+            assert!(b.is_finite(), "negative bucket must not be NaN/Inf");
+        }
     }
 }
