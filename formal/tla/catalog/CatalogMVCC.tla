@@ -94,7 +94,8 @@ CONSTANTS
     SweepSupersededNoHeadGate,  \* superseded sweep skips its HEAD-reachability gate
     LostCasProceedsOnStaleRead, \* a losing fold CAS overwrites HEAD on its stale read
     CompactionLoserOverwrites,  \* a losing compaction publish overwrites the winner
-    QueryFailsClosedOnMissingIndex \* a query with no readable index serves empty, not listing
+    QueryFailsClosedOnMissingIndex, \* a query with no readable index serves empty, not listing
+    DeletePathIgnoresUnreadableHead \* a delete pass proceeds despite a corrupt/unsupported HEAD
 
 ASSUME NoContent \in Content
 ASSUME Keys # {}
@@ -555,10 +556,12 @@ HeadNamesL0(H, r) == head.status = "valid" /\ <<"l0", H, r>> \in head.entries
 \* observed at this real deletion, so a mutant that removes the guard is caught
 \* by CorruptHeadFailsClosedOnDeletePaths. The SweepSupersededNoHeadGate switch
 \* drops the object-granular hold, reproducing the pre-ADR-0020 (issue #1134)
-\* shape.
+\* shape. DeletePathIgnoresUnreadableHead drops the head.status guard itself, so
+\* the pass can fire on a corrupt or unsupported HEAD and lastDelete records
+\* that unreadable status, the mutant CorruptHeadFailsClosedOnDeletePaths pins.
 DoSweepSuperseded(H, g) ==
     /\ crec[H][g].used
-    /\ head.status \in {"valid", "absent"}
+    /\ (head.status \in {"valid", "absent"} \/ DeletePathIgnoresUnreadableHead)
     /\ clock - crec[H][g].at >= ProtectionHorizon
     /\ LET inputs == crec[H][g].in \cap l0[H]
            deletable == IF SweepSupersededNoHeadGate
@@ -576,8 +579,10 @@ DoSweepSuperseded(H, g) ==
 \* the HEAD reference (read_head_reference) and deletes an orphan snapshot part.
 \* It removes an object only on a readable HEAD, so a corrupt or unsupported
 \* HEAD fails the whole pass closed; lastDelete records the observed status.
+\* DeletePathIgnoresUnreadableHead drops that guard, the same as in
+\* DoSweepSuperseded above.
 DoSweepCatalogObjects ==
-    /\ head.status \in {"valid", "absent"}
+    /\ (head.status \in {"valid", "absent"} \/ DeletePathIgnoresUnreadableHead)
     /\ \E p \in snapParts : SweepablePart(p)
     /\ LET orphan == CHOOSE p \in snapParts : SweepablePart(p) IN
          snapParts' = snapParts \ {orphan}
