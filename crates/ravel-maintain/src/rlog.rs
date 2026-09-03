@@ -190,9 +190,10 @@
 //! `sum(part.series_count)`, which counts a straddling stream once per part it
 //! appears in; it is reported, never used as a gate.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
@@ -207,7 +208,7 @@ use ravel_logseg::record::{
 use ravel_logseg::skip_index::SkipIndex;
 use ravel_logseg::{
     AttrValue, FieldType, LogRecord, LogStreamId, RlogConfig, RlogRangeReader, RlogWriter,
-    StreamBlockLoc, StreamBlockRows, decode_section,
+    StreamBlockLoc, StreamBlockRows, decode_section, stream_attr_pairs,
     writer::{ObjectIdentity, WriteStats},
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend};
@@ -775,6 +776,11 @@ pub(crate) async fn merge_catalogs(
     // under version 4 (ADR-0699 decision 1, a block's pages are spread across
     // its group's column chunks) -- so raw resident bytes stay bounded to one
     // such unit per input, never a whole stream or the whole bucket.
+    // Resolve the merged attribute view's stream-level half once for the whole
+    // output (ADR-0873 decision 3, issue #1057): every stream's blob is right
+    // here, decoded once, rather than re-derived per record in the fold.
+    let declared = Arc::new(DeclaredSchema::build(&declared, &merged));
+
     let identity = compactor_identity(bucket, config);
     let tracker = config.merge_memory_tracker.as_ref();
     let mut sink = PartSink {
@@ -894,9 +900,10 @@ struct PartSink<'a> {
     identity: ObjectIdentity,
     indexed_fields: Vec<String>,
     /// The declared eligible columns each output part recomputes stamps for
-    /// (ADR-0873 decision 3). Empty on the erasure-rewrite route, whose parts
-    /// stay unstamped (the wave-3 staleness rule), and on metrics/spans buckets.
-    declared: Vec<(String, DeclaredStatType)>,
+    /// (ADR-0873 decision 3), with each stream's stream-level values for them.
+    /// Empty on the erasure-rewrite route, whose parts stay unstamped (the
+    /// wave-3 staleness rule), and on metrics/spans buckets.
+    declared: Arc<DeclaredSchema>,
     tracker: Option<&'a MergeMemoryTracker>,
     /// Whether a closed part is encoded but not PUT. Not read from `config`:
     /// the erasure rewrite defers every part PUT to its own publish path (which
@@ -922,7 +929,7 @@ impl PartSink<'_> {
             self.current = Some(PartBuilder::new(
                 &self.identity,
                 &self.indexed_fields,
-                &self.declared,
+                Arc::clone(&self.declared),
             ));
         }
         let mut over_memory = false;
@@ -1118,17 +1125,116 @@ impl<T: Ord + Copy> Running<T> {
 }
 
 /// One declared column's running extrema over the records pushed to a part. Only
-/// the [`Running`] matching `ty` is ever populated: a declared I64 column counts
-/// an I64 value as non-null and reads a same-named BOOL value (or an absent one)
-/// as NULL, and vice versa -- the wave-5a `(name, value kind)` rule.
+/// the [`Running`] matching the column's declared type is ever populated: a
+/// declared I64 column counts an I64 value as non-null and reads a same-named
+/// BOOL value (or an absent one) as NULL, and vice versa -- the wave-5a
+/// `(name, value kind)` rule.
+///
+/// The column's name and type live in the per-object [`DeclaredSchema`] rather
+/// than here: a name compare per record per column is what made the fold
+/// O(attrs x cols) in String comparisons.
+#[derive(Default)]
 struct ColumnAccum {
-    name: String,
-    ty: DeclaredStatType,
     i64_run: Option<Running<i64>>,
     bool_run: Option<Running<bool>>,
-    /// First-occurrence-wins within the record currently being folded: set once
-    /// this column has taken a value from that record, cleared before the next.
-    seen_this_record: bool,
+    /// The epoch of the record that last set this column's key, at any value
+    /// kind. A record that sets the key overrides its stream's attribute of the
+    /// same name, so this suppresses the fallback for that record.
+    mention_epoch: u64,
+    /// The epoch of the record this column last took a matching-typed value
+    /// from: first-occurrence-wins within one record.
+    value_epoch: u64,
+}
+
+/// The declared eligible columns a compaction output stamps, indexed for the
+/// per-record fold, plus the stream-level half of the merged view each of the
+/// object's streams supplies.
+///
+/// Built once per merge from the STREAM_DIR blobs the merge already collected
+/// (one decode per stream in the object, never one per record) and shared by
+/// every part through an [`Arc`], since every part of a compaction stamps the
+/// same column set over the same streams.
+#[derive(Default)]
+struct DeclaredSchema {
+    /// The declared columns, in the order stamps are emitted.
+    cols: Vec<(String, DeclaredStatType)>,
+    /// Declared name to index into `cols`. A record's attribute costs one hash
+    /// lookup here instead of a String compare against every declared column.
+    index: HashMap<String, usize>,
+    /// Per stream, the declared columns its resource or scope attributes supply
+    /// a matching-typed value for, as `(column index, value)`. A stream
+    /// carrying none has no entry, which is the common shape (resource
+    /// attributes are service identity strings), and its records pay nothing.
+    fallbacks: HashMap<LogStreamId, Vec<(usize, DeclaredStatValue)>>,
+    /// Set when a stream's attribute blob did not decode, which leaves the
+    /// merged view unknown for that stream's records. Every part of the merge
+    /// then stamps nothing rather than an affirmative statement over a view the
+    /// fold could not resolve.
+    unresolved: bool,
+}
+
+impl DeclaredSchema {
+    /// Index `declared` and resolve each stream's fallbacks from its STREAM_DIR
+    /// blob. `streams` is the merge's own stream map, so each blob is decoded
+    /// exactly once per output object.
+    fn build(
+        declared: &[(String, DeclaredStatType)],
+        streams: &BTreeMap<LogStreamId, Vec<u8>>,
+    ) -> Self {
+        let mut schema = DeclaredSchema {
+            cols: declared.to_vec(),
+            index: declared
+                .iter()
+                .enumerate()
+                .map(|(i, (name, _))| (name.clone(), i))
+                .collect(),
+            fallbacks: HashMap::new(),
+            unresolved: false,
+        };
+        if declared.is_empty() {
+            return schema;
+        }
+        for (stream_id, blob) in streams {
+            let pairs = match stream_attr_pairs(blob) {
+                Ok(pairs) => pairs,
+                Err(_) => {
+                    schema.unresolved = true;
+                    continue;
+                }
+            };
+            let mut claimed: BTreeSet<usize> = BTreeSet::new();
+            let mut values: Vec<(usize, DeclaredStatValue)> = Vec::new();
+            for (name, value) in pairs {
+                let Some(&i) = schema.index.get(name.as_str()) else {
+                    continue;
+                };
+                // First occurrence wins whatever its kind, matching the
+                // reader's `find_attr` over the resource set then the scope
+                // set: an ineligible or wrong-typed first occurrence shadows a
+                // same-named eligible one behind it, and reads NULL.
+                if !claimed.insert(i) {
+                    continue;
+                }
+                let typed = match (schema.cols[i].1, value) {
+                    (DeclaredStatType::I64, AttrValue::I64(v)) => DeclaredStatValue::I64(v),
+                    (DeclaredStatType::Bool, AttrValue::Bool(b)) => DeclaredStatValue::Bool(b),
+                    _ => continue,
+                };
+                values.push((i, typed));
+            }
+            if !values.is_empty() {
+                schema.fallbacks.insert(*stream_id, values);
+            }
+        }
+        schema
+    }
+
+    /// The stream-level values a record of `stream_id` falls back to.
+    fn fallbacks_for(&self, stream_id: LogStreamId) -> &[(usize, DeclaredStatValue)] {
+        self.fallbacks
+            .get(&stream_id)
+            .map_or(&[][..], |values| values.as_slice())
+    }
 }
 
 /// The per-part fold of declared-column extrema for the compaction output
@@ -1137,6 +1243,13 @@ struct ColumnAccum {
 /// declared columns only, first-occurrence-wins per record, and a stamp whose
 /// `null_count` is derived as `sample_count - non_null` so the part's own reader
 /// ([`ravel_commit::declared_stats::read_compaction_part`]) never drops it.
+///
+/// Like the ingest side it folds the MERGED attribute view, not the record's
+/// own attributes: a record that does not set a declared key reads its stream's
+/// resource or scope attribute of that name, so the part's stamp describes what
+/// a reader resolves rather than what the record literally carries (issue
+/// #1057). The stream-level half comes from the per-object [`DeclaredSchema`],
+/// which decoded each stream's blob once for the whole merge.
 ///
 /// Unlike the ingest side it is seeded with the declared column set up front
 /// (from [`declared_columns_from_inputs`]), so it tracks only the columns it
@@ -1150,63 +1263,102 @@ struct ColumnAccum {
 /// the next [`PartBuilder`] and is folded only there.
 #[derive(Default)]
 struct DeclaredStatAccum {
+    /// The declared column set and the merged view's stream-level half, shared
+    /// with every other part of the same merge.
+    schema: Arc<DeclaredSchema>,
+    /// Running extrema, positionally aligned with `schema.cols`.
     cols: Vec<ColumnAccum>,
+    /// Monotonic per-record counter driving the first-occurrence-wins and
+    /// override epochs. Incremented before each record, so a live epoch is
+    /// never 0.
+    epoch: u64,
 }
 
 impl DeclaredStatAccum {
-    /// Build a fold over the declared eligible columns. The set comes from
+    /// Build a fold over a merge's declared eligible columns. The set comes from
     /// [`declared_columns_from_inputs`], which reads each input's decoded
     /// stamps through the commit-side reader whose type tags admit only I64
     /// and BOOL, so every column here is one of the two.
-    fn new(declared: &[(String, DeclaredStatType)]) -> Self {
-        let cols = declared
-            .iter()
-            .map(|(name, ty)| ColumnAccum {
-                name: name.clone(),
-                ty: *ty,
-                i64_run: None,
-                bool_run: None,
-                seen_this_record: false,
-            })
-            .collect();
-        DeclaredStatAccum { cols }
+    fn new(schema: Arc<DeclaredSchema>) -> Self {
+        let mut cols = Vec::new();
+        cols.resize_with(schema.cols.len(), ColumnAccum::default);
+        DeclaredStatAccum {
+            schema,
+            cols,
+            epoch: 0,
+        }
     }
 
-    /// Fold one record's attributes. Each declared column takes at most one
-    /// non-null row from the record: the first attribute matching its name AND
-    /// its declared value kind wins, and a repeat (or a same-named value of the
-    /// other kind, or an absence) is a NULL for the declaration, so no column's
-    /// non-null count can exceed the part's row count and the derived
-    /// `null_count` can never go negative.
-    fn observe_record(&mut self, attrs: &[(String, AttrValue)]) {
+    /// Fold one record's merged attribute view. Each declared column takes at
+    /// most one non-null row from the record: the first attribute matching its
+    /// name AND its declared value kind wins, and a repeat (or a same-named
+    /// value of the other kind, or an absence with no stream-level value) is a
+    /// NULL for the declaration, so no column's non-null count can exceed the
+    /// part's row count and the derived `null_count` can never go negative.
+    ///
+    /// A column the record does not name at all takes its stream's resource or
+    /// scope value, when the stream supplies one of the declared kind. A record
+    /// that names the column at ANY value kind suppresses that fallback, which
+    /// is the reader's override order.
+    ///
+    /// Cost is one hash lookup per record attribute plus one pass over the
+    /// record's stream's fallback list, with no String comparison per
+    /// (attribute, column) pair.
+    fn observe_record(&mut self, r: &LogRecord) {
         if self.cols.is_empty() {
             return;
         }
-        for c in &mut self.cols {
-            c.seen_this_record = false;
+        let Self {
+            schema,
+            cols,
+            epoch,
+        } = self;
+        *epoch += 1;
+        for (name, value) in &r.attrs {
+            let Some(&i) = schema.index.get(name.as_str()) else {
+                continue;
+            };
+            let Some(c) = cols.get_mut(i) else {
+                continue;
+            };
+            c.mention_epoch = *epoch;
+            if c.value_epoch == *epoch {
+                continue;
+            }
+            match (schema.cols[i].1, value) {
+                (DeclaredStatType::I64, AttrValue::I64(v)) => {
+                    match &mut c.i64_run {
+                        Some(run) => run.observe(*v),
+                        None => c.i64_run = Some(Running::start(*v)),
+                    }
+                    c.value_epoch = *epoch;
+                }
+                (DeclaredStatType::Bool, AttrValue::Bool(b)) => {
+                    match &mut c.bool_run {
+                        Some(run) => run.observe(*b),
+                        None => c.bool_run = Some(Running::start(*b)),
+                    }
+                    c.value_epoch = *epoch;
+                }
+                _ => {}
+            }
         }
-        for (name, value) in attrs {
-            for c in &mut self.cols {
-                if c.seen_this_record || c.name != *name {
-                    continue;
-                }
-                match (c.ty, value) {
-                    (DeclaredStatType::I64, AttrValue::I64(v)) => {
-                        match &mut c.i64_run {
-                            Some(r) => r.observe(*v),
-                            None => c.i64_run = Some(Running::start(*v)),
-                        }
-                        c.seen_this_record = true;
-                    }
-                    (DeclaredStatType::Bool, AttrValue::Bool(b)) => {
-                        match &mut c.bool_run {
-                            Some(r) => r.observe(*b),
-                            None => c.bool_run = Some(Running::start(*b)),
-                        }
-                        c.seen_this_record = true;
-                    }
-                    _ => {}
-                }
+        for (i, value) in schema.fallbacks_for(r.stream_id) {
+            let Some(c) = cols.get_mut(*i) else {
+                continue;
+            };
+            if c.mention_epoch == *epoch {
+                continue;
+            }
+            match value {
+                DeclaredStatValue::I64(v) => match &mut c.i64_run {
+                    Some(run) => run.observe(*v),
+                    None => c.i64_run = Some(Running::start(*v)),
+                },
+                DeclaredStatValue::Bool(b) => match &mut c.bool_run {
+                    Some(run) => run.observe(*b),
+                    None => c.bool_run = Some(Running::start(*b)),
+                },
             }
         }
     }
@@ -1218,9 +1370,12 @@ impl DeclaredStatAccum {
     /// `null_count = sample_count - non_null`), so `read_compaction_part` drops
     /// none of them.
     fn build_stamps(&self, sample_count: u64) -> Vec<DeclaredColumnStat> {
+        if self.schema.unresolved {
+            return Vec::new();
+        }
         let mut out = Vec::new();
-        for c in &self.cols {
-            let observed = match c.ty {
+        for (c, (name, ty)) in self.cols.iter().zip(self.schema.cols.iter()) {
+            let observed = match ty {
                 DeclaredStatType::I64 => c.i64_run.map(|r| {
                     (
                         DeclaredStatValue::I64(r.min),
@@ -1236,7 +1391,7 @@ impl DeclaredStatAccum {
                     )
                 }),
             };
-            if let Some(stat) = build_one(&c.name, c.ty, observed, sample_count) {
+            if let Some(stat) = build_one(name, *ty, observed, sample_count) {
                 out.push(stat);
             }
         }
@@ -1337,7 +1492,7 @@ impl PartBuilder {
     fn new(
         identity: &ObjectIdentity,
         indexed_fields: &[String],
-        declared: &[(String, DeclaredStatType)],
+        declared: Arc<DeclaredSchema>,
     ) -> Self {
         PartBuilder {
             identity: *identity,
@@ -1384,7 +1539,7 @@ impl PartBuilder {
         // estimates ride (ADR-0873 decision 3). Done here, once per pushed
         // record, so the exact-encode probe -- which clones `records` without
         // re-pushing -- never double-counts a record.
-        self.declared_accum.observe_record(&r.attrs);
+        self.declared_accum.observe_record(&r);
         self.records.push(r);
         if let Some(t) = tracker {
             t.set_writer_bytes(self.estimate);
