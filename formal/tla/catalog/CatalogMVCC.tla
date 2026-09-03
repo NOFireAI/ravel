@@ -95,7 +95,9 @@ CONSTANTS
     LostCasProceedsOnStaleRead, \* a losing fold CAS overwrites HEAD on its stale read
     CompactionLoserOverwrites,  \* a losing compaction publish overwrites the winner
     QueryFailsClosedOnMissingIndex, \* a query with no readable index serves empty, not listing
-    DeletePathIgnoresUnreadableHead \* a delete pass proceeds despite a corrupt/unsupported HEAD
+    DeletePathIgnoresUnreadableHead, \* a delete pass proceeds despite a corrupt/unsupported HEAD
+    FoldNamesEntryAboveWatermark, \* a fold's scan admits an entry above its own watermark
+    FoldIncludesTombstonedEntries \* a fold's scan re-includes a tombstoned hour
 
 ASSUME NoContent \in Content
 ASSUME Keys # {}
@@ -177,10 +179,16 @@ SupersededInputs(H) ==
 \* directly (that would be the oracle the review flagged). It is the fresh-scan
 \* component of the bounded incremental fold below, and the definition of "fully
 \* reconciled" that the bounded fold is deliberately weaker than.
+\* FoldNamesEntryAboveWatermark drops the e[2] <= w bound, letting a fold's scan
+\* admit an entry from an hour it has not sealed through, so a published HEAD
+\* can name a commit above its own watermark: the mutant
+\* SnapshotEntriesBelowWatermark pins. FoldIncludesTombstonedEntries drops the
+\* ~tomb[e[2]] filter, letting a retired bucket reappear in a fresh scan: the
+\* mutant TombstonedBucketContributesNothing pins.
 FoldEntriesFor(w) ==
     { e \in AllEntries :
-        /\ e[2] <= w
-        /\ ~tomb[e[2]]
+        /\ (e[2] <= w \/ FoldNamesEntryAboveWatermark)
+        /\ (~tomb[e[2]] \/ FoldIncludesTombstonedEntries)
         /\ ( \/ (e[1] = "l0" /\ e[3] \in l0[e[2]] /\ e[3] \notin SupersededInputs(e[2]))
              \/ (e[1] = "l1" /\ crec[e[2]][e[3]].used) ) }
 
