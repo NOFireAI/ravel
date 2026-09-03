@@ -280,6 +280,15 @@ pub struct LogSeriesRequest<'a> {
     pub erasure: &'a [ErasurePredicate],
     pub max_samples: usize,
     pub max_series: usize,
+    /// Checked once per fetched segment, after
+    /// [`LogSegmentFetcher::scan_accounted_with_tenant`] has already fetched
+    /// and charged it (see the check at the end of the `for seg_ref in
+    /// segments` loop in [`fetch_log_series`]). This bound is therefore a
+    /// per-segment limit in practice, not an exact byte ceiling: a query can
+    /// overshoot it by up to one whole segment's bytes before the next
+    /// iteration's check catches it. An exact bound would need a budget-aware
+    /// change to the read path itself (checking before or during a segment's
+    /// fetch, not only after), which nothing here implements.
     pub max_bytes_scanned: ByteLimit,
     pub deadline: Option<Instant>,
 }
@@ -356,16 +365,32 @@ fn body_matches(matchers: &[&LabelMatcher], body: &str) -> bool {
     matchers.iter().all(|m| matches_str(m, body))
 }
 
-fn severity_content_predicate(matchers: &[LabelMatcher]) -> Option<&LabelMatcher> {
+/// The first `severity_text` equality matcher, kept by index so
+/// [`severity_postfilters`] can skip exactly that one matcher and evaluate
+/// every other `severity_text` matcher -- including a second, third, ...
+/// equality -- as a post-filter. PromQL selector matchers conjoin: a
+/// selector naming `severity_text` twice must satisfy both, not just the
+/// first.
+fn severity_content_predicate(matchers: &[LabelMatcher]) -> Option<(usize, &LabelMatcher)> {
     matchers
         .iter()
-        .find(|m| m.name == SEVERITY_LABEL && matches!(m.op, MatchOp::Eq))
+        .enumerate()
+        .find(|(_, m)| m.name == SEVERITY_LABEL && matches!(m.op, MatchOp::Eq))
 }
 
-fn severity_postfilters(matchers: &[LabelMatcher]) -> Vec<&LabelMatcher> {
+/// Every `severity_text` matcher other than the one
+/// [`severity_content_predicate`] pushed down (identified by index, not by
+/// value or pointer, so a second matcher identical to the pushed-down one is
+/// still evaluated rather than silently treated as already satisfied).
+fn severity_postfilters(
+    matchers: &[LabelMatcher],
+    pushed_index: Option<usize>,
+) -> Vec<&LabelMatcher> {
     matchers
         .iter()
-        .filter(|m| m.name == SEVERITY_LABEL && !matches!(m.op, MatchOp::Eq))
+        .enumerate()
+        .filter(|(i, m)| m.name == SEVERITY_LABEL && Some(*i) != pushed_index)
+        .map(|(_, m)| m)
         .collect()
 }
 
@@ -399,7 +424,7 @@ pub async fn fetch_log_series(
     let body_ms = body_matchers(req.matchers);
     let needs_body = req.metric.needs_body() || !body_ms.is_empty();
     let severity_eq = severity_content_predicate(req.matchers);
-    let severity_post = severity_postfilters(req.matchers);
+    let severity_post = severity_postfilters(req.matchers, severity_eq.map(|(i, _)| i));
 
     // Column selection: ts and stream_ref are implicit; severity_text always
     // (it is either a content predicate or a label/postfilter source); body
@@ -479,7 +504,7 @@ pub async fn fetch_log_series(
         let mut query = LogQuery::new(req.window.start_ns, req.window.end_ns)
             .with_content(Predicate::StreamIn(matching_streams))
             .with_erasure(req.erasure.to_vec());
-        if let Some(m) = severity_eq {
+        if let Some((_, m)) = severity_eq {
             query = query.with_content(Predicate::Equals {
                 field: FieldSel::SeverityText,
                 value: AttrValue::Str(m.value.clone()),
@@ -556,6 +581,13 @@ pub async fn fetch_log_series(
             }
         }
 
+        // Checked only here, once per completed segment: `scan_accounted_with_tenant`
+        // has already fetched and charged this segment's bytes above, and
+        // `next_block` only decodes bytes already resident, so nothing inside
+        // the block loop can react to the budget mid-segment. A query can
+        // therefore overshoot `max_bytes_scanned` by up to one segment's
+        // bytes before this check catches it (see the field doc on
+        // `LogSeriesRequest::max_bytes_scanned`).
         let scanned = accounting.snapshot().pooled().total_s3_bytes();
         if let Some(err) = bytes_scanned_exceeded(scanned, req.max_bytes_scanned) {
             return Err(err);
