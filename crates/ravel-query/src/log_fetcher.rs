@@ -2208,45 +2208,84 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Option<Vec<(LogStreamId, Vec<u8>)>>, LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
-        let dir = if seg_ref.object_size > self.block_range_threshold {
-            let mut stats = BlockRangeStats::default();
-            let pin = EtagPin::default();
-            let phase = ReadPhases::PLAN.metadata;
-            let (footer, resident) = self
-                .block_range
-                .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
-                .await?;
+        let dir: Option<StreamDir> = if seg_ref.object_size > self.block_range_threshold {
+            // The `page_fetch` phase span the other plan paths carry (#782), so
+            // the trace shows the probe and section GETs this method issues.
+            // `s3_bytes` reports block bytes only, which are structurally zero
+            // here; the directory-overhead bytes are recorded in `accounting`.
+            let fetch_span = tracing::debug_span!(
+                "page_fetch",
+                signal = "logs",
+                s3_requests = tracing::field::Empty,
+                s3_bytes = tracing::field::Empty,
+                probe_misses = tracing::field::Empty,
+            );
+            let (dir, stats) = async {
+                let mut stats = BlockRangeStats::default();
+                let pin = EtagPin::default();
+                let phase = ReadPhases::PLAN.metadata;
+                let (footer, resident) = self
+                    .block_range
+                    .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
+                    .await?;
 
-            let Some(stream_desc) = footer.section(kind::STREAM_DIR).copied() else {
-                return Ok(None);
-            };
-            let raw = self
-                .block_range
-                .plan_section_raw(
-                    seg_ref,
-                    tenant_hash,
-                    &stream_desc,
-                    &resident,
-                    phase,
-                    &pin,
-                    accounting,
-                    &mut stats,
-                )
-                .await?;
-            StreamDir::decode(&raw, MAX_STREAMS).map_err(|source| corrupt(key, source))?
+                let dir = match footer.section(kind::STREAM_DIR).copied() {
+                    None => None,
+                    Some(stream_desc) => {
+                        let raw = self
+                            .block_range
+                            .plan_section_raw(
+                                seg_ref,
+                                tenant_hash,
+                                &stream_desc,
+                                &resident,
+                                phase,
+                                &pin,
+                                accounting,
+                                &mut stats,
+                            )
+                            .await?;
+                        Some(
+                            StreamDir::decode(&raw, MAX_STREAMS)
+                                .map_err(|source| corrupt(key, source))?,
+                        )
+                    }
+                };
+                Ok::<_, LogFetchError>((dir, stats))
+            }
+            .instrument(fetch_span.clone())
+            .await?;
+            let requests = stats.probe_gets + stats.metadata_gets + stats.block_range_gets;
+            fetch_span.record("s3_requests", requests);
+            fetch_span.record("s3_bytes", stats.block_bytes_fetched);
+            // Probe misses (#883): a footer chase or section miss here is a
+            // probe too short to reach it, reported per phase beside the
+            // request/byte counts like every other plan-phase read.
+            self.record_probe_misses(&fetch_span, &stats, ProbePhase::Plan);
+            dir
         } else {
             let bytes = self
                 .whole_object_bytes(seg_ref, tenant_hash, QueryPhase::Plan, accounting)
                 .await?;
-            self.decode_stream_dir(&bytes)
-                .map_err(|source| corrupt(key, source))?
+            let footer = footer::open(&bytes).map_err(|source| corrupt(key, source))?;
+            match footer.section(kind::STREAM_DIR).copied() {
+                None => None,
+                Some(desc) => {
+                    let raw = read_section(&bytes, &desc, &self.cfg)
+                        .map_err(|source| corrupt(key, source))?;
+                    Some(
+                        StreamDir::decode(&raw, MAX_STREAMS)
+                            .map_err(|source| corrupt(key, source))?,
+                    )
+                }
+            }
         };
-        Ok(Some(
+        Ok(dir.map(|dir| {
             dir.entries()
                 .iter()
                 .map(|entry| (entry.stream_id, entry.blob.clone()))
-                .collect(),
-        ))
+                .collect()
+        }))
     }
 
     /// Decodes the STREAM_DIR section of an object from its own public section
@@ -6631,6 +6670,305 @@ mod plan_skip_decidable_span_tests {
                 "one count per missed tail section, whichever phase issued the probe"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod fetch_stream_dir_tests {
+    //! Pins two review findings on `LogSegmentFetcher::fetch_stream_dir`
+    //! (#1106): the above-threshold branch's STREAM_DIR probe must report
+    //! through the same `page_fetch` span and `record_probe_misses` channel
+    //! every other plan-phase read carries, and the below-threshold and
+    //! above-threshold branches must agree on the absent-STREAM_DIR
+    //! tolerance the method's own doc comment promises.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([31u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [33u8; 32];
+    const KEY: &str = "t/fetch-stream-dir.rlog";
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [31u8; 16],
+            shard: 0,
+            writer_id: [6u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![],
+        }
+    }
+
+    fn build_object(records: &[LogRecord]) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in records {
+            w.push(r.clone()).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    fn seg_ref(size: u64, records: &[LogRecord]) -> SegmentRef {
+        let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: min,
+            max_event_ts_ns: max,
+            ingest_hour_bucket: 0,
+            sample_count: records.len() as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        store
+    }
+
+    /// The subset of a `page_fetch` span's fields this test asserts on.
+    #[derive(Default, Debug)]
+    struct Captured {
+        signal: Option<String>,
+        s3_requests: Option<u64>,
+        s3_bytes: Option<u64>,
+        probe_misses: Option<u64>,
+    }
+
+    struct FieldVisitor<'a>(&'a mut Captured);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "s3_requests" => self.0.s3_requests = Some(value),
+                "s3_bytes" => self.0.s3_bytes = Some(value),
+                "probe_misses" => self.0.probe_misses = Some(value),
+                _ => {}
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "signal" {
+                self.0.signal = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    /// Records every `page_fetch` span's fields as of its close, the same
+    /// test-scoped tracing capture `plan_skip_decidable_span_tests` uses.
+    #[derive(Clone, Default)]
+    struct PageFetchCollector {
+        live: Arc<Mutex<HashMap<u64, Captured>>>,
+        closed: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PageFetchCollector {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "page_fetch" {
+                return;
+            }
+            let mut captured = Captured::default();
+            attrs.record(&mut FieldVisitor(&mut captured));
+            if let Ok(mut live) = self.live.lock() {
+                live.insert(id.into_u64(), captured);
+            }
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Ok(mut live) = self.live.lock()
+                && let Some(captured) = live.get_mut(&id.into_u64())
+            {
+                values.record(&mut FieldVisitor(captured));
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let taken = self
+                .live
+                .lock()
+                .ok()
+                .and_then(|mut live| live.remove(&id.into_u64()));
+            if let (Some(captured), Ok(mut closed)) = (taken, self.closed.lock()) {
+                closed.push(captured);
+            }
+        }
+    }
+
+    /// `block_range_threshold(0)` routes every nonzero-size object through the
+    /// ranged branch, so the STREAM_DIR probe under test is the one this test
+    /// exercises rather than the whole-object shortcut.
+    fn fetcher_above_threshold(store: Arc<MemoryStore>) -> LogSegmentFetcher {
+        LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(BlockRangeFetcher::new(store).with_whole_object_threshold(0))
+    }
+
+    /// Finding 1 (#1106 CodeRabbit review on PR #1158): the above-threshold
+    /// branch of `fetch_stream_dir` must open the `page_fetch` span and call
+    /// `record_probe_misses`, exactly like `plan_segment_fast`,
+    /// `plan_segment`'s skip-decidable branch, and `plan_segment_block_stats`
+    /// already do, so the STREAM_DIR read it issues shows up in the trace and
+    /// in the probe-miss counter instead of being invisible on both.
+    ///
+    /// Non-vacuity: with the `fetch_span`/`.instrument` wrapping reverted to
+    /// the bare `probe_footer`/`plan_section_raw` calls this method had before
+    /// the fix, no span named `page_fetch` closes during this call,
+    /// `closed.len()` comes out `0`, and the `expect` below panics instead of
+    /// the field assertions running.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn above_threshold_branch_opens_page_fetch_span_and_records_probe_misses() {
+        let _serial = crate::test_tracing::guard();
+
+        let collector = PageFetchCollector::default();
+        let subscriber = tracing_subscriber::registry().with(collector.clone());
+        let _guard = subscriber.set_default();
+
+        const N: usize = 4;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let seg = seg_ref(total, &records);
+        let store = store_with_object(bytes).await;
+        let f = fetcher_above_threshold(store);
+        let acc = QueryAccounting::new();
+
+        let entries = f
+            .fetch_stream_dir(&seg, TENANT, &acc)
+            .await
+            .expect("fetch_stream_dir")
+            .expect("STREAM_DIR present");
+        assert_eq!(entries.len(), 1, "one stream, every record shares it");
+
+        let closed = collector.closed.lock().expect("lock");
+        assert_eq!(
+            closed.len(),
+            1,
+            "exactly one page_fetch span for this one fetch_stream_dir call"
+        );
+        let span = &closed[0];
+        assert_eq!(span.signal.as_deref(), Some("logs"));
+        assert!(
+            span.s3_requests.is_some_and(|n| n > 0),
+            "must carry the real request count probe_footer/plan_section_raw issued, got {:?}",
+            span.s3_requests
+        );
+        assert!(
+            span.probe_misses.is_some(),
+            "probe_misses must be recorded (structurally 0 or more, but present, not Empty), \
+             got {:?}",
+            span.probe_misses
+        );
+    }
+
+    /// Finding 2 (#1106 CodeRabbit review on PR #1158): the doc comment on
+    /// `fetch_stream_dir` says an absent STREAM_DIR section returns `None`
+    /// regardless of which branch answers the read. `RlogWriter::build_object`
+    /// always writes a STREAM_DIR section unconditionally (see the
+    /// `push_section(&mut object, &mut sections, kind::STREAM_DIR, ...)` call
+    /// both encoder paths make, `crates/ravel-logseg/src/writer.rs:716` and
+    /// `:1536`) -- there is no writer knob to omit it -- so the absent-section
+    /// case is not reachable through a real written object today, matching
+    /// the method's own doc ("never observed on a real object today"). This
+    /// test instead pins what the finding actually requires: the two branches
+    /// must agree on the same object. It drives one fixture through both the
+    /// below-threshold whole-object branch (the default threshold, well above
+    /// this small fixture's size) and the above-threshold ranged branch
+    /// (`with_block_range_threshold(0)`), and asserts they decode the same
+    /// STREAM_DIR entries.
+    #[tokio::test]
+    async fn both_threshold_branches_agree_on_the_same_object() {
+        const N: usize = 3;
+        let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
+        let bytes = build_object(&records);
+        let total = bytes.len() as u64;
+        let seg = seg_ref(total, &records);
+
+        let below_store = store_with_object(bytes.clone()).await;
+        let below = LogSegmentFetcher::new(below_store);
+        assert!(
+            total <= below.block_range_threshold(),
+            "fixture must be small enough to take the below-threshold branch by default"
+        );
+        let below_acc = QueryAccounting::new();
+        let mut below_entries = below
+            .fetch_stream_dir(&seg, TENANT, &below_acc)
+            .await
+            .expect("fetch_stream_dir (below threshold)")
+            .expect("STREAM_DIR present");
+
+        let above_store = store_with_object(bytes).await;
+        let above = fetcher_above_threshold(above_store);
+        let above_acc = QueryAccounting::new();
+        let mut above_entries = above
+            .fetch_stream_dir(&seg, TENANT, &above_acc)
+            .await
+            .expect("fetch_stream_dir (above threshold)")
+            .expect("STREAM_DIR present");
+
+        below_entries.sort_by_key(|(id, _)| *id);
+        above_entries.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            above_entries, below_entries,
+            "both branches must decode the same STREAM_DIR entries for the same object"
+        );
     }
 }
 
