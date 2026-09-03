@@ -460,7 +460,32 @@ and any `ServesSubject`-gated check on it is always vacuously satisfied).
 ## Exhaustive
 
 `exhaustive.cfg` checks every invariant and both liveness properties against
-`FairSpec` over `MaxClock = 4`. Not run by the executor; see the orchestrator's
-run. `bands.tsv` carries no exhaustive row because the executor did not measure
-one; the orchestrator adds it after the run. The FairSpec liveness pass makes it
-heavier than smoke, so it is left to the orchestrator's longer run.
+`FairSpec`, every switch at its shipped value.
+
+`MaxClock = 4` does not complete: a bounded spot-check reported it still
+growing monotonically, 2.19M states generated / 550K distinct after about
+64s, with no sign of quiescence. The FairSpec liveness pass ranges over both
+temporal properties on top of the full safety invariant list, so the time
+dimension dominates the graph the same way it did for the reduced
+per-property diagnosis above, only worse because nothing is projected away.
+
+Shipped fix: `MaxClock = 3`, one clock tick above smoke's `MaxClock = 2` and
+the smallest bound above smoke this task measured. Run directly (not via a
+separate orchestrator lane):
+
+- Result: PASS. States generated: 2357319. Distinct: 387264. Diameter
+  (depth): 21. Wall: 49s.
+- Band (`bands.tsv`): distinct within 387000 to 387500. Observed 387264 is
+  inside.
+- Coverage given up: `MaxClock = 4`'s extra tick buys one additional
+  interleaving depth of environment churn (an extra hold/release or
+  head-read flip cycle) beyond what `MaxClock = 3` reaches; it does not
+  gate any of the four behaviours below; see the probes.
+
+Reachability of the four behaviours a shrink could silently drop was checked
+by probe at `MaxClock = 3` rather than assumed (`counterexamples/reachability-probes.md`
+has the full probe module and traces): a rewrite and its supersession, a
+legal hold that actually blocks a completion, the protection horizon gating
+a delete, and the .dreq hold blocking the request-marker sweep. All four
+probes violate (TLC exit 12), so all four remain reachable at the shrunk
+bound.
