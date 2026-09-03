@@ -141,6 +141,19 @@ retention still completes (it is not permanently blocked). Without the
 blocker, a query that resolved a stale snapshot naming an already-deleted
 object would fail permanently with `SnapshotInvalidated` (503).
 
+**The sweep and the fold resolve `R` from the same source.** A tenant's
+retention window is the durable per-tenant retention override when the tenant's
+config record carries one, and otherwise the deployment-wide default (the
+process configuration's per-tenant override, else its default, else no
+retention). The durable override wins over both configured values. The physical
+retention sweep and the fold's frontier reconcile both read that same durable
+record, at the same key and with the same decode, and apply that same
+precedence, so the two never disagree about which hours are expired. Were they
+to resolve `R` differently, a durable window longer than the configured one
+would let the sweep tombstone an hour the reconcile still names: the physical
+delete would then stall on the HEAD-reachability blocker above, repeating with
+nothing deleted, until the hour aged past the shorter window.
+
 **The superseded-input sweep is gated the same way.** The same blocker, the
 same three answers, and the same per-pass cache apply to a compaction or
 rewrite record's superseded inputs, with the question asked per object rather

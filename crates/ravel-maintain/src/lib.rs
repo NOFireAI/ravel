@@ -56,6 +56,7 @@ pub mod reachability;
 pub mod read;
 pub mod request_ledger;
 pub mod retention;
+pub mod retention_window;
 pub mod rewrite;
 pub mod rlog;
 pub mod rspan_codec;
@@ -109,6 +110,7 @@ pub use retention::{
     RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket,
     maintain_bucket_with_reach, retention_sweep_bucket, retention_sweep_bucket_with_reach,
 };
+pub use retention_window::resolve_retention_window;
 pub use rewrite::{MigrateOutcome, RewriteOutcome, migrate_bucket_format, rewrite_and_publish};
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;

@@ -48,6 +48,7 @@ use crate::config::{CompactorConfig, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::reachability::SnapshotGate;
 use crate::read::{BucketListing, list_bucket, verify_commit_key};
+use crate::retention_window::resolve_retention_window;
 use crate::sweep::LeaseCheck;
 
 /// The HEAD-reachability delete blocker, shared with the superseded-input
@@ -123,7 +124,29 @@ pub async fn retention_sweep_bucket_with_reach(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
-    let Some(window_ns) = retention.window_for(&bucket.tenant_hash) else {
+    let window_ns = resolve_retention_window(store, retention, &bucket.tenant_hash).await?;
+    retention_sweep_bucket_with_reach_window(reach, store, clock, config, window_ns, lease, bucket)
+        .await
+}
+
+/// [`retention_sweep_bucket_with_reach`] with the tenant's effective retention
+/// window already resolved (via [`resolve_retention_window`]). The multi-bucket
+/// scan pass ([`crate::scan::scan_and_maintain_with_memo`]) resolves the window
+/// once per `(tenant, signal, shard)` pass and threads it in here, so the
+/// durable `TenantConfig` record is read at most once per pass rather than once
+/// per bucket. `window_ns` of `None` means the tenant has no retention window
+/// and the pass is a no-op.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn retention_sweep_bucket_with_reach_window(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    window_ns: Option<i64>,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+) -> Result<RetentionOutcome> {
+    let Some(window_ns) = window_ns else {
         return Ok(RetentionOutcome::NoPolicy);
     };
     let now = clock.now_ns();
@@ -211,9 +234,28 @@ pub async fn maintain_bucket_with_reach(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<(RetentionOutcome, Option<CompactionOutcome>)> {
-    let outcome =
-        retention_sweep_bucket_with_reach(reach, store, clock, config, retention, lease, bucket)
-            .await?;
+    let window_ns = resolve_retention_window(store, retention, &bucket.tenant_hash).await?;
+    maintain_bucket_with_reach_window(reach, store, clock, config, window_ns, lease, bucket).await
+}
+
+/// [`maintain_bucket_with_reach`] with the tenant's effective retention window
+/// already resolved (via [`resolve_retention_window`]), so the scan pass reads
+/// the durable `TenantConfig` record once per pass rather than once per bucket.
+/// See [`retention_sweep_bucket_with_reach_window`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maintain_bucket_with_reach_window(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    window_ns: Option<i64>,
+    lease: &dyn LeaseCheck,
+    bucket: &Bucket,
+) -> Result<(RetentionOutcome, Option<CompactionOutcome>)> {
+    let outcome = retention_sweep_bucket_with_reach_window(
+        reach, store, clock, config, window_ns, lease, bucket,
+    )
+    .await?;
     let compaction = match outcome {
         // The bucket is (or is being) retired, or its delete is blocked by a
         // still-reaching snapshot: never compact it.

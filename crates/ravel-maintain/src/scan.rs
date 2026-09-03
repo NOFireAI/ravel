@@ -17,8 +17,9 @@ use crate::compact::{CompactionOutcome, compact_bucket};
 use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::retention::{
-    RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket_with_reach,
+    RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket_with_reach_window,
 };
+use crate::retention_window::resolve_retention_window;
 use crate::sweep::LeaseCheck;
 
 /// One-byte version tag on the advisory cursor payload. The cursor is not a
@@ -1143,7 +1144,13 @@ pub async fn scan_and_maintain_with_memo(
     let now = clock.now_ns();
     let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
     let present: HashSet<u32> = hours.iter().copied().collect();
-    let retention_window_ns = retention.window_for(&tenant_hash);
+    // Resolve the tenant's effective window ONCE per pass, from the same durable
+    // `TenantConfig.retention_ns`-over-deployment-default sources the fold uses
+    // (ADR-0078), so the sweep and the fold never disagree on which hours are
+    // expired. Reads the durable record at most once per pass, then threads the
+    // result through every bucket (never re-reads per bucket). This value drives
+    // both the zone classification below and each bucket's expiry evaluation.
+    let retention_window_ns = resolve_retention_window(store, retention, &tenant_hash).await?;
 
     // One HEAD-reachability cache for the whole pass: the delete-blocker gate
     // (ADR-0020) reads the catalog HEAD at most once and each covering snapshot
@@ -1170,9 +1177,16 @@ pub async fn scan_and_maintain_with_memo(
         }
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
-        let (retention_outcome, compaction) =
-            maintain_bucket_with_reach(&mut reach, store, clock, config, retention, lease, &bucket)
-                .await?;
+        let (retention_outcome, compaction) = maintain_bucket_with_reach_window(
+            &mut reach,
+            store,
+            clock,
+            config,
+            retention_window_ns,
+            lease,
+            &bucket,
+        )
+        .await?;
         match retention_outcome {
             // The bucket is (being) retired; compaction was skipped by design.
             RetentionOutcome::Tombstoned
