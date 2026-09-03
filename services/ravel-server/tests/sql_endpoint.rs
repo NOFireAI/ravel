@@ -1320,19 +1320,25 @@ async fn an_alerts_plus_logs_query_is_rejected_over_http() {
 }
 
 /// A planning failure on a `logs` query returns the shared, redacted planning
-/// message -- and that message must not tell the client the problem is about
-/// the `samples` table (it named only `samples` before that fix).
+/// message, and that message names no table at all.
+///
+/// It named only `samples` once, which pointed a `logs` client at the wrong
+/// table; the fix then named `samples` and `logs`, which went stale the moment
+/// `spans`, `alerts` and `audit` were registered. `plan_error` builds this
+/// message from a bare `DataFusionError` and never knows which table the query
+/// targeted, so any table set it names is wrong for some caller. Naming none
+/// is the property that cannot go stale, and this asserts it over the whole
+/// registered set rather than over the one table that happened to be wrong.
 ///
 /// The vehicle is an unregistered function, not the `attrs['k']` subscript
 /// this change makes plannable. `attrs['k']` was the vehicle while it was
 /// the documented logs planning gap; it is now the feature under test in
 /// `a_logs_attrs_subscript_query_succeeds_over_http` below, and a test that
 /// asserts a query fails is worthless once the query is meant to succeed.
-/// What this test actually protects -- a `logs` planning failure not blaming
-/// `samples` -- is independent of which construct failed, so it keeps its
-/// value with any unplannable query.
+/// What this test protects is independent of which construct failed, so it
+/// keeps its value with any unplannable query.
 #[tokio::test]
-async fn a_logs_plan_error_does_not_blame_the_samples_table() {
+async fn a_logs_plan_error_names_no_table() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
     publish_log_segment(
@@ -1355,16 +1361,16 @@ async fn a_logs_plan_error_does_not_blame_the_samples_table() {
     assert_eq!(value["errorType"], "execution");
     let error = value["error"].as_str().expect("error string");
     assert_eq!(error, ravel_sql::MSG_PLAN);
-    // The message must be accurate for a `logs` query: it names `logs`, and it
-    // must not tell the client the fix is about the `samples` table.
-    assert!(
-        error.contains("logs"),
-        "planning message must be accurate for a logs query: {error}"
-    );
-    assert!(
-        !error.contains("samples table"),
-        "planning message must not blame the samples table: {error}"
-    );
+    // The message must be accurate for a query against ANY registered table,
+    // so it may name none of them. Asserting over the whole set is what makes
+    // this survive the next table: the two-name version passed while three
+    // names were missing.
+    for table in ["samples", "logs", "spans", "alerts", "audit"] {
+        assert!(
+            !error.contains(table),
+            "the planning message must name no table, found {table}: {error}"
+        );
+    }
 }
 
 /// `attrs['k']` plans and answers over HTTP, which is the whole point of
