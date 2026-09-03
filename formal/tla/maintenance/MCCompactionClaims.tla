@@ -11,14 +11,17 @@
 EXTENDS CompactionClaims
 
 CONSTANTS
-    CompletionOverwrite,        \* negative: mark_completed uses Overwrite not CAS
-    AllowClaimDelete,           \* negative: a path deletes the claim unconditionally
-    ClaimIsPublicationAuthority \* negative: the publish path skips CreateIfAbsent
-                                \* when the claim is held
+    CompletionOverwrite,         \* negative: mark_completed uses Overwrite not CAS
+    AllowClaimDelete,            \* negative: a path deletes the claim unconditionally
+    ClaimIsPublicationAuthority, \* negative: the publish path skips CreateIfAbsent
+                                 \* when the claim is held
+    GuardIgnoresClaim            \* negative: the guarded publish drops its
+                                 \* HoldsClaim check and publishes anyway
 
 ASSUME CompletionOverwrite \in BOOLEAN
 ASSUME AllowClaimDelete \in BOOLEAN
 ASSUME ClaimIsPublicationAuthority \in BOOLEAN
+ASSUME GuardIgnoresClaim \in BOOLEAN
 
 \* Broken: mark_completed overwrites the claim regardless of version. A stale
 \* owner (its token no longer current) still overwrites a newer claim. The witness
@@ -69,11 +72,24 @@ BrokenClaimPublish(w, u, v) ==
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
                    stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
+\* Broken: the guarded (checkpoint) publish drops its HoldsClaim check and
+\* publishes regardless. The witness still reads the store (held |-> HoldsClaim),
+\* so a publish by a non-holder records held = FALSE with fired = TRUE. Caught by
+\* LostClaimNeverPublishesThroughGuardedPath.
+BrokenGuardedPublish(w, u, v) ==
+    /\ GuardIgnoresClaim
+    /\ CanWrite
+    /\ DoPublish(u, v)
+    /\ lastGuarded' = [fired |-> TRUE, held |-> HoldsClaim(w, u)]
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
+                   stealWonVers, lastClaimOp, stolen>>
+
 MCNext ==
     \/ Next
     \/ \E w \in Workers, u \in Units : BrokenComplete(w, u)
     \/ \E u \in Units : DeleteClaim(u)
     \/ \E w \in Workers, u \in Units, v \in Variants : BrokenClaimPublish(w, u, v)
+    \/ \E w \in Workers, u \in Units, v \in Variants : BrokenGuardedPublish(w, u, v)
 
 MCSpec == Init /\ [][MCNext]_vars
 MCFairSpec == MCSpec /\ Fairness
