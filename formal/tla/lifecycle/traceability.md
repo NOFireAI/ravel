@@ -1,0 +1,31 @@
+# Traceability: lifecycle GC invariants to their Rust source
+
+Each row maps a TLA+ action or property in `LifecycleGC.tla` to the retention,
+erasure, legal-hold, or physical-GC behavior it pins, to the Rust symbol that
+implements that behavior, and to the test that exercises it (ADR-1113 D8).
+`scripts/check-tla.sh traceability` resolves the Rust references: a reference is
+`crates/<path>.rs::Sym1::Sym2...`, and the check requires the file to exist and
+every `::`-separated symbol to appear in it. A reference to a `.tla` file is
+rejected: a row cites the implementation, not the model. The "new test needed"
+column names a gap where no test covers the behavior yet, or `none`.
+
+Three behaviors the model covers have no end-to-end production symbol yet (the
+`.dreq` write, the `.done` write, and the tick-skip on a failed hold refresh);
+those rows cite the nearest real gate or key builder and name the gap. See the
+final report for the out-of-scope finding.
+
+| TLA+ action or property | Meaning | Rust path and symbol | Existing test | New test needed |
+|---|---|---|---|---|
+| RetireBucket / TombstoneExcludesBeforeDelete | The retention tombstone for a bucket is written CreateIfAbsent with retired_at set to now, and no bucket object is deleted before that tombstone exists | crates/ravel-maintain/src/retention.rs::write_tombstone::RetentionTombstone | crates/ravel-maintain/tests/retention.rs::tombstone_irreversible_when_r_is_raised | none |
+| RetentionSweep / NoDeleteInsideProtectionWindow | The physical retention delete gates on now at or past retired_at plus protection_horizon and on an empty effective HEAD for the bucket | crates/ravel-maintain/src/retention.rs::physical_sweep::bucket_is_empty_but_tombstone | crates/ravel-maintain/tests/retention.rs::retention_lifecycle_uncompacted_bucket | none |
+| PlaceHold / ReleaseHold / HeldObjectNeverDeleted | A legal hold protects held objects from every sweep; placing and clearing a hold are durable | crates/ravel-maintain/src/legal_hold.rs::write_hold_set::write_hold_clear::is_protected | crates/ravel-maintain/tests/legal_hold.rs::active_hold_blocks_delete_that_would_otherwise_happen | none, release covered by cleared_hold_lets_the_next_pass_delete |
+| SetRefresh / RefreshFailureNeverSweeps | A failed legal-hold refresh fails closed: the refresh returns an error that a sweep tick must propagate rather than delete under | crates/ravel-maintain/src/legal_hold.rs::refresh | none | add a sweep-tick test that injects a failed refresh and asserts no delete; the tick-skip on a failed refresh is not yet a distinct production symbol, only the fallible refresh is |
+| RequestErasure | The erasure request marker key is built and is meant to be written CreateIfAbsent, marking the subject erasure-requested | crates/ravel-commit/src/keys.rs::erasure_request_key::DREQ_SUFFIX | crates/ravel-commit/src/keys.rs::erasure_request_key_round_trips | gap: no production symbol PUTs the request marker, only the key builder and tests exist |
+| CompleteErasure / CompletionImpliesNoPreRewriteExposure | The completion gate is satisfied only when the served set no longer serves the subject, so no head-named object still exposes it once completion is marked | crates/ravel-maintain/src/erasure_rewrite.rs::bucket_erasure_completion::bucket_serves_subject | crates/ravel-maintain/tests/erasure_sweep.rs::dreq_without_done_is_never_removed | gap: the gate is computed but no production symbol writes the completion object |
+| DreqSweep / DreqRemovalCannotResurrect | The request marker is swept once a matching completion exists and the horizon passed; a held or pinned marker survives so the subject cannot be resurrected | crates/ravel-maintain/src/sweep.rs::sweep_erasure_requests::ErasureRequestSweepOutcome | crates/ravel-maintain/tests/erasure_sweep.rs::dreq_removed_at_horizon_boundary_not_a_nanosecond_early | none |
+| PerformRewrite / RewriteOutputsAreInputsMinusErased | The rewrite materializes an output that serves its inputs minus the erased subject and marks the inputs superseded | crates/ravel-maintain/src/erasure_rewrite.rs::build_rewrite::RewriteBuild | crates/ravel-maintain/src/erasure_rewrite.rs::rewrite_drops_matching_series_preserves_others_bit_identically | none |
+| SupersededSweep / HeadNamedObjectNeverDeletedBySupersededSweep | The superseded-input sweep holds any input the current HEAD still names by the object-granular gate, and an unreadable HEAD blocks the whole pass | crates/ravel-maintain/src/sweep.rs::sweep_superseded::SupersededSweepOutcome | crates/ravel-maintain/tests/superseded_head_gate.rs::head_named_superseded_inputs_are_held_not_deleted | none, HEAD gate covered by crates/ravel-maintain/src/reachability.rs::object_gate |
+| IdenticalInputSetsDoNotCollide | The rewrite identity hash binds the sorted applied request ids, so two rewrites over the same inputs with different requests get different keys | crates/ravel-commit/src/erasure.rs::compute_rewrite_input_set_hash::sorted_applied_request_ids | crates/ravel-commit/src/erasure.rs::compute_rewrite_input_set_hash_differs_on_request_ids | none |
+| ErasedSubjectNeverServedAfterRequest | A read applies the erasure predicate after the fetch and after any cache tier, so an erased subject is never served | crates/ravel-query/src/engine.rs::snapshot_erasure_predicates | crates/ravel-query/src/engine.rs::snapshot_erasure_predicates_excludes_matching_series | none, predicate application in crates/ravel-query/src/erasure.rs::retain_series_soa |
+| GcConfigSatisfiesHorizon | The GC startup config satisfies protection_horizon at or above max_query_duration plus grace plus clock_skew_allowance | crates/ravel-maintain/src/gc_config.rs::satisfies_constraint::GcConfigValues | crates/ravel-maintain/src/gc_config.rs::set_refuses_a_constraint_violating_proposal | none |
+| HeadAdvanceRewrite / DropRetiredBucketFromHead / PredecessorChainRepresentable | The fold advances HEAD off superseded inputs and drops the retired-hour frontier, and the rewrite lineage stays representable | crates/ravel-catalog/src/catalog.rs::resolve_rewrite_supersession::process_bucket | crates/ravel-maintain/tests/retention.rs::sweep_respects_pre_fold_head_then_deletes_after_fold_drops_bucket | none, frontier drop in crates/ravel-catalog/src/fold.rs::retirement_frontier_hour |
