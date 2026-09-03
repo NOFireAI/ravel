@@ -24,8 +24,8 @@ banded.
 Mutants demonstrated against the correct module (each in a scratch copy,
 recorded under `counterexamples/`): CAS on an absent key accepted
 (`CasOutcomeMatchesEffect`), a multipart part published early
-(`MultipartInvisibleUntilComplete`), a delete that returns a non-Ok outcome
-(`DeleteIdempotent`), a delete that resets the version counter
+(`MultipartInvisibleUntilComplete`), a delete of an absent key that stamps a
+new version onto the record (`DeleteIdempotent`), a delete that resets the version counter
 (`VersionsNeverReused`), and a counting listing consumer that deduplicates
 (`ListingConsumersConsistent`). Each reports TLC exit 12 naming that
 invariant.
