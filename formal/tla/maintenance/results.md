@@ -162,6 +162,37 @@ control that flips exactly one constant:
   (`diverge-overwrites-record`), and `MergeAttemptsConverge` by
   `MissingPartReportsConverged = TRUE` (`missing-part-reports-converged`).
 
+## Per-invariant audit
+
+One row per named invariant or property across both models. Basis is
+store-derived (the invariant reads `store`/`ContentOf` directly) or
+witness-derived (the invariant reads a variable the model set as a witness to
+an action, such as `lastMaint`, `seedFresh`, `lastPub`, `cliCorrect`, or
+`stolen`). The TLC line is the real state/distinct count from the
+Configurations table above, or from this file's own prior runs where noted;
+a property with no measured line says so rather than inventing one. Every
+cited action and variable below was grepped against the current `.tla`
+sources before being carried forward.
+
+| Invariant | Model | Basis | Observes | Non-vacuity mutant | TLC line |
+|---|---|---|---|---|---|
+| OTypeOK | Ownership | store-derived | state well-formedness (every variable's shape and range) | none; a type invariant holds by construction, not by a design choice a mutant can break | checked every run in the Configurations table above; no dedicated mutant |
+| CTypeOK | Claims | store-derived | state well-formedness (every variable's shape and range) | none; a type invariant holds by construction, not by a design choice a mutant can break | checked every run in the Configurations table above; no dedicated mutant |
+| QueryVisibleDataCorrectUnderDuplicateOwnership | Ownership | store-derived | `ContentOf(RecordKey(u))` equals the first-writer content and every present part key carries its content-addressed bytes | `OwnerPublishOverwrite = TRUE` | `ownership-as-publication-authority`: 7550 states, 2435 distinct, VIOLATED |
+| HeartbeatAndMemoNeverCas | Ownership | witness-derived (`lastMaint.verBefore`/`verAfter`, read from the store at the write, not self-reported) | the last heartbeat or memo write strictly advanced its key's stored version | `HeartbeatMemoUsesCas = TRUE` | `heartbeat-memo-cas`: 116 states, 91 distinct, VIOLATED |
+| MemoNeverExtendsFreshnessPastSnapshot | Ownership | witness-derived (`seedFresh`, the value the seed helper actually stored) | the stored clamped freshness never exceeds the source snapshot's own time | `MemoOverstamp = TRUE` | `memo-overstamp`: 1167 states, 488 distinct, VIOLATED |
+| MergeAttemptsConverge | Ownership | store-derived (`lastPub.winnerPartPresent`, read from the store) | a loser reports `Converged` only when the winner part is observed present | `MissingPartReportsConverged = TRUE` | `mo-missing-part-reports-converged`: 8096 states, 2405 distinct, VIOLATED |
+| DivergentInputSetNeverMutates | Ownership | store-derived (record version delta) | a loser with a divergent input-set hash never advances the record's stored version | `DivergeOverwritesRecord = TRUE` | `mo-diverge-overwrites-record`: 2865 states, 1074 distinct, VIOLATED |
+| EveryEligibleUnitEventuallyAttempted | Ownership | witness-derived (`attemptedByOwner`) | under stable membership every unit is eventually attempted by an in-view owner | `Phantom = TRUE` (a lingering live member outranks every real worker) | `zero-ownership-phantom`: 6350395 states, 1317024 distinct, VIOLATED (documented liveness limitation, not a defect) |
+| OwnershipIsNotPublicationAuthority | Ownership | witness-derived (`cliCorrect`, an eventuality witness) | under fairness a non-owner (the CLI path) eventually publishes and the data stays correct | none in this round; only `MCMaintenanceOwnership.exhaustive.cfg` checks this `PROPERTY`, and the exhaustive config was not run by this executor | not measured this run; see Configurations table (exhaustive: not run by executor) |
+| ClaimGrantsNoPublicationAuthority | Claims | store-derived | same shape as `QueryVisibleDataCorrectUnderDuplicateOwnership`, over the claims model's store | `ClaimIsPublicationAuthority = TRUE` | `claim-as-publication-authority`: 11577 states, 5906 distinct, VIOLATED |
+| StaleOwnerCannotOverwriteNewerClaim | Claims | witness-derived (`lastClaimOp.beforeVer`/`afterVer`/`beforeContent`/`afterContent`, read from the store) | a claim CAS is `Ok` only against the current version; a non-`Ok` CAS changes nothing | `CompletionOverwrite = TRUE` | `claim-completion-without-cas`: 20850 states, 9254 distinct, VIOLATED |
+| NoUnconditionalClaimDelete | Claims | store-derived (absence of a delete on the claim prefix) | no path removes a claim key outside the modeled CAS operations | `AllowClaimDelete = TRUE` | `claim-delete-unconditional`: 124 states, 83 distinct, VIOLATED |
+| LostClaimNeverPublishesThroughGuardedPath | Claims | witness-derived (`lastGuarded.fired`/`held`) | the guarded (checkpoint) publish path never fires while the claim is lost | `GuardIgnoresClaim = TRUE` | `guarded-publish-ignores-claim`: 267 states, 180 distinct, VIOLATED |
+| MergeAttemptsConverge | Claims | store-derived (`lastPub.winnerPartPresent`, read from the store) | a loser reports `Converged` only when the winner part is observed present | `MissingPartReportsConverged = TRUE` | `missing-part-reports-converged`: 5952 states, 3004 distinct, VIOLATED |
+| DivergentInputSetNeverMutates | Claims | store-derived (record version delta) | a loser with a divergent input-set hash never advances the record's stored version | `DivergeOverwritesRecord = TRUE` | `diverge-overwrites-record`: 1810 states, 973 distinct, VIOLATED |
+| ExpiredClaimEventuallyStolen | Claims | witness-derived (`stolen`) | an expired claim is eventually stolen under a fair thief and a fair store | none in this round; only `MCCompactionClaims.exhaustive.cfg` checks this `PROPERTY`, and the exhaustive config was not run by this executor | not measured this run; see Configurations table (exhaustive: not run by executor) |
+
 ## Where the model and the code differ
 
 - The rendezvous weight is a monotone injected table standing in for

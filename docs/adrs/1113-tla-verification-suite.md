@@ -241,9 +241,12 @@ correct. Loser convergence is not unconditional; the outcome alphabet
 includes the fail-closed variants. The claims model is labeled a
 proposed design. It checks that a claim grants no publication authority,
 that a stale owner cannot overwrite a newer claim without the matching
-version, that no path deletes a claim unconditionally, and that at most
-one thief wins a version-CAS race. Zero ownership under asymmetric views
-is a checked liveness limitation, not an assumed impossibility.
+version, and that no path deletes a claim unconditionally. A single thief
+winning a version-CAS race is not modeled as its own invariant: it
+follows from the store's own compare-and-set semantics, and is already
+carried by `StaleOwnerCannotOverwriteNewerClaim`. Zero ownership under
+asymmetric views is a checked liveness limitation, not an assumed
+impossibility.
 
 ### D4. Liveness is stated per action under a named environment
 
