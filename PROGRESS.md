@@ -44,15 +44,29 @@ Shipped:
 Deliberately not shipped:
 
 - **Fold and maintain coverage for the two signals.** Neither signal is folded
-  into the catalog or compacted by the maintain loop, so an `alerts` or `audit`
-  query lists commit records live for its window. That is the recent-hours cost
-  a logs query already pays, and volume is one object per alert transition and
-  one per executed statement. Tracked as #1137; it becomes worth doing if audit
-  volume makes the listing the dominant term.
+  into the catalog, and neither rides the maintain loop's compaction pass, so
+  an `alerts` or `audit` query lists commit records live for its window. That
+  is the recent-hours cost a logs query already pays, and volume is one object
+  per alert transition and one per executed statement. The query-audit shard
+  keeps its own retention pass, which compacts and age-sweeps it on a 90-day
+  window; the legal-hold shard is never deleted. Tracked as #1137; folding
+  becomes worth doing if audit volume makes the listing the dominant term.
 - **The bytes-scanned budget and the LIMIT fetch-stop hint.** Both are missing
   on every RLOG and RSPAN scan loop, not just these two tables, and stay out of
   scope here. Registering the tables adds two more callers to the same gap and
   changes nothing about it. Tracked as #41 and #362.
+- **The alerts-on-alerts generation guard.** A rule can now read the `alerts`
+  table, but the evaluator still passes no consumed generations to
+  `compute_generation`, so every such record is pinned at generation 1 and
+  ADR-0040 decision 4's cap never trips. Carrying the consumed rows'
+  generations out of the query path changes a result type across two crates,
+  which is its own change. Tracked as #1174.
+- **A fencing epoch for the alerts fold.** The fold key orders by
+  `writer_epoch` and `writer_seq`, but the writer epoch is a constant and each
+  evaluator's sequence restarts at 1, so across a lease handover the key
+  prefers the departing evaluator rather than the later write. One current row
+  per alert is guaranteed either way, and the SQL fold matches the evaluator's
+  own. Tracked as #1175.
 
 ## Epic #8: RSPAN v2/v3/v4 trace investigation
 
