@@ -426,6 +426,7 @@ async fn remote_write(
         .count() as u64;
     let points_accepted = samples_written + histograms_written;
 
+    let tenant_hash = tenant.hash();
     let receipt = match state
         .router
         .write_values(tenant, ingest_points, WriteMode::Strict, state.ack_deadline)
@@ -439,6 +440,7 @@ async fn remote_write(
             let durable_shard_count = err.durable_tokens().len();
             if durable_shard_count > 0 {
                 tracing::warn!(
+                    tenant_hash = %tenant_hash.to_hex(),
                     durable_shard_count,
                     "metric write partially committed before a sibling shard \
                      failed"

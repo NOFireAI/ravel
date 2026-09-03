@@ -234,6 +234,7 @@ pub async fn handle_export_traces(
             let durable_shard_count = err.durable_tokens().len();
             if durable_shard_count > 0 {
                 tracing::warn!(
+                    tenant_hash = %tenant.hash().to_hex(),
                     durable_shard_count,
                     "span write partially committed before a sibling shard \
                      failed; no idempotency marker written for the durable \

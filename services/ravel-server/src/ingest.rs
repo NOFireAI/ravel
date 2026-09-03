@@ -207,6 +207,7 @@ pub async fn handle_export(
         rejected_count += series_cap_rejected;
     }
 
+    let tenant_hash = tenant.hash();
     let receipt = state
         .router
         .write_values_with_exemplars(tenant, points, exemplars, mode, state.ack_deadline)
@@ -222,6 +223,7 @@ pub async fn handle_export(
             let durable_shard_count = err.durable_tokens().len();
             if durable_shard_count > 0 {
                 tracing::warn!(
+                    tenant_hash = %tenant_hash.to_hex(),
                     durable_shard_count,
                     "metric write partially committed before a sibling shard \
                      failed"

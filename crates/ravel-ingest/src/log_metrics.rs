@@ -86,10 +86,11 @@ pub struct LogIngestMetrics {
     /// Multi-shard Strict writes that returned
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
-    /// `write()` call. A nonzero value means some clients saw a retryable error
-    /// for data already durable on the committed shards; a retry re-ingests
+    /// `write()` call. A nonzero value means some clients saw an error,
+    /// retryable exactly when the wrapped `LogWriteError` is, for data already
+    /// durable on the committed shards; a client that does retry re-ingests
     /// those shards' records, and unlike the metrics pipeline logs have no
-    /// read-time dedup, so the retry duplicates them. An idempotency key does
+    /// read-time dedup, so that retry duplicates them. An idempotency key does
     /// not help here: a partial commit writes no marker (see
     /// docs/consistency-model.md). The metrics and span pipelines keep the
     /// same counter.

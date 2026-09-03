@@ -137,8 +137,9 @@ pub struct IngestMetrics {
     /// Multi-shard Strict writes that returned `WriteError::PartialWrite`
     /// (issue #1130): at least one shard committed durably and at least one
     /// sibling then failed in the same `write()` call. A nonzero value means
-    /// some clients saw a retryable error for data that is already durable on
-    /// the committed shards, so a blind retry re-ingests those shards' points
+    /// some clients saw an error, retryable exactly when the wrapped
+    /// `WriteError` is, for data that is already durable on the committed
+    /// shards; a client that does retry re-ingests those shards' points
     /// (metrics dedup by `(series_id, ts)` at read time, so it is not
     /// user-visible duplication; see docs/consistency-model.md). The logs and
     /// span pipelines keep the same counter.
