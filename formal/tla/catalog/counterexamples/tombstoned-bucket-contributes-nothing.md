@@ -21,3 +21,12 @@ bucket would reappear in a snapshot after retention had excluded it. The
 tombstone marker is what a later fold consults to contribute nothing for the
 hour (`crates/ravel-maintain/src/retention.rs::write_tombstone`), which this
 invariant pins.
+
+The invariant scopes the guarantee to the freshly reconciled range (hours at or
+above the fold's `reconcileLo`, the watermark it read at start): the bounded
+incremental fold reconciles only that range against the tombstone map, and
+entries carried forward verbatim from below the floor are exempt, exactly like a
+late supersession and safe by the same held-while-named argument. The mutation
+above falsifies the fresh range, which is where `FoldEntriesFor` applies the
+`~tomb` filter. `carryforward.cfg` exercises this invariant under a real
+carry-forward where the floor is above 0.
