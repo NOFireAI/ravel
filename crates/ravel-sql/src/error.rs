@@ -54,18 +54,20 @@ pub const MSG_UNSATISFIABLE: &str = "requested commit token is not yet visible; 
 /// says nothing about which column, type, or plan node was at fault: those
 /// strings carry schema detail. The full error is logged server-side.
 ///
-/// It names both v1 tables rather than one: a `Plan` error is built from a
-/// bare `DataFusionError` in `crate::executor::plan_error`, which has no
-/// handle on which table the failed query targeted, and a `logs` query can
-/// fail to plan like any other (an unregistered function, an unknown
-/// column). Naming only `samples` would point a `logs` client at the wrong
-/// table.
+/// It names no table at all: a `Plan` error is built from a bare
+/// `DataFusionError` in `crate::executor::plan_error`, which has no handle on
+/// which table the failed query targeted, and a query against any registered
+/// table can fail to plan like any other (an unregistered function, an
+/// unknown column). Naming a subset would point a client at the wrong table,
+/// which is what happened while this text said "samples or logs" and the
+/// registered set grew to five.
 ///
 /// This doc cited the `attrs['k']` subscript gap as the example until
-/// `crate::map_field_planner` closed it. The reason for naming both tables
-/// never depended on that particular gap, so only the example changed.
-pub const MSG_PLAN: &str = "the SQL query could not be planned; check that it uses only the v1 subset \
-     over the samples or logs table";
+/// `crate::map_field_planner` closed it. The reason for staying
+/// table-neutral never depended on that particular gap, so only the example
+/// changed.
+pub const MSG_PLAN: &str =
+    "the SQL query could not be planned; check that it uses only the v1 subset";
 
 /// Stable client message for a DataFusion execution failure that is not one
 /// of the classes above.
@@ -137,12 +139,13 @@ pub enum SqlError {
     #[error(transparent)]
     Validation(#[from] ValidationError),
 
-    /// The query references both the `samples` and `logs` tables. ADR-0033
-    /// decision C admits exactly one signal per query in v1 (no query needs to
-    /// scan or join both metrics and logs), so this is rejected before any
-    /// catalog resolve. Its text names only the two fixed table names -- no
-    /// server state -- so it is safe to return verbatim, like a validation
-    /// error, and maps to HTTP 400.
+    /// The query references two or more of the registered tables (`samples`,
+    /// `logs`, `spans`, `alerts`, `audit`). ADR-0033 decision C admits exactly
+    /// one signal per query in v1, and ADR-0045 decision 5 and ADR-1101
+    /// decision 1 extend that rule to the third, fourth and fifth tables, so
+    /// this is rejected before any catalog resolve. Its text names only the
+    /// fixed table names -- no server state -- so it is safe to return
+    /// verbatim, like a validation error, and maps to HTTP 400.
     #[error(
         "a SQL query may reference exactly one of the samples, logs, spans, \
          alerts and audit tables; two signals cannot be scanned or joined \
