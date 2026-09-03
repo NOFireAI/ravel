@@ -683,22 +683,32 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
 ```
 
 No performance flags. Since #1141 the server derives all six of them from the
-host at startup, and on the reference box for this benchmark (16 cores, 30 GB)
-they resolve to exactly the settings a published entry runs under: fetch
-concurrency 32, a 24 GiB read cache, an 8 GiB per-query and 16 GiB per-tenant
-SQL pool, a 1,000,000 sealed-segment cap, and an 11 minute engine deadline.
-Both of the two settings that used to be mandatory here are among them: a
-folded ClickBench tenant sits far above the old 1024 sealed-segment ceiling, so
-an un-derived server failed every statement with `8424 exceeds max 1024`, and
-the cache must exceed the ~12 GB corpus or every run is cold and there is no hot
-column to compare.
+host at startup. Three are host-independent and match a published entry
+exactly: fetch concurrency 32 (2 per core on 16 cores), a 1,000,000
+sealed-segment cap, and an 11 minute engine deadline. The three memory-derived
+settings are computed from this box's own `MemTotal`, which Linux reports as
+32,909,025,280 bytes here, so they land within 2.2% of the published figures
+rather than on them: an 80% read cache of 26,327,220,224 bytes against the
+published 25,769,803,776, a 25% per-query SQL pool of 8,227,256,320 against
+8,053,063,680, and a 50% per-tenant pool of 16,454,512,640 against
+16,106,127,360. The catalog byte cache derives to a separate 5% ceiling,
+1,645,451,264 bytes (#1141). Do not assume the resolved values: record the
+server's own startup log lines (below) with the entry. Both of the two settings
+that used to be mandatory here are among the derived six: a folded ClickBench
+tenant sits far above the old 1024 sealed-segment ceiling, so an un-derived
+server failed every statement with `8424 exceeds max 1024`, and the cache must
+exceed the ~12 GB corpus or every run is cold and there is no hot column to
+compare.
 
 Read the resolved values off the server's own startup log rather than assuming
-them, and record them with the entry:
+them, and record them with the entry (the values below are the reference-host
+32,212,254,720-byte derivation used throughout this repo; the real box's
+32,909,025,280-byte total shifts the memory-derived lines as noted above):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"
 ```
 
 Pass a flag only to measure a setting other than the derived one; a flag logs

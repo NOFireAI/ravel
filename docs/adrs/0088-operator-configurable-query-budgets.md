@@ -148,7 +148,8 @@ The six rules, and what each is measured against on #968:
 | Setting | Derived default | #968 measurement |
 |---|---|---|
 | `--fetch-concurrency` | `max(8, 2 x cores)` | 32 on the 16-core host; this is the knob that moved a cold full scan the most, and it also sets the SQL scan partition count |
-| `--cache-max-bytes` | 80% of `MemTotal` | ~24 GiB, chosen to exceed the ~12 GB corpus so a warm run has a hot column to report |
+| `--cache-max-bytes` (fetcher cache) | 80% of `MemTotal` | ~24 GiB, chosen to exceed the ~12 GB corpus so a warm run has a hot column to report |
+| catalog byte cache | 5% of `MemTotal` (a separate ceiling, resolved as `catalog_cache_max_bytes`) | ~1.5 GiB; the fetcher cache and the catalog byte cache are two independent LRU caches, so deriving both at 80% would commit 160% of `MemTotal`. An explicit `--cache-max-bytes` still bounds both at that one value |
 | `--sql-max-query-bytes` | 25% of `MemTotal` | ~8 GiB, an order of magnitude above the largest value the in-process lane had been run at; this is the pool an `ORDER BY` or high-cardinality `GROUP BY` exhausts with `query memory budget exhausted` |
 | `--sql-tenant-max-bytes` | 50% of `MemTotal` | ~16 GiB, twice the per-query pool so a serial run never binds on the isolation ceiling |
 | `--max-segments` | 1,000,000 | a folded ClickBench tenant resolves ~8,400 sealed segments, so the old 1024 cap failed every statement with `8424 exceeds max 1024` |
@@ -165,10 +166,19 @@ Consequences of the amendment:
   `/proc/meminfo`) falls back to the exact constants this ADR shipped:
   256 MiB, 1 GiB, 256 MiB cache. A percentage of an unknown total is not
   a number, and assuming one would size a 24 GiB cache on a 2 GB box.
-- The per-query SQL pool is clamped to the per-tenant ceiling, downward
-  only. Raising the ceiling to fit a per-query flag would silently widen
-  the multi-tenant isolation bound this ADR's "Rejected alternatives"
-  defends, so the clamp lowers the per-query pool instead and warns.
+- The per-query SQL pool and the per-tenant ceiling are reconciled so
+  `sql_max_query_bytes <= sql_tenant_max_bytes` always holds, and which
+  side gives depends on which was set explicitly (issue #1141 refinement).
+  An explicit `--sql-max-query-bytes` over a non-explicit (derived or
+  fallback) tenant ceiling RAISES the ceiling to the per-query flag, so an
+  operator who typed a per-query pool on a host whose `MemTotal` was
+  unknown is not silently cut to the 1 GiB fallback tenant ceiling they
+  never set. Any other crossing (an explicit tenant ceiling, or a
+  non-explicit per-query value) CLAMPS the per-query pool down and warns:
+  lowering the multi-tenant isolation bound an operator explicitly set is
+  the one direction this ADR's "Rejected alternatives" defends against.
+  Both events are logged at startup (`sql_tenant_max_bytes_raised` /
+  `sql_max_query_bytes_clamped`).
 - The amendment answers this ADR's "Auto-tune budgets from host resources
   at startup", rejected above as hiding the actual bound in play from
   whoever reads the startup flags. That objection is met by making the

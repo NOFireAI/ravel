@@ -90,13 +90,29 @@ provide it at the filesystem/volume layer (an encrypted volume mounted at
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--cache-max-bytes <n>` | derived: 80% of MemTotal (`268435456`, 256 MiB, when memory cannot be read) | Maximum bytes the RAM tier holds. Bounds **both** caches in the process from one number: the fetcher cache and the catalog byte cache. Read once at startup; there is no live resize. |
+| `--cache-max-bytes <n>` | fetcher cache derived: 80% of MemTotal; catalog byte cache derived: 5% of MemTotal (each `268435456`, 256 MiB, when memory cannot be read) | Maximum bytes the RAM tier holds. **Set**, it bounds **both** caches at that one value. **Unset**, the two derive independently: the fetcher cache at 80% of MemTotal (`25769803776` on the 30 GB reference host) and the catalog byte cache at 5% (`1610612736`), a smaller separate ceiling so the two LRU caches do not each claim 80% of RAM. Read once at startup; there is no live resize. |
 | `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by the same `--cache-max-bytes` number (there is no separate disk-tier capacity flag). Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted (see "Two tiers" above). |
 | `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
 | `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole regardless of size; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free) this flag is **overridden**, and startup logs a WARN naming the value it overrode. |
 | `--logs-fetch-policy <policy>` | `cost-based` | The logs read shape. `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` uses ranged reads wherever they save more bytes than a request costs, for egress-billed and network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`; at the shipped reference profile (intra-region, transfer free) that resolves to request-minimal behaviour, so **a deployment on default flags reads log objects whole**. Read once at startup; the running process never changes its own policy. The resolved policy, profile, and byte quantities are logged at startup on the `logs fetch policy resolved` line. |
 | `--store-cost-profile <path>` | reference profile (`s3-intra-region-2026`) | TOML file carrying this deployment's object-store prices in integer nanodollars: `name`, `put_class_nanodollars`, `get_class_nanodollars`, `transfer_nanodollars_per_gib`, `retrieval_nanodollars_per_gib`, and optionally `delete_class_nanodollars`. Only `--logs-fetch-policy cost-based` reads it, to derive how many transferred bytes one saved request is worth; no price reaches the fetch layer. An unreadable file, invalid TOML, an unknown key, or a blank `name` fails startup rather than falling back to the reference prices. |
 | `--logs-max-fetch-run-bytes <bytes>` | `67108864` (64 MiB) | The fetch bound: the maximum length of one covering GET on the log path, on every policy. An object at or under it is read in a single request; a larger one is read as sequential block-aligned covering sub-ranges of at most this many bytes each, so one oversized object cannot pull an unbounded response into memory. `0` is refused at startup. |
+
+Both `--cache-max-bytes` figures are **LRU caps, not reservations**. Neither
+cache pre-allocates its ceiling; each holds only the bytes it has actually
+admitted and evicts least-recently-used entries once it reaches its cap. The
+ceiling is an upper bound on resident cache bytes, not memory claimed at
+startup. Because the two caches are independent and the SQL memory pools
+(`--sql-max-query-bytes`, `--sql-tenant-max-bytes`) are bounded separately
+again, the **sum of every ceiling can exceed physical RAM**: the fetcher cache
+(80% of MemTotal by default) plus the catalog byte cache (5%) plus the SQL
+pools is more than 100% of MemTotal on the reference host. That is deliberate.
+The caches only fill under a working set that touches that many distinct bytes,
+and the SQL pools abort a query rather than growing past their own ceiling, so
+the peaks do not coincide the way the arithmetic sum suggests. Size a host
+against its real working set, not against the sum of the caps. Set an explicit
+`--cache-max-bytes` to bound both caches at one value on a memory-constrained
+host, or `--disable-cache` to hold no read-cache memory at all.
 
 ### The max-age sweep
 

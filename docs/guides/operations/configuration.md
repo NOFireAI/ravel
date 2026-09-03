@@ -462,7 +462,18 @@ ravel-server --store s3 --s3-bucket my-bucket --cache-dir /var/cache/ravel
 ```
 
 There is no separate capacity flag for the disk tier. Each tier is bounded by
-the single `--cache-max-bytes` number, read once at startup with no live resize.
+`--cache-max-bytes`, read once at startup with no live resize.
+
+The fetcher cache and the catalog byte cache are two independent LRU caches.
+When `--cache-max-bytes` is **set**, both are bounded at that one value. When it
+is **unset**, the two derive separately from `MemTotal`: the fetcher cache at
+80% and the catalog byte cache at a smaller 5% (`25769803776` and `1610612736`
+on the 30 GB reference host), so deriving both at 80% cannot commit 160% of RAM.
+Both ceilings are LRU caps, not reservations: neither pre-allocates, each holds
+only the bytes it has admitted, and the sum of the two cache ceilings and the
+SQL memory pools may exceed physical RAM by design (the caches fill only under a
+working set that large, and a SQL query aborts rather than growing past its own
+pool). `--disable-cache` turns both off and holds no read-cache memory.
 
 The disk tier is disposable by design. The directory is created lazily on first
 admission and is never required to exist. A missing, full or corrupt cache
@@ -937,14 +948,15 @@ at startup; set, the flag value is used verbatim. The reference-host column is a
 |---|---|---|---|
 | `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Host cores and the store's request budget. One knob with three coupled effects: it also sets the SQL scan partition count and the object-store request concurrency. |
 | `--max-segments` | derived: 1,000,000 | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
-| `--sql-max-query-bytes` | derived: 25% of MemTotal, 256 MiB if memory is unknown | 8,053,063,680 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. Always clamped to `--sql-tenant-max-bytes`. |
+| `--sql-max-query-bytes` | derived: 25% of MemTotal, 256 MiB if memory is unknown | 8,053,063,680 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. Held at or below `--sql-tenant-max-bytes`: an explicit value here raises a non-explicit (derived or fallback) tenant ceiling to fit, but an explicit tenant ceiling clamps this down and warns. |
 | `--sql-tenant-max-bytes` | derived: 50% of MemTotal, 1 GiB if memory is unknown | 16,106,127,360 | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
 
-Two more settings are derived the same way: `--cache-max-bytes` (80% of
-MemTotal, 256 MiB if memory is unknown) and `--gc-max-query-duration`
-(11 minutes). Memory is read from `/proc/meminfo`'s `MemTotal` on Linux and is
-"unknown" everywhere else; cores come from the process's available parallelism,
-floored at 1. Percentages truncate.
+Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
+80% of MemTotal, catalog byte cache a separate 5% ceiling, 256 MiB each if
+memory is unknown; an explicit flag bounds both at that one value) and
+`--gc-max-query-duration` (11 minutes). Memory is read from `/proc/meminfo`'s
+`MemTotal` on Linux and is "unknown" everywhere else; cores come from the
+process's available parallelism, floored at 1. Percentages truncate.
 
 Every resolved value is logged once at startup with the source it came from
 (`derived`, `flag`, or `fallback`), so `journalctl -u ravel-server | grep
@@ -955,6 +967,7 @@ with" without reading the unit file:
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
 INFO performance default resolved setting="max_segments" value=1000000 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"
 INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived"
 INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived"
 INFO performance default resolved setting="gc_max_query_duration" value=660 source="derived"

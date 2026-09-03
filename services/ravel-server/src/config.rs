@@ -499,7 +499,9 @@ pub struct Cli {
     /// Governs a single SQL query's intermediate `RecordBatch` footprint; a
     /// query whose pool grow would exceed it aborts rather than growing without
     /// bound. Process-wide, not per-tenant (per-tenant SQL budgets wait on the
-    /// limits-file's per-tenant enforcement gap, ADR-0088).
+    /// limits-file's per-tenant enforcement gap, ADR-0088). Default when unset:
+    /// derived, 25% of MemTotal; reference host (16 cores, 30 GB): 8,053,063,680.
+    /// Fallback when MemTotal is unknown: 256 MiB.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
@@ -516,7 +518,9 @@ pub struct Cli {
     /// `SqlExecutor`'s per-tenant accountant. The multi-tenant isolation bound:
     /// one tenant's wide scans cannot starve another tenant's query pool. Sits
     /// above `--sql-max-query-bytes` (the per-query ceiling). Process-wide, not
-    /// itself per-tenant-overridable (ADR-0088).
+    /// itself per-tenant-overridable (ADR-0088). Default when unset: derived,
+    /// 50% of MemTotal; reference host (16 cores, 30 GB): 16,106,127,360.
+    /// Fallback when MemTotal is unknown: 1 GiB.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
@@ -652,7 +656,10 @@ pub struct Cli {
     /// scan partition count (`target_partitions` in
     /// `crates/ravel-sql/src/session.rs`), and S3 GET concurrency (ADR-0087).
     /// Raising it widens all three together; sizing it is a memory-vs-latency
-    /// trade against the host's cores and the store's request budget.
+    /// trade against the host's cores and the store's request budget. Default
+    /// when unset: derived, max(8, 2 x cores); reference host (16 cores, 30 GB):
+    /// 32. Floor of 8 (the compiled-in default) on a 1-2 core host; this rule is
+    /// core-derived, so MemTotal being unknown does not change it.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
@@ -667,7 +674,10 @@ pub struct Cli {
     /// a tenant with many sealed-below-watermark L0/L1 objects hits this cap
     /// directly (only the narrow `SegmentOrigin::Recent` set, roughly the last
     /// couple of hours, is exempt); this flag is what lets an operator raise it
-    /// for such a workload.
+    /// for such a workload. Default when unset: derived (host-independent):
+    /// 1,000,000; reference host (16 cores, 30 GB): 1,000,000. A segment-count
+    /// cap is a plan-width bound, not resident bytes, so it does not scale with
+    /// MemTotal and has no memory fallback.
     ///
     /// Omitted, the value is DERIVED ([`resolve_performance_defaults`],
     /// ADR-0088 as amended by issue #1141): [`DERIVED_MAX_SEGMENTS`]
@@ -812,17 +822,22 @@ pub struct Cli {
     #[arg(long)]
     pub otap: bool,
 
-    /// Maximum resident bytes for the ADR-0046 read caches' RAM tier. Bounds
-    /// every ADR-0046 cache in the process from this one number: the query
-    /// fetcher cache (`store::build_cache`) and the catalog's byte cache
-    /// (`query::build_catalog`) both, not just the fetcher cache.
-    /// Read at startup only; there is no live resize. Ignored when
-    /// `--disable-cache` is set.
+    /// Maximum resident bytes for the ADR-0046 read caches' RAM tier. When SET,
+    /// bounds BOTH caches from this one number: the query fetcher cache
+    /// (`store::build_cache`) and the catalog's byte cache
+    /// (`query::build_catalog`). When UNSET the two derive independently, the
+    /// catalog cache at a smaller share (they are separate LRU caches, so one
+    /// number would double-commit RAM). Read at startup only; there is no live
+    /// resize. Ignored when `--disable-cache` is set. Default when unset:
+    /// derived, 80% of MemTotal for the fetcher cache and 5% for the catalog
+    /// byte cache; reference host (16 cores, 30 GB): 25,769,803,776 and
+    /// 1,610,612,736. Fallback when MemTotal is unknown: 256 MiB each.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
-    /// [`CACHE_MEMORY_PERCENT`] of `MemTotal`, or [`DEFAULT_CACHE_MAX_BYTES`]
-    /// (256 MiB) when memory cannot be read.
+    /// the fetcher cache takes [`CACHE_MEMORY_PERCENT`] of `MemTotal` and the
+    /// catalog byte cache [`CATALOG_CACHE_MEMORY_PERCENT`], or
+    /// [`DEFAULT_CACHE_MAX_BYTES`] (256 MiB) each when memory cannot be read.
     #[arg(long, value_name = "BYTES")]
     pub cache_max_bytes: Option<u64>,
 
@@ -898,7 +913,10 @@ pub struct Cli {
     /// `30s`). Query-mode startup requires it to be `<=` the durable `sys/gc`
     /// `max_query_duration` (ADR-0050 section 4). Feeds the real
     /// `QueryEngine` (`EngineConfig::deadline`) as well as the validation, so
-    /// the value validated is the value enforced.
+    /// the value validated is the value enforced. Default when unset: derived
+    /// (host-independent): 11m; reference host (16 cores, 30 GB): 11m. A
+    /// deadline is wall-clock, not resident bytes, so it does not scale with
+    /// MemTotal and has no memory fallback.
     ///
     /// Omitted, the value is DERIVED ([`resolve_performance_defaults`],
     /// ADR-0088 as amended by issue #1141): [`DERIVED_QUERY_DEADLINE`]
@@ -1479,6 +1497,15 @@ pub const MIN_DERIVED_FETCH_CONCURRENCY: usize = 8;
 /// 30 GB reference host is the ~24 GiB read cache of the #968 measurement.
 pub const CACHE_MEMORY_PERCENT: u64 = 80;
 
+/// Share of `MemTotal` the derived catalog byte cache takes, a SEPARATE ceiling
+/// from [`CACHE_MEMORY_PERCENT`]. The fetcher cache (`store::build_cache`) and
+/// the catalog byte cache (`query::build_catalog`) are two independent LRU
+/// caches, so deriving both at 80% would let the pair commit 160% of `MemTotal`.
+/// 5% on the 30 GB reference host is ~1.5 GiB of catalog objects, enough for a
+/// wide fold's HEAD/part working set without doubling the fetcher's claim. An
+/// explicit `--cache-max-bytes` still bounds both caches at that one value.
+pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
+
 /// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~8 GiB on the
 /// reference host).
 pub const SQL_QUERY_MEMORY_PERCENT: u64 = 25;
@@ -1546,8 +1573,17 @@ pub struct ResolvedPerformanceDefaults {
     pub fetch_concurrency: usize,
     /// Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
-    /// Reaches every ADR-0046 read cache's byte ceiling.
+    /// Reaches the query fetcher cache's byte ceiling
+    /// (`store::build_cache`). NOT the catalog byte cache: that has its own
+    /// [`Self::catalog_cache_max_bytes`], so the two independent LRU caches do
+    /// not each claim the full derived share of RAM.
     pub cache_max_bytes: u64,
+    /// Reaches the catalog byte cache's byte ceiling
+    /// (`query::build_catalog`), a SEPARATE LRU from the fetcher cache. Derived
+    /// at [`CATALOG_CACHE_MEMORY_PERCENT`] rather than sharing
+    /// [`Self::cache_max_bytes`]'s 80%; an explicit `--cache-max-bytes` sets
+    /// both equal.
+    pub catalog_cache_max_bytes: u64,
     /// Reaches `SqlConfig::max_query_bytes`. Never above
     /// [`Self::sql_tenant_max_bytes`].
     pub sql_max_query_bytes: usize,
@@ -1559,10 +1595,18 @@ pub struct ResolvedPerformanceDefaults {
     /// [`PERF_SOURCE_DERIVED`], or [`PERF_SOURCE_FALLBACK`].
     pub sources: PerformanceSources,
     /// Whether the per-query SQL pool was reduced to the per-tenant ceiling.
-    /// True only when the two would otherwise have crossed; the startup log
-    /// says so, because the operator's `--sql-max-query-bytes` is then not the
-    /// number in force.
+    /// True only when the two crossed and the tenant ceiling won: an explicit
+    /// tenant flag against any per-query value, or a non-explicit per-query
+    /// value against any tenant ceiling. The startup log says so, because the
+    /// operator's `--sql-max-query-bytes` is then not the number in force.
     pub sql_max_query_bytes_clamped: bool,
+    /// Whether a non-explicit (derived or fallback) per-tenant ceiling was
+    /// raised to fit an explicit `--sql-max-query-bytes`. True only when an
+    /// explicit per-query flag exceeded a tenant ceiling the operator did not
+    /// set; the tenant ceiling then equals the per-query pool. The startup log
+    /// says so, because the per-tenant number in force is not what the
+    /// derivation alone produced.
+    pub sql_tenant_max_bytes_raised: bool,
 }
 
 /// The provenance of each field of [`ResolvedPerformanceDefaults`], carried
@@ -1572,6 +1616,7 @@ pub struct PerformanceSources {
     pub fetch_concurrency: &'static str,
     pub max_segments: &'static str,
     pub cache_max_bytes: &'static str,
+    pub catalog_cache_max_bytes: &'static str,
     pub sql_max_query_bytes: &'static str,
     pub sql_tenant_max_bytes: &'static str,
     pub query_deadline: &'static str,
@@ -1605,8 +1650,12 @@ fn bytes_as_usize(bytes: u64) -> usize {
 ///
 /// - `fetch_concurrency`: `max(MIN_DERIVED_FETCH_CONCURRENCY,
 ///   FETCH_CONCURRENCY_PER_CORE * cores)`.
-/// - `cache_max_bytes`: [`CACHE_MEMORY_PERCENT`] of `MemTotal`, else
-///   [`DEFAULT_CACHE_MAX_BYTES`].
+/// - `cache_max_bytes` (fetcher cache): [`CACHE_MEMORY_PERCENT`] of `MemTotal`,
+///   else [`DEFAULT_CACHE_MAX_BYTES`].
+/// - `catalog_cache_max_bytes` (catalog byte cache): a SEPARATE ceiling,
+///   [`CATALOG_CACHE_MEMORY_PERCENT`] of `MemTotal`, else
+///   [`DEFAULT_CACHE_MAX_BYTES`]. An explicit `--cache-max-bytes` sets it equal
+///   to `cache_max_bytes`, preserving the pre-#1141 single-number coupling.
 /// - `sql_max_query_bytes`: [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`, else
 ///   [`DEFAULT_SQL_MAX_QUERY_BYTES`].
 /// - `sql_tenant_max_bytes`: [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, else
@@ -1614,11 +1663,22 @@ fn bytes_as_usize(bytes: u64) -> usize {
 /// - `max_segments`: [`DERIVED_MAX_SEGMENTS`].
 /// - `query_deadline`: [`DERIVED_QUERY_DEADLINE`].
 ///
-/// The per-query SQL pool is then clamped to the per-tenant ceiling. The clamp
-/// only ever LOWERS the per-query pool: raising the tenant ceiling to fit a
-/// per-query flag would silently widen the multi-tenant isolation bound the
-/// operator set, which is the one direction that costs isolation rather than
-/// throughput.
+/// The per-query SQL pool and the per-tenant ceiling are then reconciled so
+/// `sql_max_query_bytes <= sql_tenant_max_bytes` always holds. Which side gives
+/// depends on which was set explicitly:
+///
+/// - explicit `--sql-max-query-bytes` over a non-explicit (derived or fallback)
+///   tenant ceiling: RAISE the tenant ceiling to the per-query flag
+///   (`sql_tenant_max_bytes_raised`). An operator who typed a per-query pool on
+///   a host whose `MemTotal` was unknown must not have it silently cut to the
+///   1 GiB fallback tenant ceiling they never set.
+/// - any other crossing (an explicit tenant ceiling, or a non-explicit
+///   per-query value): CLAMP the per-query pool down to the tenant ceiling
+///   (`sql_max_query_bytes_clamped`) and warn. Lowering an isolation bound the
+///   operator explicitly set is the one direction that costs isolation.
+///
+/// Derived-vs-derived and fallback-vs-fallback never cross by construction
+/// (25% <= 50%, 256 MiB <= 1 GiB), so neither flag fires there.
 pub fn resolve_performance_defaults(
     host: HostProfile,
     flags: PerformanceFlags,
@@ -1644,6 +1704,20 @@ pub fn resolve_performance_defaults(
         (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
     };
 
+    // The catalog byte cache is a SEPARATE LRU from the fetcher cache, so an
+    // unset flag derives it at its own smaller share rather than committing a
+    // second 80% of RAM. An explicit `--cache-max-bytes` bounds both at that
+    // one value (the pre-#1141 coupling).
+    let (catalog_cache_max_bytes, catalog_cache_source) =
+        match (flags.cache_max_bytes, host.mem_total_bytes) {
+            (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, Some(total)) => (
+                percent_of(total, CATALOG_CACHE_MEMORY_PERCENT),
+                PERF_SOURCE_DERIVED,
+            ),
+            (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
+        };
+
     let (sql_tenant_max_bytes, tenant_source) =
         match (flags.sql_tenant_max_bytes, host.mem_total_bytes) {
             (Some(n), _) => (n, PERF_SOURCE_FLAG),
@@ -1663,7 +1737,25 @@ pub fn resolve_performance_defaults(
             ),
             (None, None) => (DEFAULT_SQL_MAX_QUERY_BYTES, PERF_SOURCE_FALLBACK),
         };
-    let sql_max_query_bytes = unclamped_query_bytes.min(sql_tenant_max_bytes);
+    // Reconcile the per-query pool with the per-tenant ceiling, keeping the
+    // invariant sql_max_query_bytes <= sql_tenant_max_bytes. An EXPLICIT
+    // per-query flag raises a non-explicit tenant ceiling to fit; any other
+    // crossing clamps the per-query pool down (see the doc comment above).
+    let query_bytes_explicit = query_bytes_source == PERF_SOURCE_FLAG;
+    let tenant_explicit = tenant_source == PERF_SOURCE_FLAG;
+    let mut sql_max_query_bytes = unclamped_query_bytes;
+    let mut sql_tenant_max_bytes = sql_tenant_max_bytes;
+    let mut sql_max_query_bytes_clamped = false;
+    let mut sql_tenant_max_bytes_raised = false;
+    if unclamped_query_bytes > sql_tenant_max_bytes {
+        if query_bytes_explicit && !tenant_explicit {
+            sql_tenant_max_bytes = unclamped_query_bytes;
+            sql_tenant_max_bytes_raised = true;
+        } else {
+            sql_max_query_bytes = sql_tenant_max_bytes;
+            sql_max_query_bytes_clamped = true;
+        }
+    }
 
     let (query_deadline, deadline_source) = match flags.query_deadline {
         Some(d) => (d, PERF_SOURCE_FLAG),
@@ -1674,6 +1766,7 @@ pub fn resolve_performance_defaults(
         fetch_concurrency,
         max_segments,
         cache_max_bytes,
+        catalog_cache_max_bytes,
         sql_max_query_bytes,
         sql_tenant_max_bytes,
         query_deadline,
@@ -1681,11 +1774,13 @@ pub fn resolve_performance_defaults(
             fetch_concurrency: fetch_source,
             max_segments: segments_source,
             cache_max_bytes: cache_source,
+            catalog_cache_max_bytes: catalog_cache_source,
             sql_max_query_bytes: query_bytes_source,
             sql_tenant_max_bytes: tenant_source,
             query_deadline: deadline_source,
         },
-        sql_max_query_bytes_clamped: sql_max_query_bytes != unclamped_query_bytes,
+        sql_max_query_bytes_clamped,
+        sql_tenant_max_bytes_raised,
     }
 }
 
@@ -1723,6 +1818,12 @@ impl ResolvedPerformanceDefaults {
             source = self.sources.cache_max_bytes,
             "performance default resolved"
         );
+        tracing::info!(
+            setting = "catalog_cache_max_bytes",
+            value = self.catalog_cache_max_bytes,
+            source = self.sources.catalog_cache_max_bytes,
+            "performance default resolved"
+        );
         // The only line that carries `clamped`: when it is true the value is
         // the per-tenant ceiling, not what `source` resolved, and a reader who
         // saw `source="derived"` alone would go looking for a derivation that
@@ -1752,6 +1853,14 @@ impl ResolvedPerformanceDefaults {
                 sql_tenant_max_bytes = self.sql_tenant_max_bytes,
                 "--sql-max-query-bytes was clamped to --sql-tenant-max-bytes: a single query may \
                  never hold more than its tenant's whole ceiling"
+            );
+        }
+        if self.sql_tenant_max_bytes_raised {
+            tracing::warn!(
+                sql_max_query_bytes = self.sql_max_query_bytes,
+                sql_tenant_max_bytes = self.sql_tenant_max_bytes,
+                "--sql-tenant-max-bytes was raised to fit an explicit --sql-max-query-bytes: the \
+                 derived per-tenant ceiling now equals the per-query pool the operator set"
             );
         }
     }
@@ -4702,6 +4811,10 @@ mod tests {
 
         assert_eq!(resolved.fetch_concurrency, 32);
         assert_eq!(resolved.cache_max_bytes, 25_769_803_776);
+        // The catalog byte cache derives at its own 5% share, a separate
+        // ceiling from the fetcher cache's 80%, so the pair does not commit
+        // 160% of RAM.
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_610_612_736);
         assert_eq!(resolved.sql_max_query_bytes, 8_053_063_680);
         assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
         assert_eq!(resolved.max_segments, 1_000_000);
@@ -4712,11 +4825,16 @@ mod tests {
         // not run.
         assert_eq!(resolved.sources.fetch_concurrency, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_DERIVED
+        );
         assert_eq!(resolved.sources.sql_max_query_bytes, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.sources.max_segments, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.sources.query_deadline, PERF_SOURCE_DERIVED);
         assert!(!resolved.sql_max_query_bytes_clamped);
+        assert!(!resolved.sql_tenant_max_bytes_raised);
     }
 
     /// A smaller host gets proportional, safe values from the same rules: 4
@@ -4734,6 +4852,8 @@ mod tests {
 
         assert_eq!(resolved.fetch_concurrency, 8);
         assert_eq!(resolved.cache_max_bytes, 6_871_947_673);
+        // Catalog cache is 5% of the same 8 GiB, truncated.
+        assert_eq!(resolved.catalog_cache_max_bytes, 429_496_729);
         assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
         assert_eq!(resolved.sql_tenant_max_bytes, 4_294_967_296);
         // The two host-independent rules do not shrink with the host: a
@@ -4766,6 +4886,14 @@ mod tests {
 
         assert_eq!(resolved.cache_max_bytes, 268_435_456);
         assert_eq!(resolved.cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        // The catalog byte cache falls back to the same constant: a percentage
+        // of an unknown total is not a number.
+        assert_eq!(resolved.catalog_cache_max_bytes, 268_435_456);
+        assert_eq!(resolved.catalog_cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_FALLBACK
+        );
         assert_eq!(resolved.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
         assert_eq!(resolved.sql_tenant_max_bytes, DEFAULT_SQL_TENANT_MAX_BYTES);
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FALLBACK);
@@ -4825,6 +4953,10 @@ mod tests {
         );
         assert_eq!(with_cache.cache_max_bytes, 4096);
         assert_eq!(with_cache.sources.cache_max_bytes, PERF_SOURCE_FLAG);
+        // An explicit --cache-max-bytes bounds BOTH caches at that value,
+        // preserving the pre-#1141 single-number coupling.
+        assert_eq!(with_cache.catalog_cache_max_bytes, 4096);
+        assert_eq!(with_cache.sources.catalog_cache_max_bytes, PERF_SOURCE_FLAG);
         assert_eq!(
             with_cache.sql_max_query_bytes, derived.sql_max_query_bytes,
             "the cache flag must not disturb the SQL pools"
@@ -4923,6 +5055,161 @@ mod tests {
         assert_eq!(both.sql_max_query_bytes, 4 * 1024 * 1024);
         assert_eq!(both.sql_tenant_max_bytes, 4 * 1024 * 1024);
         assert!(both.sql_max_query_bytes_clamped);
+        assert!(!both.sql_tenant_max_bytes_raised);
+    }
+
+    /// The catalog byte cache is a SEPARATE derived ceiling from the fetcher
+    /// cache (issue #1141): unset, it takes 5% of `MemTotal` while the fetcher
+    /// cache takes 80%, so the two independent LRU caches do not each claim the
+    /// full share; an explicit `--cache-max-bytes` sets both equal, the
+    /// pre-#1141 coupling. Exact integers, one host shape each.
+    ///
+    /// Prove-the-test: change [`CATALOG_CACHE_MEMORY_PERCENT`] from 5 to 80 and
+    /// the reference assertion reads 25,769,803,776 against the expected
+    /// 1,610,612,736; drop the `(Some(n), _)` arm of the catalog match and the
+    /// explicit-flag case reads the derived 1,610,612,736 against 12,345,678.
+    #[test]
+    fn the_catalog_cache_derives_at_its_own_share_and_the_flag_couples_both() {
+        // Reference profile: fetcher 80%, catalog 5% of the same total.
+        let reference = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(reference.cache_max_bytes, 25_769_803_776);
+        assert_eq!(reference.catalog_cache_max_bytes, 1_610_612_736);
+
+        // 4 cores / 8 GiB.
+        let small = resolve_performance_defaults(
+            HostProfile::new(4, Some(8 * 1024 * 1024 * 1024)),
+            PerformanceFlags::default(),
+        );
+        assert_eq!(small.catalog_cache_max_bytes, 429_496_729);
+
+        // Unknown memory: both fall back to the compiled-in constant.
+        let unknown =
+            resolve_performance_defaults(HostProfile::new(16, None), PerformanceFlags::default());
+        assert_eq!(unknown.catalog_cache_max_bytes, 268_435_456);
+        assert_eq!(
+            unknown.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_FALLBACK
+        );
+
+        // Explicit flag: both caches take the flag value verbatim.
+        let flagged = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                cache_max_bytes: Some(12_345_678),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(flagged.cache_max_bytes, 12_345_678);
+        assert_eq!(flagged.catalog_cache_max_bytes, 12_345_678);
+        assert_eq!(flagged.sources.catalog_cache_max_bytes, PERF_SOURCE_FLAG);
+    }
+
+    /// Issue #1141 clamp rule: an EXPLICIT per-query pool RAISES a non-explicit
+    /// (derived or fallback) per-tenant ceiling to fit rather than being cut to
+    /// it. An operator who typed `--sql-max-query-bytes` on a host whose
+    /// `MemTotal` was unknown must not have it silently clamped to the 1 GiB
+    /// fallback tenant ceiling they never set.
+    ///
+    /// Prove-the-test: replace the raise branch with the clamp
+    /// (`sql_max_query_bytes = sql_tenant_max_bytes`) and the first assertion
+    /// reads 1,073,741,824 against the expected 8,589,934,592.
+    #[test]
+    fn an_explicit_query_pool_raises_a_non_explicit_tenant_ceiling() {
+        // Flag per-query 8 GiB against the FALLBACK tenant ceiling (memory
+        // unknown, so tenant is the 1 GiB compiled-in default).
+        let raised_over_fallback = resolve_performance_defaults(
+            HostProfile::new(16, None),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(8 * 1024 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            raised_over_fallback.sql_max_query_bytes,
+            8 * 1024 * 1024 * 1024,
+            "the explicit per-query flag must be used verbatim, not clamped to the fallback tenant \
+             ceiling"
+        );
+        assert_eq!(
+            raised_over_fallback.sql_tenant_max_bytes,
+            8 * 1024 * 1024 * 1024,
+            "the non-explicit tenant ceiling is raised to the per-query flag"
+        );
+        assert!(raised_over_fallback.sql_tenant_max_bytes_raised);
+        assert!(!raised_over_fallback.sql_max_query_bytes_clamped);
+
+        // Flag per-query 20 GiB against the DERIVED tenant ceiling on the
+        // reference host (16 GiB): the derived ceiling is raised to 20 GiB.
+        let raised_over_derived = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(20 * 1024 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            raised_over_derived.sql_max_query_bytes,
+            20 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            raised_over_derived.sql_tenant_max_bytes,
+            20 * 1024 * 1024 * 1024
+        );
+        assert!(raised_over_derived.sql_tenant_max_bytes_raised);
+        assert!(!raised_over_derived.sql_max_query_bytes_clamped);
+    }
+
+    /// Issue #1141 clamp rule, the other side: an EXPLICIT per-tenant ceiling
+    /// clamps an explicit per-query pool down (never raises the ceiling the
+    /// operator set), and a derived-vs-derived pair never crosses so neither
+    /// flag fires.
+    ///
+    /// Prove-the-test: make the clamp branch raise instead
+    /// (`sql_tenant_max_bytes = unclamped_query_bytes`) and the first tenant
+    /// assertion reads 8,589,934,592 against the expected 1,073,741,824.
+    #[test]
+    fn an_explicit_tenant_ceiling_clamps_an_explicit_query_pool() {
+        // Both explicit, crossed: the tenant ceiling wins and the per-query
+        // pool is clamped to it.
+        let clamped = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                sql_max_query_bytes: Some(8 * 1024 * 1024 * 1024),
+                sql_tenant_max_bytes: Some(1024 * 1024 * 1024),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(clamped.sql_max_query_bytes, 1024 * 1024 * 1024);
+        assert_eq!(
+            clamped.sql_tenant_max_bytes,
+            1024 * 1024 * 1024,
+            "the explicit tenant ceiling is used verbatim, never raised to fit the per-query flag"
+        );
+        assert!(clamped.sql_max_query_bytes_clamped);
+        assert!(!clamped.sql_tenant_max_bytes_raised);
+
+        // Derived vs derived on the reference host: 25% <= 50% by construction,
+        // so no crossing and neither flag fires.
+        let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(derived.sql_max_query_bytes, 8_053_063_680);
+        assert_eq!(derived.sql_tenant_max_bytes, 16_106_127_360);
+        assert!(!derived.sql_max_query_bytes_clamped);
+        assert!(!derived.sql_tenant_max_bytes_raised);
+    }
+
+    /// The derived fetch-concurrency floor is the compiled-in library default,
+    /// as [`MIN_DERIVED_FETCH_CONCURRENCY`]'s doc comment claims: a 1-2 core
+    /// host keeps today's fan-out rather than dropping below it. Pinned so a
+    /// change to either constant that breaks the equality fails here rather than
+    /// silently lowering the floor.
+    #[test]
+    fn min_derived_fetch_concurrency_matches_compiled_in_default() {
+        assert_eq!(
+            MIN_DERIVED_FETCH_CONCURRENCY,
+            ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            "the derived fetch-concurrency floor must equal the compiled-in library default it \
+             claims to be"
+        );
     }
 
     /// `/proc/meminfo` parsing: the real shape, and every malformed shape
