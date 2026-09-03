@@ -116,6 +116,30 @@ fn stream_ident_with(n: u32, extra: &[(&str, AttrValue)]) -> (LogStreamId, Vec<u
     (id, blob)
 }
 
+/// The same as [`stream_ident_with`], but also carrying `scope_extra`
+/// attributes beyond an otherwise-empty scope set, so a declared column's
+/// stream-level fallback can be exercised on either half of the merged view
+/// in one stream (issue #1057 finding 1: a List/Map resource occurrence must
+/// not shadow a matching-typed scope occurrence behind it).
+fn stream_ident_with_scope(
+    n: u32,
+    res_extra: &[(&str, AttrValue)],
+    scope_extra: &[(&str, AttrValue)],
+) -> (LogStreamId, Vec<u8>) {
+    let mut res = vec![(
+        "service.name".to_string(),
+        AttrValue::Str(format!("svc{n}")),
+    )];
+    res.extend(res_extra.iter().map(|(k, v)| ((*k).to_string(), v.clone())));
+    let scope: Vec<(String, AttrValue)> = scope_extra
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect();
+    let id = log_stream_id(&res, "scope", "1", &scope);
+    let blob = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &scope);
+    (id, blob)
+}
+
 /// One record at `ts` on an explicit stream, carrying `attrs` and nothing else.
 fn rec_on(stream: &(LogStreamId, Vec<u8>), ts: i64, attrs: Vec<(&str, AttrValue)>) -> LogRecord {
     LogRecord {
@@ -522,6 +546,46 @@ async fn record_attribute_overrides_the_stream_level_value_for_its_row() {
         part_i64(p, STATUS),
         (Some(2), Some(7), 1),
         "2 from the record, 7 from the stream, one NULL for the Str row"
+    );
+}
+
+/// Issue #1057 finding 1: a stream whose RESOURCE attributes carry the
+/// declared column as a List and whose SCOPE attributes carry it as a
+/// matching-typed I64 must fall back to the scope value for a row that does
+/// not set the key itself, exactly as the compaction record's own reader
+/// resolves it -- the same shape as `list_resource_attribute_is_skipped_for_a_
+/// matching_scope_fallback` in `ravel-ingest`, recomputed by the compactor.
+///
+/// Prove-the-test: drop the `AttrValue::List(_) | AttrValue::Map(_)` skip
+/// from `DeclaredSchema::build` (crates/ravel-maintain/src/rlog.rs) and the
+/// List's first occurrence claims `STATUS` with no fallback, so the part
+/// stamps `(Some(2), Some(2), 2)` (the base's wrong answer) instead of
+/// `(Some(2), Some(7), 0)`.
+#[tokio::test]
+async fn part_stamps_skip_list_resource_for_a_matching_scope_fallback() {
+    let store = MemoryStore::new();
+    let stream = stream_ident_with_scope(
+        7,
+        &[(STATUS, AttrValue::List(vec![AttrValue::I64(1)]))],
+        &[(STATUS, AttrValue::I64(7))],
+    );
+    let input_1 = vec![
+        rec_on(&stream, 1000, vec![(STATUS, AttrValue::I64(2))]),
+        rec_on(&stream, 3000, vec![]),
+    ];
+    let input_2 = vec![rec_on(&stream, 2000, vec![])];
+    seed(&store, Uuid::from_u128(40), 1, &input_1, true).await;
+    seed(&store, Uuid::from_u128(41), 2, &input_2, true).await;
+
+    let record = compact_and_record(&store, &CompactorConfig::default()).await;
+    assert_eq!(record.parts.len(), 1, "three small records -> one part");
+    let p = &record.parts[0];
+    assert_eq!(p.sample_count, 3);
+    assert_eq!(
+        part_i64(p, STATUS),
+        (Some(2), Some(7), 0),
+        "the List resource occurrence is skipped; the scope's 7 is the \
+         fallback for the two rows that do not set STATUS themselves"
     );
 }
 
