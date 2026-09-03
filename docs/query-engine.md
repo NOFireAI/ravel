@@ -1774,9 +1774,9 @@ Surface: 133 constructs over 242 corpus entries in 10 corpus files.
 
 ## SQL over logs (the `logs` table, ADR-0033)
 
-`POST /api/v1/sql` serves two tables from one endpoint: `samples`
-(`Signal::Metrics`) and `logs` (`Signal::Logs`). There is no separate logs
-endpoint and no protocol change. DataFusion does not choose between two
+`POST /api/v1/sql` serves five tables from one endpoint, of which this section
+covers two: `samples` (`Signal::Metrics`) and `logs` (`Signal::Logs`). There is
+no separate logs endpoint and no protocol change. DataFusion does not choose between two
 registered tables: `SqlExecutor` decides which single table a query targets by
 parsing its `FROM` clause *before* planning (through the same parser the
 read-only gate uses, never a raw-text scan), resolves a snapshot for that one
@@ -1785,9 +1785,10 @@ signal, and registers exactly that one table in the per-query `SessionContext`
 otherwise. A `WITH <name> AS (...)` CTE that happens to be named `logs` or
 `samples` is a query-local name, not a base-table reference, and does not
 change the target (`WITH logs AS (SELECT value FROM samples) SELECT count(*)
-FROM logs` is a metrics-only query). A query naming both real tables is
-rejected before any catalog listing (HTTP 400): v1 admits one signal per
-query, and no query needs to scan or join metrics and logs together.
+FROM logs` is a metrics-only query). A query naming two real tables, these two
+or any other pair of the five, is rejected before any catalog listing (HTTP
+400): v1 admits one signal per query, and no query needs to scan or join two
+signals together.
 
 Schema (fixed columns plus one map):
 
@@ -2273,8 +2274,9 @@ oversights.
 
 ## SQL over spans (the `spans` table, ADR-0045)
 
-`POST /api/v1/sql` serves a third table alongside `samples` and `logs`:
-`spans` (`Signal::Spans`). It follows the same one-signal-per-query rule the
+`POST /api/v1/sql` serves `spans` (`Signal::Spans`) alongside `samples` and
+`logs`, and alongside the `alerts` and `audit` tables the next section covers.
+It follows the same one-signal-per-query rule the
 logs table established. `SqlExecutor` decides the target table from the `FROM`
 clause before planning, resolves a snapshot for that one signal, and registers
 exactly the one table in the per-query `SessionContext`. A query naming two real
@@ -2389,6 +2391,121 @@ The page-byte counters on `QueryAccounting` (`page_bytes_fetched` /
 they do for logs. They are the byte-weighted view of the same decode: page
 counts weight every page equally, while an attribute or event page usually
 carries far more bytes than a fixed-width one.
+
+## SQL over alerts and audit (the `alerts` and `audit` tables, ADR-1101)
+
+`POST /api/v1/sql` and Flight SQL serve `alerts` (`Signal::Alerts`) and `audit`
+(`Signal::Audit`) as the fourth and fifth tables, on the same terms as the three
+above. `SqlExecutor` reads the target from the `FROM` clause before planning,
+counts five names, and rejects a query that names two of them with
+`CrossSignalQuery` before any catalog listing (HTTP 400). It then resolves a
+snapshot for that one signal and registers exactly one table in the per-query
+`SessionContext`, as it does for every other target; a CTE named `alerts` or
+`audit` is a query-local name and does not change the target. Flight SQL's
+`CommandGetTables` lists all five tables with their public schemas: that is
+static catalog metadata built from the five schema functions, independent of the
+per-query session, which still registers one table.
+
+Both tables are built on the logs table's machinery. An alert record and an
+audit record are RLOG records (ADR-0040), so both providers scan through the
+same `LogSegmentFetcher` the `logs` table reads through, with the query's tenant
+hash, the same cache attachment, the same erasure filtering, and the same
+`QueryAccounting` handle. Cost estimation reuses the logs estimator rather than a
+renamed copy: the fetch funnel is identical, so the estimate is identical, and
+two estimators over one funnel would only drift.
+
+Schemas (`crates/ravel-sql/src/alerts_schema.rs`,
+`crates/ravel-sql/src/audit_schema.rs`):
+
+- `alerts`: `ts_ns` (`Timestamp(Nanosecond, None)`, non-null); `alert_id`,
+  `rule_id`, `state` (`Utf8`, nullable) and `generation` (`Int64`, nullable),
+  the four promoted scalar attributes every well-formed alert record carries;
+  `writer_id` (`Utf8`), `writer_epoch` (`UInt64`) and `writer_seq` (`UInt64`),
+  non-null, stamped from the commit record of the object the row was read from;
+  and `attrs` (`Map(Utf8, Utf8)`), the whole merged attribute map, including the
+  promoted keys and the open-ended `label.<name>` and `annotation.<name>` sets.
+- `audit`: `ts_ns` (`Timestamp(Nanosecond, None)`), `severity_text` and `body`
+  (`Utf8`), all non-null, and `attrs` (`Map(Utf8, Utf8)`). No record-specific
+  field is promoted, because the record kinds differ (`kind = query`,
+  `legal_hold`, `reshard`) and a later kind must not need a schema change.
+
+Row contract. `alerts` exposes raw history: one row per state transition, never
+a folded current-state row. The three write-identity columns exist because
+`ts_ns` alone is not a total order over that history. Two evaluators can overlap
+briefly at a lease handover and write the same `alert_id` at the same `ts_ns`;
+the evaluator's own fold breaks that tie with the record's epoch and sequence,
+and the table exposes the same keys plus `writer_id` so a SQL fold has a total
+order and can never return two current rows for one alert. Current state is the
+row that sorts first per `alert_id` under `ts_ns DESC, writer_epoch DESC,
+writer_seq DESC, writer_id DESC`:
+
+```sql
+SELECT *
+FROM (
+  SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY alert_id
+           ORDER BY ts_ns DESC, writer_epoch DESC, writer_seq DESC,
+                    writer_id DESC
+         ) AS rn
+  FROM alerts
+)
+WHERE rn = 1;
+```
+
+`row_number` is an admitted window function. A rule that reads
+`SELECT * FROM alerts` (alerts-on-alerts, ADR-0043) sees every transition, which
+is what the generation guard in ADR-0040 counts over. `audit` likewise exposes
+one row per record.
+
+Supported predicates (widen-only on both tables; `supports_filters_pushdown`
+returns `Inexact` for every filter, so DataFusion re-applies the originals above
+the scan):
+
+- `ts_ns` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and `BETWEEN`) on both
+  tables, folded into one inclusive window that feeds segment-level pruning and
+  the fetch's `LogQuery` bounds.
+- On `alerts` only, `alert_id = '<literal>'` and `rule_id = '<literal>'`
+  equality, compiled to a `Predicate::Equals` on the corresponding record
+  attribute and handed to the RLOG reader, which prunes blocks by the attribute
+  bloom and re-checks each surviving row. Unlike the `logs` table's
+  stream-attribute equalities, these are genuine per-record attributes, so the
+  push narrows correctly.
+- Nothing else on either table. Every other predicate, `attrs['k'] = 'v'`
+  included, contributes no prune and is evaluated as a residual. Neither table
+  registers a scalar UDF: every shape their extractors accept is a plain column
+  comparison or a map subscript the existing planner already serves.
+
+Fixed-shard signals and the read-side floor (ADR-1101 decision 2). Alerts and
+audit are the two signals whose writers pin their shard by constant: alert
+records on shard 0, legal-hold and reshard records on shard 0 of the audit
+prefix, and query-audit records on its shard 1. `Catalog::resolve` derives a
+scan set from the (tenant, signal) shard-generation history, and neither signal
+is ever provisioned, so both take the implicit generation 0 at the process
+`--shards` value. `Signal::fixed_read_shards` is the floor under that
+derivation: 1 for `Alerts`, 2 for `Audit`, 0 for every other signal. The three
+scan-set derivations in `ravel-catalog` take the maximum of the history-derived
+count and that floor through one shared helper, so a `--shards 1` deployment
+still lists the query-audit shard instead of returning an exact-looking answer
+with every statement missing. The writer constants pin themselves to the floor
+with compile-time assertions, so moving a writer to a shard the reader would not
+scan fails the build rather than the query. It is a floor and never a cap: a
+provisioning record or a wider `--shards` widens the scan exactly as it does for
+any other signal.
+
+Cost. Neither signal is folded into the catalog or maintained by the compaction
+loop, so a query lists commit records live for its window, one bounded LIST per
+shard in the scan set, which is the recent-hours cost a `logs` query already
+pays. The query-audit shard keeps its own separate compaction and 90-day sweep.
+The bounds a `logs` query runs under hold here unchanged: segment admission caps
+the resolved snapshot, every emitted batch grows the query's memory reservation
+so an over-budget scan fails with `ResourcesExhausted` at the tenant's pool
+ceiling, and the request deadline bounds wall time. The bytes-scanned budget and
+the LIMIT fetch-stop hint that the RLOG and RSPAN scan loops still lack apply
+here too, and these two tables add two more callers without changing that scope.
+
+The operator-facing pages are [docs/guides/alerting.md](guides/alerting.md) for
+alert history and [docs/guides/audit.md](guides/audit.md) for the audit trail.
 
 ## Parallel final aggregation for exact-typed queries (ADR-0094)
 
