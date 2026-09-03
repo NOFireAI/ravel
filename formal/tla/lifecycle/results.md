@@ -13,14 +13,15 @@ named Rust tests, not proved.
 `FullEnv = TRUE`, every switch at its shipped value.
 
 - Result: PASS.
-- States generated: 473807. Distinct: 80714. Diameter (depth): 19. Wall: 3 s.
-- Band (`bands.tsv`): distinct within 80500 to 81000. Observed 80714 is inside.
-- The distinct-state count is above the prior round's committed band
-  (78000-79000, measured before this round's finding 3 and finding 1 model
-  changes: `Subjects`/`AllRecords` gained a second member, and `lastGc`
-  gained the `heldInputServed` field). `bands.tsv` is re-measured against
-  this round's final model and updated to 80500-81000; the depth (19) is
-  unchanged.
+- States generated: 464571. Distinct: 79358. Diameter (depth): 19. Wall: 6 s.
+- Band (`bands.tsv`): distinct within 79200 to 79500. Observed 79358 is inside.
+- The distinct-state count moved down from the prior round's committed band
+  (80500-81000) after this round's finding 2 fix: widening `HeldInputServes`
+  to `DataObjects` and dropping its `ServesSubject` conjunct (checkpoint
+  finding 2) makes the legal-hold gate fire, and therefore prune the reachable
+  state graph, in states it previously let through. `bands.tsv` is re-measured
+  against this round's final model and updated to 79200-79500; the depth (19)
+  is unchanged.
 
 ## Negative controls
 
@@ -333,6 +334,43 @@ hold subsystem's own forward progress (already covered by
 a retry guarantee this model does not have a cited Rust-side source for; adding
 it without one would be exactly the kind of claim ADR-1113 D12 asks this
 document not to make.
+
+## Checkpoint finding 2: legal-hold gate widened past raw inputs
+
+The checkpoint review (issue #1122) found `HeldInputServes` scoped only to
+`RawInputs`, so a legal hold landing on the rewrite output after its raw
+input was swept could not be represented, unlike the shipped Rust gate
+(`bucket_is_held` in `erasure_rewrite.rs`, `chain_groups_held_by_legal_hold`
+in `sweep.rs`), which blocks on any live protected key in the bucket
+regardless of which object it is. Fixed: `HeldInputServes` now ranges over
+`DataObjects` (raw inputs and rewrite outputs) and drops the `ServesSubject`
+conjunct entirely, matching the shipped gate's content-blind, per-live-key
+semantics (`counterexamples/rewrite-output-hold-probe.md` has the full
+reasoning for why scope alone is insufficient: `RewriteOutputContent` derives
+`rwA`'s served set from the constant `Requests` set, not the `erasureRequested`
+state variable, so a correctly computed `rwA` never serves the erased subject
+and any `ServesSubject`-gated check on it is always vacuously satisfied).
+
+- Probe (`ProbeNoCompletionUnderBucketHold`, `counterexamples/rewrite-output-hold-probe.md`):
+  against the scope-only widening, TLC exit 12, `Error: Invariant
+  ProbeNoCompletionUnderBucketHold is violated.` Against the shipped
+  content-blind fix, TLC exit 0, `Model checking completed. No error has been
+  found.` (464571 states generated, 79358 distinct, depth 19). The probe is
+  now unreachable.
+- Mutant (`CompleteErasure`'s unconditional gate removed,
+  `counterexamples/completion-ignores-legal-hold-mutant.md`, "Re-run after
+  finding 2" section): re-applied against the widened, content-blind model.
+  TLC exit 12, `Error: Invariant CompletionRespectsLegalHold is violated.`
+  7-state trace, `raw1` present and held, `lastGc.heldInputServed = TRUE`
+  under `rule = "complete"`. The gate stays load-bearing under the wider
+  predicate.
+- Smoke re-measured after the fix: distinct states dropped from the prior
+  band (80500-81000) to 79358, since the wider gate now prunes reachable
+  states it previously let through. `bands.tsv` updated to 79200-79500 (see
+  "Smoke" above).
+- All seven negative controls re-run and still isolate their named target
+  (see "Negative controls" above); no control depended on the narrower
+  `HeldInputServes`.
 
 ## Exhaustive
 
