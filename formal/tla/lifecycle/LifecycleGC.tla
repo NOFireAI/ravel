@@ -181,10 +181,24 @@ EffectiveHead == IF headState = "absent" THEN {} ELSE head
 \* A subject is served now iff a readable HEAD names some present object that
 \* serves it. A read reads the HEAD object: unreadable fails closed (serves
 \* nothing) and absent names nothing, so serving uses the same EffectiveHead the
-\* GC gate reads. The .dreq presence filters the subject at read time; an
-\* erased-and-gone subject is filtered because nothing head-named serves it.
-ServesNow(s)  == HeadReadable /\ \E o \in EffectiveHead : PresentObj(o) /\ ServesSubject(o, s)
-ServedRead(s) == ServesNow(s) /\ ~PresentObj("dreqR1")
+\* GC gate reads.
+ServesNow(s) == HeadReadable /\ \E o \in EffectiveHead : PresentObj(o) /\ ServesSubject(o, s)
+
+\* A permitted in-flight query reads the HEAD snapshot it pinned, even after a fold
+\* has advanced the current HEAD past it. That reader also serves the subject if a
+\* still-present object it pinned serves it, which is why the .dreq (the read-time
+\* erasure filter) must outlive such a query.
+PinnedServes(s) ==
+    /\ query.active
+    /\ clock <= query.deadline
+    /\ \E o \in query.needs : PresentObj(o) /\ ServesSubject(o, s)
+
+ServesAny(s) == ServesNow(s) \/ PinnedServes(s)
+
+\* The .dreq presence filters the subject at read time for BOTH the current-HEAD
+\* read and a pinned read; an erased subject stays filtered until the .dreq is gone
+\* and nothing any reader can still reach serves it.
+ServedRead(s) == ServesAny(s) /\ ~PresentObj("dreqR1")
 
 --------------------------------------------------------------------------------
 \* TypeOK
@@ -479,11 +493,14 @@ SupersededSweep(o) ==
                    dreqHorizon, doneAt, sysgc>>
 
 \* .dreq sweep: delete the .dreq when a matching .done exists, its completed
-\* timestamp is non-zero, the horizon has passed, the del key is not held (del is
-\* never held) AND no superseded input it covers is still held (a HEAD-named
-\* superseded input). DreqIgnoresHeldInputs drops the last clause.
-NoHeldCoveredInput ==
-    ~\E o \in superseded : PresentObj(o) /\ o \in EffectiveHead
+\* timestamp is non-zero, the horizon has passed AND no permitted pinned query can
+\* still reach a present object serving the subject (once the .dreq read-time filter
+\* is gone, such a reader would serve the erased subject). DreqIgnoresHeldInputs
+\* drops the last clause, so the .dreq can be swept out from under such a query.
+NoPinnedReaderServes ==
+    ~\E o \in DataObjects :
+        /\ PresentObj(o) /\ ServesSubject(o, "s1")
+        /\ query.active /\ clock <= query.deadline /\ o \in query.needs
 
 DreqSweep ==
     /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
@@ -492,7 +509,7 @@ DreqSweep ==
     /\ PresentObj("doneR1")
     /\ doneAt > 0
     /\ clock >= dreqHorizon
-    /\ (DreqIgnoresHeldInputs \/ NoHeldCoveredInput)
+    /\ (DreqIgnoresHeldInputs \/ NoPinnedReaderServes)
     /\ S!Delete("dreqR1")
     /\ GcWitness("dreq", {"dreqR1"})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
@@ -584,14 +601,17 @@ CompletionImpliesNoPreRewriteExposure ==
     PresentObj("doneR1") => ~ServesNow("s1")
 
 \* Removing the .dreq cannot resurrect the subject: if the .dreq is gone after a
-\* request, nothing head-named still serves the subject.
+\* request, no reader (current HEAD or a permitted pinned query) still serves it.
 DreqRemovalCannotResurrect ==
-    ("s1" \in erasureRequested /\ ~PresentObj("dreqR1")) => ~ServesNow("s1")
+    ("s1" \in erasureRequested /\ ~PresentObj("dreqR1")) => ~ServesAny("s1")
 
 \* Two rewrites over the same input set with different applied requests get
-\* different keys (the hash binds the sorted applied ids).
+\* different keys (the hash binds the sorted applied ids). Anchored to a
+\* materialised rewrite output so TLC evaluates it as a state invariant rather than
+\* a constant.
 IdenticalInputSetsDoNotCollide ==
-    Cardinality({RewriteKey(d) : d \in Materialized}) = Cardinality(Materialized)
+    PresentObj("rwA") =>
+        Cardinality({RewriteKey(d) : d \in Materialized}) = Cardinality(Materialized)
 
 \* The predecessor chain is representable: acyclic, inputs are real data objects,
 \* bounded depth.
