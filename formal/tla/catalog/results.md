@@ -14,28 +14,33 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 |---|---|---|---|---|---|
 | smoke.cfg | Spec (safety, symmetry-reduced) | 1866396 | 31 | PASS | 20260903T135234Z-a4e9817c24f8fbe59e5dec198aa33c47032f8a47 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
-| negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | negative lane |
-| negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | negative lane |
-| negative/compaction-loser-overwrites.cfg | Spec | first counterexample | n/a | CompactionRecordImmutable violated, exit 12 | negative lane |
-| negative/reconcile-on-tick.cfg | Spec | first counterexample | n/a | ReconcileOnlyOnWatermarkAdvance violated, exit 12 | negative lane |
-| negative/snapshot-changes-mid-attempt.cfg | Spec | first counterexample | n/a | PinnedSnapshotStableWithinAttempt violated, exit 12 | negative lane |
-| negative/lost-cas-proceeds.cfg | Spec | first counterexample | n/a | NoLiveCommitOmittedByLostCas violated, exit 12 | negative lane |
-| negative/metrics-dedup-dropped.cfg | Spec | first counterexample | n/a | SignalDedupContract violated, exit 12 | negative lane |
-| negative/sweep-superseded-no-head-gate.cfg | Spec | first counterexample | n/a | HeadNamedObjectNeverDeleted violated, exit 12 | negative lane |
-| negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | tlc-carryforward-nonvacuity-1852394 |
-| negative/query-fails-closed-on-missing-index.cfg | Spec | first counterexample | n/a | MissingIndexDegradesToListing violated, exit 12 | negative lane |
-| negative/corrupt-head-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | negative lane |
-| negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | negative lane |
-| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | negative lane |
-| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260903T132807Z-111d93079ca50bad141da866930552ec362dc447 |
-| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | negative lane |
+| negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/compaction-loser-overwrites.cfg | Spec | first counterexample | n/a | CompactionRecordImmutable violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/reconcile-on-tick.cfg | Spec | first counterexample | n/a | ReconcileOnlyOnWatermarkAdvance violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/snapshot-changes-mid-attempt.cfg | Spec | first counterexample | n/a | PinnedSnapshotStableWithinAttempt violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/lost-cas-proceeds.cfg | Spec | first counterexample | n/a | NoLiveCommitOmittedByLostCas violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/metrics-dedup-dropped.cfg | Spec | first counterexample | n/a | SignalDedupContract violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/sweep-superseded-no-head-gate.cfg | Spec | first counterexample | n/a | HeadNamedObjectNeverDeleted violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/query-fails-closed-on-missing-index.cfg | Spec | first counterexample | n/a | MissingIndexDegradesToListing violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/corrupt-head-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/part-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/entry-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
 
-The fifteen `negative/` configs each flip exactly one switch (or, for
+The seventeen `negative/` configs each flip exactly one switch (or, for
 `carryforward-nonvacuity.cfg`, `frontier-reconcile-nonvacuity.cfg`, and
 `compaction-loser-diverged-nonvacuity.cfg`, check a refuted probe) and must
 exit 12 reporting exactly the named property; each
 `.expect` pins that exit code and property, and the negative lane fails if any
-config passes or reports a different property.
+config passes or reports a different property. All seventeen were last run
+together as run id `20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1`
+(`.cache/tla/last-run.tsv`); the Run column above and below cites that id
+uniformly rather than the ad hoc identifiers a prior round left on two rows.
 
 `counterexamples/late-supersession-shrink.cfg` is a recorded temporal shrink,
 not a gate: run under `FairSpec` with `PROPERTY LateSupersessionEventuallyReflected`
@@ -150,7 +155,9 @@ authority; the table restates it.
 Each named safety invariant is shown load-bearing by a behaviour mutant. All
 twelve have a dedicated switch and a negative-control config that flips it and
 drives TLC to exit 12 on that invariant (the recorded lines are in the run
-table above).
+table above). `CorruptHeadFailsClosedOnDeletePaths` has three: one per
+fail-closed trigger (unreadable HEAD, unreadable part, undecodable entry) on
+the shared delete-gate guard.
 
 | Invariant | Mutant | TLC evidence |
 |---|---|---|
@@ -164,6 +171,8 @@ table above).
 | HeadNamedObjectNeverDeleted | switch `SweepSupersededNoHeadGate` | negative/sweep-superseded-no-head-gate.cfg, exit 12 |
 | MissingIndexDegradesToListing | switch `QueryFailsClosedOnMissingIndex` | negative/query-fails-closed-on-missing-index.cfg, exit 12 |
 | CorruptHeadFailsClosedOnDeletePaths | switch `DeletePathIgnoresUnreadableHead` | negative/corrupt-head-ignores-delete-gate.cfg, exit 12 |
+| CorruptHeadFailsClosedOnDeletePaths | switch `DeletePathIgnoresUnreadablePart` | negative/part-corruption-ignores-delete-gate.cfg, exit 12 |
+| CorruptHeadFailsClosedOnDeletePaths | switch `DeletePathIgnoresUndecodableEntry` | negative/entry-corruption-ignores-delete-gate.cfg, exit 12 |
 | SnapshotEntriesBelowWatermark | switch `FoldNamesEntryAboveWatermark` | negative/fold-names-entry-above-watermark.cfg, exit 12 |
 | TombstonedBucketContributesNothing | switch `FoldIncludesTombstonedEntries` | negative/fold-includes-tombstoned-entries.cfg, exit 12 |
 
