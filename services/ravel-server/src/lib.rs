@@ -31,6 +31,7 @@ pub mod ingest_concurrency;
 pub mod lifecycle_refresh;
 pub mod logs_ingest;
 pub mod maintain;
+pub mod mem_stats;
 pub mod metadata_sink_task;
 pub mod metrics;
 #[cfg(feature = "otap")]
@@ -1161,6 +1162,9 @@ pub async fn start(
         cache_disk_metrics: cache.as_ref().and_then(|c| c.disk_metrics()),
         catalog_cache_metrics: catalog.byte_cache_metrics(),
         catalog_cache_disk_metrics: catalog.byte_cache_disk_metrics(),
+        cache: cache.clone(),
+        cache_max_bytes: config.cache_max_bytes,
+        catalog_cache_max_bytes: config.catalog_cache_max_bytes,
         admission: admission.clone(),
         metrics_tenant_labels: config.metrics_tenant_labels,
         query_accounting: query_accounting.clone(),
