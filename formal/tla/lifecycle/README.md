@@ -112,13 +112,39 @@ what the invariants read, collapsing the space to a size TLC finishes quickly.
 
 `FairSpec` adds weak fairness on the maintainer sweeps, the fold's HEAD advance,
 and erasure completion. Two conditional liveness properties are defined,
-`EventuallySwept` and `EventuallyCompleted`. They are only meaningful under the
-fairness and window agreement the exhaustive cfg sets up: a legal hold, a stopped
-maintainer, or a fold and sweep whose retention windows disagree make them false
-(#1131). This task did not run the exhaustive configuration, so it makes no claim
-here about whether the two properties hold; the orchestrator's exhaustive run and
-its outcome are recorded in `results.md`. The README claims only what the smoke,
-negative, and traceability lanes this task ran actually showed.
+`EventuallySwept` and `EventuallyCompleted`. Both hold only under an environment
+that eventually goes quiet: after some point, no further `PlaceHold`/`ReleaseHold`,
+`SetHeadState`, or `SetRefresh` transitions occur, so the corresponding sweep or
+completion action's guard, once enabled, stays enabled instead of being
+recurrently knocked down and re-armed. A legal hold left in place, a stopped
+maintainer, or a fold and sweep whose retention windows disagree (#1131) are each
+a special case of this: a hold that is placed and never released, for instance,
+is an environment that went quiet on the hold variable specifically. `FairSpec`
+grants weak fairness only to the maintainer and store actions
+(`SupersededSweep`, `HeadAdvanceRewrite`, `RetentionSweep`, `CompleteErasure`),
+never to a `FullEnv`-gated environment action; none of `PlaceHold`/`ReleaseHold`
+(a legal hold is a business decision with no code-side progress guarantee),
+`SetHeadState`, or `SetRefresh` has fairness added, so an environment that keeps
+perturbing hold state, HEAD readability, or refresh outcome forever can
+recurrently disable a maintainer action's guard just before it would fire,
+defeating weak fairness without technically violating it.
+
+This task did not run the exhaustive configuration (forbidden for this task; the
+orchestrator runs it and its outcome is recorded in `results.md`). It instead ran
+each property alone, at `MaxClock = 2`, in a cfg scoped to `TypeOK` plus that one
+property, to identify a violation cheaply: both `EventuallySwept` and
+`EventuallyCompleted` fail under this reduced configuration, with exact TLC
+counter-example traces recorded in `results.md`. `EventuallySwept` fails via a
+stutter where `SetRefresh` never clears a failed refresh, so
+`RefreshFailureNeverSweeps`'s fail-closed gate leaves `SupersededSweep` forever
+disabled. `EventuallyCompleted` fails via a genuine lasso where `SetHeadState`
+repeatedly toggles `headState` away from `"present"`, so `CompleteErasure`'s
+`HeadDeletable` gate is never continuously enabled. Neither trace is a lasso
+through `PlaceHold`/`ReleaseHold` specifically, but both are instances of the
+same class the orchestrator's exhaustive run reported (#1122 finding 2): an
+unfair environment action recurrently disabling a fairly-scheduled one. The
+README claims only what the smoke, negative, traceability, and these two
+reduced liveness lanes actually showed.
 
 ## Running
 
