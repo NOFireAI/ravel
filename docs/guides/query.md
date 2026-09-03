@@ -274,9 +274,14 @@ process-wide, not per-tenant. The "reference host" column is what a 16-core,
 | `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 25% of MemTotal (256 MiB if unknown) | 8,053,063,680 |
 | `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
 
-The per-query SQL pool is always clamped to the per-tenant ceiling: setting
-`--sql-tenant-max-bytes` below the derived per-query pool lowers the per-query
-pool to it, and never the other way around.
+The per-query SQL pool never exceeds the per-tenant ceiling. Which side moves
+depends on what the operator set. An explicit `--sql-tenant-max-bytes` below
+the per-query pool lowers the pool to it, and a ceiling the operator set is
+never raised. An explicit `--sql-max-query-bytes` above a derived or fallback
+tenant ceiling raises that ceiling to match it, because no operator set it and
+the flag would otherwise be silently inert. When neither is explicit the
+derived values already satisfy the order. Both adjustments are logged at
+startup (`clamped` and `raised` on the resolved lines, plus a WARN).
 
 Every resolved value is logged at startup, one line per setting with its source
 (`derived`, `flag`, or `fallback`):

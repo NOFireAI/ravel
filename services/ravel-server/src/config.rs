@@ -845,8 +845,11 @@ pub struct Cli {
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
     /// both the query fetcher cache (`store::build_cache`) and the catalog byte
     /// cache (`query::build_catalog`) gain a `DiskCache` at this path, each
-    /// bounded by `--cache-max-bytes` (there is no separate disk-tier capacity
-    /// flag). The directory is created lazily on first admission and is never
+    /// bounded by its own resolved RAM ceiling: the fetcher cache by
+    /// `--cache-max-bytes` or its derived value, the catalog byte cache by its
+    /// own resolved value, which equals `--cache-max-bytes` only when that flag
+    /// is set explicitly (there is no separate disk-tier capacity flag). The
+    /// directory is created lazily on first admission and is never
     /// required to exist; a missing, full, or corrupt cache directory degrades
     /// to a store read, never a query error.
     ///
@@ -1835,10 +1838,15 @@ impl ResolvedPerformanceDefaults {
             clamped = self.sql_max_query_bytes_clamped,
             "performance default resolved"
         );
+        // `raised` rides on the info line for the same reason `clamped` does
+        // above: a `source="fallback"` or `"derived"` beside a value that
+        // neither produces would send a reader looking for a derivation, when
+        // the number is the operator's own --sql-max-query-bytes.
         tracing::info!(
             setting = "sql_tenant_max_bytes",
             value = self.sql_tenant_max_bytes,
             source = self.sources.sql_tenant_max_bytes,
+            raised = self.sql_tenant_max_bytes_raised,
             "performance default resolved"
         );
         tracing::info!(
@@ -4899,6 +4907,9 @@ mod tests {
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FALLBACK);
         assert_eq!(resolved.sources.sql_max_query_bytes, PERF_SOURCE_FALLBACK);
         assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_FALLBACK);
+        // The two fallbacks already satisfy query <= tenant, so neither side moved.
+        assert!(!resolved.sql_max_query_bytes_clamped);
+        assert!(!resolved.sql_tenant_max_bytes_raised);
 
         // Cores are still known, so fetch concurrency is still derived.
         assert_eq!(resolved.fetch_concurrency, 32);
@@ -4976,9 +4987,10 @@ mod tests {
         );
         assert_eq!(
             with_query_pool.sql_tenant_max_bytes, derived.sql_tenant_max_bytes,
-            "the per-query flag must never raise the per-tenant ceiling"
+            "a per-query flag below the derived tenant ceiling leaves the ceiling alone"
         );
         assert!(!with_query_pool.sql_max_query_bytes_clamped);
+        assert!(!with_query_pool.sql_tenant_max_bytes_raised);
 
         let with_tenant_pool = resolve_performance_defaults(
             reference_host(),
@@ -5012,11 +5024,13 @@ mod tests {
         assert_eq!(with_deadline.max_segments, derived.max_segments);
     }
 
-    /// The per-query SQL pool is clamped to the per-tenant ceiling, and the
-    /// clamp only ever lowers the per-query pool. A tenant ceiling set below the
-    /// derived per-query pool must pull the per-query pool down to it, not raise
-    /// the ceiling the operator just set: raising it would silently widen the
-    /// multi-tenant isolation bound.
+    /// The per-query SQL pool is clamped to an EXPLICIT per-tenant ceiling. A
+    /// tenant ceiling the operator set below the derived per-query pool must
+    /// pull the per-query pool down to it, not raise the ceiling the operator
+    /// just set: raising it would silently widen the multi-tenant isolation
+    /// bound. (The reverse case, an explicit per-query pool over a ceiling
+    /// nobody set, raises the ceiling instead; see
+    /// `an_explicit_query_pool_raises_a_non_explicit_tenant_ceiling`.)
     ///
     /// Prove-the-test: replace the clamp with
     /// `let sql_max_query_bytes = unclamped_query_bytes;` and the first
