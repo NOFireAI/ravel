@@ -71,7 +71,8 @@ CONSTANTS
     HeadNamesUnwrittenPart,    \* folder CAS-swaps HEAD naming a part never PUT
     CompactionSwapsRecord,     \* compaction output swaps an identity (counts kept)
     ReconcileOnTick,           \* reconcile runs off a plain tick, no wm advance
-    SnapshotChangesMidAttempt  \* a pinned query snapshot mutates within an attempt
+    SnapshotChangesMidAttempt, \* a pinned query snapshot mutates within an attempt
+    DropMetricsDedup           \* metrics query stops deduping by identity at read
 
 ASSUME NoContent \in Content
 ASSUME Keys # {}
@@ -560,6 +561,15 @@ CorruptHeadFailsClosedOnDeletePaths ==
     (lastGatedSweep.ran /\ lastGatedSweep.headStatus \in {"corrupt", "unsupported"})
         => ~lastGatedSweep.deletedAny
 
+\* Every object a valid HEAD names is still present. This is NOT asserted in the
+\* smoke or exhaustive configs: sweep_superseded carries no HEAD gate (issue
+\* #1134), so under free supersession lag it can delete an L0 input that a still
+\* current HEAD names. It is asserted only in negative/free-lag-head-dangling.cfg,
+\* which is an EXPECTED failure recording the #1134 design flaw, not a protocol
+\* the model claims to hold. See counterexamples/free-lag-head-dangling.md.
+HeadNamedObjectNeverDeleted ==
+    head.status = "valid" => \A e \in head.entries : ~ObjectDeleted(e)
+
 \* A fold contributes nothing for a tombstoned bucket: the fold function excludes
 \* every tombstoned hour at every watermark.
 TombstonedBucketContributesNothing ==
@@ -575,8 +585,14 @@ SourcesServing(H, r) ==
     (IF ~tomb[H] /\ r \in l0[H] /\ r \notin SupersededInputs(H) THEN 1 ELSE 0)
       + Cardinality({ g \in CompIds :
             ~tomb[H] /\ crec[H][g].used /\ r \in crec[H][g].out })
+\* The multiplicity a query actually serves for r: the raw source count when
+\* dedup is off (logs/spans, or the DropMetricsDedup mutant), collapsed to at
+\* most one when the metrics dedup runs (crates/ravel-query/src/engine.rs
+\* is_greater over identity). The contract below is falsifiable exactly because
+\* this collapse can be turned off; a two-source conflict (SourcesServing > 1) is
+\* reachable with two compaction records, so the collapse does real work.
 MetricsMult(H, r) ==
-    IF DedupBySignal
+    IF DedupBySignal /\ ~DropMetricsDedup
         THEN (IF SourcesServing(H, r) > 0 THEN 1 ELSE 0)
         ELSE SourcesServing(H, r)
 SignalDedupContract ==
