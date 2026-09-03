@@ -1612,23 +1612,30 @@ fn render_metadata_cache_family(out: &mut String, mode: Mode, counters: &Metadat
     );
 }
 
-/// Dynamic-tenant `shard_count` provisioning failures (ADR-0050 section 5,
-/// EC5): a dynamically-resolved tenant's durable provisioning check failed,
-/// either a real disagreement against this process's configured `--shards`
-/// (failing that single first-touch request), an unreadable record (corrupt
-/// or a future format version, also a hard failure), or the same class of
-/// failure caught on the maintain per-tenant loop instead (which skips that
-/// tenant's tick rather than failing a request). A static tenant's mismatch
-/// refuses startup instead and never reaches this counter. A nonzero value
-/// means at least one dynamic tenant's provisioning record could not be
-/// validated as expected; the operations guide pages on any increase.
-/// Process-global atomic read from [`crate::provisioning`], single source,
-/// no labels.
-fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatches: u64) {
+/// The `shard_count` provisioning family (ADR-0050 section 5, EC5; ADR-0082).
+///
+/// `ravel_provisioning_shard_count_mismatch_total` counts hard provisioning
+/// failures: an unreadable record (corrupt or a future format version), or
+/// pre-ADR data a lower `shard_count` would hide, caught on a dynamic tenant's
+/// first touch or on the maintain per-tenant loop. A nonzero value means at
+/// least one tenant's provisioning record could not be validated; the
+/// operations guide pages on any increase.
+///
+/// `ravel_provisioning_shard_count_drift_total` counts the ADR-0082 case: a
+/// decodable record whose recorded generation-0 `shard_count` differs from this
+/// process's live `--shards` default. That drift is tolerated (routing uses the
+/// record's own generation history), so it is an informational signal, not a
+/// failure. Both are process-global atomic reads with no labels beyond mode.
+fn render_provisioning_family(
+    out: &mut String,
+    mode: Mode,
+    shard_count_mismatches: u64,
+    shard_count_drifts: u64,
+) {
     write_header(
         out,
         "ravel_provisioning_shard_count_mismatch_total",
-        "Dynamic-tenant provisioning checks that failed: a shard_count disagreement, an unreadable record, or a maintain-loop check catching either (ADR-0050 section 5).",
+        "Provisioning checks that failed hard: an unreadable record, or pre-ADR data a lower shard_count would hide (ADR-0050 section 5). A recorded shard_count that merely differs from the live default is tolerated and counted by ravel_provisioning_shard_count_drift_total instead.",
         "counter",
     );
     write_sample(
@@ -1636,6 +1643,18 @@ fn render_provisioning_family(out: &mut String, mode: Mode, shard_count_mismatch
         "ravel_provisioning_shard_count_mismatch_total",
         &[Label::Mode(mode)],
         shard_count_mismatches,
+    );
+    write_header(
+        out,
+        "ravel_provisioning_shard_count_drift_total",
+        "Provisioning validations where a decodable record's recorded shard_count differed from the live --shards default; the drift is tolerated and routing uses the record's own generation history (ADR-0082).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_provisioning_shard_count_drift_total",
+        &[Label::Mode(mode)],
+        shard_count_drifts,
     );
 }
 
@@ -3401,6 +3420,7 @@ pub fn render(
         &mut out,
         mode,
         crate::provisioning::shard_count_mismatch_count(),
+        ravel_catalog::shard_count_drift_count(),
     );
     render_store_probe_family(
         &mut out,
