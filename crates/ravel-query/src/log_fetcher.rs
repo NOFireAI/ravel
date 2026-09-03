@@ -3095,10 +3095,9 @@ pub struct BlockRangeFetcher {
     /// The largest single covering sub-range GET this fetcher (and every clone)
     /// has issued, in bytes: the peak wire size of one request on the segmented
     /// covering path, which never exceeds `max_fetch_run_bytes`. The resident
-    /// assembly buffer is NOT bounded by this -- the frozen `ravel-logseg`
-    /// reader ([`RlogReader::new`]) needs a contiguous object-indexed buffer, so
-    /// a covering read of an object above the bound still holds `object_size` --
-    /// but the request wire size is, which is what this records.
+    /// assembly buffer is NOT bounded by this -- see the resident-memory note
+    /// on [`Self::covering_read`] (issue #1007): this field only ever reports
+    /// the wire side.
     peak_fetch_run: Arc<AtomicU64>,
     /// Bounds in-flight byte-range GETs. Its own instance, never shared with
     /// `SegmentFetcher`'s RSEG semaphore (ADR-0107 decision 1).
@@ -3294,13 +3293,43 @@ impl BlockRangeFetcher {
     ///   and its cap too on this unaligned split, since no run is short of the
     ///   bound except the last).
     ///
-    /// NOTE (reported for ADR-0996): the assembled buffer is still `object_size`
-    /// on the segmented path, because [`RlogReader::new`] in the frozen
-    /// `ravel-logseg` crate needs a contiguous object-indexed buffer. Bounding
-    /// the RESIDENT buffer below the bound would need a decode-side change
-    /// (independent per-sub-range decode) in `ravel-logseg`/`ravel-sql`, out of
-    /// this task's scope; [`Self::peak_fetch_run_bytes`] bounds the request wire
-    /// size, which is what stays in scope here.
+    /// NOTE (issue #1007 finding, superseding the ADR-0996 note this replaces):
+    /// the assembled buffer is still `object_size` on the segmented path. This
+    /// is a bounded-window case in principle, not a genuine whole-object need
+    /// (option (b), not (c), in #1007's terms) -- `decode_v4_block`
+    /// (`ravel_logseg::reader`, `pub(crate)`) already takes a `base: u64` naming
+    /// the absolute offset of its `bytes[0]`, and `RlogRangeReader`
+    /// (`ravel_logseg::ranged`) already exploits exactly that to decode one row
+    /// group or one block at a time for the compactor merge, holding only
+    /// directories plus the one span resident, never the whole object
+    /// (`ranged.rs` module doc, `decode_one_block`). But `BlockScan::decode_block`
+    /// (`reader.rs:882-915`), the only decode entry point this fetcher's callers
+    /// use (`open_scan`/`open_scan_subset`, `log_fetcher.rs:2109,2136`, both via
+    /// `RlogReader::new`), hardcodes `base = 0` (`reader.rs:909`) and its
+    /// `next_block` contract requires `object_bytes` to be the whole object
+    /// from offset 0 (`reader.rs:775-778`) -- neither of those signatures is
+    /// touched by this commit, so `RlogReader`'s and `BlockScan`'s public API is
+    /// unchanged. Bounding this read's resident memory to the window needs a
+    /// reader change of a stated scope, not a local fix: (1) in `ravel-logseg`,
+    /// a windowed decode entry point that accepts `base != 0` for the general
+    /// predicate/prune-pruned case `BlockScan` serves (`RlogRangeReader`'s
+    /// existing windowed methods all filter to one caller-named stream, which
+    /// this fetcher's arbitrary ts-range/content/postings/bloom predicates do
+    /// not fit); and (2) in `ravel-query`, restructuring every `covering_read`
+    /// caller (this function's 4 call sites) to fetch and parse PAGE_DIR,
+    /// SKIP_IDX, and FIELD_DIR ahead of the covering loop (today `covering_read`
+    /// knows nothing about block boundaries and writes `[0, total_size)`
+    /// unconditionally), choose split points at block boundaries, and decode
+    /// each sub-range's complete blocks immediately and discard its buffer
+    /// before the next sub-range is fetched, instead of assembling into one
+    /// `object_size` buffer before ever calling `RlogReader::new`. That is a
+    /// decode-entry-point change plus a fetch-shape change on a
+    /// query-correctness-critical path, not a bounded local patch; forcing a
+    /// partial version through in one pass risks exactly the kind of
+    /// half-finished critical-path change this repo's invariants forbid. Not
+    /// implemented here; see the commit this note ships with for the full
+    /// evidence trail. [`Self::peak_fetch_run_bytes`] still bounds only the
+    /// request wire size, unchanged by this finding.
     #[allow(clippy::too_many_arguments)]
     async fn covering_read(
         &self,
