@@ -116,41 +116,62 @@ what the invariants read, collapsing the space to a size TLC finishes quickly.
 
 ## Liveness (exhaustive only)
 
-`FairSpec` adds weak fairness on the maintainer sweeps, the fold's HEAD advance,
-and erasure completion. Two conditional liveness properties are defined,
-`EventuallySwept` and `EventuallyCompleted`. Both hold only under an environment
-that eventually goes quiet: after some point, no further `PlaceHold`/`ReleaseHold`,
-`SetHeadState`, or `SetRefresh` transitions occur, so the corresponding sweep or
-completion action's guard, once enabled, stays enabled instead of being
-recurrently knocked down and re-armed. A legal hold left in place, a stopped
-maintainer, or a fold and sweep whose retention windows disagree (#1131) are each
-a special case of this: a hold that is placed and never released, for instance,
-is an environment that went quiet on the hold variable specifically. `FairSpec`
-grants weak fairness only to the maintainer and store actions
-(`SupersededSweep`, `HeadAdvanceRewrite`, `RetentionSweep`, `CompleteErasure`),
-never to a `FullEnv`-gated environment action; none of `PlaceHold`/`ReleaseHold`
-(a legal hold is a business decision with no code-side progress guarantee),
-`SetHeadState`, or `SetRefresh` has fairness added, so an environment that keeps
-perturbing hold state, HEAD readability, or refresh outcome forever can
-recurrently disable a maintainer action's guard just before it would fire,
-defeating weak fairness without technically violating it.
+`FairSpec` adds weak fairness to the maintainer sweeps, the fold's HEAD advance,
+erasure completion, the clock (`Tick`), pinned-query expiry (`ExpireQuery`), and
+the first superseding rewrite (`PerformRewrite`, restricted to firing while
+`superseded = {}`). `PlaceHold`, `ReleaseHold`, `SetHeadState`, and `SetRefresh`
+stay unfair: a legal hold is a business decision with no code-side release
+guarantee, and nothing in the implementation guarantees a HEAD read recovers or
+a refresh eventually succeeds. `PerformRewrite`'s fairness is deliberately
+scoped to its first firing rather than granted unconditionally: `RetentionSweep`
+ranges over `DataObjects`, which includes the rewrite output, so it can delete
+an already-produced rewrite output; an unconditionally fair `PerformRewrite`
+would then be compelled to recreate it and re-stamp the shared `supersededAt`
+every time, perpetually resetting the horizon countdown for the very raw input
+`EventuallySwept` is waiting on. The implementation runs one rewrite per erasure
+request, not a loop that re-derives an already-produced output whenever ordinary
+retention ages it out, so unconditional fairness there would assert a guarantee
+the implementation doesn't make.
 
-This task did not run the exhaustive configuration (forbidden for this task; the
-orchestrator runs it and its outcome is recorded in `results.md`). It instead ran
-each property alone, at `MaxClock = 2`, in a cfg scoped to `TypeOK` plus that one
-property, to identify a violation cheaply: both `EventuallySwept` and
-`EventuallyCompleted` fail under this reduced configuration, with exact TLC
-counter-example traces recorded in `results.md`. `EventuallySwept` fails via a
-stutter where `SetRefresh` never clears a failed refresh, so
-`RefreshFailureNeverSweeps`'s fail-closed gate leaves `SupersededSweep` forever
-disabled. `EventuallyCompleted` fails via a genuine lasso where `SetHeadState`
-repeatedly toggles `headState` away from `"present"`, so `CompleteErasure`'s
-`HeadDeletable` gate is never continuously enabled. Neither trace is a lasso
-through `PlaceHold`/`ReleaseHold` specifically, but both are instances of the
-same class the orchestrator's exhaustive run reported (#1122 finding 2): an
-unfair environment action recurrently disabling a fairly-scheduled one. The
-README claims only what the smoke, negative, traceability, and these two
-reduced liveness lanes actually showed.
+An earlier draft of `EventuallySwept` and `EventuallyCompleted` stated their
+hypothesis as "the environment eventually goes quiet" on the four unfair
+actions above. Checkpoint review (#1122 finding 1) showed that hypothesis false
+as written: TLC found counterexamples where those four actions never fire, yet
+the properties still failed, because `Tick`, `ExpireQuery`, and `PerformRewrite`
+were themselves unfair. Adding fairness to those three actions (as above) is
+necessary but not sufficient: reduced runs during this fix also surfaced a
+finite-clock-ceiling artifact (a horizon or query-deadline check that lands
+exactly at `MaxClock` can never clear, because `Tick`'s own guard requires
+`clock < MaxClock`) that no amount of fairness closes, for any finite bound.
+
+Both properties are now stated as explicit antecedents grounded in the real
+enabling condition of the action each is waiting on, instead of a quiescence
+hypothesis:
+
+- `EventuallySwept`: for each raw input, if `SupersededSweep`'s own guard
+  (superseded, present, not legal-held, past the horizon or query-permitted,
+  not gated off by the sweep gate, HEAD present, no unrecovered failed
+  refresh) holds *permanently* from some point on (`<>[]`), the input is
+  eventually gone.
+- `EventuallyCompleted`: if `CompleteErasure`'s own guard (`.done` absent,
+  `.dreq` present, HEAD present, served-set clear, no held input serving the
+  subject, clock past zero) holds permanently from some point on, `.done`
+  eventually exists.
+
+This task did not run the exhaustive configuration (forbidden for this task;
+the orchestrator runs it and its outcome is recorded in `results.md`). It
+instead ran each property alone against the real, non-quiescent `Next` (all
+four environment actions present and still unfair), in a cfg scoped to
+`TypeOK` plus that one property: both `EventuallySwept` and
+`EventuallyCompleted` pass at `MaxClock = 2` under this reduced configuration
+(exact TLC output recorded in `results.md`). `EventuallySwept`'s restated form
+was additionally confirmed at `MaxClock = 4` against a quiescent diagnostic
+variant (see `results.md`); the full non-quiescent model was not re-run at
+`MaxClock = 4` in this task because its state space grew past what this task's
+reduced-configuration budget and host memory should spend, and doing so would
+edge into the exhaustive-scale run this task is forbidden from running. The
+README claims only what the smoke, negative, traceability, and these reduced
+liveness runs actually showed.
 
 ## Running
 

@@ -759,25 +759,58 @@ HeadNamedObjectNeverDeletedBySupersededSweep ==
     \A o \in RawInputs : o \in head => PresentObj(o)
 
 --------------------------------------------------------------------------------
-\* Liveness (checked against FairSpec only; see README and #1131). Weak fairness
-\* on exactly the actions the implementation justifies: the maintainer tick
-\* (sweeps), the folder's HEAD advance, and store completion. A legal hold, a
-\* stopped maintainer, or a fold/sweep retention-window disagreement make these
-\* intentionally false, as README records.
+\* Liveness (checked against FairSpec only; see README and #1131, and the
+\* checkpoint-finding-1 diagnosis in results.md). Weak fairness on the actions
+\* the implementation justifies: the maintainer tick (sweeps), the folder's HEAD
+\* advance, store completion, the clock itself, pinned-query expiry, and the
+\* first superseding rewrite. PlaceHold, ReleaseHold, SetHeadState, and
+\* SetRefresh stay unfair on purpose: nothing in the implementation guarantees
+\* a legal hold is released, a HEAD read recovers, or a refresh eventually
+\* succeeds, so a spec that assumed fairness there would assert a guarantee the
+\* implementation doesn't make. PerformRewrite's fairness is restricted to its
+\* first firing (superseded = {}): the implementation runs one rewrite per
+\* erasure request, not a loop that keeps re-deriving an already-produced
+\* rewrite output every time ordinary retention ages it out, so granting it
+\* unconditional fairness would force a livelock the implementation doesn't
+\* have (RetentionSweep deleting the rewrite output, PerformRewrite recreating
+\* it and re-stamping the shared supersededAt, forever deferring the raw
+\* inputs' own sweep).
 FairSpec ==
     /\ Spec
     /\ WF_vars(\E o \in RawInputs : SupersededSweep(o))  \* maintainer sweep tick
     /\ WF_vars(HeadAdvanceRewrite)                       \* folder watermark advance
     /\ WF_vars(\E o \in DataObjects : RetentionSweep(o)) \* maintainer retention tick
     /\ WF_vars(CompleteErasure)                          \* store completion
+    /\ WF_vars(Tick)                                     \* clock advances
+    /\ WF_vars(ExpireQuery)                              \* pinned queries expire
+    /\ WF_vars(PerformRewrite /\ superseded = {})        \* the first rewrite fires
 
-\* Every superseded input that becomes deletable is eventually swept.
+\* Every superseded input that becomes deletable is eventually swept, once its
+\* own SupersededSweep guard (legal hold clear, horizon elapsed, no blocking
+\* pinned query, HEAD readable, no failed refresh) holds permanently. Stated as
+\* an explicit antecedent, not as "the environment eventually goes quiet" on
+\* PlaceHold/ReleaseHold/SetHeadState/SetRefresh: those four stay unfair (see
+\* FairSpec), and reviewers found real counterexamples (a hold that never
+\* releases, a HEAD read that never recovers, a refresh that never succeeds)
+\* where they never fire yet the old hypothesis's properties still failed.
+\* This form is checkable at any MaxClock: confirmed at MaxClock=2 and
+\* MaxClock=4 against the reduced per-property configuration (results.md).
 EventuallySwept ==
-    (superseded # {} /\ RawInputs \cap head = {}) ~>
-        (\A o \in RawInputs : ~PresentObj(o))
+    \A o \in RawInputs :
+        <>[](o \in superseded /\ PresentObj(o) /\ ~HeldObject(o, heldBuckets)
+             /\ (DeleteBeforeHorizon \/ clock >= supersededAt + sysgc.ph)
+             /\ QueryPermits(o) /\ SupersededGatePasses(o) /\ HeadDeletable
+             /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)) ~>
+            ~PresentObj(o)
 
-\* Every requested erasure is eventually completed.
+\* Every requested erasure is eventually completed, once CompleteErasure's own
+\* guard holds permanently. Same rationale as EventuallySwept: an explicit
+\* antecedent grounded in the action's real enabling condition, not a
+\* quiescence hypothesis the four unfair environment actions can falsify.
 EventuallyCompleted ==
-    (PresentObj("dreqR1")) ~> (PresentObj("doneR1"))
+    <>[](~PresentObj("doneR1") /\ PresentObj("dreqR1") /\ HeadDeletable
+         /\ (CompleteIgnoresServedSet \/ ~ServesNow("s1"))
+         /\ ~HeldInputServes("s1") /\ clock > 0) ~>
+        PresentObj("doneR1")
 
 ===============================================================================
