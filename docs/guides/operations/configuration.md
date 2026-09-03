@@ -941,8 +941,12 @@ overflow column and lose columnar access. Watch for that in
 ## Per-query budgets
 
 Four flags bound what one query may spend. Unset, each is derived from the host
-at startup; set, the flag value is used verbatim. The reference-host column is a
-16-core, 30 GB host, the shape the published ClickBench run used.
+at startup (memory shares are of `MemTotal`, capped by the cgroup memory limit
+when the process runs in a container); set, the flag value is used verbatim,
+with one reconciliation: the per-query SQL pool is clamped to an explicit
+per-tenant ceiling set below it, and the startup log says so. The
+reference-host column is a 16-core, 30 GB host, the shape the published
+ClickBench run used.
 
 | Flag | Default (unset) | Reference host | Choose against |
 |---|---|---|---|

@@ -263,9 +263,12 @@ naming the pool, never a truncated result.
 ### Operator-configurable budgets (server flags)
 
 Four of these budgets are process-wide server flags. Unset, each is **derived
-from the host** at startup; set, the flag value is used verbatim. All four are
-process-wide, not per-tenant. The "reference host" column is what a 16-core,
-30 GB host resolves to, the settings the published ClickBench run used.
+from the host** at startup (memory shares are of `MemTotal`, capped by the
+cgroup memory limit in a container); set, the flag value is used verbatim,
+except that the per-query SQL pool is clamped to an explicit per-tenant
+ceiling set below it (see the clamp rule below). All four are process-wide,
+not per-tenant. The "reference host" column is what a 16-core, 30 GB host
+resolves to, the settings the published ClickBench run used.
 
 | Flag | Reaches | Default (unset) | Reference host |
 |---|---|---|---|

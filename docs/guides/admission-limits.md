@@ -11,10 +11,13 @@ This guide covers what each knob does, its shipped default, and exactly what
 a client sees when it trips one. For the read-side query budgets
 (`max_series`/`max_samples`/`max_segments`), see
 [query.md](query.md#query-budgets); those are a different mechanism, and
-several of them (`--max-segments`, `--fetch-concurrency`, the two SQL memory
-ceilings, `--cache-max-bytes`, and the engine deadline) are derived from the
-host at startup rather than fixed, so read the resolved values off the startup
-log, not off a compiled-in number.
+several of them are resolved at startup rather than compiled in: unset,
+`--fetch-concurrency` follows the core count, and the two SQL memory ceilings
+and `--cache-max-bytes` follow the host's memory (`MemTotal`, capped by the
+cgroup limit in a container), while `--max-segments` (1,000,000) and the
+engine deadline (11 minutes) are fixed defaults that do not vary with the
+host. Read the resolved values off the startup log, not off a compiled-in
+number.
 
 ## Where limits are configured
 

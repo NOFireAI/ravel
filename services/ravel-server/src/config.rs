@@ -505,8 +505,9 @@ pub struct Cli {
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
-    /// [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`, or
-    /// [`DEFAULT_SQL_MAX_QUERY_BYTES`] (256 MiB) when memory cannot be read.
+    /// [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal` (capped by the cgroup memory
+    /// limit in a container), or [`DEFAULT_SQL_MAX_QUERY_BYTES`] (256 MiB) when
+    /// memory cannot be read.
     /// The resolved value is clamped to `--sql-tenant-max-bytes`, never above
     /// it. Meaningful only in a build with the `sql` feature (the SQL query
     /// surface); inert otherwise.
@@ -524,8 +525,9 @@ pub struct Cli {
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
-    /// [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, or
-    /// [`DEFAULT_SQL_TENANT_MAX_BYTES`] (1 GiB) when memory cannot be read.
+    /// [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal` (capped by the cgroup memory
+    /// limit in a container), or [`DEFAULT_SQL_TENANT_MAX_BYTES`] (1 GiB) when
+    /// memory cannot be read.
     /// Meaningful only in a build with the `sql` feature; inert otherwise.
     #[arg(long = "sql-tenant-max-bytes", value_name = "BYTES")]
     pub sql_tenant_max_bytes: Option<usize>,
@@ -835,9 +837,10 @@ pub struct Cli {
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
-    /// the fetcher cache takes [`CACHE_MEMORY_PERCENT`] of `MemTotal` and the
-    /// catalog byte cache [`CATALOG_CACHE_MEMORY_PERCENT`], or
-    /// [`DEFAULT_CACHE_MAX_BYTES`] (256 MiB) each when memory cannot be read.
+    /// the fetcher cache takes [`CACHE_MEMORY_PERCENT`] of `MemTotal` (capped
+    /// by the cgroup memory limit in a container) and the catalog byte cache
+    /// [`CATALOG_CACHE_MEMORY_PERCENT`], or [`DEFAULT_CACHE_MAX_BYTES`]
+    /// (256 MiB) each when memory cannot be read.
     #[arg(long, value_name = "BYTES")]
     pub cache_max_bytes: Option<u64>,
 
@@ -1421,8 +1424,11 @@ pub struct HostProfile {
     /// Usable parallelism, from `std::thread::available_parallelism`, floored
     /// at 1.
     pub cores: usize,
-    /// Total physical memory in bytes, from `/proc/meminfo`'s `MemTotal` on
-    /// Linux. `None` when it cannot be read or parsed, and on every non-Linux
+    /// Usable memory in bytes: `/proc/meminfo`'s `MemTotal` on Linux, capped
+    /// by the cgroup memory limit when the process runs under a finite one
+    /// (cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`), so a
+    /// container derives from the memory it may use rather than the host's.
+    /// `None` when neither can be read or parsed, and on every non-Linux
     /// target.
     pub mem_total_bytes: Option<u64>,
 }
@@ -1450,10 +1456,60 @@ impl HostProfile {
     }
 }
 
-/// This host's `MemTotal` in bytes, or `None` when it is not knowable.
+/// This host's usable memory total in bytes, or `None` when it is not
+/// knowable: `/proc/meminfo`'s `MemTotal`, capped by the cgroup memory limit
+/// when the process runs under one (cgroup v2 `memory.max`, else cgroup v1
+/// `memory.limit_in_bytes`). A container reads the host's `MemTotal`, so a
+/// share of it alone would size the caches and pools against memory the
+/// container is not allowed to use and the derived defaults would OOM-kill the
+/// process they were meant to size.
 #[cfg(target_os = "linux")]
 fn detect_mem_total_bytes() -> Option<u64> {
-    parse_mem_total_bytes(&std::fs::read_to_string("/proc/meminfo").ok()?)
+    let mem_total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_mem_total_bytes(&contents));
+    let cgroup_limit = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|contents| parse_cgroup_memory_limit(&contents))
+        .or_else(|| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                .ok()
+                .and_then(|contents| parse_cgroup_memory_limit(&contents))
+        });
+    effective_memory_total(mem_total, cgroup_limit)
+}
+
+/// Parse a cgroup memory limit file into a finite byte limit: `memory.max` on
+/// cgroup v2, `memory.limit_in_bytes` on v1. `max` (v2's "no limit"), the v1
+/// no-limit sentinel (the page-rounded `i64::MAX`, recognised as any value at
+/// or above 2^60), `0`, and anything malformed are `None`: an absent or
+/// unlimited cgroup must not cap anything, and a wrong cap would resize every
+/// memory-derived default.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_memory_limit(contents: &str) -> Option<u64> {
+    let raw = contents.trim();
+    if raw == "max" {
+        return None;
+    }
+    let bytes: u64 = raw.parse().ok()?;
+    if bytes == 0 || bytes >= 1 << 60 {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// The memory total the derived defaults size against: `MemTotal` capped by a
+/// finite cgroup limit. Either one alone is used when the other is unknown, so
+/// a container whose `/proc/meminfo` is unreadable still derives from its
+/// limit, and a bare host with no cgroup limit derives from `MemTotal`.
+#[cfg(any(target_os = "linux", test))]
+fn effective_memory_total(mem_total: Option<u64>, cgroup_limit: Option<u64>) -> Option<u64> {
+    match (mem_total, cgroup_limit) {
+        (Some(total), Some(limit)) => Some(total.min(limit)),
+        (Some(total), None) => Some(total),
+        (None, Some(limit)) => Some(limit),
+        (None, None) => None,
+    }
 }
 
 /// Non-Linux targets expose no `/proc/meminfo`; every memory-derived default
@@ -1849,9 +1905,11 @@ impl ResolvedPerformanceDefaults {
             raised = self.sql_tenant_max_bytes_raised,
             "performance default resolved"
         );
+        // Milliseconds, not seconds: an explicit sub-second deadline would
+        // otherwise log as `0`, which reads as no deadline at all.
         tracing::info!(
             setting = "gc_max_query_duration",
-            value = self.query_deadline.as_secs(),
+            value_ms = u64::try_from(self.query_deadline.as_millis()).unwrap_or(u64::MAX),
             source = self.sources.query_deadline,
             "performance default resolved"
         );
@@ -5248,6 +5306,60 @@ mod tests {
         assert_eq!(parse_mem_total_bytes("MemFree: 100 kB\n"), None);
         assert_eq!(parse_mem_total_bytes("MemTotal:       lots kB\n"), None);
         assert_eq!(parse_mem_total_bytes("MemTotal:       12 furlongs\n"), None);
+    }
+
+    /// cgroup limit parsing: a finite v2 or v1 limit is a cap; "max", the v1
+    /// no-limit sentinel, zero, and anything malformed are `None`, so an
+    /// unlimited or absent cgroup never caps a derivation.
+    ///
+    /// Prove-the-test: drop the `bytes >= 1 << 60` arm and the v1 sentinel
+    /// assertion reads `Some(9_223_372_036_854_771_712)` against `None`.
+    #[test]
+    fn cgroup_memory_limit_is_parsed_and_unlimited_is_none() {
+        // cgroup v2 memory.max with a finite limit, with and without the newline.
+        assert_eq!(
+            parse_cgroup_memory_limit("17179869184\n"),
+            Some(17_179_869_184)
+        );
+        assert_eq!(
+            parse_cgroup_memory_limit("17179869184"),
+            Some(17_179_869_184)
+        );
+        // cgroup v2 unlimited.
+        assert_eq!(parse_cgroup_memory_limit("max\n"), None);
+        // cgroup v1 unlimited: the page-rounded i64::MAX the kernel writes.
+        assert_eq!(parse_cgroup_memory_limit("9223372036854771712\n"), None);
+        // A zero limit is not a cap either, and malformed content is not a guess.
+        assert_eq!(parse_cgroup_memory_limit("0\n"), None);
+        assert_eq!(parse_cgroup_memory_limit(""), None);
+        assert_eq!(parse_cgroup_memory_limit("lots\n"), None);
+    }
+
+    /// The effective total is `MemTotal` capped by a finite cgroup limit, and
+    /// either one alone when the other is unknown.
+    ///
+    /// Prove-the-test: replace `total.min(limit)` with `total` and the first
+    /// assertion reads 32,212,254,720 against the expected 17,179,869,184.
+    #[test]
+    fn effective_memory_total_is_mem_total_capped_by_the_cgroup_limit() {
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), Some(17_179_869_184)),
+            Some(17_179_869_184)
+        );
+        // A limit above MemTotal does not raise the total.
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), Some(64_424_509_440)),
+            Some(32_212_254_720)
+        );
+        assert_eq!(
+            effective_memory_total(Some(32_212_254_720), None),
+            Some(32_212_254_720)
+        );
+        assert_eq!(
+            effective_memory_total(None, Some(17_179_869_184)),
+            Some(17_179_869_184)
+        );
+        assert_eq!(effective_memory_total(None, None), None);
     }
 
     /// `--cache-max-bytes` reachability (issue #1141): the resolved value is
