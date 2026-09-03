@@ -30,7 +30,7 @@ use ravel_query::log_series::{
     BODY_MATCHER_LABEL, LOG_BYTES_METRIC, LOG_LINES_METRIC, LogMetric, LogSeriesError,
     LogSeriesRequest, SEVERITY_LABEL, fetch_log_series,
 };
-use ravel_query::{ByteLimit, LogSegmentFetcher, PhaseAccounting, QueryPhase};
+use ravel_query::{ByteLimit, LogSegmentFetcher, PhaseAccounting, QueryPhase, RequestLimit};
 use ravel_types::accounting::AccountedOp;
 use ravel_types::{METRIC_NAME_LABEL, TenantHash, TimeRange};
 use uuid::Uuid;
@@ -333,6 +333,7 @@ fn lines_request<'a>(matchers: &'a [LabelMatcher], window: TimeRange) -> LogSeri
         max_samples: 1_000,
         max_series: 1_000,
         max_bytes_scanned: ByteLimit::Unlimited,
+        max_s3_requests: RequestLimit::Unlimited,
         deadline: None,
     }
 }
@@ -568,6 +569,46 @@ async fn log_series_samples_budget_trips_exactly() {
             assert_eq!(max, 5);
         }
         other => panic!("expected SamplesExceeded, got {other:?}"),
+    }
+}
+
+/// `max_s3_requests` trips at the exact request count `log_series_fetch_counts_lines_and_bytes_exactly`
+/// pins for this same fixture and window (2 Plan GETs + 6 Scan GETs = 8 for
+/// object A's one segment): `Bounded(7)` is one under that total, so the
+/// check after the segment completes must fail with the exact count, never
+/// silently truncate or round down to the budget.
+#[tokio::test]
+async fn log_series_request_budget_trips_exactly() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, _ref_b) = two_objects(&mem).await;
+    let counting = Arc::new(CountingStore::new(mem));
+    let fetcher = LogSegmentFetcher::new(counting as Arc<dyn ObjectStoreBackend>)
+        .with_block_range_threshold(0)
+        .with_suffix_len(300);
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "pay/api"),
+    ];
+    let window = TimeRange {
+        start_ns: 90,
+        end_ns: 120,
+    };
+    let req = LogSeriesRequest {
+        max_s3_requests: RequestLimit::Bounded(7),
+        ..lines_request(&matchers, window)
+    };
+    let accounting = PhaseAccounting::new();
+
+    let err = fetch_log_series(&fetcher, TENANT, &[ref_a], &req, &accounting)
+        .await
+        .expect_err("8 requests exceed max_s3_requests=7");
+    match err {
+        LogSeriesError::RequestsExceeded { requests, max } => {
+            assert_eq!(requests, 8);
+            assert_eq!(max, 7);
+        }
+        other => panic!("expected RequestsExceeded, got {other:?}"),
     }
 }
 
@@ -1274,12 +1315,12 @@ async fn log_series_body_matcher_review_probe_ok_ok_boom_request_timeout() {
 /// `RlogWriter::finish` sorts every object's own rows by `(stream_ref, ts)`
 /// (crates/ravel-logseg/src/writer.rs), so within one object the scan already
 /// comes back ts-ascending regardless of push order: a single-object fixture
-/// cannot exercise `fetch_log_series`'s own
-/// `samples.sort_by_key(|s| s.ts_ns)`. Two objects for the same stream can:
-/// each object is internally sorted, but the segment loop pushes object A's
-/// records before object B's, so the per-series `Vec<Sample>` accumulates
-/// [50, 60] then [10, 20] before the final sort reorders it. Flip
-/// `samples.sort_by_key(|s| s.ts_ns)` to a no-op and this test fails: the
+/// cannot exercise `fetch_log_series`'s own final
+/// `samples.sort_by_key(|s| (s.ts_ns, s.value.to_bits()))`. Two objects for
+/// the same stream can: each object is internally sorted, but the segment
+/// loop pushes object A's records before object B's, so the per-series
+/// `Vec<Sample>` accumulates [50, 60] then [10, 20] before the final sort
+/// reorders it. Flip the sort key to a no-op and this test fails: the
 /// samples come back in segment-scan order, [50, 60, 10, 20].
 #[tokio::test]
 async fn log_series_samples_come_back_ts_sorted_across_segments() {
@@ -1317,5 +1358,96 @@ async fn log_series_samples_come_back_ts_sorted_across_segments() {
         tss,
         vec![10, 20, 50, 60],
         "ascending, even though segment A (later timestamps) is scanned before segment B"
+    );
+}
+
+/// ADR-1103 decision 1: samples sharing a timestamp within a series order by
+/// value bits ascending, never by scan/insertion order. Two `ravel_log_bytes`
+/// records at the identical timestamp with different body lengths (so
+/// different values), written in both orders, must come back in the same
+/// ascending-by-value sequence [1.0, 5.0] regardless of which order they were
+/// written and scanned in. Flip the final sort key from
+/// `(s.ts_ns, s.value.to_bits())` back to bare `s.ts_ns` and the
+/// long-then-short fixture returns [5.0, 1.0] instead, failing this test
+/// (`sort_by_key` is stable, so a tie keeps push/scan order).
+#[tokio::test]
+async fn log_series_equal_timestamp_samples_order_by_value_bits() {
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_BYTES_METRIC),
+        LabelMatcher::equal("job", "tiecheck"),
+    ];
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: 100,
+    };
+
+    let short_then_long = vec![
+        resource_record(
+            &[("service.name", AttrValue::Str("tiecheck".to_string()))],
+            50,
+            "INFO",
+            "a",
+            &[],
+        ),
+        resource_record(
+            &[("service.name", AttrValue::Str("tiecheck".to_string()))],
+            50,
+            "INFO",
+            "bbbbb",
+            &[],
+        ),
+    ];
+    let mem_a = Arc::new(MemoryStore::new());
+    let ref_a = write_object(&mem_a, "logs/tie-a.rlog", &short_then_long).await;
+    let fetcher_a = LogSegmentFetcher::new(mem_a as Arc<dyn ObjectStoreBackend>);
+    let req_a = LogSeriesRequest {
+        metric: LogMetric::Bytes,
+        ..lines_request(&matchers, window)
+    };
+    let accounting_a = PhaseAccounting::new();
+    let out_a = fetch_log_series(&fetcher_a, TENANT, &[ref_a], &req_a, &accounting_a)
+        .await
+        .expect("fetch_log_series");
+    assert_eq!(out_a.series.len(), 1);
+    let values_a: Vec<f64> = out_a.series[0].samples.iter().map(|s| s.value).collect();
+    assert_eq!(
+        values_a,
+        vec![1.0, 5.0],
+        "short body (1 byte) sorts before long body (5 bytes) at the shared timestamp"
+    );
+
+    let long_then_short = vec![
+        resource_record(
+            &[("service.name", AttrValue::Str("tiecheck".to_string()))],
+            50,
+            "INFO",
+            "bbbbb",
+            &[],
+        ),
+        resource_record(
+            &[("service.name", AttrValue::Str("tiecheck".to_string()))],
+            50,
+            "INFO",
+            "a",
+            &[],
+        ),
+    ];
+    let mem_b = Arc::new(MemoryStore::new());
+    let ref_b = write_object(&mem_b, "logs/tie-b.rlog", &long_then_short).await;
+    let fetcher_b = LogSegmentFetcher::new(mem_b as Arc<dyn ObjectStoreBackend>);
+    let req_b = LogSeriesRequest {
+        metric: LogMetric::Bytes,
+        ..lines_request(&matchers, window)
+    };
+    let accounting_b = PhaseAccounting::new();
+    let out_b = fetch_log_series(&fetcher_b, TENANT, &[ref_b], &req_b, &accounting_b)
+        .await
+        .expect("fetch_log_series");
+    assert_eq!(out_b.series.len(), 1);
+    let values_b: Vec<f64> = out_b.series[0].samples.iter().map(|s| s.value).collect();
+    assert_eq!(
+        values_b,
+        vec![1.0, 5.0],
+        "same ascending order even though the write/scan order was reversed"
     );
 }

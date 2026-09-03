@@ -10,7 +10,7 @@ use axum::{Json, body::Body};
 use ravel_maintain::{QueryStatus, query_audit_event};
 use ravel_promql::LabelMatcher;
 use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot, QueryWorkloadClass};
-use ravel_types::{LabelSet, SeriesId, TenantHash, TimeRange};
+use ravel_types::{LabelSet, METRIC_NAME_LABEL, SeriesId, TenantHash, TimeRange};
 
 use crate::Coverage;
 use crate::engine::parse_match_selector;
@@ -23,6 +23,7 @@ use crate::http::params::{
     Params, decode_commit_tokens, parse_allow_partial, parse_deadline, parse_timestamp_ms,
 };
 use crate::http::{AppState, ONE_HOUR_NS};
+use crate::log_series;
 
 /// Caps the size of a request body read into memory. There is no
 /// Prometheus-mandated limit; this is a defensive bound for a JSON-free,
@@ -444,7 +445,32 @@ async fn handle_label_values(
             values.insert(v.to_string());
         }
     }
+    // ADR-1103: the two reserved log metric names never appear in any
+    // stored postings, so they only surface here explicitly. A request
+    // whose match[] selectors name metrics only asks about the metrics
+    // signal specifically and gets metrics names only.
+    if name == METRIC_NAME_LABEL && include_log_metric_names(&params)? {
+        values.insert(log_series::LOG_LINES_METRIC.to_string());
+        values.insert(log_series::LOG_BYTES_METRIC.to_string());
+    }
     Ok((values.into_iter().collect(), partial, warnings))
+}
+
+/// Whether `label/__name__/values` should include the two reserved log
+/// metric names (ADR-1103): true when the request carries no `match[]` at
+/// all, or when at least one `match[]` selector is a log selector.
+fn include_log_metric_names(params: &Params) -> Result<bool, ApiError> {
+    let selectors = params.all("match[]");
+    if selectors.is_empty() {
+        return Ok(true);
+    }
+    for selector in selectors {
+        let matchers = parse_match_selector(selector)?;
+        if log_series::log_metric_of(&matchers).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub async fn series(State(state): State<AppState>, req: Request<Body>) -> Response {
