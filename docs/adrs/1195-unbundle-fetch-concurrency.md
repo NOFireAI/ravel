@@ -64,13 +64,21 @@ flowchart LR
 
 ## Decision
 
-**Three named knobs**, each with its own flag and its own derived default:
+**Three named knobs**, each with its own flag, unit and derived default:
 
-| Knob | Governs | Derived default |
-|---|---|---|
-| store GET concurrency | permits against the object store | `max(8, 2 x cores)`, unchanged from today's derived value |
-| SQL partition count | DataFusion `target_partitions` | today's derived value, unchanged |
-| PromQL fan-out | `buffer_unordered` width | today's derived value, unchanged |
+| Flag | Unit | Governs | Derived default |
+|---|---|---|---|
+| `--store-get-concurrency` | count of permits | concurrent GETs against the object store, process-wide | `max(8, 2 x cores)` |
+| `--sql-partition-count` | count of partitions | DataFusion `target_partitions` (`crates/ravel-sql/src/session.rs:540`) | `max(8, 2 x cores)` |
+| `--promql-fetch-fanout` | count of in-flight futures | `buffer_unordered` width (`crates/ravel-query/src/engine.rs:1366,1784,2092`) | `max(8, 2 x cores)` |
+
+Every unit is a positive integer count; zero is rejected at startup. All three
+formulas are today's single derived default, so **no default moves**: the split
+changes which knob an operator turns, not what an untouched deployment does. The
+`max(8, ...)` floor and the `2 x cores` factor come from
+`MIN_DERIVED_FETCH_CONCURRENCY` and `FETCH_CONCURRENCY_PER_CORE`
+(`services/ravel-server/src/config.rs:1548-1553`) and are carried over unchanged
+so that the three can diverge later, deliberately, rather than by accident here.
 
 No default moves. The SQL partition default in particular stays where it is:
 `crates/ravel-sql/src/session.rs:540-544` sets `target_partitions` immediately
@@ -80,8 +88,14 @@ moving it silently would put those in scope.
 **GET concurrency becomes one process-owned limiter**, an `Arc` constructed once
 and shared by every query-side fetcher, replacing the per-fetcher semaphore. The
 RSEG `SegmentFetcher` and `SpanSegmentFetcher` are wired to it at every
-construction site. The flag then means what it says: a node-wide ceiling on
-concurrent store GETs.
+construction site. The flag then means what it says: a **process-wide** ceiling
+on concurrent store GETs.
+
+Process-wide, not node-wide: an `Arc` coordinates the fetchers inside one server
+process and cannot see a second process on the same host. A node running two
+`ravel-server` processes can still issue twice this number of concurrent GETs,
+and nothing here changes that. A node-wide bound would need a mechanism outside
+the process, which this ADR does not propose.
 
 **Legacy precedence is explicit.** `--fetch-concurrency` remains, setting all
 three. Supplying it together with any of the new flags is a **startup error**
@@ -90,9 +104,14 @@ naming both, not a silent precedence rule.
 **Compatibility changes are named, not denied.** Two behaviours change for
 existing deployments:
 
-- RSEG and RSPAN fetchers begin honouring the GET limit. On a 16-core host that
-  raises their effective concurrency from the compiled 16 to 32, and it makes
-  them subject to a shared ceiling they previously escaped.
+- **RSEG fetchers are raised and then shared.** They move from the compiled
+  `DEFAULT_MAX_CONCURRENT_GETS = 16` to the derived default, 32 on a 16-core
+  host, and become subject to a shared ceiling they previously escaped.
+- **RSPAN fetchers are constrained for the first time.** `SpanSegmentFetcher`
+  has no semaphore today, so its GET concurrency is bounded only by its caller.
+  Wiring it to the limiter is a restriction, not a raise, and it is the one
+  change here that can make a workload slower. Span-heavy deployments should be
+  told so in the release notes rather than discovering it.
 - The distributed fragment path stops being able to exceed the node limit by
   constructing a fetcher per fragment.
 
@@ -122,9 +141,13 @@ changing that default pulls ADR-0094's aggregation gate into scope.
 - The knob an operator sets for GET concurrency starts governing every fetcher
   and the process as a whole.
 - ADR-0088's amendment is superseded in the part that records `fetch_concurrency`
-  as the single knob for both scan fan-out and GET concurrency. ADR-0107 ties the
-  RLOG pool sizing to the same flag and needs re-reading against the split before
-  this lands.
+  as the single knob for both scan fan-out and GET concurrency. That supersession
+  takes effect when this ADR is accepted and implemented; while it is `Proposed`,
+  ADR-0088 and the production wiring are unchanged and remain authoritative.
+- ADR-0107 sizes the RLOG fetch pool from the same flag and is **not** reconciled
+  here. Implementation must decide which of the three new knobs that sizing
+  follows, and record the answer in ADR-0107, before the split lands. Until then
+  ADR-0107 stands as written.
 - Three flags where there was one, plus a deprecated alias. The reference doc and
   the derived-defaults table both change.
 - No performance claim. If a benchmark moves on this change alone, that is a
