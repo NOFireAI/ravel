@@ -282,7 +282,8 @@ ORDER BY transitions DESC;
 ### Cost and retention
 
 An `alerts` query reads through the same fetcher the `logs` table reads
-through, so its bytes are cached by the same RAM and disk tiers and accounted
+through, so its bytes are cached by the same tiers that fetcher runs, the RAM
+tier always and the local-disk tier when `--cache-dir` is set, and accounted
 through the same funnel. Alert records are not folded into the catalog and not
 compacted, so a query lists the tenant's alert commit records for its window on
 every call, one bounded listing per shard. One object per transition keeps that
