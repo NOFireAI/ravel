@@ -334,8 +334,7 @@ TypeOK ==
     /\ qy \in [phase: {"idle", "pinned", "done", "invalid"}, attempt: 0..2,
                pinned: SUBSET AllEntries, pinnedAtAttempt: SUBSET AllEntries,
                resolvedView: SUBSET AllEntries, dupServed: SUBSET Records,
-               headStatusAtResolve: {"none"} \cup Statuses,
-               indexReadableAtResolve: BOOLEAN]
+               headStatusAtResolve: {"none"} \cup Statuses]
     /\ lastHead \in [kind: {"none", "fold", "recTick", "corrupt", "unsupported"},
                      wmBefore: Int, wmAfter: Int, entriesChanged: BOOLEAN,
                      entries: SUBSET AllEntries, tombAtWrite: [Hours -> BOOLEAN],
@@ -366,7 +365,7 @@ Init ==
     /\ foldStage = [f \in Folders |-> ClearedStage]
     /\ qy = [phase |-> "idle", attempt |-> 0, pinned |-> {},
              pinnedAtAttempt |-> {}, resolvedView |-> {}, dupServed |-> {},
-             headStatusAtResolve |-> "none", indexReadableAtResolve |-> FALSE]
+             headStatusAtResolve |-> "none"]
     /\ lastHead = [kind |-> "none", wmBefore |-> -1, wmAfter |-> -1,
                    entriesChanged |-> FALSE, entries |-> {}, tombAtWrite |-> NoTomb,
                    reconcileLo |-> -1, frontierReconciled |-> {}]
@@ -741,18 +740,15 @@ DoTombstone(H) ==
 \* record what the resolve SERVED (via QueryServedView); resolvedView records
 \* what the store SAID should be served (the fail-open witness, computed
 \* without QueryFailsClosedOnMissingIndex), so a mutant that serves an empty
-\* result on an unreadable index diverges the two. indexReadableAtResolve
-\* records whether the index was actually readable at that resolve, the
-\* store-derived antecedent MissingIndexDegradesToListing checks. dupServed
-\* records the identities the query returned more than once.
+\* result on an unreadable index diverges the two. dupServed records the
+\* identities the query returned more than once.
 DoQueryResolve ==
     /\ qy.phase = "idle"
     /\ LET v == QueryServedView IN
         qy' = [phase |-> "pinned", attempt |-> 1,
                pinned |-> v, pinnedAtAttempt |-> v,
                resolvedView |-> Dedup(FallbackView), dupServed |-> RawDupIdentities(v),
-               headStatusAtResolve |-> head.status,
-               indexReadableAtResolve |-> IndexReadable]
+               headStatusAtResolve |-> head.status]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage,
                    lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
                    partCorruptionUsed, entryCorruptionUsed>>
@@ -769,8 +765,7 @@ DoQueryRun ==
                      qy' = [phase |-> "pinned", attempt |-> 2,
                             pinned |-> v, pinnedAtAttempt |-> v,
                             resolvedView |-> Dedup(FallbackView), dupServed |-> RawDupIdentities(v),
-                            headStatusAtResolve |-> head.status,
-                            indexReadableAtResolve |-> IndexReadable]
+                            headStatusAtResolve |-> head.status]
                 ELSE qy' = [qy EXCEPT !.phase = "invalid"]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage,
                    lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
@@ -942,14 +937,15 @@ NoLiveCommitOmittedByLostCas ==
                     (r \notin SupersededInputs(H)) => <<"l0", H, r>> \in head.entries
 
 \* A query that could not read a valid HEAD served the store listing rather
-\* than erroring. Store/witness-derived: indexReadableAtResolve is
-\* IndexReadable as observed at the resolve that produced this qy state;
-\* pinned is what the query served; resolvedView is what the store listing
-\* said should be served at that resolve, computed without
-\* QueryFailsClosedOnMissingIndex. A fail-closed mutant (serve an empty result
-\* on an unreadable HEAD) diverges pinned from resolvedView.
+\* than erroring. Witness-derived: pinned is what the query served;
+\* resolvedView is what the store listing said should be served at that
+\* resolve, computed without QueryFailsClosedOnMissingIndex. The two coincide
+\* by construction whenever the index was readable, so the invariant carries
+\* no separate readable/unreadable antecedent: a fail-closed mutant (serve an
+\* empty result on an unreadable HEAD) is the only way to diverge pinned from
+\* resolvedView, and it does so unconditionally.
 MissingIndexDegradesToListing ==
-    ~qy.indexReadableAtResolve => qy.pinned = qy.resolvedView
+    qy.pinned = qy.resolvedView
 
 \* A store deletion only ever ran while all three reachability-gate triggers
 \* cleared: HEAD readable, its covering snapshot part readable, and the
