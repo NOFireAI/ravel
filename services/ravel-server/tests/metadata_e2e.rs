@@ -354,7 +354,10 @@ async fn otlp_counter_is_suffixed_and_metadata_visible_over_http() {
 }
 
 /// The read side degrades gracefully with no metadata yet: a tenant that has
-/// ingested nothing gets a `200` with an empty `data` object, not an error.
+/// ingested nothing gets a `200` back, and `data` carries only the two
+/// reserved log-derived families (`ravel_log_lines`, `ravel_log_bytes`) that
+/// ADR-1103 decision 4 synthesizes on every resolved-tenant request; no
+/// other, fabricated entry is present.
 #[tokio::test]
 async fn metadata_for_tenant_with_no_ingest_is_empty_not_an_error() {
     let running = start_test_server().await;
@@ -370,11 +373,29 @@ async fn metadata_for_tenant_with_no_ingest_is_empty_not_an_error() {
     assert_eq!(response.status(), 200, "an empty tenant is still a 200");
     let body: serde_json::Value = response.json().await.expect("metadata JSON");
     assert_eq!(body["status"], "success");
+    let data = body["data"].as_object().expect("data is an object");
     assert_eq!(
-        body["data"],
-        serde_json::json!({}),
-        "no metadata ingested yet -> empty data object, no error"
+        data.keys().collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            &"ravel_log_lines".to_string(),
+            &"ravel_log_bytes".to_string()
+        ]),
+        "no ingest yet -> only the two reserved log families, no fabricated entry: {body}"
     );
+    assert_eq!(data["ravel_log_lines"][0]["type"], "gauge");
+    assert_eq!(
+        data["ravel_log_lines"][0]["help"],
+        "One sample per log line, value 1, derived from the logs signal at \
+         query time (ADR-1103); count_over_time counts lines."
+    );
+    assert_eq!(data["ravel_log_lines"][0]["unit"], "");
+    assert_eq!(data["ravel_log_bytes"][0]["type"], "gauge");
+    assert_eq!(
+        data["ravel_log_bytes"][0]["help"],
+        "One sample per log line whose value is the line body's length in \
+         bytes (ADR-1103); sum_over_time sums bytes."
+    );
+    assert_eq!(data["ravel_log_bytes"][0]["unit"], "bytes");
 
     running.shutdown().await.expect("graceful shutdown");
 }
