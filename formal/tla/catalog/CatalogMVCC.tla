@@ -17,11 +17,12 @@
 (*   compactor   publishes an L1 record over a maintenance-sealed hour, with *)
 (*               a counts-only conservation gate                             *)
 (*   folder      reads HEAD, stages a snapshot part, publishes the part,     *)
-(*               then CAS-swaps HEAD; may crash before the CAS; racing       *)
-(*               folders serialize on the HEAD version                       *)
-(*   sweeper     sweep_superseded (no HEAD gate, the #1134 shape) and the    *)
-(*               HEAD-gated catalog-object sweep (fail-closed on a corrupt   *)
-(*               or unsupported HEAD)                                        *)
+(*               then CAS-swaps HEAD; may crash before the CAS; rebases if    *)
+(*               it outran the protection horizon; racing folders serialize  *)
+(*               on the HEAD version                                          *)
+(*   sweeper     the HEAD-gated superseded-input sweep (ADR-0020 delete       *)
+(*               blocker) and the HEAD-gated catalog-object sweep, both       *)
+(*               fail-closed on a corrupt or unsupported HEAD                 *)
 (*   retention   marks a bucket tombstoned                                   *)
 (*   query       resolves a snapshot (or degrades to listing when HEAD is    *)
 (*               not readable), pins it, and retries once on invalidation    *)
@@ -72,7 +73,8 @@ CONSTANTS
     CompactionSwapsRecord,     \* compaction output swaps an identity (counts kept)
     ReconcileOnTick,           \* reconcile runs off a plain tick, no wm advance
     SnapshotChangesMidAttempt, \* a pinned query snapshot mutates within an attempt
-    DropMetricsDedup           \* metrics query stops deduping by identity at read
+    DropMetricsDedup,          \* metrics query stops deduping by identity at read
+    SweepSupersededNoHeadGate  \* superseded sweep skips its HEAD-reachability gate
 
 ASSUME NoContent \in Content
 ASSUME Keys # {}
@@ -113,9 +115,11 @@ AllEntries == L0Entries \cup L1Entries
 CrecRec    == [used: BOOLEAN, in: SUBSET Records, out: SUBSET Records, at: Int]
 ClearedCrec == [used |-> FALSE, in |-> {}, out |-> {}, at |-> -1]
 StageRec   == [active: BOOLEAN, wm: Int, entries: SUBSET AllEntries,
-               partWritten: BOOLEAN, baseVer: Nat, baseAbsent: BOOLEAN]
+               partWritten: BOOLEAN, baseVer: Nat, baseAbsent: BOOLEAN,
+               startClock: Int]
 ClearedStage == [active |-> FALSE, wm |-> -1, entries |-> {},
-                 partWritten |-> FALSE, baseVer |-> 0, baseAbsent |-> FALSE]
+                 partWritten |-> FALSE, baseVer |-> 0, baseAbsent |-> FALSE,
+                 startClock |-> -1]
 Statuses   == {"absent", "valid", "corrupt", "unsupported"}
 SnapPart   == [wm: Int, entries: SUBSET AllEntries]
 
@@ -274,7 +278,7 @@ DoFoldStart(f) ==
         /\ foldStage' = [foldStage EXCEPT ![f] =
               [active |-> TRUE, wm |-> w, entries |-> FoldEntriesFor(w),
                partWritten |-> FALSE, baseVer |-> store[HK].version,
-               baseAbsent |-> (head.status = "absent")]]
+               baseAbsent |-> (head.status = "absent"), startClock |-> clock]]
     /\ UNCHANGED <<clock, budget, l0, crec, tomb, head, snapParts, qy, lastHead,
                    lastGatedSweep, corruptionUsed, unsupportedUsed>>
     /\ UNCHANGED svTuple
@@ -296,8 +300,16 @@ DoFoldPutPart(f) ==
 \* snapshot atomically; a loser's CAS no-ops and it rebases (clears its stage).
 \* Correct: the CAS requires the part be written. HeadNamesUnwrittenPart waives
 \* that, so HEAD names a part absent from snapParts.
+\*
+\* Fold-lifetime bound (docs/catalog-and-mvcc.md, MVCC rules): a fold commits
+\* within the protection horizon of the state it listed at. The horizon
+\* (max_query_duration + grace) is sized to outlast any in-flight reader or
+\* fold, so a compaction published after this fold's listing cannot have its
+\* superseded L0 inputs swept before this fold's CAS lands. A fold that outran
+\* the horizon must rebase (DoFoldRebase) rather than publish a stale snapshot.
 DoFoldCas(f) ==
     /\ foldStage[f].active
+    /\ clock - foldStage[f].startClock < ProtectionHorizon
     /\ (HeadNamesUnwrittenPart \/ foldStage[f].partWritten)
     /\ LET st == foldStage[f]
            won == IF st.baseAbsent THEN ~store[HK].present
@@ -326,6 +338,19 @@ DoFoldCrash(f) ==
                    lastGatedSweep, corruptionUsed, unsupportedUsed>>
     /\ UNCHANGED svTuple
 
+\* A fold that outran the protection horizon (its listing is older than the
+\* window that keeps its inputs alive) abandons its staged snapshot and rebases,
+\* rather than CAS-publishing a HEAD that names a since-swept input. The next
+\* fold re-lists current state. This is the release valve that keeps the
+\* fold-lifetime bound in DoFoldCas from stranding a folder.
+DoFoldRebase(f) ==
+    /\ foldStage[f].active
+    /\ clock - foldStage[f].startClock >= ProtectionHorizon
+    /\ foldStage' = [foldStage EXCEPT ![f] = ClearedStage]
+    /\ UNCHANGED <<clock, budget, l0, crec, tomb, head, snapParts, qy, lastHead,
+                   lastGatedSweep, corruptionUsed, unsupportedUsed>>
+    /\ UNCHANGED svTuple
+
 \* --- reconcile off a plain tick (negative control only) ---------------------
 \* crates/ravel-catalog/src/fold.rs::Catalog::reconcile_one_bucket runs inside a
 \* watermark-advancing fold. Enabled only under ReconcileOnTick: it re-reconciles
@@ -342,15 +367,27 @@ DoReconcileTick(f) ==
                    lastGatedSweep, corruptionUsed, unsupportedUsed>>
     /\ UNCHANGED svTuple
 
-\* --- sweeper: sweep_superseded (no HEAD gate; the #1134 shape) ---------------
+\* A valid HEAD names the L0 identity r in hour H.
+HeadNamesL0(H, r) == head.status = "valid" /\ <<"l0", H, r>> \in head.entries
+
+\* --- sweeper: sweep_superseded (HEAD-gated; ADR-0020 delete blocker) ----------
 \* crates/ravel-maintain/src/sweep.rs::sweep_superseded_impl deletes an L1
-\* record's L0 inputs once past the protection horizon, with NO check that a
-\* current HEAD snapshot part still names them.
+\* record's L0 inputs once past the protection horizon, but object-granularly
+\* HOLDS any input a valid HEAD snapshot still names, and holds everything when
+\* HEAD is unreadable (fail-closed). The gate is what keeps a query over the
+\* bucket from failing closed until the fold catches up; the switch drops it,
+\* reproducing the pre-ADR-0020 (issue #1134) shape.
 DoSweepSuperseded(H, g) ==
     /\ crec[H][g].used
-    /\ crec[H][g].in \cap l0[H] # {}
+    /\ head.status \in {"valid", "absent"}
     /\ clock - crec[H][g].at >= ProtectionHorizon
-    /\ l0' = [l0 EXCEPT ![H] = @ \ crec[H][g].in]
+    /\ LET inputs == crec[H][g].in \cap l0[H]
+           deletable == IF SweepSupersededNoHeadGate
+                        THEN inputs
+                        ELSE { r \in inputs : ~HeadNamesL0(H, r) }
+       IN
+        /\ deletable # {}
+        /\ l0' = [l0 EXCEPT ![H] = @ \ deletable]
     /\ UNCHANGED <<clock, budget, crec, tomb, head, snapParts, foldStage, qy,
                    lastHead, lastGatedSweep, corruptionUsed, unsupportedUsed>>
     /\ UNCHANGED svTuple
@@ -475,6 +512,7 @@ Next ==
     \/ \E f \in Folders : DoFoldPutPart(f)
     \/ \E f \in Folders : DoFoldCas(f)
     \/ \E f \in Folders : DoFoldCrash(f)
+    \/ \E f \in Folders : DoFoldRebase(f)
     \/ \E f \in Folders : DoReconcileTick(f)
     \/ \E H \in Hours, g \in CompIds : DoSweepSuperseded(H, g)
     \/ DoSweepCatalogObjects
@@ -497,7 +535,8 @@ Spec == Init /\ [][Next]_vars
 \* Weak fairness on watermark advance (the folder makes progress: start, put
 \* part, and CAS), on the clock, and on the query, so a late supersession is
 \* eventually reflected and a started query eventually finishes.
-FoldProgress == \E f \in Folders : (DoFoldStart(f) \/ DoFoldPutPart(f) \/ DoFoldCas(f))
+FoldProgress == \E f \in Folders :
+    (DoFoldStart(f) \/ DoFoldPutPart(f) \/ DoFoldCas(f) \/ DoFoldRebase(f))
 QueryProgress == DoQueryResolve \/ DoQueryRun
 
 FairSpec ==
@@ -561,12 +600,12 @@ CorruptHeadFailsClosedOnDeletePaths ==
     (lastGatedSweep.ran /\ lastGatedSweep.headStatus \in {"corrupt", "unsupported"})
         => ~lastGatedSweep.deletedAny
 
-\* Every object a valid HEAD names is still present. This is NOT asserted in the
-\* smoke or exhaustive configs: sweep_superseded carries no HEAD gate (issue
-\* #1134), so under free supersession lag it can delete an L0 input that a still
-\* current HEAD names. It is asserted only in negative/free-lag-head-dangling.cfg,
-\* which is an EXPECTED failure recording the #1134 design flaw, not a protocol
-\* the model claims to hold. See counterexamples/free-lag-head-dangling.md.
+\* Every object a valid HEAD names is still present. The superseded sweep's
+\* object-granular HEAD-reachability gate (ADR-0020, crates/ravel-maintain/src/
+\* sweep.rs::sweep_superseded_impl) provides this: it holds any input a valid
+\* HEAD names. Broken by SweepSupersededNoHeadGate, which drops the gate and
+\* reproduces the pre-ADR-0020 (issue #1134) behavior; see
+\* counterexamples/sweep-superseded-no-head-gate.md.
 HeadNamedObjectNeverDeleted ==
     head.status = "valid" => \A e \in head.entries : ~ObjectDeleted(e)
 
