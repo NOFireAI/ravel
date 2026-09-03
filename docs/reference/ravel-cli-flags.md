@@ -345,6 +345,14 @@ Print the bucket's `sys/tenancy` marker: its scheme and, for a keyed bucket, the
 | --- | --- | --- | --- |
 | `--tenant-hash-key-file` |  |  | Optional 32-byte deployment key file (64 hex chars or 32 raw bytes) to verify against the marker's fingerprint |
 
+### tenancy resolve
+
+Hash a tenant id under the bucket's resolved scheme and print its object-store prefix (`t/<hash>/`) on stdout and nothing else (issue #1180): the one entry point for turning a tenant id into the prefix a bytes-summed total, a lifecycle rule, or an erasure check needs, instead of scraping it off a failure message. Exits nonzero if the bucket's scheme needs a key that was not supplied via the global `--tenant-hash-key-file` / `--tenant-hash-unkeyed`
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `<TENANT>` |  |  | Tenant id to resolve (hashed under the bucket's pinned scheme) |
+
 ## provision
 
 Manage the durable shard_count provisioning record (ADR-0050 section 5)
