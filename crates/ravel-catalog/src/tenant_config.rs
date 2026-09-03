@@ -280,6 +280,25 @@ impl TenantConfig {
     }
 }
 
+/// The one retention-window precedence shared by the catalog fold and the
+/// retention sweep: the durable per-tenant [`TenantConfig::retention_ns`] wins
+/// when the record is present and carries `Some`, otherwise
+/// `default_retention_ns` -- the deployment-wide window the caller already
+/// resolved from the CLI-derived config (the per-tenant override if set, else
+/// the deployment default). An absent record (`None`) or one whose
+/// `retention_ns` is unset both fall through to the default; a tenant with
+/// neither resolves to `None` (no retention). The durable record wins over the
+/// CLI per-tenant override when both are set. Stated once here so the fold and
+/// the sweep never resolve different windows for the same tenant.
+pub fn resolve_retention_window(
+    tenant_config: Option<&TenantConfig>,
+    default_retention_ns: Option<i64>,
+) -> Option<i64> {
+    tenant_config
+        .and_then(|cfg| cfg.retention_ns)
+        .or(default_retention_ns)
+}
+
 /// A typed config-record failure. Every variant is fatal to the touch that
 /// raised it, the fail-closed-on-any-anomaly discipline `ProvisioningError` and
 /// `KeyEpochError` follow. None warn and continue.

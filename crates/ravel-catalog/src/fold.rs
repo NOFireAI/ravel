@@ -887,10 +887,10 @@ impl Catalog {
                 None
             }
         };
-        let tenant_retention_ns: Option<i64> = tenant_config
-            .as_ref()
-            .and_then(|cfg| cfg.retention_ns)
-            .or(default_retention_ns);
+        let tenant_retention_ns: Option<i64> = crate::tenant_config::resolve_retention_window(
+            tenant_config.as_ref(),
+            default_retention_ns,
+        );
         // ADR-0850: the tenant's configured typed logs attribute columns, if
         // any. `None`/absent config/a read failure all mean "no configured
         // columns" -- unlike `retention_ns`, `typed_attr_columns` has no
