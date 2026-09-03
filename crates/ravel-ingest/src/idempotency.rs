@@ -157,10 +157,11 @@ fn marker_prefix(tenant_id: &TenantId, signal: Signal, client_key: &[u8]) -> Str
 
 /// Build the exact marker key for a pinned ingest-hour bucket
 /// (`t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm`).
-/// [`write_marker`] always knows this hour (pinned at flush open, the same
-/// convention as the commit-record key); [`read_marker`] does not, because a
-/// retry's flush can land in a different hour than the original, which is
-/// why lookup instead LISTs [`marker_prefix`] over a window.
+/// [`write_marker`] always knows this hour (pinned at request receive, from
+/// the receiver's admission-time clock, not the commit record's flush-open
+/// hour); [`read_marker`] does not, because a retry's request can land in a
+/// different hour than the original, which is why lookup instead LISTs
+/// [`marker_prefix`] over a window.
 pub fn marker_key(
     tenant_id: &TenantId,
     signal: Signal,
