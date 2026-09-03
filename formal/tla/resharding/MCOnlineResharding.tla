@@ -20,9 +20,10 @@ EXTENDS OnlineResharding
 (* same set, so the two orders (increase first, decrease first) are both   *)
 (* reachable under either naming.                                          *)
 (*                                                                        *)
-(* Used by the smoke config only. TLC's symmetry reduction is not sound in *)
-(* general for a temporal property, and the exhaustive config is the one   *)
-(* that checks EventuallyRoutedOnNewGeneration.                            *)
+(* Used by the smoke and exhaustive configs only. TLC's symmetry reduction *)
+(* is not sound in general for a temporal property, so live.cfg (the one   *)
+(* that checks EventuallyRoutedOnNewGeneration under MCFairSpec) omits     *)
+(* SYMMETRY entirely rather than reuse this definition.                    *)
 (***************************************************************************)
 Symmetry == Permutations(Writers) \cup Permutations(Requesters)
 

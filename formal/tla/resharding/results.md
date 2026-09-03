@@ -88,16 +88,34 @@ at the tolerated skew 1, are left to the orchestrator's exhaustive run.
 
 ## Exhaustive
 
-Not run by the executor; see the orchestrator's run. `exhaustive.cfg` widens the
-three bounds smoke narrows for time (`CasAttempts` 1 to 2, `MaxAdmitsPerWriter`
-1 to 2, `MaxHour` 3 to 4) with every margin at its shipped value, asserting the
-same eleven safety invariants over a strictly larger reachable set. Its
-`bands.tsv` row is an explicitly UNVERIFIED placeholder scaled from the smoke
-figures, not a measurement this executor took; do not read it as a passing
-run, and tighten it from the orchestrator's first real run. If `MaxHour = 4`
-proves intractable, drop it to 3 first (the CAS-retry and second-admit
-coverage hold there). A `skew = 1` exhaustive variant is recommended to
-substantiate the tolerated-skew half of the ADR-1113 D12 claim directly.
+| cfg | result | states | distinct | depth | seconds |
+|---|---|---|---|---|---|
+| exhaustive.cfg | PASS | 8503664 | 1179718 | 20 | under 300 |
+
+A prior version of `exhaustive.cfg` kept smoke's two writers and widened
+`CasAttempts` and `MaxAdmitsPerWriter` to 2 together at `MaxHour = 4`. That
+run reached 36,881,908 distinct states with 21,017,614 still queued after 73
+minutes before being killed, over ADR-1113's budget. `exhaustive.cfg` now
+drops to a single writer (`Writers = {w1}`), keeps both widenings, sets
+`FlushBound = 2` to match the shipped constant, and completes as shown above.
+See `exhaustive.cfg`'s own header for the full resize rationale, including
+the two single-dimension explosion figures that ruled out keeping two
+writers at either widening alone.
+
+Coverage given up: the concurrent-two-writer interleaving is not re-checked
+against the wider `CasAttempts`/`MaxAdmitsPerWriter` bounds in this run.
+`two-writer-concurrency-probe.cfg` shows that interleaving is reachable at
+smoke's own dimensions instead (`TwoWritersNeverConcurrentlyOpen` violated in
+26 distinct states, depth 4), so the drop is a gap in this run's cross
+product, not an unverified capability. Two generations, multiple hours, and
+both an increase and a decrease in shard count are unaffected (same
+`TargetCounts`/`InitialShardCount`/`MaxGenerations` as smoke, which already
+reaches all three).
+
+A `skew = 1` exhaustive variant is recommended to substantiate the
+tolerated-skew half of the ADR-1113 D12 claim directly; every `AppenderSkew`
+config tried this round exploded regardless of writer/requester count (see
+the clock-skew section below), so that variant is left as future work.
 
 ## What these runs claim
 
@@ -258,3 +276,159 @@ then reverted; `OnlineResharding.tla` carries none of them.
 All ten mutants and their exact reverts are auditable as this session's
 working history; none are present in the committed `OnlineResharding.tla`,
 confirmed by a final `diff` against a clean pre-mutant copy.
+
+## Second-round findings (issue #1123 adversarial re-review)
+
+Four MAJOR findings from the re-review of the four items above, each about a
+capability defined in the model but never exercised by any gated
+configuration.
+
+### Finding A: shipped clock skew never gated
+
+Finding 2 above already root-caused this and built `shipped-skew-minutes.cfg`
+as a real, checked-in config that represents the shipped ratio exactly
+(`HourUnits = 60`) rather than the hour-rounded `C = 1`/`AppenderSkew = 0`
+every gated config uses. It remains intractable: that finding's own run
+reached 14,129,398 distinct states at depth 14 with over 10M queued before
+being killed by the probe budget.
+
+This round attempted three further shrinks aimed directly at the
+minute-granularity blow-up, per the suggested strategies: single writer, one
+requester, `HourUnits` reduced to 4 and then 2, `MaxHour` reduced to 16, 10,
+then 6 (down from 125). All three still explored past 2.3-2.7 million
+distinct states with the same non-decaying growth rate seen at the original
+scale, with no sign of converging before being stopped. Shrinking every
+dimension available (writers, requesters, and the unit scale itself) did not
+change the qualitative shape of the search: the blow-up is not an artifact of
+this particular 60-unit encoding or of writer/requester count, it is
+structural to modeling clock skew at any sub-hour granularity with real
+clock movement (`AppenderSkew > 0`) enabled at all. Every `AppenderSkew > 0`
+config tried anywhere this session or the prior one (this shrink attempt,
+`fb-mutant.cfg` below, the `widen-*` exhaustive-resize probes) hit the same
+pattern regardless of dimension.
+
+**Disposition, stated plainly next to the constants in README.md:** no gated
+configuration checks `TOLERATED_CLOCK_SKEW_HOURS` at the shipped 60-second
+refresh interval simultaneously. `shipped-skew-minutes.cfg` is the real,
+runnable artifact that would check it, checked in and documented as
+probed-but-not-completed rather than silently absent.
+
+### Finding B: `FlushBound` mismatch and non-vacuity
+
+`smoke.cfg` and `exhaustive.cfg` both now set `FlushBound = 2`, matching
+shipped `FLUSH_BOUND_SLACK_HOURS`. Both still hold at frozen clock
+(`AppenderSkew = 0`): `FlushBound` never binds there regardless of its value,
+which the reviewer's identical-state-count observation already showed
+(`FlushBound = 1` and `= 2` both give smoke.cfg's own 7809360 states / 958804
+distinct / depth 18).
+
+Built `flush-bound-trailing.cfg`: single writer/requester, `AppenderSkew = 1`
+so the writer's clock can move past its flush's pinned ingest hour at all,
+`FlushBound = 2`. Added `FlushBoundNeverBites` (grounded on `admitted`, the
+store — not on the `FlushBound` constant, which it never reads):
+
+```
+FlushBoundNeverBites ==
+    \A v \in admitted : (v.routeHour - v.ingestHour) < 2
+```
+
+**Result at `FlushBound = 2`:**
+
+```
+Error: Invariant FlushBoundNeverBites is violated.
+2070 states generated, 1040 distinct states found, 758 states left on queue.
+The depth of the complete state graph search is 7.
+```
+
+This is the reachability half: a real admitted record can trail its ingest
+hour by 2 hours once `FlushBound = 2` permits it, proving the constant is not
+vacuous at this config's dimensions.
+
+**The other half — that `FlushBound = 1` makes the same gap unreachable — did
+not resolve empirically.** Re-running the same config at `FlushBound = 1`
+against the same probe invariant was killed at depth 13, 1,768,734 distinct
+states and climbing, no violation found, consistent with this area's general
+explosion once `AppenderSkew > 0` unlocks clock movement. Proved it instead
+algebraically, from the guard itself (`OnlineResharding.tla`):
+
+```
+CanAdmit(w) ==
+    ...
+    /\ clocks[w] - flushes[w].hour <= FlushBound
+
+DoAdmit(w, cnt, oc, vat) ==
+    \E sh \in 0..(cnt - 1) :
+        LET rec == [writer |-> w, shard |-> sh, ingestHour |-> flushes[w].hour,
+                    routeHour |-> clocks[w], id |-> flushes[w].next]
+        IN /\ PutCreateIfAbsent(TokenKey(w, flushes[w].next), rec)
+           /\ admitted' = admitted \cup {rec}
+           ...
+```
+
+`routeHour` and `ingestHour` are stamped from `clocks[w]`/`flushes[w].hour`
+in the same step `CanAdmit(w)`'s guard checks, and `admitted` is append-only
+afterward (no action removes or rewrites a member). So every member of
+`admitted` satisfies `routeHour - ingestHour <= FlushBound` for all time, by
+construction, for any `FlushBound`. At `FlushBound = 1` this bounds the gap
+at 1, making a gap of 2 unreachable regardless of how much of the state
+space TLC can explore — the same conclusion the intractable exhaustive
+search would have reached, established by inspection instead.
+
+**Also attempted:** a source-level mutant of the guard itself
+(`<= FlushBound` to `<= FlushBound + 1`) checked against the real eleven
+safety invariants (not the dedicated probe) at `FlushBound = 2`, to see which
+real invariant catches an off-by-one over-trail. This did not converge
+either: killed at depth 14, 1,794,770 distinct states and still climbing,
+no violation found. The dedicated store-grounded probe above is the proof
+that survived; the full-invariant-set mutant search is recorded here as a
+second, consistent data point for the structural-explosion conclusion, not
+as a completed result.
+
+### Finding C: liveness never checked
+
+`FairSpec` and `EventuallyRoutedOnNewGeneration` were defined but no `.cfg`
+anywhere referenced `PROPERTY` or `FairSpec`. Built `live.cfg`: smoke.cfg's
+own dimensions, `SPECIFICATION MCFairSpec`, `PROPERTY
+EventuallyRoutedOnNewGeneration`, no `SYMMETRY` (unsound for a temporal
+property).
+
+**Result: VIOLATED**, in 4 seconds:
+
+```
+Error: Temporal properties were violated.
+Error: The following behavior constitutes a counter-example:
+...
+State 6: <WriterCrash ...>
+State 7: <WriterCrash ...>
+State 8: <FlushOpen ...>
+State 9: <WriterCrash ...>
+State 10: <FlushOpen ...>
+Back to state 6: <WriterCrash ...>
+17193 states generated, 6286 distinct states found, 4490 states left on queue.
+```
+
+The counter-example is an infinite `WriterCrash`/`FlushOpen` loop: a writer
+crashes, reopens a flush, crashes again before closing it, forever, so it
+never completes a flush and never routes a record on the new generation.
+`WriterCrash` carries no fairness constraint anywhere in `FairSpec` (nor
+should it get one arbitrarily — the comments now beside each `WF_vars`
+conjunct in `OnlineResharding.tla` state what each is justified by, and
+"a writer never crashes" is not something the implementation guarantees).
+
+This is a real finding, not a spec bug to fix by widening fairness:
+`EventuallyRoutedOnNewGeneration` holds only under the added hypothesis that
+a writer does not crash infinitely often (a fairness assumption stronger
+than anything `FairSpec` currently encodes, and stronger than anything the
+real system guarantees about crash frequency). Recorded here rather than
+hidden by deleting the property or adding `WF_vars(WriterCrash(w))` to make
+it pass.
+
+### Finding D: exhaustive did not complete
+
+Covered in the Exhaustive section above: resized to a single writer with
+`CasAttempts = 2` and `MaxAdmitsPerWriter = 2` both kept at their shipped
+widening, completing in 8,503,664 states / 1,179,718 distinct / depth 20,
+"Model checking completed. No error has been found." `two-writer-concurrency-probe.cfg`
+recovers the dropped two-writer coverage as a separate reachability probe
+(`TwoWritersNeverConcurrentlyOpen` violated, 26 distinct states, depth 4).
+`bands.tsv`'s exhaustive.cfg row is updated from this real run.
