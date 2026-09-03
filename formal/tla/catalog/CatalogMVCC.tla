@@ -93,7 +93,8 @@ CONSTANTS
     DropMetricsDedup,           \* metrics query stops deduping by identity at read
     SweepSupersededNoHeadGate,  \* superseded sweep skips its HEAD-reachability gate
     LostCasProceedsOnStaleRead, \* a losing fold CAS overwrites HEAD on its stale read
-    CompactionLoserOverwrites   \* a losing compaction publish overwrites the winner
+    CompactionLoserOverwrites,  \* a losing compaction publish overwrites the winner
+    QueryFailsClosedOnMissingIndex \* a query with no readable index serves empty, not listing
 
 ASSUME NoContent \in Content
 ASSUME Keys # {}
@@ -250,21 +251,41 @@ ObjectDeleted(e) ==
 Serves(e, r) ==
     \/ (e[1] = "l0" /\ e[3] = r)
     \/ (e[1] = "l1" /\ r \in crec[e[2]][e[3]].out)
-\* The identities a served entry set would serve more than once (a two-source
-\* conflict) if no dedup ran.
+\* The identities a served entry set serves more than once (a two-source
+\* conflict): recomputed on whatever set was actually served, so a broken
+\* dedup is visible on the served entries themselves, never on a control flag.
 RawDupIdentities(P) == { r \in Records : Cardinality({ e \in P : Serves(e, r) }) > 1 }
-\* The metrics query collapses a two-source conflict to a single served copy;
-\* logs/spans (or the DropMetricsDedup mutant) serve every source. The witness
-\* below records the identities a query ACTUALLY served twice, so a broken dedup
-\* is visible on what the query returned rather than on a control flag.
-DedupOn == DedupBySignal /\ ~DropMetricsDedup
-DupServedFor(P) == IF DedupOn THEN {} ELSE RawDupIdentities(P)
 
-\* The view a query serves for a HEAD status: the pinned snapshot on a valid
-\* HEAD, the listing otherwise. Named so a behaviour mutant can break it (serve
-\* an empty result instead of degrading) without touching resolvedView, the
-\* store-side witness the fail-open invariant compares against.
-QueryServedView == CurrentView
+\* The metrics query collapses a two-source conflict to a single served entry
+\* per identity; logs/spans (or the DropMetricsDedup mutant) serve every
+\* source untouched. Dedup performs that collapse on the served set itself, so
+\* RawDupIdentities recomputed on its output is a store-derived witness, not a
+\* restatement of DedupApplies.
+DedupApplies == DedupBySignal /\ ~DropMetricsDedup
+Sources(r, P) == { e \in P : Serves(e, r) }
+Dedup(P) ==
+    IF ~DedupApplies THEN P
+    ELSE P \ UNION { IF Sources(r, P) = {} THEN {}
+                      ELSE Sources(r, P) \ {CHOOSE e \in Sources(r, P) : TRUE} : r \in Records }
+
+\* Whether the reader can resolve a snapshot from HEAD. HeadNamesOnlyComplete
+\* Parts already proves a valid HEAD always names an existing snapshot part
+\* (the sweep guard never reclaims a part a live HEAD names), so this reduces
+\* to HEAD validity; any other status (absent/corrupt/unsupported) leaves no
+\* index to read. Store-derived: reads head.status, not a flag.
+IndexReadable == head.status = "valid"
+
+\* What the store says a reader with a readable index would see: the pinned
+\* snapshot when the index is readable, the direct listing otherwise. Free of
+\* QueryFailsClosedOnMissingIndex, so the fail-open contract has a witness the
+\* switch cannot corrupt.
+FallbackView == IF IndexReadable THEN head.entries ELSE ListingView
+
+\* The view a query actually serves: the listing fallback, or nothing at all
+\* when QueryFailsClosedOnMissingIndex wrongly serves empty instead of
+\* degrading; then deduped the way a real reader dedups what it served.
+QueryServedView ==
+    Dedup(IF QueryFailsClosedOnMissingIndex /\ ~IndexReadable THEN {} ELSE FallbackView)
 
 TypeOK ==
     /\ StoreTypeOK
@@ -279,7 +300,8 @@ TypeOK ==
     /\ qy \in [phase: {"idle", "pinned", "done", "invalid"}, attempt: 0..2,
                pinned: SUBSET AllEntries, pinnedAtAttempt: SUBSET AllEntries,
                resolvedView: SUBSET AllEntries, dupServed: SUBSET Records,
-               headStatusAtResolve: {"none"} \cup Statuses]
+               headStatusAtResolve: {"none"} \cup Statuses,
+               indexReadableAtResolve: BOOLEAN]
     /\ lastHead \in [kind: {"none", "fold", "recTick", "corrupt", "unsupported"},
                      wmBefore: Int, wmAfter: Int, entriesChanged: BOOLEAN,
                      entries: SUBSET AllEntries, tombAtWrite: [Hours -> BOOLEAN],
@@ -304,7 +326,7 @@ Init ==
     /\ foldStage = [f \in Folders |-> ClearedStage]
     /\ qy = [phase |-> "idle", attempt |-> 0, pinned |-> {},
              pinnedAtAttempt |-> {}, resolvedView |-> {}, dupServed |-> {},
-             headStatusAtResolve |-> "none"]
+             headStatusAtResolve |-> "none", indexReadableAtResolve |-> FALSE]
     /\ lastHead = [kind |-> "none", wmBefore |-> -1, wmAfter |-> -1,
                    entriesChanged |-> FALSE, entries |-> {}, tombAtWrite |-> NoTomb,
                    reconcileLo |-> -1]
@@ -579,19 +601,23 @@ DoTombstone(H) ==
 
 \* --- query: resolve, pin, retry once ----------------------------------------
 \* crates/ravel-query/src/engine.rs::QueryEngine::resolve_snapshot_with_retry.
-\* A valid HEAD pins the snapshot; any other HEAD state degrades to a listing
-\* (fail-open), never an error. pinned/pinnedAtAttempt record what the resolve
-\* SERVED (via QueryServedView); resolvedView records what the store SAID should
-\* be served at that HEAD status (the fail-open witness), so a mutant that serves
-\* an empty result on an unreadable HEAD diverges the two. dupServed records the
-\* identities the query returned more than once.
+\* A valid HEAD with a readable index part pins the snapshot; any other state
+\* degrades to a listing (fail-open), never an error. pinned/pinnedAtAttempt
+\* record what the resolve SERVED (via QueryServedView); resolvedView records
+\* what the store SAID should be served (the fail-open witness, computed
+\* without QueryFailsClosedOnMissingIndex), so a mutant that serves an empty
+\* result on an unreadable index diverges the two. indexReadableAtResolve
+\* records whether the index was actually readable at that resolve, the
+\* store-derived antecedent MissingIndexDegradesToListing checks. dupServed
+\* records the identities the query returned more than once.
 DoQueryResolve ==
     /\ qy.phase = "idle"
     /\ LET v == QueryServedView IN
         qy' = [phase |-> "pinned", attempt |-> 1,
                pinned |-> v, pinnedAtAttempt |-> v,
-               resolvedView |-> CurrentView, dupServed |-> DupServedFor(v),
-               headStatusAtResolve |-> head.status]
+               resolvedView |-> Dedup(FallbackView), dupServed |-> RawDupIdentities(v),
+               headStatusAtResolve |-> head.status,
+               indexReadableAtResolve |-> IndexReadable]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage,
                    lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
     /\ UNCHANGED svTuple
@@ -606,8 +632,9 @@ DoQueryRun ==
                 THEN LET v == QueryServedView IN
                      qy' = [phase |-> "pinned", attempt |-> 2,
                             pinned |-> v, pinnedAtAttempt |-> v,
-                            resolvedView |-> CurrentView, dupServed |-> DupServedFor(v),
-                            headStatusAtResolve |-> head.status]
+                            resolvedView |-> Dedup(FallbackView), dupServed |-> RawDupIdentities(v),
+                            headStatusAtResolve |-> head.status,
+                            indexReadableAtResolve |-> IndexReadable]
                 ELSE qy' = [qy EXCEPT !.phase = "invalid"]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage,
                    lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
@@ -768,15 +795,15 @@ NoLiveCommitOmittedByLostCas ==
                 \A r \in l0[H] :
                     (r \notin SupersededInputs(H)) => <<"l0", H, r>> \in head.entries
 
-\* A query that could not read a valid HEAD served the store listing rather than
-\* erroring. Store/witness-derived: headStatusAtResolve is the HEAD status the
-\* resolve read returned; pinned is what the query served; resolvedView is what
-\* the store listing said should be served at that resolve. A fail-closed mutant
-\* (serve an empty result on an unreadable HEAD) diverges pinned from
-\* resolvedView.
+\* A query that could not read a valid HEAD served the store listing rather
+\* than erroring. Store/witness-derived: indexReadableAtResolve is
+\* IndexReadable as observed at the resolve that produced this qy state;
+\* pinned is what the query served; resolvedView is what the store listing
+\* said should be served at that resolve, computed without
+\* QueryFailsClosedOnMissingIndex. A fail-closed mutant (serve an empty result
+\* on an unreadable HEAD) diverges pinned from resolvedView.
 MissingIndexDegradesToListing ==
-    (qy.headStatusAtResolve \in {"absent", "corrupt", "unsupported"})
-        => qy.pinned = qy.resolvedView
+    ~qy.indexReadableAtResolve => qy.pinned = qy.resolvedView
 
 \* A store deletion only ever ran while HEAD was readable (valid or absent), so
 \* a corrupt or unsupported HEAD fails every delete path closed. Witness-derived:

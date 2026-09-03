@@ -12,8 +12,7 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 3165708 | 32 | PASS | 20260903T090656Z-d6983312780c1b1ed10555b93b7f645818baadda |
-| exhaustive.cfg | FairSpec (safety + liveness) | 1191366 | 31 | PASS | tlc-exhaustive3-1904015 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 2910784 | 32 | PASS | 20260903T122303Z-e288a3406dc4d70be033d2d5b9444e0b19b66047 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
 | negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | negative lane |
 | negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | negative lane |
@@ -24,8 +23,9 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 | negative/metrics-dedup-dropped.cfg | Spec | first counterexample | n/a | SignalDedupContract violated, exit 12 | negative lane |
 | negative/sweep-superseded-no-head-gate.cfg | Spec | first counterexample | n/a | HeadNamedObjectNeverDeleted violated, exit 12 | negative lane |
 | negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | tlc-carryforward-nonvacuity-1852394 |
+| negative/query-fails-closed-on-missing-index.cfg | Spec | first counterexample | n/a | MissingIndexDegradesToListing violated, exit 12 | negative lane |
 
-The nine `negative/` configs each flip exactly one switch (or, for
+The ten `negative/` configs each flip exactly one switch (or, for
 `carryforward-nonvacuity.cfg`, check a refuted probe) and must exit 12 reporting
 exactly the named property; each `.expect` pins that exit code and property, and
 the negative lane fails if any config passes or reports a different property.
@@ -41,18 +41,34 @@ not run by any harness lane.
 A run outside these is a regression to investigate, not to widen; see
 `bands.tsv`.
 
-- smoke distinct states in [3150000, 3185000], depth in [32, 32].
-- exhaustive distinct states in [1185000, 1198000], depth in [31, 31].
+- smoke distinct states in [2895000, 2925000], depth in [32, 32].
 
-The safety and liveness models run to a fixed complete state graph, so their
-distinct-state count and depth are deterministic; the bands carry a few percent
-of margin only to absorb a future toolchain change. `carryforward.cfg` gets no
-band row: it is a targeted three-hour carry-forward pass, not one of the two
-banded gate configs, and its full graph (4,481,272 distinct states, depth 37) is
-recorded here instead. The negative configs are NOT deterministic: they stop at
-the first counterexample TLC finds, and under `-workers auto` which state that
-is varies between runs, so a negative gets no band. Each negative is pinned
-instead by its `.expect` file.
+The safety model runs to a fixed complete state graph, so its distinct-state
+count and depth are deterministic; the band carries a small margin only to
+absorb a future toolchain change. This round's `MissingIndexDegradesToListing`
+and `SignalDedupContract` fixes (issue #1121 round two) changed `QueryServedView`
+and its resolve-time witnesses, which shrank the smoke state graph from the
+prior round's 3165708 distinct states to 2910784 (same depth, 32): a query
+now dedups the entries it actually serves before recording `dupServed` rather
+than carrying a separately-toggled duplicate-count field, collapsing some
+previously-distinct `qy` states. The band above reflects a fresh measurement
+of this round's smoke.cfg run.
+
+`exhaustive.cfg` carried a band (1185000-1198000 distinct states, depth 31)
+from the prior round's measurement, but this round's model changes shifted the
+exhaustive graph the same way they shifted smoke's, and this task's rules
+forbid an exhaustive TLC run (it risks the idle-timeout kill). Re-measuring
+that band is out of scope for this round; the stale band has been removed
+from `bands.tsv` rather than left in place unmeasured against the current
+model. Re-measure and restore it the next time an exhaustive run is in scope.
+
+`carryforward.cfg` gets no band row: it is a targeted three-hour carry-forward
+pass, not the banded gate config, and its full graph (4,481,272 distinct
+states, depth 37, recorded here from the prior round) was not re-run this
+round; it is not one of this task's required gates. The negative configs are
+NOT deterministic: they stop at the first counterexample TLC finds, and under
+`-workers auto` which state that is varies between runs, so a negative gets no
+band. Each negative is pinned instead by its `.expect` file.
 
 ## Invariant derivation audit
 
@@ -72,18 +88,18 @@ authority; the table restates it.
 | SnapshotEntriesBelowWatermark | STORE: the HEAD register |
 | PinnedSnapshotStableWithinAttempt | WITNESS: `qy.pinnedAtAttempt` (resolve-time view) versus `qy.pinned` (served now) |
 | NoLiveCommitOmittedByLostCas | STORE/WITNESS: HEAD register, the L0 plane, and `maxValidWm` (highest watermark ever on a valid HEAD) |
-| MissingIndexDegradesToListing | STORE/WITNESS: `qy.headStatusAtResolve`, `qy.pinned`, `qy.resolvedView` |
+| MissingIndexDegradesToListing | WITNESS: `qy.indexReadableAtResolve` (`IndexReadable` as observed at resolve), `qy.pinned` (what was served), `qy.resolvedView` (what the store listing said should be served, computed without the `QueryFailsClosedOnMissingIndex` switch) |
 | CorruptHeadFailsClosedOnDeletePaths | WITNESS: `lastDelete.headStatus`, the HEAD status at the last real object removal |
 | HeadNamedObjectNeverDeleted | STORE: the HEAD register, the L0 plane, and the L1 compaction-record plane |
 | TombstonedBucketContributesNothing | WITNESS: `lastHead.entries`, `lastHead.tombAtWrite`, and `lastHead.reconcileLo` of the last fold |
-| SignalDedupContract | WITNESS: `qy.dupServed`, the identities the query actually served more than once |
+| SignalDedupContract | WITNESS: `qy.dupServed`, recomputed (`RawDupIdentities`) on the entry set the query actually served after `Dedup` ran on it, not on the switch that gates `Dedup` |
 
 ## Non-vacuity: behaviour mutant per invariant
 
-Each named safety invariant is shown load-bearing by a behaviour mutant. Eight
+Each named safety invariant is shown load-bearing by a behaviour mutant. Nine
 have a dedicated switch and a negative-control config that flips it and drives
 TLC to exit 12 on that invariant (the recorded lines are in the run table
-above). Four have no switch and carry a mutant note naming a reachable
+above). Three have no switch and carry a mutant note naming a reachable
 antecedent and the mutation that would falsify them; the note filename matches
 the invariant.
 
@@ -97,8 +113,8 @@ the invariant.
 | NoLiveCommitOmittedByLostCas | switch `LostCasProceedsOnStaleRead` | negative/lost-cas-proceeds.cfg, exit 12 |
 | SignalDedupContract | switch `DropMetricsDedup` | negative/metrics-dedup-dropped.cfg, exit 12 |
 | HeadNamedObjectNeverDeleted | switch `SweepSupersededNoHeadGate` | negative/sweep-superseded-no-head-gate.cfg, exit 12 |
+| MissingIndexDegradesToListing | switch `QueryFailsClosedOnMissingIndex` | negative/query-fails-closed-on-missing-index.cfg, exit 12 |
 | SnapshotEntriesBelowWatermark | mutant note (no switch) | counterexamples/snapshot-entries-below-watermark.md |
-| MissingIndexDegradesToListing | mutant note (no switch) | counterexamples/missing-index-degrades-to-listing.md |
 | CorruptHeadFailsClosedOnDeletePaths | mutant note (no switch) | counterexamples/corrupt-head-fails-closed-on-delete-paths.md |
 | TombstonedBucketContributesNothing | mutant note (no switch) | counterexamples/tombstoned-bucket-contributes-nothing.md |
 
@@ -120,7 +136,7 @@ present only so `QueryTerminates` can hold under the bounded clock.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 3`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all eight
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all nine
 mutation switches FALSE, `SYMMETRY Symmetry`.
 
 ## Exhaustive constants
@@ -128,7 +144,7 @@ mutation switches FALSE, `SYMMETRY Symmetry`.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1, g2}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all eight
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all nine
 mutation switches FALSE, `FairSpec` (no symmetry, so liveness is checked
 soundly). Two records and a second compaction identity keep the multiset and
 dedup conflicts non-vacuous. The version-matched HEAD CAS is exercised without a
@@ -141,7 +157,7 @@ base version and takes the losing branch.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1, 2}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 0`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 2`, `DedupBySignal = TRUE`, all eight
+`RetentionHorizon = 2`, `LagBound = 2`, `DedupBySignal = TRUE`, all nine
 mutation switches FALSE, `SYMMETRY Symmetry`. Three hours let a valid HEAD fold
 at successive watermarks; both seal delays are zero so all three hours seal
 within `MaxClock = 3`. The compact-strictly-before-fold gap (`FoldSealDelay = 1`)
