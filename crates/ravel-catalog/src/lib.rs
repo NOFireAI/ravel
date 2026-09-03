@@ -81,5 +81,5 @@ pub use tenant_config::{
     DeclaredColumnType, DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS,
     SetOutcome as TenantConfigSetOutcome, TENANT_CONFIG_FORMAT_VERSION, TenantConfig,
     TenantConfigError, TenantLifecycleState, TypedAttrColumnError, config_key, read_config,
-    read_config_values, set_tenant_config, validate_typed_attr_columns,
+    read_config_values, resolve_retention_window, set_tenant_config, validate_typed_attr_columns,
 };

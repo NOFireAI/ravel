@@ -12,7 +12,7 @@ use common::*;
 use proptest::prelude::*;
 use ravel_commit::keys;
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
-use ravel_maintain::retention::{is_expired, max_event_ts};
+use ravel_maintain::retention::{is_expired, max_event_ts, resolve_retention_window_ns};
 use ravel_maintain::scan::scan_and_maintain;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, RetentionConfig,
@@ -1277,6 +1277,380 @@ async fn scan_reports_blocked_by_snapshot_counter() {
         "the HEAD-reachability block is counted on MaintainReport"
     );
     assert_eq!(r2.blocked_by_unreadable_head, 0);
+}
+
+// --- #1131: the sweep resolves the retention window like the fold ----------
+
+/// Count the commit records currently present in a bucket.
+async fn count_commit_records(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    list_all(store, &prefix)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            matches!(
+                keys::partition_bucket_entry(&m.key),
+                Ok(keys::BucketEntry::CommitRecord(_))
+            )
+        })
+        .count()
+}
+
+/// Count the retention tombstones currently present in a bucket.
+async fn count_tombstones(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> usize {
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    list_all(store, &prefix)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|m| {
+            matches!(
+                keys::partition_bucket_entry(&m.key),
+                Ok(keys::BucketEntry::Tombstone(_))
+            )
+        })
+        .count()
+}
+
+/// #1131 (a): a tenant whose durable `retention_ns` is 48h under a CLI default
+/// of 24h. The sweep must resolve the durable 48h window (exactly as the fold
+/// does, ADR-0078), so an hour aged ~30h is NOT tombstoned (exact kept count)
+/// and one aged ~50h IS (exact tombstoned count).
+///
+/// Failing assertion against pre-fix code: `assert_eq!(out_30,
+/// RetentionOutcome::NotExpired)` (and `count_tombstones(.., &bucket_30) == 0`).
+/// Pre-fix the sweep resolved the window from `RetentionConfig::window_for`
+/// alone (the CLI 24h map), never reading `TenantConfig.retention_ns`, so the
+/// 30h-old hour is expired and tombstoned: the outcome is `Tombstoned` and the
+/// tombstone count is 1.
+#[tokio::test]
+async fn sweep_honors_durable_window_over_shorter_cli_default() {
+    let store = Arc::new(MemoryStore::new());
+    let config = cfg();
+    let cli_default = 24 * NS_PER_HOUR;
+    let durable = 48 * NS_PER_HOUR;
+    let retention = RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: Some(cli_default),
+            tenants: vec![],
+        },
+        &config,
+        DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("cli retention config");
+    write_tenant_retention(store.as_ref(), durable).await;
+
+    let now = (i64::from(HOUR) + 60) * NS_PER_HOUR;
+    let clock = FixedClock::new(now);
+
+    // Aged ~30h: kept under 48h, expired under 24h.
+    let hour_30 = HOUR + 30;
+    let bucket_30 = bucket_at(hour_30);
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            hour_30,
+            Uuid::from_u128(0x30),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "h30")],
+                &[(i64::from(hour_30) * NS_PER_HOUR + 1_000, 1.0)],
+            )],
+        ),
+    )
+    .await;
+
+    // Aged ~50h: expired under both 48h and 24h.
+    let hour_50 = HOUR + 10;
+    let bucket_50 = bucket_at(hour_50);
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            hour_50,
+            Uuid::from_u128(0x50),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "h50")],
+                &[(i64::from(hour_50) * NS_PER_HOUR + 1_000, 2.0)],
+            )],
+        ),
+    )
+    .await;
+
+    // The 30h-old hour: kept by the durable 48h window.
+    let out_30 = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket_30,
+    )
+    .await
+    .expect("sweep h30");
+    assert_eq!(
+        out_30,
+        RetentionOutcome::NotExpired,
+        "the durable 48h window keeps the 30h-old hour (pre-fix reads CLI 24h and tombstones it)"
+    );
+    assert_eq!(
+        count_tombstones(store.as_ref(), &bucket_30).await,
+        0,
+        "no tombstone for the kept hour"
+    );
+    assert_eq!(
+        count_commit_records(store.as_ref(), &bucket_30).await,
+        1,
+        "the kept hour's commit record is untouched"
+    );
+
+    // The 50h-old hour: expired even under the durable 48h window.
+    let out_50 = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket_50,
+    )
+    .await
+    .expect("sweep h50");
+    assert_eq!(
+        out_50,
+        RetentionOutcome::Tombstoned,
+        "the 50h-old hour expires under the durable 48h window"
+    );
+    assert_eq!(
+        count_tombstones(store.as_ref(), &bucket_50).await,
+        1,
+        "exactly one tombstone for the expired hour"
+    );
+}
+
+/// #1131 (b): the liveness stall. With a durable window longer than the CLI
+/// default and a live HEAD naming the hour, the sweep must resolve the durable
+/// window and leave the hour retained -- never tombstone it -- so the physical
+/// sweep never repeats `BlockedBySnapshot` waiting for a frontier reconcile
+/// that (at the durable window) would not drop the hour.
+///
+/// Failing assertion against pre-fix code: `assert_eq!(pass1,
+/// RetentionOutcome::NotExpired)`. Pre-fix the sweep resolves the CLI 24h
+/// window and tombstones the 30h-old hour; a pass past the horizon then returns
+/// `BlockedBySnapshot(SnapshotBlock::Named)` on every tick, because the fold
+/// (at the durable window) keeps naming the hour and its frontier reconcile
+/// never drops it -- the stall this fix removes.
+#[tokio::test]
+async fn durable_window_avoids_blocked_by_snapshot_stall() {
+    let store = Arc::new(MemoryStore::new());
+    let config = cfg();
+    let cli_default = 24 * NS_PER_HOUR;
+    let durable = 200 * NS_PER_HOUR;
+    let retention = RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: Some(cli_default),
+            tenants: vec![],
+        },
+        &config,
+        DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("cli retention config");
+    write_tenant_retention(store.as_ref(), durable).await;
+
+    let now = (i64::from(HOUR) + 60) * NS_PER_HOUR;
+    let clock = FixedClock::new(now);
+    let hour_30 = HOUR + 30;
+    let bucket_30 = bucket_at(hour_30);
+    seed_input(
+        store.as_ref(),
+        &InputSpec::new_at(
+            hour_30,
+            Uuid::from_u128(0x31),
+            1,
+            1,
+            vec![raw_series(
+                "m",
+                &[("k", "h30")],
+                &[(i64::from(hour_30) * NS_PER_HOUR + 1_000, 1.0)],
+            )],
+        ),
+    )
+    .await;
+
+    // A live HEAD naming the hour: the fold overlays the durable window, so its
+    // frontier reconcile keeps this hour. The sweep must agree and keep it too.
+    let default_retention_ns = retention.window_for(&tenant_hash());
+    fold_head(&store, Signal::Metrics, now, default_retention_ns).await;
+
+    // First sweep: retained under the durable window, no tombstone written.
+    let pass1 = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket_30,
+    )
+    .await
+    .expect("sweep pass 1");
+    assert_eq!(
+        pass1,
+        RetentionOutcome::NotExpired,
+        "the durable window keeps the hour; pre-fix reads CLI 24h and tombstones it"
+    );
+    assert_eq!(count_tombstones(store.as_ref(), &bucket_30).await, 0);
+
+    // The fold's frontier reconcile runs (watermark advanced). At the durable
+    // window it does not drop the hour, matching the sweep.
+    fold_head(
+        &store,
+        Signal::Metrics,
+        now + 3 * NS_PER_HOUR,
+        default_retention_ns,
+    )
+    .await;
+
+    // A second sweep, past the protection horizon: still retained, never
+    // BlockedBySnapshot. Pre-fix the hour is tombstoned and this pass returns
+    // BlockedBySnapshot(Named) on every tick.
+    clock.set(now + config.protection_horizon_ns + 1);
+    let pass2 = retention_sweep_bucket(
+        store.as_ref(),
+        &clock,
+        &config,
+        &retention,
+        &NoLeases,
+        &bucket_30,
+    )
+    .await
+    .expect("sweep pass 2");
+    assert_ne!(
+        pass2,
+        RetentionOutcome::BlockedBySnapshot(SnapshotBlock::Named),
+        "the durable window means the hour is never tombstoned, so no snapshot block"
+    );
+    assert_eq!(
+        pass2,
+        RetentionOutcome::NotExpired,
+        "the hour is reported retained on the second pass"
+    );
+    assert_eq!(count_tombstones(store.as_ref(), &bucket_30).await, 0);
+}
+
+/// #1131 (c): the fold and the sweep resolve the SAME window (exact ns) for a
+/// tenant with a durable record, one with only a CLI override, and one with
+/// neither. Also pins the precedence tiebreak: a durable record wins over a CLI
+/// per-tenant override.
+///
+/// Failing assertion against pre-fix code: in case 1, `assert_eq!(sweep,
+/// Some(durable))`. To reproduce the pre-fix resolution, make
+/// `resolve_retention_window_ns` return `Ok(retention.window_for(tenant))`
+/// (ignore the durable record): the sweep then resolves the CLI override (36h),
+/// not the durable 48h, and diverges from the fold.
+#[tokio::test]
+async fn fold_and_sweep_resolve_the_same_window() {
+    let config = cfg();
+    let cli_default = 24 * NS_PER_HOUR;
+    let cli_override = 36 * NS_PER_HOUR;
+    let durable = 48 * NS_PER_HOUR;
+
+    // Resolve the window through both paths: the sweep's new async resolver, and
+    // the fold's own resolution (read the durable record the same way and
+    // overlay it on the deployment default services/ravel-server/src/fold.rs
+    // hands to Catalog::fold, `RetentionConfig::window_for`).
+    async fn resolve_both(
+        store: &dyn ObjectStoreBackend,
+        retention: &RetentionConfig,
+    ) -> (Option<i64>, Option<i64>) {
+        let th = tenant_hash();
+        let sweep = resolve_retention_window_ns(store, retention, &th)
+            .await
+            .expect("sweep resolves window");
+        let tenant_config = ravel_catalog::read_config_values(store, &th)
+            .await
+            .expect("read tenant config");
+        let fold = ravel_catalog::resolve_retention_window(
+            tenant_config.as_ref(),
+            retention.window_for(&th),
+        );
+        (sweep, fold)
+    }
+
+    // Case 1: a durable record present (with a CLI override too) -> durable wins.
+    {
+        let store = Arc::new(MemoryStore::new());
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(cli_default),
+                tenants: vec![(TENANT.to_string(), cli_override)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("retention config");
+        write_tenant_retention(store.as_ref(), durable).await;
+        let (sweep, fold) = resolve_both(store.as_ref(), &retention).await;
+        assert_eq!(
+            sweep,
+            Some(durable),
+            "the durable record wins over the CLI per-tenant override"
+        );
+        assert_eq!(fold, Some(durable));
+        assert_eq!(
+            sweep, fold,
+            "the sweep and the fold resolve the same window"
+        );
+    }
+
+    // Case 2: only a CLI per-tenant override, no durable record.
+    {
+        let store = Arc::new(MemoryStore::new());
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(cli_default),
+                tenants: vec![(TENANT.to_string(), cli_override)],
+            },
+            &config,
+            DEFAULT_MAX_INGEST_LAG_NS,
+        )
+        .expect("retention config");
+        let (sweep, fold) = resolve_both(store.as_ref(), &retention).await;
+        assert_eq!(sweep, Some(cli_override));
+        assert_eq!(fold, Some(cli_override));
+        assert_eq!(
+            sweep, fold,
+            "the sweep and the fold resolve the same window"
+        );
+    }
+
+    // Case 3: neither a durable record nor any CLI policy.
+    {
+        let store = Arc::new(MemoryStore::new());
+        let retention = RetentionConfig::default();
+        let (sweep, fold) = resolve_both(store.as_ref(), &retention).await;
+        assert_eq!(sweep, None);
+        assert_eq!(fold, None);
+        assert_eq!(
+            sweep, fold,
+            "the sweep and the fold resolve the same window"
+        );
+    }
 }
 
 /// Deliverable 5 (counters): the fail-closed undecodable-HEAD block is

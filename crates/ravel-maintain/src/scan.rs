@@ -18,6 +18,7 @@ use crate::config::{CompactorConfig, NS_PER_HOUR, RetentionConfig};
 use crate::error::{MaintainError, Result};
 use crate::retention::{
     RetentionOutcome, SnapshotBlock, SnapshotReachability, maintain_bucket_with_reach,
+    resolve_retention_window_ns,
 };
 use crate::sweep::LeaseCheck;
 
@@ -1143,7 +1144,12 @@ pub async fn scan_and_maintain_with_memo(
     let now = clock.now_ns();
     let hours = list_shard_hours(store, &tenant_hash, signal, shard).await?;
     let present: HashSet<u32> = hours.iter().copied().collect();
-    let retention_window_ns = retention.window_for(&tenant_hash);
+    // Resolve the tenant's effective retention window once for the whole pass
+    // (durable record over CLI, ADR-0078; the same window the fold resolves).
+    // The window is constant across a tenant's buckets, so this is one config
+    // GET per pass rather than one per bucket, and every bucket's retention
+    // decision and this pass's zone classification use the same value.
+    let retention_window_ns = resolve_retention_window_ns(store, retention, &tenant_hash).await?;
 
     // One HEAD-reachability cache for the whole pass: the delete-blocker gate
     // (ADR-0020) reads the catalog HEAD at most once and each covering snapshot
@@ -1170,9 +1176,16 @@ pub async fn scan_and_maintain_with_memo(
         }
 
         let bucket = Bucket::new(tenant_hash, signal, shard, hour);
-        let (retention_outcome, compaction) =
-            maintain_bucket_with_reach(&mut reach, store, clock, config, retention, lease, &bucket)
-                .await?;
+        let (retention_outcome, compaction) = maintain_bucket_with_reach(
+            &mut reach,
+            store,
+            clock,
+            config,
+            retention_window_ns,
+            lease,
+            &bucket,
+        )
+        .await?;
         match retention_outcome {
             // The bucket is (being) retired; compaction was skipped by design.
             RetentionOutcome::Tombstoned
