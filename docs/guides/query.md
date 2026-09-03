@@ -344,12 +344,15 @@ limit is on the query's *start*: a narrow `start`/`end` pair costs little
 however recent it is, so the fix is always to move `start` forward, never to
 change `end`.
 
-## SQL over `samples`, `logs`, and `spans`
+<a id="sql-over-samples-logs-and-spans"></a>
 
-`POST /api/v1/sql` serves three tables from one endpoint:
-`samples` (metrics), `logs`, and `spans`. The server parses the query's `FROM`
+## SQL over `samples`, `logs`, `spans`, `alerts`, and `audit`
+
+`POST /api/v1/sql` serves five tables from one endpoint:
+`samples` (metrics), `logs`, `spans` (traces), `alerts` (alert state
+transitions), and `audit` (audit records). The server parses the query's `FROM`
 clause before it plans, and registers only that one table for the query. A
-single query may reference exactly one of the three; naming two or more of
+single query may reference exactly one of the five; naming two or more of
 them crosses signals and is rejected with an HTTP 400, before any catalog
 listing. The request body, auth, window
 (`start`/`end`), and `min_commit_token` handling are identical to the `samples`
@@ -360,6 +363,36 @@ The `logs` table columns are `ts`, `observed_ts` (both `Timestamp(ns)`),
 `attrs` `Map(Utf8, Utf8)` that merges each record's resource, scope, and
 per-record attributes (see docs/query-engine.md for the full schema and
 semantics).
+
+The `alerts` table columns are `ts_ns` (`Timestamp(ns)`, the transition's event
+time), `alert_id`, `rule_id`, `state` (all `Utf8`), `generation` (`Int64`),
+`writer_id` (`Utf8`), `writer_epoch` and `writer_seq` (both `UInt64`), and an
+`attrs` `Map(Utf8, Utf8)` carrying the rule's `label.<k>` and `annotation.<k>`
+entries alongside the promoted keys. `state` takes four values: `pending`,
+`firing`, `resolved`, and `suppressed`.
+The table is raw history, one row per state transition, never a folded
+"current state" row. Current state is a query over that history: the row that
+sorts first per `alert_id` under `ts_ns DESC, writer_epoch DESC, writer_seq
+DESC, writer_id DESC`. The three write-identity columns are what make that a
+total order, because two evaluators can overlap briefly at a lease handover and
+write the same `alert_id` at the same `ts_ns`:
+
+```sql
+SELECT alert_id, state FROM
+  (SELECT *, ROW_NUMBER() OVER (PARTITION BY alert_id
+   ORDER BY ts_ns DESC, writer_epoch DESC, writer_seq DESC, writer_id DESC) AS rn
+   FROM alerts) WHERE rn = 1 ORDER BY alert_id
+```
+
+See the [alerting guide](alerting.md) for what writes those transitions.
+
+The `audit` table columns are `ts_ns` (`Timestamp(ns)`), `severity_text`,
+`body` (both `Utf8`), and an `attrs` `Map(Utf8, Utf8)`. It is deliberately
+generic: `attrs['kind']` selects the record kind (`query` for the query-audit
+trail, `legal_hold`, `reshard`), and each kind's own fields ride the same map.
+A query over `audit` is itself audited, so it appears in the trail a later
+query reads. Resolution is per tenant hash, so a tenant reads only its own
+records, never another tenant's.
 
 Beyond those fixed columns, an operator can declare per-tenant *typed
 attribute columns*: an attribute key promoted to a native `Int64`, `Boolean`,

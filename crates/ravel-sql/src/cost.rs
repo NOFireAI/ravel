@@ -100,6 +100,13 @@ pub fn estimate_metrics_cost(snapshot: &Snapshot, catalog_requests: u64) -> Cost
 /// both the request count and the byte sums here are exact bounds rather
 /// than padded guesses: no chase/retry safety factor applies because there
 /// is no chase/retry path to guard against.
+///
+/// This serves the `alerts` and `audit` tables too (ADR-1101 decision 1), not
+/// only `logs`. An alert record and an audit record ride RLOG v1 verbatim, so
+/// their scans fetch through the same funnel with the same shape: one
+/// `fetch_accounted_with_tenant` per relevant segment, one GET each, no
+/// separately-accounted decompression. The estimate is therefore identical,
+/// and a renamed copy per table would only invite drift.
 pub fn estimate_logs_cost(snapshot: &Snapshot, catalog_requests: u64) -> CostEstimate {
     let segments = snapshot.segments.len() as u64;
     let series: u64 = snapshot.segments.iter().map(|s| s.series_count).sum();

@@ -63,8 +63,6 @@ management service (SSE-KMS), legal hold, and admission limits.
 - Logs and traces are queryable over SQL only, as the `logs` and `spans` tables.
   There is no LogQL, no PromQL surface for logs, no TraceQL, no trace-by-ID
   endpoint, and no Jaeger or Tempo API.
-- Alert rule transitions and audit records are written to object storage, and no
-  shipped query surface can read them back.
 - Profiles are a reserved object-key prefix only. No ingest, no query.
 - Exemplars are stored from the OpenTelemetry Protocol (OTLP) only. Remote Write
   and OTAP decode exemplars and then discard them.
@@ -75,8 +73,8 @@ management service (SSE-KMS), legal hold, and admission limits.
 **Who should wait.** If your dashboards range over months of high-cardinality
 metrics, the missing downsampled storage will cost you on every panel. If your
 logs or traces workflow depends on LogQL, TraceQL, or the Jaeger UI, there is
-nothing here to point them at. If you need alert history to be queryable, it is
-not. If you need write acknowledgement in single-digit milliseconds, strict mode
+nothing here to point them at. If you need write acknowledgement in single-digit
+milliseconds, strict mode
 pays an object-store round trip and buffered mode gives up the crash guarantee
 above. Ravel is pre-1.0: the persistent formats are versioned contracts, and the
 surfaces around them still move.
@@ -95,8 +93,8 @@ matrix says which.
 | Prometheus Remote Write 1.0 and 2.0 ingest | metrics | `none` | yes |
 | OTAP ingest, gRPC | metrics | `otap` | yes |
 | PromQL HTTP API | metrics | `none` | yes |
-| SQL over `POST /api/v1/sql` | metrics as `samples`, logs as `logs`, traces as `spans` | `sql` | yes |
-| Flight SQL | the same three tables | `flight-sql` | yes |
+| SQL over `POST /api/v1/sql` | metrics as `samples`, logs as `logs`, traces as `spans`, alert history as `alerts`, audit records as `audit` | `sql` | yes |
+| Flight SQL | the same five tables | `flight-sql` | yes |
 
 <!-- END SUPPORT MATRIX -->
 
@@ -110,8 +108,8 @@ ingest is registered only when the process is started with `--otap`
 ([docs/otap-ingest.md](docs/otap-ingest.md)). A source build gets the same
 surfaces by passing the same `--features` list to cargo.
 
-Exactly three SQL tables are registered: `samples`, `logs`, and `spans`. SQL is
-the only way to query logs and traces.
+Exactly five SQL tables are registered: `samples`, `logs`, `spans`, `alerts`,
+and `audit`. SQL is the only way to query logs and traces.
 
 Also live:
 
@@ -123,8 +121,7 @@ Also live:
   it arrives over OTLP or through a collector's Prometheus exporter.
 - Exemplars that link a metric sample to its trace.
 - Alert rules whose every transition is written to object storage as immutable
-  data. Reading those records back needs a query surface Ravel does not
-  ship.
+  data, and readable back through the `alerts` SQL table.
 - An analytics endpoint for change point detection and summary statistics.
 - Compaction, age-based retention, and garbage collection across all signals.
 - A Kubernetes operator with a `RavelCluster` custom resource.
@@ -164,7 +161,8 @@ curl -s -H "Authorization: Bearer demo-token" \
 ```
 
 The published image carries the `sql` feature, so `POST /api/v1/sql` answers
-by default. The registered tables are `samples`, `logs`, and `spans`:
+by default. The registered tables are `samples`, `logs`, `spans`, `alerts`, and
+`audit`:
 
 <!-- ravel:run status=200; nonempty:.data.rows -->
 ```sh

@@ -1,8 +1,9 @@
 //! The Flight SQL catalog/metadata surface: catalogs, schemas, tables, table
 //! types, and SqlInfo.
 //!
-//! Ravel exposes exactly one logical table per tenant, `samples`, in one
-//! schema of one catalog, so every answer here is a constant. That makes the
+//! Ravel exposes the same five logical tables to every tenant (`samples`,
+//! `logs`, `spans`, `alerts`, `audit`), in one schema of one catalog, so every
+//! answer here is a constant. That makes the
 //! interesting property a negative one: nothing in this module is
 //! tenant-derived, so no metadata response can differ between two tenants and
 //! therefore none can disclose another tenant's existence, table set, or
@@ -30,8 +31,12 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use tonic::Status;
 
+use crate::alerts_schema::alerts_schema;
+use crate::audit_schema::audit_schema;
+use crate::logs_schema::logs_schema;
 use crate::schema::public_schema;
-use crate::session::SAMPLES_TABLE;
+use crate::session::{ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE};
+use crate::spans_schema::spans_schema;
 
 /// The single catalog name every tenant sees.
 pub const CATALOG_NAME: &str = "ravel";
@@ -75,19 +80,29 @@ pub(super) fn db_schemas_schema(query: CommandGetDbSchemas) -> SchemaRef {
     builder.schema()
 }
 
-/// The `CommandGetTables` response: one row for `samples`, carrying the
-/// public sample schema when the request asked for schemas.
+/// The `CommandGetTables` response: one row per registered table (ADR-1101
+/// decision 1), each carrying that table's public schema when the request
+/// asked for schemas.
+///
+/// This is static catalog metadata built from the five schema functions,
+/// independent of the per-query session, which still registers exactly the one
+/// table a query targets. The `logs` row carries the base schema: a tenant with
+/// declared typed attribute columns (ADR-0090) sees a wider `logs` schema on
+/// its own statement's `FlightInfo`, which is per tenant and per query and so
+/// cannot be reported here, where every answer is a constant.
 pub(super) fn tables(query: CommandGetTables) -> Result<RecordBatch, Status> {
     let mut builder: GetTablesBuilder = query.into_builder();
-    builder
-        .append(
-            CATALOG_NAME,
-            SCHEMA_NAME,
-            SAMPLES_TABLE,
-            TABLE_TYPE,
-            &public_schema(),
-        )
-        .map_err(|err| build_error("tables", &err))?;
+    for (name, schema) in [
+        (SAMPLES_TABLE, public_schema()),
+        (LOGS_TABLE, logs_schema()),
+        (SPANS_TABLE, spans_schema()),
+        (ALERTS_TABLE, alerts_schema()),
+        (AUDIT_TABLE, audit_schema()),
+    ] {
+        builder
+            .append(CATALOG_NAME, SCHEMA_NAME, name, TABLE_TYPE, &schema)
+            .map_err(|err| build_error("tables", &err))?;
+    }
     builder.build().map_err(|err| build_error("tables", &err))
 }
 
@@ -195,16 +210,70 @@ mod tests {
         assert_eq!(column(&batch, "db_schema_name").value(0), SCHEMA_NAME);
     }
 
+    /// ADR-1101 decision 1: every registered table is listed, and each row
+    /// carries that table's own public schema. The schema half is the half a
+    /// name-only assertion would miss: listing `alerts` under the `samples`
+    /// schema is a discoverable surface that lies about its columns.
+    ///
+    /// The rows come back sorted by table name, not in the order [`tables`]
+    /// appends them: `GetTablesBuilder::build` orders its output by
+    /// (catalog, schema, table), which is what the Flight SQL specification
+    /// requires of a `CommandGetTables` response. The expectation below is
+    /// therefore the sorted list, which is what a client actually sees.
+    ///
+    /// `table_schema` is the IPC-encapsulated schema message the builder
+    /// writes, so it is compared by decoding it back through arrow-flight's own
+    /// `IpcMessage` conversion rather than by re-deriving the bytes.
     #[test]
-    fn tables_lists_exactly_the_samples_table() {
-        let batch = tables(CommandGetTables::default()).expect("built");
-        assert_eq!(batch.num_rows(), 1);
-        assert_eq!(column(&batch, "table_name").value(0), SAMPLES_TABLE);
-        assert_eq!(column(&batch, "table_type").value(0), TABLE_TYPE);
+    fn tables_lists_the_five_registered_tables() {
+        use arrow_flight::IpcMessage;
+        use datafusion::arrow::array::BinaryArray;
+        use datafusion::arrow::datatypes::Schema;
+
+        let expected: Vec<(&str, SchemaRef)> = vec![
+            (ALERTS_TABLE, alerts_schema()),
+            (AUDIT_TABLE, audit_schema()),
+            (LOGS_TABLE, logs_schema()),
+            (SAMPLES_TABLE, public_schema()),
+            (SPANS_TABLE, spans_schema()),
+        ];
+
+        let batch = tables(CommandGetTables {
+            include_schema: true,
+            ..CommandGetTables::default()
+        })
+        .expect("built");
+        assert_eq!(batch.num_rows(), expected.len());
+
+        let names = column(&batch, "table_name");
+        let got: Vec<&str> = (0..batch.num_rows()).map(|row| names.value(row)).collect();
+        let want: Vec<&str> = expected.iter().map(|(name, _)| *name).collect();
+        assert_eq!(got, want, "every registered table, in table-name order");
+
+        let types = column(&batch, "table_type");
+        let index = batch
+            .schema()
+            .index_of("table_schema")
+            .expect("table_schema column");
+        let schemas = batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("table_schema is binary");
+        for (row, (name, schema)) in expected.iter().enumerate() {
+            assert_eq!(types.value(row), TABLE_TYPE);
+            let message = IpcMessage(bytes::Bytes::copy_from_slice(schemas.value(row)));
+            let carried: Schema = Schema::try_from(message).expect("decodes");
+            assert_eq!(
+                &carried,
+                schema.as_ref(),
+                "the {name} row must carry the {name} schema"
+            );
+        }
     }
 
     /// The builders apply the request's own filter patterns, so a request
-    /// naming a different catalog gets nothing rather than the `samples` row
+    /// naming a different catalog gets nothing rather than the table rows
     /// under a name it did not ask for.
     #[test]
     fn a_non_matching_catalog_filter_yields_no_rows() {
