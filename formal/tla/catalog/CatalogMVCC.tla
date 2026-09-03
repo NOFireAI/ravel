@@ -96,6 +96,8 @@ CONSTANTS
     CompactionLoserOverwrites,  \* a losing compaction publish overwrites the winner
     QueryFailsClosedOnMissingIndex, \* a query with no readable index serves empty, not listing
     DeletePathIgnoresUnreadableHead, \* a delete pass proceeds despite a corrupt/unsupported HEAD
+    DeletePathIgnoresUnreadablePart, \* superseded-input sweep proceeds despite an unreadable covering part
+    DeletePathIgnoresUndecodableEntry, \* superseded-input sweep proceeds despite an undecodable entry identity
     FoldNamesEntryAboveWatermark, \* a fold's scan admits an entry above its own watermark
     FoldIncludesTombstonedEntries \* a fold's scan re-includes a tombstoned hour
 
@@ -120,7 +122,11 @@ VARIABLES
     lastCompact,      \* witness: whether the last losing compaction publish mutated
     maxValidWm,       \* witness: highest watermark ever published to a valid HEAD
     corruptionUsed,   \* ghost: HEAD corruption fired (bounds state)
-    unsupportedUsed   \* ghost: unsupported-HEAD write fired (bounds state)
+    unsupportedUsed,  \* ghost: unsupported-HEAD write fired (bounds state)
+    partUnreadable,   \* [Hours -> BOOLEAN]: H's covering snapshot part cannot be read
+    entryUndecodable, \* [Hours -> BOOLEAN]: H's covering part carries an entry whose identity cannot be decoded
+    partCorruptionUsed,  \* ghost: a part was marked unreadable (bounds state, one-shot)
+    entryCorruptionUsed  \* ghost: an entry was marked undecodable (bounds state, one-shot)
 
 INSTANCE RavelObjectStore
 
@@ -151,7 +157,8 @@ Statuses   == {"absent", "valid", "corrupt", "unsupported"}
 SnapPart   == [wm: Int, entries: SUBSET AllEntries, at: Int]
 
 allModel == <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage, qy,
-              lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+              lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed,
+              partUnreadable, entryUndecodable, partCorruptionUsed, entryCorruptionUsed>>
 
 \* --- seal predicates (RECONNAISSANCE F1) ------------------------------------
 \* HourEnd(H) is the boundary tick of hour H. A bucket is maintenance-sealed
@@ -333,12 +340,17 @@ TypeOK ==
                      wmBefore: Int, wmAfter: Int, entriesChanged: BOOLEAN,
                      entries: SUBSET AllEntries, tombAtWrite: [Hours -> BOOLEAN],
                      reconcileLo: Int, frontierReconciled: SUBSET Hours]
-    /\ lastDelete \in [happened: BOOLEAN, headStatus: {"none"} \cup Statuses]
+    /\ lastDelete \in [happened: BOOLEAN, headStatus: {"none"} \cup Statuses,
+                       partUnreadable: BOOLEAN, entryUndecodable: BOOLEAN]
     /\ lastCompact \in [loserFired: BOOLEAN,
                         outcome: {"none", "converged", "diverged", "overwrite"}]
     /\ maxValidWm \in Int
     /\ corruptionUsed \in BOOLEAN
     /\ unsupportedUsed \in BOOLEAN
+    /\ partUnreadable \in [Hours -> BOOLEAN]
+    /\ entryUndecodable \in [Hours -> BOOLEAN]
+    /\ partCorruptionUsed \in BOOLEAN
+    /\ entryCorruptionUsed \in BOOLEAN
 
 NoTomb == [H \in Hours |-> FALSE]
 
@@ -358,11 +370,16 @@ Init ==
     /\ lastHead = [kind |-> "none", wmBefore |-> -1, wmAfter |-> -1,
                    entriesChanged |-> FALSE, entries |-> {}, tombAtWrite |-> NoTomb,
                    reconcileLo |-> -1, frontierReconciled |-> {}]
-    /\ lastDelete = [happened |-> FALSE, headStatus |-> "none"]
+    /\ lastDelete = [happened |-> FALSE, headStatus |-> "none",
+                     partUnreadable |-> FALSE, entryUndecodable |-> FALSE]
     /\ lastCompact = [loserFired |-> FALSE, outcome |-> "none"]
     /\ maxValidWm = -1
     /\ corruptionUsed = FALSE
     /\ unsupportedUsed = FALSE
+    /\ partUnreadable = [H \in Hours |-> FALSE]
+    /\ entryUndecodable = [H \in Hours |-> FALSE]
+    /\ partCorruptionUsed = FALSE
+    /\ entryCorruptionUsed = FALSE
 
 \* --- ingest: publish an L0 commit record ------------------------------------
 \* crates/ravel-commit/src/publish.rs::publish::put_data_object. Commits land
@@ -376,7 +393,8 @@ DoCommit(H, r) ==
     /\ l0' = [l0 EXCEPT ![H] = @ \cup {r}]
     /\ budget' = budget + 1
     /\ UNCHANGED <<clock, crec, lastCompact, tomb, head, snapParts, foldStage, qy, lastHead,
-                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* --- compactor: publish an L1 compaction record -----------------------------
@@ -401,7 +419,8 @@ DoCompact(H, g) ==
                      [used |-> TRUE, in |-> inputs, out |-> out, at |-> clock]]
     /\ budget' = budget + 1
     /\ UNCHANGED <<clock, l0, lastCompact, tomb, head, snapParts, foldStage, qy,
-                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* A second compactor reaches PUT after the winner already published this record
@@ -440,7 +459,8 @@ DoCompactLoser(H, g) ==
         /\ crec' = [crec EXCEPT ![H][g] = result]
         /\ lastCompact' = [loserFired |-> TRUE, outcome |-> outcome]
     /\ UNCHANGED <<clock, budget, l0, tomb, head, snapParts, foldStage, qy,
-                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* --- folder: read HEAD and stage a fold -------------------------------------
@@ -466,7 +486,8 @@ DoFoldStart(f) ==
                    reconcileLo |-> IF head.status = "valid"
                                    THEN head.wm - ReconcileWindow ELSE -1]]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, qy, lastHead,
-                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* crates/ravel-catalog/src/fold.rs::part_object_key: the snapshot part is
@@ -478,7 +499,8 @@ DoFoldPutPart(f) ==
          { [wm |-> foldStage[f].wm, entries |-> foldStage[f].entries, at |-> clock] }
     /\ foldStage' = [foldStage EXCEPT ![f].partWritten = TRUE]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, qy, lastHead,
-                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* crates/ravel-catalog/src/fold.rs::Catalog::get_head with MAX_HEAD_CAS_ATTEMPTS:
@@ -519,7 +541,8 @@ DoFoldCas(f) ==
         /\ maxValidWm' = IF won /\ st.wm > maxValidWm THEN st.wm ELSE maxValidWm
         /\ foldStage' = [foldStage EXCEPT ![f] = ClearedStage]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, snapParts, qy,
-                   lastDelete, corruptionUsed, unsupportedUsed>>
+                   lastDelete, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
 
 \* --- rival folder: a concurrent process wins the HEAD CAS -------------------
 \* crates/ravel-catalog/src/fold.rs::get_head::MAX_HEAD_CAS_ATTEMPTS. A second
@@ -547,7 +570,8 @@ DoRivalFoldWin ==
                             frontierReconciled |-> FH]
             /\ maxValidWm' = IF w > maxValidWm THEN w ELSE maxValidWm
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, foldStage, qy,
-                   lastDelete, corruptionUsed, unsupportedUsed>>
+                   lastDelete, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
 
 \* A folder crash between staging and the CAS: HEAD is untouched, and the
 \* published part is left orphaned in snapParts for a later catalog-object sweep.
@@ -555,7 +579,8 @@ DoFoldCrash(f) ==
     /\ foldStage[f].active
     /\ foldStage' = [foldStage EXCEPT ![f] = ClearedStage]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, qy, lastHead,
-                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* A fold that outran the protection horizon (its listing is older than the
@@ -568,7 +593,8 @@ DoFoldRebase(f) ==
     /\ clock - foldStage[f].startClock >= ProtectionHorizon
     /\ foldStage' = [foldStage EXCEPT ![f] = ClearedStage]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, qy, lastHead,
-                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* --- reconcile off a plain tick (negative control only) ---------------------
@@ -585,7 +611,8 @@ DoReconcileTick(f) ==
                         entriesChanged |-> (e2 # head.entries), entries |-> e2,
                         tombAtWrite |-> tomb, reconcileLo |-> -1, frontierReconciled |-> {}]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, snapParts, foldStage, qy,
-                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* A valid HEAD names the L0 identity r in hour H.
@@ -595,18 +622,29 @@ HeadNamesL0(H, r) == head.status = "valid" /\ <<"l0", H, r>> \in head.entries
 \* crates/ravel-maintain/src/sweep.rs::sweep_superseded_impl deletes an L1
 \* record's L0 inputs once past the protection horizon, but object-granularly
 \* HOLDS any input a valid HEAD snapshot still names, and holds everything when
-\* HEAD is unreadable (fail-closed). The head.status guard IS the reachability
-\* gate: the pass only ever removes an object on a readable HEAD, so a corrupt
-\* or unsupported HEAD blocks it. The witness lastDelete records the HEAD status
-\* observed at this real deletion, so a mutant that removes the guard is caught
-\* by CorruptHeadFailsClosedOnDeletePaths. The SweepSupersededNoHeadGate switch
-\* drops the object-granular hold, reproducing the pre-ADR-0020 (issue #1134)
-\* shape. DeletePathIgnoresUnreadableHead drops the head.status guard itself, so
-\* the pass can fire on a corrupt or unsupported HEAD and lastDelete records
-\* that unreadable status, the mutant CorruptHeadFailsClosedOnDeletePaths pins.
+\* the reachability gate cannot prove otherwise. The real gate
+\* (crates/ravel-maintain/src/reachability.rs::SnapshotReachability::object_gate)
+\* fails closed on three distinct triggers, each with its own code symbol: HEAD
+\* itself unreadable (covering_parts / ensure_head), a covering snapshot part
+\* present but undecodable (ensure_part, checked directly in object_gate and
+\* again in clear_or_block_on_skipped for a part the hour-range filter would
+\* otherwise skip), and a decoded entry whose identity fields do not fit the
+\* shape a fold writes (snapshot_object returning None inside object_gate). All
+\* three are modeled here: head.status covers the first, partUnreadable[H] the
+\* second, entryUndecodable[H] the third. The witness lastDelete records all
+\* three as observed at this real deletion, so a mutant that removes any one
+\* guard is caught by CorruptHeadFailsClosedOnDeletePaths. The
+\* SweepSupersededNoHeadGate switch drops the object-granular hold, reproducing
+\* the pre-ADR-0020 (issue #1134) shape. DeletePathIgnoresUnreadableHead,
+\* DeletePathIgnoresUnreadablePart, and DeletePathIgnoresUndecodableEntry each
+\* drop exactly one of the three guards, so the pass can fire on that one
+\* unreadable trigger alone and lastDelete records it, the mutant
+\* CorruptHeadFailsClosedOnDeletePaths pins.
 DoSweepSuperseded(H, g) ==
     /\ crec[H][g].used
     /\ (head.status \in {"valid", "absent"} \/ DeletePathIgnoresUnreadableHead)
+    /\ (~partUnreadable[H] \/ DeletePathIgnoresUnreadablePart)
+    /\ (~entryUndecodable[H] \/ DeletePathIgnoresUndecodableEntry)
     /\ clock - crec[H][g].at >= ProtectionHorizon
     /\ LET inputs == crec[H][g].in \cap l0[H]
            deletable == IF SweepSupersededNoHeadGate
@@ -615,26 +653,72 @@ DoSweepSuperseded(H, g) ==
        IN
         /\ deletable # {}
         /\ l0' = [l0 EXCEPT ![H] = @ \ deletable]
-    /\ lastDelete' = [happened |-> TRUE, headStatus |-> head.status]
+    /\ lastDelete' = [happened |-> TRUE, headStatus |-> head.status,
+                      partUnreadable |-> partUnreadable[H], entryUndecodable |-> entryUndecodable[H]]
     /\ UNCHANGED <<clock, budget, crec, lastCompact, tomb, head, snapParts, foldStage, qy,
-                   lastHead, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastHead, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* crates/ravel-maintain/src/sweep.rs::sweep_unreferenced_catalog_objects reads
 \* the HEAD reference (read_head_reference) and deletes an orphan snapshot part.
-\* It removes an object only on a readable HEAD, so a corrupt or unsupported
-\* HEAD fails the whole pass closed; lastDelete records the observed status.
+\* Unlike object_gate above, this function decodes only HEAD itself (the part
+\* refs it names live inside the HEAD object, not in a separately fetched
+\* covering part), so it has exactly one fail-closed trigger: it removes an
+\* object only on a readable HEAD, and a corrupt or unsupported HEAD fails the
+\* whole pass closed; lastDelete records the observed status.
 \* DeletePathIgnoresUnreadableHead drops that guard, the same as in
-\* DoSweepSuperseded above.
+\* DoSweepSuperseded above. partUnreadable/entryUndecodable do not apply to
+\* this action; lastDelete always records them FALSE here.
 DoSweepCatalogObjects ==
     /\ (head.status \in {"valid", "absent"} \/ DeletePathIgnoresUnreadableHead)
     /\ \E p \in snapParts : SweepablePart(p)
     /\ LET orphan == CHOOSE p \in snapParts : SweepablePart(p) IN
          snapParts' = snapParts \ {orphan}
-    /\ lastDelete' = [happened |-> TRUE, headStatus |-> head.status]
+    /\ lastDelete' = [happened |-> TRUE, headStatus |-> head.status,
+                      partUnreadable |-> FALSE, entryUndecodable |-> FALSE]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, foldStage, qy, lastHead,
-                   maxValidWm, corruptionUsed, unsupportedUsed>>
+                   maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
+
+\* --- environment: a covering snapshot part becomes unreadable ---------------
+\* crates/ravel-maintain/src/reachability.rs::SnapshotReachability::ensure_part:
+\* a snapshot part HEAD names as covering some hour is present but cannot be
+\* decoded (checksum/hash mismatch, unsupported version, or missing). One-shot
+\* (bounded by partCorruptionUsed) and fixed to a single canonical hour, not
+\* quantified over Hours in Next, so it adds exactly one branch at every
+\* reachable state, the same shape as DoCorruptHead (which also acts on the
+\* whole HEAD register with no Hours parameter) rather than |Hours| branches.
+DoCorruptPart ==
+    LET H == CHOOSE h \in Hours : TRUE IN
+        /\ ~partCorruptionUsed
+        /\ ~partUnreadable[H]
+        /\ partUnreadable' = [partUnreadable EXCEPT ![H] = TRUE]
+        /\ partCorruptionUsed' = TRUE
+        /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage, qy,
+                       lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed,
+                       entryUndecodable, entryCorruptionUsed>>
+        /\ UNCHANGED svTuple
+
+\* --- environment: a covering part's entry identity becomes undecodable ------
+\* crates/ravel-maintain/src/reachability.rs::snapshot_object: a decoded
+\* snapshot entry covering some hour has identity fields that do not fit the
+\* shape a fold writes (a malformed writer_id/input_set_hash/part_index), so
+\* object_gate cannot decide whether it names a delete candidate. One-shot
+\* (bounded by entryCorruptionUsed), independent of whether the part itself is
+\* also unreadable, and fixed to a single canonical hour for the same
+\* branching-factor reason as DoCorruptPart above.
+DoPoisonEntry ==
+    LET H == CHOOSE h \in Hours : TRUE IN
+        /\ ~entryCorruptionUsed
+        /\ ~entryUndecodable[H]
+        /\ entryUndecodable' = [entryUndecodable EXCEPT ![H] = TRUE]
+        /\ entryCorruptionUsed' = TRUE
+        /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage, qy,
+                       lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed,
+                       partUnreadable, partCorruptionUsed>>
+        /\ UNCHANGED svTuple
 
 \* --- retention: tombstone a bucket ------------------------------------------
 \* crates/ravel-maintain/src/retention.rs::write_tombstone. The marker retires
@@ -646,7 +730,8 @@ DoTombstone(H) ==
     /\ clock - HourEnd(H) >= RetentionHorizon
     /\ tomb' = [tomb EXCEPT ![H] = TRUE]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, head, snapParts, foldStage, qy,
-                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* --- query: resolve, pin, retry once ----------------------------------------
@@ -669,7 +754,8 @@ DoQueryResolve ==
                headStatusAtResolve |-> head.status,
                indexReadableAtResolve |-> IndexReadable]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage,
-                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* A pinned entry whose object was swept forces one re-resolve; a second miss is
@@ -687,7 +773,8 @@ DoQueryRun ==
                             indexReadableAtResolve |-> IndexReadable]
                 ELSE qy' = [qy EXCEPT !.phase = "invalid"]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage,
-                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* A pinned snapshot must not change under a query mid-attempt. Enabled only
@@ -699,7 +786,8 @@ DoQueryTamper ==
     /\ qy.pinned # {}
     /\ qy' = [qy EXCEPT !.pinned = qy.pinned \ {CHOOSE e \in qy.pinned : TRUE}]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage,
-                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* --- environment ------------------------------------------------------------
@@ -707,7 +795,8 @@ DoTick ==
     /\ clock < MaxClock
     /\ clock' = clock + 1
     /\ UNCHANGED <<budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage, qy,
-                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+                   lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* HEAD bytes become undecodable; the object stays present (same version). The
@@ -721,7 +810,8 @@ DoCorruptHead ==
                     tombAtWrite |-> tomb, reconcileLo |-> -1, frontierReconciled |-> {}]
     /\ corruptionUsed' = TRUE
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, snapParts, foldStage, qy,
-                   lastDelete, maxValidWm, unsupportedUsed>>
+                   lastDelete, maxValidWm, unsupportedUsed,
+                   partUnreadable, entryUndecodable, partCorruptionUsed, entryCorruptionUsed>>
     /\ UNCHANGED svTuple
 
 \* A newer-format writer publishes an unsupported HEAD version (object present,
@@ -736,7 +826,8 @@ DoUnsupportedHead ==
                     tombAtWrite |-> tomb, reconcileLo |-> -1, frontierReconciled |-> {}]
     /\ unsupportedUsed' = TRUE
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, snapParts, foldStage, qy,
-                   lastDelete, maxValidWm, corruptionUsed>>
+                   lastDelete, maxValidWm, corruptionUsed,
+                   partUnreadable, entryUndecodable, partCorruptionUsed, entryCorruptionUsed>>
 
 Next ==
     \/ \E H \in Hours, r \in Records : DoCommit(H, r)
@@ -758,10 +849,13 @@ Next ==
     \/ DoTick
     \/ DoCorruptHead
     \/ DoUnsupportedHead
+    \/ DoCorruptPart
+    \/ DoPoisonEntry
 
 vars == <<store, lastModified, versionCounter, uploads, listState,
           clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage, qy,
-          lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
+          lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
+                   partCorruptionUsed, entryCorruptionUsed>>
 
 Spec == Init /\ [][Next]_vars
 
@@ -857,13 +951,19 @@ NoLiveCommitOmittedByLostCas ==
 MissingIndexDegradesToListing ==
     ~qy.indexReadableAtResolve => qy.pinned = qy.resolvedView
 
-\* A store deletion only ever ran while HEAD was readable (valid or absent), so
-\* a corrupt or unsupported HEAD fails every delete path closed. Witness-derived:
-\* lastDelete records the HEAD status observed at the last real object removal
-\* (DoSweepSuperseded or DoSweepCatalogObjects). Falsified by breaking either
-\* sweep's head.status guard so a deletion runs under an unreadable HEAD.
+\* A store deletion only ever ran while all three reachability-gate triggers
+\* cleared: HEAD readable, its covering snapshot part readable, and the
+\* covering entry's identity decodable. Witness-derived: lastDelete records the
+\* HEAD status, partUnreadable, and entryUndecodable observed at the last real
+\* object removal (DoSweepSuperseded or DoSweepCatalogObjects; the latter has
+\* no part/entry trigger of its own, so it always records both FALSE).
+\* Falsified by breaking any one of DoSweepSuperseded's three guards
+\* (head.status, partUnreadable[H], entryUndecodable[H]) or DoSweepCatalogObjects's
+\* head.status guard, so a deletion runs under that one unreadable trigger.
 CorruptHeadFailsClosedOnDeletePaths ==
-    lastDelete.happened => lastDelete.headStatus \in {"valid", "absent"}
+    lastDelete.happened => /\ lastDelete.headStatus \in {"valid", "absent"}
+                           /\ ~lastDelete.partUnreadable
+                           /\ ~lastDelete.entryUndecodable
 
 \* Every object a valid HEAD names is still present. Store-derived: reads the
 \* HEAD register, the L0 plane, and the L1 compaction-record plane. The
