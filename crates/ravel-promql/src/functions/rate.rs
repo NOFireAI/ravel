@@ -5,17 +5,27 @@
 //! `instantValue`, `linearRegression`, `funcResets`, `funcChanges`), down to
 //! its operation order.
 //!
-//! Timestamps are nanoseconds and every interval this family divides by is
-//! computed directly in nanoseconds (`(a - b) as f64 / 1e9`), never via an
-//! intermediate millisecond value: a log-derived series (ADR-1103) can
-//! carry two distinct samples less than one millisecond apart, and flooring
-//! through milliseconds first turns a nonzero nanosecond gap into a zero
-//! divisor. For a millisecond-quantized timestamp pair (every value
-//! Prometheus itself produces), `(a - b)` is already an exact multiple of
-//! 1_000_000, so this direct formula is the same real-valued quotient as
-//! the old two-step one and, since both are single correctly-rounded IEEE
-//! 754 divisions of exactly-representable operands, bit-identical to it
-//! (see `ms_quantized_inputs_are_unchanged` below).
+//! Timestamps are nanoseconds. Every interval this family divides by goes
+//! through [`ns_diff_to_seconds`], which picks its conversion path by
+//! divisibility, not by magnitude: a nanosecond delta that is an exact
+//! multiple of 1_000_000 converts through the millisecond value exactly as
+//! the pre-ADR-1103 code did, so every millisecond-quantized input (every
+//! value Prometheus itself produces) is bit-identical to the old formula BY
+//! CONSTRUCTION (see `ms_quantized_inputs_are_unchanged` below) rather than
+//! by an argument that only holds below some bound. A delta that is not a
+//! whole number of milliseconds converts directly from nanoseconds instead;
+//! this is the sub-millisecond case #1136 exists for, where a log-derived
+//! series (ADR-1103) can carry two distinct samples less than one
+//! millisecond apart and flooring through milliseconds first would turn a
+//! nonzero nanosecond gap into a zero divisor.
+//!
+//! The magnitude argument alone does not hold: `(a - b) as f64` is only an
+//! exact (not merely correctly-rounded) conversion while `a - b` fits in an
+//! `f64` mantissa, i.e. below 2^53 nanoseconds (about 104.25 days). Past
+//! that bound a millisecond-quantized delta converted directly from
+//! nanoseconds can land one ULP away from the millisecond-first result, so
+//! the divisibility check -- not the size of the delta -- is what keeps
+//! every millisecond-quantized input on the old bit pattern.
 
 use ravel_types::Sample;
 
@@ -146,7 +156,7 @@ fn histogram_extrapolated_rate(
     }
     let mut factor = extrapolate_to_interval / sampled_interval;
     if is_rate {
-        factor /= w.range_ns as f64 / 1_000_000_000.0;
+        factor /= ns_to_seconds(w.range_ns);
     }
     reduced.mul(factor);
     Some(reduced)
@@ -301,7 +311,7 @@ fn extrapolated_rate(
     }
     result_value *= extrapolate_to_interval / sampled_interval;
     if is_rate {
-        result_value /= w.range_ns as f64 / 1_000_000_000.0;
+        result_value /= ns_to_seconds(w.range_ns);
     }
     Some(result_value)
 }
@@ -330,7 +340,7 @@ fn instant_value(samples: &[Sample], is_rate: bool) -> Option<f64> {
     }
 
     if is_rate {
-        result_value /= sampled_interval_ns as f64 / 1_000_000_000.0;
+        result_value /= ns_to_seconds(sampled_interval_ns);
     }
     Some(result_value)
 }
@@ -420,7 +430,7 @@ pub(crate) fn instant_value_hist(
     }
     result.counter_reset_hint = ResetHint::Gauge;
     if is_rate {
-        result.div(sampled_interval_ns as f64 / 1_000_000_000.0);
+        result.div(ns_to_seconds(sampled_interval_ns));
     }
     Some(result)
 }
@@ -558,7 +568,7 @@ fn linear_regression(samples: &[Sample], intercept_time_ns: i64) -> (f64, f64) {
             const_y = false;
         }
         n += 1.0;
-        let x = (s.ts_ns - intercept_time_ns) as f64 / 1_000_000_000.0;
+        let x = ns_diff_to_seconds(s.ts_ns, intercept_time_ns);
         sum_x += x;
         sum_y += s.value;
         sum_xy += x * s.value;
@@ -580,15 +590,27 @@ fn linear_regression(samples: &[Sample], intercept_time_ns: i64) -> (f64, f64) {
     (slope, intercept)
 }
 
-/// `(a - b)` converted from nanoseconds to seconds directly, with no
-/// intermediate millisecond value: timestamps are nanoseconds, and every
-/// interval this family divides by is computed in nanoseconds so a
-/// sub-millisecond, non-equal-timestamp pair (ADR-1103 log-derived series)
-/// never floors to a zero-length interval. Millisecond-quantized inputs
-/// (everything Prometheus itself produces) are unaffected: see the module
-/// doc and `ms_quantized_inputs_are_unchanged`.
+/// `(a - b)` converted from nanoseconds to seconds. Every conversion in
+/// this file (interval, range, and regression-`x` alike) routes through
+/// this one helper so there is exactly one place the choice of path is
+/// made: see the module doc for why the path is chosen by divisibility,
+/// not by magnitude.
 fn ns_diff_to_seconds(a: i64, b: i64) -> f64 {
-    (a - b) as f64 / 1_000_000_000.0
+    ns_to_seconds(a - b)
+}
+
+/// A nanosecond duration (already `a - b`, or a range/interval that is
+/// itself the quantity, such as `RangeWindow::range_ns`) converted to
+/// seconds. An exact multiple of 1_000_000 ns goes through the millisecond
+/// value, bit-identical to the pre-#1136 two-step conversion by
+/// construction; anything else (a sub-millisecond ADR-1103 delta) converts
+/// directly from nanoseconds, which is what #1136 exists to fix.
+fn ns_to_seconds(ns: i64) -> f64 {
+    if ns % 1_000_000 == 0 {
+        (ns / 1_000_000) as f64 / 1000.0
+    } else {
+        ns as f64 / 1_000_000_000.0
+    }
 }
 
 #[cfg(test)]
@@ -1130,19 +1152,30 @@ mod tests {
         assert_eq!(got_predict, expected_predict);
     }
 
-    /// #1136: the new nanosecond-direct interval formula must not move any
-    /// conformance row for millisecond-quantized timestamps (everything
-    /// Prometheus' own storage produces). This pins the algebraic argument
-    /// in the module doc with a bit-for-bit check against the old two-step
-    /// (nanoseconds -> milliseconds -> seconds) formula, reusing the
-    /// millisecond-quantized `(a, b)` pairs that already drive
-    /// `rate_extrapolates_to_the_window_boundary` and
-    /// `increase_compensates_for_a_counter_reset` above.
+    /// #1136: the interval formula must not move any conformance row for
+    /// millisecond-quantized timestamps (everything Prometheus' own storage
+    /// produces), including deltas above 2^53 ns (9_007_199_254_740_992 ns,
+    /// about 104.25 days) where `(a - b) as f64` stops being an exact
+    /// conversion. This pins the algebraic argument in the module doc with a
+    /// bit-for-bit check against the old two-step (nanoseconds ->
+    /// milliseconds -> seconds) formula: below 2^53 ns by the magnitude
+    /// argument, above it because `ns_to_seconds` routes an exact multiple
+    /// of 1_000_000 through the millisecond value regardless of size.
+    ///
+    /// Demonstrated failing against the direct-only conversion this test
+    /// started from (`(a - b) as f64 / 1_000_000_000.0`, no divisibility
+    /// check): the `4_173_190_245_167_000_000` pair below is
+    /// `4173190245.1670003` (bits `0x41ef17ba8ca55811`) direct vs.
+    /// `4173190245.167` (bits `0x41ef17ba8ca55810`) millisecond-first, one
+    /// ULP apart, so the `to_bits()` assertion in this loop fails.
     #[test]
     fn ms_quantized_inputs_are_unchanged() {
         fn old_ns_diff_to_seconds(a: i64, b: i64) -> f64 {
             ((a - b) / 1_000_000) as f64 / 1000.0
         }
+
+        const TWO_POW_53: i64 = 9_007_199_254_740_992;
+        const DAY_NS: i64 = 86_400 * 1_000_000_000;
 
         let pairs = [
             (ms(180_000), 0),
@@ -1154,6 +1187,32 @@ mod tests {
             (ms(300_000), ms(0)),
         ];
         for (a, b) in pairs {
+            let old = old_ns_diff_to_seconds(a, b);
+            let new = ns_diff_to_seconds(a, b);
+            assert_eq!(
+                old.to_bits(),
+                new.to_bits(),
+                "ns_diff_to_seconds({a}, {b}): old={old:?} new={new:?}"
+            );
+        }
+
+        // Above 2^53 ns: the magnitude argument for bit-identity no longer
+        // holds ((a - b) as f64 stops being an exact conversion), so these
+        // rely on the divisibility check alone.
+        let above_boundary_pairs = [
+            (4_173_190_245_167_000_000, 0), // the counterexample from #1136's review
+            (105 * DAY_NS, 0),
+            (365 * DAY_NS, 0),
+            // The smallest ms-quantized value above 2^53 ns: 2^53 itself is
+            // not a multiple of 1_000_000, so rounding up to the next
+            // whole millisecond is what lands just past the boundary.
+            (ms((TWO_POW_53 / 1_000_000) + 1), 0),
+        ];
+        for (a, b) in above_boundary_pairs {
+            assert!(
+                (a - b) > TWO_POW_53,
+                "pair ({a}, {b}) is meant to probe past the 2^53 ns boundary"
+            );
             let old = old_ns_diff_to_seconds(a, b);
             let new = ns_diff_to_seconds(a, b);
             assert_eq!(
