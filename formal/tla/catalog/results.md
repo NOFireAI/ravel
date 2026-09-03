@@ -25,8 +25,10 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 | negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | tlc-carryforward-nonvacuity-1852394 |
 | negative/query-fails-closed-on-missing-index.cfg | Spec | first counterexample | n/a | MissingIndexDegradesToListing violated, exit 12 | negative lane |
 | negative/corrupt-head-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | negative lane |
+| negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | negative lane |
+| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | negative lane |
 
-The eleven `negative/` configs each flip exactly one switch (or, for
+The thirteen `negative/` configs each flip exactly one switch (or, for
 `carryforward-nonvacuity.cfg`, check a refuted probe) and must exit 12 reporting
 exactly the named property; each `.expect` pins that exit code and property, and
 the negative lane fails if any config passes or reports a different property.
@@ -97,12 +99,10 @@ authority; the table restates it.
 
 ## Non-vacuity: behaviour mutant per invariant
 
-Each named safety invariant is shown load-bearing by a behaviour mutant. Ten
-have a dedicated switch and a negative-control config that flips it and drives
-TLC to exit 12 on that invariant (the recorded lines are in the run table
-above). Two have no switch and carry a mutant note naming a reachable
-antecedent and the mutation that would falsify them; the note filename matches
-the invariant.
+Each named safety invariant is shown load-bearing by a behaviour mutant. All
+twelve have a dedicated switch and a negative-control config that flips it and
+drives TLC to exit 12 on that invariant (the recorded lines are in the run
+table above).
 
 | Invariant | Mutant | TLC evidence |
 |---|---|---|
@@ -116,8 +116,8 @@ the invariant.
 | HeadNamedObjectNeverDeleted | switch `SweepSupersededNoHeadGate` | negative/sweep-superseded-no-head-gate.cfg, exit 12 |
 | MissingIndexDegradesToListing | switch `QueryFailsClosedOnMissingIndex` | negative/query-fails-closed-on-missing-index.cfg, exit 12 |
 | CorruptHeadFailsClosedOnDeletePaths | switch `DeletePathIgnoresUnreadableHead` | negative/corrupt-head-ignores-delete-gate.cfg, exit 12 |
-| SnapshotEntriesBelowWatermark | mutant note (no switch) | counterexamples/snapshot-entries-below-watermark.md |
-| TombstonedBucketContributesNothing | mutant note (no switch) | counterexamples/tombstoned-bucket-contributes-nothing.md |
+| SnapshotEntriesBelowWatermark | switch `FoldNamesEntryAboveWatermark` | negative/fold-names-entry-above-watermark.cfg, exit 12 |
+| TombstonedBucketContributesNothing | switch `FoldIncludesTombstonedEntries` | negative/fold-includes-tombstoned-entries.cfg, exit 12 |
 
 The bounded incremental fold's carry-forward branch is shown non-vacuous
 separately by `negative/carryforward-nonvacuity.cfg`, which checks the refuted
@@ -137,7 +137,7 @@ present only so `QueryTerminates` can hold under the bounded clock.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 3`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all ten
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
 mutation switches FALSE, `SYMMETRY Symmetry`.
 
 ## Exhaustive constants
@@ -145,7 +145,7 @@ mutation switches FALSE, `SYMMETRY Symmetry`.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1, g2}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all ten
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
 mutation switches FALSE, `FairSpec` (no symmetry, so liveness is checked
 soundly). Two records and a second compaction identity keep the multiset and
 dedup conflicts non-vacuous. The version-matched HEAD CAS is exercised without a
@@ -158,7 +158,7 @@ base version and takes the losing branch.
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1, 2}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 0`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 2`, `DedupBySignal = TRUE`, all ten
+`RetentionHorizon = 2`, `LagBound = 2`, `DedupBySignal = TRUE`, all twelve
 mutation switches FALSE, `SYMMETRY Symmetry`. Three hours let a valid HEAD fold
 at successive watermarks; both seal delays are zero so all three hours seal
 within `MaxClock = 3`. The compact-strictly-before-fold gap (`FoldSealDelay = 1`)
