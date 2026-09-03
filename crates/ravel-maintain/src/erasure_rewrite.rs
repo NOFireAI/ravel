@@ -1677,6 +1677,37 @@ async fn resolve_already_exists_rewrite(
     })
 }
 
+/// What one rewrite dropped in one bucket for one request: the bucket
+/// identity an `ErasureCompletion.bucket_drops` entry names, plus the request
+/// the count belongs to. A completion record is per request, so a driver
+/// collecting these across a scan needs the request id to route each count
+/// into the right record. The count is the row (metrics samples), log record,
+/// or span count that rewrite physically removed for that request in that
+/// bucket, and is zero for an applicable request the bucket held nothing for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedBucketDrop {
+    pub request_id: String,
+    pub signal: Signal,
+    pub shard: u32,
+    pub ingest_hour_bucket: u32,
+    pub dropped_count: u64,
+}
+
+/// The bucket's `drops` re-keyed to the bucket identity a completion record
+/// names, one entry per request the rewrite applied.
+fn applied_bucket_drops(bucket: &Bucket, drops: &[RewriteDrop]) -> Vec<AppliedBucketDrop> {
+    drops
+        .iter()
+        .map(|d| AppliedBucketDrop {
+            request_id: d.request_id.clone(),
+            signal: bucket.signal,
+            shard: bucket.shard,
+            ingest_hour_bucket: bucket.ingest_hour_bucket,
+            dropped_count: d.dropped_count,
+        })
+        .collect()
+}
+
 /// The result of an [`erasure_rewrite_bucket`] call. Every variant except
 /// [`ErasureRewriteOutcome::Rewritten`] means the bucket was left untouched,
 /// with the reason -- mirroring [`crate::compact::CompactionOutcome`]'s shape
@@ -1706,12 +1737,25 @@ pub enum ErasureRewriteOutcome {
     /// superseded target -- not the original L0 inputs) and lands a no-op
     /// `RewriteRecord` (`dropped_count: 0`) superseding the prior one,
     /// repeatable every pass, churning generations while erasing nothing.
-    AlreadyApplied,
+    ///
+    /// `request_ids` are the overlapping requests this bucket was skipped for,
+    /// in the order they were pending. Their dropped counts belong to a rewrite
+    /// generation an earlier pass published, so this pass cannot state them:
+    /// the live record's own `drops` carry `dropped_count: 0` for a request an
+    /// earlier generation in the same chain already erased. A driver collecting
+    /// [`AppliedBucketDrop`]s therefore knows, from this list, that its
+    /// collection is not the complete set of buckets that applied those
+    /// requests.
+    AlreadyApplied { request_ids: Vec<String> },
     /// Built and published (or converged / abandoned): `parts` output parts
-    /// written, `publish` records how the `RewriteRecord` PUT resolved.
+    /// written, `publish` records how the `RewriteRecord` PUT resolved, and
+    /// `drops` carries this bucket's dropped count for every request the
+    /// rewrite applied (one entry per applicable request, `dropped_count: 0`
+    /// included).
     Rewritten {
         parts: usize,
         publish: PublishOutcome,
+        drops: Vec<AppliedBucketDrop>,
     },
 }
 
@@ -1763,7 +1807,11 @@ fn invalidate_after_publish(memo: &mut MaintainMemo, bucket: &Bucket, publish: &
 /// that overlaps the bucket is batched into one build/publish call, so a
 /// bucket is never rewritten once per request -- one `RewriteRecord` per
 /// bucket per rewrite generation, with a `drops[]` entry (possibly
-/// `dropped_count: 0`) for every applicable request.
+/// `dropped_count: 0`) for every applicable request. A successful rewrite
+/// returns those drops to the caller as [`AppliedBucketDrop`]s so a driver
+/// scanning many buckets can write each request's completion record with the
+/// per-bucket counts that record's shape carries, without re-reading the
+/// rewrite records it just published.
 ///
 /// Every step through `overlapping` is signal-generic; only the
 /// matcher/build step below dispatches on `bucket.signal` to the metrics
@@ -1828,10 +1876,15 @@ pub async fn erasure_rewrite_bucket(
             .iter()
             .all(|p| applied.contains(&p.request.request_id))
     {
-        return Ok(ErasureRewriteOutcome::AlreadyApplied);
+        return Ok(ErasureRewriteOutcome::AlreadyApplied {
+            request_ids: overlapping
+                .iter()
+                .map(|p| p.request.request_id.clone())
+                .collect(),
+        });
     }
 
-    let (parts, publish) = match bucket.signal {
+    let (parts, drops, publish) = match bucket.signal {
         Signal::Metrics => {
             let applicable: Vec<ApplicableRequest> = overlapping
                 .iter()
@@ -1868,10 +1921,11 @@ pub async fn erasure_rewrite_bucket(
             )
             .await?;
             let parts = build.parts.len();
+            let drops = applied_bucket_drops(bucket, &build.drops);
             let publish =
                 publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
                     .await?;
-            (parts, publish)
+            (parts, drops, publish)
         }
         Signal::Logs => {
             let applicable: Vec<ApplicableLogRequest> = overlapping
@@ -1908,10 +1962,11 @@ pub async fn erasure_rewrite_bucket(
             )
             .await?;
             let parts = build.parts.len();
+            let drops = applied_bucket_drops(bucket, &build.drops);
             let publish =
                 publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
                     .await?;
-            (parts, publish)
+            (parts, drops, publish)
         }
         Signal::Spans => {
             let applicable: Vec<ApplicableSpanRequest> = overlapping
@@ -1948,10 +2003,11 @@ pub async fn erasure_rewrite_bucket(
             )
             .await?;
             let parts = build.parts.len();
+            let drops = applied_bucket_drops(bucket, &build.drops);
             let publish =
                 publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns)
                     .await?;
-            (parts, publish)
+            (parts, drops, publish)
         }
         other => {
             return Err(MaintainError::Invariant(format!(
@@ -1961,7 +2017,11 @@ pub async fn erasure_rewrite_bucket(
     };
 
     invalidate_after_publish(memo, bucket, &publish);
-    Ok(ErasureRewriteOutcome::Rewritten { parts, publish })
+    Ok(ErasureRewriteOutcome::Rewritten {
+        parts,
+        publish,
+        drops,
+    })
 }
 
 /// The catalog-resolver completion verdict for one bucket (ADR-0064 §4 F1).
@@ -2498,7 +2558,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -2813,8 +2873,11 @@ mod tests {
         .expect("pass 2 succeeds");
         assert_eq!(
             outcome2,
-            ErasureRewriteOutcome::AlreadyApplied,
-            "second pass over an already-rewritten bucket must skip, not republish"
+            ErasureRewriteOutcome::AlreadyApplied {
+                request_ids: vec![Uuid::from_u128(7).to_string()],
+            },
+            "second pass over an already-rewritten bucket must skip, not republish, \
+             and must name the request it skipped for"
         );
         let after2 = crate::read::list_bucket(&store, &bucket())
             .await
@@ -2935,7 +2998,7 @@ mod tests {
         .expect("rewrite must succeed even when >=2 live L0 commits share a series_id");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -3007,7 +3070,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!(
                 "expected Rewritten -- a windowed request matching physically-stored \
                  event timestamps must select the bucket even when those timestamps \
@@ -3081,7 +3144,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -3351,7 +3414,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -3516,7 +3579,7 @@ mod tests {
         .expect("rewrite must merge >=2 live L0 inputs into one part");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(
@@ -3846,7 +3909,7 @@ mod tests {
         .await
         .expect("erasure rewrite");
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(publish, PublishOutcome::Published);
@@ -4404,7 +4467,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -4566,7 +4629,7 @@ mod tests {
         .expect("rewrite must merge >=2 live L0 inputs into one part");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(
@@ -4750,7 +4813,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -4921,7 +4984,7 @@ mod tests {
         .await
         .expect("erasure rewrite");
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(publish, PublishOutcome::Published);
