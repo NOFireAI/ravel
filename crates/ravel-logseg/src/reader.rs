@@ -1467,7 +1467,13 @@ pub fn phrase_match(value: &[u8], word: &str) -> bool {
 /// of a record's stream and per-record attributes). Kept in this crate so the
 /// merge does not depend on `ravel-sql`
 /// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
-pub(crate) fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+///
+/// Public because the declared-column statistics producers resolve the same
+/// merged view: `ravel-ingest`'s flush fold and `ravel-maintain`'s compaction
+/// fold both need a stream's attributes to decide what a record that does not
+/// set a declared key reads. The blob grammar is frozen, so a second decoder
+/// elsewhere would be a copy that can drift from this one.
+pub fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
     use crate::varint::get_uvarint;
     let mut pos = 0usize;
     let mut pairs = decode_attr_set(blob, &mut pos, 0)?;
