@@ -1236,9 +1236,11 @@ scope-level value). Both shipped producers instead fold the records
 themselves, and both folded a record's own attribute set only. That made a
 declared column whose values live on the stream's resource or scope
 attributes stamp `null_count == sample_count` with absent extrema, which is
-an affirmative all-NULL statement rather than an absent one, so the
-metadata-only aggregate path answered `MIN`/`MAX` with NULL and `COUNT` with
-zero over a column every row of the object resolves a value for.
+an affirmative all-NULL statement rather than an absent one. DataFusion's
+aggregate-statistics rule declines a NULL min/max scalar, so `MIN`/`MAX`
+fell back to a scan and were still correct; only `COUNT` trusted the
+statement outright and answered zero over a column every row of the object
+resolves a value for.
 
 The basis is unchanged by this amendment; it is restated because the
 implementation had drifted from it. For every row, both producers now
