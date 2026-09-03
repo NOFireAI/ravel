@@ -113,6 +113,10 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Rspan { .. }
         | Command::Store { .. }
         | Command::Idem { .. }
+        // `tenancy show` decodes the marker itself and takes no `--tenant`;
+        // `tenancy resolve` (issue #1180) resolves the scheme itself inline
+        // (mirroring `show`), rather than going through this shared gate, so
+        // its dispatch arm stays self-contained and directly testable.
         | Command::Tenancy { .. }
         // sys/gc is a bucket-root object, not under any tenant prefix, so
         // gc-config never hashes a tenant. sys/auth (ADR-0072 decision 4) is
@@ -123,6 +127,36 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // `cache reclaim-legacy` operates on a local directory, not object
         // storage: no tenant prefix, no store built.
         | Command::Cache { .. } => false,
+    }
+}
+
+/// Whether `command` writes to the object store (issue #1184). Used ahead of
+/// dispatch to require the bucket's `sys/tenancy` marker (or an explicit
+/// `--tenant-hash-key-file` / `--tenant-hash-unkeyed`) before the first write,
+/// rather than the lenient absent-marker default [`tenancy::resolve_scheme`]
+/// gives read-only commands: a fresh bucket defaults to keyed on the server,
+/// so a write there under the silent v1-unkeyed fallback lands under a prefix
+/// nothing addresses once the bucket is eventually bootstrapped keyed.
+///
+/// `catalog fold`, `maintain compact-bucket`/`compact-tenant`, and `commit
+/// reconstruct` also write and hash a tenant, but are out of this fix's scope
+/// (see the final report): they are left on the lenient default.
+fn command_is_write(command: &Command) -> bool {
+    match command {
+        Command::Load { .. } => true,
+        // Both `provision` shapes write a durable record (or, for `adopt`, a
+        // control record and audit entry via `reshard`); neither has a
+        // read-only variant.
+        Command::Provision { .. } => true,
+        Command::TypedAttrColumn { command } => {
+            matches!(command, TypedAttrColumnCommand::Set { .. })
+        }
+        Command::Hold { command } => {
+            matches!(command, HoldCommand::Set { .. } | HoldCommand::Clear { .. })
+        }
+        Command::Erase { command } => matches!(command, EraseCommand::Submit { .. }),
+        Command::GcConfig { command } => matches!(command, GcConfigCommand::Set { .. }),
+        _ => false,
     }
 }
 
@@ -727,6 +761,17 @@ enum TenancyCommand {
         #[arg(long, value_name = "PATH")]
         tenant_hash_key_file: Option<std::path::PathBuf>,
     },
+    /// Hash a tenant id under the bucket's resolved scheme and print its
+    /// object-store prefix (`t/<hash>/`) on stdout and nothing else (issue
+    /// #1180): the one entry point for turning a tenant id into the prefix a
+    /// bytes-summed total, a lifecycle rule, or an erasure check needs,
+    /// instead of scraping it off a failure message. Exits nonzero if the
+    /// bucket's scheme needs a key that was not supplied via the global
+    /// `--tenant-hash-key-file` / `--tenant-hash-unkeyed`.
+    Resolve {
+        /// Tenant id to resolve (hashed under the bucket's pinned scheme).
+        tenant: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1080,9 +1125,25 @@ async fn main() -> anyhow::Result<()> {
             cli.tenancy.tenant_hash_key_file.as_deref(),
             cli.tenancy.tenant_hash_unkeyed,
         )?;
-        let scheme = tenancy::resolve_scheme(store.as_ref(), configured).await?;
+        let scheme = if command_is_write(&cli.command) {
+            tenancy::resolve_scheme_for_write(store.as_ref(), configured).await?
+        } else {
+            tenancy::resolve_scheme(store.as_ref(), configured).await?
+        };
         ravel_types::install_tenant_hash_scheme(scheme)
             .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
+    } else if command_is_write(&cli.command) {
+        // A writing command that does not hash a tenant (`gc-config set`:
+        // `sys/gc` is a bucket-root object) still writes into the same
+        // bucket the server must accept at startup, so it clears the same
+        // fail-closed gate even though it needs no `TenantHashScheme`
+        // installed (issue #1184).
+        let store = store::build_store(&cli.store)?;
+        let configured = tenancy::configured_scheme_from_flags(
+            cli.tenancy.tenant_hash_key_file.as_deref(),
+            cli.tenancy.tenant_hash_unkeyed,
+        )?;
+        tenancy::resolve_scheme_for_write(store.as_ref(), configured).await?;
     }
 
     match cli.command {
@@ -1458,6 +1519,19 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             print!("{report}");
+            Ok(())
+        }
+        Command::Tenancy {
+            command: TenancyCommand::Resolve { tenant },
+        } => {
+            let configured = tenancy::configured_scheme_from_flags(
+                cli.tenancy.tenant_hash_key_file.as_deref(),
+                cli.tenancy.tenant_hash_unkeyed,
+            )?;
+            let scheme =
+                tenancy::resolve_scheme(store::build_store(&cli.store)?.as_ref(), configured)
+                    .await?;
+            println!("{}", tenancy::resolve(&scheme, &tenant));
             Ok(())
         }
         Command::Provision {
@@ -2517,7 +2591,7 @@ mod tests {
     use clap::Parser;
 
     use super::rspan_status_mask_names;
-    use super::{Cli, Command};
+    use super::{Cli, Command, tenancy};
     use ravel_rspan::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
 
     /// This unit test binary is built from this binary root, so it links the
@@ -2636,6 +2710,253 @@ mod tests {
             max_flush_delay,
             Some(std::time::Duration::from_secs(600)),
             "--max-flush-delay 10m reaches the field as 600s"
+        );
+    }
+
+    /// Issue #1184's classification: exactly `load`, `typed-attr-column set`,
+    /// `hold set`/`clear`, `erase submit`, `provision adopt`/`reshard`, and
+    /// `gc-config set` write; their `show`/`list`/`status` siblings, and every
+    /// other command, do not.
+    #[test]
+    fn command_is_write_classifies_the_named_shapes() {
+        let cases: &[(&[&str], bool)] = &[
+            (
+                &[
+                    "ravel",
+                    "load",
+                    "--parquet",
+                    "h.parquet",
+                    "--tenant",
+                    "t",
+                    "--mapping",
+                    "m.toml",
+                ],
+                true,
+            ),
+            (&["ravel", "typed-attr-column", "set", "t", "k:str"], true),
+            (&["ravel", "typed-attr-column", "show", "t"], false),
+            (
+                &["ravel", "hold", "set", "--tenant", "t", "--scope", "t/x/"],
+                true,
+            ),
+            (
+                &["ravel", "hold", "clear", "--tenant", "t", "--scope", "t/x/"],
+                true,
+            ),
+            (&["ravel", "hold", "list", "--tenant", "t"], false),
+            (
+                &[
+                    "ravel",
+                    "erase",
+                    "submit",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--matcher",
+                    "k=v",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel", "erase", "status", "--tenant", "t", "--signal", "logs",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "provision",
+                    "adopt",
+                    "--tenant",
+                    "t",
+                    "--shards",
+                    "4",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "provision",
+                    "reshard",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--shard-count",
+                    "8",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "gc-config",
+                    "set",
+                    "--protection-horizon",
+                    "25h",
+                    "--grace",
+                    "24h",
+                    "--max-query-duration",
+                    "1h",
+                    "--max-flush-lifetime",
+                    "1h",
+                ],
+                true,
+            ),
+            (&["ravel", "gc-config", "show"], false),
+            (&["ravel", "tenancy", "show"], false),
+            (&["ravel", "tenancy", "resolve", "t"], false),
+        ];
+        for (args, expect_write) in cases {
+            let cli =
+                Cli::try_parse_from(*args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            assert_eq!(
+                super::command_is_write(&cli.command),
+                *expect_write,
+                "{args:?} classified as write={}, expected {}",
+                super::command_is_write(&cli.command),
+                expect_write
+            );
+        }
+    }
+
+    /// Issue #1184, end to end against the exact gate `main` runs before
+    /// dispatch: `hold set` (a writing shape that hashes a tenant) against a
+    /// fresh, marker-less bucket with no scheme flag refuses with the
+    /// server's own `FreshBucketNeedsKey` wording, and the store holds zero
+    /// objects both before and after the attempt -- proving the refusal
+    /// happens before any write, not just that an error was raised.
+    ///
+    /// Non-vacuity: before this fix, `command_is_write` did not exist and
+    /// every tenant-hashing command (write or not) called plain
+    /// `resolve_scheme`, whose `Unspecified` arm returns
+    /// `Ok(TenantHashScheme::V1Unkeyed)`. Reverting the `if
+    /// super::command_is_write(&cli.command) { resolve_scheme_for_write }
+    /// else { resolve_scheme }` branch below to always call `resolve_scheme`
+    /// turns this test's `expect_err` into a panic on `Ok`.
+    #[tokio::test]
+    async fn hold_set_refuses_and_writes_nothing_on_marker_less_bucket() {
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+
+        let cli = Cli::try_parse_from([
+            "ravel", "hold", "set", "--tenant", "acme", "--scope", "t/x/",
+        ])
+        .expect("hold set parses");
+        let store: std::sync::Arc<dyn ObjectStoreBackend> = std::sync::Arc::new(MemoryStore::new());
+
+        let objects_before = store
+            .list("", None)
+            .await
+            .expect("list succeeds on an empty store")
+            .objects
+            .len();
+        assert_eq!(objects_before, 0);
+
+        let configured = tenancy::configured_scheme_from_flags(None, false)
+            .expect("no scheme flags is a valid configuration");
+        let gate = if super::command_is_write(&cli.command) {
+            tenancy::resolve_scheme_for_write(store.as_ref(), configured).await
+        } else {
+            tenancy::resolve_scheme(store.as_ref(), configured).await
+        };
+        let err = gate.expect_err("hold set on a fresh bucket with no scheme flag must refuse");
+        assert!(
+            err.to_string().contains(
+                "this is a fresh bucket and the tenant hash is keyed by default, but no \
+                 --tenant-hash-key-file was configured"
+            ),
+            "err: {err}"
+        );
+
+        let objects_after = store
+            .list("", None)
+            .await
+            .expect("list still succeeds")
+            .objects
+            .len();
+        assert_eq!(
+            objects_after, 0,
+            "the refused hold set must not have written any object"
+        );
+    }
+
+    /// The read-only sibling in the same command group, `hold list`, keeps
+    /// working against the same marker-less bucket with no scheme flag
+    /// (issue #1184's explicit requirement): `command_is_write` is false for
+    /// it, so it takes the lenient `resolve_scheme` path and gets the
+    /// v1-unkeyed default rather than a refusal.
+    #[tokio::test]
+    async fn hold_list_still_succeeds_on_marker_less_bucket() {
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+
+        let cli = Cli::try_parse_from(["ravel", "hold", "list", "--tenant", "acme"])
+            .expect("hold list parses");
+        assert!(!super::command_is_write(&cli.command));
+
+        let store: std::sync::Arc<dyn ObjectStoreBackend> = std::sync::Arc::new(MemoryStore::new());
+        let configured = tenancy::configured_scheme_from_flags(None, false)
+            .expect("no scheme flags is a valid configuration");
+        tenancy::resolve_scheme(store.as_ref(), configured)
+            .await
+            .expect("a read-only command must keep working on a fresh, marker-less bucket");
+    }
+
+    /// `gc-config set` writes `sys/gc`, a bucket-root object with no tenant
+    /// prefix, so it never reaches the tenant-hashing gate above; it still
+    /// must clear the write gate on its own (the `else if
+    /// command_is_write(&cli.command)` arm in `main`), since the invariant
+    /// is "does the server accept this bucket", not "does this command hash
+    /// a tenant".
+    #[tokio::test]
+    async fn gc_config_set_refuses_on_marker_less_bucket() {
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+
+        let cli = Cli::try_parse_from([
+            "ravel",
+            "gc-config",
+            "set",
+            "--protection-horizon",
+            "25h",
+            "--grace",
+            "24h",
+            "--max-query-duration",
+            "1h",
+            "--max-flush-lifetime",
+            "1h",
+        ])
+        .expect("gc-config set parses");
+        assert!(!super::command_hashes_tenant(&cli.command));
+        assert!(super::command_is_write(&cli.command));
+
+        let store: std::sync::Arc<dyn ObjectStoreBackend> = std::sync::Arc::new(MemoryStore::new());
+        let configured = tenancy::configured_scheme_from_flags(None, false)
+            .expect("no scheme flags is a valid configuration");
+        let err = tenancy::resolve_scheme_for_write(store.as_ref(), configured)
+            .await
+            .expect_err("gc-config set on a fresh bucket with no scheme flag must refuse");
+        assert!(
+            err.to_string().contains(
+                "this is a fresh bucket and the tenant hash is keyed by default, but no \
+                 --tenant-hash-key-file was configured"
+            ),
+            "err: {err}"
+        );
+
+        let objects_after = store
+            .list("", None)
+            .await
+            .expect("list succeeds")
+            .objects
+            .len();
+        assert_eq!(
+            objects_after, 0,
+            "the refused gc-config set must not have written sys/gc"
         );
     }
 
