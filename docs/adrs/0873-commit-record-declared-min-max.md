@@ -1268,6 +1268,31 @@ Where decision 4 describes the union degenerating to the `.cstat` carrier
 alone for a declared `STR` or `BYTES` column, that now describes `BYTES`
 only; the `STR` case is not a degenerate union but no union at all.
 
+## Amendment 2026-09-03: the stamp's basis is the merged attribute view
+
+Issue #1057. Decision 3 describes the L0 and L1 folds in terms of the
+writer's per-block NumStats, which count merged-view resolution per row
+(docs/log-segment-format.md, "What a numeric stat bounds": a row that
+resolves a name off its stream layer contributes its resource- or
+scope-level value). Both shipped producers instead fold the records
+themselves, and both folded a record's own attribute set only. That made a
+declared column whose values live on the stream's resource or scope
+attributes stamp `null_count == sample_count` with absent extrema, which is
+an affirmative all-NULL statement rather than an absent one, so the
+metadata-only aggregate path answered `MIN`/`MAX` with NULL and `COUNT` with
+zero over a column every row of the object resolves a value for.
+
+The basis is unchanged by this amendment; it is restated because the
+implementation had drifted from it. For every row, both producers now
+resolve the value the reader resolves (`ravel_sql`'s
+`logs_scan::merged_value`): the record's own attribute when the record sets
+that key at any value kind, and otherwise the row's stream-level resource or
+scope attribute of the same name, first blob occurrence winning. A stream's
+attributes are decoded once per stream per object, never per record. When a
+stream's attribute blob does not decode, the producer emits no stamps at all
+for that object rather than an affirmative statement over an unresolved
+view, which is the fail-closed reading of decision 3's staleness rule.
+
 ## Out-of-scope findings, reported not fixed
 
 1. **docs/adrs/README.md index drift**: the index (111 rows) is missing
