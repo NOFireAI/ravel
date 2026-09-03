@@ -246,6 +246,14 @@ PinnedServes(s) ==
 
 ServesAny(s) == ServesNow(s) \/ PinnedServes(s)
 
+\* A raw input under legal hold, still present, that serves subject s (finding 1).
+\* This is independent of head/pinned reachability: a superseded input can be
+\* off HEAD and unpinned yet still legally held, which is exactly why the code
+\* gates on it separately (bucket_is_held in erasure_rewrite.rs,
+\* chain_groups_held_by_legal_hold in sweep.rs) rather than folding it into the
+\* served-set check. Legal hold wins over erasure (ADR-0064 section 6).
+HeldInputServes(s) == \E o \in RawInputs : HeldObject(o, heldBuckets) /\ PresentObj(o) /\ ServesSubject(o, s)
+
 \* The .dreq presence filters the subject at read time for BOTH the current-HEAD
 \* read and a pinned read; an erased subject stays filtered until the .dreq is gone
 \* and nothing any reader can still reach serves it.
@@ -273,11 +281,12 @@ TypeOK ==
     /\ objContent \in [Objects -> SUBSET AllRecords]
     /\ variantKey \in [{"v1","v2"} -> {UnnamedKey, RewriteKey(DescA), RewriteKey(DescB)}]
     /\ sysgc \in [ph: Nat, mqd: Nat, grace: Nat, skew: Nat]
-    /\ lastGc.rule \in {"none","superseded","retention","dreq"}
+    /\ lastGc.rule \in {"none","superseded","retention","dreq","complete"}
     /\ lastGc.deleted \subseteq Objects
     /\ lastGc.held \in BOOLEAN
     /\ lastGc.refreshWasFailed \in BOOLEAN
     /\ lastGc.permittedNeeds \subseteq DataObjects
+    /\ lastGc.heldInputServed \in BOOLEAN
 
 --------------------------------------------------------------------------------
 \* Init: a populated store (raw1, raw2, d2, sysgc present), HEAD naming the data,
@@ -311,7 +320,7 @@ Init ==
                 mqd |-> MaxQueryDuration, grace |-> Grace, skew |-> ClockSkew]
     /\ lastGc = [rule |-> "none", deleted |-> {}, atClock |-> 0,
                  held |-> FALSE, refreshWasFailed |-> FALSE,
-                 permittedNeeds |-> {}]
+                 permittedNeeds |-> {}, heldInputServed |-> FALSE]
 
 \* A GC witness records what the deleting store operation OBSERVED at its own
 \* step: the TRUE legal-hold state (over heldBuckets, not the sweep's known set),
@@ -319,6 +328,12 @@ Init ==
 \* state (never the live variable), so a hold or refresh flipped AFTER a legitimate
 \* delete cannot retroactively make it look unsafe. `held` uses the true hold set
 \* so a sweep that ran with degraded hold knowledge (finding 2) is caught.
+\* `heldInputServed` is the same kind of per-step witness for finding 1: whether a
+\* held raw input served the erased subject at the moment this action ran, not
+\* whatever a hold placed or released afterward makes true. It is only ever
+\* meaningful when paired with the rule/step that set it deliberately
+\* (CompleteErasure via CompletionWitness, DreqSweep via GcWitness "dreq");
+\* every other action resets it to FALSE the same way it resets `held`.
 PermittedNeeds ==
     IF query.active /\ clock <= query.deadline THEN query.needs ELSE {}
 
@@ -326,11 +341,21 @@ GcWitness(r, dels) ==
     lastGc' = [rule |-> r, deleted |-> dels, atClock |-> clock,
                held |-> \E o \in dels : HeldObject(o, heldBuckets),
                refreshWasFailed |-> refreshFailed,
-               permittedNeeds |-> PermittedNeeds]
+               permittedNeeds |-> PermittedNeeds,
+               heldInputServed |-> HeldInputServes("s1")]
 
 NoGc == lastGc' = [rule |-> "none", deleted |-> {}, atClock |-> clock,
                    held |-> FALSE, refreshWasFailed |-> FALSE,
-                   permittedNeeds |-> {}]
+                   permittedNeeds |-> {}, heldInputServed |-> FALSE]
+
+\* CompleteErasure is not a delete, so it does not fit the GcWitness shape (no
+\* object is deleted), but it needs the same per-step held-input witness as the
+\* GC actions: whether HeldInputServes("s1") was true at the moment it wrote
+\* .done, tagged with its own rule so CompletionRespectsLegalHold can find it.
+CompletionWitness ==
+    lastGc' = [rule |-> "complete", deleted |-> {}, atClock |-> clock,
+               held |-> FALSE, refreshWasFailed |-> refreshFailed,
+               permittedNeeds |-> {}, heldInputServed |-> HeldInputServes("s1")]
 
 --------------------------------------------------------------------------------
 \* Environment actor
@@ -457,19 +482,23 @@ HeadAdvanceRewrite ==
 
 \* Complete the erasure: write .done only when the served set no longer serves the
 \* subject (bucket_erasure_completion over bucket_serves_subject). completed is
-\* the current, non-zero clock.
+\* the current, non-zero clock. A legal hold on a still-present superseded input
+\* that serves the subject blocks completion unconditionally (finding 1):
+\* bucket_is_held is checked before the served-set read and has no switch of its
+\* own in the code, so the model gates on it the same way, with no bypass.
 CompleteErasure ==
     /\ ~PresentObj("doneR1")
     /\ PresentObj("dreqR1")
     /\ HeadDeletable   \* completion needs a real served-set read of HEAD
     /\ (CompleteIgnoresServedSet \/ ~ServesNow("s1"))
+    /\ ~HeldInputServes("s1")
     /\ clock > 0
     /\ S!PutOverwrite("doneR1", "dat")
     /\ doneAt' = clock
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, sysgc, supersededAt, objContent, variantKey>>
-    /\ NoGc
+    /\ CompletionWitness
 
 --------------------------------------------------------------------------------
 \* Retention actor (maintainer)
@@ -559,11 +588,15 @@ SupersededSweep(o) ==
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
 
 \* .dreq sweep: delete the .dreq when a matching .done exists, its completed
-\* timestamp is non-zero, the horizon has passed AND no reader (the current HEAD or
+\* timestamp is non-zero, the horizon has passed, no reader (the current HEAD or
 \* a permitted pinned query) still reaches a present object serving the subject
 \* (once the .dreq read-time filter is gone, such a reader would serve the erased
-\* subject). DreqIgnoresHeldInputs drops the last clause, so the .dreq can be swept
-\* out from under such a reader.
+\* subject), AND no held superseded input still serves the subject (finding 1:
+\* sweep.rs folds chain_groups_held_by_legal_hold into held_request_ids alongside
+\* the HEAD-named and unreadable-HEAD hold reasons, so a legally held input blocks
+\* the .dreq the same way a HEAD-named one does, regardless of live reachability).
+\* The ~ServesAny clause is unconditional; DreqIgnoresHeldInputs drops only the
+\* held-input clause, so its name and its behaviour agree.
 DreqSweep ==
     /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
     /\ HeadReadable
@@ -571,7 +604,8 @@ DreqSweep ==
     /\ PresentObj("doneR1")
     /\ doneAt > 0
     /\ clock >= dreqHorizon
-    /\ (DreqIgnoresHeldInputs \/ ~ServesAny("s1"))
+    /\ ~ServesAny("s1")
+    /\ (DreqIgnoresHeldInputs \/ ~HeldInputServes("s1"))
     /\ S!Delete("dreqR1")
     /\ GcWitness("dreq", {"dreqR1"})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
@@ -667,10 +701,36 @@ RewriteOutputsAreInputsMinusErased ==
 CompletionImpliesNoPreRewriteExposure ==
     PresentObj("doneR1") => ~ServesNow("s1")
 
+\* Legal hold wins over erasure completion (finding 1, ADR-0064 section 6): a
+\* still-present, legally held superseded input that served the erased subject
+\* at the moment CompleteErasure ran means that step should not have happened.
+\* Reads the CompletionWitness lastGc set at that step, not the live HeldInputServes:
+\* a hold placed or released AFTER a legitimate completion is a different bucket
+\* state, not evidence the completion itself was wrong, so the check is scoped to
+\* CompleteErasure's own transition the same way NoDeleteInsideProtectionWindow is
+\* scoped to a delete's own transition via `held`/`atClock`.
+CompletionRespectsLegalHold ==
+    (lastGc.rule = "complete") => ~lastGc.heldInputServed
+
 \* Removing the .dreq cannot resurrect the subject: if the .dreq is gone after a
 \* request, no reader (current HEAD or a permitted pinned query) still serves it.
+\* The pinned-reader case is handled here; a held-but-unreachable input is a
+\* separate concern covered by DreqSweepRespectsLegalHold below, scoped to the
+\* sweep's own step for the same reason CompletionRespectsLegalHold is scoped to
+\* CompleteErasure's: a hold placed after this sweep already ran does not mean
+\* the sweep resurrected anything.
 DreqRemovalCannotResurrect ==
     ("s1" \in erasureRequested /\ ~PresentObj("dreqR1")) => ~ServesAny("s1")
+
+\* Legal hold wins over the .dreq sweep (finding 1): a legally held superseded
+\* input that served the erased subject at the moment DreqSweep ran means that
+\* step should not have happened (sweep.rs folds chain_groups_held_by_legal_hold
+\* into held_request_ids, gating the sweep the same way bucket_is_held gates
+\* completion). Reads the GcWitness lastGc set at DreqSweep's own step ("dreq"),
+\* not the live HeldInputServes, for the same retroactivity reason as
+\* CompletionRespectsLegalHold.
+DreqSweepRespectsLegalHold ==
+    (lastGc.rule = "dreq") => ~lastGc.heldInputServed
 
 \* Two rewrites over the same input set with different applied requests get
 \* different keys (the hash binds the sorted applied ids). Reads the names
