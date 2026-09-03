@@ -36,9 +36,14 @@ process never compacts or deletes anything.
 The ingest surfaces are OTLP over HTTP and gRPC, Prometheus Remote Write,
 and OTAP behind a cargo feature. The query surfaces are the
 Prometheus-compatible `/api/v1/*` routes, `POST /api/v1/sql`, Flight SQL
-behind a cargo feature, and `POST /api/v1/analytics`. The ingest protocols
-share one pipeline: Remote Write payloads normalise to the shape OTLP
-produces and enter the same router call, so there is no second flush or
+behind a cargo feature, and `POST /api/v1/analytics`. The
+Prometheus-compatible routes also serve the logs signal: a selector with
+exact `__name__` equality on the reserved `ravel_log_lines` or
+`ravel_log_bytes` metric name is answered from log data, evaluated locally
+by the query coordinator rather than federated (ADR-1103; see
+[docs/guides/query.md](guides/query.md#promql-over-logs)). The ingest
+protocols share one pipeline: Remote Write payloads normalise to the shape
+OTLP produces and enter the same router call, so there is no second flush or
 commit path to hold correct.
 
 Two capabilities that the decision records discuss do not exist in the

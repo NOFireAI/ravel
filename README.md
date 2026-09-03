@@ -60,9 +60,11 @@ management service (SSE-KMS), legal hold, and admission limits.
 
 - No downsampled or pre-aggregated rollups. A wide-range metrics query reads
   every raw hour it covers.
-- Logs and traces are queryable over SQL only, as the `logs` and `spans` tables.
-  There is no LogQL, no PromQL surface for logs, no TraceQL, no trace-by-ID
-  endpoint, and no Jaeger or Tempo API.
+- Traces are queryable over SQL only, as the `spans` table. Logs are queryable
+  over SQL, as the `logs` table, and over PromQL, through the reserved
+  `ravel_log_lines` and `ravel_log_bytes` metric names (see
+  [PromQL over logs](docs/guides/query.md#promql-over-logs)). Neither surface
+  gets you LogQL, TraceQL, a trace-by-ID endpoint, or a Jaeger or Tempo API.
 - Profiles are a reserved object-key prefix only. No ingest, no query.
 - Exemplars are stored from the OpenTelemetry Protocol (OTLP) only. Remote Write
   and OTAP decode exemplars and then discard them.
@@ -72,10 +74,13 @@ management service (SSE-KMS), legal hold, and admission limits.
 
 **Who should wait.** If your dashboards range over months of high-cardinality
 metrics, the missing downsampled storage will cost you on every panel. If your
-logs or traces workflow depends on LogQL, TraceQL, or the Jaeger UI, there is
-nothing here to point them at. If you need write acknowledgement in single-digit
-milliseconds, strict mode
-pays an object-store round trip and buffered mode gives up the crash guarantee
+logs workflow depends on LogQL's line-pipeline browsing style, or your traces
+workflow depends on TraceQL or the Jaeger UI, there is nothing here to point
+them at; a Grafana Prometheus datasource can already chart log volume and
+error rate against Ravel through PromQL, and filter the lines it counts by
+body text, but it cannot browse the lines themselves. Reading log lines is
+SQL's job. If you need write acknowledgement in single-digit milliseconds, strict
+mode pays an object-store round trip and buffered mode gives up the crash guarantee
 above. Ravel is pre-1.0: the persistent formats are versioned contracts, and the
 surfaces around them still move.
 
@@ -92,7 +97,7 @@ matrix says which.
 | OTLP ingest, HTTP and gRPC | metrics, logs, traces | `none` | yes |
 | Prometheus Remote Write 1.0 and 2.0 ingest | metrics | `none` | yes |
 | OTAP ingest, gRPC | metrics | `otap` | yes |
-| PromQL HTTP API | metrics | `none` | yes |
+| PromQL HTTP API | metrics, logs as `ravel_log_lines` and `ravel_log_bytes` | `none` | yes |
 | SQL over `POST /api/v1/sql` | metrics as `samples`, logs as `logs`, traces as `spans`, alert history as `alerts`, audit records as `audit` | `sql` | yes |
 | Flight SQL | the same five tables | `flight-sql` | yes |
 
@@ -109,7 +114,9 @@ ingest is registered only when the process is started with `--otap`
 surfaces by passing the same `--features` list to cargo.
 
 Exactly five SQL tables are registered: `samples`, `logs`, `spans`, `alerts`,
-and `audit`. SQL is the only way to query logs and traces.
+and `audit`. SQL is the only way to query traces, alerts, and audit records.
+Logs are also queryable over PromQL, as `ravel_log_lines` and
+`ravel_log_bytes`.
 
 Also live:
 
@@ -158,6 +165,16 @@ demo bearer token, exactly as a real deployment needs a real one:
 ```sh
 curl -s -H "Authorization: Bearer demo-token" \
   'http://127.0.0.1:4318/api/v1/query?query=system_cpu_load_average_1m'
+```
+
+Logs answer the same PromQL API, through the reserved `ravel_log_lines` and
+`ravel_log_bytes` metric names ([details](docs/guides/query.md#promql-over-logs)):
+
+<!-- ravel:run status=200; json:.data.resultType=vector -->
+```sh
+curl -s -H "Authorization: Bearer demo-token" \
+  --data-urlencode 'query=sum by (job) (count_over_time(ravel_log_lines[5m]))' \
+  'http://127.0.0.1:4318/api/v1/query'
 ```
 
 The published image carries the `sql` feature, so `POST /api/v1/sql` answers

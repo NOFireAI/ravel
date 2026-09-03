@@ -311,12 +311,14 @@ that flushed, exactly like a metrics export. An unresolvable tenant returns
 pipeline cannot accept returns `503`.
 
 Log records are durable in RLOG objects under the tenant's `l` keyspace after
-the strict ack returns. **Logs are queryable over SQL**: the `logs` table is
-registered on the `POST /api/v1/sql` endpoint, and
-[query.md](query.md#sql-over-samples-logs-and-spans) documents its schema and usage.
-PromQL does not query logs, so log data is reachable only through SQL. You can
-also read a log object back directly with `ravel-cli rlog inspect`
-([inspecting-data.md](inspecting-data.md)).
+the strict ack returns. **Logs are queryable two ways**: over SQL, where the
+`logs` table is registered on the `POST /api/v1/sql` endpoint
+([query.md](query.md#sql-over-samples-logs-and-spans) documents its schema
+and usage), and over PromQL, through the reserved `ravel_log_lines` and
+`ravel_log_bytes` metric names
+([query.md](query.md#promql-over-logs) documents the label mapping and
+routing rule). You can also read a log object back directly with
+`ravel-cli rlog inspect` ([inspecting-data.md](inspecting-data.md)).
 
 ### Log admission limits
 

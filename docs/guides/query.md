@@ -218,6 +218,170 @@ Selector details that hold for a bare vector selector:
   exactly 5 minutes old is not used. A series with no sample in that window
   is omitted from the result entirely, not reported as absent or zero.
 
+## PromQL over logs
+
+The `logs` signal is also reachable through the PromQL HTTP API, via two
+reserved metric names (see Background below):
+
+- `ravel_log_lines` -- one sample per log line, value `1`. `count_over_time`
+  counts lines.
+- `ravel_log_bytes` -- one sample per log line, value the line's `body`
+  length in bytes. `sum_over_time` sums bytes.
+
+No new endpoint and no new query language. `/api/v1/query`,
+`/api/v1/query_range` and `/api/v1/metadata` serve these two names exactly
+as they serve any other metric name, and the discovery endpoints treat a
+log selector in `match[]` exactly as they treat a metrics one:
+`/api/v1/series` returns its matching label sets, `/api/v1/labels` returns
+the label names those sets carry, and `/api/v1/label/{name}/values` returns
+that label's values, which for `__name__` includes the two reserved names.
+
+### Routing: a selector is a log selector only on exact `__name__` equality
+
+A vector selector is answered from the logs signal only when its `__name__`
+matcher is an exact `=` equality on `ravel_log_lines` or `ravel_log_bytes`
+(`ravel_log_lines{job="api"}`, never `{__name__=~"ravel_log_.*"}` and never
+`!=`). Every other selector, including one that merely resembles a reserved
+name, resolves against the metrics signal as it always has.
+
+### Label mapping
+
+A log record becomes one sample whose label set is built in this precedence
+order, first writer wins on a key collision:
+
+1. `__name__` -- `ravel_log_lines` or `ravel_log_bytes`, from the selector.
+2. `job` and `instance` -- the same derivation ingest already uses for
+   metrics (see [the ingest guide](ingest.md)).
+3. `otel_scope_name` and `otel_scope_version` when non-empty, and
+   `otel_scope_<attr>` for each scope attribute.
+4. Every remaining resource attribute, sanitized to a label name. Unlike
+   metrics ingest, there is **no allowlist**: every resource attribute the
+   record's stream carries becomes a label, not just a fixed set.
+5. `severity_text` when non-empty -- the one per-record (not per-stream)
+   field promoted to a label.
+
+Only scalar attributes become labels. A string is used as it stands, and an
+integer, double or boolean is rendered the way the SQL `attrs` map renders
+it; a byte string, list or map is skipped, since none has a faithful single
+label value. An attribute whose value is empty is skipped as well, so an
+empty attribute never differs from an absent one.
+
+Sanitizing a name for use as a label rewrites the first character to
+`[A-Za-z_]` and every later character to `[A-Za-z0-9_]` in place (so
+`k8s.pod.name` becomes `k8s_pod_name`), the same rule
+`ravel_otlp::normalize::sanitize_label_name` already applies to metrics.
+The `__`-prefixed namespace is reserved: an attribute whose sanitized name
+lands there is dropped rather than becoming a label. The only `__` label on a
+log-derived series is the `__name__` the mapping itself sets to the reserved
+metric name.
+
+A **stream** is a resource-and-scope attribute set; it is not the same thing
+as a query-time series. Two streams whose resource, scope, and per-record
+`severity_text` map to the identical label set merge into one series: their
+samples interleave and none are dropped. Conversely, one stream's records
+with different `severity_text` values (say, `ERROR` and `INFO` from the same
+pod) split into distinct series, since `severity_text` is part of the label
+set.
+
+Two records at the exact same timestamp in the same series are never
+deduplicated or merged; both remain distinct samples, ordered by ascending
+`value.to_bits()` (so `ravel_log_lines`, always `1`, has no defined order
+between same-timestamp lines beyond that bit-pattern tie-break).
+
+### `__body__`: a matcher-only pseudo-label
+
+`__body__` matches a log record's body, either by whole-body equality
+(`__body__="exact text"`) or a fully-anchored regex
+(`__body__=~".*timeout.*"`). It is a matcher, not a label: it never appears
+in a returned label set, and it plays no part in series identity or the
+merge/split rules above. Multiple `__body__` matchers in one selector AND
+together.
+
+### `rate()` is not redefined for log series
+
+There is no log-specific meaning for `rate()`. The PromQL spelling of "lines
+per second" over a log selector is division by the window's seconds, exactly
+as it would be for any counter-shaped `count_over_time`:
+
+```promql
+count_over_time(ravel_log_lines{job="api"}[5m]) / 300
+```
+
+### Budgets, `series`/`labels`/`label-values`, and `metadata`
+
+A log selector draws on the same [query budgets](#query-budgets) as a
+metrics selector, in the same query: `max_samples`, `max_series`,
+`max_segments`, `max_bytes_scanned`, and `max_s3_requests` are shared totals
+across every selector a query contains, metrics and log alike. Exceeding any
+of them is the same typed `422` a metrics-only query gets.
+
+`/api/v1/series` with a log selector in `match[]` resolves that selector's
+matching log streams into label sets, same as for metrics. `/api/v1/labels`
+and `/api/v1/label/{name}/values` behave the same way when a log selector is
+present in `match[]`.
+
+`/api/v1/label/__name__/values` includes both `ravel_log_lines` and
+`ravel_log_bytes` when the request carries no `match[]`, and when at least
+one `match[]` selector is a log selector; a request whose selectors name only
+metrics gets metrics names only. The names are listed even on a tenant that
+has never ingested a log, since they exist independently of the data. A
+`match[]` naming one reserved name currently returns both of them.
+`/api/v1/metadata` always includes both reserved names too, each with a
+fixed `type`, `help`, and `unit`, subject to the same `metric` and `limit`
+filters a metrics request uses; neither entry depends on any log data having
+been ingested.
+
+### Local evaluation only in this release
+
+A log selector is answered by the query coordinator directly against
+object storage; it does not fan out over `--distributed-query` federation
+the way a metrics selector does (see Background below). A federated deployment
+still answers a log selector, just from the coordinator's own local view, not
+a cluster-wide merge; wiring log selectors into federation is unscheduled
+follow-up work.
+
+### Examples
+
+Error lines per job over the last 5 minutes:
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/query \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode 'query=sum by (job) (count_over_time(ravel_log_lines{severity_text="ERROR"}[5m]))'
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {"metric": {"job": "api"}, "value": [1732400000, "128"]}
+    ]
+  }
+}
+```
+
+Log volume in bytes for lines whose body mentions a timeout:
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/query \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode 'query=sum(sum_over_time(ravel_log_bytes{job="api", __body__=~".*timeout.*"}[1h]))'
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {"metric": {}, "value": [1732400000, "5312"]}
+    ]
+  }
+}
+```
+
 ## `min_commit_token`
 
 Pass a commit token from an ingest response's `x-ravel-commit-token`
@@ -242,6 +406,8 @@ truncation:
 | Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--fetch-concurrency`) | (not user-visible; throughput knob only) |
 | Wall-clock deadline | fixed: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
 | Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
+| Bytes scanned | unlimited (opt in via `query_defaults.max_bytes_scanned`) | `query scanned {scanned} bytes, exceeding the budget of {max}` |
+| Object-store requests | derived from the deployment's shard count and flush cadence | `query issued {requests} S3 requests, exceeding the budget of {max}` |
 
 `timeout` (Prometheus duration syntax like `30s`/`5m`, or bare float
 seconds) lowers the deadline per request. It cannot raise it above the
@@ -546,7 +712,13 @@ the modes that evaluate it, and the sinks are in the
 | 200 | n/a | Success. |
 | 400 | `bad_data` | Bad or missing parameter, PromQL parse error, invalid time range, step <= 0. |
 | 401 | `unauthorized` | Tenant authentication failed or was not provided. |
-| 422 | `execution` | An intentionally rejected PromQL construct (the set listed under PromQL support: `histogram_stddev`/`histogram_stdvar` over native histograms, an or-grouped label matcher, vector-matching fill values, a subquery over native histograms, or the experimental `limitk`/`limit_ratio` operators), or a query budget (segments/series/samples, the catalog-list window ceiling, or the SQL memory pool) exceeded. |
+| 422 | `execution` | An intentionally rejected PromQL construct (the set listed under PromQL support: `histogram_stddev`/`histogram_stdvar` over native histograms, an or-grouped label matcher, vector-matching fill values, a subquery over native histograms, or the experimental `limitk`/`limit_ratio` operators), or a query budget (segments/series/samples, bytes scanned, object-store requests, the catalog-list window ceiling, or the SQL memory pool) exceeded. |
 | 500 | `internal` | Permanent data corruption: a corrupt catalog record, segment, field, or key, or a non-monotonic sample sequence. The message is a fixed internal-error string; the storage-layer detail is redacted and logged server-side. |
 | 503 | `unavailable` | Transient catalog or segment fetch failure, an unresolvable `min_commit_token`, or a snapshot invalidated by concurrent GC/compaction. |
 | 504 | `timeout` | Query exceeded its deadline. |
+
+## Background
+
+PromQL over logs, the two reserved metric names, the label mapping, and the
+coordinator-local (non-federated) evaluation are
+[ADR-1103](../adrs/1103-promql-over-logs.md).
