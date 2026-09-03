@@ -31,6 +31,8 @@ use crate::fetcher::{
     FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
     SegmentFetcher,
 };
+use crate::log_fetcher::{LogFetchError, LogSegmentFetcher};
+use crate::log_series;
 use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
 use crate::segment_admission;
 
@@ -318,6 +320,10 @@ fn estimate_cost(
 pub struct QueryEngine {
     catalog: Arc<Catalog>,
     fetcher: SegmentFetcher,
+    /// Fetches log segments for `ravel_log_lines`/`ravel_log_bytes`
+    /// selectors (ADR-1103). Built from the same store as `fetcher`,
+    /// with the logs-specific fetch bounds from `config`.
+    log_fetcher: LogSegmentFetcher,
     config: EngineConfig,
     /// ADR-0071 distributed read fan-out. `None` is the default:
     /// the engine runs the local fetch path untouched. `Some` opts this engine
@@ -338,9 +344,30 @@ impl QueryEngine {
         store: Arc<dyn ObjectStoreBackend>,
         config: EngineConfig,
     ) -> Self {
+        // `EngineConfig::validate` is not run by every caller of `new`
+        // (services/ravel-server/src/query.rs's non-SQL path calls this
+        // infallibly), so a zero bound is substituted here rather than
+        // propagated as a constructor error.
+        let fetch_run_bytes = if config.logs_max_fetch_run_bytes == 0 {
+            crate::config::DEFAULT_LOG_MAX_FETCH_RUN_BYTES
+        } else {
+            config.logs_max_fetch_run_bytes
+        };
+        let log_fetcher = LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(config.logs_block_range_threshold)
+            .with_max_concurrent_gets(config.fetch_concurrency)
+            .with_request_cost_bytes(config.logs_request_cost_bytes)
+            .with_max_fetch_run_bytes(fetch_run_bytes)
+            .unwrap_or_else(|_| {
+                LogSegmentFetcher::new(store.clone())
+                    .with_block_range_threshold(config.logs_block_range_threshold)
+                    .with_max_concurrent_gets(config.fetch_concurrency)
+                    .with_request_cost_bytes(config.logs_request_cost_bytes)
+            });
         QueryEngine {
             catalog,
             fetcher: SegmentFetcher::new(store),
+            log_fetcher,
             config,
             distributed: None,
             federation: None,
@@ -381,7 +408,9 @@ impl QueryEngine {
     /// [`ReadCache::Tiered`] so the disk tier reaches this engine's fetcher.
     #[must_use]
     pub fn with_cache(mut self, cache: impl Into<ReadCache>) -> Self {
-        self.fetcher = self.fetcher.with_cache(cache);
+        let cache = cache.into();
+        self.fetcher = self.fetcher.with_cache(cache.clone());
+        self.log_fetcher = self.log_fetcher.with_cache(cache);
         self
     }
 
@@ -699,6 +728,12 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        if let Some(metric) = log_series::log_metric_of(matchers) {
+            return self
+                .resolve_log_series_inner(tenant_hash, metric, matchers, window, min_tokens, now_ns)
+                .await;
+        }
+
         let name_filter = equality_name_filter(matchers);
         // Discovery does not push aggregation down (ADR-0103 is scalar-sample
         // pushdown), so it ignores the resolve's generation history.
@@ -771,10 +806,90 @@ impl QueryEngine {
         let ((series, warnings, partial), mut stats) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
+                Signal::Metrics,
                 window,
                 min_tokens,
                 now_ns,
                 name_filter.as_deref(),
+                1,
+                attempt,
+            )
+            .await?;
+        stats.partial = partial;
+        stats.warnings = warnings;
+        Ok((series, stats))
+    }
+
+    /// Discovery-path counterpart of the metrics branch above, for a
+    /// `match[]` selector naming `ravel_log_lines`/`ravel_log_bytes`
+    /// (ADR-1103). Resolves `Signal::Logs` directly with no name-postings
+    /// filter, contributes each derived series' label set the same way a
+    /// metrics series would (same erasure, same dedup-by-label-set via
+    /// `build_series_by_id`), and never fans the selector to a remote
+    /// cluster: a federated deployment gets a warning annotation instead,
+    /// mirroring `prefetch`'s log lane rather than `federate_discovery`.
+    async fn resolve_log_series_inner(
+        &self,
+        tenant_hash: TenantHash,
+        metric: log_series::LogMetric,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        let attempt = |snapshot: Snapshot,
+                       _generations: Vec<ShardGeneration>,
+                       accounting: PhaseAccounting| async move {
+            let erasure = snapshot_erasure_predicates(&snapshot);
+            let req = log_series::LogSeriesRequest {
+                metric,
+                matchers,
+                window,
+                erasure: &erasure,
+                max_samples: self.config.max_samples,
+                max_series: self.config.max_series,
+                max_bytes_scanned: self.config.max_bytes_scanned,
+                max_s3_requests: self.config.max_s3_requests,
+                deadline: None,
+            };
+            let out = log_series::fetch_log_series(
+                &self.log_fetcher,
+                tenant_hash,
+                &snapshot.segments,
+                &req,
+                &accounting,
+            )
+            .await
+            .map_err(|err| self.map_log_series_error(err))?;
+
+            let mut warnings = Vec::new();
+            if self.federation.is_some() {
+                warnings.push(format!(
+                    "{} is answered by this cluster only; log series are not federated",
+                    metric.name()
+                ));
+            }
+
+            let by_id = build_series_by_id(
+                out.series
+                    .into_iter()
+                    .map(|s| (log_series_discovery_id(&s.labels), s.labels)),
+                self.config.max_series,
+            )?;
+            Ok((
+                (by_id.into_iter().collect::<Vec<_>>(), warnings, false),
+                FetchStats::default(),
+            ))
+        };
+
+        let ((series, warnings, partial), mut stats) = self
+            .resolve_snapshot_with_retry(
+                tenant_hash,
+                Signal::Logs,
+                window,
+                min_tokens,
+                now_ns,
+                None,
                 1,
                 attempt,
             )
@@ -864,17 +979,15 @@ impl QueryEngine {
         Ok((series, outcome.warnings, outcome.partial))
     }
 
-    /// Prefetches every selector `plan_selectors` reported: one shared
-    /// snapshot resolved against the union of every selector's own fetch
-    /// window (`padded_range`, docs/query-engine.md), then one
-    /// concurrency-bounded, independently budget-checked fetch+merge per
-    /// selector's own matchers against that snapshot. A selector's fetch
-    /// only prunes by its own matchers server-side; a later
-    /// `SeriesSource::query` call still clips to its own window, so
-    /// combining every selector's already-merged series into one flat
-    /// source is correct regardless of how widely the selectors' windows
-    /// or matchers differ. An empty plan list (a query with no selectors,
-    /// e.g. a bare scalar or string literal) skips storage entirely.
+    /// Prefetches every selector `plan_selectors` reported, for BOTH signals
+    /// (ADR-1103 decision 4/5): metrics selectors run through
+    /// [`Self::prefetch_metric_plans`] unchanged, and any `ravel_log_lines`/
+    /// `ravel_log_bytes` selector (`log_series::log_metric_of`) runs on a
+    /// separate lane that resolves `Signal::Logs` directly, never through
+    /// distributed fan-out or federation, and spends only the query-wide
+    /// budget the metrics lane left remaining. A query naming no log metric
+    /// takes the metrics-only path with zero added cost or `Signal::Logs`
+    /// resolves.
     async fn prefetch(
         &self,
         tenant_hash: TenantHash,
@@ -888,6 +1001,205 @@ impl QueryEngine {
                 MergedSource {
                     series: Vec::new(),
                     histogram_series: Vec::new(),
+                    log_series: Vec::new(),
+                    precomputed_count: None,
+                },
+                QueryStats::default(),
+            ));
+        }
+
+        let metric_plans: Vec<SelectorPlan> = plans
+            .iter()
+            .filter(|p| log_series::log_metric_of(&p.matchers).is_none())
+            .cloned()
+            .collect();
+        let log_plans: Vec<SelectorPlan> = plans
+            .iter()
+            .filter(|p| log_series::log_metric_of(&p.matchers).is_some())
+            .cloned()
+            .collect();
+
+        let (mut source, mut stats) = self
+            .prefetch_metric_plans(tenant_hash, &metric_plans, eval_window, min_tokens, now_ns)
+            .await?;
+
+        if log_plans.is_empty() {
+            return Ok((source, stats));
+        }
+
+        let log_windows: Vec<TimeRange> = log_plans
+            .iter()
+            .map(|plan| selector_fetch_window(plan, eval_window))
+            .collect::<Result<_, _>>()?;
+        let mut log_padded = log_windows[0];
+        for w in &log_windows[1..] {
+            log_padded.start_ns = log_padded.start_ns.min(w.start_ns);
+            log_padded.end_ns = log_padded.end_ns.max(w.end_ns);
+        }
+
+        // The log lane never retries on `NotFound` the way
+        // `resolve_snapshot_with_retry` does for metrics: it runs strictly
+        // after the metrics lane has already produced its result, so a
+        // concurrent GC/compaction race here is the same
+        // `SnapshotInvalidated` class of rare failure the metrics lane's own
+        // second attempt exists to paper over, not a case worth duplicating
+        // that machinery for.
+        let log_accounting = PhaseAccounting::new();
+        let (log_snapshot, _log_generations) = self
+            .resolve_bounded(
+                tenant_hash,
+                Signal::Logs,
+                log_padded,
+                min_tokens,
+                now_ns,
+                None,
+                log_accounting.resolve(),
+            )
+            .await?;
+
+        // ADR-1103 decision 4 step 4: a query with both a metrics and a log
+        // selector must not spend two full `max_segments` budgets. Each
+        // `resolve_bounded` call above already checked its OWN sealed-segment
+        // count individually (`segment_admission::admit`); this adds the
+        // cumulative check across both lanes, using each lane's total
+        // resolved segment count (not just the sealed subset `admit` checks)
+        // as a conservative approximation -- `resolve_bounded` does not
+        // return the sealed/exempt split to its caller.
+        let total_segments = stats.segments_fetched + log_snapshot.segments.len() as u64;
+        if total_segments as usize > self.config.max_segments {
+            return Err(QueryError::TooManySegments {
+                count: total_segments as usize,
+                max: self.config.max_segments,
+            });
+        }
+
+        let erasure = snapshot_erasure_predicates(&log_snapshot);
+
+        // Remaining query-wide budget after the metrics lane's own spend
+        // (ADR-1103 decision 4 step 4): a log lane spending a second full
+        // budget would let a query with both selector kinds cost twice what
+        // `EngineConfig` bounds it to.
+        let samples_so_far: usize = source.series.iter().map(|s| s.samples.len()).sum::<usize>()
+            + source
+                .histogram_series
+                .iter()
+                .map(|s| s.samples.len())
+                .sum::<usize>();
+        let series_so_far = source.series.len() + source.histogram_series.len();
+        let mut samples_remaining = self.config.max_samples.saturating_sub(samples_so_far);
+        let mut series_remaining = self.config.max_series.saturating_sub(series_so_far);
+
+        let scanned_so_far = stats.phase_accounting.pooled().total_s3_bytes();
+        let bytes_remaining = match self.config.max_bytes_scanned {
+            ByteLimit::Bounded(max) => ByteLimit::Bounded(max.saturating_sub(scanned_so_far)),
+            ByteLimit::Unlimited => ByteLimit::Unlimited,
+        };
+        let requests_so_far = stats.phase_accounting.pooled().total_s3_requests();
+        let requests_remaining = match self.config.max_s3_requests {
+            RequestLimit::Bounded(max) => {
+                RequestLimit::Bounded(max.saturating_sub(requests_so_far))
+            }
+            RequestLimit::Unlimited => RequestLimit::Unlimited,
+        };
+
+        // `bytes_remaining`/`requests_remaining` are the absolute ceiling for
+        // the WHOLE log lane (every log plan below shares `log_accounting`,
+        // so `fetch_log_series`'s own per-segment check sees each plan's
+        // predecessor's spend too and naturally enforces the combined
+        // budget). `samples_remaining`/`series_remaining` are plain counts
+        // with no shared live accounting behind them, so they are reduced by
+        // hand after each plan below -- otherwise two log selectors would
+        // each see, and could each spend, the full remaining budget.
+        let mut log_series_out: Vec<SeriesData> = Vec::new();
+        let mut log_segments_fetched: u64 = 0;
+        let mut fed_metric_names: Vec<&'static str> = Vec::new();
+        for plan in &log_plans {
+            // `log_plans` was filtered by `log_metric_of(...).is_some()`
+            // above, so this is always `Some`; the `continue` never fires but
+            // keeps this loop panic-free rather than relying on that
+            // invariant holding across future edits to the filter above.
+            let Some(metric) = log_series::log_metric_of(&plan.matchers) else {
+                continue;
+            };
+            let req = log_series::LogSeriesRequest {
+                metric,
+                matchers: &plan.matchers,
+                window: log_padded,
+                erasure: &erasure,
+                max_samples: samples_remaining,
+                max_series: series_remaining,
+                max_bytes_scanned: bytes_remaining,
+                max_s3_requests: requests_remaining,
+                deadline: Some(Instant::now() + self.config.deadline),
+            };
+            let out = log_series::fetch_log_series(
+                &self.log_fetcher,
+                tenant_hash,
+                &log_snapshot.segments,
+                &req,
+                &log_accounting,
+            )
+            .await
+            .map_err(|err| self.map_log_series_error(err))?;
+            let out_samples: usize = out.series.iter().map(|s| s.samples.len()).sum();
+            samples_remaining = samples_remaining.saturating_sub(out_samples);
+            series_remaining = series_remaining.saturating_sub(out.series.len());
+            log_segments_fetched = log_segments_fetched.max(out.segments_fetched as u64);
+            log_series_out.extend(out.series);
+            if !fed_metric_names.contains(&metric.name()) {
+                fed_metric_names.push(metric.name());
+            }
+        }
+
+        source.log_series = log_series_out;
+        stats.segments_fetched += log_segments_fetched;
+        stats.segments_pruned += log_snapshot.segments_pruned;
+        stats.phase_accounting =
+            combine_phase_accounting(&stats.phase_accounting, &log_accounting.snapshot());
+        stats.accounting = stats.phase_accounting.pooled();
+
+        // ADR-1103 decision 5: a federated query answers a log selector
+        // locally only, never fanning it to a remote cluster; the client is
+        // told so via the same `warnings` channel `federate_scalar` already
+        // populates for a skipped remote.
+        if self.federation.is_some() {
+            for name in fed_metric_names {
+                stats.warnings.push(format!(
+                    "{name} is answered by this cluster only; log series are not federated"
+                ));
+            }
+        }
+
+        Ok((source, stats))
+    }
+
+    /// Prefetches every metrics selector `plan_selectors` reported: one
+    /// shared snapshot resolved against the union of every selector's own
+    /// fetch window (`padded_range`, docs/query-engine.md), then one
+    /// concurrency-bounded, independently budget-checked fetch+merge per
+    /// selector's own matchers against that snapshot. A selector's fetch
+    /// only prunes by its own matchers server-side; a later
+    /// `SeriesSource::query` call still clips to its own window, so
+    /// combining every selector's already-merged series into one flat
+    /// source is correct regardless of how widely the selectors' windows
+    /// or matchers differ. An empty plan list (no metrics selector in the
+    /// query -- a bare scalar/string literal, or a query naming only log
+    /// metrics) skips storage entirely and issues zero `Signal::Metrics`
+    /// resolves.
+    async fn prefetch_metric_plans(
+        &self,
+        tenant_hash: TenantHash,
+        plans: &[SelectorPlan],
+        eval_window: &EvalWindow,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+    ) -> Result<(MergedSource, QueryStats), QueryError> {
+        if plans.is_empty() {
+            return Ok((
+                MergedSource {
+                    series: Vec::new(),
+                    histogram_series: Vec::new(),
+                    log_series: Vec::new(),
                     precomputed_count: None,
                 },
                 QueryStats::default(),
@@ -1202,6 +1514,10 @@ impl QueryEngine {
                     MergedSource {
                         series,
                         histogram_series,
+                        // Task #6 (log-plan partitioning) fills this in from
+                        // the log lane's own fetch, run outside this
+                        // `attempt` closure.
+                        log_series: Vec::new(),
                         precomputed_count,
                     },
                     fed_warnings,
@@ -1214,6 +1530,7 @@ impl QueryEngine {
         let ((source, warnings, partial), mut stats) = self
             .resolve_snapshot_with_retry(
                 tenant_hash,
+                Signal::Metrics,
                 padded,
                 min_tokens,
                 now_ns,
@@ -1236,6 +1553,7 @@ impl QueryEngine {
     async fn resolve_snapshot_with_retry<T, F, Fut>(
         &self,
         tenant_hash: TenantHash,
+        signal: Signal,
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
@@ -1262,6 +1580,7 @@ impl QueryEngine {
         let (first, first_generations) = self
             .resolve_bounded(
                 tenant_hash,
+                signal,
                 window,
                 min_tokens,
                 now_ns,
@@ -1281,6 +1600,7 @@ impl QueryEngine {
                 let (second, second_generations) = self
                     .resolve_bounded(
                         tenant_hash,
+                        signal,
                         window,
                         min_tokens,
                         now_ns,
@@ -1329,9 +1649,11 @@ impl QueryEngine {
     // `resolve_pruned_with_accounting` directly and never reaches this wrapper
     // (ADR-0044 decision 5). Instrumenting here too would span a
     // resolve reached through ravel-query twice.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_bounded(
         &self,
         tenant_hash: TenantHash,
+        signal: Signal,
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
@@ -1347,7 +1669,7 @@ impl QueryEngine {
             .catalog
             .resolve_pruned_with_generations(
                 &tenant_hash,
-                Signal::Metrics,
+                signal,
                 window,
                 min_tokens,
                 now_ns,
@@ -1361,6 +1683,60 @@ impl QueryEngine {
         // checked incrementally during fetch, below.
         segment_admission::admit(&snapshot, &origins, &self.config)?;
         Ok((snapshot, generations))
+    }
+
+    /// Maps a log lane failure onto the same [`QueryError`] variants the
+    /// metrics fetch path returns, so the HTTP layer's status mapping and
+    /// object-key redaction (`http/error.rs`) apply unchanged to a log
+    /// selector. `Corrupt`/`Decode`/`UnknownStream` have no structurally
+    /// matching `FetchError` variant available from this crate (adding one
+    /// would touch `fetcher.rs`, out of this task's scope), so all three
+    /// coarsen to `FetchError::Store` with a `StoreError::Corrupted` cause --
+    /// the client-visible message becomes "unavailable" rather than
+    /// "corrupt" for exactly those three cases, a deliberate scope trade-off
+    /// flagged in the task report, not a silent behavior change.
+    fn map_log_series_error(&self, err: log_series::LogSeriesError) -> QueryError {
+        match err {
+            log_series::LogSeriesError::SamplesExceeded { count, max } => {
+                QueryError::TooManySamples { count, max }
+            }
+            log_series::LogSeriesError::SeriesExceeded { count, max } => {
+                QueryError::TooManySeries { count, max }
+            }
+            log_series::LogSeriesError::BytesScannedExceeded { scanned, max } => {
+                QueryError::TooManyBytesScanned { scanned, max }
+            }
+            log_series::LogSeriesError::RequestsExceeded { requests, max } => {
+                QueryError::RequestBudgetExceeded { requests, max }
+            }
+            log_series::LogSeriesError::DeadlineExceeded => QueryError::DeadlineExceeded {
+                deadline: self.config.deadline,
+            },
+            log_series::LogSeriesError::Fetch(LogFetchError::Store { key, source }) => {
+                QueryError::Fetch(FetchError::Store { key, source })
+            }
+            log_series::LogSeriesError::Fetch(LogFetchError::EtagChanged { key }) => {
+                QueryError::Fetch(FetchError::EtagChanged { key })
+            }
+            log_series::LogSeriesError::Fetch(LogFetchError::Corrupt { key, source }) => {
+                QueryError::Fetch(FetchError::Store {
+                    key,
+                    source: StoreError::Corrupted(source.to_string()),
+                })
+            }
+            log_series::LogSeriesError::Decode(source) => QueryError::Fetch(FetchError::Store {
+                key: String::new(),
+                source: StoreError::Corrupted(source.to_string()),
+            }),
+            log_series::LogSeriesError::UnknownStream { stream_id } => {
+                QueryError::Fetch(FetchError::Store {
+                    key: format!("stream:{stream_id:?}"),
+                    source: StoreError::Corrupted(format!(
+                        "record's stream {stream_id:?} is not present in its segment's STREAM_DIR"
+                    )),
+                })
+            }
+        }
     }
 
     /// Fetches every matched series from each snapshot segment in a single
@@ -1777,6 +2153,54 @@ impl QueryEngine {
 /// (`services/ravel-server/src/distrib.rs`) re-exports and calls it.
 pub fn snapshot_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePredicate> {
     crate::erasure::snapshot_pending_erasure_predicates(snapshot)
+}
+
+/// Field-wise sums two independently-tracked [`PhaseAccountingSnapshot`]s
+/// (ADR-1103 decision 4 step 4): `prefetch`'s log lane runs its own
+/// [`PhaseAccounting`] handle rather than sharing the metrics lane's live
+/// handle, so the two lanes' costs are combined only once, at snapshot time,
+/// for the query-wide total the caller reports.
+fn combine_phase_accounting(
+    a: &PhaseAccountingSnapshot,
+    b: &PhaseAccountingSnapshot,
+) -> PhaseAccountingSnapshot {
+    PhaseAccountingSnapshot {
+        resolve: a.resolve.saturating_add(&b.resolve),
+        plan: a.plan.saturating_add(&b.plan),
+        probe: a.probe.saturating_add(&b.probe),
+        scan: a.scan.saturating_add(&b.scan),
+    }
+}
+
+/// A locally-scoped series identity for a log-derived series returned from
+/// a discovery endpoint (`/api/v1/series`, `/api/v1/labels`,
+/// `/api/v1/label/{name}/values`). Log series carry no persisted
+/// `SeriesId` -- ADR-1103 derives them at query time, never at ingest --
+/// and query-time code holds only a `TenantHash`, not the `TenantId`
+/// `SeriesId::compute`'s canonical encoding requires. This hash is used
+/// only to dedupe within one `resolve_log_series_inner` call (always
+/// scoped to a single tenant) and is discarded before the label set
+/// reaches the client (`series_to_json`), so it need not be canonical,
+/// persistent, or stable across calls -- unlike `SeriesId::compute`, whose
+/// doc comment marks its encoding a persistent contract.
+fn log_series_discovery_id(labels: &LabelSet) -> SeriesId {
+    let mut sorted: Vec<(&str, &str)> = labels
+        .iter()
+        .map(|l| (l.name.as_str(), l.value.as_str()))
+        .collect();
+    sorted.sort_unstable();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ravel-log-series-discovery-v1\0");
+    for (name, value) in sorted {
+        hasher.update(&(name.len() as u32).to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(&(value.len() as u32).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    SeriesId(bytes)
 }
 
 /// Builds a `series_id -> labels` map incrementally, rejecting the moment a
@@ -3188,6 +3612,12 @@ struct PrecomputedCount {
 struct MergedSource {
     series: Vec<SeriesData>,
     histogram_series: Vec<HistogramSeriesData>,
+    /// ADR-1103 log-derived series (`ravel_log_lines`/`ravel_log_bytes`),
+    /// merged in by `prefetch`'s log lane. Consulted by `query` only when
+    /// the matcher set names a log metric (`log_series::log_metric_of`);
+    /// never by `query_histograms` or `query_precomputed_count`, which
+    /// have no log-signal counterpart.
+    log_series: Vec<SeriesData>,
     /// ADR-0103 collected pushdown count table. Written by `prefetch` and read
     /// by `query_precomputed_count` (this impl) on the T4b fast path.
     precomputed_count: Option<PrecomputedCount>,
@@ -3199,10 +3629,29 @@ impl SeriesSource for MergedSource {
         matchers: &[LabelMatcher],
         window: TimeRange,
     ) -> Result<Vec<SeriesData>, SourceError> {
-        Ok(self
-            .series
+        let is_log_pool = log_series::log_metric_of(matchers).is_some();
+        let pool = if is_log_pool {
+            &self.log_series
+        } else {
+            &self.series
+        };
+        // `fetch_log_series` already applied every `__body__` matcher per
+        // record (ADR-1103 decision 3: `__body__` is a per-record pseudo-label,
+        // never a member of a log series' `LabelSet`). Re-checking it here
+        // against `s.labels` would hit matchers.rs's absent-label-as-empty-
+        // string rule and wrongly drop every series for a non-empty-matching
+        // `__body__` matcher.
+        let label_matchers: Vec<&LabelMatcher> = if is_log_pool {
+            matchers
+                .iter()
+                .filter(|m| m.name != log_series::BODY_MATCHER_LABEL)
+                .collect()
+        } else {
+            matchers.iter().collect()
+        };
+        Ok(pool
             .iter()
-            .filter(|s| matches_series(matchers, &s.labels))
+            .filter(|s| label_matchers.iter().all(|m| m.is_match(&s.labels)))
             .map(|s| SeriesData {
                 labels: s.labels.clone(),
                 samples: s
@@ -4818,6 +5267,7 @@ mod histogram_source_tests {
         MergedSource {
             series: Vec::new(),
             histogram_series,
+            log_series: Vec::new(),
             precomputed_count: None,
         }
     }
@@ -5897,6 +6347,7 @@ mod prefetch_tests {
         let source = MergedSource {
             series: Vec::new(),
             histogram_series: Vec::new(),
+            log_series: Vec::new(),
             precomputed_count: Some(PrecomputedCount {
                 matchers: matchers.clone(),
                 start_ns: 100,

@@ -39,7 +39,7 @@ use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TenantHash, TimeRa
 
 use crate::erasure::ErasurePredicate;
 use crate::phase_accounting::PhaseAccounting;
-use crate::{ByteLimit, LogFetchError, LogQuery, LogSegmentFetcher};
+use crate::{ByteLimit, LogFetchError, LogQuery, LogSegmentFetcher, RequestLimit};
 
 /// Reserved metric name for the log-lines series (ADR-1103 decision 1): one
 /// sample per matching log record, value `1.0`.
@@ -290,6 +290,9 @@ pub struct LogSeriesRequest<'a> {
     /// change to the read path itself (checking before or during a segment's
     /// fetch, not only after), which nothing here implements.
     pub max_bytes_scanned: ByteLimit,
+    /// Checked once per fetched segment, alongside `max_bytes_scanned`
+    /// (same per-segment-granularity caveat).
+    pub max_s3_requests: RequestLimit,
     pub deadline: Option<Instant>,
 }
 
@@ -312,6 +315,8 @@ pub enum LogSeriesError {
     SeriesExceeded { count: usize, max: usize },
     #[error("query scanned {scanned} bytes, exceeding the budget of {max}")]
     BytesScannedExceeded { scanned: u64, max: u64 },
+    #[error("query issued {requests} S3 requests, exceeding the budget of {max}")]
+    RequestsExceeded { requests: u64, max: u64 },
     #[error("query exceeded its deadline")]
     DeadlineExceeded,
     #[error(transparent)]
@@ -398,6 +403,15 @@ fn bytes_scanned_exceeded(scanned: u64, max: ByteLimit) -> Option<LogSeriesError
     match max {
         ByteLimit::Bounded(max) if scanned > max => {
             Some(LogSeriesError::BytesScannedExceeded { scanned, max })
+        }
+        _ => None,
+    }
+}
+
+fn requests_exceeded(requests: u64, max: RequestLimit) -> Option<LogSeriesError> {
+    match max {
+        RequestLimit::Bounded(max) if requests > max => {
+            Some(LogSeriesError::RequestsExceeded { requests, max })
         }
         _ => None,
     }
@@ -592,12 +606,18 @@ pub async fn fetch_log_series(
         if let Some(err) = bytes_scanned_exceeded(scanned, req.max_bytes_scanned) {
             return Err(err);
         }
+        let requests = accounting.snapshot().pooled().total_s3_requests();
+        if let Some(err) = requests_exceeded(requests, req.max_s3_requests) {
+            return Err(err);
+        }
     }
 
     let mut out: Vec<(Vec<u8>, LabelSet, Vec<Sample>)> = series
         .into_iter()
         .map(|(key, (labels, mut samples))| {
-            samples.sort_by_key(|s| s.ts_ns);
+            // ADR-1103 decision 1: samples sharing a timestamp within a
+            // series order by value bits ascending, not input order.
+            samples.sort_by_key(|s| (s.ts_ns, s.value.to_bits()));
             (key, labels, samples)
         })
         .collect();
