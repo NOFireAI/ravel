@@ -1,0 +1,17 @@
+[package]
+name = "ravel-version"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# CommandFactory/FromArgMatches -- the traits `#[derive(Parser)]` implements
+# for a binary's own Cli type -- live in clap's core, not the `derive`
+# feature; this crate never invokes the derive macro itself. `string` is
+# needed so `Command::version` accepts the owned `String` this crate computes
+# at runtime rather than only a `&'static str`.
+clap = { workspace = true, features = ["string"] }
+
+[lints]
+workspace = true
