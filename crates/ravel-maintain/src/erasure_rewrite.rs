@@ -832,11 +832,18 @@ fn copy_run_verbatim(object: &Bytes, run: &RunPlan) -> Result<RunInputV4> {
 }
 
 /// The first applicable request (in `requests`' fixed order) whose matcher
-/// drops the sample at `(labels, ts_ns)`, if any. First-match-wins: a sample
-/// matched by more than one pending request is attributed to whichever
-/// request comes first in the batch, which is an arbitrary but stable and
-/// deterministic tie-break -- the sample is dropped from the output exactly
-/// once either way, which is all the conservation gate checks.
+/// drops the sample at `(labels, ts_ns)`, if any.
+///
+/// First-match-wins is the attribution rule for the whole pass: a sample
+/// matched by several requests' predicates is counted ONCE, for the request
+/// that comes first in the batch. The batch order is
+/// [`pending_erasure_requests`]'s sort on the `.dreq` key, whose last component
+/// is the request id, so "first in the batch" is the lowest request id in sort
+/// order among the requests that match. The property this buys is additive
+/// counts: the per-request `dropped_count`s a bucket's `RewriteRecord.drops`
+/// carry sum to exactly the number of records that rewrite removed from the
+/// bucket, never double-counting an overlap, which is also what the
+/// conservation gate checks.
 fn first_dropping_request(
     applicable: &[usize],
     requests: &[ApplicableRequest],
@@ -1684,6 +1691,15 @@ async fn resolve_already_exists_rewrite(
 /// into the right record. The count is the row (metrics samples), log record,
 /// or span count that rewrite physically removed for that request in that
 /// bucket, and is zero for an applicable request the bucket held nothing for.
+///
+/// Attribution when predicates overlap: a record matched by several requests'
+/// predicates is counted once, for the lowest request id in sort order among
+/// them (see [`first_dropping_request`]), so the per-request counts in one
+/// bucket sum to the records that rewrite dropped there.
+///
+/// This is what ONE rewrite dropped. A request's completion bucket list is not
+/// built from these: see [`bucket_erasure_completion`], which derives it from
+/// the durable rewrite records so it covers buckets erased by earlier passes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedBucketDrop {
     pub request_id: String,
@@ -2047,6 +2063,110 @@ pub struct BucketErasureCompletion {
     /// `Err` from [`bucket_erasure_completion`] instead, so the caller can log
     /// and defer it exactly as the rewrite pass defers its own failures.
     pub unresolved: bool,
+    /// This bucket's entry in each pending request's completion bucket list,
+    /// derived from the DURABLE rewrite records rather than from what the
+    /// calling pass happened to rewrite: `request_id` to the count the
+    /// generation that APPLIED the request dropped here. A request absent from
+    /// this map has no live rewrite record naming it in this bucket, so the
+    /// bucket is not part of its applied set. See
+    /// [`bucket_erasure_completion`] for the walk.
+    pub applied: BTreeMap<String, u64>,
+    /// `request_id`s whose applying generation could not be established from
+    /// this bucket's records (a cut chain, a missing predecessor, or more than
+    /// one live rewrite naming the request). Their completion bucket list must
+    /// be written ABSENT rather than partial: a list that omits this bucket
+    /// would read as "the request applied nowhere here" to the erasure-request
+    /// sweep, retiring the `.dreq` while this bucket's chain can still hold
+    /// pre-erasure inputs.
+    pub chain_incomplete: HashSet<String>,
+}
+
+/// What one bucket's rewrite-record chain says about one request, per
+/// [`applied_generation_drop`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedGeneration {
+    /// No live rewrite record in this bucket names the request.
+    NotApplied,
+    /// The oldest generation naming the request dropped this many records here.
+    Applied(u64),
+    /// The walk could not reach the applying generation.
+    Incomplete,
+}
+
+/// The `dropped_count` `record` states for `request_id`, if it names it at all.
+fn rewrite_drop_for(record: &RewriteRecord, request_id: &str) -> Option<u64> {
+    record
+        .drops
+        .iter()
+        .find(|d| d.request_id == request_id)
+        .map(|d| d.dropped_count)
+}
+
+/// Walk one bucket's rewrite-record chain backwards to the generation that
+/// APPLIED `request_id`, and report what it dropped there.
+///
+/// The live record's own `drops` entry is not the answer. A later generation
+/// rewriting the same bucket for a NEWER request re-emits a `dropped_count: 0`
+/// entry for every request the batch carried, including one an earlier
+/// generation already erased: reading the live record alone records zero for a
+/// request whose own generation removed N. So the walk starts at the live
+/// record that names the request and follows `superseded_record_key` back while
+/// each predecessor also names it. The oldest such generation is the one that
+/// applied it, and its count is the count.
+///
+/// Termination, in the order tested:
+/// - the current record supersedes raw L0 inputs (`superseded_record_key`
+///   empty): it is the oldest generation, so its count is the answer;
+/// - its predecessor is a compaction record: a compaction applies no erasure
+///   request, so the current record is the applying generation;
+/// - its predecessor is a rewrite record that does NOT name the request: the
+///   request first appears at the current record, which is therefore the
+///   applying generation;
+/// - its predecessor is a rewrite record that DOES name the request: step back
+///   and repeat.
+///
+/// Everything else is [`AppliedGeneration::Incomplete`], never a fabricated
+/// count: a `superseded_record_key` naming an object this bucket's listing does
+/// not hold (the cut chain), a chain longer than the records present (a cycle),
+/// and more than one live rewrite naming the request (the sibling case, where
+/// which generation applied it is not decidable from the records).
+///
+/// Cost is bounded by the chain's length in map lookups over records
+/// [`bucket_erasure_completion`] has already listed and decoded: no additional
+/// listing and no additional object read.
+fn applied_generation_drop(
+    request_id: &str,
+    live_rewrites: &[&RewriteRecord],
+    rewrite_by_key: &HashMap<&str, &RewriteRecord>,
+    compaction_by_key: &HashMap<&str, &CompactionRecord>,
+    max_depth: usize,
+) -> AppliedGeneration {
+    let mut naming = live_rewrites
+        .iter()
+        .filter(|r| rewrite_drop_for(r, request_id).is_some());
+    let Some(mut current) = naming.next().copied() else {
+        return AppliedGeneration::NotApplied;
+    };
+    if naming.next().is_some() {
+        return AppliedGeneration::Incomplete;
+    }
+    for _ in 0..=max_depth {
+        let Some(count) = rewrite_drop_for(current, request_id) else {
+            return AppliedGeneration::Incomplete;
+        };
+        let predecessor_key = current.superseded_record_key.as_str();
+        if predecessor_key.is_empty() || compaction_by_key.contains_key(predecessor_key) {
+            return AppliedGeneration::Applied(count);
+        }
+        let Some(predecessor) = rewrite_by_key.get(predecessor_key) else {
+            return AppliedGeneration::Incomplete;
+        };
+        if rewrite_drop_for(predecessor, request_id).is_none() {
+            return AppliedGeneration::Applied(count);
+        }
+        current = predecessor;
+    }
+    AppliedGeneration::Incomplete
 }
 
 /// Whether one bucket, resolved through the SAME supersession logic the query
@@ -2078,6 +2198,15 @@ pub struct BucketErasureCompletion {
 /// A request whose window overlaps nothing live here is not blocked. A `.done`
 /// is safe for a request only when NO in-scope bucket blocks it.
 ///
+/// It also derives this bucket's entry in each pending request's completion
+/// bucket list (`applied` / `chain_incomplete`), off the same decoded records,
+/// via [`applied_generation_drop`]. That derivation belongs here rather than in
+/// the rewrite pass because a completion record states which buckets applied
+/// the request DURABLY, across every pass that ever rewrote them, and only the
+/// records say that: the pass that writes the `.done` may have rewritten none
+/// of them, or may have rewritten one again for a newer request and re-emitted
+/// a zero count for this one.
+///
 /// The front gates (`is_sealed`, tombstone, legal hold) mirror
 /// [`erasure_rewrite_bucket`] so this reasons about exactly the buckets the
 /// rewrite pass treats as in scope: an unsealed bucket is out of scope
@@ -2104,14 +2233,16 @@ pub async fn bucket_erasure_completion(
         return Ok(out);
     }
     let listing = crate::read::list_bucket(store, bucket).await?;
-    if listing.tombstone_key.is_some() {
-        // A retention tombstone hides the whole bucket from every snapshot, so
-        // it serves nothing and blocks no request.
-        return Ok(out);
-    }
-    if bucket_is_held(&listing, lease) {
+    // A retention tombstone hides the whole bucket from every snapshot, so it
+    // serves nothing and blocks no request, and the legal-hold gate below is
+    // moot for it. It is still part of a request's applied-bucket set if its
+    // rewrite records say so, so the derivation runs before the return.
+    let tombstoned = listing.tombstone_key.is_some();
+    if !tombstoned && bucket_is_held(&listing, lease) {
         // Legal hold wins over erasure (ADR-0064 §6): the request stays pending
         // and the query-time filter keeps hiding the data until the hold clears.
+        // `unresolved` defers the whole tick, so no completion is written and
+        // nothing needs deriving here.
         out.unresolved = true;
         return Ok(out);
     }
@@ -2157,16 +2288,16 @@ pub async fn bucket_erasure_completion(
         }
     }
     let losing_records: HashSet<String> = losing_records.into_iter().map(str::to_owned).collect();
+    let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
+        .iter()
+        .map(|(k, r)| (k.as_str(), r))
+        .collect();
+    let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
+        .iter()
+        .map(|(k, r)| (k.as_str(), r))
+        .collect();
     let mut superseded_records: HashSet<String> = HashSet::new();
     if !rewrite_records.is_empty() {
-        let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
-            .iter()
-            .map(|(k, r)| (k.as_str(), r))
-            .collect();
-        let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
-            .iter()
-            .map(|(k, r)| (k.as_str(), r))
-            .collect();
         let prefix = keys::commit_shard_hour_prefix(
             &bucket.tenant_hash,
             bucket.signal,
@@ -2191,9 +2322,47 @@ pub async fn bucket_erasure_completion(
         }
     }
 
+    // Rewrite records no newer rewrite superseded: the live generation of each
+    // chain in this bucket, by the same resolver a query resolves through.
+    let live_rewrites: Vec<&RewriteRecord> = rewrite_records
+        .iter()
+        .filter(|(key, _)| !superseded_records.contains(key))
+        .map(|(_, record)| record)
+        .collect();
+
+    // The completion bucket list, derived from those durable records. This runs
+    // for every visited bucket whatever the rewrite pass made of it: a bucket
+    // the pass skipped as `NoApplicableRequests` (its live event range no longer
+    // overlaps the request's window because an earlier pass already erased the
+    // matching records out of it), one it skipped as `AlreadyApplied`, and a
+    // tombstoned one are all in the request's applied set on exactly this rule,
+    // and are excluded only when no readable record here names the request.
+    for pending_request in pending {
+        let request_id = pending_request.request.request_id.as_str();
+        match applied_generation_drop(
+            request_id,
+            &live_rewrites,
+            &rewrite_by_key,
+            &compaction_by_key,
+            rewrite_records.len(),
+        ) {
+            AppliedGeneration::NotApplied => {}
+            AppliedGeneration::Applied(dropped_count) => {
+                out.applied.insert(request_id.to_owned(), dropped_count);
+            }
+            AppliedGeneration::Incomplete => {
+                out.chain_incomplete.insert(request_id.to_owned());
+            }
+        }
+    }
+
+    if tombstoned {
+        return Ok(out);
+    }
+
     // The live view a snapshot would serve: raw L0 records whose identity no
-    // record excluded, compaction records no rewrite superseded, and rewrite
-    // records no newer rewrite superseded.
+    // record excluded, compaction records no rewrite superseded, and the live
+    // rewrites resolved above.
     let l0_inputs = crate::read::load_inputs(
         store,
         bucket,
@@ -2214,11 +2383,6 @@ pub async fn bucket_erasure_completion(
     let live_compactions: Vec<&CompactionRecord> = compaction_records
         .iter()
         .filter(|(key, _)| !superseded_records.contains(key) && !losing_records.contains(key))
-        .map(|(_, record)| record)
-        .collect();
-    let live_rewrites: Vec<&RewriteRecord> = rewrite_records
-        .iter()
-        .filter(|(key, _)| !superseded_records.contains(key))
         .map(|(_, record)| record)
         .collect();
 

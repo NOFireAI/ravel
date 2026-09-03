@@ -1621,19 +1621,26 @@ struct ErasureRewritePass {
     /// `.done` is withheld even when `deferred` is false: completion follows the
     /// resolver the query path trusts, not the pass's own live-record hop.
     catalog_blocked: std::collections::HashSet<String>,
-    /// Per request, the buckets this pass rewrote for it and what each rewrite
-    /// dropped there, in bucket order (shard ascending, then ingest hour
-    /// ascending). This is what the request's `.done` records in its
-    /// `bucket_drops`.
+    /// Per request, the buckets that applied it and what was dropped in each,
+    /// in bucket order (shard ascending, then ingest hour ascending). This is
+    /// what the request's `.done` records in its `bucket_drops`.
+    ///
+    /// Every entry comes from [`ravel_maintain::BucketErasureCompletion::applied`]
+    /// -- the bucket's own durable rewrite records, walked back to the
+    /// generation that applied the request -- never from what this pass
+    /// observed itself rewriting. A completion record states which buckets ever
+    /// applied the request, which is not the same set as the buckets this
+    /// particular pass touched, and is not restatable from the live record's
+    /// own `drops` alone.
     bucket_drops: std::collections::BTreeMap<String, Vec<AppliedBucketDrop>>,
     /// `request_id`s whose `bucket_drops` above is NOT the complete set of
-    /// buckets that applied the request, because some in-scope bucket was
-    /// `AlreadyApplied`: an earlier pass rewrote it, and the count that pass
-    /// dropped there is not restatable from the live record (a later
-    /// generation's `drops` carry `dropped_count: 0` for a request an earlier
-    /// generation already erased). Such a request's completion is written with
-    /// no bucket list at all rather than a partial one, which is what keeps the
-    /// erasure-request sweep's truncated-bucket clause whole-signal for it.
+    /// buckets that applied the request, because some in-scope bucket could not
+    /// state its own answer:
+    /// [`ravel_maintain::BucketErasureCompletion::chain_incomplete`] (a cut
+    /// chain, a missing predecessor, or more than one live rewrite naming the
+    /// request). Such a request's completion is written with no bucket list at
+    /// all rather than a partial one, which is what keeps the erasure-request
+    /// sweep's truncated-bucket clause whole-signal for it.
     drops_incomplete: std::collections::HashSet<String>,
 }
 
@@ -1651,14 +1658,16 @@ struct ErasureRewritePass {
 /// guard and is deliberately counted, not re-driven: a bucket whose live
 /// record already names every overlapping request must not republish, or every
 /// tick would land a fresh no-op rewrite superseding the last one and churn
-/// generations forever. It does mark the requests it skipped for in
-/// `drops_incomplete`: their applied-bucket set spans more than this pass, so
-/// this pass cannot state it.
+/// generations forever.
 ///
-/// Every rewritten bucket's per-request dropped counts are collected into
-/// `bucket_drops`, which is what each request's `.done` then records. Only a
-/// rewrite contributes: a bucket the pass skipped erased nothing this pass and
-/// so names no count of its own.
+/// `bucket_drops` and `drops_incomplete` are NOT derived from the outcomes
+/// above. Each bucket's contribution to each request's completion bucket list
+/// comes from [`ravel_maintain::bucket_erasure_completion`], which reads it out
+/// of the bucket's own durable rewrite records. That is what makes the list
+/// whole across passes: a bucket an earlier pass erased for the request reports
+/// itself here even when this pass classified it `AlreadyApplied`, or
+/// `NoApplicableRequests` because the erasure moved its live event range out of
+/// the request's window, or `Tombstoned`.
 #[allow(clippy::too_many_arguments)]
 async fn erasure_rewrite_pass(
     store: &dyn ObjectStoreBackend,
@@ -1704,12 +1713,6 @@ async fn erasure_rewrite_pass(
                     if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
                         pass.deferred = true;
                     }
-                    for drop in drops {
-                        pass.bucket_drops
-                            .entry(drop.request_id.clone())
-                            .or_default()
-                            .push(drop);
-                    }
                     tracing::info!(
                         tenant = %tenant.to_hex(),
                         signal = ?signal,
@@ -1717,12 +1720,12 @@ async fn erasure_rewrite_pass(
                         hour,
                         parts,
                         publish = ?publish,
+                        dropped = drops.iter().map(|d| d.dropped_count).sum::<u64>(),
                         "maintenance: erasure rewrite published for a bucket"
                     );
                 }
-                Ok(ErasureRewriteOutcome::AlreadyApplied { request_ids }) => {
+                Ok(ErasureRewriteOutcome::AlreadyApplied { request_ids: _ }) => {
                     pass.already_applied += 1;
-                    pass.drops_incomplete.extend(request_ids);
                 }
                 Ok(
                     ErasureRewriteOutcome::NoApplicableRequests | ErasureRewriteOutcome::Tombstoned,
@@ -1779,6 +1782,21 @@ async fn erasure_rewrite_pass(
                         pass.deferred = true;
                     }
                     pass.catalog_blocked.extend(completion.blocked);
+                    // The completion bucket list, read out of this bucket's own
+                    // durable records rather than out of the outcome above.
+                    for (request_id, dropped_count) in completion.applied {
+                        pass.bucket_drops
+                            .entry(request_id.clone())
+                            .or_default()
+                            .push(AppliedBucketDrop {
+                                request_id,
+                                signal,
+                                shard,
+                                ingest_hour_bucket: hour,
+                                dropped_count,
+                            });
+                    }
+                    pass.drops_incomplete.extend(completion.chain_incomplete);
                 }
                 Err(err) => {
                     // The resolver could not establish this bucket's served
@@ -1820,20 +1838,20 @@ async fn erasure_rewrite_pass(
 /// identifier, which is the entire reason `.dreq` and `.done` are separate
 /// objects.
 ///
-/// `bucket_drops` carries `drops`: one entry per bucket this pass rewrote for
-/// the request, with the exact row, log record, or span count that rewrite
-/// removed there (zero included -- the bucket was applied). The counts come
-/// back from `erasure_rewrite_bucket` as [`AppliedBucketDrop`]s, which is the
-/// same data each bucket's own `RewriteRecord.drops` holds durably, so nothing
-/// here is inferred or fabricated.
+/// `bucket_drops` carries `drops`: one entry per bucket that applied the
+/// request, with the exact row, log record, or span count removed there (zero
+/// included -- the bucket was applied and its predicate matched nothing). Every
+/// entry is read out of that bucket's own durable `RewriteRecord.drops` by
+/// [`ravel_maintain::bucket_erasure_completion`], walked back to the generation
+/// that applied the request, so nothing here is inferred or fabricated and
+/// nothing depends on which buckets the writing pass happened to rewrite.
 ///
 /// An empty `drops` writes no bucket list. That is the honest encoding of two
 /// different situations, and callers downstream must treat it as "this record
 /// states no bucket scope", never as "the request touched no bucket": a
-/// completion written for a request every in-scope bucket had `AlreadyApplied`
-/// (an earlier pass did the erasing, and its counts are not restatable from
-/// the live record), and a completion written before this field was populated
-/// at all.
+/// completion for a request some in-scope bucket could not state its own answer
+/// for (a cut rewrite chain), and a completion written before this field was
+/// populated at all.
 async fn write_erasure_completion(
     store: &dyn ObjectStoreBackend,
     now_ns: i64,
@@ -2008,9 +2026,10 @@ async fn run_erasure_pass(
                         continue;
                     }
                     // A partial bucket list would be read as this request's
-                    // complete applied-bucket set by the erasure-request
-                    // sweep, so a request some bucket only had
-                    // `AlreadyApplied` for records no list at all.
+                    // complete applied-bucket set by the erasure-request sweep,
+                    // which would retire the `.dreq` while an omitted bucket's
+                    // chain still holds pre-erasure inputs. A request any bucket
+                    // could not state its own answer for records no list at all.
                     let drops: &[AppliedBucketDrop] =
                         if pass.drops_incomplete.contains(&entry.request.request_id) {
                             &[]
