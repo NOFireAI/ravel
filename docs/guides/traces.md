@@ -43,8 +43,9 @@ query still returns every stored span from wherever it landed.
 
 ## The `spans` table
 
-`POST /api/v1/sql` serves three tables from one endpoint: `samples`
-(metrics), `logs`, and `spans`. Each query targets exactly one table. Ravel
+`POST /api/v1/sql` serves five tables from one endpoint: `samples`
+(metrics), `logs`, `spans`, `alerts` (alert state transitions), and `audit`
+(the audit trail). Each query targets exactly one table. Ravel
 decides the target from the query's `FROM` clause before planning and rejects a
 query that names two real tables. This matches the one-signal-per-query rule the
 `samples` and `logs` tables already follow.

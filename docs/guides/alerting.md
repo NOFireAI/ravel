@@ -20,13 +20,11 @@ fire. So an operator who puts the rules file on a gateway or maintain
 deployment gets no alerts and no error. Put the rules file on the process that
 answers queries.
 
-**Alert state transitions are written durably to object storage under their own
-signal prefix, and no shipped query surface can read them back.** Neither the
-PromQL endpoints nor the SQL tables (`samples`, `logs`, `spans`) expose alert
-history. An operator who plans to build a dashboard on Ravel's own alert
-history cannot: the transitions are stored for the sinks and for restart
-recovery, not for query. Alerts reach you through the sinks below; they do not
-become queryable data.
+Alert state transitions are written durably to object storage under their own
+signal prefix, and they are read back through the `alerts` SQL table. Alerts
+reach you through the sinks below as they happen, and the same transitions stay
+queryable afterwards, so a dashboard or an investigation can read Ravel's own
+alert history. See [Querying alert history](#querying-alert-history).
 
 ## The rules file
 
@@ -94,8 +92,9 @@ rules in one tenant that would produce the same alert identity all fail the
 process at load time.
 
 A SQL detection rule reads the same tables the `POST /api/v1/sql` endpoint
-serves (`samples`, `logs`, `spans`), under the same one-signal-per-query rule.
-See the [query guide](query.md) for the query languages themselves.
+serves (`samples`, `logs`, `spans`, `alerts`, `audit`), under the same
+one-signal-per-query rule. See the [query guide](query.md) for the query
+languages themselves.
 
 ## Evaluation cadence and the SQL lookback
 
@@ -137,3 +136,145 @@ ravel-server --mode all \
 
 The full flag list, with defaults and help, is in
 [ravel-server-flags.md](../reference/ravel-server-flags.md).
+
+## Querying alert history
+
+Every transition an evaluator writes is a row in the `alerts` table, served by
+`POST /api/v1/sql` and by Flight SQL. It is one of the five tables the SQL
+surface exposes (`samples`, `logs`, `spans`, `alerts`, `audit`), under the same
+one-signal-per-query rule as the rest: a query names exactly one of them, and a
+query that names two is rejected with a 400 before any listing.
+
+The table has these columns:
+
+| column         | type                | notes                                              |
+|----------------|---------------------|----------------------------------------------------|
+| `ts_ns`        | `Timestamp(ns)`     | the transition's event time, never null             |
+| `alert_id`     | `Utf8`              | 32-character hex identity of the alert              |
+| `rule_id`      | `Utf8`              | the rule that produced the transition               |
+| `state`        | `Utf8`              | `pending`, `firing`, `resolved`, or `suppressed`    |
+| `generation`   | `Int64`             | the alerts-on-alerts generation counter             |
+| `writer_id`    | `Utf8`              | the evaluator that wrote the record, never null     |
+| `writer_epoch` | `UInt64`            | write identity from the record's commit record      |
+| `writer_seq`   | `UInt64`            | write identity from the record's commit record      |
+| `attrs`        | `Map(Utf8, Utf8)`   | every attribute of the record, merged into one map  |
+
+`alert_id` is the stable hash of the rule id and the alert's label set, so every
+record for one alerting condition carries the same value across restarts and
+across rule reloads. The record's severity mirrors `state` (firing at the ERROR
+level, pending at WARN, resolved and suppressed at INFO), but the table exposes
+no severity column: filter on `state` itself.
+
+`attrs` carries the four promoted keys above plus everything a rule attached:
+one entry per rule label under `label.<name>`, and one per annotation under
+`annotation.<name>`. Read a single one with a subscript, for example
+`attrs['label.severity'] = 'page'` or `attrs['annotation.summary']`. The label
+and annotation key sets are per-rule and open-ended, which is why they are a map
+and not columns.
+
+### One row per transition, and how to fold it
+
+A record is written when an alert changes state, never on a tick that changes
+nothing, and each transition is one immutable object. So the table is history:
+it holds what happened and when, and it never holds a folded "current state"
+row. You compute current state with a query.
+
+Each row also carries the identity of the write that produced it: `writer_id`,
+`writer_epoch`, and `writer_seq`, stamped from the object's commit record. They
+are there because `ts_ns` alone is not a total order. Two evaluators can overlap
+briefly at a lease handover and write the same `alert_id` at the same `ts_ns`,
+and ordering by timestamp alone would leave two rows tied for "latest". Ordering
+by `ts_ns DESC, writer_epoch DESC, writer_seq DESC, writer_id DESC` is a total
+order, so the fold below returns exactly one row per alert:
+
+```sql
+SELECT *
+FROM (
+  SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY alert_id
+           ORDER BY ts_ns DESC, writer_epoch DESC, writer_seq DESC,
+                    writer_id DESC
+         ) AS rn
+  FROM alerts
+)
+WHERE rn = 1;
+```
+
+That row carries its transition's `state`, `generation`, labels, and
+annotations together, so filtering it by `state` answers "what is true now"
+rather than "what changed recently".
+
+### Which predicates prune
+
+All pushdown is widen-only. DataFusion re-applies the original `WHERE`
+predicate above the scan, so a query never returns a wrong row; pruning only
+decides how much is read.
+
+- `ts_ns` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and `BETWEEN`) fold
+  into one time window that prunes objects and blocks.
+- `alert_id = '<hex>'` and `rule_id = '<name>'` equality against a string
+  literal push into the reader as exact per-record attribute equalities. The
+  reader skips blocks whose attribute bloom proves the value absent and
+  re-checks every surviving row.
+
+Every other predicate, including any `attrs['k'] = 'v'` subscript, prunes
+nothing and is evaluated exactly above the scan. The pruning shapes must be
+top-level `AND` conjuncts: an `OR` inside a conjunct drops that conjunct from
+pruning.
+
+### Worked queries
+
+Which alerts are firing right now for one rule:
+
+```sql
+SELECT alert_id, ts_ns, generation, attrs
+FROM (
+  SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY alert_id
+           ORDER BY ts_ns DESC, writer_epoch DESC, writer_seq DESC,
+                    writer_id DESC
+         ) AS rn
+  FROM alerts
+  WHERE rule_id = 'cpu-hot'
+)
+WHERE rn = 1 AND state = 'firing';
+```
+
+The `rule_id` equality is inside the subquery on purpose: it prunes the scan,
+and the fold then runs over that rule's records only.
+
+Every transition one alert went through, oldest first:
+
+```sql
+SELECT ts_ns, state, generation, writer_id
+FROM alerts
+WHERE alert_id = '5f2b9c0a1d4e6f8091a2b3c4d5e6f708'
+ORDER BY ts_ns, writer_epoch, writer_seq, writer_id;
+```
+
+How often each rule changed state in a window, the flapping check:
+
+```sql
+SELECT rule_id, count(*) AS transitions
+FROM alerts
+WHERE ts_ns >= TIMESTAMP '2026-08-19T00:00:00'
+  AND ts_ns <  TIMESTAMP '2026-08-20T00:00:00'
+GROUP BY rule_id
+ORDER BY transitions DESC;
+```
+
+### Cost and retention
+
+An `alerts` query reads through the same fetcher the `logs` table reads
+through, so its bytes are cached by the same RAM and disk tiers and accounted
+through the same funnel. Alert records are not folded into the catalog and not
+compacted, so a query lists the tenant's alert commit records for its window on
+every call, one bounded listing per shard. One object per transition keeps that
+listing small.
+
+No retention rule covers the alerts signal today. A transition record is
+written once and is never swept, so alert history grows with the number of
+transitions and nothing trims it. A future retention rule that covers the
+signal would change that; until then, plan for the records to stay.

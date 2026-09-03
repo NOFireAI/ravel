@@ -6,6 +6,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The `alerts` and `audit` SQL tables** (ADR-1101). `POST /api/v1/sql` and
+  Flight SQL serve five tables, and Flight `GetTables` lists all five; naming
+  two in one query is still rejected before any listing. `alerts` is alert
+  history, one row per state transition, and each row carries the write
+  identity of its record (`writer_id`, `writer_epoch`, `writer_seq`), so a
+  `ROW_NUMBER()` fold ordered by time and write identity returns exactly one
+  current row per alert even when two evaluators overlap at a lease handover;
+  `audit` reads back a tenant's own query, legal-hold and reshard records.
+- **A read-side shard floor for fixed-shard signals** (ADR-1101). Alert and
+  audit writers pin their shards by constant and neither signal is provisioned,
+  so the catalog's scan-set derivations now take the maximum of the
+  provisioning history and the signal's fixed shard count. An `audit` query on
+  a `--shards 1` deployment reads the query-audit shard instead of silently
+  omitting it, and a wider deployment scans exactly as before.
+
 ## [0.13.0]
 
 A stock `ravel-server` now sizes its query budgets from the host it runs on, so
