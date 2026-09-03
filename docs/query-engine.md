@@ -2503,7 +2503,10 @@ the scan):
 Fixed-shard signals and the read-side floor (ADR-1101 decision 2). Alerts and
 audit are the two signals whose writers pin their shard by constant: alert
 records on shard 0, legal-hold and reshard records on shard 0 of the audit
-prefix, and query-audit records on its shard 1. `Catalog::resolve` derives a
+prefix, and query-audit records on its shard 1. The floor covers shard 1
+whether or not anything writes there: a stock build installs no audit pipeline,
+so it emits no `kind = query` record at all, and an empty query-audit stream is
+evidence of that missing install rather than of a quiet cluster. `Catalog::resolve` derives a
 scan set from the (tenant, signal) shard-generation history, and neither signal
 is ever provisioned, so both take the implicit generation 0 at the process
 `--shards` value. `Signal::fixed_read_shards` is the floor under that
