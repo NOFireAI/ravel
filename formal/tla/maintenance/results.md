@@ -29,6 +29,10 @@ This verifies the protocol designs; implementation conformance is argued in
 The four PASS configurations are banded in `bands.tsv`; the negative controls
 stop at the first counterexample and carry no band. Every smoke config completes
 well under the 120 s ceiling and every exhaustive config well under 30 minutes.
+The `distinct` counts are deterministic; the reported search `depth` varies by a
+step or two between runs under TLC's parallel BFS (`-workers auto`), so the depth
+bands are a small range around the observed value rather than an exact figure
+(the figures in the table above are from the named run id).
 
 ## Constants chosen for exhaustive
 
