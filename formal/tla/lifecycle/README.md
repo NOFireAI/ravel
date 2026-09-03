@@ -74,11 +74,12 @@ already pin what the output serves and how its identity is bound.
 ## Switches and negative controls
 
 Eight boolean CONSTANTS gate the model's guards; all are at their shipped value
-in `smoke.cfg` and `exhaustive.cfg`. Each `negative/*.cfg` flips exactly one and
-names the single invariant it must break (scoped to `TypeOK` plus that one
-target, so a control cannot pass on the wrong invariant), so a guard silently
-deleted from the spec fails a control rather than passing unnoticed. There are
-seven controls, one per `negative/*.cfg`; each has a note under
+in `smoke.cfg` and `exhaustive.cfg`. Each `negative/*.cfg` flips exactly one,
+runs with `FullEnv = TRUE` and the full thirteen-invariant list from
+`smoke.cfg` (finding 5), and names the single invariant it must break, so a
+guard silently deleted from the spec fails a control rather than passing
+unnoticed under a reduction that happened to dodge the other invariants. There
+are seven controls, one per `negative/*.cfg`; each has a note under
 `counterexamples/`.
 
 `HorizonGuardsPinnedQueries` is candidate #1133: with it FALSE a sweep delete

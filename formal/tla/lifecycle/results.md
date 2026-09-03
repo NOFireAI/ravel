@@ -24,9 +24,15 @@ named Rust tests, not proved.
 
 ## Negative controls
 
-Each flips one switch and must break one named invariant (exit 12). Each control
-is scoped to `TypeOK` plus its single target invariant, so it cannot pass on the
-wrong invariant. All seven fire their target:
+Each flips one switch and must break one named invariant (exit 12). Each
+control runs with `FullEnv = TRUE` and the full thirteen-invariant list from
+`smoke.cfg` (finding 5: six of the seven previously ran with `FullEnv = FALSE`
+and a list scoped to `TypeOK` plus the one target, with no cfg comment
+justifying the reduction). Widening to the full environment and invariant
+list was checked to still isolate each control's target before the cfgs were
+changed: a scratch run of each control's constants against the full invariant
+list reported the same single invariant and no other, so none needed to keep
+the reduction. All seven fire their target and only their target:
 
 | control | switch flipped | invariant violated |
 |---|---|---|
@@ -250,8 +256,10 @@ findings. Disposition:
    predecessor-chain representability anywhere; no replacement is needed.
 5. (MEDIUM) Six of the seven negative controls ran with `FullEnv = FALSE` and
    checked only `TypeOK` plus their one target invariant, with no cfg comment
-   justifying the reduction. See the "Negative controls, full environment"
-   section below.
+   justifying the reduction. Fixed: all seven now run with `FullEnv = TRUE`
+   and the full thirteen-invariant list; each still fires only its target
+   (see the "Negative controls" section above). No control needed to keep the
+   reduction.
 
 Disposition of prior finding 15: round one's item 15 above ("README and
 traceability claim only what the lanes this task ran showed... and separate
