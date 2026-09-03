@@ -168,6 +168,36 @@ record_row() {
         "$RUN_ID" "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$LAST_RUN"
 }
 
+# run_with_deadline <budget-seconds> <logfile> <cwd> <cmd...>
+# Pure-shell fallback for timeout(1)/gtimeout(1) when neither is on PATH.
+# Runs <cmd...> in <cwd> as a backgrounded job under job control, which gives
+# it its own process group, then polls its liveness. On expiry it kills the
+# whole group (not just the job leader), so a JVM's own children can't
+# survive the wrapper the way they would from a plain `kill $pid`. Returns
+# 124 on expiry, matching timeout(1)'s convention, so callers already keyed
+# off that exit code work unchanged.
+run_with_deadline() {
+    local budget="$1" logfile="$2" cwd="$3"
+    shift 3
+    (
+        set -m
+        cd "$cwd" && "$@" > "$logfile" 2>&1 &
+        local pid=$!
+        local deadline=$((SECONDS + budget))
+        while kill -0 "$pid" 2>/dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+                kill -TERM -"$pid" 2>/dev/null
+                sleep 1
+                kill -KILL -"$pid" 2>/dev/null
+                wait "$pid" 2>/dev/null
+                exit 124
+            fi
+            sleep 2
+        done
+        wait "$pid"
+    )
+}
+
 # --- TLC invocation ---------------------------------------------------------
 # Runs TLC on one cfg. Echoes the log path. Returns TLC's exit code.
 # CHECK_DEADLOCK FALSE in a cfg means the model has intentional stutter/terminal
@@ -181,16 +211,16 @@ run_tlc() {
     fi
     local metadir="$CACHE_DIR/meta/$area"
     mkdir -p "$metadir"
-    # The wall-clock ceiling needs coreutils timeout (gtimeout from Homebrew
-    # coreutils on macOS). Without either the run is unbounded, announced once;
-    # CI and the fleet executors are Linux and always have timeout.
+    # The wall-clock ceiling prefers coreutils timeout (gtimeout from Homebrew
+    # coreutils on macOS); without either, run_with_deadline enforces it with
+    # a pure-shell watchdog instead of leaving the run unbounded.
     local -a wrap=()
     if [ -z "${TIMEOUT_BIN+x}" ]; then
         if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
         elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
         else
             TIMEOUT_BIN=""
-            note "neither timeout nor gtimeout on PATH: running TLC without a wall-clock ceiling"
+            note "neither timeout nor gtimeout on PATH: using shell watchdog for wall-clock ceiling"
         fi
     fi
     if [ -n "$TIMEOUT_BIN" ]; then wrap=("$TIMEOUT_BIN" "$budget"); fi
@@ -199,10 +229,15 @@ run_tlc() {
     # comes second so a same-named module in the area still wins locally.
     local libpath="$FORMAL_DIR/common:$area_dir"
     local code=0
-    # ${wrap[@]+...}: an empty array is "unbound" under set -u on bash 3.2.
-    ( cd "$area_dir" && ${wrap[@]+"${wrap[@]}"} "$JAVA" -XX:+UseParallelGC \
-        -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
-        -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
+    if [ -n "$TIMEOUT_BIN" ]; then
+        ( cd "$area_dir" && "${wrap[@]}" "$JAVA" -XX:+UseParallelGC \
+            -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
+            -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
+    else
+        run_with_deadline "$budget" "$logfile" "$area_dir" \
+            "$JAVA" -XX:+UseParallelGC -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
+            -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" || code=$?
+    fi
     return $code
 }
 
