@@ -47,8 +47,9 @@ The mental model, in the order it makes sense.
   rejection a client can see, and commit tokens. Read this to write data
   into Ravel.
 - [guides/query.md](guides/query.md): the query routes, PromQL support and
-  its rejected constructs, budgets, SQL over the `samples`, `logs` and
-  `spans` tables, and the HTTP status codes. Read this to read data back.
+  its rejected constructs, budgets, SQL over the `samples`, `logs`, `spans`,
+  `alerts` and `audit` tables, and the HTTP status codes. Read this to read
+  data back.
 - [guides/traces.md](guides/traces.md): querying spans over the `spans`
   table, why one trace is a bounded read, which predicates prune, and what
   an incomplete trace is.
@@ -57,8 +58,13 @@ The mental model, in the order it makes sense.
   exemplar query and the Grafana link.
 - [guides/alerting.md](guides/alerting.md): writing a rules file, which
   process modes evaluate it, the interval and lookback settings, and the
-  four sink kinds. Alert history is written durably and no shipped surface
-  reads it back; the page says so up front.
+  four sink kinds. Alert history is queryable through the `alerts` table:
+  the page has the columns, the predicates that prune, and the query that
+  folds the history to current state per alert.
+- [guides/audit.md](guides/audit.md): what Ravel records for every executed
+  statement, every legal hold and every reshard, who writes those records
+  and how long each shard keeps them, and the `audit` table that reads them
+  back, including the note that reading the trail is itself audited.
 - [guides/inspecting-data.md](guides/inspecting-data.md): `ravel-cli`
   worked examples that read segments, commit records and catalog listings
   straight from the bucket. Read this to see what is actually stored.

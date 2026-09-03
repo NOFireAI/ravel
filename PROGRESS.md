@@ -4,6 +4,56 @@ This file records delivered epics: what shipped and what was deliberately left
 out. It complements [CHANGELOG.md](CHANGELOG.md), which tracks releases; this
 file tracks the larger bodies of work behind them.
 
+## Epic #1101: the `alerts` and `audit` SQL tables
+
+Made two signals that were already written durably readable. Alert transitions
+and audit records had providers, pushdown extractors and scan leaves, all
+tested, and no production path constructed either one: a query naming `alerts`
+or `audit` failed at planning. Design in
+[ADR-1101](docs/adrs/1101-alerts-and-audit-sql-tables.md), on top of
+[ADR-0040](docs/adrs/0040-alerts-and-audit-signals.md) and
+[ADR-0042](docs/adrs/0042-compliance-custody.md); the operator surface in
+[docs/guides/alerting.md](docs/guides/alerting.md) and
+[docs/guides/audit.md](docs/guides/audit.md), the reference in the alerts and
+audit section of [docs/query-engine.md](docs/query-engine.md).
+
+Shipped:
+
+- **The `alerts` and `audit` tables.** Registered as the fourth and fifth
+  tables on `POST /api/v1/sql` and Flight SQL, under the same
+  one-signal-per-query rule: `target_signal` counts five names and rejects a
+  query naming two before any catalog listing. Both providers read through the
+  logs fetcher, so they are cached, tenant-checked and accounted exactly as a
+  `logs` query is, and cost estimation reuses the logs estimator.
+- **Flight `GetTables` lists all five tables** with their public schemas, built
+  from the five schema functions rather than from the per-query session, which
+  still registers exactly one table. It previously listed only `samples`,
+  under-reporting `logs` and `spans` too.
+- **Write-identity columns on `alerts`.** `writer_id`, `writer_epoch` and
+  `writer_seq`, stamped from each record's commit record, so the fold to
+  current state has a total order and cannot return two current rows for one
+  alert when two evaluators overlap at a lease handover.
+- **A read-side shard floor for fixed-shard signals.** `Signal` gained a fixed
+  read-shard count (1 for alerts, 2 for audit), and the catalog's three
+  scan-set derivations take the maximum of the provisioning history and that
+  floor through one shared helper. The writer shard constants assert against
+  the floor at compile time. Without it, an `audit` query on a `--shards 1`
+  deployment would have listed only the legal-hold shard and returned an
+  exact-looking answer with every statement missing.
+
+Deliberately not shipped:
+
+- **Fold and maintain coverage for the two signals.** Neither signal is folded
+  into the catalog or compacted by the maintain loop, so an `alerts` or `audit`
+  query lists commit records live for its window. That is the recent-hours cost
+  a logs query already pays, and volume is one object per alert transition and
+  one per executed statement. Tracked as #1137; it becomes worth doing if audit
+  volume makes the listing the dominant term.
+- **The bytes-scanned budget and the LIMIT fetch-stop hint.** Both are missing
+  on every RLOG and RSPAN scan loop, not just these two tables, and stay out of
+  scope here. Registering the tables adds two more callers to the same gap and
+  changes nothing about it. Tracked as #41 and #362.
+
 ## Epic #8: RSPAN v2/v3/v4 trace investigation
 
 Turned RSPAN from a correct span storage format into a span investigation
