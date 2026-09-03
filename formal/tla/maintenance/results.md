@@ -6,7 +6,7 @@ This verifies the protocol designs; implementation conformance is argued in
 
 - Tool: `tla2tools` 1.7.4 (TLC2 version 2.19), Java 21 (Temurin).
 - Host: fleet executor (4 cores, 8 GB).
-- Run id: `20260903T055341Z-c5e6a6bb3a38baef0617a8b6f3cbd3ae4b5f9ff5`
+- Run id: `20260903T091233Z-e23694e3abbf2bdfc8391906ca52a7ffad7e9b66`
   (`scripts/check-tla.sh ci -a maintenance`, one coherent run: smoke, negative,
   traceability).
 - Smoke and negative figures copied verbatim from `.cache/tla/last-run.tsv` for
@@ -17,23 +17,22 @@ This verifies the protocol designs; implementation conformance is argued in
 
 | cfg | TLC | states | distinct | depth | seconds | host | result |
 |---|---|---|---|---|---|---|---|
-| MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 23945345 | 1837440 | 21 | 41 | fleet executor | PASS |
+| MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 44219729 | 2773760 | 20 | 91 | fleet executor | PASS |
 | MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | - | - | - | - | - | not run by executor |
-| MCCompactionClaims.smoke.cfg | 1.7.4 | 58416976 | 9574631 | 17 | 140 | fleet executor | PASS |
+| MCCompactionClaims.smoke.cfg | 1.7.4 | 57428832 | 9370767 | 17 | 184 | fleet executor | PASS |
 | MCCompactionClaims.exhaustive.cfg | 1.7.4 | - | - | - | - | - | not run by executor |
-| negative/ownership-as-publication-authority.cfg | 1.7.4 | 9362 | 2998 | - | 2 | fleet executor | VIOLATED |
-| negative/heartbeat-memo-cas.cfg | 1.7.4 | 115 | 100 | - | 1 | fleet executor | VIOLATED |
-| negative/memo-overstamp.cfg | 1.7.4 | 1510 | 560 | - | 1 | fleet executor | VIOLATED |
-| negative/mo-diverge-overwrites-record.cfg | 1.7.4 | 1097 | 531 | - | 1 | fleet executor | VIOLATED |
-| negative/mo-missing-part-reports-converged.cfg | 1.7.4 | 13362 | 4200 | - | 1 | fleet executor | VIOLATED |
-| negative/zero-ownership-phantom.cfg | 1.7.4 | 8433521 | 1607346 | - | 64 | fleet executor | VIOLATED |
-| negative/claim-completion-without-cas.cfg | 1.7.4 | 26776 | 11849 | - | 2 | fleet executor | VIOLATED |
-| negative/claim-delete-unconditional.cfg | 1.7.4 | 109 | 75 | - | 1 | fleet executor | VIOLATED |
-| negative/claim-as-publication-authority.cfg | 1.7.4 | 9601 | 4802 | - | 2 | fleet executor | VIOLATED |
-| negative/steal-ignores-cas.cfg | 1.7.4 | 18817 | 8767 | - | 2 | fleet executor | VIOLATED |
-| negative/guarded-publish-ignores-claim.cfg | 1.7.4 | 233 | 148 | - | 1 | fleet executor | VIOLATED |
-| negative/diverge-overwrites-record.cfg | 1.7.4 | 999 | 565 | - | 1 | fleet executor | VIOLATED |
-| negative/missing-part-reports-converged.cfg | 1.7.4 | 8354 | 4204 | - | 2 | fleet executor | VIOLATED |
+| negative/ownership-as-publication-authority.cfg | 1.7.4 | 7550 | 2435 | - | 1 | fleet executor | VIOLATED |
+| negative/heartbeat-memo-cas.cfg | 1.7.4 | 116 | 91 | - | 1 | fleet executor | VIOLATED |
+| negative/memo-overstamp.cfg | 1.7.4 | 1167 | 488 | - | 1 | fleet executor | VIOLATED |
+| negative/mo-diverge-overwrites-record.cfg | 1.7.4 | 2865 | 1074 | - | 1 | fleet executor | VIOLATED |
+| negative/mo-missing-part-reports-converged.cfg | 1.7.4 | 8096 | 2405 | - | 2 | fleet executor | VIOLATED |
+| negative/zero-ownership-phantom.cfg | 1.7.4 | 6350395 | 1317024 | - | 65 | fleet executor | VIOLATED |
+| negative/claim-completion-without-cas.cfg | 1.7.4 | 20850 | 9254 | - | 1 | fleet executor | VIOLATED |
+| negative/claim-delete-unconditional.cfg | 1.7.4 | 124 | 83 | - | 1 | fleet executor | VIOLATED |
+| negative/claim-as-publication-authority.cfg | 1.7.4 | 11577 | 5906 | - | 2 | fleet executor | VIOLATED |
+| negative/guarded-publish-ignores-claim.cfg | 1.7.4 | 267 | 180 | - | 1 | fleet executor | VIOLATED |
+| negative/diverge-overwrites-record.cfg | 1.7.4 | 1810 | 973 | - | 2 | fleet executor | VIOLATED |
+| negative/missing-part-reports-converged.cfg | 1.7.4 | 5952 | 3004 | - | 2 | fleet executor | VIOLATED |
 
 The two smoke configurations and the two exhaustive configurations are banded in
 `bands.tsv`; the smoke bands were re-measured this run, the exhaustive bands are
@@ -50,9 +49,12 @@ named run id).
 - Ownership: `Workers = {1, 2}`, `Units = {1}`, `Variants = {iA, iB}`,
   `H = 1`, `Factor = 1` (window 1), `MaxT = 2`, `Phantom = FALSE`,
   `AllowCrash = FALSE` (the stable-membership environment the liveness
-  property names). Safety is view-independent, so it is checked in smoke with
-  `AllowCrash = TRUE` and richer membership churn; liveness needs the stable
-  environment.
+  property names). Safety is view-independent, so it is checked in smoke at the
+  same `MaxT = 2` with `AllowCrash = FALSE`. At `MaxT = 2` a worker that stops
+  writing heartbeats has its stamp fall outside the staleness window and is
+  excluded from the live set, so the safety-relevant crash behaviour (a silent
+  worker being dropped) is reachable in smoke without the crashed flag. See the
+  staleness reachability and crash-coverage notes below.
 - Claims: `Workers = {1, 2}`, `Units = {1}`, `Variants = {iA, iB}`,
   `DeclaredLease = 1`, `MaxObservedLease = 2`, `MaxV = 6`, `MaxTime = 2`,
   `LivenessMode = TRUE` (the paused-holder / fair-thief lifecycle that is the
@@ -64,6 +66,41 @@ Both areas use a single unit. A single `(tenant, signal, shard)` is enough for
 every checked property: duplicate publication, the phantom-owner limitation, and
 the claim CAS races all manifest on one unit with two workers and two variants.
 This is a bounded model check, not a proof for all sizes.
+
+## Staleness reachability, exhaustive termination, and crash coverage
+
+- Staleness reachable in smoke (F5). The staleness gate `Stale(s)` compares
+  `now - hbStamp[s]` against the window `Factor * H = 1`. At `MaxT = 1` the
+  clock and any heartbeat stamp are at most one apart, so the gate never fires
+  and any invariant guarded by it is vacuous. A scratch reachability invariant
+  `NoWorkerEverStale` (never committed) run over the correct smoke model
+  confirms this: `MaxT = 1` completes with no violation (408320 distinct), and
+  `MaxT = 2` is violated at 112 states (a sibling stamped at clock 0 is stale
+  once `now = 2`). The smoke config runs `MaxT = 2` for this reason.
+- Exhaustive termination via bounding (F2). The exhaustive config runs with no
+  VIEW, so the raw `versionCounter` (bumped by every successful store write, an
+  unbounded `Nat`) must stay finite for the search to terminate. The only action
+  that could re-mint versions without limit is a part vanish followed by a
+  re-PUT of the identical content-addressed bytes. `VanishPart(u)` is bounded by
+  a `vanishedOnce[u][variant]` latch, so each part vanishes at most once and the
+  vanish/re-PUT loop cannot drive `versionCounter` forever. A minimal scratch
+  model (never committed) with the auxiliary invariant `VCUnderCap ==
+  versionCounter =< 12` demonstrates the bound: with the latch guard the search
+  completes (263268 distinct, depth 16) and `VCUnderCap` holds; with the guard
+  removed the search violates the cap (exit 12) and the reported depth grows
+  without settling. The full exhaustive run is not executed by this executor
+  (its budget exceeds the streaming idle timeout); the probe shows the bounding
+  change is what makes it finite.
+- Crash coverage (residual). With `AllowCrash = FALSE` in every current config
+  (smoke, exhaustive, and all negatives) the `crashed` flag is never set, so the
+  `Crash` and `Revive` actions are not exercised by any checked model. Their
+  safety-relevant effect (a worker that stops heartbeating is dropped from the
+  live set) is subsumed by time staleness at `MaxT = 2`, which is exercised. The
+  crashed-flag machinery remains in the spec as the explicit-fault switch; a
+  dedicated `AllowCrash = TRUE` config is not run because at `MaxT = 2` it
+  exceeds the 300 s smoke budget (over six million distinct states, still
+  growing at the cap). This is a coverage gap in the crashed flag itself, not in
+  the staleness behaviour it stands for.
 
 ## Counterexamples and their classification
 
@@ -85,11 +122,10 @@ recorded is a negative control (a single flipped constant), classified here.
   membership design accepts that asymmetric views can leave a unit
   transiently unattended, and correctness never depends on it.
 - `claim-completion-without-cas`, `claim-delete-unconditional`,
-  `claim-as-publication-authority`, `steal-ignores-cas`,
-  `guarded-publish-ignores-claim` (safety): the ADR-1029 hazards the design
-  forbids. Classification: **design demonstration**; the proposed design uses
-  CasVersion, never deletes, treats no claim as publication authority, consumes a
-  version token at most once, and abandons the guarded path on a lost claim.
+  `claim-as-publication-authority`, `guarded-publish-ignores-claim` (safety):
+  the ADR-1029 hazards the design forbids. Classification: **design
+  demonstration**; the proposed design uses CasVersion, never deletes, treats no
+  claim as publication authority, and abandons the guarded path on a lost claim.
 - `diverge-overwrites-record` / `mo-diverge-overwrites-record` and
   `missing-part-reports-converged` / `mo-missing-part-reports-converged`
   (safety, F6/F7): fail-closed convergence (ADR-1113 D3), one pair per model. The

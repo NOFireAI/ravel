@@ -25,7 +25,7 @@ Run: `negative/mo-missing-part-reports-converged.cfg` (module
 Error: Invariant MergeAttemptsConverge is violated.
 State 4: <TombstonePart ... of module MaintenanceOwnership>
 State 5: <BrokenMissingPartConverge ... of module MCMaintenanceOwnership>
-/\ lastPub = [outcome |-> "Converged", winnerPartPresent |-> FALSE, recOverwritten |-> FALSE]
+/\ lastPub = [outcome |-> "Converged", winnerPartPresent |-> FALSE]
 ```
 
 The violating state claims `Converged` while `winnerPartPresent |-> FALSE`:

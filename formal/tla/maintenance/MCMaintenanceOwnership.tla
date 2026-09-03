@@ -30,13 +30,16 @@ ASSUME DivergeOverwritesRecord \in BOOLEAN
 ASSUME MissingPartReportsConverged \in BOOLEAN
 
 \* Broken: an in-view owner overwrites the terminal record with its own variant.
-\* A second overwrite with a different variant leaves the record diverging from
-\* the winner firstRecord latched -- caught by
+\* Restricted to units no legitimate publish has sealed (recVer = 0) so the ONLY
+\* invariant it can trip is the record-divergence one: a first overwrite creates
+\* the record and latches firstRecord, a second overwrite with a different variant
+\* leaves the record diverging from that latched winner. Caught by
 \* QueryVisibleDataCorrectUnderDuplicateOwnership.
 BrokenOwnerPublish(w, u, v) ==
     /\ OwnerPublishOverwrite
     /\ ~crashed[w]
     /\ Owns(w, u)
+    /\ recVer[u] = 0
     /\ Present(PartKey(u, v))
     /\ LET rk == RecordKey(u) IN
         /\ PutOverwrite(rk, <<u, v>>)
@@ -45,7 +48,8 @@ BrokenOwnerPublish(w, u, v) ==
                             ELSE firstRecord
     /\ attemptedByOwner' = [attemptedByOwner EXCEPT ![u] = TRUE]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   cliCorrect, lastMaint, partTomb, lastPub>>
+                   cliCorrect, lastMaint, partTomb, lastPub, recVer,
+                   seedFresh, vanishedOnce>>
 
 \* Broken: a memo persistence write uses CasVersion against a stale version token
 \* (0) instead of Overwrite. The contract makes CasVersion a no-op both on an
@@ -59,34 +63,38 @@ BrokenMemoCas(w) ==
     /\ PutCasVersion(MemoKey(w), 0, MemoContent(w))
     /\ lastMaint' = [class |-> "memo",
                      verBefore |-> VersionOf(MemoKey(w)),
-                     verAfter |-> store'[MemoKey(w)].version,
-                     maxExcess |-> 0]
+                     verAfter |-> store'[MemoKey(w)].version]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
-\* Broken: seeding takes the raw verified stamp without clamping it to the
-\* source snapshot time, so an in-memory entry can read fresher than its own
-\* snapshot. The per-entry excess for a future/skewed entry (verU > snapNs) is
-\* then positive even when another entry has a larger snapshot. Caught by
-\* MemoNeverExtendsFreshnessPastSnapshot.
+\* Broken: seeding takes the raw verified stamp without clamping it to the source
+\* snapshot time and STORES that, so seedFresh records an in-memory entry that
+\* reads fresher than its own snapshot. For a future/skewed worst entry
+\* (verU > snapNs) the stored fresh exceeds the stored snap. Caught by
+\* MemoNeverExtendsFreshnessPastSnapshot reading the stored pair.
 BrokenSeed(w) ==
     /\ MemoOverstamp
     /\ ~crashed[w]
-    /\ LET valid == ValidSnaps(w)
-           excess == { memoSnap[x].verU - memoSnap[x].snapNs : x \in valid }
-           mx == IF excess = {} THEN 0 ELSE Max(excess)
-       IN lastMaint' = [class |-> "seed", verBefore |-> 0, verAfter |-> 0,
-                        maxExcess |-> mx]
+    /\ LET valid == ValidSnaps(w) IN
+       IF valid = {}
+         THEN seedFresh' = [seedFresh EXCEPT ![w] = [fresh |-> 0, snap |-> 0]]
+         ELSE LET worst == CHOOSE x \in valid :
+                             \A y \in valid :
+                               memoSnap[y].verU - memoSnap[y].snapNs
+                                 =< memoSnap[x].verU - memoSnap[x].snapNs
+                  s == memoSnap[worst]
+              IN seedFresh' = [seedFresh EXCEPT ![w] =
+                                 [fresh |-> s.verU, snap |-> s.snapNs]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect,
-                   partTomb, lastPub>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub, recVer, vanishedOnce>>
 
 \* Broken: a loser whose input set diverges from the winner overwrites the
-\* terminal record instead of alarming. The overwrite keeps the same content, so
-\* the record-immutability invariant still holds; recOverwritten (the store
-\* version delta) moves regardless, so the alarm-mutates-nothing property is what
-\* catches it. Caught by DivergentInputSetNeverMutates.
+\* terminal record instead of alarming. The overwrite re-writes identical content,
+\* so a content-only check would miss it; but the PUT mints a fresh store version,
+\* moving VersionOf(RecordKey(u)) off the latched recVer (left UNCHANGED here).
+\* Caught by DivergentInputSetNeverMutates as a pure store observation.
 BrokenDivergePublish(u, v) ==
     /\ DivergeOverwritesRecord
     /\ Present(RecordKey(u))
@@ -95,10 +103,10 @@ BrokenDivergePublish(u, v) ==
     /\ LET rk == RecordKey(u) IN
         /\ PutOverwrite(rk, ContentOf(rk))
         /\ lastPub' = [outcome |-> "InputSetHashDivergence",
-                       winnerPartPresent |-> Present(PartKey(u, firstRecord[u][2])),
-                       recOverwritten |-> store'[rk].version # VersionOf(rk)]
+                       winnerPartPresent |-> Present(PartKey(u, firstRecord[u][2]))]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint, partTomb>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, recVer, seedFresh, vanishedOnce>>
 
 \* Broken: a resolution whose winner part vanished and is tombstoned (not
 \* re-PUTtable) reports Converged. It self-reports the "Converged" label while the
@@ -112,10 +120,10 @@ BrokenMissingPartConverge(u, v) ==
     /\ ~Present(PartKey(u, v))
     /\ partTomb[u][v]
     /\ lastPub' = [outcome |-> "Converged",
-                   winnerPartPresent |-> Present(PartKey(u, v)),
-                   recOverwritten |-> FALSE]
+                   winnerPartPresent |-> Present(PartKey(u, v))]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint, partTomb>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, recVer, seedFresh, vanishedOnce>>
 
 MCNext ==
     \/ Next
@@ -130,20 +138,24 @@ MCFairSpec == MCSpec /\ Fairness
 
 \* Safety-check state projection (smoke and the invariant negatives). The store's
 \* absolute versions, the global monotone versionCounter, and lastModified are
-\* dead state once a write has happened: no action or safety invariant reads them.
-\* The only version-derived fact any invariant reads is the sign of the last
-\* heartbeat/memo write's version delta (HeartbeatAndMemoNeverCas), which the
-\* witness has already captured into lastMaint. Projecting the raw versions away
-\* while keeping present/content and that delta sign collapses states that differ
-\* only in global write order, which is the whole source of the version-counter
-\* blow-up. Sound for safety only: it is NOT applied to the temporal cfgs, where a
-\* VIEW that merges stutter-equivalent states can mask a liveness counterexample.
+\* dead state once a write has happened: no action reads them. The only version-
+\* derived facts any invariant reads are the sign of the last heartbeat/memo
+\* write's version delta (HeartbeatAndMemoNeverCas), captured into lastMaint, and
+\* whether the terminal record's version still equals the one it was minted at
+\* (DivergentInputSetNeverMutates); the latter is projected here as the two
+\* booleans that invariant reads (recVer = 0, recVer = the record's current
+\* version), never the raw version, so states differing only in global write order
+\* still merge. recVer and seedFresh are otherwise read by no action, so projecting
+\* them to those invariant-relevant booleans is sound for safety. NOT applied to
+\* the temporal cfgs, where a VIEW merging stutter-equivalent states can mask a
+\* liveness counterexample.
 StoreView == [k \in OKeys |-> <<store[k].present, store[k].content>>]
-LastMaintView == <<lastMaint.class,
-                   lastMaint.verAfter > lastMaint.verBefore,
-                   lastMaint.maxExcess>>
+LastMaintView == <<lastMaint.class, lastMaint.verAfter > lastMaint.verBefore>>
+RecSealView == [u \in Units |-> <<recVer[u] = 0,
+                                  recVer[u] = VersionOf(RecordKey(u))>>]
+SeedFreshView == [w \in Workers |-> seedFresh[w].fresh =< seedFresh[w].snap]
 MCView == <<StoreView, now, hbStamp, crashed, cachedLive, memoSnap,
             firstRecord, attemptedByOwner, cliCorrect, LastMaintView,
-            partTomb, lastPub>>
+            partTomb, lastPub, RecSealView, SeedFreshView, vanishedOnce>>
 
 =============================================================================

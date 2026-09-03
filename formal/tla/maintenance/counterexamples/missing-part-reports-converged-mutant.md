@@ -25,7 +25,7 @@ Run: `negative/missing-part-reports-converged.cfg` (module
 Error: Invariant MergeAttemptsConverge is violated.
 State 5: <TombstonePart ... of module CompactionClaims>
 State 6: <BrokenMissingPartConverge ... of module MCCompactionClaims>
-/\ lastPub = [outcome |-> "Converged", winnerPartPresent |-> FALSE, recOverwritten |-> FALSE]
+/\ lastPub = [outcome |-> "Converged", winnerPartPresent |-> FALSE]
 /\ partTomb = <<(iA :> FALSE @@ iB :> TRUE)>>
 ```
 

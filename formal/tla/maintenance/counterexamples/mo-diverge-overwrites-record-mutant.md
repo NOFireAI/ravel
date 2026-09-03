@@ -12,11 +12,13 @@ mutate nothing.
 The mutant is carried as the committed negative control
 `BrokenDivergePublish`, gated off by `DivergeOverwritesRecord = FALSE` in
 every shipping cfg and flipped on only by the negative cfg. It self-reports
-`outcome |-> "InputSetHashDivergence"` yet performs the `PutOverwrite`, and
-it sets `recOverwritten` from the store post-state
-(`store'[rk].version # VersionOf(rk)`), not from intent.
-`DivergentInputSetNeverMutates` reads that store-derived witness, so it
-catches the mutation regardless of what the action claims its outcome was.
+`outcome |-> "InputSetHashDivergence"` yet performs the `PutOverwrite` with the
+same content bytes, which mints a fresh store version, and it leaves the latch
+`recVer` unchanged. `DivergentInputSetNeverMutates` reads the store directly:
+the record's minted version is latched into `recVer[u]` at publish, and the
+invariant holds `VersionOf(RecordKey(u))` equal to that latch, so the fresh
+version the overwrite mints is caught regardless of what the action claims its
+outcome was.
 
 Run: `negative/mo-diverge-overwrites-record.cfg` (module
 `MCMaintenanceOwnership`, `DivergeOverwritesRecord = TRUE`).
@@ -25,13 +27,12 @@ Run: `negative/mo-diverge-overwrites-record.cfg` (module
 Error: Invariant DivergentInputSetNeverMutates is violated.
 State 4: <BrokenDivergePublish ... of module MCMaintenanceOwnership>
 /\ lastPub = [ outcome |-> "InputSetHashDivergence",
-  winnerPartPresent |-> TRUE,
-  recOverwritten |-> TRUE ]
+  winnerPartPresent |-> TRUE ]
 ```
 
-The violating state has `outcome |-> "InputSetHashDivergence"` and
-`recOverwritten |-> TRUE`: the store's version advanced across the divergent
-publish. An invariant that trusted the outcome label alone, or that read a
-self-reported "I did not overwrite" flag, would pass. The store-derived
-`recOverwritten` witness makes the overwrite observable, which is exactly the
-F6 fix. TLC exits 12, matching `negative/mo-diverge-overwrites-record.expect`.
+The violating state self-reports `outcome |-> "InputSetHashDivergence"` while
+the store's version for the record key has advanced past the latched `recVer`:
+the identical-content `PutOverwrite` minted a new version. An invariant that
+trusted the outcome label alone, or that compared content bytes, would pass. The
+store-version latch makes the overwrite observable, which is exactly the F6 fix.
+TLC exits 12, matching `negative/mo-diverge-overwrites-record.expect`.

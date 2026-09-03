@@ -140,17 +140,25 @@ VARIABLES
     firstRecord,     \* [Units -> OContent \cup {NoRec}] content of the winning record
     attemptedByOwner,\* [Units -> BOOLEAN] some in-view owner attempted the unit
     cliCorrect,      \* BOOLEAN a non-owner (CLI) published a winning record
-    lastMaint,       \* the most recent heartbeat/memo/seed step (put mode, clamp)
+    lastMaint,       \* the most recent heartbeat/memo persistence step (put mode)
     partTomb,        \* [Units -> [Variants -> BOOLEAN]] a part key deleted and
                      \* not re-PUTtable (a tombstone/GC the rerun cannot recreate)
-    lastPub          \* the outcome of the most recent publish resolution, with
-                     \* store-observed witnesses (never a self-reported label)
+    lastPub,         \* the outcome of the most recent publish resolution, with a
+                     \* store-observed part witness (never a self-reported label)
+    recVer,          \* [Units -> Nat] the store version the terminal record was
+                     \* published at (0 = unpublished); latched from the store at
+                     \* the CreateIfAbsent winner and asserted never to move again
+    seedFresh,       \* [Workers -> [fresh: Int, snap: Int]] the seeded freshness
+                     \* actually stored by the last seed, and the source snapshot
+                     \* time it must not exceed (0/0 before any seed)
+    vanishedOnce     \* [Units -> [Variants -> BOOLEAN]] a winner part has already
+                     \* transiently vanished once (bounds the vanish/re-PUT cycle)
 
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           now, hbStamp, crashed, cachedLive, memoSnap,
           firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-          partTomb, lastPub>>
+          partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* The publication-resolution outcome alphabet (ADR-1113 D3), mirroring
 \* publish.rs::resolve_already_exists: the CreateIfAbsent winner is Published; a
@@ -201,12 +209,13 @@ OTypeOK ==
     /\ firstRecord \in [Units -> OContent \cup {NoRec}]
     /\ attemptedByOwner \in [Units -> BOOLEAN]
     /\ cliCorrect \in BOOLEAN
-    /\ lastMaint \in [class: {"none", "heartbeat", "memo", "seed"},
-                      verBefore: Nat, verAfter: Nat,
-                      maxExcess: Int]
+    /\ lastMaint \in [class: {"none", "heartbeat", "memo"},
+                      verBefore: Nat, verAfter: Nat]
     /\ partTomb \in [Units -> [Variants -> BOOLEAN]]
-    /\ lastPub \in [outcome: PubOutcomes,
-                    winnerPartPresent: BOOLEAN, recOverwritten: BOOLEAN]
+    /\ lastPub \in [outcome: PubOutcomes, winnerPartPresent: BOOLEAN]
+    /\ recVer \in [Units -> Nat]
+    /\ seedFresh \in [Workers -> [fresh: Int, snap: Int]]
+    /\ vanishedOnce \in [Units -> [Variants -> BOOLEAN]]
 
 Init ==
     /\ StoreInit
@@ -218,10 +227,12 @@ Init ==
     /\ firstRecord = [u \in Units |-> NoRec]
     /\ attemptedByOwner = [u \in Units |-> FALSE]
     /\ cliCorrect = FALSE
-    /\ lastMaint = [class |-> "none", verBefore |-> 0, verAfter |-> 0, maxExcess |-> 0]
+    /\ lastMaint = [class |-> "none", verBefore |-> 0, verAfter |-> 0]
     /\ partTomb = [u \in Units |-> [v \in Variants |-> FALSE]]
-    /\ lastPub = [outcome |-> "none", winnerPartPresent |-> FALSE,
-                  recOverwritten |-> FALSE]
+    /\ lastPub = [outcome |-> "none", winnerPartPresent |-> FALSE]
+    /\ recVer = [u \in Units |-> 0]
+    /\ seedFresh = [w \in Workers |-> [fresh |-> 0, snap |-> 0]]
+    /\ vanishedOnce = [u \in Units |-> [v \in Variants |-> FALSE]]
 
 \* --- Membership actions -----------------------------------------------------
 
@@ -237,7 +248,7 @@ WriteHeartbeat(w) ==
     /\ hbStamp' = [hbStamp EXCEPT ![w] = now]
     /\ UNCHANGED <<sVars, now, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* The durable heartbeat OBJECT write (Overwrite of sys/maintain/workers/<id>),
 \* self-owned and never a CAS. Bounded to once per key: the put mode does not vary
@@ -251,18 +262,17 @@ PersistHeartbeat(w) ==
     /\ PutOverwrite(HbKey(w), HbContent(w))
     /\ lastMaint' = [class |-> "heartbeat",
                      verBefore |-> VersionOf(HbKey(w)),
-                     verAfter |-> store'[HbKey(w)].version,
-                     maxExcess |-> 0]
+                     verAfter |-> store'[HbKey(w)].version]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 Tick ==
     /\ now < MaxT
     /\ now' = now + 1
     /\ UNCHANGED <<sVars, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 Crash(w) ==
     /\ AllowCrash
@@ -270,7 +280,7 @@ Crash(w) ==
     /\ crashed' = [crashed EXCEPT ![w] = TRUE]
     /\ UNCHANGED <<sVars, now, hbStamp, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* A restart takes a fresh incarnation heartbeat (the old key lingers, abstracted
 \* per the header): re-heartbeat at the current clock.
@@ -280,7 +290,7 @@ Revive(w) ==
     /\ hbStamp' = [hbStamp EXCEPT ![w] = now]
     /\ UNCHANGED <<sVars, now, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* WorkerSet::live_set snapshotted once at the head of a discovery cycle
 \* (run_discovery_cycle threads one live set through every unit).
@@ -289,7 +299,7 @@ ComputeLive(w) ==
     /\ cachedLive' = [cachedLive EXCEPT ![w] = LiveView(w)]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* --- Compaction publication -------------------------------------------------
 
@@ -301,14 +311,15 @@ PutPart(u, v) ==
     /\ PutCreateIfAbsent(PartKey(u, v), <<u, v>>)
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* The winner's terminal record PUT (CreateIfAbsent) and the loser's convergence
 \* over the shared object store, resolving exactly as
-\* publish_record_with_conservation and resolve_already_exists do. The outcome
-\* witness (lastPub) reads the store around the resolution (winnerPartPresent from
-\* store', recOverwritten from the record version delta), never a self-reported
-\* label:
+\* publish_record_with_conservation and resolve_already_exists do. The part
+\* witness (lastPub.winnerPartPresent) is read from the store around the
+\* resolution in EVERY branch, never a literal, and the winner's record version is
+\* latched into recVer at the moment it is first published so the record-
+\* immutability invariant can observe the store, not a self-report:
 \*  * record absent: this attempter is the CreateIfAbsent winner -> Published;
 \*  * record present, a DIFFERENT input set: alarm, delete and overwrite
 \*    nothing -> InputSetHashDivergence;
@@ -327,29 +338,25 @@ DoPublish(u, v) ==
       THEN /\ Present(PartKey(u, v))
            /\ PutCreateIfAbsent(rk, <<u, v>>)
            /\ firstRecord' = [firstRecord EXCEPT ![u] = <<u, v>>]
+           /\ recVer' = [recVer EXCEPT ![u] = store'[rk].version]
            /\ lastPub' = [outcome |-> "Published",
-                          winnerPartPresent |-> store'[PartKey(u, v)].present,
-                          recOverwritten |-> FALSE]
+                          winnerPartPresent |-> store'[PartKey(u, v)].present]
       ELSE IF v # wv
-        THEN /\ UNCHANGED <<sVars, firstRecord>>
+        THEN /\ UNCHANGED <<sVars, firstRecord, recVer>>
              /\ lastPub' = [outcome |-> "InputSetHashDivergence",
-                            winnerPartPresent |-> Present(wpk),
-                            recOverwritten |-> FALSE]
+                            winnerPartPresent |-> Present(wpk)]
         ELSE IF Present(wpk)
-          THEN /\ UNCHANGED <<sVars, firstRecord>>
+          THEN /\ UNCHANGED <<sVars, firstRecord, recVer>>
                /\ lastPub' = [outcome |-> "Converged",
-                              winnerPartPresent |-> TRUE,
-                              recOverwritten |-> FALSE]
+                              winnerPartPresent |-> Present(wpk)]
           ELSE IF ~partTomb[u][wv]
             THEN /\ PutCreateIfAbsent(wpk, <<u, wv>>)
-                 /\ UNCHANGED firstRecord
+                 /\ UNCHANGED <<firstRecord, recVer>>
                  /\ lastPub' = [outcome |-> "Converged",
-                                winnerPartPresent |-> store'[wpk].present,
-                                recOverwritten |-> FALSE]
-            ELSE /\ UNCHANGED <<sVars, firstRecord>>
+                                winnerPartPresent |-> store'[wpk].present]
+            ELSE /\ UNCHANGED <<sVars, firstRecord, recVer>>
                  /\ lastPub' = [outcome |-> "ConvergedWinnerPartMissing",
-                                winnerPartPresent |-> FALSE,
-                                recOverwritten |-> FALSE]
+                                winnerPartPresent |-> Present(wpk)]
 
 \* run_tick_with_clock: an in-view owner attempts its unit with the canonical
 \* variant. Ownership gates which unit a worker attempts; it does NOT gate the
@@ -361,7 +368,7 @@ WorkerRecord(w, u) ==
     /\ DoPublish(u, Canon)
     /\ attemptedByOwner' = [attemptedByOwner EXCEPT ![u] = TRUE]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   cliCorrect, lastMaint, partTomb>>
+                   cliCorrect, lastMaint, partTomb, seedFresh, vanishedOnce>>
 
 \* The ungated CLI path (services/ravel-cli/src/maintain.rs): publishes any unit
 \* and any variant with no heartbeat and no ownership. A CLI actor is always a
@@ -374,7 +381,7 @@ CliRecord(u, v) ==
     /\ DoPublish(u, v)
     /\ cliCorrect' = TRUE
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   attemptedByOwner, lastMaint, partTomb>>
+                   attemptedByOwner, lastMaint, partTomb, seedFresh, vanishedOnce>>
 
 \* --- Maintain memo ----------------------------------------------------------
 
@@ -389,7 +396,7 @@ WriteMemo(w) ==
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> now, verU |-> now]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* A future/skewed entry: the snapshot records an entry verified AFTER its own
 \* snapshot_unix_ns (a clock ahead of the snapshot-writing clock). This is the
@@ -401,7 +408,7 @@ FutureEntry(w) ==
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> now, verU |-> now + 1]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* write_memo_snapshot: the durable memo OBJECT write (Overwrite of
 \* sys/maintain/memo/<id>), self-owned and never a CAS. Bounded to once per key
@@ -414,11 +421,10 @@ PersistMemo(w) ==
     /\ PutOverwrite(MemoKey(w), MemoContent(w))
     /\ lastMaint' = [class |-> "memo",
                      verBefore |-> VersionOf(MemoKey(w)),
-                     verAfter |-> store'[MemoKey(w)].version,
-                     maxExcess |-> 0]
+                     verAfter |-> store'[MemoKey(w)].version]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* Corruption of a snapshot is treated as absent: snapNs = -1 removes it from the
 \* seed set (MemoSnapshotError, corruption treated as absent).
@@ -426,7 +432,7 @@ CorruptMemo(w) ==
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> -1, verU |-> memoSnap[w].verU]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
 
 \* Valid snapshots for w to seed from: not corrupt, and within the bidirectional
 \* staleness gate of w's clock.
@@ -437,37 +443,45 @@ ValidSnaps(w) == { x \in Workers :
 
 \* MaintainMemo::seed_from_snapshot: seed in-memory freshness from all valid
 \* snapshots, clamping each entry to that snapshot's snapshot_unix_ns
-\* (verified_ns = min(verified_ns, snapshot_unix_ns)). The witness is per entry:
-\* maxExcess is the largest amount by which any seeded entry's clamped value
-\* exceeds its OWN source snapshot time. The correct clamp never lets an entry
-\* read past its own snapshot, so maxExcess stays <= 0 regardless of any other
-\* entry with a larger snapshot.
+\* (verified_ns = min(verified_ns, snapshot_unix_ns)). The seed STORES the result:
+\* seedFresh[w] records the clamped freshness it committed for the worst entry (the
+\* one whose raw verU most exceeds its own snapshot) and that entry's snapshot
+\* time. The invariant then reads the stored pair, not an expression, so a mutant
+\* that stores an unclamped value is caught by state, not by re-deriving the clamp.
 SeedMemo(w) ==
     /\ ~crashed[w]
-    /\ LET valid == ValidSnaps(w)
-           excess == { LET s  == memoSnap[x]
-                           ev == IF s.verU < s.snapNs THEN s.verU ELSE s.snapNs
-                       IN ev - s.snapNs
-                       : x \in valid }
-           mx == IF excess = {} THEN 0 ELSE Max(excess)
-       IN lastMaint' = [class |-> "seed", verBefore |-> 0, verAfter |-> 0,
-                        maxExcess |-> mx]
+    /\ LET valid == ValidSnaps(w) IN
+       IF valid = {}
+         THEN seedFresh' = [seedFresh EXCEPT ![w] = [fresh |-> 0, snap |-> 0]]
+         ELSE LET worst == CHOOSE x \in valid :
+                             \A y \in valid :
+                               memoSnap[y].verU - memoSnap[y].snapNs
+                                 =< memoSnap[x].verU - memoSnap[x].snapNs
+                  s == memoSnap[worst]
+                  clamped == IF s.verU < s.snapNs THEN s.verU ELSE s.snapNs
+              IN seedFresh' = [seedFresh EXCEPT ![w] =
+                                 [fresh |-> clamped, snap |-> s.snapNs]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect,
-                   partTomb, lastPub>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub, recVer, vanishedOnce>>
 
 \* A published winner part transiently disappears (a tombstone race, GC, or a
 \* delayed listing), and is re-PUTtable: a later convergence re-creates the
 \* identical content-addressed bytes. Models tombstone_race.rs's revanish path up
-\* to the point the part can still be recreated.
+\* to the point the part can still be recreated. One-shot per key: this bounds the
+\* vanish/re-PUT write cycle so the model's write count stays finite (the store
+\* bumps its version on every re-PUT but not on a delete, so an unbounded vanish
+\* would drive versionCounter without end and the exhaustive run, which projects no
+\* view, would not terminate).
 VanishPart(u) ==
     /\ firstRecord[u] # NoRec
     /\ Present(PartKey(u, firstRecord[u][2]))
-    /\ ~partTomb[u][firstRecord[u][2]]
+    /\ ~vanishedOnce[u][firstRecord[u][2]]
     /\ Delete(PartKey(u, firstRecord[u][2]))
+    /\ vanishedOnce' = [vanishedOnce EXCEPT ![u][firstRecord[u][2]] = TRUE]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub>>
+                   partTomb, lastPub, recVer, seedFresh>>
 
 \* The winner part vanishes and is tombstoned: it cannot be re-PUT (the rerun in
 \* tombstone_race.rs::rerun_with_revanished_part_fails_typed_not_converged sees a
@@ -481,7 +495,8 @@ TombstonePart(u) ==
          THEN Delete(PartKey(u, firstRecord[u][2]))
          ELSE UNCHANGED sVars
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint, lastPub>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   lastPub, recVer, seedFresh, vanishedOnce>>
 
 Next ==
     \/ \E w \in Workers : WriteHeartbeat(w)
@@ -536,13 +551,14 @@ HeartbeatAndMemoNeverCas ==
         lastMaint.verAfter > lastMaint.verBefore
 
 \* Seeding never lets an in-memory entry read fresher than the snapshot it came
-\* from: for EVERY seeded entry, its clamped value never exceeds its own source
-\* snapshot's time. Stated per entry, not as an aggregate Max over all snapshots:
-\* an aggregate bound would pass whenever some other entry has a larger snapshot,
-\* which is the gap the review found. maxExcess is the worst per-entry overshoot.
-\* (Broken by the memo-overstamp control, which skips the per-entry clamp.)
+\* from. Stated over the freshness the seed actually STORED (seedFresh), not an
+\* expression recomputed in the invariant: for the worst seeded entry, the stored
+\* clamped value never exceeds the source snapshot's own time. The correct seed
+\* stores min(verU, snapNs) against snapNs, so fresh =< snap holds by what was
+\* stored; a mutant that stores the raw verU of a future/skewed entry stores
+\* fresh > snap, which this reads directly. (Broken by the memo-overstamp control.)
 MemoNeverExtendsFreshnessPastSnapshot ==
-    lastMaint.class = "seed" => lastMaint.maxExcess =< 0
+    \A w \in Workers : seedFresh[w].fresh =< seedFresh[w].snap
 
 \* Merge attempts converge or fail closed (ADR-1113 D3), stated for a world where
 \* a part can vanish. A resolution reports Converged only when the winner part is
@@ -559,14 +575,16 @@ MergeAttemptsConverge ==
     /\ (lastPub.outcome = "ConvergedWinnerPartMissing" => ~lastPub.winnerPartPresent)
 
 \* A divergent input set alarms and mutates nothing: the loser neither overwrites
-\* the terminal record nor deletes any part. recOverwritten is the store-observed
-\* record version delta across the resolution (FALSE means the record version did
-\* not move), so a mutant that overwrites the record on divergence -- even to
-\* identical content, which still mints a new version -- is caught. The divergent
-\* branch of DoPublish is UNCHANGED store, so no part is deleted either. (Broken by
-\* the diverge-overwrites-record switch.)
+\* the terminal record nor deletes any part. Stated as a pure store observation:
+\* the store version the record was minted at (recVer, latched from store' at the
+\* CreateIfAbsent winner) never moves again. VersionOf reads the store now, so a
+\* loser that overwrites the record on divergence -- even to identical content,
+\* which still mints a fresh version -- moves VersionOf off the latched recVer and
+\* is caught, with no self-reported flag. The divergent branch of DoPublish leaves
+\* the store UNCHANGED, so no part is deleted either. (Broken by the
+\* diverge-overwrites-record switch.)
 DivergentInputSetNeverMutates ==
-    lastPub.outcome = "InputSetHashDivergence" => ~lastPub.recOverwritten
+    \A u \in Units : recVer[u] # 0 => VersionOf(RecordKey(u)) = recVer[u]
 
 \* --- Fairness and liveness --------------------------------------------------
 \* Weak fairness only on the actions the implementation justifies: a maintainer
