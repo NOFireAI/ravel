@@ -47,8 +47,10 @@ bucket is compactable strictly before it is foldable.
 `PinnedSnapshotStableWithinAttempt`, `NoLiveCommitOmittedByLostCas`,
 `MissingIndexDegradesToListing`, `CorruptHeadFailsClosedOnDeletePaths`,
 `HeadNamedObjectNeverDeleted`, `TombstonedBucketContributesNothing`, and
-`SignalDedupContract`. Temporal (exhaustive only):
-`LateSupersessionEventuallyReflected`.
+`SignalDedupContract`. Temporal (exhaustive only): `QueryTerminates`.
+`LateSupersessionEventuallyReflected` is defined but not checked: it is a
+recorded shrink (finite-model liveness limitation; see
+`counterexamples/late-supersession-shrink.md`).
 
 Six invariants are shown non-vacuous by a negative control that flips one
 switch and makes them falsifiable (see `negative/` and `counterexamples/`); the

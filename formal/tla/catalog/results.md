@@ -38,8 +38,19 @@ The smoke config applies `SYMMETRY Symmetry` (permutations of `Clients`, which
 are the folders) to shrink the safety search; the exhaustive config drops
 symmetry because TLC does not check liveness under symmetry reduction, adds two
 folders and two compaction identities, and runs `FairSpec` with `WF_vars` on
-the clock, fold progress, and query progress so
-`LateSupersessionEventuallyReflected` can hold.
+the clock, fold progress, and query progress so `QueryTerminates` can hold.
+
+`LateSupersessionEventuallyReflected` is defined in the spec but not checked by
+any config: it is a recorded shrink. Under the F16/F17 design (reconcile runs
+only on a watermark-advancing fold), a compaction landing in an already-folded
+hour is reflected only by a later fold whose watermark advances past that hour.
+A bounded model clock saturates its finite watermark, so a compaction published
+after the final advance is never re-reconciled and TLC reports a stuttering
+counter-example. The stale window it exposes is safe by design (query-time
+dedup, pinned by `SignalDedupContract`), so this is a finite-model liveness
+limitation, not a defect. The shrunk trace and analysis are in
+`counterexamples/late-supersession-shrink.md`. `QueryTerminates`, which holds
+under the bounded clock, is checked in its place.
 
 ## Exhaustive constants
 
