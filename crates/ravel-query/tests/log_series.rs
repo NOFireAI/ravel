@@ -1104,6 +1104,91 @@ async fn log_series_window_covering_only_object_a_fetches_one_segment() {
     assert_eq!(out.segments_fetched, 1, "only object A overlaps [0, 200]");
 }
 
+/// Finding 3 (CodeRabbit review on PR #1158, #1106, log_series.rs:370): two
+/// `severity_text` equality matchers must conjoin like every other pair of
+/// matchers in a PromQL selector -- `severity_text="ERROR"` AND
+/// `severity_text="INFO"` can never both hold for one record, so the
+/// selector must return zero series, not every ERROR record. A second case
+/// with two IDENTICAL equalities must behave exactly like a single one.
+///
+/// Object A ([`two_objects`]) has exactly one ERROR record (ts=105) among 10
+/// INFO records on stream `job="pay/api"`. The scan pushes down the first
+/// `severity_text` equality (`"ERROR"`) as a content predicate, so only that
+/// one record reaches the per-record loop; `severity_post` then evaluates
+/// every other `severity_text` matcher against it.
+///
+/// Demonstrated failing against the pre-fix code: before the fix,
+/// `severity_postfilters` excluded every `Eq`-op `severity_text` matcher
+/// unconditionally (`m.op != MatchOp::Eq`, no index tracking), so the second
+/// `severity_text="INFO"` matcher was dropped along with the pushed-down
+/// first one instead of surviving as a post-filter. With no post-filter left
+/// to reject it, the single scanned ERROR record was accepted unconditionally
+/// and this test's first case returned 1 series / 1 sample instead of the
+/// empty result PromQL conjunction requires. The fix (log_series.rs:385,
+/// `severity_postfilters`) keeps every `severity_text` matcher except the one
+/// at `pushed_index`, so the second `severity_text="INFO"` matcher survives
+/// as a post-filter and rejects the ERROR record: `"ERROR" != "INFO"`.
+#[tokio::test]
+async fn log_series_conflicting_severity_equalities_return_no_samples() {
+    let mem = Arc::new(MemoryStore::new());
+    let (ref_a, _ref_b) = two_objects(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+
+    let window = TimeRange {
+        start_ns: 90,
+        end_ns: 120,
+    };
+
+    // Conflicting: ERROR and INFO can never both hold for one record.
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "pay/api"),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+        LabelMatcher::equal(SEVERITY_LABEL, "INFO"),
+    ];
+    let req = lines_request(&matchers, window);
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(
+        &fetcher,
+        TENANT,
+        std::slice::from_ref(&ref_a),
+        &req,
+        &accounting,
+    )
+    .await
+    .expect("fetch_log_series");
+    assert_eq!(
+        out.series.len(),
+        0,
+        "severity_text=\"ERROR\" AND severity_text=\"INFO\" matches no record"
+    );
+    assert_eq!(
+        out.records_scanned, 0,
+        "the sole scanned ERROR record is rejected by the INFO post-filter"
+    );
+
+    // Identical: repeating the same equality changes nothing.
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "pay/api"),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+        LabelMatcher::equal(SEVERITY_LABEL, "ERROR"),
+    ];
+    let req = lines_request(&matchers, window);
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(&fetcher, TENANT, &[ref_a], &req, &accounting)
+        .await
+        .expect("fetch_log_series");
+    assert_eq!(
+        out.series.len(),
+        1,
+        "two identical severity_text=\"ERROR\" equalities behave like one"
+    );
+    assert_eq!(out.series[0].samples.len(), 1);
+    assert_eq!(out.series[0].samples[0].ts_ns, 105);
+    assert_eq!(out.records_scanned, 1);
+}
+
 /// Finding 1 (F1), reproducing the review's exact bodies: `ok`, `ok`, `boom`,
 /// `request timeout`. `__body__="ok"` finds the two exact matches,
 /// `=~".*timeout.*"` finds the "request timeout" record, `!~".*timeout.*"`
