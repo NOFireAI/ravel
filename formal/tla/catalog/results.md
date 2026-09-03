@@ -139,7 +139,7 @@ authority; the table restates it.
 | SnapshotEntriesBelowWatermark | STORE: the HEAD register |
 | PinnedSnapshotStableWithinAttempt | WITNESS: `qy.pinnedAtAttempt` (resolve-time view) versus `qy.pinned` (served now) |
 | NoLiveCommitOmittedByLostCas | STORE/WITNESS: HEAD register, the L0 plane, and `maxValidWm` (highest watermark ever on a valid HEAD) |
-| MissingIndexDegradesToListing | WITNESS: `qy.indexReadableAtResolve` (`IndexReadable` as observed at resolve), `qy.pinned` (what was served), `qy.resolvedView` (what the store listing said should be served, computed without the `QueryFailsClosedOnMissingIndex` switch) |
+| MissingIndexDegradesToListing | WITNESS: `qy.pinned` (what was served) versus `qy.resolvedView` (what the store listing said should be served, computed without the `QueryFailsClosedOnMissingIndex` switch); the two coincide by construction whenever the index was readable, so no separate readable/unreadable antecedent is needed |
 | CorruptHeadFailsClosedOnDeletePaths | WITNESS: `lastDelete.headStatus`, the HEAD status at the last real object removal |
 | HeadNamedObjectNeverDeleted | STORE: the HEAD register, the L0 plane, and the L1 compaction-record plane |
 | TombstonedBucketContributesNothing | WITNESS: `lastHead.entries`, `lastHead.tombAtWrite`, `lastHead.reconcileLo`, and `lastHead.frontierReconciled` of the last fold |
