@@ -36,6 +36,7 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_query::http::StaticBearerTokenResolver;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_server::alerting::ALERT_SHARD;
 use ravel_server::sql::{ARROW_STREAM_MEDIA_TYPE, SqlState, router};
 use ravel_sql::{SqlConfig, SqlExecutor};
 use ravel_types::logstream::log_stream_id;
@@ -327,6 +328,116 @@ async fn publish_span_segment(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish span commit");
+}
+
+/// One alert transition record, carrying the `ravel-alerting` attribute
+/// convention (ADR-0040 decision 2) by hand: the four promoted keys
+/// (`alert_id`, `rule_id`, `state`, `generation` as an `I64`), a
+/// `label.severity` entry, and the state mirrored onto `severity_text`. Built
+/// here rather than through `ravel-alerting` so this test depends only on the
+/// attribute convention the `alerts` table reads; the drift between that
+/// convention and the real writer is pinned in
+/// `crates/ravel-sql/tests/alerts_provider.rs`.
+fn alert_record(
+    ts: i64,
+    alert_id: &str,
+    rule_id: &str,
+    state: &str,
+    generation: i64,
+    severity: &str,
+) -> LogRecord {
+    LogRecord {
+        stream_id: log_stream_id(&[], "alerts", "1", &[]),
+        stream_attrs: stream_attrs_bytes(&[], "alerts", "1", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 0,
+        severity_text: state.to_string(),
+        body: format!("alert {alert_id} {state}"),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: vec![
+            ("alert_id".to_string(), AttrValue::Str(alert_id.to_string())),
+            ("rule_id".to_string(), AttrValue::Str(rule_id.to_string())),
+            ("state".to_string(), AttrValue::Str(state.to_string())),
+            ("generation".to_string(), AttrValue::I64(generation)),
+            (
+                "label.severity".to_string(),
+                AttrValue::Str(severity.to_string()),
+            ),
+        ],
+    }
+}
+
+/// Publish one real RLOG object plus its `Signal::Alerts` commit record for
+/// `tenant` on [`ALERT_SHARD`], the alert-signal sibling of
+/// [`publish_log_segment`]. The write identity is a parameter rather than
+/// derived from an index: the `alerts` table stamps `writer_id`/`writer_epoch`/
+/// `writer_seq` from the commit record, and the fold's tie-break is only
+/// observable when two objects share a `ts_ns` and differ in one of them.
+async fn publish_alert_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    writer_id: Uuid,
+    writer_epoch: u64,
+    writer_seq: u64,
+    records: &[LogRecord],
+) {
+    let tenant_hash = tenant.hash();
+
+    let mut min_event_ts_ns = i64::MAX;
+    let mut max_event_ts_ns = i64::MIN;
+    let mut streams = std::collections::HashSet::new();
+    for rec in records {
+        min_event_ts_ns = min_event_ts_ns.min(rec.ts_ns);
+        max_event_ts_ns = max_event_ts_ns.max(rec.ts_ns);
+        streams.insert(rec.stream_id);
+    }
+
+    let identity = ObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: ALERT_SHARD,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch,
+        writer_seq,
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for rec in records {
+        writer.push(rec.clone()).expect("push alert record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+    let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Alerts,
+        shard: ALERT_SHARD,
+        writer_id,
+        writer_epoch,
+        writer_seq,
+        object_size: bytes.len() as u64,
+        content_hash,
+        sample_count: records.len() as u64,
+        series_count: streams.len() as u64,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        min_ingest_ts_ns: min_event_ts_ns,
+        max_ingest_ts_ns: max_event_ts_ns,
+        segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
+        created_unix_ns: 10 + writer_seq as i64,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid alert commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put alert data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish alert commit");
 }
 
 fn build_router(store: Arc<dyn ObjectStoreBackend>, tokens: HashMap<String, TenantId>) -> Router {
@@ -991,6 +1102,217 @@ async fn a_spans_plus_samples_query_is_rejected_over_http() {
         &app,
         "acme-token",
         "SELECT * FROM spans JOIN samples ON spans.start_ts = samples.ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["status"], "error");
+}
+
+// ---------------------------------------------------------------------------
+// The `alerts` and `audit` tables over HTTP (ADR-1101 decision 1)
+// ---------------------------------------------------------------------------
+
+/// The fold-to-current-state query from ADR-1101 decision 1: the row that sorts
+/// first per `alert_id` under the total order `(ts_ns, writer_epoch,
+/// writer_seq, writer_id)` descending. The identity columns are what make it a
+/// total order: two evaluators overlapping at a lease handover can write the
+/// same `alert_id` at the same `ts_ns`, and `ts_ns` alone would leave the
+/// winner unspecified.
+const FOLD_TO_CURRENT_STATE: &str = "SELECT alert_id, state FROM \
+     (SELECT *, ROW_NUMBER() OVER (PARTITION BY alert_id \
+     ORDER BY ts_ns DESC, writer_epoch DESC, writer_seq DESC, writer_id DESC) AS rn \
+     FROM alerts) WHERE rn = 1 ORDER BY alert_id";
+
+/// ADR-1101 decision 1 reachability proof for `alerts`: a `SELECT ... FROM
+/// alerts` posted to the real `/api/v1/sql` handler over published alert
+/// records returns real rows. Before the wiring, `AlertsTableProvider`,
+/// `AlertsScanExec`, and the alert schema all existed and were tested in
+/// isolation, but no production path constructed them, so the query fell into
+/// the "no real table" default, resolved a metrics snapshot, and failed with a
+/// table-not-found planning error.
+///
+/// Four properties, in one fixture so the fold is asserted over the same
+/// history the raw queries returned: every transition comes back in order, an
+/// `alert_id` predicate selects one alert's history, the fold returns one
+/// current row per alert, and the fold's tie-break is decided by `writer_seq`
+/// when two records share a `ts_ns`.
+#[tokio::test]
+async fn sql_query_against_alerts_table_returns_rows() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+
+    // Alert A fires at 100 and resolves at 300; alert B fires at 200. One
+    // object, one write identity (writer W, epoch 1, seq 1).
+    let writer = Uuid::from_u128(7_000);
+    publish_alert_segment(
+        store.as_ref(),
+        &tenant,
+        writer,
+        1,
+        1,
+        &[
+            alert_record(100, "aa01", "cpu-high", "firing", 1, "page"),
+            alert_record(200, "bb02", "mem-high", "firing", 1, "ticket"),
+            alert_record(300, "aa01", "cpu-high", "resolved", 1, "page"),
+        ],
+    )
+    .await;
+    let app = build_router(Arc::clone(&store), tokens(&[("acme-token", "acme")]));
+
+    // (a) Every published transition comes back, in ts order, with its exact
+    // values: the reachability proof.
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT ts_ns, alert_id, state FROM alerts ORDER BY ts_ns",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 3, "every published transition: {value}");
+    assert_eq!(rows[0], serde_json::json!([100, "aa01", "firing"]));
+    assert_eq!(rows[1], serde_json::json!([200, "bb02", "firing"]));
+    assert_eq!(rows[2], serde_json::json!([300, "aa01", "resolved"]));
+
+    // (b) The `alert_id` equality selects exactly that alert's history.
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT ts_ns, state FROM alerts WHERE alert_id = 'aa01' ORDER BY ts_ns",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "only alert aa01's two rows: {value}");
+    assert_eq!(rows[0], serde_json::json!([100, "firing"]));
+    assert_eq!(rows[1], serde_json::json!([300, "resolved"]));
+
+    // (c) The fold returns exactly one current row per alert.
+    let (status, value) = post_json(&app, "acme-token", FOLD_TO_CURRENT_STATE).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "one current row per alert: {value}");
+    assert_eq!(rows[0], serde_json::json!(["aa01", "resolved"]));
+    assert_eq!(rows[1], serde_json::json!(["bb02", "firing"]));
+
+    // (d) The tie-break is pinned. A second object writes alert A `firing`
+    // again at the SAME ts_ns as its `resolved` record, under the same
+    // writer_id and epoch but a greater writer_seq. Only the identity columns
+    // can order those two rows, so the fold must now report `firing` for A.
+    publish_alert_segment(
+        store.as_ref(),
+        &tenant,
+        writer,
+        1,
+        2,
+        &[alert_record(300, "aa01", "cpu-high", "firing", 2, "page")],
+    )
+    .await;
+
+    let (status, value) = post_json(&app, "acme-token", FOLD_TO_CURRENT_STATE).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 2, "still one current row per alert: {value}");
+    assert_eq!(
+        rows[0],
+        serde_json::json!(["aa01", "firing"]),
+        "the greater writer_seq wins the ts_ns tie: {value}"
+    );
+    assert_eq!(rows[1], serde_json::json!(["bb02", "firing"]));
+}
+
+/// ADR-1101 decision 1 reachability proof for `audit`: a tenant reads its own
+/// query-audit trail back through the `audit` table, and the read is itself
+/// audited.
+///
+/// The first statement is audited by the `AuditMode::Required` pipeline before
+/// its response returns, so the second statement -- a query over `audit` --
+/// finds exactly that one record and reports its `kind` and verbatim
+/// `query.text`. The store then holds exactly two query-audit records: the
+/// first statement's, and the audit query's own. Exact counts, because "at
+/// least one" would pass on a surface that audited the wrong statement or
+/// double-audited.
+#[tokio::test]
+async fn sql_query_against_audit_table_returns_the_previous_querys_audit_record() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(100, 1.0), (200, 2.5)]).await;
+    let app = build_router_with_sink(
+        Arc::clone(&store),
+        tokens(&[("acme-token", "acme")]),
+        audit_pipeline(
+            Arc::clone(&store),
+            &tenant,
+            ravel_maintain::AuditMode::Required,
+        ),
+    );
+
+    let first = "SELECT ts, value FROM samples ORDER BY ts";
+    let (status, value) = post_json(&app, "acme-token", first).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT body, attrs['kind'], attrs['query.text'] FROM audit \
+         WHERE attrs['kind'] = 'query' ORDER BY ts_ns",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    let rows = value["data"]["rows"].as_array().expect("rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly the first statement's record: {value}"
+    );
+    assert_eq!(rows[0][1], serde_json::json!("query"));
+    assert_eq!(
+        rows[0][2],
+        serde_json::json!(first),
+        "the audited statement text is verbatim: {value}"
+    );
+
+    // A query over `audit` is itself audited: the store now holds exactly two
+    // query-audit records, the first statement's and the audit query's own.
+    // Compared as a sorted pair, not by position: both records carry the same
+    // `ts_ns` (one frozen clock) and the helper returns them in commit-key
+    // listing order, which is not write order.
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    assert_eq!(
+        records.len(),
+        2,
+        "the audit query is audited like any other query"
+    );
+    let mut texts: Vec<&str> = records
+        .iter()
+        .map(|row| attr(row, "query.text").expect("every record carries its query text"))
+        .collect();
+    texts.sort_unstable();
+    let mut want = vec![
+        first,
+        "SELECT body, attrs['kind'], attrs['query.text'] FROM audit \
+         WHERE attrs['kind'] = 'query' ORDER BY ts_ns",
+    ];
+    want.sort_unstable();
+    assert_eq!(
+        texts, want,
+        "the second record is the audit query itself, verbatim"
+    );
+}
+
+/// A cross-signal query naming `alerts` and `logs` is rejected as a 400, the
+/// same way `spans` + `samples` is: ADR-1101 decision 1 extends the
+/// one-signal-per-query rule from three names to five, and the rejection
+/// happens in `target_signal` before any catalog listing.
+#[tokio::test]
+async fn an_alerts_plus_logs_query_is_rejected_over_http() {
+    let app = one_tenant_app("m", &[(100, 1.0)]).await;
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT * FROM alerts JOIN logs ON alerts.ts_ns = logs.ts",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");

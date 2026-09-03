@@ -11,10 +11,12 @@
 //!    injected clock (no `SystemTime::now()` in library logic).
 //!    `signal` is chosen from the query's own `FROM` clause
 //!    ([`SqlExecutor::target_signal`], ADR-0033, extended to `spans` by
-//!    ADR-0045 decision 5): `Signal::Logs` for the `logs` table,
-//!    `Signal::Spans` for the `spans` table, otherwise `Signal::Metrics`. A
-//!    query referencing two of the three tables is rejected here, before the
-//!    LIST, because v1 admits one signal per query (decision C). `name_filter` is the equality
+//!    ADR-0045 decision 5 and to `alerts`/`audit` by ADR-1101 decision 1):
+//!    `Signal::Logs` for the `logs` table, `Signal::Spans` for `spans`,
+//!    `Signal::Alerts` for `alerts`, `Signal::Audit` for `audit`, otherwise
+//!    `Signal::Metrics`. A query referencing two of the five tables is rejected
+//!    here, before the LIST, because v1 admits one signal per query
+//!    (decision C). `name_filter` is the equality
 //!    `__name__` value derived from the query's pushed-down predicates
 //!    ([`SqlExecutor::pushed_down_name_filter`]), so a metrics query
 //!    naming one metric prunes by postings exactly as PromQL does; a logs
@@ -92,6 +94,8 @@ use ravel_query::{LogSegmentFetcher, QueryError, SegmentFetcher, admit};
 use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
+use crate::alerts_provider::AlertsTableProvider;
+use crate::audit_provider::AuditTableProvider;
 use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
 use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_source};
@@ -103,14 +107,15 @@ use crate::output::QueryOutput;
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
 use crate::session::{
-    LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, SpillDecision, build_session,
+    ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE, SAMPLES_TABLE, SPANS_TABLE, SessionTable, SpillDecision,
+    build_session,
 };
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
 use crate::spill::{OperatorSpill, SpillCounts, SpillScratch, accumulate_spill_counts};
 use crate::validate::{referenced_base_tables, validate};
 
-/// Which of the three v1 tables (and thus which `Signal`) a query targets.
+/// Which of the five v1 tables (and thus which `Signal`) a query targets.
 /// A closed enum rather than `Signal` directly: `Signal` carries a `Profiles`
 /// variant the SQL surface has no table for, and the executor must never
 /// resolve or register that.
@@ -122,6 +127,12 @@ enum TargetSignal {
     Logs,
     /// The `spans` table, resolved against `Signal::Spans` (ADR-0045 decision 5).
     Spans,
+    /// The `alerts` table, resolved against `Signal::Alerts` (ADR-1101
+    /// decision 1).
+    Alerts,
+    /// The `audit` table, resolved against `Signal::Audit` (ADR-1101
+    /// decision 1).
+    Audit,
 }
 
 impl TargetSignal {
@@ -130,6 +141,8 @@ impl TargetSignal {
             TargetSignal::Metrics => Signal::Metrics,
             TargetSignal::Logs => Signal::Logs,
             TargetSignal::Spans => Signal::Spans,
+            TargetSignal::Alerts => Signal::Alerts,
+            TargetSignal::Audit => Signal::Audit,
         }
     }
 }
@@ -852,6 +865,23 @@ impl SqlExecutor {
                 self.span_fetcher.clone(),
                 accounting.clone(),
             ))),
+            // The two RLOG-backed tables (ADR-1101 decision 1) read through the
+            // executor's existing `log_fetcher`: an alert and an audit record
+            // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
+            // tenant-checked fetch funnel and its caches. No declared columns
+            // and no column statistics apply to either.
+            TargetSignal::Alerts => SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+                snapshot,
+                tenant_hash,
+                self.log_fetcher.clone(),
+                accounting.clone(),
+            ))),
+            TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
+                snapshot,
+                tenant_hash,
+                self.log_fetcher.clone(),
+                accounting.clone(),
+            ))),
         };
 
         let decision = match &scratch {
@@ -995,9 +1025,12 @@ impl SqlExecutor {
         // safely when postings are absent or unusable.
         let name_filter = match target {
             TargetSignal::Metrics => self.pushed_down_name_filter(tenant_hash, &req.sql).await,
-            // Only a metrics query has a `__name__` postings index; neither a
-            // logs nor a spans query prunes by it.
-            TargetSignal::Logs | TargetSignal::Spans => None,
+            // Only a metrics query has a `__name__` postings index; a logs,
+            // spans, alerts, or audit query never prunes by it.
+            TargetSignal::Logs
+            | TargetSignal::Spans
+            | TargetSignal::Alerts
+            | TargetSignal::Audit => None,
         };
         let catalog_requests = self
             .catalog
@@ -1022,7 +1055,12 @@ impl SqlExecutor {
         admit(&snapshot, &origins, &self.config.engine).map_err(admission_error_to_sql)?;
         let estimate = match target {
             TargetSignal::Metrics => estimate_metrics_cost(&snapshot, catalog_requests),
-            TargetSignal::Logs => estimate_logs_cost(&snapshot, catalog_requests),
+            // The `alerts` and `audit` scans fetch through the same RLOG funnel
+            // the `logs` scan does, one GET per segment, so they share its
+            // estimate rather than a renamed copy of it (ADR-1101 decision 1).
+            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => {
+                estimate_logs_cost(&snapshot, catalog_requests)
+            }
             TargetSignal::Spans => estimate_spans_cost(&snapshot, catalog_requests),
         };
         Ok((snapshot, estimate))
@@ -1270,6 +1308,18 @@ impl SqlExecutor {
                 self.span_fetcher.clone(),
                 QueryAccounting::new(),
             ))),
+            TargetSignal::Alerts => SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+                empty_snapshot(),
+                tenant_hash,
+                self.log_fetcher.clone(),
+                QueryAccounting::new(),
+            ))),
+            TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
+                empty_snapshot(),
+                tenant_hash,
+                self.log_fetcher.clone(),
+                QueryAccounting::new(),
+            ))),
         }
     }
 
@@ -1280,15 +1330,17 @@ impl SqlExecutor {
     /// The referenced table names come from the same `DFParser` front end the
     /// validation gate uses ([`referenced_base_tables`]), never a raw-text
     /// scan. The mapping (ADR-0045 decision 5 extends the ADR-0033 two-table
-    /// rule to a third arm):
+    /// rule to a third arm, ADR-1101 decision 1 to a fourth and fifth):
     ///
     /// - references `logs` only -> [`TargetSignal::Logs`].
     /// - references `spans` only -> [`TargetSignal::Spans`].
+    /// - references `alerts` only -> [`TargetSignal::Alerts`].
+    /// - references `audit` only -> [`TargetSignal::Audit`].
     /// - references `samples` only, or references no real table ->
     ///   [`TargetSignal::Metrics`].
-    /// - references two or more of {`samples`, `logs`, `spans`} ->
-    ///   [`SqlError::CrossSignalQuery`], rejected before the catalog LIST
-    ///   (decision C: v1 admits one signal per query).
+    /// - references two or more of {`samples`, `logs`, `spans`, `alerts`,
+    ///   `audit`} -> [`SqlError::CrossSignalQuery`], rejected before the
+    ///   catalog LIST (decision C: v1 admits one signal per query).
     ///
     /// The "no real table" case (a constant query such as `SELECT 1`, or one
     /// whose only source is a CTE with no base table) defaults to `Metrics`: it
@@ -1301,9 +1353,15 @@ impl SqlExecutor {
         let has_samples = tables.contains(SAMPLES_TABLE);
         let has_logs = tables.contains(LOGS_TABLE);
         let has_spans = tables.contains(SPANS_TABLE);
-        // Naming two of the three real tables crosses signals: v1 resolves one
+        let has_alerts = tables.contains(ALERTS_TABLE);
+        let has_audit = tables.contains(AUDIT_TABLE);
+        // Naming two of the five real tables crosses signals: v1 resolves one
         // snapshot per query, so this is rejected before any catalog listing.
-        let named = u8::from(has_samples) + u8::from(has_logs) + u8::from(has_spans);
+        let named = u8::from(has_samples)
+            + u8::from(has_logs)
+            + u8::from(has_spans)
+            + u8::from(has_alerts)
+            + u8::from(has_audit);
         if named > 1 {
             return Err(SqlError::CrossSignalQuery);
         }
@@ -1311,6 +1369,10 @@ impl SqlExecutor {
             Ok(TargetSignal::Logs)
         } else if has_spans {
             Ok(TargetSignal::Spans)
+        } else if has_alerts {
+            Ok(TargetSignal::Alerts)
+        } else if has_audit {
+            Ok(TargetSignal::Audit)
         } else {
             // `samples` only, or no real table at all: metrics by default.
             Ok(TargetSignal::Metrics)
@@ -2836,6 +2898,50 @@ mod tests {
             .expect("cte named samples over logs is logs-only"),
             TargetSignal::Logs
         );
+    }
+
+    /// ADR-1101 decision 1: the fourth and fifth arms. `FROM alerts` resolves
+    /// `Signal::Alerts` and `FROM audit` resolves `Signal::Audit`, while a CTE
+    /// named after either is query-local and leaves the target alone, exactly
+    /// as for the other three tables.
+    #[test]
+    fn target_signal_maps_alerts_and_audit() {
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT alert_id FROM alerts").expect("ok"),
+            TargetSignal::Alerts
+        );
+        assert_eq!(
+            SqlExecutor::target_signal("SELECT body FROM audit").expect("ok"),
+            TargetSignal::Audit
+        );
+        // A CTE named `audit` reading only `samples` is a metrics query: the
+        // name is query-local, not a base table.
+        assert_eq!(
+            SqlExecutor::target_signal(
+                "WITH audit AS (SELECT value FROM samples) SELECT count(*) FROM audit"
+            )
+            .expect("cte named audit over samples is metrics-only"),
+            TargetSignal::Metrics
+        );
+    }
+
+    /// ADR-1101 decision 1: the one-signal-per-query rule counts five names, so
+    /// a query naming `alerts` and `audit` -- or `samples` and `audit` -- is
+    /// `CrossSignalQuery`, exactly as samples+logs is.
+    #[test]
+    fn target_signal_rejects_a_query_naming_alerts_and_audit() {
+        for sql in [
+            "SELECT * FROM alerts JOIN audit ON alerts.ts_ns = audit.ts_ns",
+            "SELECT * FROM samples JOIN audit ON samples.ts = audit.ts_ns",
+            "SELECT * FROM alerts JOIN logs ON alerts.ts_ns = logs.ts",
+        ] {
+            let err = SqlExecutor::target_signal(sql)
+                .expect_err("a query naming two of the five tables is rejected");
+            assert!(
+                matches!(err, SqlError::CrossSignalQuery),
+                "expected CrossSignalQuery for {sql:?}, got {err:?}"
+            );
+        }
     }
 
     /// ADR-0045 decision 5 / ADR-0033 decision C: a cross-signal query is
