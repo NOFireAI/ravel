@@ -58,17 +58,25 @@ limitation; see `counterexamples/late-supersession-shrink.md`).
 
 All twelve named invariants above are shown non-vacuous by a negative control
 that flips one switch and makes them falsifiable (see `negative/` and
-`counterexamples/`); none is left to a mutant note. Two configs are
-non-vacuity probes rather than switch mutants: `negative/carryforward-nonvacuity.cfg`
-checks `NoCarryForward` over three-hour bounds where a watermark-advancing
-fold is reachable, so TLC reporting it violated proves the bounded
-incremental fold's carry-forward branch does real work (see `carryforward.cfg`
-and `counterexamples/carryforward-nonvacuity.md`); and
-`negative/frontier-reconcile-nonvacuity.cfg` checks `NoFrontierReconcile`, so
-TLC reporting it violated proves the ADR-0020 retention-frontier reconcile
-added to `DoFoldStart` / `DoRivalFoldWin` is exercised, not dead code, and
-that `TombstonedBucketContributesNothing`'s `frontierReconciled` disjunct is
-not vacuous.
+`counterexamples/`); none is left to a mutant note. Three configs are
+non-vacuity probes rather than switch mutants, each checking a refuted
+reachability property instead of flipping a switch:
+
+- `negative/carryforward-nonvacuity.cfg` checks `NoCarryForward` over
+  three-hour bounds where a watermark-advancing fold is reachable, so TLC
+  reporting it violated proves the bounded incremental fold's carry-forward
+  branch does real work (see `carryforward.cfg` and
+  `counterexamples/carryforward-nonvacuity.md`).
+- `negative/frontier-reconcile-nonvacuity.cfg` checks `NoFrontierReconcile`,
+  so TLC reporting it violated proves the ADR-0020 retention-frontier
+  reconcile added to `DoFoldStart` / `DoRivalFoldWin` is exercised, not dead
+  code, and that `TombstonedBucketContributesNothing`'s
+  `frontierReconciled` disjunct is not vacuous.
+- `negative/compaction-loser-diverged-nonvacuity.cfg` checks
+  `NoCompactionLoserDivergence`, so TLC reporting it violated proves the
+  `"diverged"` member of `lastCompact.outcome`'s widened alphabet (finding
+  6) is reachable, not a value the model can define but never hit (see
+  `counterexamples/compaction-loser-diverged-nonvacuity.md`).
 
 ## Running
 
