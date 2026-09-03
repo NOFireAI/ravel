@@ -77,6 +77,21 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      histogram monotonicity fixup is an info.)
 ```
 
+### Log selectors
+
+A log selector -- exact `__name__` equality on `ravel_log_lines` or
+`ravel_log_bytes` (ADR-1103) -- is planned by the same `plan_selectors` walk
+above and shares the query's total budgets with every metrics selector in
+the same query, but resolves against the tenant's log catalog instead of the
+metrics one, and only against this coordinator's own local view: log
+selectors are never federated (ADR-1103 decision 5), so a
+`--distributed-query` deployment still answers one from local segments only,
+never a cluster-wide merge. Its decoded per-record samples (one
+`ravel_log_lines`/`ravel_log_bytes` sample per log line, labels derived per
+[query.md](guides/query.md#promql-over-logs)) join the same query-wide
+pooled merge a metrics selector's runs join, so a query mixing a metrics and
+a log selector still evaluates over one merged, sorted series set.
+
 `padded_range`: the union, over every selector `plan_selectors` reports, of
 that selector's own fetch window (its lookback or matrix range, plus its
 own offset, anchored per `PlanAnchor::Window`/`Pinned`), so lookback never
@@ -973,9 +988,13 @@ absence-of-output-sample contract the raw path already has.
 This is the engine-level (queryfrag) fetch, merge, and federation machinery for
 all five signals, shipped and covered by the per-signal differential, erasure,
 skew, and federation tests. The coordinator caller that actually dispatches a
-Logs/Alerts/Audit/Spans distributed *search* is the SQL surface (log and trace
-search runs through the `logs`/`alerts`/`audit`/`spans` tables, not PromQL); the
-PromQL engine's own fetch/federation flow drives `Signal::Metrics` only today.
+Alerts/Audit/Spans distributed *search* is the SQL surface (trace search runs
+through the `alerts`/`audit`/`spans` tables, not PromQL); logs are reachable
+both ways, through the `logs` SQL table and, since ADR-1103, through the
+PromQL engine's own fetch flow (see "Log selectors" above) -- but that PromQL
+log lane is coordinator-local only. The PromQL engine's federation half still
+drives `Signal::Metrics` only today: a log selector is never federated
+(ADR-1103 decision 5).
 The SQL-lane distributed scan that drives that log and trace search is a
 separate step, and it exists only in a `flight-sql` build, which the published
 image is; see "The SQL-lane distributed scan" below.
