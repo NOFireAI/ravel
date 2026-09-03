@@ -390,9 +390,17 @@ The `audit` table columns are `ts_ns` (`Timestamp(ns)`), `severity_text`,
 `body` (both `Utf8`), and an `attrs` `Map(Utf8, Utf8)`. It is deliberately
 generic: `attrs['kind']` selects the record kind (`query` for the query-audit
 trail, `legal_hold`, `reshard`), and each kind's own fields ride the same map.
-A query over `audit` is itself audited, so it appears in the trail a later
-query reads. Resolution is per tenant hash, so a tenant reads only its own
-records, never another tenant's.
+Resolution is per tenant hash, so a tenant reads only its own records, never
+another tenant's.
+
+Legal-hold and reshard records are written by the maintenance process itself,
+so they are present on any deployment that has taken those actions.
+Query-audit records are not: every query surface submits one per executed
+statement through a sink that no shipped startup path replaces with the real
+pipeline, so on a stock build `attrs['kind'] = 'query'` selects nothing. The
+handler behavior and the record shape are already in place; only the install
+is missing. Once a deployment attaches the pipeline, a query over `audit` is
+itself audited and appears in the trail a later query reads.
 
 Beyond those fixed columns, an operator can declare per-tenant *typed
 attribute columns*: an attribute key promoted to a native `Int64`, `Boolean`,
