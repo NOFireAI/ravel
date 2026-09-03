@@ -8,62 +8,143 @@ count or depth falls outside them.
 Toolchain: TLC2 2.19 (tla2tools 1.7.4, sha256 verified by the harness),
 Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
-| Config | Spec | Distinct states | Depth | Wall time | Result |
+## Recorded runs
+
+| Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 1739129 | 32 | 20s | PASS |
-| exhaustive.cfg | FairSpec (safety + liveness) | 4656716 | 34 | 555s | PASS |
-| negative/compaction-swaps-record.cfg | Spec | short prefix | n/a | short | CompactionPreservesMultiset violated, exit 12 |
-| negative/head-names-unwritten-part.cfg | Spec | short prefix | n/a | short | HeadNamesOnlyCompleteParts violated, exit 12 |
-| negative/metrics-dedup-dropped.cfg | Spec | short prefix | n/a | short | SignalDedupContract violated, exit 12 |
-| negative/reconcile-on-tick.cfg | Spec | short prefix | n/a | short | ReconcileOnlyOnWatermarkAdvance violated, exit 12 |
-| negative/snapshot-changes-mid-attempt.cfg | Spec | short prefix | n/a | short | PinnedSnapshotStableWithinAttempt violated, exit 12 |
-| negative/sweep-superseded-no-head-gate.cfg | Spec | short prefix | n/a | short | HeadNamedObjectNeverDeleted violated, exit 12 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 3165708 | 32 | PASS | 20260903T090656Z-d6983312780c1b1ed10555b93b7f645818baadda |
+| exhaustive.cfg | FairSpec (safety + liveness) | 1191366 | 31 | PASS | tlc-exhaustive3-1904015 |
+| carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
+| negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | negative lane |
+| negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | negative lane |
+| negative/compaction-loser-overwrites.cfg | Spec | first counterexample | n/a | CompactionRecordImmutable violated, exit 12 | negative lane |
+| negative/reconcile-on-tick.cfg | Spec | first counterexample | n/a | ReconcileOnlyOnWatermarkAdvance violated, exit 12 | negative lane |
+| negative/snapshot-changes-mid-attempt.cfg | Spec | first counterexample | n/a | PinnedSnapshotStableWithinAttempt violated, exit 12 | negative lane |
+| negative/lost-cas-proceeds.cfg | Spec | first counterexample | n/a | NoLiveCommitOmittedByLostCas violated, exit 12 | negative lane |
+| negative/metrics-dedup-dropped.cfg | Spec | first counterexample | n/a | SignalDedupContract violated, exit 12 | negative lane |
+| negative/sweep-superseded-no-head-gate.cfg | Spec | first counterexample | n/a | HeadNamedObjectNeverDeleted violated, exit 12 | negative lane |
+| negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | tlc-carryforward-nonvacuity-1852394 |
 
-Bands (a run outside these is a regression to investigate, not to widen; see
-`bands.tsv`):
+The nine `negative/` configs each flip exactly one switch (or, for
+`carryforward-nonvacuity.cfg`, check a refuted probe) and must exit 12 reporting
+exactly the named property; each `.expect` pins that exit code and property, and
+the negative lane fails if any config passes or reports a different property.
 
-- smoke distinct states in [1700000, 1780000], depth in [32, 32].
-- exhaustive distinct states in [4600000, 4710000], depth in [34, 34].
+`counterexamples/late-supersession-shrink.cfg` is a recorded temporal shrink,
+not a gate: run under `FairSpec` with `PROPERTY LateSupersessionEventuallyReflected`
+it exits 13 (temporal property violated), reproducing the finite-model liveness
+limitation documented in `counterexamples/late-supersession-shrink.md`. It is
+not run by any harness lane.
+
+## Bands
+
+A run outside these is a regression to investigate, not to widen; see
+`bands.tsv`.
+
+- smoke distinct states in [3150000, 3185000], depth in [32, 32].
+- exhaustive distinct states in [1185000, 1198000], depth in [31, 31].
 
 The safety and liveness models run to a fixed complete state graph, so their
 distinct-state count and depth are deterministic; the bands carry a few percent
-of margin only to absorb a future toolchain change. The negative configs are
-NOT deterministic: they stop at the first counterexample TLC finds, and under
-`-workers auto` which state that is varies between runs, so a negative gets no
-band. Each negative is pinned instead by its `.expect` file: TLC must exit
-exactly 12 (a safety violation) and report exactly the named invariant.
+of margin only to absorb a future toolchain change. `carryforward.cfg` gets no
+band row: it is a targeted three-hour carry-forward pass, not one of the two
+banded gate configs, and its full graph (4,481,272 distinct states, depth 37) is
+recorded here instead. The negative configs are NOT deterministic: they stop at
+the first counterexample TLC finds, and under `-workers auto` which state that
+is varies between runs, so a negative gets no band. Each negative is pinned
+instead by its `.expect` file.
 
-The smoke config applies `SYMMETRY Symmetry` (permutations of `Clients`) and
-runs `Spec` for a fast safety-only search; the exhaustive config drops symmetry
-because TLC does not check liveness under symmetry reduction, adds a second
-compaction identity so the two-input-set dedup conflict is non-vacuous, and runs
-`FairSpec` with `WF_vars` on the clock, fold progress, and query progress so
-`QueryTerminates` can hold.
+## Invariant derivation audit
 
-Both configs run a single folder. The model's HEAD has one folder writer, so a
-literal two-folder CAS race is not enumerated; the version-matched CAS is still
-exercised, because `DoUnsupportedHead` bumps the HEAD version under an in-flight
-fold, so a fold reaches its CAS with a stale base version and takes the losing
-branch (HEAD untouched, folder rebases). The staged part it abandons is then
-swept by the catalog-object pass, so both sides of the version-match guard are
-covered without a second folder.
+Every invariant observes the modelled STORE (objects present, their content, the
+HEAD register, an L0 commit or L1 compaction record) or an effect WITNESS that
+records what an action actually did, never a compliance flag the model set for
+itself. The derivation comment beside each invariant in `CatalogMVCC.tla` is the
+authority; the table restates it.
 
-`LateSupersessionEventuallyReflected` is defined in the spec but not checked by
-any config: it is a recorded shrink. Under the F16/F17 design (reconcile runs
-only on a watermark-advancing fold), a compaction landing in an already-folded
-hour is reflected only by a later fold whose watermark advances past that hour.
-A bounded model clock saturates its finite watermark, so a compaction published
-after the final advance is never re-reconciled and TLC reports a stuttering
-counter-example. The stale window it exposes is safe by design (query-time
-dedup, pinned by `SignalDedupContract`), so this is a finite-model liveness
-limitation, not a defect. The shrunk trace and analysis are in
-`counterexamples/late-supersession-shrink.md`. `QueryTerminates`, which holds
-under the bounded clock, is checked in its place.
+| Invariant | Reads |
+|---|---|
+| TypeOK | structural: all state variables against their declared domains |
+| HeadNamesOnlyCompleteParts | STORE: the HEAD register and the set of present snapshot parts |
+| CompactionPreservesMultiset | STORE: the L1 compaction-record plane (`crec`) |
+| CompactionRecordImmutable | WITNESS: `lastCompact.mutated`, set from whether a losing publish actually changed the stored record |
+| ReconcileOnlyOnWatermarkAdvance | WITNESS: `lastHead` wm delta and `entriesChanged` of the last HEAD write |
+| SnapshotEntriesBelowWatermark | STORE: the HEAD register |
+| PinnedSnapshotStableWithinAttempt | WITNESS: `qy.pinnedAtAttempt` (resolve-time view) versus `qy.pinned` (served now) |
+| NoLiveCommitOmittedByLostCas | STORE/WITNESS: HEAD register, the L0 plane, and `maxValidWm` (highest watermark ever on a valid HEAD) |
+| MissingIndexDegradesToListing | STORE/WITNESS: `qy.headStatusAtResolve`, `qy.pinned`, `qy.resolvedView` |
+| CorruptHeadFailsClosedOnDeletePaths | WITNESS: `lastDelete.headStatus`, the HEAD status at the last real object removal |
+| HeadNamedObjectNeverDeleted | STORE: the HEAD register, the L0 plane, and the L1 compaction-record plane |
+| TombstonedBucketContributesNothing | WITNESS: `lastHead.entries`, `lastHead.tombAtWrite`, and `lastHead.reconcileLo` of the last fold |
+| SignalDedupContract | WITNESS: `qy.dupServed`, the identities the query actually served more than once |
+
+## Non-vacuity: behaviour mutant per invariant
+
+Each named safety invariant is shown load-bearing by a behaviour mutant. Eight
+have a dedicated switch and a negative-control config that flips it and drives
+TLC to exit 12 on that invariant (the recorded lines are in the run table
+above). Four have no switch and carry a mutant note naming a reachable
+antecedent and the mutation that would falsify them; the note filename matches
+the invariant.
+
+| Invariant | Mutant | TLC evidence |
+|---|---|---|
+| HeadNamesOnlyCompleteParts | switch `HeadNamesUnwrittenPart` | negative/head-names-unwritten-part.cfg, exit 12 |
+| CompactionPreservesMultiset | switch `CompactionSwapsRecord` | negative/compaction-swaps-record.cfg, exit 12 |
+| CompactionRecordImmutable | switch `CompactionLoserOverwrites` | negative/compaction-loser-overwrites.cfg, exit 12 |
+| ReconcileOnlyOnWatermarkAdvance | switch `ReconcileOnTick` | negative/reconcile-on-tick.cfg, exit 12 |
+| PinnedSnapshotStableWithinAttempt | switch `SnapshotChangesMidAttempt` | negative/snapshot-changes-mid-attempt.cfg, exit 12 |
+| NoLiveCommitOmittedByLostCas | switch `LostCasProceedsOnStaleRead` | negative/lost-cas-proceeds.cfg, exit 12 |
+| SignalDedupContract | switch `DropMetricsDedup` | negative/metrics-dedup-dropped.cfg, exit 12 |
+| HeadNamedObjectNeverDeleted | switch `SweepSupersededNoHeadGate` | negative/sweep-superseded-no-head-gate.cfg, exit 12 |
+| SnapshotEntriesBelowWatermark | mutant note (no switch) | counterexamples/snapshot-entries-below-watermark.md |
+| MissingIndexDegradesToListing | mutant note (no switch) | counterexamples/missing-index-degrades-to-listing.md |
+| CorruptHeadFailsClosedOnDeletePaths | mutant note (no switch) | counterexamples/corrupt-head-fails-closed-on-delete-paths.md |
+| TombstonedBucketContributesNothing | mutant note (no switch) | counterexamples/tombstoned-bucket-contributes-nothing.md |
+
+The bounded incremental fold's carry-forward branch is shown non-vacuous
+separately by `negative/carryforward-nonvacuity.cfg`, which checks the refuted
+probe `NoCarryForward` and exits 12: a watermark-advancing fold is reachable at
+those bounds and carries a below-floor hour forward, so the paired
+`carryforward.cfg` safety pass is not vacuous.
+
+## Fairness
+
+`FairSpec` adds only per-action weak fairness: `WF_vars(DoTick)`,
+`WF_vars(FoldProgress)`, and `WF_vars(QueryProgress)`. There is no `WF` or `SF`
+over the whole `Next`, and no safety invariant depends on fairness; fairness is
+present only so `QueryTerminates` can hold under the bounded clock.
+
+## Smoke constants
+
+`Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
+`Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1}`, `MaxClock = 3`,
+`MaxOps = 3`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all eight
+mutation switches FALSE, `SYMMETRY Symmetry`.
 
 ## Exhaustive constants
 
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1, g2}`, `MaxClock = 3`,
-`MaxOps = 3`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
-`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all six negative
-switches FALSE.
+`MaxOps = 2`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all eight
+mutation switches FALSE, `FairSpec` (no symmetry, so liveness is checked
+soundly). Two records and a second compaction identity keep the multiset and
+dedup conflicts non-vacuous. The version-matched HEAD CAS is exercised without a
+second modeled folder because `DoRivalFoldWin` advances HEAD and bumps its
+object version under an in-flight fold, so that fold reaches its CAS with a stale
+base version and takes the losing branch.
+
+## Carry-forward constants
+
+`Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
+`Hours = {0, 1, 2}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
+`MaxOps = 2`, `FoldSealDelay = 0`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
+`RetentionHorizon = 2`, `LagBound = 2`, `DedupBySignal = TRUE`, all eight
+mutation switches FALSE, `SYMMETRY Symmetry`. Three hours let a valid HEAD fold
+at successive watermarks; both seal delays are zero so all three hours seal
+within `MaxClock = 3`. The compact-strictly-before-fold gap (`FoldSealDelay = 1`)
+is orthogonal to carry-forward and is covered by the smoke and exhaustive
+configs. Under this config the full safety invariant set holds while the
+incremental fold carries a below-floor hour forward verbatim.
