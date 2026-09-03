@@ -1071,10 +1071,12 @@ async fn phase_accounting_reports_exact_get_counts_for_a_log_query() {
     // block layout and catalog round trips are infeasible to hand-derive).
     // Resolve: the Signal::Logs catalog snapshot resolve, generic per-query
     // overhead shared with a metrics query, not log-series-specific. Plan:
-    // one footer probe GET plus one STREAM_DIR range GET for object A (the
-    // only object `job="api"` matches; object B is pruned by stream before
-    // any GET). Scan: one BLOCKS range read for object A's 8 records, which
-    // fit a single block at this fixture's size.
+    // two GETs, one per candidate object, because stream discovery reads
+    // every candidate's directory before any of them can be excluded:
+    // object A's footer probe and object B's STREAM_DIR read. Only A matches
+    // `job="api"`; B is pruned out of the scan by that read, not before it.
+    // Scan: one BLOCKS range read for object A's 8 records, which fit a
+    // single block at this fixture's size.
     assert_eq!(
         stats
             .phase_accounting
