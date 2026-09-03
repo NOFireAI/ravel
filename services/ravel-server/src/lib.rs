@@ -361,11 +361,12 @@ pub struct ServerConfig {
     /// a 512 MiB catalog byte cache.
     pub disable_cache: bool,
     /// The resolved RAM budget for the query fetcher cache
-    /// (`ResolvedPerformanceDefaults::cache_max_bytes`). `main` fills it from
-    /// the resolved struct; [`start`] and `main` pass it to
-    /// `store::build_cache`. The catalog byte cache has its own
-    /// [`Self::catalog_cache_max_bytes`], so the two independent LRU caches do
-    /// not each claim the full derived share of RAM. Ignored when
+    /// (`ResolvedPerformanceDefaults::cache_max_bytes`), recorded here for
+    /// provenance. Nothing on the library path reads it: `main` builds the
+    /// fetcher cache from the resolved struct (`store::build_store`) before this
+    /// config exists, and [`start`] hands the catalog byte cache its own
+    /// [`Self::catalog_cache_max_bytes`]. The two are independent LRU ceilings,
+    /// so neither claims the other's derived share of RAM. Ignored when
     /// `disable_cache` is set.
     pub cache_max_bytes: u64,
     /// The resolved RAM budget for the catalog byte cache
