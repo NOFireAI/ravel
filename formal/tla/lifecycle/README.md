@@ -54,14 +54,20 @@ one-line meaning of each and its Rust source. The load-bearing ones:
 legal-hold-wins-over-erasure rule (ADR-0064 section 6) that
 `bucket_is_held` enforces in `bucket_erasure_completion` and that
 `chain_groups_held_by_legal_hold` enforces in the request-marker sweep: a
-held, still-present superseded input serving the erased subject blocks
-completion and blocks the `.dreq` sweep, independently of whether the
-subject is reachable through HEAD or a pinned read. Both invariants read a
-per-step witness on `lastGc` (`heldInputServed`, tagged by `rule`), not the
-live `heldBuckets`, so a hold placed or released strictly after a
-legitimate completion or sweep does not retroactively fail them; this is
-the same reason `NoDeleteInsideProtectionWindow` reads `lastGc` instead of
-the live `supersededAt`/query state.
+held, still-present data object (raw input or rewrite output) in the erased
+bucket blocks completion and blocks the `.dreq` sweep, independently of
+whether that object's current content still serves the erased subject and of
+whether the subject is reachable through HEAD or a pinned read. The gate is
+scoped to `DataObjects`, not only `RawInputs`, and content-blind, matching
+`bucket_is_held`'s and `chain_groups_held_by_legal_hold`'s own per-live-key
+gating rather than a per-subject one; a narrower, raw-input-only, content-
+matching version of this gate let a hold on the rewrite output through once
+its raw input was swept (finding 2, `counterexamples/rewrite-output-hold-
+probe.md`). Both invariants read a per-step witness on `lastGc`
+(`heldInputServed`, tagged by `rule`), not the live `heldBuckets`, so a hold
+placed or released strictly after a legitimate completion or sweep does not
+retroactively fail them; this is the same reason `NoDeleteInsideProtectionWindow`
+reads `lastGc` instead of the live `supersededAt`/query state.
 
 The config horizon inequality (protection_horizon at or above
 max_query_duration plus grace plus clock_skew) is an `ASSUME` on the constants,

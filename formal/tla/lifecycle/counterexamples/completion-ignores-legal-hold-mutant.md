@@ -36,3 +36,19 @@ records `HeldInputServes("s1") = TRUE` under `rule = "complete"` in the same
 transition, and `CompletionRespectsLegalHold` reads that witness and fails.
 Restoring the deleted conjunct makes the invariant hold again (smoke passes),
 which is the non-vacuity argument for the gate.
+
+## Re-run after finding 2 (widened, content-blind `HeldInputServes`)
+
+Re-applied the same one-line removal to the post-finding-2 model (`DataObjects`,
+no `ServesSubject` conjunct; see `rewrite-output-hold-probe.md`) against the
+same base `smoke.cfg`. TLC exit 12. Exact line:
+
+```
+Error: Invariant CompletionRespectsLegalHold is violated.
+```
+
+7-state trace: `Init`, `Tick`, `PlaceHold`, `RequestErasure`, `PerformRewrite`,
+`HeadAdvanceRewrite`, `CompleteErasure` (8549 states generated, 2751 distinct
+states found). Final state: `raw1` present and held, `heldBuckets = {"b1"}`,
+`lastGc.heldInputServed = TRUE` under `rule = "complete"`, same failure as
+before the widening. The gate stays load-bearing under the wider predicate.

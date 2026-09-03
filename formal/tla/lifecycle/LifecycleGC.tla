@@ -246,13 +246,24 @@ PinnedServes(s) ==
 
 ServesAny(s) == ServesNow(s) \/ PinnedServes(s)
 
-\* A raw input under legal hold, still present, that serves subject s (finding 1).
-\* This is independent of head/pinned reachability: a superseded input can be
-\* off HEAD and unpinned yet still legally held, which is exactly why the code
-\* gates on it separately (bucket_is_held in erasure_rewrite.rs,
-\* chain_groups_held_by_legal_hold in sweep.rs) rather than folding it into the
-\* served-set check. Legal hold wins over erasure (ADR-0064 section 6).
-HeldInputServes(s) == \E o \in RawInputs : HeldObject(o, heldBuckets) /\ PresentObj(o) /\ ServesSubject(o, s)
+\* A live data object (raw input OR rewrite output) under legal hold (finding 1;
+\* scope widened to DataObjects and off content, finding 2). Independent of
+\* head/pinned reachability: a superseded input can be off HEAD and unpinned
+\* yet still legally held, which is exactly why the code gates on it separately
+\* (bucket_is_held in erasure_rewrite.rs, chain_groups_held_by_legal_hold in
+\* sweep.rs) rather than folding it into the served-set check. Both gate on
+\* live key presence in the bucket listing, never on whether that key's stored
+\* content still serves the subject being erased ("a hold over any single key
+\* in [a chain group] stops all of it", sweep.rs); a raw input always still
+\* carries the erased subject's record in this finite model, so an earlier,
+\* narrower version of this predicate that also required ServesSubject(o, s)
+\* passed for RawInputs by coincidence, while the same requirement made a held
+\* rewrite output invisible once its raw input was swept, since a correctly
+\* computed rewrite output never serves an already-erased subject -- exactly
+\* the gap finding 2 found reachable. `s` stays in the signature for the call
+\* sites' shape; the subject no longer changes the result, matching the
+\* shipped gate.
+HeldInputServes(s) == \E o \in DataObjects : HeldObject(o, heldBuckets) /\ PresentObj(o)
 
 \* The .dreq presence filters the subject at read time for BOTH the current-HEAD
 \* read and a pinned read; an erased subject stays filtered until the .dreq is gone
