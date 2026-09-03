@@ -582,7 +582,7 @@ async fn log_series_request_budget_trips_exactly() {
     let mem = Arc::new(MemoryStore::new());
     let (ref_a, _ref_b) = two_objects(&mem).await;
     let counting = Arc::new(CountingStore::new(mem));
-    let fetcher = LogSegmentFetcher::new(counting as Arc<dyn ObjectStoreBackend>)
+    let fetcher = LogSegmentFetcher::new(counting.clone() as Arc<dyn ObjectStoreBackend>)
         .with_block_range_threshold(0)
         .with_suffix_len(300);
 
@@ -610,6 +610,11 @@ async fn log_series_request_budget_trips_exactly() {
         }
         other => panic!("expected RequestsExceeded, got {other:?}"),
     }
+    assert_eq!(
+        counting.get_count(),
+        8,
+        "accounted request count must equal the store's real GET count"
+    );
 }
 
 /// A deadline already in the past is caught before the first segment's Plan
