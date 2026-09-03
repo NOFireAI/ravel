@@ -417,12 +417,13 @@ async fn rewrite_created_ns(store: &dyn ObjectStoreBackend, key: &str) -> i64 {
 
 /// Whether a seeded `.done` carries per-bucket dropped counts.
 ///
-/// [`Drops::Absent`] is the production shape: the server's completion writer
-/// publishes `bucket_drops` empty, so no rule may depend on it being
-/// populated. [`Drops::Present`] is the optional narrowing hint a completion
-/// may carry. Every test that seeds the hint has a production-shape twin
-/// asserting the same holds, so a rule that only works on the hint cannot
-/// pass this suite.
+/// [`Drops::Absent`] names no bucket, which is what a completion written
+/// before the pass collected per-bucket counts carries, and also what the pass
+/// writes when it cannot state a complete bucket list. Every rule must keep
+/// holding on such a record. [`Drops::Present`] names [`OLD_HOUR`], the bucket
+/// these fixtures rewrite. Every test that seeds counts has a twin asserting
+/// the same holds out of an empty list, so a rule that only works on a
+/// populated list cannot pass this suite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drops {
     Present,
@@ -1505,6 +1506,170 @@ async fn cut_chain_holds_the_bucket_case(drops: Drops) {
     );
 }
 
+// --- (f2) a truncated bucket holds only what it could have touched ----------
+
+/// One completion `bucket_drops` entry in [`SHARD`]'s `hour`, the shape the
+/// server's pass publishes for every bucket a request's rewrite applied.
+fn drop_in(hour: u32, dropped_count: u64) -> ErasureBucketDrop {
+    ErasureBucketDrop {
+        signal: signal::to_proto(Signal::Metrics) as i32,
+        shard: SHARD,
+        ingest_hour_bucket: hour,
+        dropped_count,
+    }
+}
+
+/// Leave [`OLD_HOUR`] reported as a truncated bucket holding inputs, by the
+/// same reachable route [`cut_chain_holds_the_bucket_case`] takes: three
+/// generations, a pass whose last record delete faults (so R1's record is gone
+/// and the chain is cut), then a store whose catalog HEAD cannot be read.
+///
+/// Returns that second store. A `.dreq` sweep against it observes exactly one
+/// truncated bucket, `(SHARD, OLD_HOUR)`. Unlike that case's step 2 this plan
+/// carries no blanket delete fault, so a filter the guard does release is
+/// physically deleted.
+async fn truncated_old_hour(
+    mem: &Arc<MemoryStore>,
+    clock: &FixedClock,
+    created: i64,
+) -> FaultStore<Arc<MemoryStore>> {
+    let fixture = seed_chain(mem, clock, created, 3, Some(200)).await;
+    clock.set(past_horizon(created));
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains(fixture.chain[1].clone()),
+    );
+    let store = FaultStore::new(mem.clone(), plan);
+    assert!(
+        sweep(&store, clock).await.is_err(),
+        "the faulted delete of R2's record surfaces as a pass error"
+    );
+    assert!(
+        mem.head(&fixture.chain[0]).await.is_err(),
+        "R1's record went first: the chain is cut at the generation that applied X"
+    );
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Get, ScriptedFault::CorruptRange).with_key_contains(head_key()));
+    FaultStore::new(mem.clone(), plan)
+}
+
+/// The truncated-bucket clause covers the requests that bucket could have
+/// touched, not every request in the signal. [`OLD_HOUR`]'s chain is cut and
+/// its residue is held, so objects in that bucket may still carry pre-erasure
+/// rows. Request A's completion names that bucket, so A's filter must outlive
+/// them. Request B's completion names another hour only: nothing the cut chain
+/// holds can carry B's subject, so B's filter retires on its horizon.
+///
+/// Neither request is named by any surviving record, so the request-id clause
+/// holds neither one and the bucket clause decides both.
+///
+/// Flip-line proof: replace the `truncated_hold_applies(completion, ...)` arm
+/// of the `held` decision in `sweep_erasure_requests_inner` with
+/// `!holds.truncated_buckets.is_empty()`. B is then held on a bucket its
+/// completion does not name: `deleted == 1` fails with 0, and the surviving-key
+/// assertion fails with B's `.dreq` still present.
+#[tokio::test]
+async fn a_truncated_bucket_holds_only_the_requests_its_completion_names() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let store = truncated_old_hour(&mem, &clock, created).await;
+
+    let (dreq_a, _) = seed_dreq_and_done_with_drops(
+        mem.as_ref(),
+        request_id_n(10),
+        "absent10",
+        created,
+        vec![drop_in(OLD_HOUR, 2)],
+    )
+    .await;
+    let (dreq_b, _) = seed_dreq_and_done_with_drops(
+        mem.as_ref(),
+        request_id_n(11),
+        "absent11",
+        created,
+        vec![drop_in(RECENT_HOUR, 1)],
+    )
+    .await;
+
+    let dreq = sweep_erasure_requests(
+        &store,
+        &clock,
+        &cfg(),
+        &NoLeases,
+        &tenant_hash(),
+        Signal::Metrics,
+    )
+    .await
+    .expect("dreq sweep");
+    assert_eq!(
+        dreq.deleted, 1,
+        "B's filter: its completion names no bucket the sweep held"
+    );
+    assert_eq!(dreq.kept, 1);
+    assert_eq!(
+        dreq.held_by_superseded_inputs, 1,
+        "A's filter, by the truncated bucket its completion names"
+    );
+    let both: BTreeSet<String> = [dreq_a.clone(), dreq_b].into_iter().collect();
+    assert_eq!(both.len(), 2, "two distinct requests");
+    assert_eq!(
+        present_keys(mem.as_ref(), &both).await,
+        BTreeSet::from([dreq_a]),
+        "exactly A's .dreq survives the pass"
+    );
+}
+
+/// The legacy fallback. A completion carrying no `bucket_drops` makes no
+/// statement about which buckets its request touched, which is not the same
+/// claim as touching none: every completion written before the pass collected
+/// per-bucket counts carries an empty list. A truncated bucket holds such a
+/// request whatever hour it is in, which is the whole-signal behaviour those
+/// records keep.
+///
+/// Flip-line proof: delete the `completion.bucket_drops.is_empty()` early
+/// return from `truncated_hold_applies`. The empty list then matches no
+/// truncated bucket, the filter is deleted on its horizon, and both
+/// `deleted == 0` and the surviving-key assertion fail.
+#[tokio::test]
+async fn a_completion_naming_no_bucket_is_held_by_a_truncated_bucket() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let store = truncated_old_hour(&mem, &clock, created).await;
+
+    let (dreq_c, _) = seed_dreq_and_done_for(
+        mem.as_ref(),
+        request_id_n(12),
+        "absent12",
+        created,
+        Drops::Absent,
+    )
+    .await;
+
+    let dreq = sweep_erasure_requests(
+        &store,
+        &clock,
+        &cfg(),
+        &NoLeases,
+        &tenant_hash(),
+        Signal::Metrics,
+    )
+    .await
+    .expect("dreq sweep");
+    assert_eq!(
+        dreq.deleted, 0,
+        "a completion that names no bucket is held by any truncated bucket"
+    );
+    assert_eq!(dreq.kept, 1);
+    assert_eq!(dreq.held_by_superseded_inputs, 1);
+    let only: BTreeSet<String> = BTreeSet::from([dreq_c]);
+    assert_eq!(
+        present_keys(mem.as_ref(), &only).await,
+        only,
+        "the .dreq is physically present"
+    );
+}
+
 // --- (g) the whole ordering, end to end, across a crash and a fold ----------
 
 /// Two requests over two generations, in production completion shape. R1
@@ -2496,8 +2661,9 @@ async fn staggered_chain_release_case(drops: Drops) {
 /// A completion that names one of the two buckets its request touched. The
 /// bucket it omits is the one whose inputs are still HEAD-named, so narrowing
 /// the observation by that list would release the filter over data the request
-/// erased a subject out of. `bucket_drops` is informational only: the hold is
-/// decided over every chain in the signal.
+/// erased a subject out of. The list scopes the truncated-bucket clause and
+/// nothing else: which chains the pass observes, and which request ids a held
+/// chain carries, are read off the store.
 ///
 /// The two touched buckets are real, not asserted: X was applied in
 /// [`OLD_HOUR`] and in [`RECENT_HOUR`], and the second fold reconciles only the
