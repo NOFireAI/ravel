@@ -30,25 +30,38 @@ CONSTANTS
     Requesters,              \* concurrent reshard requests at the operator
     TargetCounts,            \* shard counts a request may ask for
     InitialShardCount,       \* generation 0's shard count
-    MaxHour,                 \* model horizon, in hours
+    MaxHour,                 \* model horizon, in model time-units
     MaxGenerations,          \* appends allowed past generation 0
     MaxAdmitsPerWriter,      \* admitted records per writer (model bound)
     CasAttempts,             \* RESHARD_CAS_ATTEMPTS
-    C,                       \* refresh interval, in hours
-    MinLeadHours,            \* min_lead_hours(C) = ceil(C) + 1
+    C,                       \* refresh interval, in model time-units
+    MinLeadHours,            \* min_lead_hours(C) = HourCeil(C) + HourUnits
     L,                       \* activation lead the caller asks for
-    S,                       \* read-side scan slack, in hours
-    FlushBound,              \* max_flush_delay_idle + max_flush_lifetime, in hours
+    S,                       \* read-side scan slack, in model time-units
+    FlushBound,              \* max_flush_delay_idle + max_flush_lifetime, in model time-units
     WriterSkew,              \* bound on router-to-router clock difference
     AppenderSkew,            \* bound on appender-to-router clock difference
     WriterFenceEnabled,      \* negative switch: fail closed on a view past grace
-    TokenValidatedAgainstCount  \* negative switch: validate token.shard vs a count
+    TokenValidatedAgainstCount, \* negative switch: validate token.shard vs a count
+    HourUnits                \* model time-units per wall-clock hour (see below)
+
+\* HourUnits lets a config choose how finely a model time-unit divides the
+\* wall-clock hour that min_lead_hours(C) rounds up to. Every cfg shipped
+\* before this constant existed models a time-unit of one hour and sets
+\* HourUnits = 1, under which HourCeil(C) = C and the formula below collapses
+\* to the original MinLeadHours = C + 1. A cfg that instead models minutes
+\* sets HourUnits = 60 and C = 1, representing the real 60 s refresh interval
+\* exactly instead of rounding it up to a whole hour first; see README.md's
+\* "Time-unit granularity" section for why that rounding otherwise inflates
+\* cached-view staleness by the same factor it discards.
+HourCeil(c) == ((c + HourUnits - 1) \div HourUnits) * HourUnits
 
 ASSUME Writers # {}
 ASSUME Requesters # {}
 ASSUME TargetCounts # {} /\ \A c \in TargetCounts : c >= 1
 ASSUME InitialShardCount >= 1
-ASSUME MinLeadHours = C + 1
+ASSUME HourUnits >= 1
+ASSUME MinLeadHours = HourCeil(C) + HourUnits
 ASSUME L >= 1 /\ S >= 0 /\ FlushBound >= 0
 ASSUME WriterSkew >= 0 /\ AppenderSkew >= 0
 ASSUME MaxHour >= 1 /\ MaxGenerations >= 1 /\ MaxAdmitsPerWriter >= 1
@@ -580,12 +593,16 @@ HistoryDenseAppendOnlyIncreasing ==
                  /\ g[i + 1].act > g[i].act
                  /\ g[i + 1].count # g[i].count
 
-\* A successful (or lost-response) CAS append extends the history by exactly
-\* one generation and discards nothing.
+\* A successful (or lost-response) CAS append extends the durable history by
+\* exactly one generation and discards nothing already stored. Grounded on the
+\* store's current content (Gens), not on the witness's own before/after
+\* fields, so a lost-response append that in fact clobbered the record would
+\* be caught here even though the witness recorded its own intended effect.
 CasAppendNeverDiscards ==
-    (lastOp.kind = "append" /\ lastOp.outcome \in {"ok", "lost"}) =>
-        /\ IsPrefixOf(lastOp.before, lastOp.after)
-        /\ Len(lastOp.after) = Len(lastOp.before) + 1
+    (lastOp.kind = "append" /\ lastOp.outcome \in {"ok", "lost"}
+        /\ Present(ProvKey)) =>
+            /\ IsPrefixOf(lastOp.before, Gens)
+            /\ Len(Gens) = Len(lastOp.before) + 1
 
 \* No admitted record sits at a shard index outside the scan set for the
 \* window that reaches from its ingest hour to the hour it was routed at.
