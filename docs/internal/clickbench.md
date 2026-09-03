@@ -713,10 +713,12 @@ cargo run -p ravel-server --features flight-sql --bin ravel-server -- \
 ```
 
 No performance flags. Since #1141 the server derives all six of them from the
-host at startup. Three are host-independent and match a published entry
-exactly: fetch concurrency 32 (2 per core on 16 cores), a 1,000,000
-sealed-segment cap, and an 11 minute engine deadline. The three memory-derived
-settings are computed from this box's own `MemTotal`, which Linux reports as
+host at startup. Two are host-independent and match a published entry exactly:
+a 1,000,000 sealed-segment cap and an 11-minute engine deadline. Fetch
+concurrency is CPU-derived and also matches on this box: 32, two per core on
+16 cores. The three memory-derived settings are computed from this box's own
+`MemTotal` (capped by the cgroup limit when the server runs in a container,
+which the reference box does not), which Linux reports as
 32,909,025,280 bytes here, so they land within 2.2% of the published figures
 rather than on them: an 80% read cache of 26,327,220,224 bytes against the
 published 25,769,803,776, a 25% per-query SQL pool of 8,227,256,320 against
@@ -758,12 +760,15 @@ not comparable:
 - `--sql-max-query-bytes` is the per-query DataFusion memory-pool ceiling. A
   statement that fits the bench's budget and not the server's aborts on the
   server with `query memory budget exhausted` and lands in `failed`.
-- `--sql-tenant-max-bytes` has no bench counterpart: it is the server's
-  per-tenant ceiling across concurrent queries, which an in-process lane running
-  one statement at a time never reaches. The derived value is twice the derived
-  per-query pool, so it is not the binding limit for a serial run; a flag that
-  sets it below the per-query pool clamps the per-query pool down to it, and the
-  server warns when it does.
+- `--sql-tenant-max-bytes`: the bench exposes a flag of that name, but it
+  configures only the in-process executor; on the Flight lane the client sends
+  the SQL statement alone, so the flag never reaches the server, and the
+  server's own `--sql-tenant-max-bytes` (or its derived value) governs. It is
+  the server's per-tenant ceiling across concurrent queries, which a lane
+  running one statement at a time never reaches. The derived value is twice
+  the derived per-query pool, so it is not the binding limit for a serial run;
+  an explicit value below the per-query pool clamps the per-query pool down to
+  it, and the server warns when it does.
 - Cache flags: the bench's `--cache-bytes` attaches an ADR-0046 read cache to
   its own fetcher; the server's equivalent is `--cache-max-bytes` (plus
   `--cache-dir` for the disk tier, and `--disable-cache` to turn it off). To
@@ -780,8 +785,13 @@ cargo run -p ravel-bench --features sql-latency,flight-lane --bin sql_latency_be
   --tenant clickbench --store s3 --flight 127.0.0.1:4317 \
   --corpus benchmarks/clickbench/hits.corpus.json \
   --runs 3 --compaction pre --window-hours 200000 \
-  --fetch-concurrency 8 --sql-max-query-bytes 1073741824
+  --fetch-concurrency 32 --sql-max-query-bytes 8053063680
 ```
+
+The two bench-side values are the reference host's resolved defaults, so the
+report's provenance matches the server's startup log; substitute the values
+your server logged. On the Flight lane they are recorded, not enforced: the
+server's own resolution governs every statement.
 
 - `--flight <host:port>` is the server's `--listen-grpc` address. It needs the
   `flight-lane` build feature; without it the run fails with an error naming the
