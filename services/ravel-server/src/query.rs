@@ -517,17 +517,21 @@ mod catalog_cache_tests {
         );
     }
 
-    /// Issue #1141 reachability for the derived `--cache-max-bytes`: the number
-    /// the resolution produced on an injected host is the number the catalog
-    /// byte cache is bounded by, through the same `build_catalog` argument
-    /// `crate::start` passes (`ServerConfig::cache_max_bytes`, which `main`
-    /// fills from `ResolvedPerformanceDefaults::cache_max_bytes`). The other
-    /// consumer of the same number, `store::build_cache`, takes it as a
-    /// parameter from the same field.
+    /// Issue #1141 reachability for the derived catalog cache ceiling: the
+    /// number the resolution produced on an injected host is the number the
+    /// catalog byte cache is bounded by, through the same `build_catalog`
+    /// argument `crate::start` passes (`ServerConfig::catalog_cache_max_bytes`,
+    /// which `main` fills from
+    /// `ResolvedPerformanceDefaults::catalog_cache_max_bytes`). The catalog
+    /// cache is a SEPARATE ceiling from the fetcher cache: on the reference
+    /// profile it resolves to 5% of `MemTotal` (1,610,612,736) while the fetcher
+    /// cache `store::build_cache` bounds stays at 80% (25,769,803,776), so the
+    /// two independent LRU caches do not each claim the full share. An explicit
+    /// `--cache-max-bytes` sets both equal.
     ///
-    /// Prove-the-test: resolve with `PerformanceFlags::default()` against
-    /// `HostProfile::new(16, None)` (the unknown-memory fallback) and the
-    /// assertion reads 268,435,456 against the expected 25,769,803,776.
+    /// Prove-the-test: pass `resolved.cache_max_bytes` (the fetcher 80% number)
+    /// to `build_catalog` here and the first assertion reads 25,769,803,776
+    /// against the expected 1,610,612,736.
     #[test]
     fn the_derived_cache_max_bytes_reaches_the_catalog_byte_cache() {
         use clap::Parser;
@@ -538,22 +542,47 @@ mod catalog_cache_tests {
         let resolved = cli
             .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
             .expect("performance defaults resolve");
+        // The two caches derive to different ceilings on the same host.
         assert_eq!(resolved.cache_max_bytes, 25_769_803_776);
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_610_612_736);
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog = build_catalog(
             store,
             1,
             cli.disable_cache,
-            resolved.cache_max_bytes,
+            resolved.catalog_cache_max_bytes,
             cli.cache_dir.clone(),
         )
         .expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
-            25_769_803_776,
-            "the host-derived cache ceiling must bound the catalog byte cache, not the \
-             compiled-in 256 MiB"
+            1_610_612_736,
+            "the catalog byte cache must be bounded by the derived catalog ceiling (5% of \
+             MemTotal), not the fetcher cache's 80% and not the compiled-in 256 MiB"
+        );
+
+        // An explicit --cache-max-bytes couples both caches at that one value.
+        let flagged = crate::Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "4096"])
+            .expect("flag parses");
+        let resolved = flagged
+            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
+        assert_eq!(resolved.cache_max_bytes, 4096);
+        assert_eq!(resolved.catalog_cache_max_bytes, 4096);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store,
+            1,
+            flagged.disable_cache,
+            resolved.catalog_cache_max_bytes,
+            flagged.cache_dir.clone(),
+        )
+        .expect("catalog builds");
+        assert_eq!(
+            catalog.config().byte_cache_max_bytes,
+            4096,
+            "an explicit --cache-max-bytes bounds the catalog byte cache at the flag value"
         );
     }
 }

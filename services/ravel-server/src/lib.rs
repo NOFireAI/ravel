@@ -360,12 +360,22 @@ pub struct ServerConfig {
     /// a memory-constrained `--disable-cache` deployment does not silently keep
     /// a 512 MiB catalog byte cache.
     pub disable_cache: bool,
-    /// `--cache-max-bytes`: the shared RAM budget for the ADR-0046 read caches.
-    /// `main` sets it from `Cli::cache_max_bytes`; it bounds the fetcher cache
-    /// (via `store::build_cache`) and the catalog byte cache (via
-    /// [`query::build_catalog`]) from one number. Ignored when
+    /// The resolved RAM budget for the query fetcher cache
+    /// (`ResolvedPerformanceDefaults::cache_max_bytes`). `main` fills it from
+    /// the resolved struct; [`start`] and `main` pass it to
+    /// `store::build_cache`. The catalog byte cache has its own
+    /// [`Self::catalog_cache_max_bytes`], so the two independent LRU caches do
+    /// not each claim the full derived share of RAM. Ignored when
     /// `disable_cache` is set.
     pub cache_max_bytes: u64,
+    /// The resolved RAM budget for the catalog byte cache
+    /// (`ResolvedPerformanceDefaults::catalog_cache_max_bytes`), a SEPARATE LRU
+    /// ceiling from [`Self::cache_max_bytes`]. `main` fills it from the resolved
+    /// struct; [`start`] passes THIS value, not `cache_max_bytes`, to
+    /// [`query::build_catalog`]. Unset, it derives to a smaller share than the
+    /// fetcher cache; an explicit `--cache-max-bytes` sets both equal. Ignored
+    /// when `disable_cache` is set.
+    pub catalog_cache_max_bytes: u64,
     /// `--cache-dir`: the ADR-0046 local-disk cache tier's directory (#97),
     /// `None` when the flag is unset. `main` sets it from `Cli::cache_dir`.
     /// When `Some` and `disable_cache` is off, [`query::build_catalog`] attaches
@@ -1007,7 +1017,7 @@ pub async fn start(
         store.clone(),
         config.shard_count,
         config.disable_cache,
-        config.cache_max_bytes,
+        config.catalog_cache_max_bytes,
         config.cache_dir.clone(),
     )?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
