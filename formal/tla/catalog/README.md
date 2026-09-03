@@ -12,6 +12,8 @@ CatalogMVCC.tla     the contract module (operators, actions, invariants)
 MCCatalogMVCC.tla   model-check entry: folder symmetry, switch defaults
 smoke.cfg           fast safety config (symmetry-reduced)
 exhaustive.cfg      full safety + liveness config
+carryforward.cfg    three-hour safety config that exercises the incremental fold
+                    carry-forward branch (paired with its non-vacuity probe)
 bands.tsv           per-config distinct-state and depth bands
 traceability.md     TLA+ action or property -> Rust source table
 results.md          recorded figures and the bands they must stay in
@@ -43,19 +45,24 @@ bucket is compactable strictly before it is foldable.
 ## Named safety invariants
 
 `HeadNamesOnlyCompleteParts`, `CompactionPreservesMultiset`,
-`ReconcileOnlyOnWatermarkAdvance`, `SnapshotEntriesBelowWatermark`,
-`PinnedSnapshotStableWithinAttempt`, `NoLiveCommitOmittedByLostCas`,
-`MissingIndexDegradesToListing`, `CorruptHeadFailsClosedOnDeletePaths`,
-`HeadNamedObjectNeverDeleted`, `TombstonedBucketContributesNothing`, and
-`SignalDedupContract`. Temporal (exhaustive only): `QueryTerminates`.
-`LateSupersessionEventuallyReflected` is defined but not checked: it is a
-recorded shrink (finite-model liveness limitation; see
-`counterexamples/late-supersession-shrink.md`).
+`CompactionRecordImmutable`, `ReconcileOnlyOnWatermarkAdvance`,
+`SnapshotEntriesBelowWatermark`, `PinnedSnapshotStableWithinAttempt`,
+`NoLiveCommitOmittedByLostCas`, `MissingIndexDegradesToListing`,
+`CorruptHeadFailsClosedOnDeletePaths`, `HeadNamedObjectNeverDeleted`,
+`TombstonedBucketContributesNothing`, and `SignalDedupContract`. Temporal
+(exhaustive only): `QueryTerminates`. `LateSupersessionEventuallyReflected` is
+defined but not checked: it is a recorded shrink (finite-model liveness
+limitation; see `counterexamples/late-supersession-shrink.md`).
 
-Six invariants are shown non-vacuous by a negative control that flips one
+Eight invariants are shown non-vacuous by a negative control that flips one
 switch and makes them falsifiable (see `negative/` and `counterexamples/`); the
-five without a switch carry a mutant note in `counterexamples/` naming a
-reachable antecedent state and the mutation that would falsify them.
+four without a switch carry a mutant note in `counterexamples/` naming a
+reachable antecedent state and the mutation that would falsify them. A ninth
+config, `negative/carryforward-nonvacuity.cfg`, is a non-vacuity probe rather
+than a mutant: it checks `NoCarryForward` over three-hour bounds where a
+watermark-advancing fold is reachable, so TLC reporting it violated proves the
+bounded incremental fold's carry-forward branch does real work (see
+`carryforward.cfg` and `counterexamples/carryforward-nonvacuity.md`).
 
 ## Running
 

@@ -1,9 +1,25 @@
 # late-supersession-shrink (recorded shrink)
 
 `LateSupersessionEventuallyReflected` is defined in `CatalogMVCC.tla` but is not
-checked by any config. TLC finds a real stuttering counter-example under
-`FairSpec`, and this note records the shrunk trace and why the property cannot
-hold in a bounded model rather than forcing it green.
+checked by the smoke, negative, or exhaustive harness lanes. TLC finds a real
+stuttering counter-example under `FairSpec`, and this note records the shrunk
+trace and why the property cannot hold in a bounded model rather than forcing it
+green.
+
+## Reproducing
+
+The paired `late-supersession-shrink.cfg` in this directory checks the property
+under `FairSpec` at the bounds cited below. It is not run by any harness lane
+(the harness matches invariant violations, and a liveness failure prints
+`Temporal properties were violated` instead); run it directly to reproduce:
+
+```
+java -cp <tla2tools.jar> tlc2.TLC -config late-supersession-shrink.cfg \
+  -workers auto -deadlock MCCatalogMVCC
+```
+
+TLC exits non-zero with `Temporal properties were violated` and prints the
+stuttering trace whose shape is described below.
 
 ## The property
 
@@ -13,8 +29,9 @@ inputs leave it.
 
 ## The shrunk counter-example
 
-Constants as `exhaustive.cfg` (`Hours = {0, 1}`, `MaxClock = 4`, `FoldSealDelay
-= 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`). The trace TLC minimized:
+Constants as `late-supersession-shrink.cfg` (`Hours = {0, 1}`, `MaxClock = 4`,
+`FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`). The trace
+TLC minimized:
 
 - States 1 to 11 ingest `rB` into hour 1 and run a fold that CAS-swaps a valid
   HEAD at watermark 1: `head = [wm |-> 1, entries |-> {l0/0/rA, l0/1/rB},
