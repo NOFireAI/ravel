@@ -159,11 +159,15 @@ TRUE, under which this trace has no successor.
   ungated variants are carried as the `superseded-sweep-ungated` and
   `dreq-ignores-held-inputs` negative controls.
 - #1131 is a liveness limitation, not a safety defect. `EventuallySwept` and
-  `EventuallyCompleted` are conditional on fairness and on the fold's and the
-  sweep's retention windows agreeing; when they disagree the sweep waits on the
-  fold forever and the properties are intentionally false. Whether they hold
-  under `FairSpec` is checked only in `exhaustive.cfg`, which this task did not
-  run, so this document makes no claim here that they hold.
+  `EventuallyCompleted` are conditional on fairness, on the fold's and the
+  sweep's retention windows agreeing, and (round two, finding 2) on the
+  environment eventually going quiet on hold state, HEAD read state, and
+  refresh outcome; when any of those keeps changing forever, or the retention
+  windows disagree, the properties are intentionally false. `exhaustive.cfg`
+  itself was not run by this task; a reduced, single-property diagnosis was,
+  and both properties fail at `MaxClock = 2` for the reasons in "Liveness,
+  reduced diagnosis" below. This is consistent with, not contradicting, the
+  orchestrator's `exhaustive.cfg` report of a liveness violation.
 
 ## Review findings (issue #1122)
 
@@ -231,10 +235,17 @@ findings. Disposition:
    orchestrator to exit 13 (a liveness violation) via a short lasso through
    repeated hold placement and release, not one of the three conditions the
    README already named (a legal hold, a stopped maintainer, or a fold/sweep
-   retention-window disagreement, #1131). See the "Liveness" section below
-   for the reduced per-property diagnosis; the exhaustive configuration
-   itself was not run here (out of scope for this task; the orchestrator
-   measures it).
+   retention-window disagreement, #1131). Diagnosed without running
+   `exhaustive.cfg`: each of `EventuallySwept` and `EventuallyCompleted`,
+   checked alone at `MaxClock = 2`, fails, for the same root cause as the
+   orchestrator's lasso (`FairSpec` gives no fairness to any environment
+   action, so one cycling forever can recurrently disable a fairly-scheduled
+   action's guard). See "Liveness, reduced diagnosis" below for the two TLC
+   traces. Fixed by documentation: README now states both properties under
+   the wider hypothesis that the environment (holds, HEAD read state, refresh
+   outcome) eventually goes quiet, rather than by adding fairness to any of
+   `PlaceHold`/`ReleaseHold`/`SetHeadState`/`SetRefresh` (none of their
+   real-world analogs has a cited implementation guarantee of progress).
 3. (MEDIUM) `RewriteOutputsAreInputsMinusErased` had a decorative guard: the
    "kept" direction of the multiset claim was unfalsifiable because the model
    had only one record and one subject, and the sole request erased that
@@ -267,6 +278,61 @@ safety from liveness") is still the operative rule; this round's finding 2
 fix changes what the README says it showed (a per-property reduced run and
 its hypothesis, replacing "makes no claim"), but does not add a claim the
 lanes run here did not support. See "Liveness" below.
+
+## Liveness, reduced diagnosis (finding 2)
+
+The orchestrator reported `exhaustive.cfg` (`FairSpec`, `MaxClock = 4`) exiting
+13 via a 7-state lasso through repeated `PlaceHold`/`ReleaseHold`, not one of
+the three conditions the README named at the time (a legal hold left in place,
+a stopped maintainer, or a fold/sweep retention-window disagreement, #1131).
+This task did not run `exhaustive.cfg` (forbidden; the run is long enough to
+risk the idle-kill timeout). Instead, each of the two liveness properties was
+checked alone, in a scratch cfg scoped to `TypeOK` plus that one property, at
+`MaxClock = 2` (small enough to reproduce a violation quickly), `FullEnv =
+TRUE`, `SPECIFICATION FairSpec`, every switch at its shipped value. Both fail:
+
+- `EventuallySwept`: TLC exit 13. A 9-state behavior ending in stuttering, not
+  a lasso. `SetRefresh` sets `refreshFailed = TRUE` (state 4) and no later
+  state clears it; `superseded = {"raw1"}` and `RawInputs \cap head = {}` hold
+  from state 9 on (the antecedent is true), `raw1` stays present, and
+  `SupersededSweep` is fail-closed on `refreshFailed` (`RefreshFailureNeverSweeps`),
+  so it stays disabled forever. `SetRefresh(FALSE)` is enabled at state 9 (it
+  would clear the failure) but `FairSpec` grants it no fairness, so the
+  environment is free to never call it again. Exact line:
+  `Error: Temporal properties were violated.` with the counter-example above
+  (`/tmp/liveness-swept.out` this session; not committed, scratch only).
+- `EventuallyCompleted`: TLC exit 13. An 11-state behavior with a genuine
+  4-state lasso, states 8 through 11 repeating forever (`Back to state 8`).
+  `dreqR1` is present throughout (the antecedent), `doneR1` never becomes
+  present. The cycle is `RetentionSweep` (deletes `rwA`) -> `PerformRewrite`
+  (recreates `rwA`) -> `SetHeadState` (`headState' = "absent"`) -> (next lap)
+  `SetHeadState` again (`headState' = "present"`), so `headState` is
+  `"present"` only instantaneously and never stays there. `CompleteErasure`
+  requires `HeadDeletable` (`headState = "present"`); `SetHeadState` has no
+  fairness in `FairSpec`, so the environment can keep flipping `headState` in
+  and out of `"present"` forever, defeating `WF_vars(CompleteErasure)` without
+  it ever being continuously enabled. Exact line:
+  `Error: Temporal properties were violated.` with the counter-example above
+  (`/tmp/liveness-completed.out` this session; not committed, scratch only).
+
+Neither reduced trace matches the orchestrator's `PlaceHold`/`ReleaseHold`
+lasso literally, but both are the same failure class: `FairSpec` grants weak
+fairness only to the maintainer and store actions
+(`SupersededSweep`, `HeadAdvanceRewrite`, `RetentionSweep`, `CompleteErasure`),
+never to a `FullEnv`-gated environment action (`PlaceHold`, `ReleaseHold`,
+`SetHeadState`, `SetRefresh`), so any one of them cycling forever can
+recurrently disable a fairly-scheduled action's guard just before it fires.
+Disposition: state both properties under the wider hypothesis that the
+environment eventually goes quiet on all three of these (README, "Liveness"
+section), rather than adding fairness to any of them. `PlaceHold`/`ReleaseHold`
+is a business decision with no code-side liveness guarantee, so fairness there
+would claim something the implementation does not promise. `SetHeadState` and
+`SetRefresh` model read/refresh flakiness rather than the fold's or the legal
+hold subsystem's own forward progress (already covered by
+`WF_vars(HeadAdvanceRewrite)`), so adding fairness to them would likewise claim
+a retry guarantee this model does not have a cited Rust-side source for; adding
+it without one would be exactly the kind of claim ADR-1113 D12 asks this
+document not to make.
 
 ## Exhaustive
 
