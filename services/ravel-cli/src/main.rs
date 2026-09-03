@@ -2721,34 +2721,88 @@ mod tests {
     fn command_is_write_classifies_the_named_shapes() {
         let cases: &[(&[&str], bool)] = &[
             (
-                &["ravel", "load", "--parquet", "h.parquet", "--tenant", "t", "--mapping", "m.toml"],
+                &[
+                    "ravel",
+                    "load",
+                    "--parquet",
+                    "h.parquet",
+                    "--tenant",
+                    "t",
+                    "--mapping",
+                    "m.toml",
+                ],
                 true,
             ),
             (&["ravel", "typed-attr-column", "set", "t", "k:str"], true),
             (&["ravel", "typed-attr-column", "show", "t"], false),
-            (&["ravel", "hold", "set", "--tenant", "t", "--scope", "t/x/"], true),
-            (&["ravel", "hold", "clear", "--tenant", "t", "--scope", "t/x/"], true),
+            (
+                &["ravel", "hold", "set", "--tenant", "t", "--scope", "t/x/"],
+                true,
+            ),
+            (
+                &["ravel", "hold", "clear", "--tenant", "t", "--scope", "t/x/"],
+                true,
+            ),
             (&["ravel", "hold", "list", "--tenant", "t"], false),
             (
                 &[
-                    "ravel", "erase", "submit", "--tenant", "t", "--signal", "logs", "--matcher",
+                    "ravel",
+                    "erase",
+                    "submit",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--matcher",
                     "k=v",
                 ],
                 true,
             ),
-            (&["ravel", "erase", "status", "--tenant", "t", "--signal", "logs"], false),
-            (&["ravel", "provision", "adopt", "--tenant", "t", "--shards", "4"], true),
             (
                 &[
-                    "ravel", "provision", "reshard", "--tenant", "t", "--signal", "logs",
-                    "--shard-count", "8",
+                    "ravel", "erase", "status", "--tenant", "t", "--signal", "logs",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "provision",
+                    "adopt",
+                    "--tenant",
+                    "t",
+                    "--shards",
+                    "4",
                 ],
                 true,
             ),
             (
                 &[
-                    "ravel", "gc-config", "set", "--protection-horizon", "25h", "--grace", "24h",
-                    "--max-query-duration", "1h", "--max-flush-lifetime", "1h",
+                    "ravel",
+                    "provision",
+                    "reshard",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--shard-count",
+                    "8",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "gc-config",
+                    "set",
+                    "--protection-horizon",
+                    "25h",
+                    "--grace",
+                    "24h",
+                    "--max-query-duration",
+                    "1h",
+                    "--max-flush-lifetime",
+                    "1h",
                 ],
                 true,
             ),
@@ -2757,8 +2811,8 @@ mod tests {
             (&["ravel", "tenancy", "resolve", "t"], false),
         ];
         for (args, expect_write) in cases {
-            let cli = Cli::try_parse_from(*args)
-                .unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+            let cli =
+                Cli::try_parse_from(*args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
             assert_eq!(
                 super::command_is_write(&cli.command),
                 *expect_write,
