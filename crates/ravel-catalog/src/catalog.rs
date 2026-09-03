@@ -4735,7 +4735,9 @@ mod tests {
         let err = catalog
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
-            .expect_err("once a record appears the resolve must re-check and fail closed on corruption");
+            .expect_err(
+                "once a record appears the resolve must re-check and fail closed on corruption",
+            );
         assert!(
             matches!(err, CatalogError::Provisioning(_)),
             "expected a provisioning failure from the re-check, got: {err}"
