@@ -67,6 +67,14 @@ Deliberately not shipped:
   prefers the departing evaluator rather than the later write. One current row
   per alert is guaranteed either way, and the SQL fold matches the evaluator's
   own. Tracked as #1175.
+- **The query-audit pipeline install.** The `audit` table reads back whatever
+  is stored, and on a stock build that is legal-hold and reshard records only:
+  every query surface submits its per-statement event through a sink that
+  startup fills with the no-op, and nothing outside the audit crate's own
+  tests constructs the real pipeline. So `attrs['kind'] = 'query'` selects
+  nothing, and `audit_mode=required` cannot fail closed either, since the
+  no-op always reports success. Pre-existing, found while writing these docs,
+  and named in them rather than papered over. Tracked as #1187.
 
 ## Epic #8: RSPAN v2/v3/v4 trace investigation
 
