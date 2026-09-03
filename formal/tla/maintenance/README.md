@@ -50,6 +50,24 @@ TLC checked this finite model under the bounds in `results.md`. Safety
 - **MemoNeverExtendsFreshnessPastSnapshot**: seeding clamps each entry to its
   source snapshot's time, so an in-memory entry never reads fresher than the
   snapshot it came from.
+- **MergeAttemptsConverge**: fail-closed convergence (ADR-1113 D3). The publish
+  outcome witness is drawn from the alphabet that mirrors
+  `crates/ravel-maintain/src/publish.rs::resolve_already_exists`
+  (`Published`, `Converged`, `Abandoned`, `ConvergedWinnerPartMissing`,
+  `InputSetHashDivergence`). A loser reports `Converged` only when it observes
+  the winner's part present in the store (or re-PUTs the identical
+  content-addressed part and then observes it present); when the winning part has
+  vanished and cannot be re-PUT it reports `ConvergedWinnerPartMissing`, never a
+  bare `Converged`. The invariant reads the store-derived witness
+  (`lastPub.winnerPartPresent`, set from whether the part key is present after
+  the publish attempt), not a self-reported success flag.
+- **DivergentInputSetNeverMutates**: when a loser observes a record whose
+  input-set hash differs from its own (`Variants`, a divergent listing yielding a
+  different `input_set_hash`), it fails closed with outcome
+  `InputSetHashDivergence` and never deletes or overwrites the existing record.
+  The invariant reads a store-derived witness (`lastPub.recOverwritten`, set from
+  whether the record object's version changed across the attempt), not the
+  action's own claim.
 
 Liveness (checked against `MCFairSpec`; fairness: weak fairness on each worker's
 live-set recompute, on the part PUT, on some in-view owner's record attempt per
@@ -74,6 +92,46 @@ heartbeat `H` for the survivor to notice, and the length of a discovery cycle
 owned unit). Correctness holds across this window because publication is
 CreateIfAbsent over content-addressed parts and never reads ownership --
 `QueryVisibleDataCorrectUnderDuplicateOwnership` is exactly this claim.
+
+### Fail-closed convergence and the vanishing part
+
+The publish model carries the store actions that let a winning part disappear
+between the record write and a loser's convergence check: `VanishPart` deletes a
+part object, and `TombstonePart` marks a part key non-re-PUTtable (the
+content-addressed key was tombstoned, so a `CreateIfAbsent` re-PUT is refused).
+`DoPublish` branches over the observed store state, not over any intent:
+
+- record absent and the winning part present: `Published`.
+- record present with a matching input-set hash and the winning part present:
+  `Converged`.
+- record present, winning part absent but re-PUTtable: the loser re-PUTs the
+  identical part and converges (`Converged`, `winnerPartPresent` observed true).
+- record present, winning part absent and tombstoned (not re-PUTtable):
+  `ConvergedWinnerPartMissing`. The earlier `MergeAttemptsConverge` held only
+  because no part ever vanished; with `VanishPart`/`TombstonePart` present the
+  invariant now states the real contract, that a vanished, non-re-PUTtable
+  winning part yields `ConvergedWinnerPartMissing` and never a bare `Converged`.
+  This mirrors
+  `crates/ravel-maintain/tests/tombstone_race.rs::rerun_with_revanished_part_fails_typed_not_converged`.
+- record present with a divergent input-set hash: `InputSetHashDivergence`, store
+  unchanged.
+
+Coverage note: with two in-view owners publishing different input sets for the
+same unit, `QueryVisibleDataCorrectUnderDuplicateOwnership` still holds. The
+record is the single `CreateIfAbsent` winner regardless of publisher, and the
+loser's divergent-hash observation fails closed rather than overwriting, so the
+terminal record and its content-addressed parts stay consistent.
+
+### The live-set fail-open lives in the caller
+
+The `ComputeLive` step models the once-per-cycle live-set recompute. The
+fail-open on a read error (a failed refresh keeps the previous set) is **not** in
+this computation: it is the caller's, in
+`services/ravel-server/src/maintain.rs::run_loop`, whose discovery arm reuses the
+last set the heartbeat watch channel published
+(`live_rx.borrow().clone()`). The model captures that as the *absence* of a
+`ComputeLive` step: the worker keeps its frozen `cachedLive`. The `scrub.rs`
+read-fault fallback is a separate caller and is out of scope for this model.
 
 ### The zero-ownership limitation
 
@@ -132,8 +190,20 @@ TLC checked this finite model under the bounds in `results.md`. Safety (against
 - **LostClaimNeverPublishesThroughGuardedPath**: the cancellation-checkpoint
   path abandons once the claim is lost; the ungated path may still publish and
   the data stays correct.
-- **MergeAttemptsConverge**: a present record's winning part is present, so a
-  later attempt finds or re-PUTs identical parts.
+- **MergeAttemptsConverge**: fail-closed convergence (ADR-1113 D3). The outcome
+  witness is the alphabet mirroring
+  `crates/ravel-maintain/src/publish.rs::resolve_already_exists`. A loser reports
+  `Converged` only when it observes the winner's part present (or re-PUTs the
+  identical content-addressed part and observes it present); a vanished,
+  non-re-PUTtable winning part yields `ConvergedWinnerPartMissing`, never a bare
+  `Converged`. The `VanishPart`/`TombstonePart` actions make the vanishing case
+  reachable; the invariant reads the store-derived `winnerPartPresent` witness,
+  mirroring
+  `crates/ravel-maintain/tests/tombstone_race.rs::rerun_with_revanished_part_fails_typed_not_converged`.
+- **DivergentInputSetNeverMutates**: a loser observing a record whose input-set
+  hash differs from its own fails closed with outcome `InputSetHashDivergence`
+  and never deletes or overwrites the record; the invariant reads the
+  store-derived `recOverwritten` witness, not the action's own claim.
 
 Liveness (against `MCFairSpec`; fairness: weak fairness on time passing, on the
 holder's acquire, and on the thief's observe and steal; environment: a paused

@@ -5,34 +5,45 @@ This verifies the protocol designs; implementation conformance is argued in
 `traceability.md` and asserted by the named Rust tests, not proved.
 
 - Tool: `tla2tools` 1.7.4 (TLC2 version 2.19), Java 21 (Temurin).
-- Host: `rp2` (4 cores).
-- Run id: `20260903T023102Z-0d8d5d780b5aa9d3bb58f5a1f283d28cfba3ae44`
-  (`scripts/check-tla.sh all -a maintenance`, one coherent run).
-- Figures copied verbatim from `.cache/tla/last-run.tsv` for that run id.
+- Host: fleet executor (4 cores, 8 GB).
+- Run id: `20260903T055341Z-c5e6a6bb3a38baef0617a8b6f3cbd3ae4b5f9ff5`
+  (`scripts/check-tla.sh ci -a maintenance`, one coherent run: smoke, negative,
+  traceability).
+- Smoke and negative figures copied verbatim from `.cache/tla/last-run.tsv` for
+  that run id. The exhaustive configs were not run by this executor; their rows
+  carry no re-measured figures.
 
 ## Configurations
 
 | cfg | TLC | states | distinct | depth | seconds | host | result |
 |---|---|---|---|---|---|---|---|
-| MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 15955521 | 1247232 | 20 | 36 | rp2 | PASS |
-| MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 3649907 | 231072 | 17 | 77 | rp2 | PASS |
-| MCCompactionClaims.smoke.cfg | 1.7.4 | 1696352 | 393257 | 13 | 10 | rp2 | PASS |
-| MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 10 | 1 | rp2 | PASS |
-| negative/ownership-as-publication-authority.cfg | 1.7.4 | 5948 | 1582 | - | 2 | rp2 | VIOLATED |
-| negative/heartbeat-memo-cas.cfg | 1.7.4 | 82 | 55 | - | 1 | rp2 | VIOLATED |
-| negative/memo-overstamp.cfg | 1.7.4 | 530 | 226 | - | 1 | rp2 | VIOLATED |
-| negative/zero-ownership-phantom.cfg | 1.7.4 | 121747 | 21573 | - | 4 | rp2 | VIOLATED |
-| negative/claim-completion-without-cas.cfg | 1.7.4 | 14612 | 6044 | - | 2 | rp2 | VIOLATED |
-| negative/claim-delete-unconditional.cfg | 1.7.4 | 55 | 39 | - | 2 | rp2 | VIOLATED |
-| negative/claim-as-publication-authority.cfg | 1.7.4 | 7700 | 3453 | - | 1 | rp2 | VIOLATED |
+| MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 23945345 | 1837440 | 21 | 41 | fleet executor | PASS |
+| MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | - | - | - | - | - | not run by executor |
+| MCCompactionClaims.smoke.cfg | 1.7.4 | 58416976 | 9574631 | 17 | 140 | fleet executor | PASS |
+| MCCompactionClaims.exhaustive.cfg | 1.7.4 | - | - | - | - | - | not run by executor |
+| negative/ownership-as-publication-authority.cfg | 1.7.4 | 9362 | 2998 | - | 2 | fleet executor | VIOLATED |
+| negative/heartbeat-memo-cas.cfg | 1.7.4 | 115 | 100 | - | 1 | fleet executor | VIOLATED |
+| negative/memo-overstamp.cfg | 1.7.4 | 1510 | 560 | - | 1 | fleet executor | VIOLATED |
+| negative/mo-diverge-overwrites-record.cfg | 1.7.4 | 1097 | 531 | - | 1 | fleet executor | VIOLATED |
+| negative/mo-missing-part-reports-converged.cfg | 1.7.4 | 13362 | 4200 | - | 1 | fleet executor | VIOLATED |
+| negative/zero-ownership-phantom.cfg | 1.7.4 | 8433521 | 1607346 | - | 64 | fleet executor | VIOLATED |
+| negative/claim-completion-without-cas.cfg | 1.7.4 | 26776 | 11849 | - | 2 | fleet executor | VIOLATED |
+| negative/claim-delete-unconditional.cfg | 1.7.4 | 109 | 75 | - | 1 | fleet executor | VIOLATED |
+| negative/claim-as-publication-authority.cfg | 1.7.4 | 9601 | 4802 | - | 2 | fleet executor | VIOLATED |
+| negative/steal-ignores-cas.cfg | 1.7.4 | 18817 | 8767 | - | 2 | fleet executor | VIOLATED |
+| negative/guarded-publish-ignores-claim.cfg | 1.7.4 | 233 | 148 | - | 1 | fleet executor | VIOLATED |
+| negative/diverge-overwrites-record.cfg | 1.7.4 | 999 | 565 | - | 1 | fleet executor | VIOLATED |
+| negative/missing-part-reports-converged.cfg | 1.7.4 | 8354 | 4204 | - | 2 | fleet executor | VIOLATED |
 
-The four PASS configurations are banded in `bands.tsv`; the negative controls
+The two smoke configurations and the two exhaustive configurations are banded in
+`bands.tsv`; the smoke bands were re-measured this run, the exhaustive bands are
+carried from the prior full run and were not re-run here. The negative controls
 stop at the first counterexample and carry no band. Every smoke config completes
-well under the 120 s ceiling and every exhaustive config well under 30 minutes.
-The `distinct` counts are deterministic; the reported search `depth` varies by a
-step or two between runs under TLC's parallel BFS (`-workers auto`), so the depth
-bands are a small range around the observed value rather than an exact figure
-(the figures in the table above are from the named run id).
+under the 300 s smoke budget. The `distinct` counts are deterministic; the
+reported search `depth` varies by a step or two between runs under TLC's parallel
+BFS (`-workers auto`), so the depth bands are a small range around the observed
+value rather than an exact figure (the figures in the table above are from the
+named run id).
 
 ## Constants chosen for exhaustive
 
@@ -74,10 +85,25 @@ recorded is a negative control (a single flipped constant), classified here.
   membership design accepts that asymmetric views can leave a unit
   transiently unattended, and correctness never depends on it.
 - `claim-completion-without-cas`, `claim-delete-unconditional`,
-  `claim-as-publication-authority` (safety): the three ADR-1029 hazards the
-  design forbids. Classification: **design demonstration**; the proposed design
-  uses CasVersion, never deletes, and never treats a claim as publication
-  authority.
+  `claim-as-publication-authority`, `steal-ignores-cas`,
+  `guarded-publish-ignores-claim` (safety): the ADR-1029 hazards the design
+  forbids. Classification: **design demonstration**; the proposed design uses
+  CasVersion, never deletes, treats no claim as publication authority, consumes a
+  version token at most once, and abandons the guarded path on a lost claim.
+- `diverge-overwrites-record` / `mo-diverge-overwrites-record` and
+  `missing-part-reports-converged` / `mo-missing-part-reports-converged`
+  (safety, F6/F7): fail-closed convergence (ADR-1113 D3), one pair per model. The
+  first flips `DivergeOverwritesRecord = TRUE` so a loser with a divergent
+  input-set hash overwrites the record; `DivergentInputSetNeverMutates` catches
+  it via the store version delta. The second flips
+  `MissingPartReportsConverged = TRUE` so a loser reports `Converged` while the
+  winning part is tombstoned; `MergeAttemptsConverge` catches it via the
+  store-derived `winnerPartPresent` witness. Classification: **model
+  demonstration of a required clause**; the shipped resolution reports
+  `ConvergedWinnerPartMissing` or `InputSetHashDivergence` and mutates nothing.
+  Prose walks in `negative/counterexamples/`; the scratch-mutant walks that
+  confirm the witnesses are store-derived, not self-reported, are in
+  `counterexamples/`.
 
 ## Non-vacuity of the named invariants
 
@@ -87,12 +113,18 @@ control that flips exactly one constant:
 - Ownership: `QueryVisibleDataCorrectUnderDuplicateOwnership` is violated by
   flipping `OwnerPublishOverwrite = TRUE`
   (`ownership-as-publication-authority`). Additionally
-  `HeartbeatAndMemoNeverCas` is violated by `HeartbeatMemoUsesCas = TRUE`
-  and `MemoNeverExtendsFreshnessPastSnapshot` by `MemoOverstamp = TRUE`.
+  `HeartbeatAndMemoNeverCas` is violated by `HeartbeatMemoUsesCas = TRUE`,
+  `MemoNeverExtendsFreshnessPastSnapshot` by `MemoOverstamp = TRUE`,
+  `DivergentInputSetNeverMutates` by `DivergeOverwritesRecord = TRUE`
+  (`mo-diverge-overwrites-record`), and `MergeAttemptsConverge` by
+  `MissingPartReportsConverged = TRUE` (`mo-missing-part-reports-converged`).
 - Claims: `StaleOwnerCannotOverwriteNewerClaim` is violated by flipping
   `CompletionOverwrite = TRUE` (`claim-completion-without-cas`). Additionally
-  `NoUnconditionalClaimDelete` is violated by `AllowClaimDelete = TRUE` and
-  `ClaimGrantsNoPublicationAuthority` by `ClaimIsPublicationAuthority = TRUE`.
+  `NoUnconditionalClaimDelete` is violated by `AllowClaimDelete = TRUE`,
+  `ClaimGrantsNoPublicationAuthority` by `ClaimIsPublicationAuthority = TRUE`,
+  `DivergentInputSetNeverMutates` by `DivergeOverwritesRecord = TRUE`
+  (`diverge-overwrites-record`), and `MergeAttemptsConverge` by
+  `MissingPartReportsConverged = TRUE` (`missing-part-reports-converged`).
 
 ## Where the model and the code differ
 

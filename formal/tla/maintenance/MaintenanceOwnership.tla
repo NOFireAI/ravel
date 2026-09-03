@@ -10,8 +10,12 @@
 (*    stamped with the writer's clock (WorkerSet::write_heartbeat);            *)
 (*  * the live set as self plus every sibling whose stamp is within a          *)
 (*    bidirectional staleness window of the reader's clock, self always        *)
-(*    included, fail-open to the previous set on a read error                  *)
-(*    (WorkerSet::live_set, is_stale, DEFAULT_LIVENESS_FACTOR);                *)
+(*    included (WorkerSet::live_set, is_stale, DEFAULT_LIVENESS_FACTOR); the   *)
+(*    fail-open on a read error is the CALLER's, not this helper: run_loop's   *)
+(*    discovery arm reuses the last live set the heartbeat watch published     *)
+(*    (services/ravel-server maintain.rs run_loop, live_rx.borrow().clone()),  *)
+(*    so a failed refresh keeps the previous set; the scrub loop's own         *)
+(*    read-fault fallback is out of scope (see README);                        *)
 (*  * rendezvous ownership as a deterministic argmax of an injected weight     *)
 (*    table over the live set (owner, owns, owns_unit); the table STANDS IN    *)
 (*    for blake3(unit_key || process_id), which the model does not compute;    *)
@@ -67,6 +71,7 @@ CONSTANTS
                     \* different variant, hence a different input_set_hash)
     Canon,          \* the variant a background owner attempts (in Variants)
     NoC,            \* NoContent sentinel for the store instance
+    MaintTok,       \* content marker for the self-owned heartbeat/memo keys
     NoRec,          \* firstRecord sentinel: no record has been published yet
     H,              \* heartbeat interval (DEFAULT_HEARTBEAT_INTERVAL)
     Factor,         \* liveness factor (DEFAULT_LIVENESS_FACTOR); window = Factor*H
@@ -77,11 +82,20 @@ CONSTANTS
     AllowCrash      \* TRUE: workers may crash and revive (membership churn)
 
 ASSUME Canon \in Variants
+ASSUME MaintTok \notin ({NoC} \cup {<<u, v>> : u \in Units, v \in Variants})
 ASSUME PH \notin Workers
 ASSUME H \in Nat /\ Factor \in Nat /\ MaxT \in Nat
 ASSUME Phantom \in BOOLEAN /\ AllowCrash \in BOOLEAN
 
 Window == Factor * H
+
+\* One representative worker performs the durable heartbeat/memo OBJECT writes.
+\* The put-mode property (HeartbeatAndMemoNeverCas) is per-write and independent
+\* of which worker issues it, so a single writer observes it faithfully; letting
+\* every worker mint its own monotone store version multiplies the write-ordering
+\* combinatorics against the compaction plane's versions for no added coverage.
+\* Every worker still refreshes its membership STAMP logically (WriteHeartbeat).
+PersistWorker == CHOOSE w \in Workers : \A x \in Workers : w =< x
 
 \* Rendezvous weight: a deterministic total order over (unit, worker) standing
 \* in for blake3(unit_key || process_id). Monotone in the worker id: this is a
@@ -93,9 +107,24 @@ Weight(u, m) == IF m = PH THEN PhantomWeight ELSE RealWeight(u, m)
 \* --- compaction plane keys and contents (drive the store instance) ----------
 RecordKey(u)  == <<"rec", u>>
 PartKey(u, v) == <<"part", u, v>>
+\* Self-owned membership/memo keys, actually written to the store (F2): the
+\* heartbeat key sys/maintain/workers/<id> and the memo key sys/maintain/memo/<id>.
+HbKey(w)      == <<"hb", w>>
+MemoKey(w)    == <<"memo", w>>
 OKeys    == {RecordKey(u) : u \in Units}
               \cup {PartKey(u, v) : u \in Units, v \in Variants}
-OContent == {NoC} \cup {<<u, v>> : u \in Units, v \in Variants}
+              \cup {HbKey(w) : w \in Workers}
+              \cup {MemoKey(w) : w \in Workers}
+\* A payload marker for the self-owned keys. Content is irrelevant to the checked
+\* property: the store mints a fresh version on every Overwrite regardless of
+\* content, so repeated self-owned writes advance the key's version and the
+\* witness reads that version delta. MaintTok is a distinguished model value (like
+\* NoC), which keeps these markers safely outside the <<unit, variant>> tuple
+\* space; TLC compares model values against tuples without a type error.
+HbContent(w)   == MaintTok
+MemoContent(w) == MaintTok
+OContent == {NoC, MaintTok}
+              \cup {<<u, v>> : u \in Units, v \in Variants}
 
 VARIABLES
     \* --- the object store instance (compaction plane) ---
@@ -111,12 +140,29 @@ VARIABLES
     firstRecord,     \* [Units -> OContent \cup {NoRec}] content of the winning record
     attemptedByOwner,\* [Units -> BOOLEAN] some in-view owner attempted the unit
     cliCorrect,      \* BOOLEAN a non-owner (CLI) published a winning record
-    lastMaint        \* the most recent heartbeat/memo/seed step (put mode, clamp)
+    lastMaint,       \* the most recent heartbeat/memo/seed step (put mode, clamp)
+    partTomb,        \* [Units -> [Variants -> BOOLEAN]] a part key deleted and
+                     \* not re-PUTtable (a tombstone/GC the rerun cannot recreate)
+    lastPub          \* the outcome of the most recent publish resolution, with
+                     \* store-observed witnesses (never a self-reported label)
 
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           now, hbStamp, crashed, cachedLive, memoSnap,
-          firstRecord, attemptedByOwner, cliCorrect, lastMaint>>
+          firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+          partTomb, lastPub>>
+
+\* The publication-resolution outcome alphabet (ADR-1113 D3), mirroring
+\* publish.rs::resolve_already_exists: the CreateIfAbsent winner is Published; a
+\* later attempt that finds the record present converges on it (Converged), or
+\* re-PUTs a transiently vanished winner part and converges, or fails closed when
+\* the winner part vanished and is not re-PUTtable (ConvergedWinnerPartMissing),
+\* or refuses to touch a record whose input set diverges from its own
+\* (InputSetHashDivergence). Abandoned is carried for alphabet parity with the
+\* claim model; this ownership model has no cancellation checkpoint, so it is not
+\* reached here.
+PubOutcomes == {"none", "Published", "Converged", "Abandoned",
+                "ConvergedWinnerPartMissing", "InputSetHashDivergence"}
 
 INSTANCE RavelObjectStore
     WITH Keys <- OKeys, Content <- OContent, NoContent <- NoC, Clients <- {}
@@ -131,8 +177,11 @@ Stale(s) == \/ now - hbStamp[s] > Window
             \/ hbStamp[s] - now > Window
 
 \* The live set: self always included, every fresh sibling, plus the phantom
-\* when injected. Fail-open to the previous cachedLive on a read error is
-\* modeled by the ABSENCE of a ComputeLive step (the worker keeps its frozen set).
+\* when injected. The fail-open on a read error is the CALLER's, not this
+\* computation: run_loop's discovery arm reuses the last set the heartbeat watch
+\* channel published (live_rx.borrow().clone()), so a failed refresh keeps the
+\* previous set. The model captures that as the ABSENCE of a ComputeLive step
+\* (the worker keeps its frozen cachedLive).
 LiveView(w) == { s \in Workers : s = w \/ ~Stale(s) }
                  \cup (IF Phantom THEN {PH} ELSE {})
 
@@ -153,8 +202,11 @@ OTypeOK ==
     /\ attemptedByOwner \in [Units -> BOOLEAN]
     /\ cliCorrect \in BOOLEAN
     /\ lastMaint \in [class: {"none", "heartbeat", "memo", "seed"},
-                      mode: {"none", "Overwrite", "CasVersion"},
-                      val: Int, bound: Int]
+                      verBefore: Nat, verAfter: Nat,
+                      maxExcess: Int]
+    /\ partTomb \in [Units -> [Variants -> BOOLEAN]]
+    /\ lastPub \in [outcome: PubOutcomes,
+                    winnerPartPresent: BOOLEAN, recOverwritten: BOOLEAN]
 
 Init ==
     /\ StoreInit
@@ -166,32 +218,59 @@ Init ==
     /\ firstRecord = [u \in Units |-> NoRec]
     /\ attemptedByOwner = [u \in Units |-> FALSE]
     /\ cliCorrect = FALSE
-    /\ lastMaint = [class |-> "none", mode |-> "none", val |-> 0, bound |-> 0]
+    /\ lastMaint = [class |-> "none", verBefore |-> 0, verAfter |-> 0, maxExcess |-> 0]
+    /\ partTomb = [u \in Units |-> [v \in Variants |-> FALSE]]
+    /\ lastPub = [outcome |-> "none", winnerPartPresent |-> FALSE,
+                  recOverwritten |-> FALSE]
 
 \* --- Membership actions -----------------------------------------------------
 
-\* WorkerSet::write_heartbeat: Overwrite of sys/maintain/workers/<id>, stamped
-\* with the writer's own clock. Self-owned; never a CAS.
+\* WorkerSet::write_heartbeat has two views the model separates so the store
+\* version does not churn once per clock (the put MODE is frequency-invariant, so
+\* re-writing the same mode adds property coverage of nothing and only multiplies
+\* version orderings). WriteHeartbeat refreshes the advisory STAMP that live_set
+\* reads for staleness (logical, per clock, no store write); PersistHeartbeat
+\* below is the durable OBJECT write whose put mode the invariant observes.
 WriteHeartbeat(w) ==
     /\ ~crashed[w]
+    /\ hbStamp[w] < now
     /\ hbStamp' = [hbStamp EXCEPT ![w] = now]
-    /\ lastMaint' = [class |-> "heartbeat", mode |-> "Overwrite",
-                     val |-> now, bound |-> now]
     /\ UNCHANGED <<sVars, now, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
+
+\* The durable heartbeat OBJECT write (Overwrite of sys/maintain/workers/<id>),
+\* self-owned and never a CAS. Bounded to once per key: the put mode does not vary
+\* with frequency, so a single write suffices to observe it. The witness records
+\* the key's stored version before and after, so the invariant observes that the
+\* write landed unconditionally (a fresh version) rather than a self-report.
+PersistHeartbeat(w) ==
+    /\ w = PersistWorker
+    /\ ~crashed[w]
+    /\ ~Present(HbKey(w))
+    /\ PutOverwrite(HbKey(w), HbContent(w))
+    /\ lastMaint' = [class |-> "heartbeat",
+                     verBefore |-> VersionOf(HbKey(w)),
+                     verAfter |-> store'[HbKey(w)].version,
+                     maxExcess |-> 0]
+    /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
+                   firstRecord, attemptedByOwner, cliCorrect,
+                   partTomb, lastPub>>
 
 Tick ==
     /\ now < MaxT
     /\ now' = now + 1
     /\ UNCHANGED <<sVars, hbStamp, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
 
 Crash(w) ==
     /\ AllowCrash
     /\ ~crashed[w]
     /\ crashed' = [crashed EXCEPT ![w] = TRUE]
     /\ UNCHANGED <<sVars, now, hbStamp, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
 
 \* A restart takes a fresh incarnation heartbeat (the old key lingers, abstracted
 \* per the header): re-heartbeat at the current clock.
@@ -200,7 +279,8 @@ Revive(w) ==
     /\ crashed' = [crashed EXCEPT ![w] = FALSE]
     /\ hbStamp' = [hbStamp EXCEPT ![w] = now]
     /\ UNCHANGED <<sVars, now, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
 
 \* WorkerSet::live_set snapshotted once at the head of a discovery cycle
 \* (run_discovery_cycle threads one live set through every unit).
@@ -208,7 +288,8 @@ ComputeLive(w) ==
     /\ ~crashed[w]
     /\ cachedLive' = [cachedLive EXCEPT ![w] = LiveView(w)]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
 
 \* --- Compaction publication -------------------------------------------------
 
@@ -216,21 +297,59 @@ ComputeLive(w) ==
 \* so a second PUT of the same logical part is AlreadyExists and identical
 \* (crates/ravel-maintain/src/build.rs::put_part).
 PutPart(u, v) ==
+    /\ ~partTomb[u][v]
     /\ PutCreateIfAbsent(PartKey(u, v), <<u, v>>)
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
 
 \* The winner's terminal record PUT (CreateIfAbsent) and the loser's convergence
-\* (publish_record_with_conservation, resolve_already_exists): the loser's
-\* CreateIfAbsent is a no-op (AlreadyExists); it reads the winner and either
-\* converges (same variant) or alarms on divergence, deleting nothing.
+\* over the shared object store, resolving exactly as
+\* publish_record_with_conservation and resolve_already_exists do. The outcome
+\* witness (lastPub) reads the store around the resolution (winnerPartPresent from
+\* store', recOverwritten from the record version delta), never a self-reported
+\* label:
+\*  * record absent: this attempter is the CreateIfAbsent winner -> Published;
+\*  * record present, a DIFFERENT input set: alarm, delete and overwrite
+\*    nothing -> InputSetHashDivergence;
+\*  * record present, same input set, winner part intact: Converged;
+\*  * record present, same input set, winner part transiently vanished but
+\*    re-PUTtable: re-PUT identical content-addressed bytes -> Converged;
+\*  * record present, same input set, winner part vanished and tombstoned
+\*    (not re-PUTtable): fail closed -> ConvergedWinnerPartMissing.
 DoPublish(u, v) ==
-    LET rk == RecordKey(u) IN
-    /\ Present(PartKey(u, v))
-    /\ PutCreateIfAbsent(rk, <<u, v>>)
-    /\ firstRecord' = IF ~Present(rk)
-                        THEN [firstRecord EXCEPT ![u] = <<u, v>>]
-                        ELSE firstRecord
+    LET rk  == RecordKey(u)
+        rp  == Present(rk)
+        wv  == IF rp /\ firstRecord[u] # NoRec THEN firstRecord[u][2] ELSE v
+        wpk == PartKey(u, wv)
+    IN
+    IF ~rp
+      THEN /\ Present(PartKey(u, v))
+           /\ PutCreateIfAbsent(rk, <<u, v>>)
+           /\ firstRecord' = [firstRecord EXCEPT ![u] = <<u, v>>]
+           /\ lastPub' = [outcome |-> "Published",
+                          winnerPartPresent |-> store'[PartKey(u, v)].present,
+                          recOverwritten |-> FALSE]
+      ELSE IF v # wv
+        THEN /\ UNCHANGED <<sVars, firstRecord>>
+             /\ lastPub' = [outcome |-> "InputSetHashDivergence",
+                            winnerPartPresent |-> Present(wpk),
+                            recOverwritten |-> FALSE]
+        ELSE IF Present(wpk)
+          THEN /\ UNCHANGED <<sVars, firstRecord>>
+               /\ lastPub' = [outcome |-> "Converged",
+                              winnerPartPresent |-> TRUE,
+                              recOverwritten |-> FALSE]
+          ELSE IF ~partTomb[u][wv]
+            THEN /\ PutCreateIfAbsent(wpk, <<u, wv>>)
+                 /\ UNCHANGED firstRecord
+                 /\ lastPub' = [outcome |-> "Converged",
+                                winnerPartPresent |-> store'[wpk].present,
+                                recOverwritten |-> FALSE]
+            ELSE /\ UNCHANGED <<sVars, firstRecord>>
+                 /\ lastPub' = [outcome |-> "ConvergedWinnerPartMissing",
+                                winnerPartPresent |-> FALSE,
+                                recOverwritten |-> FALSE]
 
 \* run_tick_with_clock: an in-view owner attempts its unit with the canonical
 \* variant. Ownership gates which unit a worker attempts; it does NOT gate the
@@ -242,7 +361,7 @@ WorkerRecord(w, u) ==
     /\ DoPublish(u, Canon)
     /\ attemptedByOwner' = [attemptedByOwner EXCEPT ![u] = TRUE]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   cliCorrect, lastMaint>>
+                   cliCorrect, lastMaint, partTomb>>
 
 \* The ungated CLI path (services/ravel-cli/src/maintain.rs): publishes any unit
 \* and any variant with no heartbeat and no ownership. A CLI actor is always a
@@ -255,20 +374,22 @@ CliRecord(u, v) ==
     /\ DoPublish(u, v)
     /\ cliCorrect' = TRUE
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   attemptedByOwner, lastMaint>>
+                   attemptedByOwner, lastMaint, partTomb>>
 
 \* --- Maintain memo ----------------------------------------------------------
 
-\* write_memo_snapshot: Overwrite of sys/maintain/memo/<id>. verU is an entry's
-\* verified stamp; it MAY exceed the snapshot time (a future/skewed entry), which
-\* the seed path clamps.
+\* The memo snapshot's freshness DATA, refreshed logically (per clock, no store
+\* write) exactly as WriteHeartbeat refreshes the heartbeat stamp. verU is an
+\* entry's verified stamp; it MAY exceed the snapshot time (a future/skewed
+\* entry), which the seed path clamps. PersistMemo below is the durable OBJECT
+\* write whose put mode the invariant observes.
 WriteMemo(w) ==
     /\ ~crashed[w]
+    /\ memoSnap[w].snapNs < now
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> now, verU |-> now]]
-    /\ lastMaint' = [class |-> "memo", mode |-> "Overwrite",
-                     val |-> now, bound |-> now]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
-                   firstRecord, attemptedByOwner, cliCorrect>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
 
 \* A future/skewed entry: the snapshot records an entry verified AFTER its own
 \* snapshot_unix_ns (a clock ahead of the snapshot-writing clock). This is the
@@ -276,18 +397,36 @@ WriteMemo(w) ==
 FutureEntry(w) ==
     /\ ~crashed[w]
     /\ now < MaxT
+    /\ memoSnap[w].snapNs < now
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> now, verU |-> now + 1]]
-    /\ lastMaint' = [class |-> "memo", mode |-> "Overwrite",
-                     val |-> now, bound |-> now]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
-                   firstRecord, attemptedByOwner, cliCorrect>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
+
+\* write_memo_snapshot: the durable memo OBJECT write (Overwrite of
+\* sys/maintain/memo/<id>), self-owned and never a CAS. Bounded to once per key
+\* for the same reason as PersistHeartbeat: the put mode is frequency-invariant.
+\* The witness reads the stored version before and after.
+PersistMemo(w) ==
+    /\ w = PersistWorker
+    /\ ~crashed[w]
+    /\ ~Present(MemoKey(w))
+    /\ PutOverwrite(MemoKey(w), MemoContent(w))
+    /\ lastMaint' = [class |-> "memo",
+                     verBefore |-> VersionOf(MemoKey(w)),
+                     verAfter |-> store'[MemoKey(w)].version,
+                     maxExcess |-> 0]
+    /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
+                   firstRecord, attemptedByOwner, cliCorrect,
+                   partTomb, lastPub>>
 
 \* Corruption of a snapshot is treated as absent: snapNs = -1 removes it from the
 \* seed set (MemoSnapshotError, corruption treated as absent).
 CorruptMemo(w) ==
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> -1, verU |-> memoSnap[w].verU]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
-                   firstRecord, attemptedByOwner, cliCorrect, lastMaint>>
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
 
 \* Valid snapshots for w to seed from: not corrupt, and within the bidirectional
 \* staleness gate of w's clock.
@@ -298,22 +437,55 @@ ValidSnaps(w) == { x \in Workers :
 
 \* MaintainMemo::seed_from_snapshot: seed in-memory freshness from all valid
 \* snapshots, clamping each entry to that snapshot's snapshot_unix_ns
-\* (verified_ns = min(verified_ns, snapshot_unix_ns)). Modeled as a witness of
-\* the clamped value against its bound (the largest source snapshot time).
+\* (verified_ns = min(verified_ns, snapshot_unix_ns)). The witness is per entry:
+\* maxExcess is the largest amount by which any seeded entry's clamped value
+\* exceeds its OWN source snapshot time. The correct clamp never lets an entry
+\* read past its own snapshot, so maxExcess stays <= 0 regardless of any other
+\* entry with a larger snapshot.
 SeedMemo(w) ==
     /\ ~crashed[w]
     /\ LET valid == ValidSnaps(w)
-           clamped == { LET s == memoSnap[x]
-                        IN IF s.verU < s.snapNs THEN s.verU ELSE s.snapNs
-                        : x \in valid }
-           value == IF clamped = {} THEN 0 ELSE Max(clamped)
-           bnd == IF valid = {} THEN 0 ELSE Max({ memoSnap[x].snapNs : x \in valid })
-       IN lastMaint' = [class |-> "seed", mode |-> "none", val |-> value, bound |-> bnd]
+           excess == { LET s  == memoSnap[x]
+                           ev == IF s.verU < s.snapNs THEN s.verU ELSE s.snapNs
+                       IN ev - s.snapNs
+                       : x \in valid }
+           mx == IF excess = {} THEN 0 ELSE Max(excess)
+       IN lastMaint' = [class |-> "seed", verBefore |-> 0, verAfter |-> 0,
+                        maxExcess |-> mx]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive, memoSnap,
-                   firstRecord, attemptedByOwner, cliCorrect>>
+                   firstRecord, attemptedByOwner, cliCorrect,
+                   partTomb, lastPub>>
+
+\* A published winner part transiently disappears (a tombstone race, GC, or a
+\* delayed listing), and is re-PUTtable: a later convergence re-creates the
+\* identical content-addressed bytes. Models tombstone_race.rs's revanish path up
+\* to the point the part can still be recreated.
+VanishPart(u) ==
+    /\ firstRecord[u] # NoRec
+    /\ Present(PartKey(u, firstRecord[u][2]))
+    /\ ~partTomb[u][firstRecord[u][2]]
+    /\ Delete(PartKey(u, firstRecord[u][2]))
+    /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint,
+                   partTomb, lastPub>>
+
+\* The winner part vanishes and is tombstoned: it cannot be re-PUT (the rerun in
+\* tombstone_race.rs::rerun_with_revanished_part_fails_typed_not_converged sees a
+\* delete tombstone the content-addressed create cannot overwrite). One-shot per
+\* key. A later convergence on this unit must fail closed, never report Converged.
+TombstonePart(u) ==
+    /\ firstRecord[u] # NoRec
+    /\ ~partTomb[u][firstRecord[u][2]]
+    /\ partTomb' = [partTomb EXCEPT ![u][firstRecord[u][2]] = TRUE]
+    /\ IF Present(PartKey(u, firstRecord[u][2]))
+         THEN Delete(PartKey(u, firstRecord[u][2]))
+         ELSE UNCHANGED sVars
+    /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
+                   firstRecord, attemptedByOwner, cliCorrect, lastMaint, lastPub>>
 
 Next ==
     \/ \E w \in Workers : WriteHeartbeat(w)
+    \/ \E w \in Workers : PersistHeartbeat(w)
     \/ Tick
     \/ \E w \in Workers : Crash(w)
     \/ \E w \in Workers : Revive(w)
@@ -323,8 +495,11 @@ Next ==
     \/ \E u \in Units, v \in Variants : CliRecord(u, v)
     \/ \E w \in Workers : WriteMemo(w)
     \/ \E w \in Workers : FutureEntry(w)
+    \/ \E w \in Workers : PersistMemo(w)
     \/ \E w \in Workers : CorruptMemo(w)
     \/ \E w \in Workers : SeedMemo(w)
+    \/ \E u \in Units : VanishPart(u)
+    \/ \E u \in Units : TombstonePart(u)
 
 Spec == Init /\ [][Next]_vars
 
@@ -350,14 +525,48 @@ QueryVisibleDataCorrectUnderDuplicateOwnership ==
     /\ \A u \in Units, v \in Variants :
          Present(PartKey(u, v)) => ContentOf(PartKey(u, v)) = <<u, v>>
 
-\* Heartbeat and memo writes are Overwrite, never CAS (self-owned keys).
+\* Heartbeat and memo writes are Overwrite, never CAS (self-owned keys). Observed
+\* through the store: an Overwrite always mints a fresh version, so the written
+\* key's stored version strictly advances. A CAS gated on a version token can
+\* fail its precondition and leave the key unchanged, which this catches: for the
+\* last heartbeat/memo write, the stored version after exceeds the version before.
+\* (Broken by the heartbeat-memo-cas control, which performs a real CAS.)
 HeartbeatAndMemoNeverCas ==
-    lastMaint.class \in {"heartbeat", "memo"} => lastMaint.mode = "Overwrite"
+    lastMaint.class \in {"heartbeat", "memo"} =>
+        lastMaint.verAfter > lastMaint.verBefore
 
 \* Seeding never lets an in-memory entry read fresher than the snapshot it came
-\* from: the clamped value never exceeds its source snapshot's time.
+\* from: for EVERY seeded entry, its clamped value never exceeds its own source
+\* snapshot's time. Stated per entry, not as an aggregate Max over all snapshots:
+\* an aggregate bound would pass whenever some other entry has a larger snapshot,
+\* which is the gap the review found. maxExcess is the worst per-entry overshoot.
+\* (Broken by the memo-overstamp control, which skips the per-entry clamp.)
 MemoNeverExtendsFreshnessPastSnapshot ==
-    lastMaint.class = "seed" => lastMaint.val =< lastMaint.bound
+    lastMaint.class = "seed" => lastMaint.maxExcess =< 0
+
+\* Merge attempts converge or fail closed (ADR-1113 D3), stated for a world where
+\* a part can vanish. A resolution reports Converged only when the winner part is
+\* actually present, and reports ConvergedWinnerPartMissing exactly when the winner
+\* part has vanished and is not re-PUTtable (tombstoned) -- it never silently
+\* claims convergence over a missing part. winnerPartPresent is read from the store
+\* at the moment of resolution (store' in DoPublish), never a self-reported label,
+\* so a mutant that labels a missing-part resolution "Converged" is caught. A
+\* transiently vanished, re-PUTtable part is not a violation: the resolution re-PUTs
+\* identical content-addressed bytes and reports Converged with the part present
+\* again. See README (F6/F7). (Broken by the missing-part-reports-converged switch.)
+MergeAttemptsConverge ==
+    /\ (lastPub.outcome = "Converged" => lastPub.winnerPartPresent)
+    /\ (lastPub.outcome = "ConvergedWinnerPartMissing" => ~lastPub.winnerPartPresent)
+
+\* A divergent input set alarms and mutates nothing: the loser neither overwrites
+\* the terminal record nor deletes any part. recOverwritten is the store-observed
+\* record version delta across the resolution (FALSE means the record version did
+\* not move), so a mutant that overwrites the record on divergence -- even to
+\* identical content, which still mints a new version -- is caught. The divergent
+\* branch of DoPublish is UNCHANGED store, so no part is deleted either. (Broken by
+\* the diverge-overwrites-record switch.)
+DivergentInputSetNeverMutates ==
+    lastPub.outcome = "InputSetHashDivergence" => ~lastPub.recOverwritten
 
 \* --- Fairness and liveness --------------------------------------------------
 \* Weak fairness only on the actions the implementation justifies: a maintainer
