@@ -358,7 +358,12 @@ impl QueryEngine {
             .with_max_concurrent_gets(config.fetch_concurrency)
             .with_request_cost_bytes(config.logs_request_cost_bytes)
             .with_max_fetch_run_bytes(fetch_run_bytes)
-            .unwrap_or_else(|_| {
+            .unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    fetch_run_bytes,
+                    "invalid logs_max_fetch_run_bytes; using the log fetcher's default bound"
+                );
                 LogSegmentFetcher::new(store.clone())
                     .with_block_range_threshold(config.logs_block_range_threshold)
                     .with_max_concurrent_gets(config.fetch_concurrency)
@@ -864,10 +869,7 @@ impl QueryEngine {
 
             let mut warnings = Vec::new();
             if self.federation.is_some() {
-                warnings.push(format!(
-                    "{} is answered by this cluster only; log series are not federated",
-                    metric.name()
-                ));
+                warnings.push(log_not_federated_warning(metric.name()));
             }
 
             let by_id = build_series_by_id(
@@ -1164,9 +1166,7 @@ impl QueryEngine {
         // populates for a skipped remote.
         if self.federation.is_some() {
             for name in fed_metric_names {
-                stats.warnings.push(format!(
-                    "{name} is answered by this cluster only; log series are not federated"
-                ));
+                stats.warnings.push(log_not_federated_warning(name));
             }
         }
 
@@ -2766,6 +2766,13 @@ mod name_filter_tests {
         let one_bypasses = vec![plan(re("^foo.*$")), plan(re("foo|bar"))];
         assert!(shared_equality_name_filter(&one_bypasses).is_none());
     }
+}
+
+/// ADR-1103 decision 5: a federated query answers a log selector locally
+/// only, never fanning it to a remote cluster. Shared by both call sites so
+/// the two `warnings` entries this produces cannot drift apart.
+fn log_not_federated_warning(name: &str) -> String {
+    format!("{name} is answered by this cluster only; log series are not federated")
 }
 
 /// Parses `query` as a bare vector selector (Phase 1 scope) and returns its

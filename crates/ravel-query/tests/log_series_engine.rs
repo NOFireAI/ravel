@@ -985,7 +985,6 @@ async fn series_endpoint_lists_log_series_for_a_log_selector() {
     values.sort_unstable();
     assert!(values.contains(&"ravel_log_lines"));
     assert!(values.contains(&"ravel_log_bytes"));
-    let _ = &mut values;
 }
 
 #[tokio::test]
@@ -1010,17 +1009,11 @@ async fn metadata_endpoint_always_includes_the_two_reserved_log_metrics() {
         MetadataCacheConfig::default(),
         Arc::new(SystemClock),
     ));
-    let mut tokens = HashMap::new();
-    tokens
-        .insert("secret-a".to_string(), th)
-        .into_iter()
-        .for_each(drop);
     let mut tok = HashMap::new();
     tok.insert("secret-a".to_string(), tid);
     let state = AppState::new(engine, Arc::new(StaticBearerTokenResolver::new(tok)))
         .with_metadata_cache(cache);
     let app = router(state);
-    let _ = &mut tokens;
 
     let (status, body) = call(&app, "/api/v1/metadata", Some("secret-a")).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");

@@ -103,8 +103,11 @@ additive only, no existing route changed:
 
 ADR-1103 decision 4 supersedes decision 2's empty-`data` claim for exactly
 two reserved family names, `ravel_log_lines` and `ravel_log_bytes`:
-`/api/v1/metadata` now always includes them for a request whose tenant
-resolves and whose cache is attached, alongside any real captured metadata.
+for a request whose tenant resolves and whose cache is attached, the
+*unfiltered* result now always includes them, alongside any real captured
+metadata, before the endpoint's `metric` and `limit` request filters are
+applied; a request that filters them out (e.g. `metric=does_not_exist`, or
+a `limit` too small to reach them) still excludes them from the response.
 These are definitions Ravel itself implements (query-time derived series
 over the logs signal), not guessed OTLP descriptors, so the "no inferred
 placeholder metadata" rejection above still holds for every other name.
