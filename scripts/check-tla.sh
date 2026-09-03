@@ -184,18 +184,52 @@ run_with_deadline() {
         cd "$cwd" && "$@" > "$logfile" 2>&1 &
         local pid=$!
         local deadline=$((SECONDS + budget))
+
+        terminate_group() {
+            kill -TERM -"$pid" 2>/dev/null
+            sleep 1
+            kill -KILL -"$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+        }
+        on_term() { terminate_group; exit 143; }
+        on_int()  { terminate_group; exit 130; }
+        on_hup()  { terminate_group; exit 129; }
+        trap on_term TERM
+        trap on_int INT
+        trap on_hup HUP
+
         while kill -0 "$pid" 2>/dev/null; do
             if [ "$SECONDS" -ge "$deadline" ]; then
-                kill -TERM -"$pid" 2>/dev/null
-                sleep 1
-                kill -KILL -"$pid" 2>/dev/null
-                wait "$pid" 2>/dev/null
+                terminate_group
                 exit 124
             fi
             sleep 2
         done
-        wait "$pid"
-    )
+        # TLC may exit during the sleep, after the deadline already passed:
+        # kill -0 goes false without the loop ever re-checking SECONDS, so
+        # `wait` alone would report TLC's own success as the verdict. Decide
+        # the verdict from the deadline, not from which side of that race won.
+        local code=0
+        wait "$pid" || code=$?
+        if [ "$SECONDS" -ge "$deadline" ]; then
+            exit 124
+        fi
+        exit "$code"
+    ) &
+    local watchdog_pid=$!
+    # The watchdog subshell keeps our own process group; only the TLC job it
+    # backgrounds under `set -m` gets a group of its own. So a plain
+    # `kill <our-pid>` from outside (a terminal interrupt, or a harness
+    # killing this script) never reaches the subshell on its own. Forward
+    # the signal to it directly so its own trap, where TLC's pid is in
+    # scope, actually runs and can tear down TLC's group.
+    trap 'kill -TERM "$watchdog_pid" 2>/dev/null' TERM
+    trap 'kill -INT  "$watchdog_pid" 2>/dev/null' INT
+    trap 'kill -HUP  "$watchdog_pid" 2>/dev/null' HUP
+    local code=0
+    wait "$watchdog_pid" || code=$?
+    trap - TERM INT HUP
+    return "$code"
 }
 
 # --- TLC invocation ---------------------------------------------------------
