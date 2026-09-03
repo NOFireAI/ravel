@@ -76,6 +76,11 @@ ReportsPartial == Signal = "logs"
 \* a pair names one flush.
 FlushIds == Writers \X Shards
 
+\* The client request a flush serves. A fresh pin serves its own request; a
+\* retry after a lost acknowledgement serves the ORIGINAL one. The sentinel is
+\* shaped like a flush id so TLC never compares a string with a tuple.
+NoReq == <<"norequest", "norequest">>
+
 NoC == "nocontent"
 AllContent == Contents \cup {NoC}
 
@@ -99,10 +104,18 @@ VARIABLES
     ackKind,    \* [FlushIds -> {"none","strict","buffered","timeout","error"}]
     marker,     \* "absent" | "written"
     \* --- witnesses: what a store operation actually returned --------------
-    lastPut,    \* the commit PUT's own outcome, read off the store
-    duplicates, \* commit records holding a content some other record holds
-    publishedAt \* [FlushIds -> 0..MaxTicks+1] tick the record write landed;
-                \* MaxTicks+1 means this pin never wrote one
+    lastPut,     \* the commit PUT's own outcome, read off the store
+    publishedAt, \* [FlushIds -> 0..MaxTicks+1] tick the record write landed
+    tombstoned,  \* SUBSET FlushIds: buckets retention has tombstoned
+    superseded,  \* SUBSET FlushIds: records a compaction or rewrite replaced
+    retryOf,     \* [FlushIds -> FlushIds \cup {NoReq}] the earlier attempt a
+                 \* flush is a client retry of. Only ClientRetry sets it, so
+                 \* it is what makes a duplicate a duplicate rather than two
+                 \* unrelated writes that happened to carry equal content
+    tokenResult  \* [FlushIds -> the answer a commit-token query gave, WITH the
+                 \* store state it saw: an answer is judged against the store
+                 \* as it was when the query ran, because a token that is not
+                 \* yet visible is a retryable failure, not a stale result
 
 Store == INSTANCE RavelObjectStore
             WITH Keys <- ObjKeys, Content <- AllContent,
@@ -117,10 +130,10 @@ AckKinds == {"none", "strict", "buffered", "timeout", "error"}
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
 
 protoVars == <<phase, pinned, openedAt, retries, clock, shardDead,
-               ackKind, marker, lastPut, duplicates, publishedAt>>
+               ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           phase, pinned, openedAt, retries, clock, shardDead,
-          ackKind, marker, lastPut, duplicates, publishedAt>>
+          ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
 
 \* The commit PUT witness: what the caller asked for, what the store already
 \* held, and what the operator returned. Invariants read THIS and the store,
@@ -141,7 +154,13 @@ TypeOK ==
     /\ lastPut \in [kind: {"none", "commit"}, flush: FlushIds,
                     mine: AllContent, stored: AllContent,
                     outcome: {"none", "Ok", "AlreadyExists", "SplitBrain"}]
-    /\ duplicates \in Nat
+    /\ retryOf \in [FlushIds -> FlushIds \cup {NoReq}]
+    /\ tombstoned \subseteq FlushIds
+    /\ superseded \subseteq FlushIds
+    /\ tokenResult \in [FlushIds -> [outcome: {"none", "served", "tombstoned",
+                                              "superseded", "unsatisfiable"},
+                                    present: BOOLEAN, tomb: BOOLEAN,
+                                    sup: BOOLEAN]]
     /\ publishedAt \in [FlushIds -> 0..(MaxTicks + 1)]
 
 Init ==
@@ -155,7 +174,12 @@ Init ==
     /\ ackKind = [f \in FlushIds |-> "none"]
     /\ marker = "absent"
     /\ lastPut = NoPut
-    /\ duplicates = 0
+    /\ retryOf = [f \in FlushIds |-> NoReq]
+    /\ tombstoned = {}
+    /\ superseded = {}
+    /\ tokenResult = [f \in FlushIds |->
+                        [outcome |-> "none", present |-> FALSE,
+                         tomb |-> FALSE, sup |-> FALSE]]
     /\ publishedAt = [f \in FlushIds |-> MaxTicks + 1]
 
 \* --- derived views ----------------------------------------------------------
@@ -172,6 +196,19 @@ AllShardsDurable ==
     \A s \in Shards : \E w \in Writers : Visible(<<w, s>>)
 
 Expired(f) == clock > openedAt[f] + FlushLifetime
+
+\* RetryDedups is a MUTATION, not shipped behaviour: a hypothetical
+\* exactly-once mechanism for logs and spans. It suppresses the commit WRITE,
+\* not the resend decision, and it guards every path that can write a commit
+\* record. Both matter. A check made before either write cannot exclude the
+\* other, because both attempts pass it; and guarding only the ordinary PUT
+\* leaves the lost-response PUT free to create the second record. Actions are
+\* atomic, so whichever write runs first disables the other.
+DedupSuppressed(f) ==
+    RetryDedups /\ \E h \in FlushIds :
+        /\ \/ retryOf[f] = h
+           \/ retryOf[h] = f
+        /\ Store!Present(CommitKey(h))
 
 \* ---------------------------------------------------------------------------
 \* Writer actions. Each names the Rust symbol that performs the transition.
@@ -192,7 +229,7 @@ PinFlush(f, c) ==
     \* action (BufferedAck) and is not what this switch models.
     /\ ackKind' = [ackKind EXCEPT ![f] =
                      IF AckAtEnqueue THEN "strict" ELSE @]
-    /\ UNCHANGED <<retries, clock, shardDead, marker, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<retries, clock, shardDead, marker, lastPut, tombstoned, superseded, retryOf, tokenResult>>
     /\ UNCHANGED sVars
 
 \* IngestRouter::write_points returning at enqueue in buffered mode: the client
@@ -201,8 +238,7 @@ BufferedAck(f) ==
     /\ phase[f] = "pinned"
     /\ ackKind[f] = "none"
     /\ ackKind' = [ackKind EXCEPT ![f] = "buffered"]
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead,
-                   marker, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
     /\ UNCHANGED sVars
 
 \* FlushCtx::put_data_object_with_retry -> publish::put_data_object.
@@ -214,8 +250,7 @@ PutData(f) ==
     /\ ~shardDead[f[2]]
     /\ Store!PutCreateIfAbsent(DataKey(f), pinned[f])
     /\ phase' = [phase EXCEPT ![f] = "data"]
-    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, ackKind,
-                   marker, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
 
 \* The response to the data PUT was lost: the effect landed, the caller saw a
 \* failure and retries the same pinned flush. The retry is the PutData step
@@ -227,8 +262,7 @@ PutDataLostResponse(f) ==
     /\ retries[f] < MaxRetries
     /\ Store!PutCreateIfAbsentLostResponse(DataKey(f), pinned[f])
     /\ retries' = [retries EXCEPT ![f] = @ + 1]
-    /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind,
-                   marker, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
 
 \* FlushCtx::publish_with_retry -> publish::publish_with_rng.
 \* PutMode::CreateIfAbsent. The client does not pre-classify the outcome: it
@@ -237,6 +271,7 @@ PutDataLostResponse(f) ==
 PutCommit(f) ==
     /\ \/ phase[f] = "data"
        \/ (CommitBeforeData /\ phase[f] = "pinned")   \* BROKEN switch
+    /\ ~DedupSuppressed(f)
     /\ ~Expired(f)
     /\ ~shardDead[f[2]]
     /\ LET k == CommitKey(f)
@@ -258,27 +293,15 @@ PutCommit(f) ==
                                            ELSE "committed"]
           /\ shardDead' = IF split THEN [shardDead EXCEPT ![f[2]] = TRUE]
                           ELSE shardDead
-          \* A retry after a lost acknowledgement, with no usable marker,
-          \* leaves a second durable record holding the same content. The
-          \* store dedups by key, so the model counts the event that the
-          \* at-least-once contract permits: a second commit for content that
-          \* another flush already committed.
           /\ publishedAt' = [publishedAt EXCEPT ![f] =
                                 IF Store!Present(k) THEN @ ELSE clock]
-          /\ duplicates' =
-               IF RetryDedups THEN duplicates
-               ELSE IF ~existed
-                       /\ \E g \in FlushIds :
-                             g # f /\ Store!Present(CommitKey(g))
-                             /\ Store!ContentOf(CommitKey(g)) = pinned[f]
-                    THEN duplicates + 1
-                    ELSE duplicates
-    /\ UNCHANGED <<pinned, openedAt, retries, clock, ackKind, marker>>
+    /\ UNCHANGED <<pinned, openedAt, retries, clock, ackKind, marker, tombstoned, superseded, retryOf, tokenResult>>
 
 \* The commit PUT landed and its response was lost. The caller retries the same
 \* pinned flush; that retry takes the AlreadyExists path above.
 PutCommitLostResponse(f) ==
     /\ phase[f] = "data"
+    /\ ~DedupSuppressed(f)
     /\ ~Expired(f)
     /\ ~shardDead[f[2]]
     /\ retries[f] < MaxRetries
@@ -286,8 +309,7 @@ PutCommitLostResponse(f) ==
                         IF Store!Present(CommitKey(f)) THEN @ ELSE clock]
     /\ Store!PutCreateIfAbsentLostResponse(CommitKey(f), pinned[f])
     /\ retries' = [retries EXCEPT ![f] = @ + 1]
-    /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind,
-                   marker, lastPut, duplicates>>
+    /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind, marker, lastPut, tombstoned, superseded, retryOf, tokenResult>>
 
 \* A transient store failure applies nothing; the caller retries.
 TransientFailure(f) ==
@@ -296,8 +318,7 @@ TransientFailure(f) ==
     /\ retries[f] < MaxRetries
     /\ Store!TransientFailure
     /\ retries' = [retries EXCEPT ![f] = @ + 1]
-    /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind,
-                   marker, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
 
 \* FlushCtx::ack_waiters, then the router's token collection and
 \* otlp_http::otlp_response. Strict mode acknowledges only after the commit
@@ -307,8 +328,7 @@ StrictAck(f) ==
     /\ ackKind[f] \in {"none", "buffered"}
     /\ phase' = [phase EXCEPT ![f] = "acked"]
     /\ ackKind' = [ackKind EXCEPT ![f] = "strict"]
-    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, marker,
-                   lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
     /\ UNCHANGED sVars
 
 \* WriteError::AckTimeout. The client's wait is dropped while the flush task
@@ -317,8 +337,7 @@ AckTimeout(f) ==
     /\ phase[f] \in {"pinned", "data"}
     /\ ackKind[f] = "none"
     /\ ackKind' = [ackKind EXCEPT ![f] = "timeout"]
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead,
-                   marker, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
     /\ UNCHANGED sVars
 
 \* WriteError::Abandoned. FlushCtx::bound_to_deadline races every attempt
@@ -328,8 +347,7 @@ Abandon(f) ==
     /\ Expired(f)
     /\ phase' = [phase EXCEPT ![f] = "abandoned"]
     /\ ackKind' = [ackKind EXCEPT ![f] = IF @ = "none" THEN "error" ELSE @]
-    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, marker,
-                   lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
     /\ UNCHANGED sVars
 
 \* A crash loses everything in memory. Durable objects stay; the pinned flush
@@ -344,7 +362,7 @@ Crash(f) ==
     /\ pinned' = [pinned EXCEPT ![f] = @]
     /\ retries' = [retries EXCEPT ![f] = 0]
     /\ ackKind' = [ackKind EXCEPT ![f] = IF @ = "none" THEN "error" ELSE @]
-    /\ UNCHANGED <<openedAt, clock, shardDead, marker, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<openedAt, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
     /\ UNCHANGED sVars
 
 \* ravel_ingest::write_marker, from the logs and traces handlers. The marker is
@@ -357,8 +375,7 @@ WriteMarker ==
        \/ (MarkerAfterFirstShard /\ DurableSet # {})   \* BROKEN switch
     /\ Store!PutCreateIfAbsent(MarkerKey, CHOOSE c \in Contents : TRUE)
     /\ marker' = "written"
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead,
-                   ackKind, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
 
 \* Accidental reuse of a commit identity with different content: the hazard
 \* ADR-0002 names. The protocol does not prevent it, it DETECTS it: the commit
@@ -374,14 +391,93 @@ ReuseIdentity(f, c) ==
     /\ openedAt' = [openedAt EXCEPT ![f] = clock]
     /\ retries' = [retries EXCEPT ![f] = 0]
     /\ publishedAt' = [publishedAt EXCEPT ![f] = MaxTicks + 1]
-    /\ UNCHANGED <<clock, shardDead, ackKind, marker, lastPut, duplicates>>
+    /\ UNCHANGED <<clock, shardDead, ackKind, marker, lastPut, tombstoned, superseded, retryOf, tokenResult>>
+    /\ UNCHANGED sVars
+
+\* A CLIENT retry after a lost acknowledgement. The first attempt's client saw
+\* a timeout or an error, so it resends the same payload; the gateway routes it
+\* to a fresh flush identity (`g`) carrying the SAME content. This is the
+\* transition that produces at-least-once delivery for logs and spans.
+\*
+\* RetryDedups is the BROKEN switch: it makes the retry consult the store for
+\* an existing record of the same content and skip publishing, which is
+\* exactly the exactly-once behaviour Ravel does not offer. It suppresses the
+\* WRITE, not a counter, so the obligation below is derived from the store.
+ClientRetry(f, g) ==
+    /\ f # g
+    \* A resend carries the same series, so the router picks the same shard.
+    \* The resend is therefore a different writer's attempt on that shard,
+    \* which is why the duplicate configurations use two writers and one
+    \* shard and every other configuration leaves this action disabled.
+    /\ g[2] = f[2]
+    \* One client resend per behaviour. A second resend adds interleavings
+    \* without adding an outcome: the duplicate obligation and the dedup
+    \* mutant are both settled by the first one.
+    /\ \A h \in FlushIds : retryOf[h] = NoReq
+    /\ ackKind[f] \in {"timeout", "error"}
+    /\ pinned[f] # NoC
+    /\ phase[g] = "idle"
+    /\ ~shardDead[g[2]]
+    /\ clock < MaxTicks
+    /\ ~(MarkersApply /\ marker = "written")   \* a usable marker replays instead
+    /\ phase' = [phase EXCEPT ![g] = "pinned"]
+    /\ pinned' = [pinned EXCEPT ![g] = pinned[f]]
+    /\ openedAt' = [openedAt EXCEPT ![g] = clock]
+    /\ publishedAt' = [publishedAt EXCEPT ![g] = MaxTicks + 1]
+    \* g is the client's resend of f, which is what makes a second durable
+    \* record a duplicate rather than an unrelated write of equal content
+    /\ retryOf' = [retryOf EXCEPT ![g] = f]
+    /\ UNCHANGED <<retries, clock, shardDead, ackKind, marker, lastPut, tombstoned, superseded, tokenResult>>
+    /\ UNCHANGED sVars
+
+\* Retention tombstones a bucket (retention::write_tombstone), and a compaction
+\* or erasure rewrite supersedes a record. Both are modelled only as far as a
+\* commit-token query must distinguish them.
+\* At most one bucket is retired per behaviour: the token invariant needs one
+\* retired bucket to distinguish its outcomes, and letting every flush be
+\* retired independently multiplies the state space without adding coverage.
+TombstoneBucket(f) ==
+    /\ Visible(f)
+    /\ tombstoned = {}
+    /\ superseded = {}
+    /\ f \notin tombstoned
+    /\ tombstoned' = tombstoned \cup {f}
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, superseded, retryOf, tokenResult>>
+    /\ UNCHANGED sVars
+
+SupersedeRecord(f) ==
+    /\ Visible(f)
+    /\ tombstoned = {}
+    /\ superseded = {}
+    /\ f \notin superseded
+    /\ f \notin tombstoned
+    /\ superseded' = superseded \cup {f}
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, retryOf, tokenResult>>
+    /\ UNCHANGED sVars
+
+\* Catalog::resolve_min_token: an exact-key GET on the commit key the token
+\* names, with the bucket listing behind it. The four outcomes are the shipped
+\* ones and each is decided from the STORE plus the tombstone and supersession
+\* state, never from what the writer believed.
+ResolveToken(f) ==
+    \* One token query per behaviour, for the same reason.
+    /\ \A g \in FlushIds : tokenResult[g].outcome = "none"
+    /\ pinned[f] # NoC
+    /\ tokenResult' = [tokenResult EXCEPT ![f] =
+            [outcome |-> IF Store!Present(CommitKey(f)) THEN "served"
+                         ELSE IF f \in tombstoned THEN "tombstoned"
+                         ELSE IF f \in superseded THEN "superseded"
+                         ELSE "unsatisfiable",
+             present |-> Store!Present(CommitKey(f)),
+             tomb    |-> f \in tombstoned,
+             sup     |-> f \in superseded]]
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf>>
     /\ UNCHANGED sVars
 
 Tick ==
     /\ clock < MaxTicks
     /\ clock' = clock + 1
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, shardDead, ackKind,
-                   marker, lastPut, duplicates, publishedAt>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
     /\ UNCHANGED sVars
 
 Next ==
@@ -397,6 +493,10 @@ Next ==
     \/ \E f \in FlushIds : Abandon(f)
     \/ \E f \in FlushIds : Crash(f)
     \/ \E f \in FlushIds, c \in Contents : ReuseIdentity(f, c)
+    \/ \E f, g \in FlushIds : ClientRetry(f, g)
+    \/ \E f \in FlushIds : TombstoneBucket(f)
+    \/ \E f \in FlushIds : SupersedeRecord(f)
+    \/ \E f \in FlushIds : ResolveToken(f)
     \/ WriteMarker
     \/ Tick
 
@@ -478,6 +578,20 @@ NoPublishAfterAbandon ==
 \* The marker is written only when every shard of the request is durable.
 MarkerImpliesAllShardsDurable ==
     (marker = "written") => AllShardsDurable
+
+\* A commit-token query includes the named commit, reports the bucket
+\* deliberately retired (tombstoned, or served through the record that
+\* superseded it), or fails explicitly. It never silently serves a stale
+\* result: every outcome is checked against the store, not against what the
+\* writer believed. (Broken by a resolution that answers "served" for an
+\* absent record, or "unsatisfiable" for a present one.)
+TokenNeverServesStale ==
+    \A f \in FlushIds :
+        LET r == tokenResult[f] IN
+        /\ (r.outcome = "served"        => r.present)
+        /\ (r.outcome = "unsatisfiable" => ~r.present /\ ~r.tomb /\ ~r.sup)
+        /\ (r.outcome = "tombstoned"    => r.tomb /\ ~r.present)
+        /\ (r.outcome = "superseded"    => r.sup /\ ~r.present)
 
 \* Logs report the durable tokens of a partial commit; metrics and spans do
 \* not. Stated over what the model may claim, so a variant that invents
