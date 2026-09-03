@@ -11,8 +11,7 @@ column names a gap where no test covers the behavior yet, or `none`.
 
 Three behaviors the model covers have no end-to-end production symbol yet (the
 `.dreq` write, the `.done` write, and the tick-skip on a failed hold refresh);
-those rows cite the nearest real gate or key builder and name the gap. See the
-final report for the out-of-scope finding.
+those rows cite the nearest real gate or key builder and name the gap.
 
 | TLA+ action or property | Meaning | Rust path and symbol | Existing test | New test needed |
 |---|---|---|---|---|
