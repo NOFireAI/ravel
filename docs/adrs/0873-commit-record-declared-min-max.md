@@ -1191,6 +1191,48 @@ flowchart TD
   claims in `CompactionPart` with ADR-0815's, first-to-land takes the
   lower numbers; this ADR claims only field 12.
 
+## Amendment: the .cstat carrier joins by entry identity and STR extrema stay .cstat-only
+
+Amended 2026-09-03. Two statements above do not describe the shipped reader.
+Decision 4 says both carriers of the union resolve through one segment
+identity, the data object's content hash. Decision 2 says a `.cstat` `STR`
+extremum is answered at `Precision::Exact` today and mandates a positive
+regression test for that. The code does neither, and the decision here is
+that the code is right and this document moves to it. The decisions' original
+text stands as written except where this section supersedes it.
+
+The `.cstat` side of the union joins by the entry identity the fold already
+writes into the object: ingest hour bucket, shard, writer id, writer epoch,
+and writer sequence. The stamp side joins by content hash in the only sense a
+stamp can, since it rides the resolved segment reference itself and that
+reference's content hash is the record's. Both lookups start from one
+resolved segment reference and read fields of that reference, so the two
+carriers are matched to the same segment through the reference rather than
+through two independently stored keys that could name different segments.
+That is what keeps this inside ADR-0942 rather than beside it. What it
+introduces is nothing: no new field on any object, no key a reader must
+store, compare across objects, or keep converging with another. The identity
+tuple is the fold's existing per-entry key and the content hash is the
+record's existing one; neither is a name this ADR invents, and no durable
+object gains a second way to be addressed. What ADR-0942 forbade was a join
+key that covered many segments at once and so merged their statistics. The
+entry identity has the opposite property, naming exactly one flush of one
+shard in one ingest hour, and a compacted segment carries the nil writer id,
+matches no `.cstat` entry, and falls back to a scan.
+
+A `.cstat` `STR` extremum is never consulted. The read side declines a
+declared `STR` column before either carrier is examined, because the column
+is projected as a dictionary-encoded string and has no scalar form on the
+statistics path, so `MIN` and `MAX` over a declared `STR` column are answered
+by scanning. Decision 2's "from today" claim for `STR` is withdrawn, and with
+it the positive regression test that decision mandates for a `STR` entry: no
+such test can pass against a reader that never reaches the entry. The `BYTES`
+half of that mandate stands unchanged, since `BYTES` is excluded from the
+stamp vocabulary, is read from `.cstat`, and does reach `Precision::Exact`.
+Where decision 4 describes the union degenerating to the `.cstat` carrier
+alone for a declared `STR` or `BYTES` column, that now describes `BYTES`
+only; the `STR` case is not a degenerate union but no union at all.
+
 ## Out-of-scope findings, reported not fixed
 
 1. **docs/adrs/README.md index drift**: the index (111 rows) is missing
