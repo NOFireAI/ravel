@@ -231,9 +231,12 @@ Two carriers feed it, unioned per segment and per column (ADR-0873 decision
   snapshot entry (field 15) that resolution already reads. Because it rides
   those records, it covers the live tail above the fold watermark and
   token-resolved segments, which no fold-built sibling object can;
-- the ADR-0850/0942 `.cstat` entry, joined by segment identity, which is the
-  carrier for pre-stamp sealed history and the only carrier for `Str`/`Bytes`
-  extrema.
+- the ADR-0850/0942 `.cstat` entry, joined by the entry identity (ingest hour
+  bucket, shard, writer id, writer epoch, writer sequence), which is the
+  carrier for pre-stamp sealed history and the only carrier for `Bytes`
+  extrema. A declared `Str` column is declined before either carrier is read,
+  since it is projected as a dictionary-encoded string with no scalar form on
+  this path, so `MIN`/`MAX` over one is always answered by the scan.
 
 **The write side of the stamp carrier does not exist.** Nothing in the
 flush or compaction path calls the stamp writers in
@@ -263,18 +266,24 @@ of the `stats_are_exact` gate above:
 - an entry either carrier's reader refuses: a stamp of an ineligible type, a
   stamp whose type disagrees with the tenant's declaration, a duplicated
   entry name (ADR-0873 clause 6 drops every occurrence, so a duplicate never
-  reaches a reader as coverage), or a `.cstat` entry whose extrema presence
-  disagrees with its `non_null_count`;
+  reaches a reader as coverage), a `.cstat` entry whose extrema presence
+  disagrees with its `non_null_count`, or a `.cstat` entry whose row
+  accounting (`non_null_count + null_count`) does not reconcile against the
+  joined `SegmentRef::sample_count`;
 - the two carriers disagreeing about one segment in `min`, `max`, or
   `null_count`. Nothing is ever combined across carriers: both claim to
   describe the same rows of one immutable object exactly, so a disagreement
   means one of them is wrong and no answer is safe.
 
-A `null_count` is reported `Exact` only when every covering carrier proved it,
-which means the stamp: a `.cstat` entry's row accounting is not reconciled
-against the joined `SegmentRef::sample_count` on this path, and an unreconciled
-figure would answer `COUNT(col)` from something nothing checked. The extrema are
-exact either way.
+A `.cstat` entry's row accounting is reconciled against the joined
+`SegmentRef::sample_count` before the entry grants anything, and the refusal
+covers the whole entry, extrema included: an entry whose counts do not add up
+to the segment's rows describes rows the object does not have, so no figure it
+carries describes the object the query reads. A `null_count` is reported
+`Exact` only when every covering carrier proved its figure, which means the
+stamp: reconciliation is a fail-closed gate on what a `.cstat` entry may grant,
+not a promotion of its NULL count to a proven one, so a `.cstat`-only column
+answers `MIN`/`MAX` exactly and leaves `COUNT(col)` to the scan.
 
 One statistics shape is exact and still does not shortcut the query. A declared
 column that reads NULL in every touched row has an exactly-NULL extremum, and
@@ -295,9 +304,11 @@ the numbers may be read.
 statistics entries a reader dropped, one per dropped entry, labelled by the
 carrier that was read: `commit-record`, `compaction-part`, `snapshot-entry`, and
 `cstat`. The first three are the stamp reads in `ravel-commit`; the `cstat`
-label is reported by `ravel-sql`'s `.cstat` reader, which counts exactly two
-refusals as defects (a duplicated column name, and extrema presence that
-contradicts the row accounting) and treats a missing object, segment, or column
+label is reported by `ravel-sql`'s `.cstat` reader, which counts exactly three
+refusals as defects (a duplicated column name, extrema presence that
+contradicts the row accounting, and row accounting that does not reconcile
+against the joined `SegmentRef::sample_count`) and treats a missing object,
+segment, or column
 entry as the ordinary uncovered state. Each READ of a defective carrier
 increments the label again: there is no per-entry deduplication, because it
 would need unbounded state keyed by (object, column) on a path walked once per
