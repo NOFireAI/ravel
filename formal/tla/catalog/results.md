@@ -12,7 +12,7 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 1866396 | 31 | PASS | 20260903T135234Z-a4e9817c24f8fbe59e5dec198aa33c47032f8a47 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260903T221635Z-3bf1df10b3cd1e65d40c1ebe9ae9ff9b2b0baa34 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
 | negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
 | negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
@@ -53,7 +53,7 @@ not run by any harness lane.
 A run outside these is a regression to investigate, not to widen; see
 `bands.tsv`.
 
-- smoke distinct states in [1861000, 1872000], depth in [31, 31].
+- smoke distinct states in [3455000, 3470000], depth in [33, 33].
 
 The safety model runs to a fixed complete state graph, so its distinct-state
 count and depth are deterministic; the band carries a small margin only to
@@ -101,14 +101,24 @@ in 60 seconds. `CompactionSwapsRecord` is FALSE throughout smoke, so its own
 swap mutation (which needs spare capacity in `Records \ inputs`) was never
 exercised by smoke's PASS invariants either before or after this change; it
 keeps its own non-vacuity proof in `negative/compaction-swaps-record.cfg`
-with its own, unaffected bounds. The band above reflects a fresh measurement
-of this round's smoke.cfg run, at its current bounds, including both
-findings' costs. `exhaustive.cfg`'s graph will grow by a comparable or
-larger factor from finding 5's branching the next time an exhaustive run is
-in scope (see below); finding 6 adds no branching factor but will still cost
-some un-collapsed states there too. That run should re-measure rather than
-assume proportional growth, since exhaustive's larger `Hours` and `Records`
-sets make both costs larger.
+with its own, unaffected bounds.
+
+Issue #1121 round three (finding 1: widening `CorruptHeadFailsClosedOnDeletePaths`
+to three fail-closed triggers) then grew the smoke graph again, from 1866396
+to 3463504 distinct states, depth 31 to 33: the new one-shot `DoCorruptPart`
+and `DoPoisonEntry` actions each add a transition reachable from any state
+where a part or entry exists to corrupt, and the widened invariant's extra
+`lastDelete` witness fields (`partUnreadable`, `entryUndecodable`) un-collapse
+states that the single-trigger version folded together. Round three's finding
+2 (dropping `MissingIndexDegradesToListing`'s inert `indexReadableAtResolve`
+antecedent, and the matching `qy` field) was re-measured against this new
+baseline and confirmed to change nothing: 3463504 distinct states, depth 33,
+unchanged, because the removed field never influenced reachability, only the
+served/resolved comparison. The band above reflects a fresh measurement of
+this round's smoke.cfg run at its current bounds, including all three
+rounds' costs. `exhaustive.cfg`'s graph grows by a comparable factor from the
+same two new actions; see the Exhaustive band below for the fresh
+measurement this round took.
 
 `exhaustive.cfg` carried a band (1185000-1198000 distinct states, depth 31)
 from the prior round's measurement, but this round's model changes shifted the
