@@ -60,6 +60,36 @@ that implements the same rule.
 | `InitialShardCount`, `TargetCounts` | generation 0's count and the counts a reshard may target |
 | `WriterFenceEnabled` | negative switch (correct value TRUE): fail closed on a view past grace |
 | `TokenValidatedAgainstCount` | negative switch (correct value FALSE): token resolution is an exact-key GET, not a count check |
+| `HourUnits` | model time-units per wall-clock hour; `1` for every hour-granular cfg, `60` for `shipped-skew-minutes.cfg`'s minute granularity |
+
+## Time-unit granularity and the shipped clock skew
+
+Every cfg before `shipped-skew-minutes.cfg` models time in whole hours
+(`HourUnits = 1`), so `C = 1` hour and `MinLeadHours = HourCeil(C) + HourUnits
+= 2`. At that rounding the shipped `TOLERATED_CLOCK_SKEW_HOURS = 1` sits on
+the same integer scale as `C` and `MinLeadHours`, which is why `smoke.cfg`
+sets `AppenderSkew = 0`: carrying both the refresh-interval rounding and a
+nonzero skew at once, at hour granularity, would model a collision the real
+system does not have (the shipped 60 s refresh interval and 1-hour tolerated
+skew differ by a factor of 60, not by 1).
+
+`HourUnits` and `HourCeil` (see `OnlineResharding.tla`) let a cfg model time
+at finer granularity instead of avoiding the collision by zeroing the skew.
+`shipped-skew-minutes.cfg` sets `HourUnits = 60` and represents the refresh
+interval, the 2-hour activation lead, and the 1-hour tolerated skew at their
+true ratio simultaneously: `C = 1` (minute), `MinLeadHours = L = 120`
+(minutes), `AppenderSkew = 60` (minutes). This is the only config in the repo
+where none of those three is rounded onto another's scale.
+
+That config was run this session and found **intractable within the
+executor's probe budget** (killed at depth 14 by an internal 280 s timeout,
+14.1M distinct states found and still growing, 10M+ states left on queue —
+see results.md for the full figures). It is checked in as a real, runnable
+config for a longer-budget run, not as a passing or failing check: no
+configuration in this repo has verified the shipped clock-skew value against
+the shipped refresh interval and lead to exhaustion, and this file should not
+be read as having done so. `smoke.cfg`'s `AppenderSkew = 0` remains the
+gating config's workaround for the hour-granularity collision above.
 
 ## Assumptions
 
@@ -71,7 +101,9 @@ that implements the same rule.
   Consequences run through the whole model: safety at the tolerated skew is a
   boundary case here rather than a comfortable one (see results.md), and the
   smoke run keeps `AppenderSkew = 0` because carrying both the refresh rounding
-  and a skew rounding at once would model a system that does not exist.
+  and a skew rounding at once would model a system that does not exist. See
+  "Time-unit granularity and the shipped clock skew" above for the minute-
+  granular alternative and its result.
 - Clocks advance monotonically; router clocks advance together (`WriterSkew`
   bounds any residual difference, set to 0 in the runnable configs).
 - The store is linearizable with CAS on version, as `RavelObjectStore` models.
