@@ -335,6 +335,91 @@ a retry guarantee this model does not have a cited Rust-side source for; adding
 it without one would be exactly the kind of claim ADR-1113 D12 asks this
 document not to make.
 
+## Checkpoint finding 1: liveness hypothesis was false as written
+
+The round-two disposition above (restate as "environment eventually quiet on
+`PlaceHold`/`ReleaseHold`, `SetHeadState`, `SetRefresh`") was itself checked by
+the checkpoint review (issue #1122) and found false: counterexamples exist
+where all four of those actions never fire, yet both `EventuallySwept` and
+`EventuallyCompleted` still fail, because `Tick`, `ExpireQuery`, and
+`PerformRewrite` were themselves unfair.
+
+Diagnosis, done with a scratch copy of `LifecycleGC.tla` (`LifecycleGCQuiet`,
+`/tmp/tla-live1/`, not committed) whose `Next` structurally excludes
+`PlaceHold`, `ReleaseHold`, `SetHeadState`, and `SetRefresh`, so any remaining
+failure cannot be blamed on those four:
+
+1. Baseline (four actions excluded, no new fairness): `EventuallySwept` fails
+   at `MaxClock = 2` via a 2-state stutter at `clock = 0` — `Tick` is enabled
+   and never taken, confirming the round-two hypothesis is false even under
+   literal permanent quiescence of the named actions.
+2. Adding `WF_vars(Tick)`, `WF_vars(ExpireQuery)`, `WF_vars(PerformRewrite)`
+   (unconditional) fixes `EventuallyCompleted` but `EventuallySwept` now fails
+   via a 2-state lasso: `PerformRewrite` (state 11) <-> `RetentionSweep`
+   (state 12). `RetentionSweep` ranges over `DataObjects`, so it deletes the
+   rewrite output `rwA`; the now-unconditionally-fair `PerformRewrite`
+   recreates it and re-stamps the shared `supersededAt' = clock` every time,
+   perpetually resetting the horizon countdown for `raw1`, which is otherwise
+   already superseded and off HEAD. This is a livelock introduced by the new
+   fairness, not present in the unfair baseline.
+3. Restricting `PerformRewrite`'s fairness to `WF_vars(PerformRewrite /\
+   superseded = {})` (first firing only) closes that livelock:
+   `EventuallyCompleted` still passes (exit 0). `EventuallySwept` still fails,
+   but now via a stutter at state 9, `supersededAt = 2`, `sysgc.ph = 1`,
+   `MaxClock = 2`: `2 + 1 > 2`, so the horizon guard can never clear. This is a
+   finite-clock-ceiling artifact, not a fairness gap: `Tick`'s own guard
+   (`clock < MaxClock`) disables further clock advancement once `PerformRewrite`
+   lands at `clock = MaxClock`, for any finite bound. Confirmed structural by
+   re-running the same scratch check at `MaxClock = 4`: TLC exit 13, identical
+   pattern (`supersededAt = 4`, last tick).
+4. Restating `EventuallySwept`'s antecedent as `<>[](...)` ("eventually
+   permanently", not just "eventually") over `supersededAt + sysgc.ph <=
+   MaxClock` does not close this alone: TLC still finds a stuttering
+   counterexample at state 10/11, this time because a pinned query
+   (`query.active`, `query.deadline = 2 = MaxClock`) permanently blocks
+   `QueryPermits`, and `ExpireQuery`'s own guard (`clock > query.deadline`) can
+   never clear for the same reason as step 3 — the same finite-clock-ceiling
+   class, manifesting through a second, independent time-gated guard.
+   Confirms this is structural to any bounded `Nat` clock, not specific to the
+   supersession horizon.
+5. Final form: state `EventuallySwept`'s antecedent as `SupersededSweep(o)`'s
+   own enabling guard in full (superseded, present, not held, past horizon,
+   query-permitted, HEAD present, no unrecovered refresh failure) holding
+   permanently (`<>[]`), rather than enumerating individual timing gates.
+   Symmetrically, restate `EventuallyCompleted`'s antecedent as
+   `CompleteErasure`'s own guard held permanently. TLC exit 0 for both, on the
+   scratch quiescent variant at `MaxClock = 2` (`swept-quiet.cfg`,
+   `completed-quiet.cfg`) and, for `EventuallySwept`, at `MaxClock = 4`
+   (`swept-quiet-mc4.cfg`; 594029 states generated, 180915 distinct, depth 20,
+   `Model checking completed. No error has been found.`).
+
+Shipped fix (`LifecycleGC.tla`): `FairSpec` gains `WF_vars(Tick)`,
+`WF_vars(ExpireQuery)`, and `WF_vars(PerformRewrite /\ superseded = {})` on
+top of the four already-fair maintainer/store actions; `PlaceHold`,
+`ReleaseHold`, `SetHeadState`, `SetRefresh` remain unfair (same rationale as
+round two: no code-side progress guarantee to cite). Both `EventuallySwept`
+and `EventuallyCompleted` are restated as leads-to from each action's own
+enabling guard held permanently, replacing the disproven quiescence
+hypothesis.
+
+Re-verified against the real, non-quiescent `LifecycleGC.tla` (all four
+environment actions present in `Next`, still unfair) with the same reduced
+per-property cfg pattern as round two (`TypeOK` plus one `PROPERTY`, `FullEnv
+= TRUE`, `SPECIFICATION FairSpec`, shipped switch values), `MaxClock = 2`:
+
+- `EventuallySwept`: TLC exit 0, `Model checking completed. No error has been
+  found.` (464571 states generated, 79358 distinct, depth 19).
+- `EventuallyCompleted`: TLC exit 0, `Model checking completed. No error has
+  been found.` (464571 states generated, 79358 distinct, depth 19).
+
+`MaxClock = 4` was confirmed for `EventuallySwept` only on the quiescent
+diagnostic variant (step 5 above), not re-run against the full non-quiescent
+model in this task: the non-quiescent `MaxClock = 4` state space was still
+growing past 4.6M states generated / 940K distinct after several minutes when
+stopped, which is exhaustive-scale and out of this task's reduced-configuration
+budget; README states only the `MaxClock = 2` full-model outcome plus the
+`MaxClock = 4` quiescent-variant outcome, nothing stronger.
+
 ## Checkpoint finding 2: legal-hold gate widened past raw inputs
 
 The checkpoint review (issue #1122) found `HeldInputServes` scoped only to
