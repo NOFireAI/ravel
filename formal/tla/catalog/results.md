@@ -13,6 +13,7 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
 | smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260903T221635Z-3bf1df10b3cd1e65d40c1ebe9ae9ff9b2b0baa34 |
+| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 13690096 | 33 | PASS | 20260903T222041Z-5796e637494e9b50af404421586e7f2fd1954538 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
 | negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
 | negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
@@ -120,13 +121,19 @@ rounds' costs. `exhaustive.cfg`'s graph grows by a comparable factor from the
 same two new actions; see the Exhaustive band below for the fresh
 measurement this round took.
 
-`exhaustive.cfg` carried a band (1185000-1198000 distinct states, depth 31)
-from the prior round's measurement, but this round's model changes shifted the
-exhaustive graph the same way they shifted smoke's, and this task's rules
-forbid an exhaustive TLC run (it risks the idle-timeout kill). Re-measuring
-that band is out of scope for this round; the stale band has been removed
-from `bands.tsv` rather than left in place unmeasured against the current
-model. Re-measure and restore it the next time an exhaustive run is in scope.
+`exhaustive.cfg` is now run for real this round (issue #1121 round three,
+finding 5): it completed within the 3600-second budget at 2932 seconds,
+`13690096` distinct states, depth `33`, `PASS`, run id
+`20260903T222041Z-5796e637494e9b50af404421586e7f2fd1954538`. No constant
+shrink was needed to fit the budget, unlike smoke's finding 6 (`Records`
+stays `{rA, rB}`, `CompIds` stays `{g1, g2}`); the growth from finding 1's two
+new one-shot actions still applies to exhaustive's larger bounds, but
+`-workers auto` on the exhaustive host's core count comfortably finishes the
+larger graph inside the hour. Band recorded above and in `bands.tsv`:
+`[13680000, 13700000]` distinct states, depth `[33, 33]`. The prior round's
+stale band (`1185000-1198000` distinct states, depth 31) predates finding 1
+entirely and was already removed rather than left unmeasured; this is its
+replacement, measured against the current model.
 
 `carryforward.cfg` gets no band row: it is a targeted three-hour carry-forward
 pass, not the banded gate config, and its full graph (4,481,272 distinct
