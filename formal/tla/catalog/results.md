@@ -11,7 +11,7 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 | Config | Spec | Distinct states | Depth | Wall time | Result |
 |---|---|---|---|---|---|
 | smoke.cfg | Spec (safety, symmetry-reduced) | 1739129 | 32 | 20s | PASS |
-| exhaustive.cfg | FairSpec (safety + liveness) | (recorded below) | (recorded below) | (recorded below) | PASS |
+| exhaustive.cfg | FairSpec (safety + liveness) | 4656716 | 34 | 555s | PASS |
 | negative/compaction-swaps-record.cfg | Spec | short prefix | n/a | short | CompactionPreservesMultiset violated, exit 12 |
 | negative/head-names-unwritten-part.cfg | Spec | short prefix | n/a | short | HeadNamesOnlyCompleteParts violated, exit 12 |
 | negative/metrics-dedup-dropped.cfg | Spec | short prefix | n/a | short | SignalDedupContract violated, exit 12 |
@@ -23,8 +23,7 @@ Bands (a run outside these is a regression to investigate, not to widen; see
 `bands.tsv`):
 
 - smoke distinct states in [1700000, 1780000], depth in [32, 32].
-- exhaustive distinct states and depth: recorded in the exhaustive row above
-  and banded in `bands.tsv` from the single recorded exhaustive run.
+- exhaustive distinct states in [4600000, 4710000], depth in [34, 34].
 
 The safety and liveness models run to a fixed complete state graph, so their
 distinct-state count and depth are deterministic; the bands carry a few percent
@@ -34,11 +33,20 @@ NOT deterministic: they stop at the first counterexample TLC finds, and under
 band. Each negative is pinned instead by its `.expect` file: TLC must exit
 exactly 12 (a safety violation) and report exactly the named invariant.
 
-The smoke config applies `SYMMETRY Symmetry` (permutations of `Clients`, which
-are the folders) to shrink the safety search; the exhaustive config drops
-symmetry because TLC does not check liveness under symmetry reduction, adds two
-folders and two compaction identities, and runs `FairSpec` with `WF_vars` on
-the clock, fold progress, and query progress so `QueryTerminates` can hold.
+The smoke config applies `SYMMETRY Symmetry` (permutations of `Clients`) and
+runs `Spec` for a fast safety-only search; the exhaustive config drops symmetry
+because TLC does not check liveness under symmetry reduction, adds a second
+compaction identity so the two-input-set dedup conflict is non-vacuous, and runs
+`FairSpec` with `WF_vars` on the clock, fold progress, and query progress so
+`QueryTerminates` can hold.
+
+Both configs run a single folder. The model's HEAD has one folder writer, so a
+literal two-folder CAS race is not enumerated; the version-matched CAS is still
+exercised, because `DoUnsupportedHead` bumps the HEAD version under an in-flight
+fold, so a fold reaches its CAS with a stale base version and takes the losing
+branch (HEAD untouched, folder rebases). The staged part it abandons is then
+swept by the catalog-object pass, so both sides of the version-match guard are
+covered without a second folder.
 
 `LateSupersessionEventuallyReflected` is defined in the spec but not checked by
 any config: it is a recorded shrink. Under the F16/F17 design (reconcile runs
@@ -54,8 +62,8 @@ under the bounded clock, is checked in its place.
 
 ## Exhaustive constants
 
-`Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1, f2}`,
-`Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1, g2}`, `MaxClock = 4`,
-`MaxOps = 4`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
+`Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
+`Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1, g2}`, `MaxClock = 3`,
+`MaxOps = 3`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
 `RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all six negative
 switches FALSE.
