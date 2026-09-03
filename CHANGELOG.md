@@ -6,6 +6,162 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.0]
+
+A stock `ravel-server` now sizes its query budgets from the host it runs on, so
+a deployment no longer has to know six flags to scan a large tenant, and a
+container sizes against the memory it may actually use. The two catalog defects
+the 0.12.0 notes listed as known limitations are fixed, and the object-store
+contract is checked by a TLA+ harness in CI.
+
+### Added
+
+- **TLA+ verification harness** (ADR-1113). `scripts/check-tla.sh` runs TLC over
+  every area under `formal/tla` with `smoke`, `exhaustive`, `negative`,
+  `traceability`, `ci`, and `all` subcommands; the TLC jar is pinned by sha256
+  (or supplied through `RAVEL_TLA_TOOLS_JAR` and verified, never downloaded),
+  Java 17 or newer is required, and every run writes one row per config to
+  `.cache/tla/last-run.tsv`. The first area models the object-store contract
+  (`docs/object-store-contract.md`): create-if-absent single winner, CAS on a
+  fresh version, read-after-write including lost responses, monotonic versions
+  across delete and recreate, multipart invisible until complete, listing
+  completeness and consumer consistency. Three negative controls must fail with
+  the exit code and property their `.expect` file pins (two invariants, one
+  liveness property), state-space bands are enforced on passing runs, and a
+  traceability table maps each requirement to its invariant and Rust symbol,
+  naming the rows whose backend half is still an assumption. CI runs the fast
+  lane when a formal area, the harness, an implementation crate the models cite,
+  or a normative document changes; `tla-nightly.yml` runs the exhaustive lane on
+  a schedule.
+- **`ravel-cli cache reclaim-legacy --cache-dir <dir> [--apply]`** (#826).
+  Lists (dry run) or deletes cache entry files left at the pre-namespacing
+  `<cache-dir>/<shard>/<file>` layout, which the current cache never reads,
+  evicts, or counts. Only entry files whose names map back to a cache key are
+  touched; a foreign file keeps its directory. Safe while a node is live.
+- **Partial multi-shard commits are reported for metrics and spans** (#1130).
+  `WriteError` and `SpanWriteError` gain a `PartialWrite` variant matching the
+  log router's: both routers now await every shard's acknowledgement and return
+  the durable sibling tokens when some shards committed and others failed. The
+  partial-commit count is exported as `ravel_ingest_partial_writes_total` for
+  all three signals.
+- **`sql_latency_bench --logs-fetch-policy` and `--logs-block-range-threshold`**
+  (#1139), mirroring the server's flags with the same names and defaults, so the
+  in-process lane routes logs fetches the way `ravel-server` does: at the default
+  cost-based policy every object is read whole in one covering GET.
+  `--logs-request-cost-bytes` is now optional and wins over the policy when set.
+  Report provenance records the policy and the effective threshold, and a figure
+  the report cannot know is labelled "not recorded" rather than as the server's
+  configuration.
+
+### Changed
+
+- **Server budgets are resolved at startup, most of them from the host**
+  (#1141, amending ADR-0088). When the flag is unset, `ravel-server` now
+  resolves: `--fetch-concurrency` to twice the available cores (floor 8), the
+  fetcher read cache (`--cache-max-bytes`) to 80% of usable memory and the
+  catalog byte cache to 5%, `--sql-max-query-bytes` to 25% and
+  `--sql-tenant-max-bytes` to 50%. `--max-segments` (1,000,000) and
+  `--gc-max-query-duration` (11 minutes, still validated against the durable
+  `sys/gc` ceiling) are fixed defaults that do not vary with the host. Usable
+  memory is `/proc/meminfo`'s `MemTotal` **capped by the cgroup memory limit**
+  (cgroup v2 `memory.max`, else v1 `memory.limit_in_bytes`; `max`, the v1
+  no-limit sentinel, `0`, and malformed content are treated as no cap), so a
+  container no longer sizes its caches and pools against host memory it cannot
+  use. An explicit flag wins; an explicit per-query SQL pool raises a
+  non-explicit tenant ceiling rather than being clamped by it, and an explicit
+  `--cache-max-bytes` bounds both caches as before. Where memory cannot be read
+  (a non-Linux host), the memory-derived values fall back to the previous
+  constants. The startup log names each resolved value, its source, and the
+  resolved deadline in milliseconds. These ceilings are LRU caps, not
+  reservations. Before this change a freshly loaded ClickBench tenant (8,424
+  objects) could not be scanned at all against the previous 1,024 segment cap;
+  the measured ClickBench figures for a server at these defaults are recorded on
+  #968.
+- **Overlapping compaction records resolve to one authoritative record**
+  (#1070). When two compaction records in one sealed bucket name overlapping
+  input sets, the catalog keeps one winner per overlap group (largest input set,
+  then smallest `input_set_hash`, then record key), serves its parts, and serves
+  an input only a losing record names as a raw L0 segment, so logs and spans are
+  served once instead of twice. The superseded-input sweep and the erasure
+  completion gate follow the same choice, so an input only a loser names is
+  never deleted from under a query. Publish-time refusal of a second overlapping
+  record is left to a follow-up in `ravel-maintain`.
+- **Declared-column statistics are stamped in one slot-keyed pass per record**
+  (#1135). The bulk-load stamp no longer rescans a record's occurrences per slot
+  or allocates per record; on the 104-column ClickBench shape it measured 11.39x
+  faster per record on the measuring host, with byte-identical output. The
+  bundled benchmark enforces a 2x floor, not the measured ratio, which is host
+  dependent.
+- **A timed-out or cancelled query records the cost it incurred** (#840) instead
+  of a zero-cost outcome; an object-store GET is counted when it is issued, its
+  bytes when it completes.
+- **Alerts and audit scan sets are floored at their pinned shard counts.** A
+  `--shards 1` deployment silently dropped every query-audit record from every
+  audit query, with no error and no counter; the fixed read-shard count is now a
+  floor (1 for alerts, 2 for audit).
+- **CI: each push to `main` has its own concurrency group** (#1145), so a queued
+  main run is no longer cancelled by the next merge and a release commit can
+  always obtain the green `ci.yml` run the publish gate needs.
+
+### Fixed
+
+- **Erasure and GC holds** (#1085, ADR-0064 amended in #1140). The
+  superseded-input sweep is gated on live-HEAD reachability, so an input a
+  HEAD-named snapshot part still resolves is held rather than deleted; a
+  supersession chain is deleted as one unit, its own records last of all, so a
+  rewrite record outlives every input it superseded; an erasure request's
+  `.dreq` and its query-time filter are held past their horizon while any input
+  a rewrite applying that request superseded is still in the store, with the
+  hold read off the sweep itself rather than a completion field the production
+  writer never populates; the hold is observed on every chain in scope, young or
+  aged; request ids are compared in one canonical form; a chain group with a
+  legally held key is skipped whole; and a part reference whose declared bounds
+  disagree with its header blocks fail-closed. Before these fixes an erased
+  subject could become servable again after its filter was retired while its
+  pre-rewrite inputs were still present.
+- **Idempotent retry of a partially committed write** (#1130). The consistency
+  model and the counter comments claimed a keyed retry of a timed-out or
+  partially committed write is deduplicated; the idempotency marker is written
+  only after a fully acknowledged write, so the key deduplicates from the first
+  retry that commits in full. Every partial-commit warning carries the tenant
+  hash.
+- **`cache reclaim-legacy`** removes regular files only (a symlink or directory
+  with an entry-shaped name is left alone) and fails on a listing error instead
+  of under-reporting (#826).
+
+### Documentation
+
+- ADR-1103 decides PromQL over logs: the logs signal exposed to the existing
+  PromQL engine as `ravel_log_lines` and `ravel_log_bytes`, with a `__body__`
+  matcher. A decision record only; no endpoint ships in this release.
+- ADR-0873 is amended to the shipped behaviour: an erasure rewrite part carries
+  no declared min/max stamp at all, replacing decision 3's never-implemented
+  recompute.
+- The catalog and concepts pages state the overlapping-record guarantee and the
+  full tie-break; the deletion and GC document states the real inputs of the
+  erasure hold and why it terminates; the ingest and consistency pages qualify
+  partial-commit retryability; the query, configuration, caching and
+  admission-limits guides state which budgets resolve from host resources and
+  which are fixed; the ClickBench internal pages record the new bench flags and
+  note that passes taken before them are not comparable with passes at defaults.
+
+### Known limitations
+
+- Query latency still depends on the tenant's working set fitting in the read
+  cache; removing the full-scan floor is tracked in #849. The derived cache
+  default makes that working set fit on a host sized for the tenant, but does
+  not remove the floor.
+- The heaviest ClickBench aggregates over the whole table can exceed the derived
+  per-query SQL pool on a 30 GB host and abort with `query memory budget
+  exhausted`. Raise `--sql-max-query-bytes` (and the tenant ceiling with it) to
+  run them.
+- The read cache and the SQL pools are sized independently, so their ceilings
+  can sum past the host's memory. They are LRU caps rather than reservations, so
+  this is a policy gap rather than a measured fault; coordinating them under one
+  process-wide budget is tracked in #1170.
+- Completion records carry no per-bucket dropped counts from the production
+  writer; the erasure hold no longer depends on them.
+
 ## [0.12.0]
 
 Object-store request cost becomes an input that the logs read path and

@@ -32,7 +32,7 @@ That brings up five things, all from published images:
   bootstrap-and-continue path for it, so a freshly created bucket has to be
   qualified before the server starts. The step is idempotent: on an
   already-qualified bucket it reports the existing record and exits 0.
-- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.12.0` (override the pin
+- `ravel-server` from `ghcr.io/nofireai/ravel-server:0.13.0` (override the pin
   with the `RAVEL_IMAGE` environment variable), listening on `127.0.0.1:4318`
   (HTTP) and `127.0.0.1:4317` (gRPC), with the tenant token `demo-token` mapped
   to tenant `demo-tenant`.
