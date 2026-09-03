@@ -48,10 +48,12 @@ log path.
 
 Alert transitions and audit records are log objects on their own signal
 prefixes, and the `alerts` and `audit` tables read them through that same log
-fetcher, so their bytes are cached by both tiers on the same terms as any other
-log object: whole object or block ranges by the same size threshold and fetch
-policy, keyed the same way, accounted through the same funnel. Nothing about
-the cache is specific to those two signals.
+fetcher, so their bytes are cached on the same terms as any other log object:
+whole object or block ranges by the same size threshold and fetch policy, keyed
+the same way, accounted through the same funnel. That is the RAM tier, which is
+the one a server wires today; the disk and tiered variants exist but no startup
+path builds them, for these two signals or any other. Nothing about the cache
+is specific to those two signals.
 
 One thing is not cached:
 

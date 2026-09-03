@@ -14,8 +14,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   history, one row per state transition, and each row carries the write
   identity of its record (`writer_id`, `writer_epoch`, `writer_seq`), so a
   `ROW_NUMBER()` fold ordered by time and write identity returns exactly one
-  current row per alert even when two evaluators overlap at a lease handover;
-  `audit` reads back a tenant's own query, legal-hold and reshard records.
+  current row per alert even when two evaluators overlap at a lease handover.
+  `audit` reads back a tenant's own legal-hold and reshard records, which the
+  maintenance process writes directly. It also serves query-audit records, but
+  no shipped startup path installs the pipeline those go through, so
+  `attrs['kind'] = 'query'` selects nothing until a deployment attaches one.
 - **A read-side shard floor for fixed-shard signals** (ADR-1101). Alert and
   audit writers pin their shards by constant and neither signal is provisioned,
   so the catalog's scan-set derivations now take the maximum of the

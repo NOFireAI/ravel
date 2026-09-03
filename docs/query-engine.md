@@ -2448,7 +2448,16 @@ the evaluator's own fold breaks that tie with the record's epoch and sequence,
 and the table exposes the same keys plus `writer_id` so a SQL fold has a total
 order and can never return two current rows for one alert. Current state is the
 row that sorts first per `alert_id` under `ts_ns DESC, writer_epoch DESC,
-writer_seq DESC, writer_id DESC`:
+writer_seq DESC, writer_id DESC`.
+
+The key is a tie-break, not a causal order between evaluators. `writer_epoch`
+is stamped from `ALERT_WRITER_EPOCH`, a constant rather than a lease term, and
+each evaluator task mints a fresh `writer_id` and restarts `writer_seq` at 1,
+so at a handover the departing evaluator's higher sequence sorts first. What
+the key guarantees is that exactly one row wins, deterministically, and that it
+is the same row `load_latest_records` picks, so the SQL surface never diverges
+from the evaluator's own view. Making the epoch a real fencing term is the
+change that would turn this into handover ordering.
 
 ```sql
 SELECT *
@@ -2465,9 +2474,13 @@ WHERE rn = 1;
 ```
 
 `row_number` is an admitted window function. A rule that reads
-`SELECT * FROM alerts` (alerts-on-alerts, ADR-0043) sees every transition, which
-is what the generation guard in ADR-0040 counts over. `audit` likewise exposes
-one row per record.
+`SELECT * FROM alerts` (alerts-on-alerts, ADR-0043) would see every transition,
+which is what the generation guard in ADR-0040 is meant to count over. That
+path is not live: the evaluator passes an empty consumed-generation set to
+`compute_generation`, so every record such a rule produced sits at generation 1
+and the `max_alert_generation` breaker cannot trip. The table is queryable from
+the SQL endpoint; only the evaluator's side of the loop is missing. `audit`
+likewise exposes one row per record.
 
 Supported predicates (widen-only on both tables; `supports_filters_pushdown`
 returns `Inexact` for every filter, so DataFusion re-applies the originals above
