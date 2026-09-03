@@ -39,17 +39,18 @@ BrokenComplete(w, u) ==
                            afterVer |-> store'[ClaimKey(u)].version,
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
-    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, dupThiefWin,
+    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, dupThiefWin,
                    stealWonVers, lastGuarded, stolen>>
 
-\* Broken: an unconditional DELETE of the claim key. Caught by
-\* NoUnconditionalClaimDelete.
+\* Broken: an unconditional DELETE of the claim key, touching no witness. The
+\* store-level NoUnconditionalClaimDelete catches it: the claim key drops from
+\* present to absent while the claimBorn latch (set when it was created) stays
+\* set. Caught by NoUnconditionalClaimDelete.
 DeleteClaim(u) ==
     /\ AllowClaimDelete
     /\ ClaimPresent(u)
     /\ Delete(ClaimKey(u))
-    /\ claimDeleted' = TRUE
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, dupThiefWin,
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
                    stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
 \* Broken: when the claim is held, the publish path overwrites the terminal
@@ -65,7 +66,7 @@ BrokenClaimPublish(w, u, v) ==
         /\ firstRecord' = IF ~Present(rk)
                             THEN [firstRecord EXCEPT ![u] = <<u, v>>]
                             ELSE firstRecord
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimDeleted, dupThiefWin,
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
                    stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
 MCNext ==

@@ -82,7 +82,7 @@ VARIABLES
     heldVer,         \* [Workers -> [Units -> 0..MaxV]] 0 = holds no token
     obsVer,          \* [Workers -> [Units -> 0..MaxV]] last observed claim version
     firstRecord,     \* [Units -> OContent \cup {NoRec}]
-    claimDeleted,    \* BOOLEAN a claim key was deleted unconditionally
+    claimBorn,       \* [Units -> BOOLEAN] a claim key has ever been created
     dupThiefWin,     \* BOOLEAN two thieves won the same observed version
     stealWonVers,    \* [Units -> SUBSET (0..MaxV)] observed versions a steal won on
     lastClaimOp,     \* the most recent claim CAS (kind, version used, outcome)
@@ -91,7 +91,7 @@ VARIABLES
 
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
-          timeUsed, heldVer, obsVer, firstRecord, claimDeleted, dupThiefWin,
+          timeUsed, heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
           stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
 INSTANCE RavelObjectStore
@@ -126,7 +126,7 @@ CTypeOK ==
     /\ heldVer \in [Workers -> [Units -> VerRange]]
     /\ obsVer \in [Workers -> [Units -> VerRange]]
     /\ firstRecord \in [Units -> OContent \cup {NoRec}]
-    /\ claimDeleted \in BOOLEAN
+    /\ claimBorn \in [Units -> BOOLEAN]
     /\ dupThiefWin \in BOOLEAN
     /\ stealWonVers \in [Units -> SUBSET VerRange]
     /\ lastClaimOp \in [kind: {"none", "acquire", "renew", "steal", "complete"},
@@ -142,7 +142,7 @@ Init ==
     /\ heldVer = [w \in Workers |-> [u \in Units |-> 0]]
     /\ obsVer = [w \in Workers |-> [u \in Units |-> 0]]
     /\ firstRecord = [u \in Units |-> NoRec]
-    /\ claimDeleted = FALSE
+    /\ claimBorn = [u \in Units |-> FALSE]
     /\ dupThiefWin = FALSE
     /\ stealWonVers = [u \in Units |-> {}]
     /\ lastClaimOp = [kind |-> "none", unit |-> CHOOSE u \in Units : TRUE,
@@ -164,14 +164,15 @@ Acquire(w, u) ==
                        beforeVer |-> ClaimVer(u), afterVer |-> store'[ClaimKey(u)].version,
                        beforeContent |-> ClaimContentOf(u),
                        afterContent |-> store'[ClaimKey(u)].content]
-    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, dupThiefWin,
+    /\ claimBorn' = [claimBorn EXCEPT ![u] = TRUE]
+    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, dupThiefWin,
                    stealWonVers, lastGuarded, stolen>>
 
 \* claim.rs::observe -- one GET plus one HEAD; records the observed version.
 Observe(w, u) ==
     /\ ClaimPresent(u)
     /\ obsVer' = [obsVer EXCEPT ![w][u] = ClaimVer(u)]
-    /\ UNCHANGED <<sVars, timeUsed, heldVer, firstRecord, claimDeleted,
+    /\ UNCHANGED <<sVars, timeUsed, heldVer, firstRecord, claimBorn,
                    dupThiefWin, stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
 \* claim.rs::renew -- CasVersion on the held token; PreconditionFailed is
@@ -190,7 +191,7 @@ Renew(w, u) ==
                            afterVer |-> store'[ClaimKey(u)].version,
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
-    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, dupThiefWin,
+    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, dupThiefWin,
                    stealWonVers, lastGuarded, stolen>>
 
 \* claim.rs::steal -- CasVersion on the observed version, gated on expiry and a
@@ -214,7 +215,7 @@ Steal(w, u) ==
                            afterVer |-> store'[ClaimKey(u)].version,
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
-    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, lastGuarded>>
+    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded>>
 
 \* claim.rs::mark_completed -- CasVersion; PreconditionFailed is NotOwner.
 MarkCompleted(w, u) ==
@@ -231,7 +232,7 @@ MarkCompleted(w, u) ==
                            afterVer |-> store'[ClaimKey(u)].version,
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
-    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, dupThiefWin,
+    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, dupThiefWin,
                    stealWonVers, lastGuarded, stolen>>
 
 \* A claim payload becomes unreadable (corruption). Treated as absent by readers
@@ -243,7 +244,7 @@ CorruptClaim(u) ==
     /\ store' = [store EXCEPT ![ClaimKey(u)] =
                    [present |-> TRUE, content |-> Corrupt, version |-> ClaimVer(u)]]
     /\ UNCHANGED <<lastModified, versionCounter, uploads, listState, timeUsed,
-                   heldVer, obsVer, firstRecord, claimDeleted, dupThiefWin,
+                   heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
                    stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
 \* Logical time advances (an unrelated store write bumps the version domain that
@@ -255,7 +256,7 @@ TimePass ==
     /\ (~LivenessMode \/ \A u \in Units : ClaimPresent(u))
     /\ PutOverwrite(ScratchKey, Scr)
     /\ timeUsed' = timeUsed + 1
-    /\ UNCHANGED <<heldVer, obsVer, firstRecord, claimDeleted, dupThiefWin,
+    /\ UNCHANGED <<heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
                    stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
 \* --- compaction publication (never reads the claim) -------------------------
@@ -264,7 +265,7 @@ PutPart(u, v) ==
     /\ CanWrite
     /\ (~LivenessMode \/ \A x \in Units : ClaimPresent(x))
     /\ PutCreateIfAbsent(PartKey(u, v), <<u, v>>)
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimDeleted,
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
                    dupThiefWin, stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
 DoPublish(u, v) ==
@@ -283,7 +284,7 @@ GuardedPublish(w, u, v) ==
     /\ HoldsClaim(w, u)
     /\ DoPublish(u, v)
     /\ lastGuarded' = [fired |-> TRUE, held |-> TRUE]
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimDeleted, dupThiefWin,
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
                    stealWonVers, lastClaimOp, stolen>>
 
 \* The ungated publish: the --no-claim CLI path and a paused stale worker that
@@ -294,7 +295,7 @@ UngatedPublish(u, v) ==
     /\ CanWrite
     /\ ~LivenessMode
     /\ DoPublish(u, v)
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimDeleted, dupThiefWin,
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
                    stealWonVers, lastClaimOp, lastGuarded, stolen>>
 
 Next ==
@@ -340,8 +341,13 @@ StaleOwnerCannotOverwriteNewerClaim ==
               /\ lastClaimOp.afterContent = lastClaimOp.beforeContent)
 
 \* No path deletes a claim unconditionally (a stale worker's DELETE could destroy
-\* a newer owner's claim). (Broken by claim-delete-unconditional.)
-NoUnconditionalClaimDelete == ~claimDeleted
+\* a newer owner's claim). Stated over the store: a claim key that was ever
+\* created is still present, since no modeled action legitimately removes one.
+\* claimBorn latches on the CreateIfAbsent that births the key, so a DELETE of a
+\* present claim drops ClaimPresent while the latch stays set. (Broken by
+\* claim-delete-unconditional.)
+NoUnconditionalClaimDelete ==
+    \A u \in Units : claimBorn[u] => ClaimPresent(u)
 
 \* At most one thief wins a given observed version: the version token is consumed
 \* by the first successful steal, so a second steal on the same observed version
