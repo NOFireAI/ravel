@@ -187,13 +187,18 @@ written with `CreateIfAbsent` at the tenant's first write for that signal
 validates against the winner rather than erroring. It lives under the
 tenant's own prefix, alongside that signal's `l0/` and `c/` shard data, not
 in the bucket-root `sys/` space, because it is per-tenant state. Every
-ingest, catalog-resolve, and maintenance touch validates the configured
-`shard_count` against it: a statically-known tenant's disagreement refuses
-startup, a dynamic tenant's disagreement fails that one request, and a query
-never resolves over a subset of shards. A (tenant, signal) with pre-ADR data
-but no record is adopted once (the record is written from config) only when
-every observed shard index is below the configured `shard_count`; a higher
-observed index proves the value would hide data and refuses without writing.
+ingest, catalog-resolve, and maintenance touch reads the record and routes
+over the recorded shard count, so a query never resolves over a subset of
+shards. The recorded count is authoritative: it does not have to equal the
+process's live `--shards` value, which is only a default for tenants that have
+no record yet. A difference between the two (for example after lowering the
+global default) is tolerated and surfaced as an informational metric, not a
+refusal (ADR-0082). Only two cases still fail closed: adopting a value that
+would hide existing data, and an unreadable record whose true count cannot be
+trusted. A (tenant, signal) with pre-ADR data but no record is adopted once
+(the record is written from config) only when every observed shard index is
+below the configured `shard_count`; a higher observed index proves the value
+would hide data and refuses without writing.
 `shard_count` is immutable per generation; the generation history is
 append-only; the shard-index domain of hour `h` is `0..scan_count(h)`
 (ADR-0052, online resharding), floored at `Signal::fixed_read_shards()` for

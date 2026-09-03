@@ -68,8 +68,14 @@ pub async fn adopt(
             Ok(ProvisioningCheck::Written) => {
                 println!("{sig}: adopted (wrote provisioning record with shard_count={shards})");
             }
-            Ok(ProvisioningCheck::Matched) => {
-                println!("{sig}: already provisioned; recorded shard_count matches {shards}");
+            Ok(ProvisioningCheck::RecordPresent {
+                recorded_shard_count,
+            }) => {
+                println!(
+                    "{sig}: already provisioned; recorded shard_count is {recorded_shard_count}, \
+                     live --shards default is {shards} (routing uses the recorded generation \
+                     history)"
+                );
             }
             Ok(ProvisioningCheck::FreshNoData) => {
                 println!(

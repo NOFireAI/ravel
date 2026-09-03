@@ -707,22 +707,32 @@ schemes starts a new bucket and drains into it.
 
 ## Durable shard count
 
-`--shards` is immutable per tenant and signal. Once a tenant's data for a signal
-is written across N shards, resolution iterates `0..N`, so serving that tenant
-with a lower `--shards` would silently omit every series in the missing shards.
-It also sets both the ingest router's shard count and the query-side catalog's
-shard count, which is why there is no separate query-side flag.
+`--shards` is a default for tenants that have not yet been provisioned. It is
+not a per-tenant setting you can change after the fact: once a tenant's data for
+a signal is written across N shards, that count is fixed for that tenant and
+signal, and routing serves it over its own recorded shard range regardless of
+the live `--shards` value. The flag sets both the ingest router's shard count
+and the query-side catalog's shard count for new tenants, which is why there is
+no separate query-side flag.
 
-To make a mismatch loud instead of silent, the first write for a tenant and
-signal records the value in a durable provisioning record at
-`t/<tenant_hash>/<signal>/prov`, and every later ingest, query and maintenance
-touch validates against it. Lowering `--shards` for a tenant that has data in
-higher shards is refused by construction.
+The first write for a tenant and signal records its shard count in a durable
+provisioning record at `t/<tenant_hash>/<signal>/prov`. Every later ingest,
+query, and maintenance touch reads that record and routes over the recorded
+count. An already-provisioned tenant keeps its recorded count: changing the
+global `--shards` default (for example, lowering it for new tenants) does not
+affect a tenant that already has a record, and does not refuse startup, fail its
+queries, or skip its maintenance. This drift between a tenant's recorded count
+and the live default is expected and is surfaced as an informational metric, not
+an error.
+
+The one case still refused is a record whose shard count would hide existing
+data if adopted, and an unreadable (corrupt or future-format) record whose true
+shard count cannot be trusted; both fail closed.
 
 A brand-new tenant with no prior writes has no record yet, so a fresh
 deployment, including an operator-managed cluster that starts with zero data and
 configured tokens, starts normally. The record is created on the tenant's first
-write.
+write and pins the live `--shards` default as that tenant's count.
 
 **Adopting data written before the record existed.** A tenant and signal that
 already had data is adopted the first time a server ingests or maintains it, or
