@@ -17,7 +17,9 @@ carryforward.cfg    three-hour safety config that exercises the incremental fold
 bands.tsv           per-config distinct-state and depth bands
 traceability.md     TLA+ action or property -> Rust source table
 results.md          recorded figures and the bands they must stay in
-counterexamples/    one note per negative control and per switch-less invariant
+counterexamples/    one prose note per negative control, plus the recorded
+                    liveness shrink for the one temporal property that is
+                    defined but not checked
 negative/           negative-control configs, one broken switch each
   <name>.cfg        a config that flips exactly one switch
   <name>.expect     the exit code and property that config must violate
@@ -54,15 +56,19 @@ bucket is compactable strictly before it is foldable.
 defined but not checked: it is a recorded shrink (finite-model liveness
 limitation; see `counterexamples/late-supersession-shrink.md`).
 
-Eight invariants are shown non-vacuous by a negative control that flips one
-switch and makes them falsifiable (see `negative/` and `counterexamples/`); the
-four without a switch carry a mutant note in `counterexamples/` naming a
-reachable antecedent state and the mutation that would falsify them. A ninth
-config, `negative/carryforward-nonvacuity.cfg`, is a non-vacuity probe rather
-than a mutant: it checks `NoCarryForward` over three-hour bounds where a
-watermark-advancing fold is reachable, so TLC reporting it violated proves the
-bounded incremental fold's carry-forward branch does real work (see
-`carryforward.cfg` and `counterexamples/carryforward-nonvacuity.md`).
+All twelve named invariants above are shown non-vacuous by a negative control
+that flips one switch and makes them falsifiable (see `negative/` and
+`counterexamples/`); none is left to a mutant note. Two configs are
+non-vacuity probes rather than switch mutants: `negative/carryforward-nonvacuity.cfg`
+checks `NoCarryForward` over three-hour bounds where a watermark-advancing
+fold is reachable, so TLC reporting it violated proves the bounded
+incremental fold's carry-forward branch does real work (see `carryforward.cfg`
+and `counterexamples/carryforward-nonvacuity.md`); and
+`negative/frontier-reconcile-nonvacuity.cfg` checks `NoFrontierReconcile`, so
+TLC reporting it violated proves the ADR-0020 retention-frontier reconcile
+added to `DoFoldStart` / `DoRivalFoldWin` is exercised, not dead code, and
+that `TombstonedBucketContributesNothing`'s `frontierReconciled` disjunct is
+not vacuous.
 
 ## Running
 
