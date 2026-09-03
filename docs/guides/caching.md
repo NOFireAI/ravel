@@ -43,9 +43,17 @@ The cache stores byte ranges read from two kinds of objects:
   shape, where the threshold above governs. See the flag table below.
 
 Both PromQL queries and SQL queries over the `samples` table use the
-metric path. SQL queries over the `logs` table use the log path.
+metric path. SQL queries over the `logs`, `alerts` and `audit` tables use the
+log path.
 
-Two things are not cached, for two different reasons:
+Alert transitions and audit records are log objects on their own signal
+prefixes, and the `alerts` and `audit` tables read them through that same log
+fetcher, so their bytes are cached by both tiers on the same terms as any other
+log object: whole object or block ranges by the same size threshold and fetch
+policy, keyed the same way, accounted through the same funnel. Nothing about
+the cache is specific to those two signals.
+
+One thing is not cached:
 
 - **Spans.** The `spans` SQL table is queryable on `POST /api/v1/sql`, but its
   reads are uncached. The span scan fetches each RSPAN segment straight from
@@ -53,10 +61,6 @@ Two things are not cached, for two different reasons:
   and the tenant identity the log path uses to key its cache entries serves
   only as that tenant check here. A repeated span query therefore re-reads the
   same objects. This is the one genuine cache gap.
-- **Alert transitions and audit records.** These are written durably, but
-  the SQL session registers exactly three tables, `samples`, `logs`, and
-  `spans`, and no query surface can read alert or audit data at all, so there
-  is no read path to cache.
 
 Each cache entry is keyed by tenant, the content hash of the object it
 came from, and the byte offset and length. Content is immutable once
@@ -221,8 +225,9 @@ in-process, which is what the `ravel-bench` logs scan does.
 
 The one genuine gap is spans: RSPAN reads have no cache seam, so a repeated
 span query re-reads the same objects from the store every time. Alert
-transitions and audit records are not a cache gap, because they have no read
-path at all: neither is a registered SQL table.
+transitions and audit records are not a gap: the `alerts` and `audit` tables
+read through the log fetcher, so their bytes are cached exactly as log bytes
+are.
 
 ## Background
 
