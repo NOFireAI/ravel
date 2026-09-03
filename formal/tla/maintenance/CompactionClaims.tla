@@ -277,13 +277,16 @@ DoPublish(u, v) ==
                         ELSE firstRecord
 
 \* The guarded (cancellation-checkpoint) publish: publishes only while still
-\* holding the claim, so a lost claim abandons the run (no publication).
+\* holding the claim, so a lost claim abandons the run (no publication). The
+\* witness records whether the worker actually held the claim in the store at the
+\* moment of publication (HoldsClaim reads the stored owner and version), NOT a
+\* literal, so an unguarded publish is caught.
 GuardedPublish(w, u, v) ==
     /\ CanWrite
     /\ ~LivenessMode
     /\ HoldsClaim(w, u)
     /\ DoPublish(u, v)
-    /\ lastGuarded' = [fired |-> TRUE, held |-> TRUE]
+    /\ lastGuarded' = [fired |-> TRUE, held |-> HoldsClaim(w, u)]
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
                    stealWonVers, lastClaimOp, stolen>>
 
