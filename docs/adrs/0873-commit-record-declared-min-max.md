@@ -804,6 +804,41 @@ order; the wide-schema case (ADR-0100, dozens of declared I64 columns) is
 the sizing worst case and belongs in the implementation's pre-registered
 figures.
 
+## Amendment: rewrite parts are written and read unstamped; the recompute is a rejected refinement
+
+2026-09-03.
+
+An erasure rewrite's output parts carry no declared min/max stamps. Every
+producer of a rewrite part emits empty stamps, and both readers enforce
+the same rule independently: the fold that builds a rewrite part's
+snapshot entry forces the stamp fields empty rather than trusting what a
+producer wrote, and the live resolver does the same at the point it
+builds a catalog entry from a rewrite record. The rule holds regardless
+of which producer wrote the part or which reader observes it.
+
+The reason is fail-closed correctness for erasure. An unstamped part can
+never resurrect an erased row's extremum, because a reader that finds no
+stamp falls back to a full scan of the part's rows, which already
+reflects the erasure. A recompute over surviving rows, the path decision
+3 originally described, would have to prove that same fail-closed
+property on every producer of a rewrite part rather than getting it for
+free from the absence of a stamp, and no producer implements that
+recompute today. Force-empty gets the same correctness guarantee from a
+strictly smaller mechanism.
+
+The cost is that a rewritten bucket loses the stamp shortcut on every
+declared column until it is recompacted; queries over that bucket fall
+back to a full scan for statistics rather than reading a whole-object
+min/max. This is accepted as the price of erasure correctness rather than
+optimized away.
+
+The recompute rule stated in decision 3 above, including its pinned
+erase-the-max-shrinks test, is a rejected refinement: it was never
+implemented, and this amendment supersedes it as the recorded decision.
+The later passage in this document that repeats the recompute as a test
+the implementation owes is superseded by this amendment as well; the
+governing rule for rewrite parts is force-empty, not recompute.
+
 ### 4. Read side: union of carriers, behind the existing gate
 
 The fold copies `CommitRecord.declared_column_stats` onto the
