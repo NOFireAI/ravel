@@ -83,6 +83,32 @@ unit, and on the CLI publish path):
   witnessed state has correct data. This is how the model shows a non-owner
   publish is reachable and stays correct.
 
+### Exhaustive coverage is split by worker count
+
+`MCMaintenanceOwnership.exhaustive.cfg` runs with `Workers = {1}`, not `{1, 2}`.
+At two workers the reachable graph under a temporal spec (no `VIEW` is sound
+there; see below) does not converge in any practical budget: a probe of the
+exact two-worker exhaustive constants passed 4,600,000 distinct states at
+depth 13 of an eventual 20 and was still growing. One worker is exhaustive and
+completes at 1,038,446 distinct states, depth 18, in under two minutes.
+
+That leaves two different guarantees at two different worker counts, and
+neither substitutes for the other:
+
+- The two-worker duplicate-ownership race is covered **exhaustively for
+  safety only**, up to the state abstraction in `MCView`, by
+  `MCMaintenanceOwnership.smoke.cfg` (`Workers = {1, 2}`, the same six safety
+  invariants, `MCSpec` with no fairness). `MCView` is sound for these
+  invariants because it only merges states that agree on everything any
+  invariant reads (see the module comment above `MCView`'s definition); it is
+  not applied under a temporal spec anywhere in this area, because collapsing
+  stutter-equivalent states can mask a real liveness counterexample.
+- **EveryEligibleUnitEventuallyAttempted** and
+  **OwnershipIsNotPublicationAuthority** are checked exhaustively only at one
+  worker. Nothing in this suite exhaustively checks either liveness property
+  in the presence of the two-worker duplicate-ownership race; that combination
+  is not covered, and no band in `bands.tsv` claims otherwise.
+
 ### The double-ownership window
 
 The model does **not** assert continuous single ownership, and none is claimed.
