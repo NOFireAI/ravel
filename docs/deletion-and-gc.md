@@ -417,9 +417,18 @@ every bound is measured.
   data prefixes preserves (such a hold does not cover the request keyspace,
   so it would otherwise retire the filter over data it is preserving). The
   `.done` record carries only a hash of the canonical
-  predicate, timestamps, and optionally per-bucket dropped counts, no subject
+  predicate, timestamps, and per-bucket dropped counts, no subject
   identifier, and is permanent, deny-delete audit evidence for every role
-  (ADR-0055 amendment).
+  (ADR-0055 amendment). The pass writes one bucket entry per bucket whose
+  rewrite it applied for this request, in bucket order, each naming the
+  bucket's signal, shard, and ingest hour with the exact number of samples the
+  rewrite dropped there; a bucket it rewrote and dropped nothing in appears
+  with a count of zero, and a bucket it skipped does not appear. That list is
+  either complete or absent: when the pass cannot state the whole set, because
+  some bucket in the request's scope was already rewritten by an earlier pass
+  and this one has no count for it, it writes no bucket entries at all rather
+  than a partial list. A permanent audit record makes no partial claim, and
+  the sweep rule below reads the difference.
 
 - **The hold is read off the superseded-input sweep, not rediscovered.** That
   sweep runs first in the same pass and already knows, per chain group, which
@@ -428,7 +437,8 @@ every bound is measured.
   pass, for either reason the gate holds them, and the buckets in which it
   held the inputs of a chain it could not walk back to a raw input. The
   erasure rule holds a `.dreq` past its horizon when its request id is in the
-  first set, or when the second set is non-empty at all.
+  first set, or when one of those buckets is a bucket this request could have
+  touched.
 
   **The hold is computed over every supersession chain a HEAD-named part
   still resolves, whether or not the chain is old enough to delete.** Two
@@ -444,13 +454,30 @@ every bound is measured.
   horizon; that a pass could not have deleted it is not recorded and not
   consulted.
 
-  **A completion record's bucket list is informational only.** No part of this
-  rule reads `bucket_drops`: not the hold decision, and not the scope of the
-  observation. The field is optional on the wire, is written empty by the
-  production completion writer, and a writer that does populate it is not
-  obliged to enumerate every bucket it touched, so a present list can be
-  partial. Narrowing either the decision or the observation by such a list
-  would release the filter over a bucket the request did touch. The
+  **A completion record's bucket list scopes the cut-chain clause, and
+  nothing else.** A cut chain names no requests, so the bucket it was cut in
+  stands in for them; which requests it stands in for is decided per
+  candidate, from that candidate's own completion record. A bucket entry is a
+  durable statement that this request's rewrite applied in that bucket, so a
+  cut-chain bucket the list does not name is a bucket nothing this request
+  erased from can be held in, and the filter retires on its horizon. Matching
+  the entry against the reported bucket on shard and ingest hour is exact
+  because both sides are already scoped to one signal: the pass runs per
+  tenant and signal, and every entry in a completion must carry that
+  completion's own signal.
+
+  An empty bucket list is not a statement that the request touched no bucket,
+  it is the absence of any statement: a completion written before the pass
+  carried per-bucket counts, and one whose pass suppressed an incomplete list,
+  both look the same on the wire. Such a candidate keeps the original
+  whole-signal behaviour, held while any cut-chain bucket exists in the
+  signal. Reading an empty list as "no buckets" would retire those filters
+  over data a cut chain is still holding.
+
+  Nothing else in the rule reads the list, in particular not the scope of the
+  observation. A populated list from any writer other than the pass may still
+  be partial, and narrowing the observation by one would leave a bucket the
+  request did touch unobserved. The
   observation is therefore always whole-signal: one listing of the commit
   keyspace enumerates the signal's shards, and every shard is observed across
   every hour. A shard with no commit key holds nothing, so that scope costs
@@ -467,9 +494,10 @@ every bound is measured.
   they still carry whatever the generation above them erased. When the walk
   cannot reach a raw input because a generation's record is already gone, the
   requests that generation applied are no longer named anywhere; the sweep
-  reports that bucket as one where a chain was cut, and any candidate `.dreq`
-  is held while such a bucket exists, since no surviving record can say which
-  requests the missing generation applied. A chain group
+  reports that bucket as one where a chain was cut, and a candidate `.dreq`
+  whose completion names that bucket, or names no bucket at all, is held while
+  it exists, since no surviving record can say which requests the missing
+  generation applied. A chain group
   the legal-hold gate skipped holds its requests' `.dreq`s the same way a
   HEAD-held one does, which is what keeps a data-prefix-only hold from
   retiring a filter over data it is preserving.
