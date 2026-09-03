@@ -8,8 +8,10 @@
 (* store key, deletion is `MemoryStore::delete`, tombstone creation is         *)
 (* CreateIfAbsent. The protocol state that the store does not carry -- the      *)
 (* HEAD's named parts, the fold watermark, legal holds, pinned queries, the     *)
-(* abstract cache, the sys/gc config -- lives in dedicated variables and is     *)
-(* documented in README.md as an abstraction boundary.                          *)
+(* served-record content of each object, the rewrite identity, the sys/gc       *)
+(* config -- lives in dedicated variables and is documented in README.md as an  *)
+(* abstraction boundary. There is no cache tier in this model; the erasure      *)
+(* invariants make no claim about one (finding 11).                             *)
 (*                                                                             *)
 (* Abstraction boundary (see README for the full mapping):                      *)
 (*  * `store[o].present` is whether object o exists in object storage.          *)
@@ -24,7 +26,7 @@
 (*    data objects, never .dreq/.done/tombstone, are held.                      *)
 (*  * `query` is one pinned in-flight query with a deadline = pin + mqd.         *)
 (*  * `erasureRequested` is monotone: once an erasure is requested for a         *)
-(*    subject it must never be served again, even through the cache.            *)
+(*    subject it must never be served again by any modelled read.              *)
 (*                                                                             *)
 (* Every deletion goes through the store operator S!Delete and records what it  *)
 (* observed (the held set, the head it read, the horizon, the refresh state) in *)
@@ -44,7 +46,6 @@ CONSTANTS
     Grace,               \* grace
     MaxQueryDuration,    \* max_query_duration
     ClockSkew,           \* clock_skew_allowance
-    BadProtectionHorizon,\* a horizon that violates the startup inequality
     (* The fold overlays a durable per-tenant retention window; the sweep reads
        its own from CLI flags. Modelled as two constants that may differ (#1131):
        the fold seals a retired bucket out of HEAD only after FoldRetentionWindow,
@@ -66,9 +67,13 @@ CONSTANTS
     DeleteBeforeHorizon,        \* retention deletes without the horizon gate
     RefreshFailureSweepsAnyway, \* a failed hold refresh does not skip the tick
     SupersededSweepUngated,     \* drop the object-granular HEAD gate
-    DreqIgnoresHeldInputs,      \* delete the .dreq while a superseded input is held
+    DreqIgnoresHeldInputs,      \* delete the .dreq while an input serving the erased
+                                \* subject is still present in the store
     RewriteIdentityOmitsRequests, \* the rewrite key hash ignores the applied ids
-    GcConfigViolatesInequality, \* the sys/gc record fails the startup inequality
+    RewriteKeepsErasedRecords,  \* the rewrite output keeps the erased records
+                                \* instead of dropping them (breaks the multiset rule)
+    CompleteIgnoresServedSet,   \* completion skips the served-set check, marking
+                                \* .done while the current HEAD still serves the subject
     HorizonGuardsPinnedQueries  \* base: a horizon-gated delete also respects an
                                 \* in-window pinned query. Candidate #1133 sets it
                                 \* FALSE to model the shipped delete, which gates on
@@ -77,6 +82,11 @@ CONSTANTS
 ASSUME ProtectionHorizon \in Nat /\ Grace \in Nat
 ASSUME MaxQueryDuration \in Nat /\ ClockSkew \in Nat
 ASSUME MaxClock \in Nat
+\* The GC startup inequality (gc_config.rs::satisfies_constraint) is a precondition
+\* on the configuration the maintainer runs with, enforced at startup and never
+\* re-checked per state. It is an ASSUME here, not a state invariant (finding 9):
+\* as an invariant it reduced to a constant comparison the model never varies.
+ASSUME ProtectionHorizon >= MaxQueryDuration + Grace + ClockSkew
 
 \* --- The finite instance (a fixed bounded model; README documents the bounds) -
 \* One retention bucket b1 with a single L0 raw input is the minimal slice that
@@ -100,9 +110,13 @@ InitPresent   == RawInputs \cup {"sysgc"}
 Bucket(o) == CASE o \in {"raw1","rwA","tombB1","dreqR1","doneR1"} -> "b1"
                [] OTHER -> "sys"
 
-\* Does o serve records of subject s? The raw input carries s1; the rewrite output
-\* has s1 removed.
-ServesSubject(o, s) == (o \in RawInputs) /\ (s = "s1")
+\* The served records are modelled by identity, not by count: one record rec1 of
+\* subject s1. `objContent` (a state variable) holds the set of record identities
+\* each object serves, so "serves subject s" is a fact about the stored content, and
+\* the rewrite multiset rule (finding 3) is checked over record identities rather
+\* than reduced to a constant. RecordSubject maps a record to its subject.
+AllRecords     == {"rec1"}
+RecordSubject(r) == "s1"
 
 Predecessors(o) == IF o = "rwA" THEN RawInputs ELSE {}
 AppliedReqs(o)  == IF o = "rwA" THEN Requests ELSE {}
@@ -110,26 +124,43 @@ AppliedReqs(o)  == IF o = "rwA" THEN Requests ELSE {}
 \* Subjects erased by a set of request ids (r1 erases s1).
 ErasedBy(reqs) == IF "r1" \in reqs THEN {"s1"} ELSE {}
 
+\* Content of a raw input at Init: the raw input carries rec1 (subject s1); every
+\* other object carries no records until an action writes it.
+InitContent(o) == IF o \in RawInputs THEN {"rec1"} ELSE {}
+
+\* The record set the rewrite output should serve: its predecessors' records minus
+\* the records whose subject the applied requests erased. RewriteKeepsErasedRecords
+\* drops the minus (finding 3 behaviour mutant).
+RewriteOutputContent ==
+    LET inRecs == UNION { InitContent(i) : i \in Predecessors("rwA") }
+    IN IF RewriteKeepsErasedRecords
+           THEN inRecs
+           ELSE { r \in inRecs : RecordSubject(r) \notin ErasedBy(AppliedReqs("rwA")) }
+
 \* Rewrite descriptors for the identity-collision property: same input set, a
 \* different applied-request set. The shipped key binds the sorted applied ids
 \* (compute_rewrite_input_set_hash); the switch drops them so the two collide.
-Descriptors == { [inputs |-> RawInputs, reqs |-> {"r1"}],
-                 [inputs |-> RawInputs, reqs |-> {}] }
+\* PerformRewrite names its two output variants by RewriteKey and stores those
+\* names in `variantKey`; the invariant reads the stored names, not this operator
+\* (finding 4). RewriteKey itself is what the action USES to name an object.
+DescA == [inputs |-> RawInputs, reqs |-> {"r1"}]
+DescB == [inputs |-> RawInputs, reqs |-> {}]
 RewriteKey(d) == IF RewriteIdentityOmitsRequests
                      THEN <<d.inputs>>
                      ELSE <<d.inputs, d.reqs>>
-
-\* Both descriptors are always materialised (a rewrite output really keyed by its
-\* input-set hash exists for each). Kept as a fixed set, not a variable, so the
-\* identity-collision property is checked without enlarging the state space.
-Materialized == Descriptors
+\* The sentinel a variant name holds before PerformRewrite has assigned it.
+UnnamedKey == <<>>
 
 \* Legal-hold coverage: a hold on a bucket covers its data objects (l0/commit/l1)
 \* but never the del prefix (.dreq/.done/tombstone) or sys.
 HeldObject(o, heldB) == (o \in DataObjects) /\ (Bucket(o) \in heldB)
 
-\* Rules whose deletion is gated on a time horizon (as opposed to the HEAD gate).
-HorizonGatedRules == {"retention", "dreq"}
+\* Rules whose deletion is gated on a time horizon (as opposed to only a HEAD
+\* gate). The superseded-input sweep is horizon-gated too (sweep.rs skips a record
+\* younger than the protection horizon in both the compaction and the rewrite
+\* branch), so it is included here and the pinned-query clause of
+\* NoDeleteInsideProtectionWindow covers it (finding 6).
+HorizonGatedRules == {"retention", "dreq", "superseded"}
 
 \* --- Store instance ----------------------------------------------------------
 VARIABLES
@@ -145,23 +176,32 @@ VARIABLES
     tombRetiredAt,    \* [Buckets -> Nat]: retired_at, 0 when no tombstone
     dreqHorizon,      \* Nat: the .dreq horizon
     doneAt,           \* Nat: completion timestamp (0 when no .done)
+    supersededAt,     \* Nat: clock at which the rewrite superseded its inputs (0 = none)
+    objContent,       \* [Objects -> SUBSET AllRecords]: served record identities
+    variantKey,       \* [{"v1","v2"} -> key]: the names PerformRewrite assigned
     sysgc,            \* [ph, mqd, grace, skew]
     lastGc            \* witness of the last GC deletion step
 
 storeVars == <<store, lastModified, versionCounter, uploads, listState>>
 protoVars == <<head, headState, clock, superseded, heldBuckets,
                refreshFailed, query, erasureRequested, tombRetiredAt,
-               dreqHorizon, doneAt, sysgc, lastGc>>
+               dreqHorizon, doneAt, supersededAt, objContent, variantKey,
+               sysgc, lastGc>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           head, headState, clock, superseded, heldBuckets,
           refreshFailed, query, erasureRequested, tombRetiredAt,
-          dreqHorizon, doneAt, sysgc, lastGc>>
+          dreqHorizon, doneAt, supersededAt, objContent, variantKey,
+          sysgc, lastGc>>
 
 S == INSTANCE RavelObjectStore
        WITH Keys <- Objects, Content <- {"dat", "nc"}, NoContent <- "nc",
             Clients <- {"mnt"}
 
 PresentObj(o) == store[o].present
+
+\* A subject is served by object o iff a record of that subject is in o's stored
+\* content (finding 3: serving is a fact about stored content, not a static CASE).
+ServesSubject(o, s) == \E r \in objContent[o] : RecordSubject(r) = s
 
 \* State-space view: the invariants and every gate read object PRESENCE, never the
 \* store's version, content, upload or listing bookkeeping. Projecting those away
@@ -170,10 +210,15 @@ PresentObj(o) == store[o].present
 StoreView == [o \in Objects |-> store[o].present]
 View ==
     <<StoreView, head, headState, clock, superseded, heldBuckets, refreshFailed,
-      query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc, lastGc>>
+      query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt, supersededAt,
+      objContent, variantKey, sysgc, lastGc>>
 
-\* Effective HEAD for a GC gate read: absent clears (empty), present reads the
-\* set, unreadable is handled by HeadReadable (the whole pass is blocked).
+\* A delete decision needs a real read of the current HEAD object. Only a present
+\* read authorises a decision about whether an object is still referenced; an
+\* absent or unreadable read fails closed (the sweep does not delete), because the
+\* true HEAD may still name the object (finding 5). HeadReadable is kept for the
+\* serving predicate, which treats a missing HEAD as naming nothing (fail-safe).
+HeadDeletable == headState = "present"
 HeadReadable == headState # "unreadable"
 EffectiveHead == IF headState = "absent" THEN {} ELSE head
 
@@ -218,13 +263,15 @@ TypeOK ==
     /\ tombRetiredAt \in [Buckets -> 0..MaxClock]
     /\ dreqHorizon \in Nat
     /\ doneAt \in 0..MaxClock
+    /\ supersededAt \in 0..MaxClock
+    /\ objContent \in [Objects -> SUBSET AllRecords]
+    /\ variantKey \in [{"v1","v2"} -> {UnnamedKey, RewriteKey(DescA), RewriteKey(DescB)}]
     /\ sysgc \in [ph: Nat, mqd: Nat, grace: Nat, skew: Nat]
     /\ lastGc.rule \in {"none","superseded","retention","dreq"}
     /\ lastGc.deleted \subseteq Objects
     /\ lastGc.held \in BOOLEAN
     /\ lastGc.refreshWasFailed \in BOOLEAN
     /\ lastGc.permittedNeeds \subseteq DataObjects
-    /\ lastGc.headNamed \subseteq Objects
 
 --------------------------------------------------------------------------------
 \* Init: a populated store (raw1, raw2, d2, sysgc present), HEAD naming the data,
@@ -251,17 +298,21 @@ Init ==
     /\ tombRetiredAt = [b \in Buckets |-> 0]
     /\ dreqHorizon = 0
     /\ doneAt = 0
-    /\ sysgc = [ph |-> IF GcConfigViolatesInequality THEN BadProtectionHorizon ELSE ProtectionHorizon,
+    /\ supersededAt = 0
+    /\ objContent = [o \in Objects |-> InitContent(o)]
+    /\ variantKey = [v \in {"v1","v2"} |-> UnnamedKey]
+    /\ sysgc = [ph |-> ProtectionHorizon,
                 mqd |-> MaxQueryDuration, grace |-> Grace, skew |-> ClockSkew]
     /\ lastGc = [rule |-> "none", deleted |-> {}, atClock |-> 0,
                  held |-> FALSE, refreshWasFailed |-> FALSE,
-                 permittedNeeds |-> {}, headNamed |-> {}]
+                 permittedNeeds |-> {}]
 
 \* A GC witness records what the deleting store operation OBSERVED at its own
-\* step: the legal-hold state, the refresh state, the permitted-query needs, and
-\* the HEAD-named subset it deleted. Invariants read this captured state (never
-\* the live variable), so a hold or refresh flipped AFTER a legitimate delete
-\* cannot retroactively make it look unsafe.
+\* step: the TRUE legal-hold state (over heldBuckets, not the sweep's known set),
+\* the refresh state, and the permitted-query needs. Invariants read this captured
+\* state (never the live variable), so a hold or refresh flipped AFTER a legitimate
+\* delete cannot retroactively make it look unsafe. `held` uses the true hold set
+\* so a sweep that ran with degraded hold knowledge (finding 2) is caught.
 PermittedNeeds ==
     IF query.active /\ clock <= query.deadline THEN query.needs ELSE {}
 
@@ -269,12 +320,11 @@ GcWitness(r, dels) ==
     lastGc' = [rule |-> r, deleted |-> dels, atClock |-> clock,
                held |-> \E o \in dels : HeldObject(o, heldBuckets),
                refreshWasFailed |-> refreshFailed,
-               permittedNeeds |-> PermittedNeeds,
-               headNamed |-> dels \cap EffectiveHead]
+               permittedNeeds |-> PermittedNeeds]
 
 NoGc == lastGc' = [rule |-> "none", deleted |-> {}, atClock |-> clock,
                    held |-> FALSE, refreshWasFailed |-> FALSE,
-                   permittedNeeds |-> {}, headNamed |-> {}]
+                   permittedNeeds |-> {}]
 
 --------------------------------------------------------------------------------
 \* Environment actor
@@ -287,7 +337,7 @@ Tick ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 \* Pin an in-flight query at the current HEAD; its deadline is pin + mqd. It is
@@ -301,7 +351,7 @@ PinQuery ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 ExpireQuery ==
@@ -311,7 +361,7 @@ ExpireQuery ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 \* Place / release a legal hold on bucket b (its data prefixes).
@@ -321,7 +371,7 @@ PlaceHold(b) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 ReleaseHold(b) ==
@@ -330,7 +380,7 @@ ReleaseHold(b) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 \* The HEAD object read can fail (unreadable) or find the HEAD gone (absent).
@@ -341,7 +391,7 @@ SetHeadState(s) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 \* Toggle this tick's legal-hold refresh outcome.
@@ -352,7 +402,7 @@ SetRefresh(f) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 --------------------------------------------------------------------------------
@@ -361,14 +411,14 @@ SetRefresh(f) ==
 
 \* Write the .dreq for the erasure request (CreateIfAbsent, irreversible key).
 \* crates/ravel-commit erasure request; the subject is marked erasure-requested
-\* forever (it must never be served again, even through the cache).
+\* forever (it must never be served again by any modelled read).
 RequestErasure ==
     /\ ~PresentObj("dreqR1")
     /\ S!PutCreateIfAbsent("dreqR1", "dat")
     /\ erasureRequested' = erasureRequested \cup {"s1"}
     /\ dreqHorizon' = clock + DreqHorizonDelta
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
-                   refreshFailed, query, tombRetiredAt, doneAt, sysgc>>
+                   refreshFailed, query, tombRetiredAt, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 \* Materialise the rewrite output rwA = inputs minus the erased subject and mark
@@ -379,6 +429,10 @@ PerformRewrite ==
     /\ ~PresentObj("rwA")
     /\ S!PutOverwrite("rwA", "dat")
     /\ superseded' = superseded \cup RawInputs
+    /\ supersededAt' = clock
+    /\ objContent' = [objContent EXCEPT !["rwA"] = RewriteOutputContent]
+    /\ variantKey' = [variantKey EXCEPT !["v1"] = RewriteKey(DescA),
+                                        !["v2"] = RewriteKey(DescB)]
     /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc>>
     /\ NoGc
@@ -392,7 +446,7 @@ HeadAdvanceRewrite ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 \* Complete the erasure: write .done only when the served set no longer serves the
@@ -401,14 +455,14 @@ HeadAdvanceRewrite ==
 CompleteErasure ==
     /\ ~PresentObj("doneR1")
     /\ PresentObj("dreqR1")
-    /\ headState = "present"   \* completion needs a real served-set read of HEAD
-    /\ ~ServesNow("s1")
+    /\ HeadDeletable   \* completion needs a real served-set read of HEAD
+    /\ (CompleteIgnoresServedSet \/ ~ServesNow("s1"))
     /\ clock > 0
     /\ S!PutOverwrite("doneR1", "dat")
     /\ doneAt' = clock
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, sysgc>>
+                   dreqHorizon, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 --------------------------------------------------------------------------------
@@ -422,7 +476,7 @@ RetireBucket ==
     /\ S!PutCreateIfAbsent("tombB1", "dat")
     /\ tombRetiredAt' = [tombRetiredAt EXCEPT !["b1"] = clock]
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
-                   refreshFailed, query, erasureRequested, dreqHorizon, doneAt, sysgc>>
+                   refreshFailed, query, erasureRequested, dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 \* Fold reconciles a retired bucket out of the HEAD; it may lag (a late fold) and
@@ -437,21 +491,23 @@ DropRetiredBucketFromHead ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
     /\ NoGc
 
 \* Retention physical sweep of one b1 data object. Gates on now >= retired_at +
 \* protection_horizon (DeleteBeforeHorizon drops this) AND the current HEAD naming
-\* nothing in the bucket, with absent HEAD clearing and unreadable HEAD blocking
-\* the whole pass. A failed hold refresh skips the whole tick. A held object is
-\* never swept. Base additionally respects an in-window pinned query
-\* (HorizonGuardsPinnedQueries); candidate #1133 sets that FALSE.
+\* nothing in the bucket. The head-empty check reads the real HEAD, and the pass
+\* runs only on a present HEAD read (HeadDeletable): an absent or unreadable read
+\* fails closed, because the true HEAD may still name the object (finding 5). A
+\* failed hold refresh skips the whole tick. A held object is never swept. Base
+\* additionally respects an in-window pinned query (HorizonGuardsPinnedQueries);
+\* candidate #1133 sets that FALSE.
 QueryPermits(o) ==
     HorizonGuardsPinnedQueries =>
         ~(query.active /\ clock <= query.deadline /\ o \in query.needs)
 
 RetentionSweep(o) ==
-    /\ HeadReadable
+    /\ HeadDeletable
     /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
     /\ o \in DataObjects
     /\ Bucket(o) = "b1"
@@ -459,49 +515,49 @@ RetentionSweep(o) ==
     /\ PresentObj("tombB1")
     /\ (DeleteBeforeHorizon \/ clock >= tombRetiredAt["b1"] + sysgc.ph)
     /\ clock >= tombRetiredAt["b1"] + SweepRetentionWindow
-    /\ \A x \in EffectiveHead : Bucket(x) # "b1"
+    /\ \A x \in head : Bucket(x) # "b1"
     /\ ~HeldObject(o, heldBuckets)
     /\ QueryPermits(o)
     /\ S!Delete(o)
     /\ GcWitness("retention", {o})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
 
 --------------------------------------------------------------------------------
 \* Physical GC actor (maintainer): superseded-input sweep and .dreq sweep
 --------------------------------------------------------------------------------
 
 \* Superseded-input sweep of one raw input. Object-granular HEAD gate
-\* (reachability object_gate): an input the current HEAD still names is HELD, an
-\* unreadable HEAD blocks the whole pass fail-closed, an absent HEAD clears the
-\* gate. SupersededSweepUngated drops the head-membership check.
+\* (reachability object_gate): an input the current HEAD still names is HELD. The
+\* pass runs only on a present HEAD read (HeadDeletable); an absent or unreadable
+\* read fails closed. The delete is horizon-gated (sweep.rs skips a record younger
+\* than the protection horizon) and respects an in-window pinned query.
+\* SupersededSweepUngated drops the head-membership check.
 SupersededGatePasses(o) ==
-    IF SupersededSweepUngated THEN TRUE ELSE o \notin EffectiveHead
+    IF SupersededSweepUngated THEN TRUE ELSE o \notin head
 
 SupersededSweep(o) ==
-    /\ HeadReadable
+    /\ HeadDeletable
     /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
     /\ o \in superseded
     /\ PresentObj(o)
     /\ ~HeldObject(o, heldBuckets)
+    /\ (DeleteBeforeHorizon \/ clock >= supersededAt + sysgc.ph)
+    /\ QueryPermits(o)
     /\ SupersededGatePasses(o)
     /\ S!Delete(o)
     /\ GcWitness("superseded", {o})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
 
 \* .dreq sweep: delete the .dreq when a matching .done exists, its completed
-\* timestamp is non-zero, the horizon has passed AND no permitted pinned query can
-\* still reach a present object serving the subject (once the .dreq read-time filter
-\* is gone, such a reader would serve the erased subject). DreqIgnoresHeldInputs
-\* drops the last clause, so the .dreq can be swept out from under such a query.
-NoPinnedReaderServes ==
-    ~\E o \in DataObjects :
-        /\ PresentObj(o) /\ ServesSubject(o, "s1")
-        /\ query.active /\ clock <= query.deadline /\ o \in query.needs
-
+\* timestamp is non-zero, the horizon has passed AND no reader (the current HEAD or
+\* a permitted pinned query) still reaches a present object serving the subject
+\* (once the .dreq read-time filter is gone, such a reader would serve the erased
+\* subject). DreqIgnoresHeldInputs drops the last clause, so the .dreq can be swept
+\* out from under such a reader.
 DreqSweep ==
     /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
     /\ HeadReadable
@@ -509,12 +565,12 @@ DreqSweep ==
     /\ PresentObj("doneR1")
     /\ doneAt > 0
     /\ clock >= dreqHorizon
-    /\ (DreqIgnoresHeldInputs \/ NoPinnedReaderServes)
+    /\ (DreqIgnoresHeldInputs \/ ~ServesAny("s1"))
     /\ S!Delete("dreqR1")
     /\ GcWitness("dreq", {"dreqR1"})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
 
 --------------------------------------------------------------------------------
 Next ==
@@ -558,6 +614,8 @@ Terminal ==
 NoDeleteInsideProtectionWindow ==
     /\ ( lastGc.rule = "retention" =>
              lastGc.atClock >= tombRetiredAt["b1"] + sysgc.ph )
+    /\ ( lastGc.rule = "superseded" =>
+             lastGc.atClock >= supersededAt + sysgc.ph )
     /\ ( lastGc.rule \in HorizonGatedRules =>
              (lastGc.deleted \cap lastGc.permittedNeeds) = {} )
 
@@ -582,8 +640,9 @@ TombstoneExcludesBeforeDelete ==
               /\ tombRetiredAt["b1"] <= lastGc.atClock
 
 \* Once an erasure is requested for a subject, that subject is never served
-\* again, including through the cache (the read applies the erasure predicate
-\* after fetch and after the cache).
+\* again: the modeled read (ServedRead) applies the erasure predicate after the
+\* store fetch. The model has no cache tier; the production read applies the same
+\* predicate after its cache, but that ordering is not something this model shows.
 ErasedSubjectNeverServedAfterRequest ==
     \A s \in erasureRequested : ~ServedRead(s)
 
@@ -595,8 +654,10 @@ RewriteOutputsAreInputsMinusErased ==
                 ( (\E i \in Predecessors("rwA") : ServesSubject(i, s))
                   /\ s \notin ErasedBy(AppliedReqs("rwA")) )
 
-\* Completion implies no pre-rewrite exposure: once .done exists, no present
-\* head-named object still serves the erased subject.
+\* Completion implies no pre-rewrite exposure: once .done exists, the current HEAD
+\* no longer serves the erased subject (the rewrite advanced HEAD off it). A pinned
+\* reader holding an older snapshot is handled separately by the .dreq read-time
+\* filter (DreqRemovalCannotResurrect), not by completion.
 CompletionImpliesNoPreRewriteExposure ==
     PresentObj("doneR1") => ~ServesNow("s1")
 
@@ -606,30 +667,19 @@ DreqRemovalCannotResurrect ==
     ("s1" \in erasureRequested /\ ~PresentObj("dreqR1")) => ~ServesAny("s1")
 
 \* Two rewrites over the same input set with different applied requests get
-\* different keys (the hash binds the sorted applied ids). Anchored to a
-\* materialised rewrite output so TLC evaluates it as a state invariant rather than
-\* a constant.
+\* different keys (the hash binds the sorted applied ids). Reads the names
+\* PerformRewrite actually stored (variantKey), not the RewriteKey operator, so the
+\* property observes what the write produced (finding 4). RewriteIdentityOmitsRequests
+\* drops the applied ids from the key, collapsing the two names.
 IdenticalInputSetsDoNotCollide ==
-    PresentObj("rwA") =>
-        Cardinality({RewriteKey(d) : d \in Materialized}) = Cardinality(Materialized)
+    PresentObj("rwA") => variantKey["v1"] # variantKey["v2"]
 
-\* The predecessor chain is representable: acyclic, inputs are real data objects,
-\* bounded depth.
-PredecessorChainRepresentable ==
-    \A o \in Objects :
-        /\ o \notin Predecessors(o)
-        /\ Predecessors(o) \subseteq DataObjects
-        /\ (\A p \in Predecessors(o) : Predecessors(p) = {})
-
-\* An object the live HEAD still names is held, never deleted, by the superseded
-\* sweep (the object-granular HEAD gate).
+\* An object the current HEAD still names must be present: no sweep may delete a
+\* HEAD-named raw input. Reads the store presence against the live HEAD set, so the
+\* object-granular gate is observed on the store, not a witness field.
+\* SupersededSweepUngated deletes a HEAD-named input and fires this.
 HeadNamedObjectNeverDeletedBySupersededSweep ==
-    lastGc.rule = "superseded" => lastGc.headNamed = {}
-
-\* The sys/gc record satisfies the startup inequality
-\* (protection_horizon >= max_query_duration + grace + clock_skew_allowance).
-GcConfigSatisfiesHorizon ==
-    sysgc.ph >= sysgc.mqd + sysgc.grace + sysgc.skew
+    \A o \in RawInputs : o \in head => PresentObj(o)
 
 --------------------------------------------------------------------------------
 \* Liveness (checked against FairSpec only; see README and #1131). Weak fairness

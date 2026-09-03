@@ -6,14 +6,20 @@ that runs before its tombstone exists is reachable and the invariant catches it.
 ## Mutation
 
 Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. The
-tombstone-present precondition is removed from the retention sweep:
+tombstone-present precondition is removed from both sweep-enabling actions:
 
 ```
 -    /\ PresentObj("tombB1")
 ```
 
-removed from `RetentionSweep` only (the `RetireBucket` and invariant references
-to `tombB1` are untouched). The run used the base `smoke.cfg`.
+removed from `RetentionSweep` and from `DropRetiredBucketFromHead`. Both are
+needed: `RetentionSweep` gates on the HEAD naming nothing in the bucket, and the
+only action that empties the bucket from HEAD is `DropRetiredBucketFromHead`,
+which itself requires the tombstone. Removing the guard from the sweep alone is
+unreachable, because HEAD can only be emptied after the tombstone exists, so the
+tombstone is always present by the time the sweep could fire. The `RetireBucket`
+guard (`~PresentObj("tombB1")`) and the invariant's own `PresentObj("tombB1")`
+clause are untouched. The run used the base `smoke.cfg`.
 
 ## Result
 

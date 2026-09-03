@@ -11,6 +11,16 @@ point that extends it. Both instantiate the shared `RavelObjectStore.tla` (under
 `../common`) as the durable backend, so every write, overwrite, delete, and
 conditional create obeys the object-store contract rather than a hand-rolled map.
 
+## What this model claims (ADR-1113 D12)
+
+TLC checked this finite model under the bounds and assumptions in each `.cfg`.
+This model verifies the protocol design; implementation conformance is argued in
+the traceability table and asserted by the named Rust tests, not proved. Safety
+and liveness are stated separately below, and every liveness result carries its
+fairness assumptions. The object store's own conformance to its contract, and any
+hash or identity function the rewrite identity relies on, are assumptions, stated
+as such and not checked here.
+
 ## What the model contains
 
 - A store of a few named objects: one raw input, one rewrite output, a retention
@@ -29,26 +39,35 @@ conditional create obeys the object-store contract rather than a hand-rolled map
 
 ## Invariants
 
-Thirteen safety invariants including `TypeOK`; see `traceability.md` for the
+Eleven safety invariants including `TypeOK`; see `traceability.md` for the
 one-line meaning of each and its Rust source. The load-bearing ones:
 `NoDeleteInsideProtectionWindow`, `HeldObjectNeverDeleted`,
 `RefreshFailureNeverSweeps`, `TombstoneExcludesBeforeDelete`,
 `ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`,
 `CompletionImpliesNoPreRewriteExposure`, `DreqRemovalCannotResurrect`,
-`IdenticalInputSetsDoNotCollide`, `PredecessorChainRepresentable`,
-`HeadNamedObjectNeverDeletedBySupersededSweep`, `GcConfigSatisfiesHorizon`.
+`IdenticalInputSetsDoNotCollide`, `HeadNamedObjectNeverDeletedBySupersededSweep`.
+
+The config horizon inequality (protection_horizon at or above
+max_query_duration plus grace plus clock_skew) is an `ASSUME` on the constants,
+not a checked invariant: it is a precondition on config rather than a
+store-observable property, so a runtime invariant reading it would only restate
+the constant. The rewrite lineage is likewise not a separate invariant; the
+store-derived `RewriteOutputsAreInputsMinusErased` and `IdenticalInputSetsDoNotCollide`
+already pin what the output serves and how its identity is bound.
 
 ## Switches and negative controls
 
-Seven boolean CONSTANTS gate the model's guards; all are at their shipped value
+Eight boolean CONSTANTS gate the model's guards; all are at their shipped value
 in `smoke.cfg` and `exhaustive.cfg`. Each `negative/*.cfg` flips exactly one and
-names the single invariant it must break, so a guard silently deleted from the
-spec fails a control rather than passing unnoticed. The six controls and their
-targets are listed in `bands.tsv`; each has a note under `counterexamples/`.
+names the single invariant it must break (scoped to `TypeOK` plus that one
+target, so a control cannot pass on the wrong invariant), so a guard silently
+deleted from the spec fails a control rather than passing unnoticed. There are
+seven controls, one per `negative/*.cfg`; each has a note under
+`counterexamples/`.
 
-`HorizonGuardsPinnedQueries` is candidate #1133: with it FALSE the retention
-delete gates on the horizon and an empty HEAD but not on an in-window pinned
-query. `candidate-1133.cfg` runs that configuration and it is unsafe;
+`HorizonGuardsPinnedQueries` is candidate #1133: with it FALSE a sweep delete
+gates on the horizon and an unnamed HEAD but not on an in-window pinned query.
+`candidate-1133.cfg` runs that configuration and it is unsafe;
 `counterexamples/candidate-1133.md` has the trace. The shipped model keeps the
 switch TRUE.
 
@@ -58,8 +77,9 @@ An invariant that no reachable behaviour can break is decoration. Three of them
 are shown breakable by mutating the BEHAVIOUR (not a switch) in a scratch copy
 and running TLC: `HeldObjectNeverDeleted`, `TombstoneExcludesBeforeDelete`, and
 `ErasedSubjectNeverServedAfterRequest`. The mutations and the exact TLC violation
-lines are recorded under `counterexamples/*-mutant.md`. The six negative controls
-provide the same evidence for six more invariants by switch.
+lines are recorded under `counterexamples/*-mutant.md`. The seven negative controls
+provide the same evidence for seven more invariants by switch, so all ten named
+safety invariants have a recorded TLC violation.
 
 ## State-space control
 
@@ -71,10 +91,14 @@ what the invariants read, collapsing the space to a size TLC finishes quickly.
 ## Liveness (exhaustive only)
 
 `FairSpec` adds weak fairness on the maintainer sweeps, the fold's HEAD advance,
-and erasure completion. Two properties, `EventuallySwept` and
-`EventuallyCompleted`, hold under it. They are intentionally conditional: a legal
-hold, a stopped maintainer, or a fold and sweep whose retention windows disagree
-make them false (#1131). The exhaustive cfg sets both windows to agree.
+and erasure completion. Two conditional liveness properties are defined,
+`EventuallySwept` and `EventuallyCompleted`. They are only meaningful under the
+fairness and window agreement the exhaustive cfg sets up: a legal hold, a stopped
+maintainer, or a fold and sweep whose retention windows disagree make them false
+(#1131). This task did not run the exhaustive configuration, so it makes no claim
+here about whether the two properties hold; the orchestrator's exhaustive run and
+its outcome are recorded in `results.md`. The README claims only what the smoke,
+negative, and traceability lanes this task ran actually showed.
 
 ## Running
 
