@@ -940,18 +940,20 @@ overflow column and lose columnar access. Watch for that in
 
 ## Per-query budgets
 
-Four flags bound what one query may spend. Unset, each is derived from the host
-at startup (memory shares are of `MemTotal`, capped by the cgroup memory limit
-when the process runs in a container); set, the flag value is used verbatim,
-with one reconciliation: the per-query SQL pool is clamped to an explicit
-per-tenant ceiling set below it, and the startup log says so. The
+Four flags bound what one query may spend. Unset, each resolves at startup, but
+only some resolve from host resources: `--fetch-concurrency` follows the core
+count and the two SQL ceilings follow memory (shares of `MemTotal`, capped by
+the cgroup memory limit when the process runs in a container), while
+`--max-segments` is a fixed 1,000,000 on every host. Set, the flag value is
+used verbatim, with one reconciliation: the per-query SQL pool is clamped to an
+explicit per-tenant ceiling set below it, and the startup log says so. The
 reference-host column is a 16-core, 30 GB host, the shape the published
 ClickBench run used.
 
 | Flag | Default (unset) | Reference host | Choose against |
 |---|---|---|---|
 | `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Host cores and the store's request budget. One knob with three coupled effects: it also sets the SQL scan partition count and the object-store request concurrency. |
-| `--max-segments` | derived: 1,000,000 | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
+| `--max-segments` | fixed: 1,000,000 (host-independent) | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
 | `--sql-max-query-bytes` | derived: 25% of MemTotal, 256 MiB if memory is unknown | 8,053,063,680 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. Held at or below `--sql-tenant-max-bytes`: an explicit value here raises a non-explicit (derived or fallback) tenant ceiling to fit, but an explicit tenant ceiling clamps this down and warns. |
 | `--sql-tenant-max-bytes` | derived: 50% of MemTotal, 1 GiB if memory is unknown | 16,106,127,360 | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
 

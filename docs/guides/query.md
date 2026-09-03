@@ -236,11 +236,11 @@ truncation:
 
 | Budget | Default | Error when exceeded |
 |---|---|---|
-| Segments touched | derived: 1,000,000 (`--max-segments`) | `query matched {count} segments, exceeding the limit of {max}` |
+| Segments touched | fixed: 1,000,000 (`--max-segments`) | `query matched {count} segments, exceeding the limit of {max}` |
 | Distinct series | 10,000 | `query matched {count} series, exceeding the limit of {max}` |
 | Samples materialized | 10,000,000 | `query matched {count} samples, exceeding the limit of {max}` |
 | Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--fetch-concurrency`) | (not user-visible; throughput knob only) |
-| Wall-clock deadline | derived: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
+| Wall-clock deadline | fixed: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
 | Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
 
 `timeout` (Prometheus duration syntax like `30s`/`5m`, or bare float
@@ -262,18 +262,20 @@ naming the pool, never a truncated result.
 
 ### Operator-configurable budgets (server flags)
 
-Four of these budgets are process-wide server flags. Unset, each is **derived
-from the host** at startup (memory shares are of `MemTotal`, capped by the
-cgroup memory limit in a container); set, the flag value is used verbatim,
-except that the per-query SQL pool is clamped to an explicit per-tenant
-ceiling set below it (see the clamp rule below). All four are process-wide,
-not per-tenant. The "reference host" column is what a 16-core, 30 GB host
-resolves to, the settings the published ClickBench run used.
+Four of these budgets are process-wide server flags. Unset, each resolves at
+startup, but only some resolve **from host resources**: `--fetch-concurrency`
+follows the core count and the two SQL ceilings follow memory (shares of
+`MemTotal`, capped by the cgroup memory limit in a container), while
+`--max-segments` is a fixed 1,000,000 on every host. Set, the flag value is
+used verbatim, except that the per-query SQL pool is clamped to an explicit
+per-tenant ceiling set below it (see the clamp rule below). All four are
+process-wide, not per-tenant. The "reference host" column is what a 16-core,
+30 GB host resolves to, the settings the published ClickBench run used.
 
 | Flag | Reaches | Default (unset) | Reference host |
 |---|---|---|---|
 | `--fetch-concurrency <N>` | `EngineConfig::fetch_concurrency` | derived: `max(8, 2 x cores)` | 32 |
-| `--max-segments <N>` | `EngineConfig::max_segments` | derived: 1,000,000 | 1,000,000 |
+| `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
 | `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 25% of MemTotal (256 MiB if unknown) | 8,053,063,680 |
 | `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
 
@@ -321,8 +323,8 @@ these ceilings are process-wide flags.
 is a flag; omitted, it is derived from `--shards` and the flush cadence.
 
 `--gc-max-query-duration` sets the engine's enforced wall-clock deadline.
-Unset, it is derived: **11 minutes**, the deadline the published ClickBench run
-needed for its longest statement. It must be **`<=`** the tenant's durable
+Unset, it is a fixed **11 minutes** on every host, the deadline the published
+ClickBench run was configured with. It must be **`<=`** the tenant's durable
 `sys/gc.max_query_duration` (default 1h), which the derived value satisfies.
 A value above it is **rejected at startup** (a hard error), not clamped: raise
 `sys/gc.max_query_duration` first (`ravel-cli gc-config set`) if you need a
