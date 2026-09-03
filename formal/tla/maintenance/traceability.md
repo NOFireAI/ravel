@@ -9,7 +9,7 @@ or the backend does. Symbols only, never line numbers.
 
 | TLA+ action or property | meaning | Rust path and symbol | existing test | new test needed |
 |---|---|---|---|---|
-| OTypeOK | state well-formedness (every variable's shape and range), not a runtime check; holds by construction | n/a (type invariant, not a code path) | none | none |
+| OTypeOK | state well-formedness: every variable's shape and range, which the Rust types make unrepresentable rather than checking at runtime | `crates/ravel-fleet/src/worker_set.rs::WorkerSet` | `crates/ravel-fleet/src/worker_set.rs::live_sets_converge_to_include_both_workers` | none |
 | WriteHeartbeat | one self-owned Overwrite PUT stamped with the writer clock; atomic in Rust | `crates/ravel-fleet/src/worker_set.rs::WorkerSet::write_heartbeat` | `crates/ravel-fleet/src/worker_set.rs::live_sets_converge_to_include_both_workers` | none |
 | PersistHeartbeat | the durable heartbeat object write (Overwrite of `sys/maintain/workers/<id>`), self-owned and never a CAS, bounded to once per key; atomic in Rust | `crates/ravel-fleet/src/worker_set.rs::WorkerSet::write_heartbeat` | `crates/ravel-fleet/src/worker_set.rs::live_sets_converge_to_include_both_workers` | none |
 | ComputeLive | the once-per-cycle live-set recompute; Rust does a LIST plus one GET per sibling, not atomic, a helper the model collapses to one step. The fail-open freeze (a failed refresh keeps the last set) is the caller's, in `services/ravel-server/src/maintain.rs::run_loop` via `live_rx.borrow().clone()`, modeled as the absence of this step | `crates/ravel-fleet/src/worker_set.rs::live_set` | `crates/ravel-fleet/src/worker_set.rs::stale_sibling_is_excluded_at_three_h` | none |
@@ -38,7 +38,7 @@ or the backend does. Symbols only, never line numbers.
 
 | TLA+ action or property | meaning | Rust path and symbol | existing test | new test needed |
 |---|---|---|---|---|
-| CTypeOK | state well-formedness (every variable's shape and range), not a runtime check; holds by construction | n/a (type invariant, not a code path) | none | none |
+| CTypeOK | state well-formedness: every variable's shape and range, which the Rust types make unrepresentable rather than checking at runtime | `crates/ravel-fleet/src/claim.rs::ClaimHolder` | `crates/ravel-fleet/src/claim.rs::uncontended_acquire_costs_one_put_and_no_reads` | none |
 | Acquire | claim CreateIfAbsent returning a version token; atomic single PUT | `crates/ravel-fleet/src/claim.rs::acquire` | `crates/ravel-fleet/src/claim.rs::uncontended_acquire_costs_one_put_and_no_reads` | none |
 | Observe | one GET plus one HEAD recording the observed version; a helper, not atomic | `crates/ravel-fleet/src/claim.rs::observe` | `crates/ravel-fleet/src/claim.rs::a_corrupt_claim_payload_is_observed_and_never_stolen` | none |
 | Renew | CasVersion on the held token; PreconditionFailed is ClaimLost; atomic | `crates/ravel-fleet/src/claim.rs::renew` | `crates/ravel-fleet/src/claim.rs::renew_after_steal_fails_precondition` | none |
