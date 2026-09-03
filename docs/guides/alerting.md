@@ -92,9 +92,16 @@ rules in one tenant that would produce the same alert identity all fail the
 process at load time.
 
 A SQL detection rule reads the same tables the `POST /api/v1/sql` endpoint
-serves (`samples`, `logs`, `spans`, `alerts`, `audit`), under the same
+serves (`samples`, `logs`, `spans`, `audit`), under the same
 one-signal-per-query rule. See the [query guide](query.md) for the query
 languages themselves.
+
+A rule that reads `alerts`, so that an alert fires on other alerts, is not
+usable yet. The table is queryable from the endpoint, but the evaluator passes
+no consumed generations to the recursion guard, so every record such a rule
+produced would sit at generation 1 and the `max_alert_generation` circuit
+breaker could never trip. Until that is wired, write rules against the other
+four tables.
 
 ## Evaluation cadence and the SQL lookback
 
@@ -150,10 +157,10 @@ The table has these columns:
 | column         | type                | notes                                              |
 |----------------|---------------------|----------------------------------------------------|
 | `ts_ns`        | `Timestamp(ns)`     | the transition's event time, never null             |
-| `alert_id`     | `Utf8`              | 32-character hex identity of the alert              |
-| `rule_id`      | `Utf8`              | the rule that produced the transition               |
-| `state`        | `Utf8`              | `pending`, `firing`, `resolved`, or `suppressed`    |
-| `generation`   | `Int64`             | the alerts-on-alerts generation counter             |
+| `alert_id`     | `Utf8`              | 32-character hex identity of the alert, nullable    |
+| `rule_id`      | `Utf8`              | the rule that produced the transition, nullable     |
+| `state`        | `Utf8`              | `pending`, `firing`, `resolved`, `suppressed`; nullable |
+| `generation`   | `Int64`             | the alerts-on-alerts generation counter, nullable   |
 | `writer_id`    | `Utf8`              | the evaluator that wrote the record, never null     |
 | `writer_epoch` | `UInt64`            | write identity from the record's commit record      |
 | `writer_seq`   | `UInt64`            | write identity from the record's commit record      |
@@ -185,7 +192,14 @@ are there because `ts_ns` alone is not a total order. Two evaluators can overlap
 briefly at a lease handover and write the same `alert_id` at the same `ts_ns`,
 and ordering by timestamp alone would leave two rows tied for "latest". Ordering
 by `ts_ns DESC, writer_epoch DESC, writer_seq DESC, writer_id DESC` is a total
-order, so the fold below returns exactly one row per alert:
+order, so the fold below returns exactly one row per alert.
+
+One caveat on what that order means. `writer_epoch` is a constant today, not a
+lease term, and each evaluator's `writer_seq` restarts at 1, so across a
+handover the key picks the departing evaluator's record rather than the later
+write. The result is still exactly one current row per alert, and it is the
+same row the evaluator's own fold picks, so the table agrees with the writer.
+Do not read the order as causal ordering between evaluators.
 
 ```sql
 SELECT *
