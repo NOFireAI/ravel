@@ -31,21 +31,37 @@ as such and not checked here.
 - Actors: the environment (clock, HEAD state, hold refresh, query pin), the
   erasure and rewrite maintainer, the retention maintainer, and the physical GC
   maintainer (superseded and request-marker sweeps).
-- A witness, `lastGc`, that records what a delete OBSERVED at its own step (the
-  hold state, the refresh state, the permitted-query needs, the HEAD-named
-  subset). Every safety invariant reads the witness or the store, never a ghost
-  field the action writes about itself, so a hold or refresh flipped after a
-  legitimate delete cannot retroactively make it look unsafe.
+- A witness, `lastGc`, that records what a delete (or, for `CompleteErasure`,
+  a completion write) OBSERVED at its own step: the hold state, the refresh
+  state, the permitted-query needs, the HEAD-named subset, and whether a held
+  raw input served the erased subject. Every safety invariant reads the
+  witness or the store, never a ghost field the action writes about itself,
+  so a hold or refresh flipped after a legitimate delete or completion
+  cannot retroactively make it look unsafe.
 
 ## Invariants
 
-Eleven safety invariants including `TypeOK`; see `traceability.md` for the
+Thirteen safety invariants including `TypeOK`; see `traceability.md` for the
 one-line meaning of each and its Rust source. The load-bearing ones:
 `NoDeleteInsideProtectionWindow`, `HeldObjectNeverDeleted`,
 `RefreshFailureNeverSweeps`, `TombstoneExcludesBeforeDelete`,
 `ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`,
-`CompletionImpliesNoPreRewriteExposure`, `DreqRemovalCannotResurrect`,
+`CompletionImpliesNoPreRewriteExposure`, `CompletionRespectsLegalHold`,
+`DreqRemovalCannotResurrect`, `DreqSweepRespectsLegalHold`,
 `IdenticalInputSetsDoNotCollide`, `HeadNamedObjectNeverDeletedBySupersededSweep`.
+
+`CompletionRespectsLegalHold` and `DreqSweepRespectsLegalHold` pin the same
+legal-hold-wins-over-erasure rule (ADR-0064 section 6) that
+`bucket_is_held` enforces in `bucket_erasure_completion` and that
+`chain_groups_held_by_legal_hold` enforces in the request-marker sweep: a
+held, still-present superseded input serving the erased subject blocks
+completion and blocks the `.dreq` sweep, independently of whether the
+subject is reachable through HEAD or a pinned read. Both invariants read a
+per-step witness on `lastGc` (`heldInputServed`, tagged by `rule`), not the
+live `heldBuckets`, so a hold placed or released strictly after a
+legitimate completion or sweep does not retroactively fail them; this is
+the same reason `NoDeleteInsideProtectionWindow` reads `lastGc` instead of
+the live `supersededAt`/query state.
 
 The config horizon inequality (protection_horizon at or above
 max_query_duration plus grace plus clock_skew) is an `ASSUME` on the constants,
@@ -73,13 +89,16 @@ switch TRUE.
 
 ## Non-vacuity
 
-An invariant that no reachable behaviour can break is decoration. Three of them
+An invariant that no reachable behaviour can break is decoration. Six of them
 are shown breakable by mutating the BEHAVIOUR (not a switch) in a scratch copy
-and running TLC: `HeldObjectNeverDeleted`, `TombstoneExcludesBeforeDelete`, and
-`ErasedSubjectNeverServedAfterRequest`. The mutations and the exact TLC violation
-lines are recorded under `counterexamples/*-mutant.md`. The seven negative controls
-provide the same evidence for seven more invariants by switch, so all ten named
-safety invariants have a recorded TLC violation.
+and running TLC: `HeldObjectNeverDeleted`, `TombstoneExcludesBeforeDelete`,
+`ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`
+(the "kept" direction), `CompletionRespectsLegalHold`, and
+`DreqRemovalCannotResurrect`. The mutations and the exact TLC violation lines
+are recorded under `counterexamples/*-mutant.md`. The seven negative controls
+provide the same evidence for their target invariants by switch (one target,
+`RewriteOutputsAreInputsMinusErased`, is also covered by a behaviour mutant
+above), so all twelve named safety invariants have a recorded TLC violation.
 
 ## State-space control
 
