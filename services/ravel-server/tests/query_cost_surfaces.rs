@@ -211,6 +211,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
             ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
         ),
         metadata_cache: None,
+        cache: None,
+        cache_max_bytes: 0,
+        catalog_cache_max_bytes: 0,
     });
 
     Surfaces {
@@ -615,6 +618,9 @@ mod flight {
                 ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
             ),
             metadata_cache: None,
+            cache: None,
+            cache_max_bytes: 0,
+            catalog_cache_max_bytes: 0,
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![

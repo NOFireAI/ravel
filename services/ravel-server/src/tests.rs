@@ -201,6 +201,9 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
             crate::ingest_byte_metrics::IngestByteMetrics::new(),
         ),
         metadata_cache: None,
+        cache: None,
+        cache_max_bytes: 0,
+        catalog_cache_max_bytes: 0,
     });
 
     Harness {

@@ -2590,6 +2590,11 @@ mod tests {
             None,
             &[],
             None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
         );
         assert!(
             body.contains("ravel_distrib_quarantine_marks_total{mode=\"query\"} 1"),
