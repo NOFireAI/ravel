@@ -533,8 +533,8 @@ Spec == Init /\ [][Next]_vars
 
 \* --- fairness (liveness only) -----------------------------------------------
 \* Weak fairness on watermark advance (the folder makes progress: start, put
-\* part, and CAS), on the clock, and on the query, so a late supersession is
-\* eventually reflected and a started query eventually finishes.
+\* part, and CAS), on the clock, and on the query, so a started query eventually
+\* finishes (QueryTerminates).
 FoldProgress == \E f \in Folders :
     (DoFoldStart(f) \/ DoFoldPutPart(f) \/ DoFoldCas(f) \/ DoFoldRebase(f))
 QueryProgress == DoQueryResolve \/ DoQueryRun
@@ -641,9 +641,29 @@ SignalDedupContract ==
 ----------------------------------------------------------------------------
 \* Named temporal properties (checked against FairSpec only).
 
+\* A started query always reaches a terminal phase: a pinned query either
+\* completes or is invalidated, never spinning forever. One swept-object miss
+\* forces exactly one re-resolve, a second miss is terminal
+\* (crates/ravel-query/src/error.rs::QueryError::SnapshotInvalidated), so the
+\* retry ladder is bounded. Fairness: WF on query progress. Checked in
+\* exhaustive.cfg.
+QueryTerminates ==
+    (qy.phase = "pinned") ~> (qy.phase \in {"done", "invalid"})
+
 \* A published compaction record is eventually reflected in a valid HEAD: its
-\* superseded L0 inputs leave the snapshot and its L1 part enters it. Fairness:
-\* WF on fold progress and the clock.
+\* superseded L0 inputs leave the snapshot and its L1 part enters it.
+\*
+\* NOT CHECKED in any config: recorded as a shrink. Under the F16/F17 design
+\* (reconcile runs only on a watermark-advancing fold, RECONNAISSANCE.md), a
+\* compaction that lands in an already-folded hour is reflected only by a later
+\* fold whose watermark advances past that hour. Real deployments satisfy this
+\* because the watermark advances without bound as wall-clock time moves and new
+\* hours seal. A bounded model clock cannot: a compaction published after the
+\* final watermark advance (Hours is finite, so the watermark saturates) is
+\* never re-reconciled, and TLC reports a stuttering counter-example. The stale
+\* window it exposes is safe by design (query-time dedup serves each identity
+\* once, pinned by SignalDedupContract), so this is a finite-model liveness
+\* limitation, not a defect. See counterexamples/late-supersession-shrink.md.
 LateSupersessionEventuallyReflected ==
     \A H \in Hours : \A g \in CompIds :
         (crec[H][g].used /\ ~tomb[H])
