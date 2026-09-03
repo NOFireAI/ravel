@@ -1,5 +1,5 @@
 cfg	min_distinct	max_distinct	min_depth	max_depth
 MCMaintenanceOwnership.smoke.cfg	2640000	2910000	18	22
-MCMaintenanceOwnership.exhaustive.cfg	219000	243000	14	20
+MCMaintenanceOwnership.exhaustive.cfg	950000	1100000	16	20
 MCCompactionClaims.smoke.cfg	9350000	9800000	14	20
 MCCompactionClaims.exhaustive.cfg	500	580	8	13

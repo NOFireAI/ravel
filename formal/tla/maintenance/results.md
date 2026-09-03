@@ -4,57 +4,72 @@ TLC checked these finite models under the bounds and assumptions recorded here.
 This verifies the protocol designs; implementation conformance is argued in
 `traceability.md` and asserted by the named Rust tests, not proved.
 
-- Tool: `tla2tools` 1.7.4 (TLC2 version 2.19), Java 21 (Temurin).
-- Host: fleet executor (4 cores, 8 GB).
-- Run id: `20260903T091233Z-e23694e3abbf2bdfc8391906ca52a7ffad7e9b66`
-  (`scripts/check-tla.sh ci -a maintenance`, one coherent run: smoke, negative,
-  traceability).
-- Smoke and negative figures copied verbatim from `.cache/tla/last-run.tsv` for
-  that run id. The exhaustive configs were not run by this executor; their rows
-  carry no re-measured figures.
+- Tool: `tla2tools` 1.7.4 (TLC2 version 2.19), Java 21 (Temurin, installed under
+  `/tmp`; this host's `$HOME` is a 256 MB tmpfs with no room for a JRE).
+- Host: fleet executor (8 cores, 8 GB), `-workers auto` resolves to 8 TLC
+  workers.
+- Smoke, negative, and traceability run id:
+  `20260903T193802Z-12bfb462ff18b3269f6cbccf5877a511ffe9bc61` prefix run
+  (`scripts/check-tla.sh smoke|negative|traceability -a maintenance`).
+  Exhaustive run: same session, `scripts/check-tla.sh exhaustive -a
+  maintenance`. Figures below are copied verbatim from each subcommand's
+  `.cache/tla/last-run.tsv` output (the file is truncated per subcommand, so
+  figures were captured immediately after each call) or from the command's own
+  PASS/VIOLATED summary line. Both exhaustive configs were run this session and
+  completed; neither is a carried-over or unmeasured figure.
 
 ## Configurations
 
 | cfg | TLC | states | distinct | depth | seconds | host | result |
 |---|---|---|---|---|---|---|---|
-| MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 44219729 | 2773760 | 20 | 91 | fleet executor | PASS |
-| MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | - | - | - | - | - | not run by executor |
-| MCCompactionClaims.smoke.cfg | 1.7.4 | 57428832 | 9370767 | 17 | 184 | fleet executor | PASS |
-| MCCompactionClaims.exhaustive.cfg | 1.7.4 | - | - | - | - | - | not run by executor |
-| negative/ownership-as-publication-authority.cfg | 1.7.4 | 7550 | 2435 | - | 1 | fleet executor | VIOLATED |
-| negative/heartbeat-memo-cas.cfg | 1.7.4 | 116 | 91 | - | 1 | fleet executor | VIOLATED |
-| negative/memo-overstamp.cfg | 1.7.4 | 1167 | 488 | - | 1 | fleet executor | VIOLATED |
-| negative/mo-diverge-overwrites-record.cfg | 1.7.4 | 2865 | 1074 | - | 1 | fleet executor | VIOLATED |
-| negative/mo-missing-part-reports-converged.cfg | 1.7.4 | 8096 | 2405 | - | 2 | fleet executor | VIOLATED |
-| negative/zero-ownership-phantom.cfg | 1.7.4 | 6350395 | 1317024 | - | 65 | fleet executor | VIOLATED |
-| negative/claim-completion-without-cas.cfg | 1.7.4 | 20850 | 9254 | - | 1 | fleet executor | VIOLATED |
-| negative/claim-delete-unconditional.cfg | 1.7.4 | 124 | 83 | - | 1 | fleet executor | VIOLATED |
-| negative/claim-as-publication-authority.cfg | 1.7.4 | 11577 | 5906 | - | 2 | fleet executor | VIOLATED |
-| negative/guarded-publish-ignores-claim.cfg | 1.7.4 | 267 | 180 | - | 1 | fleet executor | VIOLATED |
-| negative/diverge-overwrites-record.cfg | 1.7.4 | 1810 | 973 | - | 2 | fleet executor | VIOLATED |
-| negative/missing-part-reports-converged.cfg | 1.7.4 | 5952 | 3004 | - | 2 | fleet executor | VIOLATED |
+| MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 44219729 | 2773760 | 20 | 83 | fleet executor | PASS |
+| MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 10538602 | 1038446 | 18 | 103 | fleet executor | PASS |
+| MCCompactionClaims.smoke.cfg | 1.7.4 | 57428832 | 9370767 | 17 | 127 | fleet executor | PASS |
+| MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 11 | 2 | fleet executor | PASS |
+| negative/ownership-as-publication-authority.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/heartbeat-memo-cas.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/memo-overstamp.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/mo-diverge-overwrites-record.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/mo-missing-part-reports-converged.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/zero-ownership-phantom.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 13) |
+| negative/claim-completion-without-cas.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/claim-delete-unconditional.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/claim-as-publication-authority.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/guarded-publish-ignores-claim.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/diverge-overwrites-record.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
+| negative/missing-part-reports-converged.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
 
 The two smoke configurations and the two exhaustive configurations are banded in
-`bands.tsv`; the smoke bands were re-measured this run, the exhaustive bands are
-carried from the prior full run and were not re-run here. The negative controls
-stop at the first counterexample and carry no band. Every smoke config completes
-under the 300 s smoke budget. The `distinct` counts are deterministic; the
-reported search `depth` varies by a step or two between runs under TLC's parallel
-BFS (`-workers auto`), so the depth bands are a small range around the observed
-value rather than an exact figure (the figures in the table above are from the
-named run id).
+`bands.tsv`; every row was re-measured this run and every band comes from a run
+that completed (see "Exhaustive coverage is split by worker count" below for how
+`MCMaintenanceOwnership.exhaustive.cfg` gets there). The negative controls stop
+at the first counterexample and carry no band. Every smoke and exhaustive config
+completes under its budget. The `states` and `distinct` counts for a PASS
+(exhaustive-search) row are deterministic; the reported search `depth` varies by
+a step or two between runs under TLC's parallel BFS (`-workers auto`), so the
+depth bands are a small range around the observed value rather than an exact
+figure. A VIOLATED row's states/distinct count is not reproducible: TLC's
+parallel BFS (8 workers on this host) stops at the first violating state it
+reaches, and that count depends on worker count and scheduling, not on the
+model. Only the invariant name and the exit code are stable facts for a VIOLATED
+row (exit 12: an `INVARIANT` failed; exit 13: a `PROPERTY` failed), so that is
+all this table records for one; see "Per-invariant audit" below for which
+invariant each negative control targets.
 
 ## Constants chosen for exhaustive
 
-- Ownership: `Workers = {1, 2}`, `Units = {1}`, `Variants = {iA, iB}`,
-  `H = 1`, `Factor = 1` (window 1), `MaxT = 2`, `Phantom = FALSE`,
-  `AllowCrash = FALSE` (the stable-membership environment the liveness
-  property names). Safety is view-independent, so it is checked in smoke at the
-  same `MaxT = 2` with `AllowCrash = FALSE`. At `MaxT = 2` a worker that stops
-  writing heartbeats has its stamp fall outside the staleness window and is
-  excluded from the live set, so the safety-relevant crash behaviour (a silent
-  worker being dropped) is reachable in smoke without the crashed flag. See the
-  staleness reachability and crash-coverage notes below.
+- Ownership: `Workers = {1}` (see "Exhaustive coverage is split by worker
+  count" in README.md), `Units = {1}`, `Variants = {iA, iB}`, `H = 1`,
+  `Factor = 1` (window 1), `MaxT = 2`, `Phantom = FALSE`, `AllowCrash = FALSE`
+  (the stable-membership environment the liveness property names). Safety is
+  view-independent, so the two-worker duplicate-ownership race is checked
+  exhaustively (up to the sound `MCView` abstraction) in smoke instead, at the
+  same `MaxT = 2` with `AllowCrash = FALSE` and `Workers = {1, 2}`. At
+  `MaxT = 2` a worker that stops writing heartbeats has its stamp fall outside
+  the staleness window and is excluded from the live set, so the
+  safety-relevant crash behaviour (a silent worker being dropped) is reachable
+  in smoke without the crashed flag. See the staleness reachability and
+  worker-count notes below.
 - Claims: `Workers = {1, 2}`, `Units = {1}`, `Variants = {iA, iB}`,
   `DeclaredLease = 1`, `MaxObservedLease = 2`, `MaxV = 6`, `MaxTime = 2`,
   `LivenessMode = TRUE` (the paused-holder / fair-thief lifecycle that is the
@@ -77,20 +92,28 @@ This is a bounded model check, not a proof for all sizes.
   confirms this: `MaxT = 1` completes with no violation (408320 distinct), and
   `MaxT = 2` is violated at 112 states (a sibling stamped at clock 0 is stale
   once `now = 2`). The smoke config runs `MaxT = 2` for this reason.
-- Exhaustive termination via bounding (F2). The exhaustive config runs with no
-  VIEW, so the raw `versionCounter` (bumped by every successful store write, an
-  unbounded `Nat`) must stay finite for the search to terminate. The only action
-  that could re-mint versions without limit is a part vanish followed by a
-  re-PUT of the identical content-addressed bytes. `VanishPart(u)` is bounded by
-  a `vanishedOnce[u][variant]` latch, so each part vanishes at most once and the
-  vanish/re-PUT loop cannot drive `versionCounter` forever. A minimal scratch
-  model (never committed) with the auxiliary invariant `VCUnderCap ==
-  versionCounter =< 12` demonstrates the bound: with the latch guard the search
-  completes (263268 distinct, depth 16) and `VCUnderCap` holds; with the guard
-  removed the search violates the cap (exit 12) and the reported depth grows
-  without settling. The full exhaustive run is not executed by this executor
-  (its budget exceeds the streaming idle timeout); the probe shows the bounding
-  change is what makes it finite.
+- Exhaustive termination requires a finite `versionCounter`, but that alone
+  does not make the two-worker graph tractable (F2). The exhaustive config runs
+  with no VIEW, so the raw `versionCounter` (bumped by every successful store
+  write, an unbounded `Nat`) must stay finite for the search to terminate at
+  all. The only action that could re-mint versions without limit is a part
+  vanish followed by a re-PUT of the identical content-addressed bytes.
+  `VanishPart(u)` is bounded by a `vanishedOnce[u][variant]` latch, so each part
+  vanishes at most once and the vanish/re-PUT loop cannot drive `versionCounter`
+  forever; the model is finite regardless of `Workers`. That finiteness is
+  necessary but not sufficient: at `Workers = {1, 2}` the no-VIEW exhaustive
+  graph is finite but still passed 4,600,000 distinct states at depth 13 of an
+  eventual 20 without converging in any practical budget. The blowup tracks
+  `Workers`, not `versionCounter` or `MaxT` -- the same no-VIEW configuration at
+  `Workers = {1}` completes at 1,038,446 distinct states, depth 18, in under
+  two minutes (see the Configurations table). `versionCounter` was ruled out as
+  a bounding lever for this: it is already bounded by the one-shot vanish latch
+  above, so constraining it further would not shrink the two-worker graph, only
+  mask the same blowup behind a different variable. `MCMaintenanceOwnership.
+  exhaustive.cfg` therefore runs at `Workers = {1}`; the two-worker race is
+  covered exhaustively for safety only, via `MCView`, by smoke.cfg. See
+  README.md, "Exhaustive coverage is split by worker count", for the full
+  rationale and exactly which properties are covered at which worker count.
 - Crash coverage (residual). With `AllowCrash = FALSE` in every current config
   (smoke, exhaustive, and all negatives) the `crashed` flag is never set, so the
   `Crash` and `Revive` actions are not exercised by any checked model. Their
@@ -168,30 +191,32 @@ One row per named invariant or property across both models. Basis is
 store-derived (the invariant reads `store`/`ContentOf` directly) or
 witness-derived (the invariant reads a variable the model set as a witness to
 an action, such as `lastMaint`, `seedFresh`, `lastPub`, `cliCorrect`, or
-`stolen`). The TLC line is the real state/distinct count from the
-Configurations table above, or from this file's own prior runs where noted;
-a property with no measured line says so rather than inventing one. Every
-cited action and variable below was grepped against the current `.tla`
-sources before being carried forward.
+`stolen`). The TLC line names the run and its exit code; every cited action
+and variable below was grepped against the current `.tla` sources before
+being carried forward. A VIOLATED run's state/distinct count is not a stable
+fact (TLC's parallel BFS stops at the first violating state, and the count
+depends on worker count and scheduling; see the Configurations table note
+above), so it is not carried into this table -- the invariant name and the
+exit code are what a violated row asserts, and both are reproducible.
 
 | Invariant | Model | Basis | Observes | Non-vacuity mutant | TLC line |
 |---|---|---|---|---|---|
 | OTypeOK | Ownership | store-derived | state well-formedness (every variable's shape and range) | none; a type invariant holds by construction, not by a design choice a mutant can break | checked every run in the Configurations table above; no dedicated mutant |
 | CTypeOK | Claims | store-derived | state well-formedness (every variable's shape and range) | none; a type invariant holds by construction, not by a design choice a mutant can break | checked every run in the Configurations table above; no dedicated mutant |
-| QueryVisibleDataCorrectUnderDuplicateOwnership | Ownership | store-derived | `ContentOf(RecordKey(u))` equals the first-writer content and every present part key carries its content-addressed bytes | `OwnerPublishOverwrite = TRUE` | `ownership-as-publication-authority`: 7550 states, 2435 distinct, VIOLATED |
-| HeartbeatAndMemoNeverCas | Ownership | witness-derived (`lastMaint.verBefore`/`verAfter`, read from the store at the write, not self-reported) | the last heartbeat or memo write strictly advanced its key's stored version | `HeartbeatMemoUsesCas = TRUE` | `heartbeat-memo-cas`: 116 states, 91 distinct, VIOLATED |
-| MemoNeverExtendsFreshnessPastSnapshot | Ownership | witness-derived (`seedFresh`, the value the seed helper actually stored) | the stored clamped freshness never exceeds the source snapshot's own time | `MemoOverstamp = TRUE` | `memo-overstamp`: 1167 states, 488 distinct, VIOLATED |
-| MergeAttemptsConverge | Ownership | store-derived (`lastPub.winnerPartPresent`, read from the store) | a loser reports `Converged` only when the winner part is observed present | `MissingPartReportsConverged = TRUE` | `mo-missing-part-reports-converged`: 8096 states, 2405 distinct, VIOLATED |
-| DivergentInputSetNeverMutates | Ownership | store-derived (record version delta) | a loser with a divergent input-set hash never advances the record's stored version | `DivergeOverwritesRecord = TRUE` | `mo-diverge-overwrites-record`: 2865 states, 1074 distinct, VIOLATED |
-| EveryEligibleUnitEventuallyAttempted | Ownership | witness-derived (`attemptedByOwner`) | under stable membership every unit is eventually attempted by an in-view owner | `Phantom = TRUE` (a lingering live member outranks every real worker) | `zero-ownership-phantom`: 6350395 states, 1317024 distinct, VIOLATED (documented liveness limitation, not a defect) |
-| OwnershipIsNotPublicationAuthority | Ownership | witness-derived (`cliCorrect`, an eventuality witness) | under fairness a non-owner (the CLI path) eventually publishes and the data stays correct | none in this round; only `MCMaintenanceOwnership.exhaustive.cfg` checks this `PROPERTY`, and the exhaustive config was not run by this executor | not measured this run; see Configurations table (exhaustive: not run by executor) |
-| ClaimGrantsNoPublicationAuthority | Claims | store-derived | same shape as `QueryVisibleDataCorrectUnderDuplicateOwnership`, over the claims model's store | `ClaimIsPublicationAuthority = TRUE` | `claim-as-publication-authority`: 11577 states, 5906 distinct, VIOLATED |
-| StaleOwnerCannotOverwriteNewerClaim | Claims | witness-derived (`lastClaimOp.beforeVer`/`afterVer`/`beforeContent`/`afterContent`, read from the store) | a claim CAS is `Ok` only against the current version; a non-`Ok` CAS changes nothing | `CompletionOverwrite = TRUE` | `claim-completion-without-cas`: 20850 states, 9254 distinct, VIOLATED |
-| NoUnconditionalClaimDelete | Claims | store-derived (absence of a delete on the claim prefix) | no path removes a claim key outside the modeled CAS operations | `AllowClaimDelete = TRUE` | `claim-delete-unconditional`: 124 states, 83 distinct, VIOLATED |
-| LostClaimNeverPublishesThroughGuardedPath | Claims | witness-derived (`lastGuarded.fired`/`held`) | the guarded (checkpoint) publish path never fires while the claim is lost | `GuardIgnoresClaim = TRUE` | `guarded-publish-ignores-claim`: 267 states, 180 distinct, VIOLATED |
-| MergeAttemptsConverge | Claims | store-derived (`lastPub.winnerPartPresent`, read from the store) | a loser reports `Converged` only when the winner part is observed present | `MissingPartReportsConverged = TRUE` | `missing-part-reports-converged`: 5952 states, 3004 distinct, VIOLATED |
-| DivergentInputSetNeverMutates | Claims | store-derived (record version delta) | a loser with a divergent input-set hash never advances the record's stored version | `DivergeOverwritesRecord = TRUE` | `diverge-overwrites-record`: 1810 states, 973 distinct, VIOLATED |
-| ExpiredClaimEventuallyStolen | Claims | witness-derived (`stolen`) | an expired claim is eventually stolen under a fair thief and a fair store | none in this round; only `MCCompactionClaims.exhaustive.cfg` checks this `PROPERTY`, and the exhaustive config was not run by this executor | not measured this run; see Configurations table (exhaustive: not run by executor) |
+| QueryVisibleDataCorrectUnderDuplicateOwnership | Ownership | store-derived | `ContentOf(RecordKey(u))` equals the first-writer content and every present part key carries its content-addressed bytes | `OwnerPublishOverwrite = TRUE` | `ownership-as-publication-authority`: VIOLATED, exit 12 |
+| HeartbeatAndMemoNeverCas | Ownership | witness-derived (`lastMaint.verBefore`/`verAfter`, read from the store at the write, not self-reported) | the last heartbeat or memo write strictly advanced its key's stored version | `HeartbeatMemoUsesCas = TRUE` | `heartbeat-memo-cas`: VIOLATED, exit 12 |
+| MemoNeverExtendsFreshnessPastSnapshot | Ownership | witness-derived (`seedFresh`, the value the seed helper actually stored) | the stored clamped freshness never exceeds the source snapshot's own time | `MemoOverstamp = TRUE` | `memo-overstamp`: VIOLATED, exit 12 |
+| MergeAttemptsConverge | Ownership | store-derived (`lastPub.winnerPartPresent`, read from the store) | a loser reports `Converged` only when the winner part is observed present | `MissingPartReportsConverged = TRUE` | `mo-missing-part-reports-converged`: VIOLATED, exit 12 |
+| DivergentInputSetNeverMutates | Ownership | store-derived (record version delta) | a loser with a divergent input-set hash never advances the record's stored version | `DivergeOverwritesRecord = TRUE` | `mo-diverge-overwrites-record`: VIOLATED, exit 12 |
+| EveryEligibleUnitEventuallyAttempted | Ownership | witness-derived (`attemptedByOwner`) | under stable membership every unit is eventually attempted by an in-view owner | `Phantom = TRUE` (a lingering live member outranks every real worker) | `zero-ownership-phantom`: VIOLATED, exit 13 (documented liveness limitation, not a defect) |
+| OwnershipIsNotPublicationAuthority | Ownership | witness-derived (`cliCorrect`, an eventuality witness) | under fairness a non-owner (the CLI path) eventually publishes and the data stays correct | none; this is a reachability witness, not a hazard a mutant demonstrates | `MCMaintenanceOwnership.exhaustive.cfg` (`Workers = {1}`): PASS, 1038446 distinct, depth 18; see Configurations table and README.md's worker-count split for why this `PROPERTY` is checked at one worker, not two |
+| ClaimGrantsNoPublicationAuthority | Claims | store-derived | same shape as `QueryVisibleDataCorrectUnderDuplicateOwnership`, over the claims model's store | `ClaimIsPublicationAuthority = TRUE` | `claim-as-publication-authority`: VIOLATED, exit 12 |
+| StaleOwnerCannotOverwriteNewerClaim | Claims | witness-derived (`lastClaimOp.beforeVer`/`afterVer`/`beforeContent`/`afterContent`, read from the store) | a claim CAS is `Ok` only against the current version; a non-`Ok` CAS changes nothing | `CompletionOverwrite = TRUE` | `claim-completion-without-cas`: VIOLATED, exit 12 |
+| NoUnconditionalClaimDelete | Claims | store-derived (absence of a delete on the claim prefix) | no path removes a claim key outside the modeled CAS operations | `AllowClaimDelete = TRUE` | `claim-delete-unconditional`: VIOLATED, exit 12 |
+| LostClaimNeverPublishesThroughGuardedPath | Claims | witness-derived (`lastGuarded.fired`/`held`) | the guarded (checkpoint) publish path never fires while the claim is lost | `GuardIgnoresClaim = TRUE` | `guarded-publish-ignores-claim`: VIOLATED, exit 12 |
+| MergeAttemptsConverge | Claims | store-derived (`lastPub.winnerPartPresent`, read from the store) | a loser reports `Converged` only when the winner part is observed present | `MissingPartReportsConverged = TRUE` | `missing-part-reports-converged`: VIOLATED, exit 12 |
+| DivergentInputSetNeverMutates | Claims | store-derived (record version delta) | a loser with a divergent input-set hash never advances the record's stored version | `DivergeOverwritesRecord = TRUE` | `diverge-overwrites-record`: VIOLATED, exit 12 |
+| ExpiredClaimEventuallyStolen | Claims | witness-derived (`stolen`) | an expired claim is eventually stolen under a fair thief and a fair store | none; this is a reachability witness, not a hazard a mutant demonstrates | `MCCompactionClaims.exhaustive.cfg`: PASS, 543 distinct, depth 11; see Configurations table |
 
 ## Where the model and the code differ
 
