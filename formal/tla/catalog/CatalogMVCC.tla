@@ -334,7 +334,8 @@ TypeOK ==
                      entries: SUBSET AllEntries, tombAtWrite: [Hours -> BOOLEAN],
                      reconcileLo: Int, frontierReconciled: SUBSET Hours]
     /\ lastDelete \in [happened: BOOLEAN, headStatus: {"none"} \cup Statuses]
-    /\ lastCompact \in [loserFired: BOOLEAN, mutated: BOOLEAN]
+    /\ lastCompact \in [loserFired: BOOLEAN,
+                        outcome: {"none", "converged", "diverged", "overwrite"}]
     /\ maxValidWm \in Int
     /\ corruptionUsed \in BOOLEAN
     /\ unsupportedUsed \in BOOLEAN
@@ -358,7 +359,7 @@ Init ==
                    entriesChanged |-> FALSE, entries |-> {}, tombAtWrite |-> NoTomb,
                    reconcileLo |-> -1, frontierReconciled |-> {}]
     /\ lastDelete = [happened |-> FALSE, headStatus |-> "none"]
-    /\ lastCompact = [loserFired |-> FALSE, mutated |-> FALSE]
+    /\ lastCompact = [loserFired |-> FALSE, outcome |-> "none"]
     /\ maxValidWm = -1
     /\ corruptionUsed = FALSE
     /\ unsupportedUsed = FALSE
@@ -405,15 +406,23 @@ DoCompact(H, g) ==
 
 \* A second compactor reaches PUT after the winner already published this record
 \* (crates/ravel-maintain/src/publish.rs::resolve_already_exists). The publish is
-\* CreateIfAbsent, so the loser's PUT returns AlreadyExists; the loser then reads
-\* the winner's record back and adopts it (a no-op on the immutable L1 plane),
-\* NEVER overwriting it. The loser may have classified a later view of l0[H]
-\* (a commit landed after the winner published, inside the maintenance-seal
-\* window), so its recomputed record can differ; adopting the winner discards
-\* that divergent result. CompactionLoserOverwrites breaks exactly this: the
-\* loser overwrites the published record with its own output, mutating an
-\* immutable object. The witness lastCompact records whether the loser's
-\* transition changed the stored record, so CompactionRecordImmutable observes
+\* CreateIfAbsent, so the loser's PUT returns AlreadyExists and the loser reads
+\* the winner's record back. Real resolve_already_exists then takes one of two
+\* non-error-free-of-mutation outcomes, neither of which ever overwrites the
+\* immutable record: Converged when the loser's own recomputed input set
+\* matches the winner's (adopts the winner's record as-is; a real repair re-PUT
+\* of a missing but reproducible L1 part is not itself a crec mutation, and this
+\* model has no separate part-presence store state to represent the distinct
+\* ConvergedWinnerPartMissing fail-closed case), or the typed error
+\* InputSetHashDivergence when it does not (the loser classified a later view of
+\* l0[H] -- a commit landed after the winner published, inside the
+\* maintenance-seal window -- so its recomputed record differs; the mismatch is
+\* reported, not silently resolved, and the winner's record is still left
+\* untouched). CompactionLoserOverwrites breaks both real outcomes at once: the
+\* loser overwrites the published record with its own output regardless of
+\* whether the input sets matched. The witness lastCompact.outcome records
+\* which of the three the transition took and whether the store was mutated
+\* (only "overwrite" ever mutates it), so CompactionRecordImmutable observes
 \* the store effect, not a flag the action sets about itself.
 DoCompactLoser(H, g) ==
     /\ crec[H][g].used
@@ -421,12 +430,15 @@ DoCompactLoser(H, g) ==
     /\ ~tomb[H]
     /\ LET existing == crec[H][g]
            inputs   == l0[H]
-           result   == IF CompactionLoserOverwrites
+           outcome  == IF CompactionLoserOverwrites THEN "overwrite"
+                       ELSE IF inputs = existing.in THEN "converged"
+                       ELSE "diverged"
+           result   == IF outcome = "overwrite"
                        THEN [used |-> TRUE, in |-> inputs, out |-> inputs, at |-> clock]
                        ELSE existing
        IN
         /\ crec' = [crec EXCEPT ![H][g] = result]
-        /\ lastCompact' = [loserFired |-> TRUE, mutated |-> (result # existing)]
+        /\ lastCompact' = [loserFired |-> TRUE, outcome |-> outcome]
     /\ UNCHANGED <<clock, budget, l0, tomb, head, snapParts, foldStage, qy,
                    lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
     /\ UNCHANGED svTuple
@@ -789,13 +801,15 @@ CompactionPreservesMultiset ==
         crec[H][g].used => crec[H][g].out = crec[H][g].in
 
 \* A losing compaction publish never mutates the record the winner already
-\* published: on AlreadyExists it reads the winner back and adopts it, so the
-\* immutable L1 object is untouched. Witness-derived: lastCompact.mutated is set
-\* from whether the loser's transition actually changed the stored record.
-\* (Broken by CompactionLoserOverwrites, which re-PUTs the loser's divergent
-\* output over the winner.)
+\* published, regardless of which of the real resolve_already_exists outcomes
+\* it took: on AlreadyExists it reads the winner back and adopts it whether its
+\* own recomputed input set converged or diverged from the winner's, so the
+\* immutable L1 object is untouched either way. Witness-derived:
+\* lastCompact.outcome is set from the loser's transition; only "overwrite"
+\* ever changes the stored record. (Broken by CompactionLoserOverwrites, which
+\* re-PUTs the loser's own output over the winner regardless of outcome.)
 CompactionRecordImmutable ==
-    lastCompact.loserFired => ~lastCompact.mutated
+    lastCompact.loserFired => lastCompact.outcome # "overwrite"
 
 \* A reconcile step that changed HEAD's entries also raised the watermark, so
 \* reconcile never runs off a plain tick. Witness-derived: lastHead records the
@@ -931,6 +945,22 @@ FrontierReconcileExercised ==
         /\ lastHead.tombAtWrite[h]
 
 NoFrontierReconcile == ~FrontierReconcileExercised
+
+\* Non-vacuity probe for the widened compaction-loser outcome alphabet
+\* (finding 6, ADR-1113 round two). True once a losing compaction publish
+\* actually took the "diverged" branch: its own recomputed input set differed
+\* from the already-published winner's, from a commit landing in l0[H] between
+\* the winner's publish and the loser's retry. Derived from lastCompact, no
+\* extra state. Used only as a refuted control: NoCompactionLoserDivergence is
+\* checked as an INVARIANT in negative/compaction-loser-diverged-nonvacuity.cfg,
+\* whose bounds make that commit-between-publish-and-retry interleaving
+\* reachable; TLC reporting NoCompactionLoserDivergence violated proves the
+\* "diverged" outcome is a real, reachable member of the alphabet, not a value
+\* CompactionRecordImmutable's proof happens to pass through without ever
+\* hitting.
+CompactionLoserDiverged == lastCompact.outcome = "diverged"
+
+NoCompactionLoserDivergence == ~CompactionLoserDiverged
 
 ----------------------------------------------------------------------------
 \* Named temporal properties (checked against FairSpec only).

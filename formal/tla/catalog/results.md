@@ -12,7 +12,7 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 8408098 | 32 | PASS | 20260903T133531Z-111d93079ca50bad141da866930552ec362dc447 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 1866396 | 31 | PASS | 20260903T135234Z-a4e9817c24f8fbe59e5dec198aa33c47032f8a47 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
 | negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | negative lane |
 | negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | negative lane |
@@ -28,10 +28,12 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 | negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | negative lane |
 | negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | negative lane |
 | negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260903T132807Z-111d93079ca50bad141da866930552ec362dc447 |
+| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | negative lane |
 
-The fourteen `negative/` configs each flip exactly one switch (or, for
-`carryforward-nonvacuity.cfg` and `frontier-reconcile-nonvacuity.cfg`, check a
-refuted probe) and must exit 12 reporting exactly the named property; each
+The fifteen `negative/` configs each flip exactly one switch (or, for
+`carryforward-nonvacuity.cfg`, `frontier-reconcile-nonvacuity.cfg`, and
+`compaction-loser-diverged-nonvacuity.cfg`, check a refuted probe) and must
+exit 12 reporting exactly the named property; each
 `.expect` pins that exit code and property, and the negative lane fails if any
 config passes or reports a different property.
 
@@ -46,7 +48,7 @@ not run by any harness lane.
 A run outside these is a regression to investigate, not to widen; see
 `bands.tsv`.
 
-- smoke distinct states in [8390000, 8430000], depth in [32, 32].
+- smoke distinct states in [1861000, 1872000], depth in [31, 31].
 
 The safety model runs to a fixed complete state graph, so its distinct-state
 count and depth are deterministic; the band carries a small margin only to
@@ -71,13 +73,37 @@ single-hour-per-fold abstraction instead (documented beside
 hour's tombstone filtering is independent of every other hour's, so what a
 multi-hour batch reconciles in one fold, a run of single-hour folds
 reconciles the same way across several folds -- sound for the safety
-invariants this model checks, not a claim about reconcile throughput. The
-band above reflects a fresh measurement of this round's smoke.cfg run
-including this cost. `exhaustive.cfg`'s graph will grow by a comparable or
-larger factor the next time an exhaustive run is in scope (see below); that
-run should re-measure rather than assume proportional growth, since
-exhaustive's larger `Hours` set makes the per-transition branching factor
-larger too.
+invariants this model checks, not a claim about reconcile throughput.
+
+Finding 6 (the `resolve_already_exists` compaction-loser outcome alphabet)
+then grew the smoke graph again to 34 million-plus states in progress at the
+300-second smoke wall-clock ceiling (`scripts/check-tla.sh` hardcodes this
+budget; it is out of `formal/tla/catalog`'s edit scope), before finishing at
+all: `lastCompact.outcome` splitting `"converged"` from `"diverged"` is
+STORE-derived from `l0[H]` versus `crec[H][g].in`, so it un-collapses many
+`l0[H]` subsets that the old boolean `mutated` witness folded into one state,
+and that finer state persists in `lastCompact` for the rest of the run
+instead of being forgotten. Unlike finding 5's change this added no new
+per-transition branching factor (`DoCompactLoser` still has exactly one
+successor per firing); the cost is purely from carrying more real
+information forward. Rather than widen the smoke band past what the fixed
+300-second budget can run to completion, `Records` shrank from `{rA, rB}` to
+`{rA}` in `smoke.cfg` (see Smoke constants below): this halves the reachable
+`l0[H]` subset space per hour, which is exactly the space
+`"converged"`/`"diverged"` classification depends on, and brought the run
+back to 1866396 distinct states at depth 31 (one step shallower than before)
+in 60 seconds. `CompactionSwapsRecord` is FALSE throughout smoke, so its own
+swap mutation (which needs spare capacity in `Records \ inputs`) was never
+exercised by smoke's PASS invariants either before or after this change; it
+keeps its own non-vacuity proof in `negative/compaction-swaps-record.cfg`
+with its own, unaffected bounds. The band above reflects a fresh measurement
+of this round's smoke.cfg run, at its current bounds, including both
+findings' costs. `exhaustive.cfg`'s graph will grow by a comparable or
+larger factor from finding 5's branching the next time an exhaustive run is
+in scope (see below); finding 6 adds no branching factor but will still cost
+some un-collapsed states there too. That run should re-measure rather than
+assume proportional growth, since exhaustive's larger `Hours` and `Records`
+sets make both costs larger.
 
 `exhaustive.cfg` carried a band (1185000-1198000 distinct states, depth 31)
 from the prior round's measurement, but this round's model changes shifted the
@@ -108,7 +134,7 @@ authority; the table restates it.
 | TypeOK | structural: all state variables against their declared domains |
 | HeadNamesOnlyCompleteParts | STORE: the HEAD register and the set of present snapshot parts |
 | CompactionPreservesMultiset | STORE: the L1 compaction-record plane (`crec`) |
-| CompactionRecordImmutable | WITNESS: `lastCompact.mutated`, set from whether a losing publish actually changed the stored record |
+| CompactionRecordImmutable | WITNESS: `lastCompact.outcome` (`"converged"`, `"diverged"`, or `"overwrite"`), set from comparing the loser's recomputed input set to the winner's stored one; only `"overwrite"` changes the stored record |
 | ReconcileOnlyOnWatermarkAdvance | WITNESS: `lastHead` wm delta and `entriesChanged` of the last HEAD write |
 | SnapshotEntriesBelowWatermark | STORE: the HEAD register |
 | PinnedSnapshotStableWithinAttempt | WITNESS: `qy.pinnedAtAttempt` (resolve-time view) versus `qy.pinned` (served now) |
@@ -156,6 +182,30 @@ its frontier set, so the frontier-filtering branch of `FrontierAdmits` is
 exercised and not dead code. See
 `counterexamples/frontier-reconcile-nonvacuity.md` for the recorded trace.
 
+`lastCompact.outcome` (finding 6) now carries the real `resolve_already_exists`
+alphabet as far as this model's store state supports: `"converged"` (the
+loser's recomputed input set matches the winner's, STORE-derived by comparing
+`l0[H]` against `crec[H][g].in`) and `"diverged"` (it does not, the real
+`InputSetHashDivergence` path) both leave the record untouched; only
+`"overwrite"`, gated by the `CompactionLoserOverwrites` switch, mutates it,
+and `negative/compaction-loser-overwrites.cfg` continues to show
+`CompactionRecordImmutable` non-vacuous against that switch (unchanged by this
+widening: the mutant still flips `"overwrite"` regardless of which of the two
+real outcomes would otherwise have applied). The `"diverged"` branch itself is
+shown non-vacuous by `negative/compaction-loser-diverged-nonvacuity.cfg`,
+which checks the refuted probe `NoCompactionLoserDivergence` and exits 12: at
+two-record bounds, a second commit lands in `l0[H]` after the winner already
+published, so the loser's retry reads a diverged input set (state 6, depth 6,
+1063 states generated, 595 distinct states found). See
+`counterexamples/compaction-loser-diverged-nonvacuity.md` for the recorded
+trace. One real outcome is intentionally NOT modeled: `ConvergedWinnerPartMissing`,
+the fail-closed case where the input sets converge but a referenced L1 part is
+missing and unrepairable. This model has no per-part presence in the object
+store (`crec` is an abstract record with no tracked part objects), so there is
+no store state to ground a third fail-closed branch honestly; adding one would
+be a compliance flag standard (a) forbids, not a real gap-closing fix. This is
+a disclosed modeling limitation, not a silently dropped finding.
+
 ## Fairness
 
 `FairSpec` adds only per-action weak fairness: `WF_vars(DoTick)`,
@@ -166,10 +216,12 @@ present only so `QueryTerminates` can hold under the bounded clock.
 ## Smoke constants
 
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
-`Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1}`, `MaxClock = 3`,
+`Hours = {0, 1}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 3`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
 `RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
-mutation switches FALSE, `SYMMETRY Symmetry`.
+mutation switches FALSE, `SYMMETRY Symmetry`. `Records` shrank from `{rA, rB}`
+to `{rA}` this round (finding 6, see Bands above) to keep the smoke run
+inside the fixed 300-second wall-clock budget.
 
 ## Exhaustive constants
 
