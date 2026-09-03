@@ -10,6 +10,12 @@ name = "ravel-operator"
 path = "src/main.rs"
 
 [dependencies]
+# `--version` (issue #1177): the single shared resolution shared with the
+# other three shipped binaries. Not in `[workspace.dependencies]` (the
+# workspace root Cargo.toml is out of this task's scope); version-pinned so
+# cargo-deny does not count it as a wildcard path dependency, matching how
+# services/ravel-server pins its own path-only crates.
+ravel-version = { path = "../../crates/ravel-version", version = "0.13.0" }
 kube = { workspace = true }
 kube-runtime = { workspace = true }
 k8s-openapi = { workspace = true }

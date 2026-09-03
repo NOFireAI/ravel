@@ -10,6 +10,12 @@ name = "ravel-ingest-router"
 path = "src/main.rs"
 
 [dependencies]
+# `--version` (issue #1177): the single shared resolution shared with the
+# other three shipped binaries. Not in `[workspace.dependencies]` (the
+# workspace root Cargo.toml is out of this task's scope); version-pinned so
+# cargo-deny does not count it as a wildcard path dependency, matching how
+# services/ravel-server pins its own path-only crates.
+ravel-version = { path = "../../crates/ravel-version", version = "0.13.0" }
 # Ravel-native subset affinity (ADR-0080 decision 3): `rank` gives the full HRW
 # order, which the unready-member fallback walks past position S.
 ravel-affinity = { workspace = true }

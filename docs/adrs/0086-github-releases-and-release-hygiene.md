@@ -425,6 +425,39 @@ either having the gate consult required-job outcomes rather than the run
 conclusion, or stopping `coverage` from setting that conclusion. Neither
 belongs in this epic.
 
+## Amendment: `--version` build argument (issue #1177)
+
+None of the four shipped binaries answered `--version` before this. Each now
+resolves its own version through one shared crate, `crates/ravel-version`:
+an explicit build-time override wins; otherwise the workspace's next minor
+version combined with the short commit sha `build.rs` captures via `git
+rev-parse` at compile time (`v0.14.0-f00b4r` for a workspace at `0.13.x` --
+newer than the last release, not yet the next one); otherwise a fallback that
+is visibly not a real version.
+
+The git-derived branch cannot fire inside this Dockerfile's builder stage:
+`.dockerignore` excludes `.git`, and `COPY . .` copies from that filtered
+context, so a release image's `crates/ravel-version/build.rs` sees no
+repository at all. A release build therefore has to reach its version a
+different way: the Dockerfile takes a `RAVEL_VERSION_OVERRIDE` build
+argument, forwarded to the `cargo build` layer as an env var, which
+`ravel-version` reads at compile time via `option_env!` and prefers over the
+git-derived path.
+
+`publish-images.yml`'s `build` job sets that argument from `GITHUB_REF_NAME`
+(already `vX.Y.Z` on the tag-push trigger decision 11 gates on matching
+`[workspace.package] version`) on all three `docker/build-push-action`
+invocations sharing the builder stage, so the four binaries inside every
+published image report the exact released version. A `workflow_dispatch`
+run has no release tag to derive one from, so the build argument is left
+empty and its `manual-<sha>` binaries fall back to `ravel-version`'s
+no-real-version string -- consistent with a manual publish being explicitly
+not a release.
+
+This is CI configuration and a Dockerfile change, unverified by any local
+gate (CLAUDE.md: nothing compiles `.github/workflows/` locally); it is
+confirmed only by a green `publish-images.yml` run.
+
 ## Rejected alternatives
 
 - **Publish macOS binaries.** Rejected for now. There is no tested macOS

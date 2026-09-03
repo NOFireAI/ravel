@@ -6,7 +6,6 @@
 
 use std::process::ExitCode;
 
-use clap::Parser;
 use ravel_ingest_router::config::Cli;
 use tracing_subscriber::EnvFilter;
 
@@ -24,7 +23,8 @@ async fn main() -> ExitCode {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let config = match Cli::parse().into_config() {
+    let cli: Cli = ravel_version::parse();
+    let config = match cli.into_config() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("invalid configuration: {error}");

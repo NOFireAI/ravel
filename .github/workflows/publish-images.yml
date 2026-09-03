@@ -229,6 +229,28 @@ jobs:
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
+      # `--version` (issue #1177): the Dockerfile's `RAVEL_VERSION_OVERRIDE`
+      # build arg is how a released binary learns its own release version --
+      # the builder stage has no `.git` (`.dockerignore` excludes it), so
+      # `crates/ravel-version/build.rs`'s git-derived path always misses
+      # inside the image build. On a tag push, `GITHUB_REF_NAME` is that exact
+      # released version string (`vX.Y.Z`), the gate job above already
+      # verified it equals `[workspace.package] version`, and `resolve()`
+      # uses an override verbatim, so no `v`-stripping or reformatting is
+      # needed here. A workflow_dispatch run has no release tag to derive
+      # from, so it leaves the build arg empty and the binaries fall back to
+      # `ravel_version`'s no-real-version string, matching a manual-<sha>
+      # build being explicitly not a release.
+      - name: Determine version build arg
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "override=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "override=" >> "$GITHUB_OUTPUT"
+          fi
+
       # The three target builds below share the builder stage. No
       # cache-from/cache-to: type=gha on any of them: the builder stage's single
       # COPY-then-build layer changes on every commit (ADR-0037 decision 4), so
@@ -255,6 +277,7 @@ jobs:
           context: .
           target: server
           platforms: ${{ matrix.platform }}
+          build-args: RAVEL_VERSION_OVERRIDE=${{ steps.version.outputs.override }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-server,push-by-digest=true,name-canonical=true,push=true
           sbom: true
           provenance: mode=max
@@ -266,6 +289,7 @@ jobs:
           context: .
           target: operator
           platforms: ${{ matrix.platform }}
+          build-args: RAVEL_VERSION_OVERRIDE=${{ steps.version.outputs.override }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-operator,push-by-digest=true,name-canonical=true,push=true
           sbom: true
           provenance: mode=max
@@ -277,6 +301,7 @@ jobs:
           context: .
           target: ingest-router
           platforms: ${{ matrix.platform }}
+          build-args: RAVEL_VERSION_OVERRIDE=${{ steps.version.outputs.override }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/ravel-ingest-router,push-by-digest=true,name-canonical=true,push=true
           sbom: true
           provenance: mode=max

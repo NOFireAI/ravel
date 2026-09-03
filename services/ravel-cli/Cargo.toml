@@ -21,6 +21,12 @@ stage-timing = ["ravel-ingest/stage-timing"]
 profiling = ["dep:pprof"]
 
 [dependencies]
+# `--version` (issue #1177): the single shared resolution shared with the
+# other three shipped binaries. Not in `[workspace.dependencies]` (the
+# workspace root Cargo.toml is out of this task's scope); version-pinned so
+# cargo-deny does not count it as a wildcard path dependency, matching how
+# ravel-sql is pinned in this crate's [dev-dependencies] below.
+ravel-version = { path = "../../crates/ravel-version", version = "0.13.0" }
 # Optional: see the `profiling` feature above. Same version/feature set as
 # crates/ravel-bench's pin so the two crates' flamegraphs are comparable.
 pprof = { version = "0.15", optional = true, features = ["flamegraph"] }

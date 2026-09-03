@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# `--version` (issue #1177): the single shared resolution shared with the
+# other three shipped binaries. Not in `[workspace.dependencies]` for the
+# same reason ravel-alerting/ravel-sql below are not (the workspace root
+# Cargo.toml is out of this task's scope); version-pinned so cargo-deny
+# does not count it as a wildcard path dependency.
+ravel-version = { path = "../../crates/ravel-version", version = "0.13.0" }
 ravel-types = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-cache = { workspace = true }

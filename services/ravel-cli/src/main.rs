@@ -1065,7 +1065,7 @@ enum CatalogCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli: Cli = ravel_version::parse();
 
     // Before running any subcommand that computes a tenant hash, resolve the
     // bucket's real tenant-hash scheme from `sys/tenancy` and install it

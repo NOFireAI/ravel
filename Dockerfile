@@ -15,6 +15,19 @@
 # the image build uses the same compiler CI and local development pin to.
 FROM rust:1.97.1-bookworm AS builder
 
+# `--version` (issue #1177): this stage has no `.git` (`.dockerignore`
+# excludes it, and the `COPY . .` below copies from that filtered context),
+# so `crates/ravel-version/build.rs`'s `git rev-parse` finds nothing and the
+# binaries would fall back to the "no real version" string. A release build
+# instead passes the released tag through this build argument, which becomes
+# an env var for the `cargo build` below; `ravel-version` reads it at compile
+# time via `option_env!("RAVEL_VERSION_OVERRIDE")` and it wins over the
+# git-derived path. `.github/workflows/publish-images.yml` sets it from the
+# release tag. Empty by default, matching a plain `docker build` with no
+# release tag: `ravel_version::resolve` treats an empty override as absent.
+ARG RAVEL_VERSION_OVERRIDE=""
+ENV RAVEL_VERSION_OVERRIDE=${RAVEL_VERSION_OVERRIDE}
+
 WORKDIR /app
 
 # All proto compilation in this workspace uses protox (pure Rust); no protoc,

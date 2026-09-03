@@ -73,7 +73,7 @@ async fn main() -> ExitCode {
     // either way, so the result is discarded rather than unwrapped.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cli = Cli::parse();
+    let cli: Cli = ravel_version::parse();
 
     if cli.print_crd {
         return match serde_json::to_string_pretty(&ravel_cluster_crd()) {

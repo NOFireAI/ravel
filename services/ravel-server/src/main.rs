@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use clap::Parser;
 use ravel_maintain::{CompactorConfig, RetentionConfig};
 use ravel_server::alert_sink::DEFAULT_SINK_TIMEOUT;
 use ravel_server::alerting::{DEFAULT_QUERY_DEADLINE, load_rules_file};
@@ -36,7 +35,7 @@ fn now_unix_ns() -> i64 {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli: Cli = ravel_version::parse();
 
     // Trace subscriber (ADR-0060). The filter is exactly today's:
     // RUST_LOG when set, else `info`. With --otlp-trace-endpoint absent,
