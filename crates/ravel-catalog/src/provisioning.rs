@@ -1094,7 +1094,14 @@ fn validate_record(
             actual: format!("{}", record.signal),
         });
     }
-    if record.shard_count != shard_count {
+    let drifted = record.shard_count != shard_count;
+    // The append-only generation history (ADR-0052 section 1) must still be
+    // structurally sound on every touch: a corrupt history could route or scan
+    // over the wrong shard set. Validate it here so any consumer fails closed on
+    // corruption, before the drift counter (below) trusts this record as a
+    // rejected-but-countable case rather than an unusable one.
+    read_generations(record, key)?;
+    if drifted {
         // ADR-0082: drift is tolerated, not fatal. The live `--shards` default
         // is a default for new tenants; an already-provisioned tenant keeps
         // routing at its own generation history (`active_shard_count` /
@@ -1111,11 +1118,6 @@ fn validate_record(
              tolerated, routing uses the record's own generation history (ADR-0082)"
         );
     }
-    // The append-only generation history (ADR-0052 section 1) must still be
-    // structurally sound on every touch: a corrupt history could route or scan
-    // over the wrong shard set. Validate it here so any consumer fails closed on
-    // corruption.
-    read_generations(record, key)?;
     Ok(())
 }
 
@@ -1999,6 +2001,68 @@ mod tests {
             shard_count_drift_count(),
             before + 1,
             "a matching record does not move the drift counter"
+        );
+    }
+
+    /// A record that is both drifted (recorded 4, live default 2) and has a
+    /// corrupt generation history must be rejected as `CorruptGenerations`,
+    /// and the drift counter must not move: a rejected record cannot provide
+    /// routing history, so it must never be counted as a tolerated drift.
+    /// Before the fix (drift counted ahead of `read_generations`), this test's
+    /// `assert_eq!(shard_count_drift_count(), before, ...)` failed because the
+    /// increment at the old call site (this file, formerly directly inside the
+    /// `if record.shard_count != shard_count` block ahead of
+    /// `read_generations(record, key)?`) ran before the corruption was ever
+    /// detected.
+    #[tokio::test]
+    async fn drifted_record_with_corrupt_generations_does_not_count_as_drift() {
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            // ScalarMismatch: generations[0].shard_count (8) != scalar shard_count (4).
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 8,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        store
+            .put(&key, record.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed corrupt-generations record");
+
+        let before = shard_count_drift_count();
+        let err = validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            2,
+            1_000,
+            AbsentPolicy::AdoptIfData,
+        )
+        .await
+        .expect_err("a corrupt generation history must be rejected, not tolerated as drift");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptGenerations {
+                    defect: GenerationDefect::ScalarMismatch,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            shard_count_drift_count(),
+            before,
+            "a rejected corrupt-generations record must not increment the drift counter"
         );
     }
 

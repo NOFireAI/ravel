@@ -65,12 +65,18 @@ pub fn shard_count_mismatch_count() -> u64 {
 /// failure at all (ADR-0082): it is tolerated and never reaches here. Every
 /// remaining variant means the tenant's true `shard_count` is unknown or
 /// adopting the live value would hide data -- an `AdoptionWouldHideData`
-/// refusal, or an unreadable record (`UnsupportedVersion`, `CorruptRecord`,
-/// `Decode`) whose recorded `shard_count` cannot be trusted. Proceeding with
-/// ingest under an unknown `shard_count` is exactly the silent-data-hiding this
-/// record exists to prevent (ADR-0050 section 5), so those all fail hard: the
-/// version guard refuses "rather than misread a future record format", and a
-/// fail-open here would defeat that guard's own stated purpose.
+/// refusal, an unreadable record (`UnsupportedVersion`, `CorruptRecord`,
+/// `Decode`), or a decodable record whose generation history fails its
+/// structural invariants (`CorruptGenerations`) -- whose recorded
+/// `shard_count` cannot be trusted. Proceeding with ingest under an unknown
+/// `shard_count` is exactly the silent-data-hiding this record exists to
+/// prevent (ADR-0050 section 5), so those all fail hard: the version guard
+/// refuses "rather than misread a future record format", and a fail-open here
+/// would defeat that guard's own stated purpose. `CorruptGenerations` must fail
+/// hard for the same reason: `Catalog::enforce_provisioning_once` rejects the
+/// identical record via the same `validate_or_adopt` call, so failing open
+/// here would let the ingest router route a write the catalog refuses to
+/// resolve.
 fn is_hard_failure(err: &ProvisioningError) -> bool {
     matches!(
         err,
@@ -78,6 +84,7 @@ fn is_hard_failure(err: &ProvisioningError) -> bool {
             | ProvisioningError::UnsupportedVersion { .. }
             | ProvisioningError::CorruptRecord { .. }
             | ProvisioningError::Decode { .. }
+            | ProvisioningError::CorruptGenerations { .. }
     )
 }
 
@@ -435,6 +442,59 @@ mod tests {
         assert!(
             matches!(err, ProvisioningError::Decode { .. }),
             "got: {err}"
+        );
+    }
+
+    /// A record with a corrupt generation history on a dynamic tenant's
+    /// first-touch path must fail that request with a typed
+    /// `CorruptGenerations` error and increment the mismatch counter, rather
+    /// than being logged and letting ingest proceed and the router cache a
+    /// tenant `Catalog::enforce_provisioning_once` would reject the same
+    /// record for (split-brain between the ingest router's and the catalog's
+    /// view of the record). Before the fix, `is_hard_failure` (this file, the
+    /// `matches!` in `is_hard_failure` above) omitted
+    /// `ProvisioningError::CorruptGenerations`, so `ensure` fell into the
+    /// fail-open `Err(err) => ... Ok(())` arm and this `expect_err` panicked.
+    #[tokio::test]
+    async fn dynamic_first_touch_corrupt_generations_fails_request() {
+        let store = store();
+        let th = TenantId::new("acme").hash();
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: th.0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 1,
+            // ScalarMismatch: generations[0].shard_count (8) != scalar shard_count (4).
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 8,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        store
+            .put(
+                &provisioning_key(&th, Signal::Metrics),
+                record.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt-generations record");
+        let before = shard_count_mismatch_count();
+        let writer = Arc::new(ProvisioningRecordWriter::new(store.clone(), 4));
+        let err = writer
+            .ensure(&th, Signal::Metrics, 1_000)
+            .await
+            .expect_err("a corrupt generation history must fail the request, not fail-open");
+        assert!(
+            matches!(err, ProvisioningError::CorruptGenerations { .. }),
+            "got: {err}"
+        );
+        assert!(
+            shard_count_mismatch_count() > before,
+            "a hard provisioning failure must increment the counter"
         );
     }
 
