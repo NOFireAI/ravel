@@ -110,6 +110,48 @@ fn record_on(
     }
 }
 
+/// The same as [`record_on`], but the stream's SCOPE attributes also carry
+/// `scope_extra` beyond an otherwise-empty scope set, so a declared column's
+/// stream-level fallback can be exercised on either half of the merged view
+/// in one stream (issue #1057 finding 1: a List/Map resource occurrence must
+/// not shadow a matching-typed scope occurrence behind it).
+fn record_on_scoped(
+    res_extra: &[(&str, AttrValue)],
+    scope_extra: &[(&str, AttrValue)],
+    ts_ns: i64,
+    attrs: Vec<(&str, AttrValue)>,
+) -> NormalizedLogRecord {
+    let mut res: Vec<(String, AttrValue)> = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    res.extend(
+        res_extra
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect::<Vec<_>>(),
+    );
+    let scope_attrs: Vec<(String, AttrValue)> = scope_extra
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let stream_id = log_stream_id(&res, "scope", "", &scope_attrs);
+    let stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "", &scope_attrs);
+    NormalizedLogRecord {
+        stream_id,
+        stream_attrs,
+        ts_ns,
+        observed_ts_ns: ts_ns,
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: "row".to_string(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+    }
+}
+
 /// Write the tenant's declared typed columns so the flush's config read resolves
 /// them and stamps their extrema.
 async fn declare_columns(store: &dyn ObjectStoreBackend, columns: Vec<DeclaredTypedColumn>) {
@@ -560,7 +602,11 @@ async fn stamped_min_max_count(
 ///
 /// Prove-the-test: fold only the record's own attributes (drop the stream-level
 /// fallback from `DeclaredStatAccum::build_stamps`) and the stamp becomes
-/// `min == None, max == None, null_count == 3`, so both answers come back NULL.
+/// `min == None, max == None, null_count == 3`, the affirmative all-NULL claim
+/// issue #1057 is about. DataFusion's aggregate-statistics rule declines that
+/// NULL min/max scalar, so `MIN`/`MAX` would still fall back to a scan and
+/// answer correctly; only `COUNT` trusts the stamp outright and would answer
+/// 0 against a true 3.
 #[tokio::test]
 async fn stream_level_declared_value_answers_min_max_end_to_end() {
     let records = (0..3)
@@ -637,6 +683,64 @@ async fn record_override_of_a_stream_level_value_answers_end_to_end() {
     assert_eq!(min, Some(2), "MIN answered from the stamp");
     assert_eq!(max, Some(7), "MAX answered from the stamp");
     assert_eq!(count, Some(3));
+    assert!(
+        !plan_text.contains("LogsScanExec"),
+        "the scan is elided:\n{plan_text}"
+    );
+    assert_eq!(gets, 0, "a statement answered from stamps reads no data");
+}
+
+/// Issue #1057 finding 1, end to end: a stream whose RESOURCE attributes carry
+/// the declared column as a List (the shape `ravel_otlp::logs_normalize::
+/// convert_attrs` produces from real OTLP input) and whose SCOPE attributes
+/// carry it as a matching-typed I64 must answer from the scope value for the
+/// rows that do not set the key themselves -- the List occurrence must not
+/// shadow the scope occurrence behind it, exactly as the reader's decoder
+/// (which never decodes a List entry at all) resolves it.
+///
+/// Prove-the-test: drop the `AttrValue::List(_) | AttrValue::Map(_)` skip from
+/// `stream_state` (`crates/ravel-ingest/src/log_declared_stats.rs`) and this
+/// answers `2, 2, 1` (the base's wrong answer, with a data scan needed to even
+/// get COUNT right) instead of `2, 7, 3` with the scan elided and zero GETs.
+#[tokio::test]
+async fn list_resource_attribute_falls_back_to_scope_value_end_to_end() {
+    let stream_res = [(COL, AttrValue::List(vec![AttrValue::I64(1)]))];
+    let stream_scope = [(COL, AttrValue::I64(7))];
+    let records = vec![
+        record_on_scoped(
+            &stream_res,
+            &stream_scope,
+            BASE_NS,
+            vec![(COL, AttrValue::I64(2))],
+        ),
+        record_on_scoped(&stream_res, &stream_scope, BASE_NS + 1, vec![]),
+        record_on_scoped(&stream_res, &stream_scope, BASE_NS + 2, vec![]),
+    ];
+
+    let (commit, (min, max, count), plan_text, gets) = stamped_min_max_count(records).await;
+
+    let read = read_commit_record(&commit);
+    assert!(
+        read.dropped().is_empty(),
+        "the flush's own reader drops nothing it stamped"
+    );
+    assert_eq!(commit.sample_count, 3);
+    let ev = read.column(COL).expect("EventDate stamped");
+    assert_eq!(
+        ev.min(),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(2)),
+        "the record's own value wins for its row"
+    );
+    assert_eq!(
+        ev.max(),
+        Some(ravel_types::declared_stats::DeclaredStatValue::I64(7)),
+        "the two rows that set nothing read the scope's 7, not the List"
+    );
+    assert_eq!(ev.null_count(), 0);
+
+    assert_eq!(min, Some(2), "MIN answered from the stamp");
+    assert_eq!(max, Some(7), "MAX answered from the stamp");
+    assert_eq!(count, Some(3), "every row counts as non-NULL");
     assert!(
         !plan_text.contains("LogsScanExec"),
         "the scan is elided:\n{plan_text}"

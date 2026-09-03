@@ -158,10 +158,11 @@ struct StreamAttrState {
 #[derive(Default)]
 struct StreamState {
     rows: u64,
-    /// Only the names whose first blob occurrence (resource set before scope
-    /// set, the order the reader's `find_attr` resolves) is I64 or BOOL. A name
-    /// whose first occurrence is of any other kind reads NULL for a declaration
-    /// either way, so it is dropped at decode time and costs nothing per record.
+    /// Only the names whose first non-List/Map blob occurrence (resource set
+    /// before scope set, the order the reader's `find_attr` resolves) is I64
+    /// or BOOL. A name whose first non-List/Map occurrence is of any other
+    /// kind reads NULL for a declaration either way, so it is dropped at
+    /// decode time and costs nothing per record.
     attrs: HashMap<String, StreamAttrState>,
 }
 
@@ -171,9 +172,17 @@ fn stream_state(blob: &[u8]) -> Option<StreamState> {
     let pairs = stream_attr_pairs(blob).ok()?;
     let mut first: HashMap<String, Option<StreamValue>> = HashMap::with_capacity(pairs.len());
     for (name, value) in pairs {
-        // First occurrence wins whatever its kind, matching the reader: an
-        // ineligible first occurrence shadows a same-named eligible one behind
-        // it, so it must be recorded as "claimed, no fallback".
+        // The reader's decoder (`ravel_sql::rlog_attrs::decode_value`) never
+        // pushes a List or Map entry into the pairs it resolves over, so such
+        // an occurrence must not claim the key here either: skip it and let a
+        // later occurrence of the same name compete.
+        if matches!(value, AttrValue::List(_) | AttrValue::Map(_)) {
+            continue;
+        }
+        // First occurrence whose value is not a List or Map wins, matching
+        // the reader: an ineligible (but decoded) first occurrence shadows a
+        // same-named eligible one behind it, so it must be recorded as
+        // "claimed, no fallback".
         first.entry(name).or_insert(match value {
             AttrValue::I64(v) => Some(StreamValue::I64(v)),
             AttrValue::Bool(b) => Some(StreamValue::Bool(b)),
@@ -1037,5 +1046,55 @@ mod tests {
         assert_eq!(row[0].min(), s.min());
         assert_eq!(row[0].max(), s.max());
         assert_eq!(row[0].null_count(), s.null_count());
+    }
+
+    /// Issue #1057 finding 1: a stream whose RESOURCE attributes carry the
+    /// declared key as a List and whose SCOPE attributes carry it as a
+    /// matching-typed I64 must fall back to the scope value, exactly what the
+    /// reader's decoder resolves (it never decodes a List entry at all, so it
+    /// moves straight to the next occurrence of the key).
+    ///
+    /// Prove-the-test: drop the `AttrValue::List(_) | AttrValue::Map(_)` skip
+    /// from `stream_state` and the List's first occurrence claims `k` with no
+    /// fallback, stamping min 2, max 2, null_count 2 over these same records
+    /// (the base's wrong answer) instead of min 2, max 7, null_count 0.
+    #[test]
+    fn list_resource_attribute_is_skipped_for_a_matching_scope_fallback() {
+        let stream = blob(
+            &[("k", AttrValue::List(vec![AttrValue::I64(1)]))],
+            &[("k", AttrValue::I64(7))],
+        );
+        let mut acc = DeclaredStatAccum::default();
+        acc.observe_records(&[
+            rec_in(1, &stream, vec![("k", AttrValue::I64(2))]),
+            rec_in(1, &stream, vec![]),
+            rec_in(1, &stream, vec![]),
+        ]);
+        let stamps = acc.build_stamps(&[i64_col("k")], 3);
+        let s = stat(&stamps, "k").expect("stamped");
+        assert_eq!(s.min(), Some(DeclaredStatValue::I64(2)));
+        assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));
+        assert_eq!(s.null_count(), 0);
+    }
+
+    /// Same stream shape as above, but no record sets `k` itself: every row
+    /// reads the scope fallback the List resource attribute must not shadow.
+    #[test]
+    fn list_resource_attribute_is_skipped_when_no_record_overrides() {
+        let stream = blob(
+            &[("k", AttrValue::List(vec![AttrValue::I64(1)]))],
+            &[("k", AttrValue::I64(7))],
+        );
+        let mut acc = DeclaredStatAccum::default();
+        acc.observe_records(&[
+            rec_in(1, &stream, vec![]),
+            rec_in(1, &stream, vec![]),
+            rec_in(1, &stream, vec![]),
+        ]);
+        let stamps = acc.build_stamps(&[i64_col("k")], 3);
+        let s = stat(&stamps, "k").expect("stamped");
+        assert_eq!(s.min(), Some(DeclaredStatValue::I64(7)));
+        assert_eq!(s.max(), Some(DeclaredStatValue::I64(7)));
+        assert_eq!(s.null_count(), 0);
     }
 }

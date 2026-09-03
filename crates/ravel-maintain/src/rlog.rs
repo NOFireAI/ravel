@@ -1205,13 +1205,22 @@ impl DeclaredSchema {
             let mut claimed: BTreeSet<usize> = BTreeSet::new();
             let mut values: Vec<(usize, DeclaredStatValue)> = Vec::new();
             for (name, value) in pairs {
+                // The reader's decoder (`ravel_sql::rlog_attrs::decode_value`)
+                // never pushes a List or Map entry into the pairs `find_attr`
+                // resolves over, so such an occurrence must not claim the key
+                // here either: skip it and let a later occurrence of the same
+                // name compete.
+                if matches!(value, AttrValue::List(_) | AttrValue::Map(_)) {
+                    continue;
+                }
                 let Some(&i) = schema.index.get(name.as_str()) else {
                     continue;
                 };
-                // First occurrence wins whatever its kind, matching the
-                // reader's `find_attr` over the resource set then the scope
-                // set: an ineligible or wrong-typed first occurrence shadows a
-                // same-named eligible one behind it, and reads NULL.
+                // First occurrence whose value is not a List or Map wins,
+                // matching the reader's `find_attr` over the resource set
+                // then the scope set: an ineligible (but decoded) or
+                // wrong-typed first occurrence shadows a same-named eligible
+                // one behind it, and reads NULL.
                 if !claimed.insert(i) {
                     continue;
                 }
