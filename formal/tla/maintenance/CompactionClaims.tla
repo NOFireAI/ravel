@@ -87,12 +87,27 @@ VARIABLES
     stealWonVers,    \* [Units -> SUBSET (0..MaxV)] observed versions a steal won on
     lastClaimOp,     \* the most recent claim CAS (kind, version used, outcome)
     lastGuarded,     \* [fired: BOOL, held: BOOL] the last guarded publish
-    stolen           \* BOOLEAN a steal has succeeded (liveness witness)
+    stolen,          \* BOOLEAN a steal has succeeded (liveness witness)
+    partTomb,        \* [Units -> [Variants -> BOOLEAN]] a part key deleted and
+                     \* not re-PUTtable (a tombstone/GC the rerun cannot recreate)
+    lastPub          \* the outcome of the most recent publish resolution, with
+                     \* store-observed witnesses (never a self-reported label)
 
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           timeUsed, heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
-          stealWonVers, lastClaimOp, lastGuarded, stolen>>
+          stealWonVers, lastClaimOp, lastGuarded, stolen, partTomb, lastPub>>
+
+\* The publication-resolution outcome alphabet (ADR-1113 D3), mirroring
+\* publish.rs::resolve_already_exists: the CreateIfAbsent winner is Published;
+\* a later attempt that finds the record present converges on it (Converged), or
+\* re-PUTs a transiently vanished winner part and converges, or fails closed when
+\* the winner part vanished and is not re-PUTtable (ConvergedWinnerPartMissing),
+\* or refuses to touch a record whose input set diverges from its own
+\* (InputSetHashDivergence); a checkpoint that loses the claim before publishing
+\* Abandoned.
+PubOutcomes == {"none", "Published", "Converged", "Abandoned",
+                "ConvergedWinnerPartMissing", "InputSetHashDivergence"}
 
 INSTANCE RavelObjectStore
     WITH Keys <- OKeys, Content <- OContent, NoContent <- NoC, Clients <- {}
@@ -135,6 +150,9 @@ CTypeOK ==
                         beforeContent: OContent, afterContent: OContent]
     /\ lastGuarded \in [fired: BOOLEAN, held: BOOLEAN]
     /\ stolen \in BOOLEAN
+    /\ partTomb \in [Units -> [Variants -> BOOLEAN]]
+    /\ lastPub \in [outcome: PubOutcomes,
+                    winnerPartPresent: BOOLEAN, recOverwritten: BOOLEAN]
 
 Init ==
     /\ StoreInit
@@ -150,6 +168,9 @@ Init ==
                       beforeContent |-> NoC, afterContent |-> NoC]
     /\ lastGuarded = [fired |-> FALSE, held |-> FALSE]
     /\ stolen = FALSE
+    /\ partTomb = [u \in Units |-> [v \in Variants |-> FALSE]]
+    /\ lastPub = [outcome |-> "none", winnerPartPresent |-> FALSE,
+                  recOverwritten |-> FALSE]
 
 \* --- claim lifecycle --------------------------------------------------------
 
@@ -166,14 +187,15 @@ Acquire(w, u) ==
                        afterContent |-> store'[ClaimKey(u)].content]
     /\ claimBorn' = [claimBorn EXCEPT ![u] = TRUE]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, dupThiefWin,
-                   stealWonVers, lastGuarded, stolen>>
+                   stealWonVers, lastGuarded, stolen, partTomb, lastPub>>
 
 \* claim.rs::observe -- one GET plus one HEAD; records the observed version.
 Observe(w, u) ==
     /\ ClaimPresent(u)
     /\ obsVer' = [obsVer EXCEPT ![w][u] = ClaimVer(u)]
     /\ UNCHANGED <<sVars, timeUsed, heldVer, firstRecord, claimBorn,
-                   dupThiefWin, stealWonVers, lastClaimOp, lastGuarded, stolen>>
+                   dupThiefWin, stealWonVers, lastClaimOp, lastGuarded, stolen,
+                   partTomb, lastPub>>
 
 \* claim.rs::renew -- CasVersion on the held token; PreconditionFailed is
 \* ClaimLost (the token is dropped). Only the holder attempts it (its token).
@@ -192,7 +214,7 @@ Renew(w, u) ==
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, dupThiefWin,
-                   stealWonVers, lastGuarded, stolen>>
+                   stealWonVers, lastGuarded, stolen, partTomb, lastPub>>
 
 \* claim.rs::steal -- CasVersion on the observed version, gated on expiry and a
 \* readable payload. StealRefused (NotExpired/UnreadableClaim) issues no store
@@ -215,7 +237,8 @@ Steal(w, u) ==
                            afterVer |-> store'[ClaimKey(u)].version,
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
-    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded>>
+    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded,
+                   partTomb, lastPub>>
 
 \* claim.rs::mark_completed -- CasVersion; PreconditionFailed is NotOwner.
 MarkCompleted(w, u) ==
@@ -233,7 +256,7 @@ MarkCompleted(w, u) ==
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, dupThiefWin,
-                   stealWonVers, lastGuarded, stolen>>
+                   stealWonVers, lastGuarded, stolen, partTomb, lastPub>>
 
 \* A claim payload becomes unreadable (corruption). Treated as absent by readers
 \* and never stolen. No metadata changes (raw corruption, not a store write).
@@ -245,7 +268,8 @@ CorruptClaim(u) ==
                    [present |-> TRUE, content |-> Corrupt, version |-> ClaimVer(u)]]
     /\ UNCHANGED <<lastModified, versionCounter, uploads, listState, timeUsed,
                    heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, lastGuarded, stolen>>
+                   stealWonVers, lastClaimOp, lastGuarded, stolen,
+                   partTomb, lastPub>>
 
 \* Logical time advances (an unrelated store write bumps the version domain that
 \* last_modified lives in). Bounded by MaxTime, separately from the write bound,
@@ -257,24 +281,69 @@ TimePass ==
     /\ PutOverwrite(ScratchKey, Scr)
     /\ timeUsed' = timeUsed + 1
     /\ UNCHANGED <<heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, lastGuarded, stolen>>
+                   stealWonVers, lastClaimOp, lastGuarded, stolen,
+                   partTomb, lastPub>>
 
 \* --- compaction publication (never reads the claim) -------------------------
 
+\* A part is content-addressed CreateIfAbsent. A tombstoned key (VanishPart set
+\* partTomb) cannot be recreated, so a rerun that needs it must fail closed
+\* rather than silently re-PUT it.
 PutPart(u, v) ==
     /\ CanWrite
+    /\ ~partTomb[u][v]
     /\ (~LivenessMode \/ \A x \in Units : ClaimPresent(x))
     /\ PutCreateIfAbsent(PartKey(u, v), <<u, v>>)
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-                   dupThiefWin, stealWonVers, lastClaimOp, lastGuarded, stolen>>
+                   dupThiefWin, stealWonVers, lastClaimOp, lastGuarded, stolen,
+                   partTomb, lastPub>>
 
+\* The winner's terminal record PUT (CreateIfAbsent) and the loser's convergence
+\* over the shared object store, resolving exactly as publish.rs and
+\* resolve_already_exists do. The outcome witness (lastPub) reads the store
+\* around the resolution (winnerPartPresent from store', recOverwritten from the
+\* record version delta), never a self-reported label:
+\*  * record absent: this attempter is the CreateIfAbsent winner -> Published;
+\*  * record present, a DIFFERENT input set: alarm, delete and overwrite
+\*    nothing -> InputSetHashDivergence;
+\*  * record present, same input set, winner part intact: Converged;
+\*  * record present, same input set, winner part transiently vanished but
+\*    re-PUTtable: re-PUT identical content-addressed bytes -> Converged;
+\*  * record present, same input set, winner part vanished and tombstoned
+\*    (not re-PUTtable): fail closed -> ConvergedWinnerPartMissing.
 DoPublish(u, v) ==
-    LET rk == RecordKey(u) IN
-    /\ Present(PartKey(u, v))
-    /\ PutCreateIfAbsent(rk, <<u, v>>)
-    /\ firstRecord' = IF ~Present(rk)
-                        THEN [firstRecord EXCEPT ![u] = <<u, v>>]
-                        ELSE firstRecord
+    LET rk  == RecordKey(u)
+        rp  == Present(rk)
+        wv  == IF rp /\ firstRecord[u] # NoRec THEN firstRecord[u][2] ELSE v
+        wpk == PartKey(u, wv)
+    IN
+    IF ~rp
+      THEN /\ Present(PartKey(u, v))
+           /\ PutCreateIfAbsent(rk, <<u, v>>)
+           /\ firstRecord' = [firstRecord EXCEPT ![u] = <<u, v>>]
+           /\ lastPub' = [outcome |-> "Published",
+                          winnerPartPresent |-> store'[PartKey(u, v)].present,
+                          recOverwritten |-> FALSE]
+      ELSE IF v # wv
+        THEN /\ UNCHANGED <<sVars, firstRecord>>
+             /\ lastPub' = [outcome |-> "InputSetHashDivergence",
+                            winnerPartPresent |-> Present(wpk),
+                            recOverwritten |-> FALSE]
+        ELSE IF Present(wpk)
+          THEN /\ UNCHANGED <<sVars, firstRecord>>
+               /\ lastPub' = [outcome |-> "Converged",
+                              winnerPartPresent |-> TRUE,
+                              recOverwritten |-> FALSE]
+          ELSE IF ~partTomb[u][wv]
+            THEN /\ PutCreateIfAbsent(wpk, <<u, wv>>)
+                 /\ UNCHANGED firstRecord
+                 /\ lastPub' = [outcome |-> "Converged",
+                                winnerPartPresent |-> store'[wpk].present,
+                                recOverwritten |-> FALSE]
+            ELSE /\ UNCHANGED <<sVars, firstRecord>>
+                 /\ lastPub' = [outcome |-> "ConvergedWinnerPartMissing",
+                                winnerPartPresent |-> FALSE,
+                                recOverwritten |-> FALSE]
 
 \* The guarded (cancellation-checkpoint) publish: publishes only while still
 \* holding the claim, so a lost claim abandons the run (no publication). The
@@ -288,7 +357,7 @@ GuardedPublish(w, u, v) ==
     /\ DoPublish(u, v)
     /\ lastGuarded' = [fired |-> TRUE, held |-> HoldsClaim(w, u)]
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, stolen>>
+                   stealWonVers, lastClaimOp, stolen, partTomb>>
 
 \* The ungated publish: the --no-claim CLI path and a paused stale worker that
 \* ignores its checkpoints and reaches the publication path anyway. Publishes
@@ -299,7 +368,50 @@ UngatedPublish(u, v) ==
     /\ ~LivenessMode
     /\ DoPublish(u, v)
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, lastGuarded, stolen>>
+                   stealWonVers, lastClaimOp, lastGuarded, stolen, partTomb>>
+
+\* The cancellation checkpoint that finds the claim already lost abandons the
+\* run: it publishes nothing (the store is unchanged) and records the Abandoned
+\* outcome. HoldsClaim is read from the store, so a genuine loss is the only way
+\* to reach this.
+AbandonPublish(w, u, v) ==
+    /\ ~LivenessMode
+    /\ ~HoldsClaim(w, u)
+    /\ Present(PartKey(u, v))
+    /\ lastPub' = [outcome |-> "Abandoned",
+                   winnerPartPresent |-> IF firstRecord[u] = NoRec
+                                           THEN Present(PartKey(u, v))
+                                           ELSE Present(PartKey(u, firstRecord[u][2])),
+                   recOverwritten |-> FALSE]
+    /\ UNCHANGED <<sVars, timeUsed, heldVer, obsVer, firstRecord, claimBorn,
+                   dupThiefWin, stealWonVers, lastClaimOp, lastGuarded, stolen,
+                   partTomb>>
+
+\* A published winner part transiently disappears (a tombstone race, GC, or a
+\* delayed listing), and is re-PUTtable: a later convergence re-creates the
+\* identical content-addressed bytes. Models tombstone_race.rs's revanish path
+\* up to the point the part can still be recreated.
+VanishPart(u) ==
+    /\ firstRecord[u] # NoRec
+    /\ Present(PartKey(u, firstRecord[u][2]))
+    /\ ~partTomb[u][firstRecord[u][2]]
+    /\ Delete(PartKey(u, firstRecord[u][2]))
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
+                   stealWonVers, lastClaimOp, lastGuarded, stolen, partTomb, lastPub>>
+
+\* The winner part vanishes and is tombstoned: it cannot be re-PUT (the rerun in
+\* tombstone_race.rs::rerun_with_revanished_part_fails_typed_not_converged sees a
+\* delete tombstone the content-addressed create cannot overwrite). One-shot per
+\* key. A later convergence on this unit must fail closed, never report Converged.
+TombstonePart(u) ==
+    /\ firstRecord[u] # NoRec
+    /\ ~partTomb[u][firstRecord[u][2]]
+    /\ partTomb' = [partTomb EXCEPT ![u][firstRecord[u][2]] = TRUE]
+    /\ IF Present(PartKey(u, firstRecord[u][2]))
+         THEN Delete(PartKey(u, firstRecord[u][2]))
+         ELSE UNCHANGED sVars
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
+                   stealWonVers, lastClaimOp, lastGuarded, stolen, lastPub>>
 
 Next ==
     \/ \E w \in Workers, u \in Units : Acquire(w, u)
@@ -312,6 +424,9 @@ Next ==
     \/ \E u \in Units, v \in Variants : PutPart(u, v)
     \/ \E w \in Workers, u \in Units, v \in Variants : GuardedPublish(w, u, v)
     \/ \E u \in Units, v \in Variants : UngatedPublish(u, v)
+    \/ \E w \in Workers, u \in Units, v \in Variants : AbandonPublish(w, u, v)
+    \/ \E u \in Units : VanishPart(u)
+    \/ \E u \in Units : TombstonePart(u)
 
 Spec == Init /\ [][Next]_vars
 
@@ -354,19 +469,41 @@ NoUnconditionalClaimDelete ==
 
 \* At most one thief wins a given observed version: the version token is consumed
 \* by the first successful steal, so a second steal on the same observed version
-\* fails. (Broken by a steal that ignores the CAS.)
+\* fails its CAS. (Broken by the steal-ignores-cas control, which counts a win
+\* from a steal whose CAS did not match.)
 AtMostOneThiefWinsAVersion == ~dupThiefWin
 
 \* The guarded (checkpoint) path never publishes once the claim is lost.
 LostClaimNeverPublishesThroughGuardedPath ==
     lastGuarded.fired => lastGuarded.held
 
-\* Merge attempts converge: a present record's winning part is present, so a
-\* later attempt finds the parts it needs or re-PUTs identical ones.
+\* Merge attempts converge, restated for a world where a part can vanish (F7).
+\* The old form asserted a present record's winner part is present; that held
+\* ONLY because nothing ever deleted a part. Once VanishPart/TombstonePart exist
+\* the honest guarantee is fail-closed convergence: a resolution reports Converged
+\* only when the winner part is actually present, and reports
+\* ConvergedWinnerPartMissing exactly when the winner part has vanished and is not
+\* re-PUTtable (tombstoned) -- it never silently claims convergence over a missing
+\* part. winnerPartPresent is read from the store at the moment of resolution
+\* (store' in DoPublish), never a self-reported label, so a mutant that labels a
+\* missing-part resolution "Converged" (its witness still reads the absent store)
+\* is caught. A transiently vanished, re-PUTtable part is not a violation: the
+\* resolution re-PUTs identical content-addressed bytes and reports Converged with
+\* the part present again. See README (F7). (Broken by the
+\* missing-part-reports-converged switch.)
 MergeAttemptsConverge ==
-    \A u \in Units :
-        (Present(RecordKey(u)) /\ firstRecord[u] # NoRec) =>
-            Present(PartKey(u, firstRecord[u][2]))
+    /\ (lastPub.outcome = "Converged" => lastPub.winnerPartPresent)
+    /\ (lastPub.outcome = "ConvergedWinnerPartMissing" => ~lastPub.winnerPartPresent)
+
+\* A divergent input set alarms and mutates nothing: the loser neither overwrites
+\* the terminal record nor deletes any part. recOverwritten is the store-observed
+\* record version delta across the resolution (FALSE means the record version did
+\* not move), so a mutant that overwrites the record on divergence -- even to
+\* identical content, which still mints a new version -- is caught. The divergent
+\* branch of DoPublish is UNCHANGED store, so no part is deleted either.
+\* (Broken by the diverge-overwrites-record switch.)
+DivergentInputSetNeverMutates ==
+    lastPub.outcome = "InputSetHashDivergence" => ~lastPub.recOverwritten
 
 \* --- fairness and liveness --------------------------------------------------
 \* Under LivenessMode the lifecycle is acquire (paused holder) -> time passes ->
