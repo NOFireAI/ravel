@@ -21,8 +21,10 @@ ASSUME AllowClaimDelete \in BOOLEAN
 ASSUME ClaimIsPublicationAuthority \in BOOLEAN
 
 \* Broken: mark_completed overwrites the claim regardless of version. A stale
-\* owner (its token no longer current) still overwrites a newer claim. Caught by
-\* StaleOwnerCannotOverwriteNewerClaim (a non-Ok CAS that changed state).
+\* owner (its token no longer current) still overwrites a newer claim. The witness
+\* reads the store before and after exactly as the correct MarkCompleted does, so
+\* it captures the real Overwrite: on a stale token the reported outcome is not-Ok
+\* yet the stored version moved. Caught by StaleOwnerCannotOverwriteNewerClaim.
 BrokenComplete(w, u) ==
     /\ CompletionOverwrite
     /\ CanWrite
@@ -33,7 +35,10 @@ BrokenComplete(w, u) ==
         /\ PutOverwrite(ClaimKey(u), <<"c", w, "done">>)
         /\ heldVer' = [heldVer EXCEPT ![w][u] = versionCounter + 1]
         /\ lastClaimOp' = [kind |-> "complete", unit |-> u, usedVer |-> v, ok |-> ok,
-                           beforeVer |-> ClaimVer(u), afterVer |-> versionCounter + 1]
+                           beforeVer |-> ClaimVer(u),
+                           afterVer |-> store'[ClaimKey(u)].version,
+                           beforeContent |-> ClaimContentOf(u),
+                           afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, dupThiefWin,
                    stealWonVers, lastGuarded, stolen>>
 

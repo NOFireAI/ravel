@@ -131,7 +131,8 @@ CTypeOK ==
     /\ stealWonVers \in [Units -> SUBSET VerRange]
     /\ lastClaimOp \in [kind: {"none", "acquire", "renew", "steal", "complete"},
                         unit: Units, usedVer: VerRange, ok: BOOLEAN,
-                        beforeVer: VerRange, afterVer: VerRange]
+                        beforeVer: VerRange, afterVer: VerRange,
+                        beforeContent: OContent, afterContent: OContent]
     /\ lastGuarded \in [fired: BOOLEAN, held: BOOLEAN]
     /\ stolen \in BOOLEAN
 
@@ -145,7 +146,8 @@ Init ==
     /\ dupThiefWin = FALSE
     /\ stealWonVers = [u \in Units |-> {}]
     /\ lastClaimOp = [kind |-> "none", unit |-> CHOOSE u \in Units : TRUE,
-                      usedVer |-> 0, ok |-> TRUE, beforeVer |-> 0, afterVer |-> 0]
+                      usedVer |-> 0, ok |-> TRUE, beforeVer |-> 0, afterVer |-> 0,
+                      beforeContent |-> NoC, afterContent |-> NoC]
     /\ lastGuarded = [fired |-> FALSE, held |-> FALSE]
     /\ stolen = FALSE
 
@@ -159,7 +161,9 @@ Acquire(w, u) ==
     /\ PutCreateIfAbsent(ClaimKey(u), <<"c", w, "run">>)
     /\ heldVer' = [heldVer EXCEPT ![w][u] = versionCounter + 1]
     /\ lastClaimOp' = [kind |-> "acquire", unit |-> u, usedVer |-> 0, ok |-> TRUE,
-                       beforeVer |-> 0, afterVer |-> versionCounter + 1]
+                       beforeVer |-> ClaimVer(u), afterVer |-> store'[ClaimKey(u)].version,
+                       beforeContent |-> ClaimContentOf(u),
+                       afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, dupThiefWin,
                    stealWonVers, lastGuarded, stolen>>
 
@@ -183,7 +187,9 @@ Renew(w, u) ==
         /\ heldVer' = [heldVer EXCEPT ![w][u] = IF ok THEN versionCounter + 1 ELSE 0]
         /\ lastClaimOp' = [kind |-> "renew", unit |-> u, usedVer |-> v, ok |-> ok,
                            beforeVer |-> ClaimVer(u),
-                           afterVer |-> IF ok THEN versionCounter + 1 ELSE ClaimVer(u)]
+                           afterVer |-> store'[ClaimKey(u)].version,
+                           beforeContent |-> ClaimContentOf(u),
+                           afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, dupThiefWin,
                    stealWonVers, lastGuarded, stolen>>
 
@@ -205,7 +211,9 @@ Steal(w, u) ==
         /\ stolen' = IF ok THEN TRUE ELSE stolen
         /\ lastClaimOp' = [kind |-> "steal", unit |-> u, usedVer |-> v, ok |-> ok,
                            beforeVer |-> ClaimVer(u),
-                           afterVer |-> IF ok THEN versionCounter + 1 ELSE ClaimVer(u)]
+                           afterVer |-> store'[ClaimKey(u)].version,
+                           beforeContent |-> ClaimContentOf(u),
+                           afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, lastGuarded>>
 
 \* claim.rs::mark_completed -- CasVersion; PreconditionFailed is NotOwner.
@@ -220,7 +228,9 @@ MarkCompleted(w, u) ==
         /\ heldVer' = [heldVer EXCEPT ![w][u] = IF ok THEN versionCounter + 1 ELSE 0]
         /\ lastClaimOp' = [kind |-> "complete", unit |-> u, usedVer |-> v, ok |-> ok,
                            beforeVer |-> ClaimVer(u),
-                           afterVer |-> IF ok THEN versionCounter + 1 ELSE ClaimVer(u)]
+                           afterVer |-> store'[ClaimKey(u)].version,
+                           beforeContent |-> ClaimContentOf(u),
+                           afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimDeleted, dupThiefWin,
                    stealWonVers, lastGuarded, stolen>>
 
@@ -313,13 +323,21 @@ ClaimGrantsNoPublicationAuthority ==
     /\ \A u \in Units, v \in Variants :
          Present(PartKey(u, v)) => ContentOf(PartKey(u, v)) = <<u, v>>
 
-\* A stale-version claim write never succeeds: a claim CAS is Ok only against the
-\* current version, and a non-Ok CAS changes nothing. (Broken by
-\* claim-completion-without-cas.)
+\* A stale-version claim write never succeeds. The witness records what the store
+\* held before the operator ran and what it held after (beforeVer/afterVer and
+\* beforeContent/afterContent are read from the store, not self-reported), so the
+\* invariant relates the reported outcome to the durable delta: a successful CAS
+\* used the current version and bumped the stored version, and a failed CAS left
+\* the stored record byte-for-byte unchanged. (Broken by
+\* claim-completion-without-cas, which turns the CAS into an Overwrite.)
 StaleOwnerCannotOverwriteNewerClaim ==
     lastClaimOp.kind \in {"renew", "steal", "complete"} =>
-        /\ (lastClaimOp.ok => lastClaimOp.usedVer = lastClaimOp.beforeVer)
-        /\ (~lastClaimOp.ok => lastClaimOp.afterVer = lastClaimOp.beforeVer)
+        /\ (lastClaimOp.ok =>
+              /\ lastClaimOp.usedVer = lastClaimOp.beforeVer
+              /\ lastClaimOp.afterVer # lastClaimOp.beforeVer)
+        /\ (~lastClaimOp.ok =>
+              /\ lastClaimOp.afterVer = lastClaimOp.beforeVer
+              /\ lastClaimOp.afterContent = lastClaimOp.beforeContent)
 
 \* No path deletes a claim unconditionally (a stale worker's DELETE could destroy
 \* a newer owner's claim). (Broken by claim-delete-unconditional.)
