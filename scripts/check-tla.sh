@@ -63,6 +63,17 @@ resolve_java() {
     note "java: $java (version $ver)"
 }
 
+# sha256 of a file: coreutils sha256sum where present, else the shasum that
+# ships with macOS. An empty digest would reject a valid jar, so both paths
+# print exactly one hex string or nothing.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
 ensure_jar() {
     mkdir -p "$CACHE_DIR"
     # RAVEL_TLA_TOOLS_JAR (ADR-1113 D9): an operator-supplied jar. Use it as-is,
@@ -73,7 +84,7 @@ ensure_jar() {
         [ -f "$RAVEL_TLA_TOOLS_JAR" ] \
             || die "RAVEL_TLA_TOOLS_JAR=$RAVEL_TLA_TOOLS_JAR does not exist"
         local supplied
-        supplied="$(sha256sum "$RAVEL_TLA_TOOLS_JAR" | awk '{print $1}')"
+        supplied="$(sha256_of "$RAVEL_TLA_TOOLS_JAR")"
         [ "$supplied" = "$TLA_JAR_SHA256" ] \
             || die "RAVEL_TLA_TOOLS_JAR sha256 $supplied != expected $TLA_JAR_SHA256; refusing to run (not downloading)"
         JAR="$RAVEL_TLA_TOOLS_JAR"
@@ -81,7 +92,7 @@ ensure_jar() {
     fi
     if [ -f "$JAR" ]; then
         local got
-        got="$(sha256sum "$JAR" | awk '{print $1}')"
+        got="$(sha256_of "$JAR")"
         if [ "$got" = "$TLA_JAR_SHA256" ]; then
             return 0
         fi
@@ -97,7 +108,7 @@ ensure_jar() {
         die "neither curl nor wget available to fetch the TLC jar"
     fi
     local got
-    got="$(sha256sum "$tmp" | awk '{print $1}')"
+    got="$(sha256_of "$tmp")"
     if [ "$got" != "$TLA_JAR_SHA256" ]; then
         rm -f "$tmp"
         die "downloaded jar has sha256 $got, expected $TLA_JAR_SHA256; refusing to run"
@@ -407,7 +418,9 @@ check_negative() {
         states="$(log_field "$logfile" '[0-9]+ states generated')"
         distinct="$(log_field "$logfile" '[0-9]+ distinct states found')"
 
-        if [ "$code" = "$want_exit" ] && grep -qE "$viol_re" "$logfile"; then
+        # Fixed-string match: the expected property name is data, never a
+        # regular expression (property=.* must not accept any violation).
+        if [ "$code" = "$want_exit" ] && grep -qF "$viol_re" "$logfile"; then
             record_row "$area" "negative/$name.cfg" "$states" "$distinct" "-" "$secs" "VIOLATED"
             note "$area negative $name: VIOLATED as expected (exit $code, $want_prop)"
         else
