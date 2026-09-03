@@ -94,7 +94,7 @@ ASSUME ProtectionHorizon >= MaxQueryDuration + Grace + ClockSkew
 \* query race. README records why a second raw input and a second bucket add no
 \* new reachable invariant behaviour, only state.
 Buckets   == {"b1"}
-Subjects  == {"s1"}
+Subjects  == {"s1", "s2"}
 Requests  == {"r1"}
 
 \* Object identities (store keys).
@@ -110,23 +110,29 @@ InitPresent   == RawInputs \cup {"sysgc"}
 Bucket(o) == CASE o \in {"raw1","rwA","tombB1","dreqR1","doneR1"} -> "b1"
                [] OTHER -> "sys"
 
-\* The served records are modelled by identity, not by count: one record rec1 of
-\* subject s1. `objContent` (a state variable) holds the set of record identities
-\* each object serves, so "serves subject s" is a fact about the stored content, and
-\* the rewrite multiset rule (finding 3) is checked over record identities rather
-\* than reduced to a constant. RecordSubject maps a record to its subject.
-AllRecords     == {"rec1"}
-RecordSubject(r) == "s1"
+\* The served records are modelled by identity, not by count: raw1 carries two
+\* records of two distinct subjects. `objContent` (a state variable) holds the
+\* set of record identities each object serves, so "serves subject s" is a fact
+\* about the stored content, and the rewrite multiset rule (finding 3) is
+\* checked over record identities rather than reduced to a constant.
+\* RecordSubject maps a record to its subject. rec1/s1 is the erased side of the
+\* claim; rec2/s2 is the surviving side -- r1 erases only s1, so a correct
+\* rewrite must drop rec1 and keep rec2. Without rec2 the "kept" direction of
+\* RewriteOutputsAreInputsMinusErased has no witness: every record in scope is
+\* erased, so the right-hand side of the <=> is a state-independent FALSE.
+AllRecords     == {"rec1", "rec2"}
+RecordSubject(r) == IF r = "rec1" THEN "s1" ELSE "s2"
 
 Predecessors(o) == IF o = "rwA" THEN RawInputs ELSE {}
 AppliedReqs(o)  == IF o = "rwA" THEN Requests ELSE {}
 
-\* Subjects erased by a set of request ids (r1 erases s1).
+\* Subjects erased by a set of request ids (r1 erases s1, never s2).
 ErasedBy(reqs) == IF "r1" \in reqs THEN {"s1"} ELSE {}
 
-\* Content of a raw input at Init: the raw input carries rec1 (subject s1); every
-\* other object carries no records until an action writes it.
-InitContent(o) == IF o \in RawInputs THEN {"rec1"} ELSE {}
+\* Content of a raw input at Init: raw1 carries rec1 (s1, erasable) and rec2
+\* (s2, must survive any rewrite applying r1); every other object carries no
+\* records until an action writes it.
+InitContent(o) == IF o \in RawInputs THEN {"rec1", "rec2"} ELSE {}
 
 \* The record set the rewrite output should serve: its predecessors' records minus
 \* the records whose subject the applied requests erased. RewriteKeepsErasedRecords
