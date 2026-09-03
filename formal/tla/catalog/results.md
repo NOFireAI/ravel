@@ -12,7 +12,7 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 2910784 | 32 | PASS | 20260903T122303Z-e288a3406dc4d70be033d2d5b9444e0b19b66047 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 8408098 | 32 | PASS | 20260903T133531Z-111d93079ca50bad141da866930552ec362dc447 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
 | negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | negative lane |
 | negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | negative lane |
@@ -27,11 +27,13 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 | negative/corrupt-head-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | negative lane |
 | negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | negative lane |
 | negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | negative lane |
+| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260903T132807Z-111d93079ca50bad141da866930552ec362dc447 |
 
-The thirteen `negative/` configs each flip exactly one switch (or, for
-`carryforward-nonvacuity.cfg`, check a refuted probe) and must exit 12 reporting
-exactly the named property; each `.expect` pins that exit code and property, and
-the negative lane fails if any config passes or reports a different property.
+The fourteen `negative/` configs each flip exactly one switch (or, for
+`carryforward-nonvacuity.cfg` and `frontier-reconcile-nonvacuity.cfg`, check a
+refuted probe) and must exit 12 reporting exactly the named property; each
+`.expect` pins that exit code and property, and the negative lane fails if any
+config passes or reports a different property.
 
 `counterexamples/late-supersession-shrink.cfg` is a recorded temporal shrink,
 not a gate: run under `FairSpec` with `PROPERTY LateSupersessionEventuallyReflected`
@@ -44,7 +46,7 @@ not run by any harness lane.
 A run outside these is a regression to investigate, not to widen; see
 `bands.tsv`.
 
-- smoke distinct states in [2895000, 2925000], depth in [32, 32].
+- smoke distinct states in [8390000, 8430000], depth in [32, 32].
 
 The safety model runs to a fixed complete state graph, so its distinct-state
 count and depth are deterministic; the band carries a small margin only to
@@ -54,8 +56,28 @@ and its resolve-time witnesses, which shrank the smoke state graph from the
 prior round's 3165708 distinct states to 2910784 (same depth, 32): a query
 now dedups the entries it actually serves before recording `dupServed` rather
 than carrying a separately-toggled duplicate-count field, collapsing some
-previously-distinct `qy` states. The band above reflects a fresh measurement
-of this round's smoke.cfg run.
+previously-distinct `qy` states.
+
+Finding 5 (ADR-0020 retention-frontier reconcile) then grew the smoke graph
+again, from 2910784 to 8408098 distinct states (depth unchanged, 32):
+`DoFoldStart` and `DoRivalFoldWin` now each existentially choose a frontier
+hour from `Hours \cup {-1}`, a three-way branch (no pick, pick hour 0, pick
+hour 1) at smoke's two-hour bounds, at every fold-start and rival-fold-win
+transition in the graph. This is a real, surfaced cost, not an incidental
+shift: a full `SUBSET Hours` frontier choice would have been `2^|Hours|`
+branches per fold-start instead of `|Hours| + 1`; the model takes the
+single-hour-per-fold abstraction instead (documented beside
+`IncrementalFoldEntries` in `CatalogMVCC.tla`) on the argument that each
+hour's tombstone filtering is independent of every other hour's, so what a
+multi-hour batch reconciles in one fold, a run of single-hour folds
+reconciles the same way across several folds -- sound for the safety
+invariants this model checks, not a claim about reconcile throughput. The
+band above reflects a fresh measurement of this round's smoke.cfg run
+including this cost. `exhaustive.cfg`'s graph will grow by a comparable or
+larger factor the next time an exhaustive run is in scope (see below); that
+run should re-measure rather than assume proportional growth, since
+exhaustive's larger `Hours` set makes the per-transition branching factor
+larger too.
 
 `exhaustive.cfg` carried a band (1185000-1198000 distinct states, depth 31)
 from the prior round's measurement, but this round's model changes shifted the
@@ -94,7 +116,7 @@ authority; the table restates it.
 | MissingIndexDegradesToListing | WITNESS: `qy.indexReadableAtResolve` (`IndexReadable` as observed at resolve), `qy.pinned` (what was served), `qy.resolvedView` (what the store listing said should be served, computed without the `QueryFailsClosedOnMissingIndex` switch) |
 | CorruptHeadFailsClosedOnDeletePaths | WITNESS: `lastDelete.headStatus`, the HEAD status at the last real object removal |
 | HeadNamedObjectNeverDeleted | STORE: the HEAD register, the L0 plane, and the L1 compaction-record plane |
-| TombstonedBucketContributesNothing | WITNESS: `lastHead.entries`, `lastHead.tombAtWrite`, and `lastHead.reconcileLo` of the last fold |
+| TombstonedBucketContributesNothing | WITNESS: `lastHead.entries`, `lastHead.tombAtWrite`, `lastHead.reconcileLo`, and `lastHead.frontierReconciled` of the last fold |
 | SignalDedupContract | WITNESS: `qy.dupServed`, recomputed (`RawDupIdentities`) on the entry set the query actually served after `Dedup` ran on it, not on the switch that gates `Dedup` |
 
 ## Non-vacuity: behaviour mutant per invariant
@@ -124,6 +146,15 @@ separately by `negative/carryforward-nonvacuity.cfg`, which checks the refuted
 probe `NoCarryForward` and exits 12: a watermark-advancing fold is reachable at
 those bounds and carries a below-floor hour forward, so the paired
 `carryforward.cfg` safety pass is not vacuous.
+
+`TombstonedBucketContributesNothing`'s `frontierReconciled` disjunct (added
+for finding 5, ADR-0020) is shown non-vacuous the same way, by
+`negative/frontier-reconcile-nonvacuity.cfg`, which checks the refuted probe
+`NoFrontierReconcile` and exits 12: a second, watermark-advancing fold
+reachable at those bounds picks an already-tombstoned, below-floor hour into
+its frontier set, so the frontier-filtering branch of `FrontierAdmits` is
+exercised and not dead code. See
+`counterexamples/frontier-reconcile-nonvacuity.md` for the recorded trace.
 
 ## Fairness
 

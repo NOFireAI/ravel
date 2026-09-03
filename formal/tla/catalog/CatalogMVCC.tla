@@ -142,11 +142,11 @@ ClearedCrec == [used |-> FALSE, in |-> {}, out |-> {}, at |-> -1]
 StageRec   == [active: BOOLEAN, wm: Int, entries: SUBSET AllEntries,
                partWritten: BOOLEAN, baseVer: Nat, baseAbsent: BOOLEAN,
                startClock: Int, tombAtStage: [Hours -> BOOLEAN],
-               reconcileLo: Int]
+               reconcileLo: Int, frontierReconciled: SUBSET Hours]
 ClearedStage == [active |-> FALSE, wm |-> -1, entries |-> {},
                  partWritten |-> FALSE, baseVer |-> 0, baseAbsent |-> FALSE,
                  startClock |-> -1, tombAtStage |-> [H \in Hours |-> FALSE],
-                 reconcileLo |-> -1]
+                 reconcileLo |-> -1, frontierReconciled |-> {}]
 Statuses   == {"absent", "valid", "corrupt", "unsupported"}
 SnapPart   == [wm: Int, entries: SUBSET AllEntries, at: Int]
 
@@ -201,14 +201,32 @@ FoldEntriesFor(w) ==
 \* staleness and the one the model checks.
 ReconcileWindow == 0
 
+\* ADR-0020 retention-frontier reconcile (docs/catalog-and-mvcc.md,
+\* "Retention-frontier reconcile"): independent of the fixed window below, a
+\* fold may also re-diff one carried-forward hour, applying the identical
+\* tombstone filter the fresh scan uses. Unlike a superseded L0 input (safe to
+\* carry forever, held by the sweep gate), a tombstoned bucket left below the
+\* floor blocks retention permanently without this pass: nothing else ever
+\* drops it from HEAD, so the sweep's HEAD-reachability gate never clears and
+\* the objects are never deleted. The real fold bounds this to
+\* frontier_reconcile_max_hours (168 in production) and drains a backlog
+\* oldest-first over many folds; the model checks the tightest case, one hour
+\* per fold, since each hour's tombstone filtering is independent of every
+\* other hour's: what a multi-hour batch proves reconciled in a single fold, a
+\* run of single-hour folds proves the same way across several, the same
+\* worst-case-stands-in-for-every-case argument ReconcileWindow = 0 uses below.
+FrontierAdmits(FH, e) == e[2] \in FH => (~tomb[e[2]] \/ FoldIncludesTombstonedEntries)
+
 \* The bounded incremental fold (crates/ravel-catalog/src/fold.rs::reconcile_one_
 \* bucket over the incremental range, plus the carried-forward prefix of the
 \* prior snapshot). Advancing a valid HEAD from wmOld to wmNew:
 \*   - hours < wmOld - ReconcileWindow are CARRIED FORWARD verbatim from the
-\*     prior snapshot (head.entries), NOT rescanned. A compaction that supersedes
-\*     one of their L0 inputs after this hour left the window is therefore NOT
-\*     reflected: the snapshot keeps naming the pre-compaction L0 input. This is
-\*     the bound the review required in place of the oracle.
+\*     prior snapshot (head.entries), NOT rescanned, UNLESS the frontier pass
+\*     (FH, at most one hour) picked one of them: that hour still gets the
+\*     tombstone filter. A compaction that supersedes one of their L0 inputs
+\*     after this hour left the window is NOT reflected by either pass: the
+\*     snapshot keeps naming the pre-compaction L0 input. This is the bound
+\*     the review required in place of the oracle.
 \*   - hours >= wmOld - ReconcileWindow (the window plus every newly sealed hour
 \*     up to wmNew) are freshly reconciled from the store.
 \* A rebuild from an absent or corrupt HEAD has no prior snapshot to carry, so it
@@ -217,10 +235,10 @@ ReconcileWindow == 0
 \* the snapshot still names is held in the store (HeadNamedObjectNeverDeleted),
 \* and a query serves it (correct data, merely uncompacted) with query-time dedup
 \* collapsing any duplicate identity (SignalDedupContract). See #7 in results.md.
-IncrementalFoldEntries(wmNew) ==
+IncrementalFoldEntries(wmNew, FH) ==
     IF head.status = "valid"
     THEN LET reconcileLo == head.wm - ReconcileWindow IN
-           { e \in head.entries : e[2] < reconcileLo }
+           { e \in head.entries : e[2] < reconcileLo /\ FrontierAdmits(FH, e) }
              \cup { e \in FoldEntriesFor(wmNew) : e[2] >= reconcileLo }
     ELSE FoldEntriesFor(wmNew)
 
@@ -314,7 +332,7 @@ TypeOK ==
     /\ lastHead \in [kind: {"none", "fold", "recTick", "corrupt", "unsupported"},
                      wmBefore: Int, wmAfter: Int, entriesChanged: BOOLEAN,
                      entries: SUBSET AllEntries, tombAtWrite: [Hours -> BOOLEAN],
-                     reconcileLo: Int]
+                     reconcileLo: Int, frontierReconciled: SUBSET Hours]
     /\ lastDelete \in [happened: BOOLEAN, headStatus: {"none"} \cup Statuses]
     /\ lastCompact \in [loserFired: BOOLEAN, mutated: BOOLEAN]
     /\ maxValidWm \in Int
@@ -338,7 +356,7 @@ Init ==
              headStatusAtResolve |-> "none", indexReadableAtResolve |-> FALSE]
     /\ lastHead = [kind |-> "none", wmBefore |-> -1, wmAfter |-> -1,
                    entriesChanged |-> FALSE, entries |-> {}, tombAtWrite |-> NoTomb,
-                   reconcileLo |-> -1]
+                   reconcileLo |-> -1, frontierReconciled |-> {}]
     /\ lastDelete = [happened |-> FALSE, headStatus |-> "none"]
     /\ lastCompact = [loserFired |-> FALSE, mutated |-> FALSE]
     /\ maxValidWm = -1
@@ -421,17 +439,20 @@ DoCompactLoser(H, g) ==
 DoFoldStart(f) ==
     /\ ~foldStage[f].active
     /\ head.status # "unsupported"
-    /\ LET w == FoldWatermark IN
-        /\ w >= 0
-        /\ ( \/ head.status \in {"absent", "corrupt"}
-             \/ (head.status = "valid" /\ w > head.wm) )
-        /\ foldStage' = [foldStage EXCEPT ![f] =
-              [active |-> TRUE, wm |-> w, entries |-> IncrementalFoldEntries(w),
-               partWritten |-> FALSE, baseVer |-> store[HK].version,
-               baseAbsent |-> (head.status = "absent"), startClock |-> clock,
-               tombAtStage |-> tomb,
-               reconcileLo |-> IF head.status = "valid"
-                               THEN head.wm - ReconcileWindow ELSE -1]]
+    /\ \E oh \in Hours \cup {-1} :
+        LET w == FoldWatermark
+            FH == IF oh = -1 THEN {} ELSE {oh}
+        IN
+            /\ w >= 0
+            /\ ( \/ head.status \in {"absent", "corrupt"}
+                 \/ (head.status = "valid" /\ w > head.wm) )
+            /\ foldStage' = [foldStage EXCEPT ![f] =
+                  [active |-> TRUE, wm |-> w, entries |-> IncrementalFoldEntries(w, FH),
+                   partWritten |-> FALSE, baseVer |-> store[HK].version,
+                   baseAbsent |-> (head.status = "absent"), startClock |-> clock,
+                   tombAtStage |-> tomb, frontierReconciled |-> FH,
+                   reconcileLo |-> IF head.status = "valid"
+                                   THEN head.wm - ReconcileWindow ELSE -1]]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, qy, lastHead,
                    lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
     /\ UNCHANGED svTuple
@@ -480,7 +501,8 @@ DoFoldCas(f) ==
                        THEN [kind |-> "fold", wmBefore |-> head.wm, wmAfter |-> st.wm,
                              entriesChanged |-> (st.entries # head.entries),
                              entries |-> st.entries, tombAtWrite |-> st.tombAtStage,
-                             reconcileLo |-> st.reconcileLo]
+                             reconcileLo |-> st.reconcileLo,
+                             frontierReconciled |-> st.frontierReconciled]
                        ELSE lastHead
         /\ maxValidWm' = IF won /\ st.wm > maxValidWm THEN st.wm ELSE maxValidWm
         /\ foldStage' = [foldStage EXCEPT ![f] = ClearedStage]
@@ -499,16 +521,19 @@ DoFoldCas(f) ==
 DoRivalFoldWin ==
     /\ head.status = "valid"
     /\ FoldWatermark > head.wm
-    /\ LET w == FoldWatermark
-           es == IncrementalFoldEntries(FoldWatermark)
-       IN
-        /\ PutOverwrite(HK, HeadContentVal)
-        /\ head' = [status |-> "valid", wm |-> w, entries |-> es]
-        /\ snapParts' = snapParts \cup { [wm |-> w, entries |-> es, at |-> clock] }
-        /\ lastHead' = [kind |-> "fold", wmBefore |-> head.wm, wmAfter |-> w,
-                        entriesChanged |-> (es # head.entries), entries |-> es,
-                        tombAtWrite |-> tomb, reconcileLo |-> head.wm - ReconcileWindow]
-        /\ maxValidWm' = IF w > maxValidWm THEN w ELSE maxValidWm
+    /\ \E oh \in Hours \cup {-1} :
+        LET w == FoldWatermark
+            FH == IF oh = -1 THEN {} ELSE {oh}
+            es == IncrementalFoldEntries(FoldWatermark, FH)
+        IN
+            /\ PutOverwrite(HK, HeadContentVal)
+            /\ head' = [status |-> "valid", wm |-> w, entries |-> es]
+            /\ snapParts' = snapParts \cup { [wm |-> w, entries |-> es, at |-> clock] }
+            /\ lastHead' = [kind |-> "fold", wmBefore |-> head.wm, wmAfter |-> w,
+                            entriesChanged |-> (es # head.entries), entries |-> es,
+                            tombAtWrite |-> tomb, reconcileLo |-> head.wm - ReconcileWindow,
+                            frontierReconciled |-> FH]
+            /\ maxValidWm' = IF w > maxValidWm THEN w ELSE maxValidWm
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, foldStage, qy,
                    lastDelete, corruptionUsed, unsupportedUsed>>
 
@@ -546,7 +571,7 @@ DoReconcileTick(f) ==
         /\ head' = [head EXCEPT !.entries = e2]
         /\ lastHead' = [kind |-> "recTick", wmBefore |-> head.wm, wmAfter |-> head.wm,
                         entriesChanged |-> (e2 # head.entries), entries |-> e2,
-                        tombAtWrite |-> tomb, reconcileLo |-> -1]
+                        tombAtWrite |-> tomb, reconcileLo |-> -1, frontierReconciled |-> {}]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, snapParts, foldStage, qy,
                    lastDelete, maxValidWm, corruptionUsed, unsupportedUsed>>
     /\ UNCHANGED svTuple
@@ -681,7 +706,7 @@ DoCorruptHead ==
     /\ head' = [status |-> "corrupt", wm |-> -1, entries |-> {}]
     /\ lastHead' = [kind |-> "corrupt", wmBefore |-> head.wm, wmAfter |-> -1,
                     entriesChanged |-> (head.entries # {}), entries |-> {},
-                    tombAtWrite |-> tomb, reconcileLo |-> -1]
+                    tombAtWrite |-> tomb, reconcileLo |-> -1, frontierReconciled |-> {}]
     /\ corruptionUsed' = TRUE
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, snapParts, foldStage, qy,
                    lastDelete, maxValidWm, unsupportedUsed>>
@@ -696,7 +721,7 @@ DoUnsupportedHead ==
     /\ head' = [status |-> "unsupported", wm |-> -1, entries |-> {}]
     /\ lastHead' = [kind |-> "unsupported", wmBefore |-> head.wm, wmAfter |-> -1,
                     entriesChanged |-> (head.entries # {}), entries |-> {},
-                    tombAtWrite |-> tomb, reconcileLo |-> -1]
+                    tombAtWrite |-> tomb, reconcileLo |-> -1, frontierReconciled |-> {}]
     /\ unsupportedUsed' = TRUE
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, snapParts, foldStage, qy,
                    lastDelete, maxValidWm, corruptionUsed>>
@@ -836,24 +861,33 @@ HeadNamedObjectNeverDeleted ==
 
 \* A fold contributes nothing for a bucket tombstoned at the time it reconciled
 \* that bucket. Witness-derived: lastHead.entries is the entry set the last fold
-\* wrote to HEAD, and lastHead.tombAtWrite is the tombstone map that fold read.
-\* The guarantee is scoped to the freshly reconciled range (hours at or above the
-\* fold's reconcile floor, lastHead.reconcileLo, recorded at fold start from the
+\* wrote to HEAD, lastHead.tombAtWrite is the tombstone map that fold read, and
+\* lastHead.frontierReconciled is the (at most one) below-floor hour the fold's
+\* ADR-0020 retention-frontier pass separately re-diffed this cycle. The
+\* guarantee covers the freshly reconciled range (hours at or above the fold's
+\* reconcile floor, lastHead.reconcileLo, recorded at fold start from the
 \* watermark the fold actually read, so a HEAD change between start and CAS, a
-\* rival win or a corruption-then-heal, cannot shift it); a rebuild records a
-\* floor of -1, below every hour, so the whole snapshot is fresh. Entries carried
-\* forward from the prior snapshot (below the floor) are exempt: a bucket
-\* tombstoned after it left the reconcile window is reflected only once the window
-\* returns to it or on a rebuild, exactly like a late supersession, and is safe by
-\* the same argument (the tombstoned bucket's objects stay held while HEAD names
-\* them). A hour tombstoned AFTER a fold reconciled it is legitimate and does not
-\* falsify this, because tombAtWrite is frozen at the write. Falsified by dropping
-\* the ~tomb filter from FoldEntriesFor (the fresh scan then admits a tombstoned
-\* bucket).
+\* rival win or a corruption-then-heal, cannot shift it) AND any hour the
+\* frontier pass separately picked, since both apply the identical tombstone
+\* filter (FrontierAdmits); a rebuild records a floor of -1, below every hour,
+\* so the whole snapshot is fresh regardless of the frontier pass. A
+\* carried-forward hour below the floor that the frontier pass did NOT pick
+\* this cycle is still exempt: a bucket tombstoned there is reflected once the
+\* frontier pass reaches it (this fold or a later one) or the window returns to
+\* it, exactly like a late supersession, and is safe meanwhile by the same
+\* argument (the tombstoned bucket's objects stay held while HEAD names them).
+\* Unlike a late supersession, this exemption is not permanent: the frontier
+\* pass is what lets retention actually complete, since nothing else ever
+\* drops a below-floor tombstoned hour from HEAD. An hour tombstoned AFTER a
+\* fold reconciled it is legitimate and does not falsify this, because
+\* tombAtWrite is frozen at the write. Falsified by dropping the ~tomb filter
+\* (FoldIncludesTombstonedEntries), which defeats both the fresh scan and the
+\* frontier pass since they share one check.
 TombstonedBucketContributesNothing ==
     lastHead.kind = "fold" =>
         \A e \in lastHead.entries :
-            e[2] >= lastHead.reconcileLo => ~lastHead.tombAtWrite[e[2]]
+            (e[2] >= lastHead.reconcileLo \/ e[2] \in lastHead.frontierReconciled)
+                => ~lastHead.tombAtWrite[e[2]]
 
 \* Signal semantics: under metrics (query-time dedup) a query serves each
 \* identity at most once even when two sources (an L0 record plus an L1 part, or
@@ -878,6 +912,25 @@ CarryForwardExercised ==
     /\ \E e \in lastHead.entries : e[2] < lastHead.reconcileLo
 
 NoCarryForward == ~CarryForwardExercised
+
+\* Non-vacuity probe for the ADR-0020 retention-frontier reconcile. True once
+\* a fold picked a below-floor hour into its frontier set while that hour was
+\* already tombstoned, i.e. the nondeterministic frontier choice in
+\* DoFoldStart / DoRivalFoldWin fired on an hour where it does real work (the
+\* same reachability argument CarryForwardExercised uses for the carry-forward
+\* branch itself). Used only as a refuted control: NoFrontierReconcile is
+\* checked as an INVARIANT in negative/frontier-reconcile-nonvacuity.cfg,
+\* whose bounds make a second, watermark-advancing fold reachable after the
+\* first hour is tombstoned; TLC reporting NoFrontierReconcile violated proves
+\* the frontier pass is exercised, so TombstonedBucketContributesNothing's
+\* frontierReconciled disjunct is not dead code.
+FrontierReconcileExercised ==
+    /\ lastHead.kind = "fold"
+    /\ \E h \in lastHead.frontierReconciled :
+        /\ h < lastHead.reconcileLo
+        /\ lastHead.tombAtWrite[h]
+
+NoFrontierReconcile == ~FrontierReconcileExercised
 
 ----------------------------------------------------------------------------
 \* Named temporal properties (checked against FairSpec only).
