@@ -91,6 +91,20 @@ the shipped refresh interval and lead to exhaustion, and this file should not
 be read as having done so. `smoke.cfg`'s `AppenderSkew = 0` remains the
 gating config's workaround for the hour-granularity collision above.
 
+A later attempt tried to make the shipped ratio tractable by attacking the
+minute-granularity blow-up directly: single writer, one requester, `HourUnits`
+lowered to 4 and then 2 (from 60), `MaxHour` lowered to 16, 10, then 6 (from
+125). All three shrinks still explored past 2.3-2.7 million distinct states
+at the same non-decaying growth rate before being stopped, with no sign of
+converging. This rules out the specific 60-unit encoding, or the two-writer
+dimension, as the cause: the blow-up is structural to modeling any nonzero
+`AppenderSkew` at all, at any sub-hour granularity. Every `AppenderSkew > 0`
+config tried this session, regardless of purpose or dimensions, showed the
+same shape (see results.md's Finding B for two more instances, from the
+`FlushBound` mutant search). **No gated configuration exercises
+`TOLERATED_CLOCK_SKEW_HOURS` at the shipped refresh interval; this is stated
+here next to the constants, not left implied.**
+
 ## Assumptions
 
 - **The `C = 1` rounding.** The model's time unit is an hour, so the 60-second

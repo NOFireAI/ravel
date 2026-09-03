@@ -611,6 +611,14 @@ EveryAdmittedWriteInScanSet ==
         \A v \in admitted :
             v.shard < RangeScanCount(Gens, v.ingestHour, v.routeHour, S)
 
+\* Coverage probe, not a safety property: witnesses that a real admitted
+\* record can trail its ingest hour by 2 or more, so a config actually
+\* reaches the FlushBound=2 boundary rather than passing it vacuously.
+\* Grounded on admitted (the store), not on the FlushBound constant itself.
+\* See flush-bound-trailing.cfg.
+FlushBoundNeverBites ==
+    \A v \in admitted : (v.routeHour - v.ingestHour) < 2
+
 \* The straggler case of the above: a record routed on a count larger than the
 \* one active at its route hour (a decrease's retiring count) stays in scope.
 DecreaseKeepsStraggler ==
@@ -618,6 +626,14 @@ DecreaseKeepsStraggler ==
         \A v \in admitted :
             v.shard >= ActiveCount(Gens, v.routeHour) =>
                 v.shard < RangeScanCount(Gens, v.ingestHour, v.routeHour, S)
+
+\* Coverage probe, not a safety property: witnesses that two distinct
+\* writers can hold an open flush at the same time. exhaustive.cfg drops to
+\* a single writer for tractability; this probe (see
+\* two-writer-concurrency-probe.cfg) shows the concurrent-writer interleaving
+\* it gives up is still reachable, at smoke's own dimensions.
+TwoWritersNeverConcurrentlyOpen ==
+    \A wa, wb \in Writers : (wa # wb) => ~(flushes[wa].open /\ flushes[wb].open)
 
 \* No record is admitted on a view older than the degraded-grace horizon.
 StaleWriterFailsClosed ==
@@ -662,8 +678,12 @@ LeadCoversRefreshHorizon ==
 \* the appender is never required to act.
 FairSpec ==
     /\ Spec
+    \* The writer's refresh loop retries on its own; nothing external is
+    \* required to make a pending refresh-and-admit succeed.
     /\ \A w \in Writers : WF_vars(AdmitAfterRefresh(w))
+    \* A writer with no open flush always opens one on its own next tick.
     /\ \A w \in Writers : WF_vars(FlushOpen(w))
+    \* An open flush is always closed once its window elapses.
     /\ \A w \in Writers : WF_vars(FlushClose(w))
 
 RoutedOnLatest(w) == views[w].has /\ Len(views[w].gens) = Len(Gens)
