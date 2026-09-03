@@ -597,7 +597,7 @@ async fn catalog_and_metadata_methods_answer_an_authenticated_caller() {
     .await
     .expect("decodes");
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(rows, 1, "exactly the samples table");
+    assert_eq!(rows, 5, "one row per registered table");
 
     let mut request = Request::new(FlightDescriptor::new_cmd(Vec::new()));
     authed(request.metadata_mut());
