@@ -1627,13 +1627,29 @@ struct ErasureRewritePass {
     /// `bucket_drops`.
     bucket_drops: std::collections::BTreeMap<String, Vec<AppliedBucketDrop>>,
     /// `request_id`s whose `bucket_drops` above is NOT the complete set of
-    /// buckets that applied the request, because some in-scope bucket was
-    /// `AlreadyApplied`: an earlier pass rewrote it, and the count that pass
-    /// dropped there is not restatable from the live record (a later
-    /// generation's `drops` carry `dropped_count: 0` for a request an earlier
-    /// generation already erased). Such a request's completion is written with
-    /// no bucket list at all rather than a partial one, which is what keeps the
-    /// erasure-request sweep's truncated-bucket clause whole-signal for it.
+    /// buckets that applied the request, because some in-scope bucket already
+    /// named it applied in a generation earlier than this pass: the count
+    /// that generation dropped there is not restatable from the live record
+    /// (a later generation's `drops` carry `dropped_count: 0` for a request
+    /// an earlier generation already erased). Such a request's completion is
+    /// written with no bucket list at all rather than a partial one, which is
+    /// what keeps the erasure-request sweep's truncated-bucket clause
+    /// whole-signal for it.
+    ///
+    /// Fed from [`ravel_maintain::bucket_already_applied_request_ids`], read
+    /// per bucket BEFORE that bucket's own [`erasure_rewrite_bucket`] call,
+    /// unioned in regardless of what that call then returns -- `Rewritten`,
+    /// `AlreadyApplied`, `NoApplicableRequests`, and `Tombstoned` alike --
+    /// never only from `AlreadyApplied`. A request whose applying bucket
+    /// later falls out of scope (its window no longer overlaps the bucket's
+    /// shrunk live event bounds, or the bucket is later tombstoned) must
+    /// still be marked here: the bucket's live record still durably names
+    /// it, so this pass still cannot restate that bucket's count for it,
+    /// even though the bucket itself is no longer `AlreadyApplied` or
+    /// `Rewritten` for that request. Reading it before the rewrite attempt,
+    /// rather than from the attempt's own outcome, is what keeps a bucket
+    /// this pass just rewrote for the first time from picking up its own
+    /// fresh generation instead of the prior one.
     drops_incomplete: std::collections::HashSet<String>,
 }
 
@@ -1690,57 +1706,93 @@ async fn erasure_rewrite_pass(
         };
         for hour in hours {
             let bucket = Bucket::new(*tenant, signal, shard, hour);
+            // Read before the rewrite attempt below, and unioned in
+            // regardless of that attempt's outcome: this is exactly the set
+            // of requests this bucket's live record named as applied BEFORE
+            // this pass touches it, so a bucket this pass rewrites for the
+            // first time does not pick up its own fresh generation instead
+            // (finding 2), and a bucket that falls out of this pass's scope
+            // (finding 1: a windowed request whose window shrank out of the
+            // bucket's live event bounds, or a bucket since tombstoned)
+            // still surfaces the requests it already applied earlier.
+            match ravel_maintain::bucket_already_applied_request_ids(store, compactor, &bucket)
+                .await
+            {
+                Ok(already_applied) => pass.drops_incomplete.extend(already_applied),
+                Err(err) => {
+                    // Record unreadable: conservatively treat every pending
+                    // request as unable to be vouched for by this bucket.
+                    // `deferred = true` already withholds every completion
+                    // this tick, so no partial list can be written regardless.
+                    pass.deferred = true;
+                    pass.drops_incomplete
+                        .extend(pending.iter().map(|p| p.request.request_id.clone()));
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        hour,
+                        error = %err,
+                        "maintenance: erasure rewrite could not read a bucket's live \
+                         applied-request set; no completion written this tick, retried \
+                         next tick"
+                    );
+                }
+            }
             match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
                 .await
             {
-                Ok(ErasureRewriteOutcome::Rewritten {
-                    parts,
-                    publish,
-                    drops,
-                }) => {
-                    pass.rewritten += 1;
-                    // An abandoned publish wrote no record, so this bucket
-                    // does not yet name the pending requests.
-                    if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
-                        pass.deferred = true;
+                Ok(outcome) => {
+                    match outcome {
+                        ErasureRewriteOutcome::Rewritten {
+                            parts,
+                            publish,
+                            drops,
+                        } => {
+                            pass.rewritten += 1;
+                            // An abandoned publish wrote no record, so this
+                            // bucket does not yet name the pending requests.
+                            if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
+                                pass.deferred = true;
+                            }
+                            for drop in drops {
+                                pass.bucket_drops
+                                    .entry(drop.request_id.clone())
+                                    .or_default()
+                                    .push(drop);
+                            }
+                            tracing::info!(
+                                tenant = %tenant.to_hex(),
+                                signal = ?signal,
+                                shard,
+                                hour,
+                                parts,
+                                publish = ?publish,
+                                "maintenance: erasure rewrite published for a bucket"
+                            );
+                        }
+                        ErasureRewriteOutcome::AlreadyApplied { .. } => {
+                            pass.already_applied += 1;
+                        }
+                        ErasureRewriteOutcome::NoApplicableRequests
+                        | ErasureRewriteOutcome::Tombstoned => pass.out_of_scope += 1,
+                        ErasureRewriteOutcome::NotSealed => pass.not_sealed += 1,
+                        ErasureRewriteOutcome::Held => {
+                            // ADR-0064 §6: a legal hold wins over erasure. The
+                            // request stays pending, query-time exclusion
+                            // keeps hiding the data, and the erasure clock is
+                            // explicitly paused.
+                            pass.deferred = true;
+                            tracing::info!(
+                                tenant = %tenant.to_hex(),
+                                signal = ?signal,
+                                shard,
+                                hour,
+                                "maintenance: erasure rewrite skipped a bucket under legal \
+                                 hold; the request stays pending until the hold clears"
+                            );
+                        }
                     }
-                    for drop in drops {
-                        pass.bucket_drops
-                            .entry(drop.request_id.clone())
-                            .or_default()
-                            .push(drop);
-                    }
-                    tracing::info!(
-                        tenant = %tenant.to_hex(),
-                        signal = ?signal,
-                        shard,
-                        hour,
-                        parts,
-                        publish = ?publish,
-                        "maintenance: erasure rewrite published for a bucket"
-                    );
-                }
-                Ok(ErasureRewriteOutcome::AlreadyApplied { request_ids }) => {
-                    pass.already_applied += 1;
-                    pass.drops_incomplete.extend(request_ids);
-                }
-                Ok(
-                    ErasureRewriteOutcome::NoApplicableRequests | ErasureRewriteOutcome::Tombstoned,
-                ) => pass.out_of_scope += 1,
-                Ok(ErasureRewriteOutcome::NotSealed) => pass.not_sealed += 1,
-                Ok(ErasureRewriteOutcome::Held) => {
-                    // ADR-0064 §6: a legal hold wins over erasure. The request
-                    // stays pending, query-time exclusion keeps hiding the
-                    // data, and the erasure clock is explicitly paused.
-                    pass.deferred = true;
-                    tracing::info!(
-                        tenant = %tenant.to_hex(),
-                        signal = ?signal,
-                        shard,
-                        hour,
-                        "maintenance: erasure rewrite skipped a bucket under legal hold; \
-                         the request stays pending until the hold clears"
-                    );
                 }
                 Err(err) => {
                     pass.deferred = true;
@@ -2197,6 +2249,10 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+    // `RetentionTombstone` is manually forged (never through
+    // `ravel-maintain::retention`, out of this task's scope) to encode its
+    // `.encode_to_vec()`.
+    use prost::Message as _;
 
     use ravel_ingest::{IdempotencyReceipt, marker_key, write_marker};
 
@@ -2968,18 +3024,23 @@ mod tests {
 
     /// Forge a `RewriteRecord` at `(Metrics, shard 0, hour 0)` that supersedes
     /// ONLY `superseded` (a single L0 identity) and names `request_id` in its
-    /// drops, with one non-empty output part overlapping the subject's event
-    /// time. This is a deliberately inconsistent bucket state -- a real rewrite
-    /// pass always supersedes the whole live input set -- constructed to expose
-    /// the F1 divergence: ravel-maintain's one-hop `resolve_live_record` picks
-    /// this record as the single live generation and reports the request
-    /// `AlreadyApplied`, while the catalog resolver excludes only the one named
-    /// L0 and keeps serving the subject out of any other live L0.
+    /// drops with `dropped_count`, its one output part's event-time bounds
+    /// pinned to `event_ts_ns`. This is a deliberately inconsistent bucket
+    /// state -- a real rewrite pass always supersedes the whole live input set
+    /// -- constructed to expose the F1 divergence: ravel-maintain's one-hop
+    /// `resolve_live_record` picks this record as the single live generation
+    /// and reports the request `AlreadyApplied`, while the catalog resolver
+    /// excludes only the one named L0 and keeps serving the subject out of any
+    /// other live L0. Callers that need the output bounds to fall outside a
+    /// windowed request's scope (Finding 1's window-shrink half) set
+    /// `event_ts_ns` accordingly.
     async fn forge_partial_rewrite(
         store: &dyn ObjectStoreBackend,
         tenant: &TenantHash,
         superseded: &ravel_proto::commit::v1::CompactionInputIdentity,
         request_id: Uuid,
+        event_ts_ns: i64,
+        dropped_count: u64,
     ) {
         let part = ravel_proto::commit::v1::CompactionPart {
             part_index: 0,
@@ -2990,8 +3051,8 @@ mod tests {
             sample_count: 1,
             series_count: 1,
             run_count: 1,
-            min_event_ts_ns: 1_000,
-            max_event_ts_ns: 1_000,
+            min_event_ts_ns: event_ts_ns,
+            max_event_ts_ns: event_ts_ns,
             segment_format_version: 3,
             declared_column_stats: Vec::new(),
         };
@@ -3010,7 +3071,7 @@ mod tests {
             parts: vec![part],
             drops: vec![ravel_proto::commit::v1::RewriteDrop {
                 request_id: request_id.to_string(),
-                dropped_count: 1,
+                dropped_count,
             }],
             created_unix_ns: 20,
             superseded_record_key: String::new(),
@@ -3025,6 +3086,43 @@ mod tests {
             )
             .await
             .expect("put forged rewrite");
+    }
+
+    /// Manually place a `RetentionTombstone` at `(Metrics, shard 0, hour)` --
+    /// the object `ravel_maintain::retention::retention_sweep_bucket` would
+    /// write once a bucket's retention window elapses. That real path is
+    /// unreachable for a bucket already rewritten for an erasure request:
+    /// retention's expiry check (`max_event_ts`) reads only `CommitRecord`
+    /// and `CompactionRecord`, never a `RewriteRecord`, so a rewrite-only
+    /// live bucket always evaluates `max_event_ts() == None` and never
+    /// expires. This bypasses that gap to construct the state directly
+    /// (`retention.rs` is out of this task's scope to change), the same way
+    /// `forge_partial_rewrite` above bypasses the real rewrite-publish path.
+    async fn write_retention_tombstone(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        hour: u32,
+        retired_at_ns: i64,
+    ) {
+        let tombstone = ravel_proto::commit::v1::RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: hour,
+            retired_at_ns,
+            retention_window_ns: 0,
+            record_count_observed: 1,
+        };
+        let key = keys::retention_tombstone_key_for(&tombstone).expect("tombstone key");
+        store
+            .put(
+                &key,
+                tombstone.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put forged tombstone");
     }
 
     /// ADR-0064 §4 (2026-08-08 F1 correction): a `.done` is written ONLY when
@@ -3061,7 +3159,7 @@ mod tests {
         let request_id = Uuid::from_u128(0xF10);
         // A rewrite that supersedes only l0_one and names the request. l0_two
         // stays live and keeps serving the subject.
-        forge_partial_rewrite(&store, &tenant, &l0_one, request_id).await;
+        forge_partial_rewrite(&store, &tenant, &l0_one, request_id, 1_000, 1).await;
 
         let dreq_key = submit_erasure_request(
             &store,
@@ -3188,9 +3286,298 @@ mod tests {
         );
     }
 
+    /// Finding 1 (window-shrink half): a bucket whose live `RewriteRecord`
+    /// already names a windowed request from an earlier generation, but whose
+    /// current output event-time bounds no longer overlap that request's
+    /// window, must still hold the request incomplete -- `erasure_rewrite_bucket`
+    /// reports `NoApplicableRequests` for it (the window prefilter excludes
+    /// it from `pending` before any drop is even considered), which by itself
+    /// names nothing for `drops_incomplete`.
+    ///
+    /// Bucket X (hour 0): forge a rewrite that already dropped the subject for
+    /// the request in an earlier generation, with its live output bounds
+    /// (`5_000`) outside the request's `[0, 2_000)` window. Bucket Y (hour 1):
+    /// a fresh sealed bucket the window does cover, which this pass genuinely
+    /// rewrites. Only Y's rewrite is real this pass, but X's live record still
+    /// durably names the request, so the completion must carry no bucket list
+    /// at all -- not Y's real drop alone.
+    ///
+    /// The flip that proves this test bites: in `erasure_rewrite_pass`, union
+    /// `drops_incomplete` only from the `AlreadyApplied` outcome arm (drop the
+    /// unconditional `bucket_already_applied_request_ids` pre-check) and the
+    /// assertion below fails with Y's one real drop present instead of an
+    /// empty list.
+    #[tokio::test]
+    async fn a_bucket_outside_a_windowed_requests_shrunk_scope_still_marks_it_incomplete() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let l0_x = publish_subject_l0(&store, &tenant_id, 1).await;
+        let request_id = Uuid::from_u128(0x1201);
+        forge_partial_rewrite(&store, &tenant, &l0_x, request_id, 5_000, 1).await;
+
+        publish_erasable_bucket_at(&store, &tenant_id, 1, 3).await;
+
+        let dreq_key = submit_windowed_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+            0,
+            2_000,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        let got = store
+            .get(&done_key, GetRange::Full)
+            .await
+            .expect("Y was genuinely rewritten this pass, so the pass completes and writes .done");
+        let completion =
+            ravel_commit::erasure::decode_completion(&got.data).expect("decode completion");
+        assert_eq!(
+            completion.bucket_drops,
+            Vec::new(),
+            "X's live record still names the request from an earlier generation this pass's \
+             window filter never re-examines, so the request must stay incomplete with no \
+             bucket list -- not Y's real drop alone"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "an incomplete request's .dreq must survive"
+        );
+    }
+
+    /// Finding 1 (tombstone half): a bucket tombstoned after an earlier
+    /// generation applied a request still names that request in its live
+    /// `RewriteRecord`'s drops, even though the pass now reports it
+    /// `Tombstoned` (out of scope), not `AlreadyApplied`. That request's
+    /// `.done` must carry no bucket list at all -- not a second, genuinely
+    /// rewritten bucket's real drop alone. (A single tombstoned bucket in
+    /// scope is not itself a differentiating repro: with nothing else to
+    /// rewrite, `bucket_drops` has no entry for the request either way,
+    /// pre-fix or post-fix, and the empty list would pass by coincidence
+    /// rather than because the fix marked it incomplete.)
+    ///
+    /// Bucket X (hour 0) is forged with a live rewrite naming the request,
+    /// then tombstoned directly (see [`write_retention_tombstone`] for why
+    /// the real retention path cannot reach this state). Bucket Y (hour 1)
+    /// is a fresh sealed bucket the same request genuinely rewrites this
+    /// pass.
+    ///
+    /// The flip that proves this test bites: in `erasure_rewrite_pass`, union
+    /// `drops_incomplete` only from the `AlreadyApplied` outcome arm and the
+    /// assertion below fails with Y's one real drop present instead of an
+    /// empty list.
+    #[tokio::test]
+    async fn a_tombstoned_bucket_whose_live_record_names_the_request_keeps_it_incomplete() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let l0 = publish_subject_l0(&store, &tenant_id, 1).await;
+        let request_id = Uuid::from_u128(0x1401);
+        forge_partial_rewrite(&store, &tenant, &l0, request_id, 1_000, 1).await;
+        write_retention_tombstone(&store, &tenant, 0, TEST_ERASURE_NOW_NS).await;
+
+        publish_erasable_bucket_at(&store, &tenant_id, 1, 4).await;
+
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        let got = store
+            .get(&done_key, GetRange::Full)
+            .await
+            .expect("Y was genuinely rewritten this pass, so the pass completes and writes .done");
+        let completion =
+            ravel_commit::erasure::decode_completion(&got.data).expect("decode completion");
+        assert_eq!(
+            completion.bucket_drops,
+            Vec::new(),
+            "X's tombstoned live record still names the request from an earlier generation this \
+             pass never re-verifies, so the request must stay incomplete with no bucket list -- \
+             not Y's real drop alone"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "an incomplete request's .dreq must survive"
+        );
+    }
+
+    /// Finding 2: a bucket whose live record already applied one request
+    /// rewrites again for a newly-submitted second request that also
+    /// overlaps it. The new generation's own drops carry `dropped_count: 0`
+    /// for the first request (nothing new to drop -- an earlier generation
+    /// already erased it), which is not that request's real earlier-generation
+    /// count. Its `.done` must carry no bucket list at all, not the bucket's
+    /// wrongly-restated zero.
+    ///
+    /// Stage generation 1 directly through the private `erasure_rewrite_pass`
+    /// (which never writes `.done`) so R1's `.dreq` survives to be reused by
+    /// generation 2, then submit R2 against the same bucket's surviving
+    /// bystander subject and drive the real `run_erasure_pass`.
+    ///
+    /// The flip that proves this test bites: in `run_erasure_pass`, always use
+    /// `pass.bucket_drops.get(request_id)` regardless of `drops_incomplete`,
+    /// and R1's `.done` records the bucket with `dropped_count: 0` instead of
+    /// an absent list.
+    #[tokio::test]
+    async fn a_bucket_rewritten_again_for_a_new_request_does_not_restate_an_earlier_generations_count()
+     {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // One bucket holding two erasable subjects: 3 samples of the first,
+        // 1 of the second (the usual bystander, targeted here by R2).
+        publish_erasable_bucket_at(&store, &tenant_id, 0, 3).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        let r1 = Uuid::from_u128(0x1301);
+        submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            r1,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+
+        // Stage generation 1 directly: erasure_rewrite_pass rewrites the
+        // bucket for R1 (3 real drops) but writes no completion.
+        let pending_gen1 = pending_erasure_requests(&store, &tenant, Signal::Metrics)
+            .await
+            .expect("list pending");
+        erasure_rewrite_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &pending_gen1,
+            &mut memo,
+        )
+        .await;
+
+        let r2 = Uuid::from_u128(0x1302);
+        submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            r2,
+            TEST_SURVIVING_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        let metrics_proto = ravel_commit::signal::to_proto(Signal::Metrics) as i32;
+
+        let r1_done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, r1).expect("done key");
+        let got1 = store
+            .get(&r1_done_key, GetRange::Full)
+            .await
+            .expect("R1's .done is written once the pass observes it applied");
+        let r1_completion =
+            ravel_commit::erasure::decode_completion(&got1.data).expect("decode completion");
+        assert_eq!(
+            r1_completion.bucket_drops,
+            Vec::new(),
+            "generation 2's own drops record 0 for R1 in this bucket (nothing new to drop), \
+             which is not R1's real generation-1 count (3) -- the completion must carry no \
+             bucket list rather than restate that wrong zero"
+        );
+
+        let r2_done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, r2).expect("done key");
+        let got2 = store
+            .get(&r2_done_key, GetRange::Full)
+            .await
+            .expect("R2 is fully applied this pass");
+        let r2_completion =
+            ravel_commit::erasure::decode_completion(&got2.data).expect("decode completion");
+        assert_eq!(
+            r2_completion.bucket_drops,
+            vec![ErasureBucketDrop {
+                signal: metrics_proto,
+                shard: 0,
+                ingest_hour_bucket: 0,
+                dropped_count: 1,
+            }],
+            "R2's own generation-2 count for this bucket must be recorded exactly"
+        );
+    }
+
     /// Submit one erasure request exactly as `ravel-cli erase submit` does: a
     /// validated `ErasureRequest` written `CreateIfAbsent` to its `.dreq` key.
-    /// Returns the key.
+    /// Returns the key. Windowless (`window_start_ns`/`window_end_ns` both 0);
+    /// see [`submit_windowed_erasure_request`] for a bounded window.
     async fn submit_erasure_request(
         store: &dyn ObjectStoreBackend,
         tenant: &TenantHash,
@@ -3198,6 +3585,26 @@ mod tests {
         request_id: Uuid,
         subject: &str,
         now_ns: i64,
+    ) -> String {
+        submit_windowed_erasure_request(store, tenant, signal, request_id, subject, now_ns, 0, 0)
+            .await
+    }
+
+    /// [`submit_erasure_request`], with an explicit `[window_start_ns,
+    /// window_end_ns)` -- the half-open event-time window
+    /// [`ravel_maintain::erasure_rewrite::bucket_may_overlap`] filters buckets
+    /// against (a zero bound on either side means "no bound" on that side, so
+    /// this is a strict superset of the windowless helper's behavior).
+    #[allow(clippy::too_many_arguments)]
+    async fn submit_windowed_erasure_request(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        request_id: Uuid,
+        subject: &str,
+        now_ns: i64,
+        window_start_ns: i64,
+        window_end_ns: i64,
     ) -> String {
         let request = ErasureRequest {
             format_version: ravel_commit::erasure::FORMAT_VERSION,
@@ -3209,8 +3616,8 @@ mod tests {
                 key: TEST_SUBJECT_LABEL.to_string(),
                 value: subject.to_string(),
             }],
-            window_start_ns: 0,
-            window_end_ns: 0,
+            window_start_ns,
+            window_end_ns,
             reason: "dsar".to_string(),
         };
         ravel_commit::erasure::validate_request(&request).expect("valid request");

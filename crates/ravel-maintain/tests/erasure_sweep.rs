@@ -432,7 +432,7 @@ async fn seed_dreq_done(
             signal: signal::to_proto(Signal::Metrics) as i32,
             request_id: request_id.to_string(),
             predicate_hash: vec![0x11; 32],
-            bucket_drops: vec![],
+            bucket_drops: Vec::new(),
             requested_unix_ns: 0,
             completed_unix_ns,
             deferral_cause: 0,

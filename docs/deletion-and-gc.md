@@ -423,12 +423,21 @@ every bound is measured.
   rewrite it applied for this request, in bucket order, each naming the
   bucket's signal, shard, and ingest hour with the exact number of samples the
   rewrite dropped there; a bucket it rewrote and dropped nothing in appears
-  with a count of zero, and a bucket it skipped does not appear. That list is
-  either complete or absent: when the pass cannot state the whole set, because
-  some bucket in the request's scope was already rewritten by an earlier pass
-  and this one has no count for it, it writes no bucket entries at all rather
-  than a partial list. A permanent audit record makes no partial claim, and
-  the sweep rule below reads the difference.
+  with a count of zero, and a bucket it skipped does not appear. A sample
+  whose value matches more than one request applicable to the same rewrite is
+  attributed once, to whichever of those requests sorts lowest by request id
+  (first-match-wins over the pass's fixed request order), never counted
+  against more than one; a bucket entry's count is exactly what the rewrite
+  dropped there for that one request, and every applicable request's counts
+  in a bucket sum to exactly the samples that bucket's rewrite removed, with
+  no double-count. That list is either complete or absent: when the pass
+  cannot state the whole set for a request, because some bucket in the
+  request's scope was already rewritten (or tombstoned) by an earlier
+  generation and this pass has no fresh count for what that generation
+  applied there, it writes no bucket entries at all for that request rather
+  than a partial list, however many other buckets this same pass genuinely
+  rewrote for it. A permanent audit record makes no partial claim, and the
+  sweep rule below reads the difference.
 
 - **The hold is read off the superseded-input sweep, not rediscovered.** That
   sweep runs first in the same pass and already knows, per chain group, which

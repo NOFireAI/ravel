@@ -635,6 +635,22 @@ fn live_rewrite_applied_request_ids(live: &LiveInputs) -> Option<HashSet<String>
     }
 }
 
+/// [`live_rewrite_applied_request_ids`], from the cheaper [`LiveRecord`] a
+/// bucket resolves before [`resolve_live_inputs`]'s additional per-input GET.
+/// The tombstoned path in [`erasure_rewrite_bucket`] needs exactly this and
+/// nothing more: a tombstoned bucket contributes no live input catalog, but
+/// its live compaction/rewrite record (if any) is still listed and readable,
+/// and still durably names whichever requests an earlier generation applied.
+fn live_record_applied_request_ids(live: &LiveRecord) -> Option<HashSet<String>> {
+    match live {
+        LiveRecord::Existing {
+            body: LiveRecordBody::Rewrite(r),
+            ..
+        } => Some(r.drops.iter().map(|d| d.request_id.clone()).collect()),
+        _ => None,
+    }
+}
+
 /// Resolve `live` down to both the [`InputCatalog`]s [`build_rewrite`]
 /// decodes and the [`RewriteSupersession`] target the eventual
 /// `RewriteRecord` names: the raw L0 inputs' own catalogs plus their
@@ -1684,6 +1700,13 @@ async fn resolve_already_exists_rewrite(
 /// into the right record. The count is the row (metrics samples), log record,
 /// or span count that rewrite physically removed for that request in that
 /// bucket, and is zero for an applicable request the bucket held nothing for.
+///
+/// Attribution is first-match-wins ([`first_dropping_request`]): a sample
+/// whose value matches more than one applicable request's predicate is
+/// counted once, against whichever of those requests sorts lowest by request
+/// id (the fixed order `pending_erasure_requests` already establishes), never
+/// against more than one. The per-request counts in a bucket therefore sum to
+/// exactly the samples that bucket's rewrite dropped, with no double-count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppliedBucketDrop {
     pub request_id: String,
@@ -1820,6 +1843,15 @@ fn invalidate_after_publish(memo: &mut MaintainMemo, bucket: &Bucket, publish: &
 /// for any other signal: this dispatch scopes erasure
 /// rewrite to metrics/logs/spans only, and profiles/alerts/audit have no
 /// driver here to dispatch to.
+///
+/// Sibling of [`bucket_already_applied_request_ids`]: that function answers
+/// "what did an earlier generation already apply here" from the bucket's
+/// live record alone, cheaply and without a rewrite attempt, so a caller can
+/// capture it before this function runs. This function then performs the
+/// rewrite attempt itself and returns only the outcome; it does not restate
+/// the already-applied set; a caller collecting completion evidence across a
+/// scan gets that from [`bucket_already_applied_request_ids`], called once
+/// per bucket before this one.
 pub async fn erasure_rewrite_bucket(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -1851,6 +1883,7 @@ pub async fn erasure_rewrite_bucket(
     // GET, unlike the old purely key-derived prefilter this replaced.
     let live = resolve_live_inputs(store, bucket, &listing, config.input_read_concurrency).await?;
     let (min_event_ts_ns, max_event_ts_ns) = live_input_event_bounds(&live);
+    let already_applied = live_rewrite_applied_request_ids(&live).unwrap_or_default();
     let overlapping: Vec<&PendingErasureRequest> = pending
         .iter()
         .filter(|p| bucket_may_overlap(min_event_ts_ns, max_event_ts_ns, &p.request))
@@ -1871,10 +1904,9 @@ pub async fn erasure_rewrite_bucket(
     // rewrite whose `drops` name every overlapping request, including the
     // already-applied ones with dropped_count 0, so the sibling-case
     // completion condition (ADR-0064 §4) stays satisfiable.
-    if let Some(applied) = live_rewrite_applied_request_ids(&live)
-        && overlapping
-            .iter()
-            .all(|p| applied.contains(&p.request.request_id))
+    if overlapping
+        .iter()
+        .all(|p| already_applied.contains(&p.request.request_id))
     {
         return Ok(ErasureRewriteOutcome::AlreadyApplied {
             request_ids: overlapping
@@ -2022,6 +2054,39 @@ pub async fn erasure_rewrite_bucket(
         publish,
         drops,
     })
+}
+
+/// Every `request_id` this bucket's live record already names as applied,
+/// read fresh and independently of any rewrite attempt. A caller collecting
+/// completion evidence across a scan calls this once per bucket BEFORE
+/// [`erasure_rewrite_bucket`] runs on the same bucket, and unions the result
+/// into its incomplete-request tracking regardless of what
+/// [`erasure_rewrite_bucket`] then returns -- `Rewritten`, `AlreadyApplied`,
+/// `NoApplicableRequests`, and `Tombstoned` alike. A request this bucket
+/// already applied in an earlier generation can surface here even when this
+/// pass no longer treats the bucket as in-scope for it (a windowed request
+/// whose surviving inputs shrank out of its own window, or a bucket since
+/// tombstoned), and calling this before the rewrite attempt is what keeps it
+/// from picking up that attempt's own fresh generation instead of the prior
+/// one. Only a request that no visited bucket names here has a bucket list
+/// the pass can state as complete for it.
+///
+/// A tombstoned bucket's `commit_keys` and any compaction/rewrite record are
+/// still listed (the tombstone is a separate object), so an earlier
+/// generation's applied-request set is still readable even though the
+/// bucket contributes nothing further to a rewrite attempt.
+pub async fn bucket_already_applied_request_ids(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+) -> Result<HashSet<String>> {
+    let listing = crate::read::list_bucket(store, bucket).await?;
+    if listing.tombstone_key.is_some() {
+        let live_record = resolve_live_record(store, bucket, &listing).await?;
+        return Ok(live_record_applied_request_ids(&live_record).unwrap_or_default());
+    }
+    let live = resolve_live_inputs(store, bucket, &listing, config.input_read_concurrency).await?;
+    Ok(live_rewrite_applied_request_ids(&live).unwrap_or_default())
 }
 
 /// The catalog-resolver completion verdict for one bucket (ADR-0064 §4 F1).
