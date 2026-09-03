@@ -13,11 +13,18 @@ three kinds today, and a query selects one with `attrs['kind']`.
 ### `kind = query`
 
 One record for every SQL statement Ravel executes, written after the statement
-runs. Both transports write it: `POST /api/v1/sql` writes one per request, and
-Flight SQL writes one per executed statement. The record is written by the
-server from the execution path itself, never derived from the request body or
-the ticket a client sent, so a tenant can neither forge one nor suppress one for
-a statement it ran.
+runs. Both transports submit it: `POST /api/v1/sql` submits one per request, and
+Flight SQL one per executed statement. The record comes from the server's own
+execution path, never from the request body or the ticket a client sent, so a
+tenant can neither forge one nor suppress one for a statement it ran.
+
+**These records are not written on a stock build.** Both transports submit
+their event through a sink that startup fills with a no-op, and no shipped
+path constructs the real pipeline, so `attrs['kind'] = 'query'` selects
+nothing until a deployment attaches one. The handler behavior and the record
+shape below are in place; only the install is missing. The two kinds that
+follow are written directly by the maintenance process and are present on any
+deployment that has taken those actions.
 
 Attributes:
 
@@ -134,6 +141,10 @@ not bound the read.
 
 ### Worked queries
 
+The first two read `kind = query` records, which a stock build does not write;
+they return rows once a deployment attaches the pipeline. The legal-hold query
+below reads records the maintenance process writes directly and works today.
+
 Every statement your tenant ran in one hour, newest first:
 
 ```sql
@@ -191,11 +202,13 @@ ORDER BY ts_ns;
 
 ## Reading the audit trail is audited
 
-A query over `audit` is a SQL statement, so it writes one more query-audit
-record, exactly as any other statement does. The trail therefore records its own
-readers: the statement you just ran appears in the next `audit` query you run.
-An investigation that reads the trail repeatedly adds one record per read, which
-is the intended behavior and not something to work around.
+A query over `audit` is a SQL statement, so it submits one more query-audit
+record, exactly as any other statement does. On a deployment that has attached
+the pipeline the trail therefore records its own readers: the statement you
+just ran appears in the next `audit` query you run, and an investigation that
+reads the trail repeatedly adds one record per read. That is the intended
+behavior and not something to work around. Until the pipeline is attached
+nothing is written, so no record of the readers exists either.
 
 ## Tenancy
 
