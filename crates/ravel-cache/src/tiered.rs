@@ -409,6 +409,35 @@ where
         self.disk.insert(key, &value);
     }
 
+    /// Current number of resident entries in the **RAM tier**.
+    ///
+    /// Live, not cumulative: this is [`Cache::len`], which tracks the S3-FIFO
+    /// queues' actual occupancy and falls when an entry is evicted. It answers
+    /// "how many entries does this tier hold right now," a question
+    /// [`ram_metrics`](Self::ram_metrics)'s counters cannot answer -- they only
+    /// ever grow, so nothing nets an eviction against an earlier admission.
+    pub fn ram_len(&self) -> usize {
+        self.ram.len()
+    }
+
+    /// Current total payload bytes resident in the **RAM tier**, by the same
+    /// live-vs-cumulative distinction [`ram_len`](Self::ram_len) documents.
+    pub fn ram_total_bytes(&self) -> u64 {
+        self.ram.total_bytes()
+    }
+
+    /// Current number of resident entries in the **disk tier**, live rather
+    /// than cumulative -- see [`ram_len`](Self::ram_len).
+    pub fn disk_len(&self) -> usize {
+        self.disk.len()
+    }
+
+    /// Current total payload bytes resident in the **disk tier**, live rather
+    /// than cumulative -- see [`ram_len`](Self::ram_len).
+    pub fn disk_total_bytes(&self) -> u64 {
+        self.disk.total_bytes()
+    }
+
     /// Whether the **RAM tier** holds no resident entry.
     ///
     /// "Empty" is defined as the RAM tier alone, not both tiers, because every
@@ -1157,5 +1186,66 @@ mod tests {
             served, ram_corrupted,
             "a disk-served hit must be corrupted exactly like a RAM hit"
         );
+    }
+
+    /// Live residency accounting for [`TieredCache::ram_len`],
+    /// [`TieredCache::ram_total_bytes`], [`TieredCache::disk_len`], and
+    /// [`TieredCache::disk_total_bytes`] (#1170): each answers "how many
+    /// bytes/entries are resident right now," which a cumulative
+    /// [`CacheMetrics`] counter (`bytes_admitted`, `evictions`) cannot --
+    /// those only ever grow, with no per-eviction byte accounting to net
+    /// against admissions. This test insists on exact counts and bytes at
+    /// every step, never `> 0`: four sequential inserts with no `get` in
+    /// between all land in the small (probation) queue with `freq == 0`, so
+    /// eviction is deterministic FIFO (oldest-admitted first) once the byte
+    /// bound is exceeded.
+    ///
+    /// FLIP (magnitude, non-vacuity): in `TieredCache::ram_total_bytes`,
+    /// change `self.ram.total_bytes()` to `self.ram.total_bytes() / 2`. The
+    /// `assert_eq!(tiered.ram_total_bytes(), 300)` below then reads 150 and
+    /// fails.
+    #[tokio::test]
+    async fn tiered_cache_residency_tracks_exact_bytes_and_entries_across_eviction() {
+        let tmp = TempDir::new().unwrap();
+        let limits = CacheLimits::new(300, 10_000, 1_000);
+        let disk = DiskCache::new(tmp.path().to_path_buf(), limits);
+        let ram: Cache<&'static str> = Cache::new(limits);
+        let tiered = TieredCache::new(ram, disk);
+
+        let payload = |n: u8| Bytes::from(vec![n; 100]);
+
+        tiered.insert(test_key(1, 100), payload(1));
+        tiered.insert(test_key(2, 100), payload(2));
+        tiered.insert(test_key(3, 100), payload(3));
+
+        assert_eq!(
+            tiered.ram_len(),
+            3,
+            "three 100-byte entries, no eviction yet"
+        );
+        assert_eq!(tiered.ram_total_bytes(), 300);
+        assert_eq!(tiered.disk_len(), 3);
+        assert_eq!(tiered.disk_total_bytes(), 300);
+
+        // A fourth 100-byte entry pushes total resident bytes to 400, over
+        // the 300-byte limit: the oldest entry (key 1) is evicted from both
+        // tiers' independent S3-FIFO instances, deterministically, since
+        // none of the four keys was ever `get`-touched (freq stays 0, so
+        // eviction is FIFO from the front of the small queue).
+        tiered.insert(test_key(4, 100), payload(4));
+
+        assert_eq!(
+            tiered.ram_len(),
+            3,
+            "the byte bound evicted exactly one entry to make room"
+        );
+        assert_eq!(
+            tiered.ram_total_bytes(),
+            300,
+            "resident bytes fall by exactly the evicted entry's size (100), \
+             not merely 'less than before'"
+        );
+        assert_eq!(tiered.disk_len(), 3);
+        assert_eq!(tiered.disk_total_bytes(), 300);
     }
 }
