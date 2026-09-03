@@ -79,10 +79,10 @@ pub use config::{
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{
-    ApplicableRequest, BucketErasureCompletion, ErasureMatcher, ErasureRewriteOutcome,
-    PendingErasureRequest, RewriteBuild, RewriteSupersession, bucket_erasure_completion,
-    bucket_may_overlap, build_rewrite, erasure_rewrite_bucket, pending_erasure_requests,
-    publish_rewrite_record,
+    ApplicableRequest, AppliedBucketDrop, BucketErasureCompletion, ErasureMatcher,
+    ErasureRewriteOutcome, PendingErasureRequest, RewriteBuild, RewriteSupersession,
+    bucket_erasure_completion, bucket_may_overlap, build_rewrite, erasure_rewrite_bucket,
+    pending_erasure_requests, publish_rewrite_record,
 };
 pub use error::{MaintainError, MergeCursorBudgetSite, Result};
 pub use gc_config::{
