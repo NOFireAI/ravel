@@ -12,10 +12,12 @@ mutate nothing.
 The mutant is the committed negative control `BrokenDivergePublish`, gated off
 by `DivergeOverwritesRecord = FALSE` in every shipping cfg and flipped on only
 by the negative cfg. It self-reports `outcome |-> "InputSetHashDivergence"`
-yet performs the `PutOverwrite`, and it sets `recOverwritten` from the store
-post-state, not from intent. `DivergentInputSetNeverMutates` reads that
-store-derived witness, so it catches the mutation regardless of the action's
-own outcome label.
+yet performs the `PutOverwrite` with the same content bytes, which mints a fresh
+store version, and it leaves the latch `recVer` unchanged.
+`DivergentInputSetNeverMutates` reads the store directly: the record's minted
+version is latched into `recVer[u]` at publish, and the invariant holds
+`VersionOf(RecordKey(u))` equal to that latch, so the fresh version the
+overwrite mints is caught regardless of the action's own outcome label.
 
 Run: `negative/diverge-overwrites-record.cfg` (module `MCCompactionClaims`,
 `DivergeOverwritesRecord = TRUE`).
@@ -24,13 +26,12 @@ Run: `negative/diverge-overwrites-record.cfg` (module `MCCompactionClaims`,
 Error: Invariant DivergentInputSetNeverMutates is violated.
 State 4: <BrokenDivergePublish ... of module MCCompactionClaims>
 /\ lastPub = [ outcome |-> "InputSetHashDivergence",
-  winnerPartPresent |-> TRUE,
-  recOverwritten |-> TRUE ]
+  winnerPartPresent |-> TRUE ]
 ```
 
-The violating state has `outcome |-> "InputSetHashDivergence"` and
-`recOverwritten |-> TRUE`: the store's version advanced across the divergent
-publish. An invariant that trusted the outcome label alone would pass. The
-store-derived `recOverwritten` witness makes the overwrite observable, which
-is the F6 fix. TLC exits 12, matching
-`negative/diverge-overwrites-record.expect`.
+The violating state self-reports `outcome |-> "InputSetHashDivergence"` while
+the store's version for the record key has advanced past the latched `recVer`:
+the identical-content `PutOverwrite` minted a new version. An invariant that
+trusted the outcome label alone, or that compared content bytes, would pass. The
+store-version latch makes the overwrite observable, which is the F6 fix. TLC
+exits 12, matching `negative/diverge-overwrites-record.expect`.

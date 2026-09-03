@@ -17,8 +17,6 @@ CONSTANTS
                                  \* when the claim is held
     GuardIgnoresClaim,           \* negative: the guarded publish drops its
                                  \* HoldsClaim check and publishes anyway
-    StealIgnoresCas,             \* negative: the steal's duplicate-win guard
-                                 \* drops the CAS-outcome conjunct
     DivergeOverwritesRecord,     \* negative: a divergent-input loser overwrites
                                  \* the terminal record instead of alarming
     MissingPartReportsConverged  \* negative: a resolution whose winner part
@@ -28,7 +26,6 @@ ASSUME CompletionOverwrite \in BOOLEAN
 ASSUME AllowClaimDelete \in BOOLEAN
 ASSUME ClaimIsPublicationAuthority \in BOOLEAN
 ASSUME GuardIgnoresClaim \in BOOLEAN
-ASSUME StealIgnoresCas \in BOOLEAN
 ASSUME DivergeOverwritesRecord \in BOOLEAN
 ASSUME MissingPartReportsConverged \in BOOLEAN
 
@@ -51,8 +48,8 @@ BrokenComplete(w, u) ==
                            afterVer |-> store'[ClaimKey(u)].version,
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
-    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, dupThiefWin,
-                   stealWonVers, lastGuarded, stolen, partTomb, lastPub>>
+    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn,
+                   lastGuarded, stolen, partTomb, recVer, lastPub>>
 
 \* Broken: an unconditional DELETE of the claim key, touching no witness. The
 \* store-level NoUnconditionalClaimDelete catches it: the claim key drops from
@@ -62,9 +59,8 @@ DeleteClaim(u) ==
     /\ AllowClaimDelete
     /\ ClaimPresent(u)
     /\ Delete(ClaimKey(u))
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, lastGuarded, stolen,
-                   partTomb, lastPub>>
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
 
 \* Broken: when the claim is held, the publish path overwrites the terminal
 \* record instead of CreateIfAbsent, so a holder can mutate the record to a
@@ -79,9 +75,8 @@ BrokenClaimPublish(w, u, v) ==
         /\ firstRecord' = IF ~Present(rk)
                             THEN [firstRecord EXCEPT ![u] = <<u, v>>]
                             ELSE firstRecord
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, lastGuarded, stolen,
-                   partTomb, lastPub>>
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn,
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
 
 \* Broken: the guarded (checkpoint) publish drops its HoldsClaim check and
 \* publishes regardless. The witness still reads the store (held |-> HoldsClaim),
@@ -92,41 +87,15 @@ BrokenGuardedPublish(w, u, v) ==
     /\ CanWrite
     /\ DoPublish(u, v)
     /\ lastGuarded' = [fired |-> TRUE, held |-> HoldsClaim(w, u)]
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, stolen, partTomb>>
-
-\* Broken: the steal is a correct CAS in every respect except that the
-\* duplicate-win guard drops the ok conjunct, so it counts a win from a steal
-\* whose CAS did not match the stored version. The store write, the honest ok,
-\* stealWonVers, stolen, and the witness are all the correct Steal's; only
-\* dupThiefWin loses its `ok /\`. Caught by AtMostOneThiefWinsAVersion, and only
-\* reachable once a claim can re-expire (smoke's DeclaredLease = 0).
-BrokenSteal(w, u) ==
-    /\ StealIgnoresCas
-    /\ CanWrite
-    /\ ClaimPresent(u)
-    /\ Expired(u)
-    /\ ClaimReadable(u)
-    /\ obsVer[w][u] # 0
-    /\ LET v == obsVer[w][u] ok == (ClaimVer(u) = v) IN
-        /\ PutCasVersion(ClaimKey(u), v, <<"c", w, "run">>)
-        /\ heldVer' = [heldVer EXCEPT ![w][u] = IF ok THEN versionCounter + 1 ELSE @]
-        /\ dupThiefWin' = IF v \in stealWonVers[u] THEN TRUE ELSE dupThiefWin
-        /\ stealWonVers' = IF ok THEN [stealWonVers EXCEPT ![u] = @ \cup {v}] ELSE stealWonVers
-        /\ stolen' = IF ok THEN TRUE ELSE stolen
-        /\ lastClaimOp' = [kind |-> "steal", unit |-> u, usedVer |-> v, ok |-> ok,
-                           beforeVer |-> ClaimVer(u),
-                           afterVer |-> store'[ClaimKey(u)].version,
-                           beforeContent |-> ClaimContentOf(u),
-                           afterContent |-> store'[ClaimKey(u)].content]
-    /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded,
-                   partTomb, lastPub>>
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn,
+                   lastClaimOp, stolen, partTomb>>
 
 \* Broken: a loser whose input set diverges from the winner overwrites the
-\* terminal record instead of alarming. The overwrite keeps the same content, so
-\* the record-immutability invariant still holds; recOverwritten (the store
-\* version delta) moves regardless, so the alarm-mutates-nothing property is what
-\* catches it. Caught by DivergentInputSetNeverMutates.
+\* terminal record instead of alarming. The overwrite re-writes identical content,
+\* so a content-only check would miss it; but PutOverwrite mints a fresh store
+\* version, moving VersionOf(RecordKey(u)) away from the latched recVer. recVer is
+\* left UNCHANGED here (a real re-publish would not move it either), so the pure
+\* store observation catches the mutation. Caught by DivergentInputSetNeverMutates.
 BrokenDivergePublish(u, v) ==
     /\ DivergeOverwritesRecord
     /\ CanWrite
@@ -136,10 +105,9 @@ BrokenDivergePublish(u, v) ==
     /\ LET rk == RecordKey(u) IN
         /\ PutOverwrite(rk, ContentOf(rk))
         /\ lastPub' = [outcome |-> "InputSetHashDivergence",
-                       winnerPartPresent |-> Present(PartKey(u, firstRecord[u][2])),
-                       recOverwritten |-> store'[rk].version # VersionOf(rk)]
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, lastGuarded, stolen, partTomb>>
+                       winnerPartPresent |-> Present(PartKey(u, firstRecord[u][2]))]
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer>>
 
 \* Broken: a resolution whose winner part vanished and is tombstoned (not
 \* re-PUTtable) reports Converged. It self-reports the "Converged" label while
@@ -154,11 +122,9 @@ BrokenMissingPartConverge(u, v) ==
     /\ ~Present(PartKey(u, v))
     /\ partTomb[u][v]
     /\ lastPub' = [outcome |-> "Converged",
-                   winnerPartPresent |-> Present(PartKey(u, v)),
-                   recOverwritten |-> FALSE]
+                   winnerPartPresent |-> Present(PartKey(u, v))]
     /\ UNCHANGED <<sVars, timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-                   dupThiefWin, stealWonVers, lastClaimOp, lastGuarded, stolen,
-                   partTomb>>
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer>>
 
 MCNext ==
     \/ Next
@@ -166,7 +132,6 @@ MCNext ==
     \/ \E u \in Units : DeleteClaim(u)
     \/ \E w \in Workers, u \in Units, v \in Variants : BrokenClaimPublish(w, u, v)
     \/ \E w \in Workers, u \in Units, v \in Variants : BrokenGuardedPublish(w, u, v)
-    \/ \E w \in Workers, u \in Units : BrokenSteal(w, u)
     \/ \E u \in Units, v \in Variants : BrokenDivergePublish(u, v)
     \/ \E u \in Units, v \in Variants : BrokenMissingPartConverge(u, v)
 

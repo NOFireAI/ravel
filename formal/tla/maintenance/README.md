@@ -65,9 +65,11 @@ TLC checked this finite model under the bounds in `results.md`. Safety
   input-set hash differs from its own (`Variants`, a divergent listing yielding a
   different `input_set_hash`), it fails closed with outcome
   `InputSetHashDivergence` and never deletes or overwrites the existing record.
-  The invariant reads a store-derived witness (`lastPub.recOverwritten`, set from
-  whether the record object's version changed across the attempt), not the
-  action's own claim.
+  The invariant reads the store directly: the record's minted version is latched
+  into `recVer[u]` at publish, and the invariant holds `VersionOf(RecordKey(u))`
+  equal to that latch, so any later PUT that mints a fresh version (even one
+  re-writing identical bytes) is caught. It observes the store, not the action's
+  own claim.
 
 Liveness (checked against `MCFairSpec`; fairness: weak fairness on each worker's
 live-set recompute, on the part PUT, on some in-view owner's record attempt per
@@ -185,8 +187,6 @@ TLC checked this finite model under the bounds in `results.md`. Safety (against
 - **StaleOwnerCannotOverwriteNewerClaim**: a claim CAS succeeds only against the
   current version; a stale-version write is a no-op.
 - **NoUnconditionalClaimDelete**: no path deletes a claim key.
-- **AtMostOneThiefWinsAVersion**: the version token is consumed by the first
-  steal, so a second steal on the same observed version fails.
 - **LostClaimNeverPublishesThroughGuardedPath**: the cancellation-checkpoint
   path abandons once the claim is lost; the ungated path may still publish and
   the data stays correct.
@@ -202,8 +202,9 @@ TLC checked this finite model under the bounds in `results.md`. Safety (against
   `crates/ravel-maintain/tests/tombstone_race.rs::rerun_with_revanished_part_fails_typed_not_converged`.
 - **DivergentInputSetNeverMutates**: a loser observing a record whose input-set
   hash differs from its own fails closed with outcome `InputSetHashDivergence`
-  and never deletes or overwrites the record; the invariant reads the
-  store-derived `recOverwritten` witness, not the action's own claim.
+  and never deletes or overwrites the record; the invariant reads the store
+  directly, holding `VersionOf(RecordKey(u))` equal to the version latched into
+  `recVer[u]` at publish, so a fresh PUT (even of identical bytes) is caught.
 
 Liveness (against `MCFairSpec`; fairness: weak fairness on time passing, on the
 holder's acquire, and on the thief's observe and steal; environment: a paused

@@ -8,8 +8,8 @@ present claim key and touches no witness.
 SilentDeleteClaim(u) ==
     /\ ClaimPresent(u)
     /\ Delete(ClaimKey(u))
-    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn, dupThiefWin,
-                   stealWonVers, lastClaimOp, lastGuarded, stolen>>
+    /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
 ```
 
 `NoUnconditionalClaimDelete` now reads the store: the claim key drops from
