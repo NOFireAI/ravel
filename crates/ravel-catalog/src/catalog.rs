@@ -627,9 +627,9 @@ impl Catalog {
             self.config.shard_count,
         )
         .await?;
-        // Only a `Matched` result is safe to cache forever: the record is
-        // immutable, so a match stays a match. `FreshNoData` means "no record
-        // exists yet, nothing to validate against" -- caching it would skip the
+        // Only a `RecordPresent` result is safe to cache forever: the record is
+        // immutable, so a present record stays present. `FreshNoData` means "no
+        // record exists yet, nothing to validate against" -- caching it would skip the
         // real check once a later, higher-shard_count process writes the record
         // and lands data across shards this process would then silently omit
         // (records are immutable; a stale cache hit never re-checks). Re-check
@@ -4111,13 +4111,15 @@ mod tests {
             .expect("seed provisioning record");
     }
 
-    /// With provisioning enforcement on (as `build_catalog` sets it), a resolve
-    /// for a (tenant, signal) whose record disagrees with the configured
-    /// shard_count fails with a typed error before the `0..shard_count` listing
-    /// loop, so a lower shard_count never serves a truncated shard range
-    /// (ADR-0050 section 5, S1-E6 query-path guard).
+    /// ADR-0082: with provisioning enforcement on (as `build_catalog` sets it),
+    /// a resolve for a (tenant, signal) whose recorded generation-0 shard_count
+    /// (4) differs from the configured default (2) no longer fails. The record
+    /// is present and decodable, so the resolve proceeds and routing uses the
+    /// record's own generation history. Before this change the enforcement gate
+    /// returned `CatalogError::Provisioning` and the `.expect(...)` on the `Ok`
+    /// value below panicked.
     #[tokio::test]
-    async fn resolve_enforces_provisioning_record_mismatch() {
+    async fn resolve_tolerates_provisioning_record_drift() {
         let store = Arc::new(MemoryStore::new());
         let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
         publish_segment(&store, 0, 1, 500_000, now, now - 1_000, now).await;
@@ -4132,13 +4134,14 @@ mod tests {
             start_ns: now - 1_000,
             end_ns: now,
         };
-        let err = catalog
+        let snapshot = catalog
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
-            .expect_err("a lower configured shard_count must fail the resolve");
-        assert!(
-            matches!(err, CatalogError::Provisioning(_)),
-            "expected a provisioning failure, got: {err}"
+            .expect("a drifted-but-decodable record must be tolerated (ADR-0082)");
+        assert_eq!(
+            snapshot.segments.len(),
+            1,
+            "the resolve serves the published segment rather than refusing"
         );
     }
 
@@ -4512,12 +4515,15 @@ mod tests {
         );
     }
 
-    /// Regression: a `FreshNoData` result (no record yet) must not be
-    /// cached as validated. A query-only catalog resolves an empty-record tenant
-    /// (passes as fresh), then a real record appears written under a higher
-    /// shard_count; the next resolve must re-check and surface the mismatch, not
-    /// serve a truncated shard range from a stale "already validated" cache
-    /// entry (records are immutable, so a wrongly-cached miss never re-checks).
+    /// Regression: a `FreshNoData` result (no record yet) must not be cached as
+    /// validated. A query-only catalog resolves an empty-record tenant (passes
+    /// as fresh), then a record appears; the next resolve must re-read it rather
+    /// than serve from a stale "already validated" cache entry (records are
+    /// immutable, so a wrongly-cached miss never re-checks). ADR-0082 makes a
+    /// shard_count difference tolerated, so the re-check is proved here with a
+    /// corrupt record, which still fails closed: if the earlier `FreshNoData`
+    /// had been cached as validated, this second resolve would skip the check
+    /// and succeed, so the `.expect_err(...)` below would fail.
     #[tokio::test]
     async fn resolve_rechecks_after_fresh_no_data_until_record_appears() {
         let store = Arc::new(MemoryStore::new());
@@ -4539,16 +4545,23 @@ mod tests {
             .expect("a fresh (no-record) tenant resolves cleanly");
         assert_eq!(snapshot.segments.len(), 1, "first resolve returns the data");
 
-        // A separate higher-shard_count process now writes the real record and
-        // (conceptually) lands data across shards 0..4. If the earlier
+        // A corrupt record now appears at the provisioning key. If the earlier
         // `FreshNoData` had been cached as validated, this resolve would skip the
-        // check and silently serve only shards 0..2.
-        seed_provisioning_record(&store, 4).await;
+        // check and serve data; instead it must re-read and fail closed on the
+        // undecodable record.
+        store
+            .put(
+                &crate::provisioning::provisioning_key(&tenant(), Signal::Metrics),
+                vec![0xFF, 0xFF, 0xFF, 0x07].into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt record");
 
         let err = catalog
             .resolve(&tenant(), Signal::Metrics, range, &[], now)
             .await
-            .expect_err("once the real record appears the resolve must re-check and refuse");
+            .expect_err("once a record appears the resolve must re-check and fail closed on corruption");
         assert!(
             matches!(err, CatalogError::Provisioning(_)),
             "expected a provisioning failure from the re-check, got: {err}"

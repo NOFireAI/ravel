@@ -1,18 +1,18 @@
-//! Durable `shard_count` acceptance test (ADR-0050 section 5, EC5).
-//! Ingest across four shards through a real in-process server (which
-//! writes the provisioning record with shard_count=4), then simulate a restart
-//! configured for two shards and assert the process refuses to start with a
-//! typed error naming the record, and that no query path serves the truncated
-//! shard range.
+//! Durable `shard_count` drift-tolerance acceptance test (ADR-0082, over
+//! ADR-0050 section 5). Ingest across four shards through a real in-process
+//! server (which writes the provisioning record with shard_count=4), then
+//! simulate a restart configured for two shards and assert the process starts
+//! cleanly and the query path serves the recorded four-shard range rather than
+//! a truncated `0..2`.
 //!
-//! The startup refusal itself lives in `main.rs`
+//! The startup check lives in `main.rs`
 //! (`ravel_server::provisioning::validate_static_provisioning`, called before
 //! any listener binds), not in `ravel_server::start`, so the "restart"
 //! phase calls that exact function the binary calls, against the same store the
-//! first process wrote. The query-path guard is exercised through a real
-//! `Catalog` built the way `build_catalog` builds it (with provisioning
-//! enforcement), so a lower-shard_count query fails rather than resolving over
-//! `0..2`.
+//! first process wrote. The query path is exercised through a real `Catalog`
+//! built the way `build_catalog` builds it (with provisioning enforcement):
+//! generation-aware resolve serves the recorded four shards even when the live
+//! `--shards` default is two.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -151,10 +151,10 @@ async fn start_server(
     .expect("server starts")
 }
 
-/// Ingest 4 shards, restart at 2, assert the restart refuses with a
-/// typed error naming the record, and that no query serves the truncated range.
+/// Ingest 4 shards, restart at 2, assert the restart starts cleanly and the
+/// query path serves the recorded four-shard range (ADR-0082).
 #[tokio::test]
-async fn startup_fails_on_shard_count_mismatch() {
+async fn startup_tolerates_shard_count_drift() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
     // Phase 1: ingest across 4 shards through the real HTTP handler. This writes
@@ -200,37 +200,25 @@ async fn startup_fails_on_shard_count_mismatch() {
 
     // Phase 2: simulate a restart configured for 2 shards. This is exactly what
     // `main.rs` runs before binding any listener: the static tenant ("acme",
-    // from `--tenant-token`) is validated against its record and the process
-    // refuses to start on a mismatch.
+    // from `--tenant-token`) is validated against its record. Under ADR-0082 a
+    // recorded shard_count (4) above the live default (2) is tolerated: startup
+    // proceeds rather than refusing. Before ADR-0082 this returned
+    // `ProvisioningError::ShardCountMismatch` and the `.expect(...)` panicked.
     let static_tenants = vec![TenantId::new(TENANT).hash()];
-    let err = ravel_server::provisioning::validate_static_provisioning(
+    ravel_server::provisioning::validate_static_provisioning(
         store.as_ref(),
         &static_tenants,
         RESTART_SHARDS,
         now_ns(),
     )
     .await
-    .expect_err("restart configured for 2 shards must refuse to start");
-    // A typed FieldMismatch-style error naming the record and the values.
-    assert!(
-        matches!(
-            err,
-            ravel_catalog::ProvisioningError::ShardCountMismatch { .. }
-        ),
-        "expected a typed shard_count mismatch, got: {err}"
-    );
-    let msg = err.to_string();
-    assert!(msg.contains("/prov"), "error names the record key: {msg}");
-    assert!(msg.contains("shard_count"), "error names the field: {msg}");
-    assert!(
-        msg.contains(&RESTART_SHARDS.to_string()) && msg.contains(&INGEST_SHARDS.to_string()),
-        "error names expected (2) and actual (4): {msg}"
-    );
+    .expect("a restart with a lower --shards default must tolerate the recorded count (ADR-0082)");
 
-    // Phase 3: prove the query path never serves the truncated shard range. A
-    // catalog built for 2 shards (the way `build_catalog` builds it, with
-    // provisioning enforcement) fails the resolve on the record mismatch rather
-    // than iterating `0..2` and dropping shards 2 and 3.
+    // Phase 3: prove the query path serves the recorded four-shard range, not a
+    // truncated `0..2`. A catalog built for 2 shards (the way `build_catalog`
+    // builds it, with provisioning enforcement) resolves via the record's own
+    // generation history, so the resolve succeeds and covers the recorded
+    // shards. Before ADR-0082 this failed with a provisioning error.
     let catalog = Catalog::new(
         store.clone(),
         CatalogConfig {
@@ -240,7 +228,7 @@ async fn startup_fails_on_shard_count_mismatch() {
     )
     .expect("catalog builds")
     .with_provisioning_enforcement();
-    let resolve_err = catalog
+    catalog
         .resolve(
             &TenantId::new(TENANT).hash(),
             Signal::Metrics,
@@ -252,11 +240,7 @@ async fn startup_fails_on_shard_count_mismatch() {
             now_ns(),
         )
         .await
-        .expect_err("a query at shard_count=2 must fail, never serve a truncated shard range");
-    assert!(
-        matches!(resolve_err, ravel_catalog::CatalogError::Provisioning(_)),
-        "expected a provisioning failure on resolve, got: {resolve_err}"
-    );
+        .expect("a query at a lower --shards default resolves over the recorded shard range");
 }
 
 /// The fresh-deployment guarantee at the server layer: a
