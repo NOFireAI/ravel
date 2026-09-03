@@ -305,6 +305,19 @@ window would still call a Hit.
   max(max_event_ts) across both.
 - Observing a tombstone invalidates that bucket's cached commit and
   compaction records (the trigger ADR-0010 §10 promises).
+- The retention window a sweep applies to a bucket is resolved by a single
+  precedence, the same one the fold applies (ADR-0078): the durable per-tenant
+  retention window wins when set, otherwise the deployment default, where the
+  deployment default is the per-tenant deployment override if one is configured
+  and the deployment-wide default otherwise. So a durable per-tenant record
+  overrides both deployment settings. The sweep reads that durable record from
+  object storage under the same key and through the same decoder the fold uses,
+  so the sweep and the fold always resolve the same window for a tenant. This
+  agreement is required, not incidental: the two passes run independently, and a
+  sweep using a shorter window than the fold would tombstone an hour the fold's
+  snapshot still names and whose retention-frontier reconcile never drops,
+  leaving the physical sweep blocked on the HEAD-referenced-snapshot delete
+  blocker on every pass.
 - Retention is durable and irreversible: raising a tenant's retention
   window after a bucket is tombstoned never resurrects it. A token whose
   bucket is tombstoned resolves as satisfied with zero segments, not as

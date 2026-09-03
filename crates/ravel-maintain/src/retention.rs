@@ -40,6 +40,7 @@ use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone};
+use ravel_types::TenantHash;
 
 use crate::bucket::Bucket;
 use crate::clock::Clock;
@@ -87,6 +88,45 @@ pub enum RetentionOutcome {
     BlockedBySnapshot(SnapshotBlock),
 }
 
+/// Resolve a tenant's effective retention window the same way the catalog fold
+/// does (ADR-0078): overlay the durable per-tenant `TenantConfig.retention_ns`
+/// on the deployment default that `RetentionConfig::window_for` yields (the
+/// `--retention-tenant` per-tenant override if set, else `--retention-default`).
+/// The durable record is read from the same object store, under the same key,
+/// through the same decoder the fold uses
+/// ([`ravel_catalog::read_config_values`]), and the precedence is the single one
+/// stated in [`ravel_catalog::resolve_retention_window`] -- durable record wins,
+/// then CLI per-tenant override, then CLI default -- so the sweep and the fold
+/// never resolve different windows for the same tenant. Without this the sweep
+/// read only the CLI map and would tombstone an hour a longer durable window
+/// keeps, which the fold's frontier reconcile never drops, stalling the physical
+/// sweep on a repeating `BlockedBySnapshot`.
+///
+/// A config-read fault fails the resolution closed (propagates the error) rather
+/// than falling back to the possibly shorter CLI window: a tombstone is
+/// irreversible, so a transient store fault must never shorten the window and
+/// retire a bucket the durable record would keep. The sweep is idempotent, so
+/// the pass simply retries on the next tick.
+pub async fn resolve_retention_window_ns(
+    store: &dyn ObjectStoreBackend,
+    retention: &RetentionConfig,
+    tenant: &TenantHash,
+) -> Result<Option<i64>> {
+    let default_retention_ns = retention.window_for(tenant);
+    let tenant_config = ravel_catalog::read_config_values(store, tenant)
+        .await
+        .map_err(|e| {
+            MaintainError::Invariant(format!(
+                "tenant config read failed while resolving retention window for {}: {e}",
+                tenant.to_hex()
+            ))
+        })?;
+    Ok(ravel_catalog::resolve_retention_window(
+        tenant_config.as_ref(),
+        default_retention_ns,
+    ))
+}
+
 /// Run one retention pass over a single sealed bucket (ADR-0019):
 /// evaluate expiry, write the tombstone if newly expired, and run the
 /// horizon-gated physical sweep if a tombstone is already present and its
@@ -101,8 +141,9 @@ pub async fn retention_sweep_bucket(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
+    let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
     let mut reach = SnapshotReachability::new();
-    retention_sweep_bucket_with_reach(&mut reach, store, clock, config, retention, lease, bucket)
+    retention_sweep_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket)
         .await
 }
 
@@ -113,17 +154,25 @@ pub async fn retention_sweep_bucket(
 /// public [`retention_sweep_bucket`] wraps this with a fresh per-call cache;
 /// [`crate::scan::scan_and_maintain_with_memo`] owns one cache for the whole
 /// per-(tenant, signal, shard) pass and calls this directly.
+///
+/// `window_ns` is the tenant's effective retention window already resolved by
+/// [`resolve_retention_window_ns`] (durable record over CLI, ADR-0078). The
+/// caller resolves it once per pass -- the window is constant across a tenant's
+/// buckets, so reading the durable config per bucket would be one redundant GET
+/// per bucket -- and threads the same value into every bucket of the pass, so
+/// the sweep, the pass's zone classification, and the fold all use one window.
+/// `None` means no retention policy for this tenant.
 #[allow(clippy::too_many_arguments)]
 pub async fn retention_sweep_bucket_with_reach(
     reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     config: &CompactorConfig,
-    retention: &RetentionConfig,
+    window_ns: Option<i64>,
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<RetentionOutcome> {
-    let Some(window_ns) = retention.window_for(&bucket.tenant_hash) else {
+    let Some(window_ns) = window_ns else {
         return Ok(RetentionOutcome::NoPolicy);
     };
     let now = clock.now_ns();
@@ -193,26 +242,28 @@ pub async fn maintain_bucket(
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<(RetentionOutcome, Option<CompactionOutcome>)> {
+    let window_ns = resolve_retention_window_ns(store, retention, &bucket.tenant_hash).await?;
     let mut reach = SnapshotReachability::new();
-    maintain_bucket_with_reach(&mut reach, store, clock, config, retention, lease, bucket).await
+    maintain_bucket_with_reach(&mut reach, store, clock, config, window_ns, lease, bucket).await
 }
 
 /// [`maintain_bucket`] with a caller-owned [`SnapshotReachability`] cache
 /// shared across the buckets of one sweep pass (ADR-0076 request cost, see
 /// [`retention_sweep_bucket_with_reach`]). The public [`maintain_bucket`] wraps
-/// this with a fresh per-call cache.
+/// this with a fresh per-call cache. `window_ns` is the pass-resolved retention
+/// window (see [`retention_sweep_bucket_with_reach`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn maintain_bucket_with_reach(
     reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
     config: &CompactorConfig,
-    retention: &RetentionConfig,
+    window_ns: Option<i64>,
     lease: &dyn LeaseCheck,
     bucket: &Bucket,
 ) -> Result<(RetentionOutcome, Option<CompactionOutcome>)> {
     let outcome =
-        retention_sweep_bucket_with_reach(reach, store, clock, config, retention, lease, bucket)
+        retention_sweep_bucket_with_reach(reach, store, clock, config, window_ns, lease, bucket)
             .await?;
     let compaction = match outcome {
         // The bucket is (or is being) retired, or its delete is blocked by a
