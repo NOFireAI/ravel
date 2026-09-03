@@ -1308,3 +1308,183 @@ async fn the_stamped_bool_answer_equals_the_scanned_answer() {
     );
     assert_eq!(from_stats.gets, 0);
 }
+
+// ---------------------------------------------------------------------------
+// The `.cstat` row-accounting reconciliation (ADR-0873 decision 2, clause 4's
+// `.cstat` arm) at the statement level: what a query ANSWERS when an entry's
+// `non_null_count + null_count` does not reach the joined segment's row count.
+// The plan-time half of these cases, asserted as a drop-metric delta, is in
+// declared_stat_cstat_drops.rs; here the assertion is the number the statement
+// returns, so an entry wrongly accepted shows up as a wrong answer.
+// ---------------------------------------------------------------------------
+
+/// The stale-claim segment: it holds both the corpus minimum and the corpus
+/// maximum, so an entry of its that is wrongly accepted takes both extrema out
+/// of the answer while the statement still succeeds.
+const STALE_SEG_ROWS: &[(i64, Option<i64>)] =
+    &[(400, Some(9_000)), (401, Some(9_500)), (402, None)];
+/// Its companion, stamped by a correct writer, holding values strictly inside
+/// the stale segment's range.
+const COMPANION_SEG_ROWS: &[(i64, Option<i64>)] = &[(500, Some(9_100)), (501, Some(9_200))];
+
+/// A `.cstat` entry whose counts are stated outright rather than derived from
+/// the rows the object holds, which is what [`cstat_for`] does. Only this form
+/// can express an entry that does not reconcile against the joined
+/// `SegmentRef::sample_count`.
+fn cstat_counts(
+    non_null_count: u64,
+    null_count: u64,
+    min: Option<i64>,
+    max: Option<i64>,
+) -> ColumnStat {
+    ColumnStat {
+        name: COL.to_string(),
+        declared_type: 2, // ravel.sys.v1.TypedAttrColumnType::I64
+        non_null_count,
+        null_count,
+        min: min.map(i64_value),
+        max: max.map(i64_value),
+        dictionary_present: false,
+        dictionary: Vec::new(),
+        sum: None,
+    }
+}
+
+/// An entry accounting for two of the segment's three rows describes an object
+/// that does not exist, so it lends no `Exact` extremum and the statement
+/// scans to the object's real extrema. Its extrema are deliberately values no
+/// row carries: the answer is the assertion that the scan, not the entry,
+/// produced it.
+///
+/// Prove-the-test: delete the `accounted != Some(seg.sample_count)` refusal
+/// block in `reconciled_column_stat` (crates/ravel-sql/src/logs_scan.rs). The
+/// plan then loses its `LogsScanExec`, the statement answers
+/// `(Some(-1), Some(42))` from the entry with zero GETs, and the column
+/// statistics read `Precision::Exact(Int64(-1))`.
+#[tokio::test]
+async fn an_unreconciled_cstat_entry_lends_no_exact_extremum() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let a = write_segment(&store, "logs/unreconciled.rlog", 1, SEG_A_ROWS).await;
+    // 2 + 0 = 2, against a three-row segment.
+    let stats = loaded_stats(vec![(&a, vec![cstat_counts(2, 0, Some(-1), Some(42))])]);
+    let snapshot = snapshot_of(vec![a]);
+
+    let plan_stats = scan_stats(snapshot.clone(), Some(Arc::clone(&stats)));
+    let col = declared_col_stats(&plan_stats);
+    assert_eq!(
+        col.min_value,
+        Precision::Absent,
+        "an unreconciled entry grants no MIN"
+    );
+    assert_eq!(
+        col.max_value,
+        Precision::Absent,
+        "nor a MAX: the whole entry is refused"
+    );
+
+    let out = min_max_over_store(&store, snapshot, Some(stats)).await;
+    assert!(
+        out.plan.contains("LogsScanExec"),
+        "an unreconciled entry must fail closed to a scan; plan was:\n{}",
+        out.plan
+    );
+    assert_eq!(
+        out.answer,
+        (Some(18_500), Some(19_000)),
+        "the scan answers the object's real extrema, not the entry's -1 and 42"
+    );
+    assert_eq!(out.objects_touched, 1, "the one segment, opened once");
+}
+
+/// The reconciled half of the same segment, which is what keeps the refusal
+/// above from being satisfied by a reader that refuses every entry: `2 + 1 == 3
+/// == sample_count`, so the entry answers at plan time with no `LogsScanExec`
+/// and zero GETs.
+///
+/// Prove-the-test: change the refusal in `reconciled_column_stat` to
+/// `accounted != Some(seg.sample_count + 1)` and this plan regains its
+/// `LogsScanExec` and its GETs while the test above still passes.
+#[tokio::test]
+async fn a_reconciled_cstat_entry_still_answers_from_statistics() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let a = write_segment(&store, "logs/reconciled.rlog", 1, SEG_A_ROWS).await;
+    let stats = loaded_stats(vec![(
+        &a,
+        vec![cstat_counts(2, 1, Some(18_500), Some(19_000))],
+    )]);
+    let snapshot = snapshot_of(vec![a]);
+
+    let plan_stats = scan_stats(snapshot.clone(), Some(Arc::clone(&stats)));
+    let col = declared_col_stats(&plan_stats);
+    assert_eq!(
+        col.min_value,
+        Precision::Exact(ScalarValue::Int64(Some(18_500))),
+        "a reconciled entry still lends an exact MIN"
+    );
+    assert_eq!(
+        col.max_value,
+        Precision::Exact(ScalarValue::Int64(Some(19_000)))
+    );
+
+    let out = min_max_over_store(&store, snapshot, Some(stats)).await;
+    assert!(
+        !out.plan.contains("LogsScanExec"),
+        "a reconciled entry answers at plan time; plan was:\n{}",
+        out.plan
+    );
+    assert_eq!(out.answer, (Some(18_500), Some(19_000)));
+    assert_eq!(out.gets, 0, "no data object may be read");
+    assert_eq!(out.objects_touched, 0);
+}
+
+/// The stale all-NULL claim: an entry with zero non-null rows and both extrema
+/// absent, internally consistent under the presence rule, whose `null_count`
+/// equals the rows it claims to describe but not the rows the joined segment
+/// holds (2, against a three-row object). Accepting it would cover the segment
+/// while contributing nothing, which is silent absence: the corpus minimum and
+/// maximum both live in that segment, so the answer would collapse to the
+/// companion segment's narrower range with no scan and no error.
+///
+/// Prove-the-test: delete the same `accounted != Some(seg.sample_count)` block
+/// in `reconciled_column_stat`. The stale entry is then accepted as an exact
+/// all-NULL coverage statement, the plan loses its `LogsScanExec`, and the
+/// statement answers `(Some(9_100), Some(9_200))` instead of the true
+/// `(Some(9_000), Some(9_500))`.
+#[tokio::test]
+async fn a_stale_all_null_cstat_claim_does_not_answer_null() {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let stale = write_segment(&store, "logs/stale.rlog", 1, STALE_SEG_ROWS).await;
+    let companion = write_segment(&store, "logs/companion.rlog", 2, COMPANION_SEG_ROWS).await;
+    // 0 + 2 = 2, against a three-row segment: an all-NULL claim over rows the
+    // object does not have.
+    let stats = loaded_stats(vec![(&stale, vec![cstat_counts(0, 2, None, None)])]);
+    let snapshot = snapshot_of(vec![
+        stale,
+        stamped(
+            &companion,
+            vec![encode_stamp(&stamp_for(COMPANION_SEG_ROWS))],
+        ),
+    ]);
+
+    let plan_stats = scan_stats(snapshot.clone(), Some(Arc::clone(&stats)));
+    let col = declared_col_stats(&plan_stats);
+    assert_eq!(
+        col.min_value,
+        Precision::Absent,
+        "a stale all-NULL claim is refused, not accepted as an exact NULL"
+    );
+    assert_eq!(col.max_value, Precision::Absent);
+
+    let out = min_max_over_store(&store, snapshot, Some(stats)).await;
+    assert!(
+        out.plan.contains("LogsScanExec"),
+        "a stale claim must fail closed to a scan; plan was:\n{}",
+        out.plan
+    );
+    assert_eq!(
+        out.answer,
+        (Some(9_000), Some(9_500)),
+        "both extrema live in the segment whose entry was refused"
+    );
+    assert_eq!(out.objects_touched, 2, "both segments opened, once each");
+}
