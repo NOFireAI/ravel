@@ -2,9 +2,11 @@
 
 Switch: `AllowClaimDelete = TRUE`. Expected: `NoUnconditionalClaimDelete` violated (exit 12).
 
-Trace: worker 1 acquires the claim of unit 1. The broken `DeleteClaim` step then
-issues an unconditional DELETE of the claim key and sets the `claimDeleted`
-witness. The invariant `~claimDeleted` fails immediately.
+Trace: worker 1 acquires the claim of unit 1, which latches `claimBorn[1]`. The
+broken `DeleteClaim` step then issues an unconditional DELETE of the claim key,
+touching no witness. `NoUnconditionalClaimDelete` reads the store and fails: the
+claim key is now absent while `claimBorn[1]` stays set, so
+`claimBorn[1] => ClaimPresent(1)` is false.
 
 Why it matters: ADR-1029 step 6 forbids an unconditional delete precisely
 because a stale worker's DELETE could destroy a newer owner's claim; the
