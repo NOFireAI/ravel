@@ -298,7 +298,7 @@ TypeOK ==
     /\ objContent \in [Objects -> SUBSET AllRecords]
     /\ variantKey \in [{"v1","v2"} -> {UnnamedKey, RewriteKey(DescA), RewriteKey(DescB)}]
     /\ sysgc \in [ph: Nat, mqd: Nat, grace: Nat, skew: Nat]
-    /\ lastGc.rule \in {"none","superseded","retention","dreq","complete"}
+    /\ lastGc.rule \in {"none","superseded","retention","dreq","complete","tombstone"}
     /\ lastGc.deleted \subseteq Objects
     /\ lastGc.atClock \in 0..MaxClock
     /\ lastGc.held \in BOOLEAN
@@ -600,6 +600,27 @@ RetentionSweep(o) ==
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
 
+\* Final tombstone delete (finding 3, round four): physical_sweep deletes the
+\* bucket's data, verifies via bucket_is_empty_but_tombstone that only the
+\* tombstone remains, then deletes the tombstone itself and reports the
+\* bucket swept. The model stopped at the data delete; this adds the missing
+\* last step, gated the same as the code: the same bucket_gate read
+\* RetentionSweep uses (HeadReadable, EffectiveHead not naming the bucket),
+\* the same LeaseCheck instance the data deletes used (is_protected on the
+\* tombstone key, so a failed refresh fails closed here too), and the bucket
+\* holding nothing but the tombstone.
+SweepTombstone ==
+    /\ HeadReadable
+    /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
+    /\ \A x \in EffectiveHead : Bucket(x) # "b1"
+    /\ PresentObj("tombB1")
+    /\ \A o \in DataObjects : Bucket(o) = "b1" => ~PresentObj(o)
+    /\ S!Delete("tombB1")
+    /\ GcWitness("tombstone", {"tombB1"})
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
+                   refreshFailed, query, erasureRequested, tombRetiredAt,
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+
 --------------------------------------------------------------------------------
 \* Physical GC actor (maintainer): superseded-input sweep and .dreq sweep
 --------------------------------------------------------------------------------
@@ -670,6 +691,7 @@ Next ==
     \/ RetireBucket
     \/ DropRetiredBucketFromHead
     \/ \E o \in DataObjects : RetentionSweep(o)
+    \/ SweepTombstone
     \/ \E o \in RawInputs : SupersededSweep(o)
     \/ DreqSweep
 
@@ -737,6 +759,16 @@ TombstoneExcludesBeforeDelete ==
         /\ \A o \in lastGc.deleted :
               /\ Bucket(o) = "b1"
               /\ tombRetiredAt["b1"] <= lastGc.atClock
+
+\* The tombstone itself is never deleted while any of its bucket's data
+\* objects are still present: physical_sweep only deletes the tombstone
+\* after bucket_is_empty_but_tombstone confirms nothing else remains. Kept
+\* separate from TombstoneExcludesBeforeDelete (finding 3, round four) so
+\* each rule's own claim, the tombstone existing before a data delete versus
+\* the tombstone outliving every data delete, stays independently falsifiable.
+TombstoneNotDeletedBeforeBucketEmpty ==
+    lastGc.rule = "tombstone" =>
+        \A o \in DataObjects : Bucket(o) = "b1" => ~PresentObj(o)
 
 \* Once an erasure is requested for a subject, that subject is never served
 \* again: the modeled read (ServedRead) applies the erasure predicate after the
