@@ -142,7 +142,6 @@ HoldsClaim(w, u) ==
 CanWrite == versionCounter < MaxV
 
 VerRange == 0..MaxV
-RecType == [present: BOOLEAN, content: OContent, version: Nat]
 
 CTypeOK ==
     /\ StoreTypeOK

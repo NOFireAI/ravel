@@ -186,8 +186,6 @@ INSTANCE RavelObjectStore
 
 Members == Workers \cup (IF Phantom THEN {PH} ELSE {})
 
-Max(S) == CHOOSE m \in S : \A x \in S : x =< m
-
 \* A sibling is stale (excluded) when its stamp is more than the window into
 \* the reader's past OR its future (is_stale is bidirectional).
 Stale(s) == \/ now - hbStamp[s] > Window
@@ -205,8 +203,6 @@ LiveView(w) == { s \in Workers : s = w \/ ~Stale(s) }
 \* Rendezvous owner in a view: the argmax of the weight table.
 Owner(u, S) == CHOOSE m \in S : \A x \in S : Weight(u, x) =< Weight(u, m)
 Owns(w, u)  == Owner(u, cachedLive[w]) = w
-
-RecType == [present: BOOLEAN, content: OContent, version: Nat]
 
 OTypeOK ==
     /\ StoreTypeOK
