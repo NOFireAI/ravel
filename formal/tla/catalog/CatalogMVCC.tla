@@ -160,10 +160,6 @@ ClearedStage == [active |-> FALSE, wm |-> -1, entries |-> {},
 Statuses   == {"absent", "valid", "corrupt", "unsupported"}
 SnapPart   == [wm: Int, entries: SUBSET AllEntries, at: Int]
 
-allModel == <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage, qy,
-              lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed,
-              partUnreadable, entryUndecodable, partCorruptionUsed, entryCorruptionUsed>>
-
 \* --- seal predicates (RECONNAISSANCE F1) ------------------------------------
 \* HourEnd(H) is the boundary tick of hour H. A bucket is maintenance-sealed
 \* MaintSealDelay after its end (Bucket::is_sealed), and fold-sealed a further
@@ -605,7 +601,7 @@ DoFoldRebase(f) ==
 \* watermark-advancing fold. Enabled only under ReconcileOnTick: it re-reconciles
 \* HEAD without advancing the watermark, which the witness records as a reconcile
 \* whose step did not raise the watermark.
-DoReconcileTick(f) ==
+DoReconcileTick ==
     /\ ReconcileOnTick
     /\ head.status = "valid"
     /\ LET e2 == FoldEntriesFor(head.wm) IN
@@ -847,7 +843,7 @@ Next ==
     \/ DoRivalFoldWin
     \/ \E f \in Folders : DoFoldCrash(f)
     \/ \E f \in Folders : DoFoldRebase(f)
-    \/ \E f \in Folders : DoReconcileTick(f)
+    \/ DoReconcileTick
     \/ \E H \in Hours, g \in CompIds : DoSweepSuperseded(H, g)
     \/ DoSweepCatalogObjects
     \/ \E H \in Hours : DoTombstone(H)
