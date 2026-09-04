@@ -1,15 +1,16 @@
 # Resharding model: results
 
 Model checker: TLC from tla2tools 1.7.4 (sha256 verified by the harness).
-Run id: `20260903T042234Z-49ff7c78bf9d67949e0c4b7bbfcc232845d1125b`
+Run id: `20260904T143812Z-c7b636a7a5d2fbdc6c28ad9bd839749e63fcd9f8`
 (`scripts/check-tla.sh ci -a resharding`, a single coherent run of smoke,
-every negative control, and traceability).
+every negative control, and traceability, re-run for the issue #1123
+third-round review below).
 
 ## Smoke (safety)
 
 | cfg | result | states | distinct | depth | seconds |
 |---|---|---|---|---|---|
-| smoke.cfg | PASS | 7809360 | 958804 | 18 | 36 |
+| smoke.cfg | PASS | 7809360 | 958804 | 18 | 37 |
 
 Two writers and two requesters race an increase (3) and a decrease (1) from
 generation 0's count of 2, symmetry-reduced over both permutation groups, with
@@ -27,11 +28,15 @@ the harness fails unless TLC reports that one.
 
 | Control | Flipped from shipped | Property violated | distinct | seconds |
 |---|---|---|---|---|
-| scan-slack-zero | `S = 0` (shipped 3) | EveryAdmittedWriteInScanSet | 2761 | 2 |
-| appender-skew-unbounded | `AppenderSkew = 5` (tolerated 1) | EveryAdmittedWriteInScanSet | 146033 | 4 |
-| lead-one | `L = 1` (shipped 2) | LeadCoversRefreshHorizon | 199 | 1 |
-| no-writer-fence | `WriterFenceEnabled = FALSE` | StaleWriterFailsClosed | 75612 | 3 |
-| token-validated-against-count | `TokenValidatedAgainstCount = TRUE` | TokenResolvesAcrossReshards | 17452 | 2 |
+| scan-slack-zero | `S = 0` (shipped 3) | EveryAdmittedWriteInScanSet | 3512 | 2 |
+| appender-skew-unbounded | `AppenderSkew = 5` (tolerated 1) | EveryAdmittedWriteInScanSet | 124721 | 4 |
+| lead-one | `L = 1` (shipped 2) | LeadCoversRefreshHorizon | 174 | 2 |
+| no-writer-fence | `WriterFenceEnabled = FALSE` | StaleWriterFailsClosed | 48018 | 2 |
+| token-validated-against-count | `TokenValidatedAgainstCount = TRUE` | TokenResolvesAcrossReshards | 12709 | 3 |
+
+TLC's error-search runs stop at the first violation a worker finds, so the
+exact distinct-state count for a VIOLATED result varies run to run with
+worker scheduling; these are this run's figures, not a fixed constant.
 
 ### Two controls target the invariant their margin directly protects
 
@@ -456,3 +461,23 @@ widening, completing in 8,503,664 states / 1,179,718 distinct / depth 20,
 recovers the dropped two-writer coverage as a separate reachability probe
 (`TwoWritersNeverConcurrentlyOpen` violated, 26 distinct states, depth 4).
 `bands.tsv`'s exhaustive.cfg row is updated from this real run.
+
+## Third-round findings (issue #1123 review, 2026-09-04)
+
+Five findings from a further review of the area. Finding 1 (liveness
+fairness) is recorded above under "Finding C, revisited". The rest follow.
+
+### Finding 3: appender-skew-unbounded's FlushBound contradicted its own claim
+
+`negative/appender-skew-unbounded.cfg` set `FlushBound = 1` while its header
+comment and `counterexamples/appender-skew-unbounded.md` both say every
+margin but the skew itself is shipped, and the shipped
+`FLUSH_BOUND_SLACK_HOURS` is 2 (see `exhaustive.cfg`, `smoke.cfg`). The
+violation itself never depended on this: a smaller `FlushBound` only
+narrows `CanAdmit`'s admit window, so the counterexample stays reachable at
+the wider, correct value.
+
+Set `FlushBound = 2` and re-ran: still `EveryAdmittedWriteInScanSet`
+VIOLATED, 124721 distinct states, 4 seconds (see the negative-controls table
+above, from the same coherent run). The claim and the configuration now
+agree.
