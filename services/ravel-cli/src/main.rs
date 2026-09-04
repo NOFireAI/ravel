@@ -185,11 +185,16 @@ fn command_is_write(command: &Command) -> bool {
         },
         Command::Maintain { command } => match command {
             // Writes L1 segment objects and a compaction record under
-            // `t/<tenant_hash>/<signal>/<shard>/...`.
-            MaintainCommand::CompactBucket { .. } | MaintainCommand::CompactTenant { .. } => true,
+            // `t/<tenant_hash>/<signal>/<shard>/...`, EXCEPT under `--dry-run`,
+            // which only reports the plan it would run. Gating a dry run would
+            // stop an operator inspecting that plan on a marker-less bucket,
+            // which is the one case where they most need to look before acting.
+            MaintainCommand::CompactBucket { dry_run, .. }
+            | MaintainCommand::CompactTenant { dry_run, .. } => !dry_run,
             // Deletes orphaned/superseded/unreferenced segment objects under
-            // `t/<tenant_hash>/<signal>/<shard>/...`.
-            MaintainCommand::Sweep { .. } => true,
+            // `t/<tenant_hash>/<signal>/<shard>/...`; `--dry-run` only lists
+            // what it would delete.
+            MaintainCommand::Sweep { dry_run, .. } => !dry_run,
             // Rewrites objects to the target format version and raises the
             // recorded format floor under `t/<tenant_hash>/...`.
             MaintainCommand::Migrate { .. } => true,
@@ -2903,6 +2908,29 @@ mod tests {
                     "0",
                 ],
                 true,
+            ),
+            // `--dry-run` reports the plan and mutates nothing, so it is a read
+            // even on the commands whose non-dry form writes. Gating it would
+            // stop an operator inspecting the plan on a marker-less bucket.
+            (
+                &[
+                    "ravel", "maintain", "sweep", "--tenant", "t", "--signal", "logs", "--shard",
+                    "0", "--dry-run",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "maintain",
+                    "compact-tenant",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--dry-run",
+                ],
+                false,
             ),
             (
                 &[
