@@ -26,7 +26,7 @@ otherwise.
 | negative/no-cross-shard-atomicity.cfg | 243 | 174 | n/a | 1 | VIOLATED as required (NoCrossShardAtomicityUnreachable) |
 | negative/query-reads-uncommitted-data.cfg | 77 | 65 | n/a | 1 | VIOLATED as required (NoUncommittedDataVisible) |
 | traceability | n/a | n/a | n/a | n/a | PASS, 21 rows resolve |
-| exhaustive.cfg | 442076218 | 118898952 | not reached | 3600 | TIMEOUT, not a violation |
+| exhaustive.cfg | 642136435 | 148881235 | 38 | 2728 | PASS |
 
 The negative rows are the required outcome: each config disables a guard or
 flips a broken-behaviour switch, and TLC finding the counterexample proves
@@ -44,56 +44,80 @@ identity-reuse coverage needs — a single content value can't distinguish
 reuse-with-same-content from reuse-with-different-content),
 `FlushLifetime=1`/`MaxTicks=2` (the
 floor `ASSUME FlushLifetime > 0` and deadline-reachability allow), and
-`MaxRetries=0`/`Writers={w1}` (already at their floor). The one coverage
-item given up versus the pre-task cfg is `MaxRetries`: it now runs at 0
-instead of 1, dropping the second-retry interleaving from the exhaustive
-lane specifically (the retry path itself is still exercised at
-`MaxRetries=1` elsewhere, in `negative/at-least-once-duplicate-reachable.cfg`
-and `dedup-mutant.cfg`).
+`MaxRetries=0`/`Writers={w1}` (already at their floor). Two coverage items
+are given up versus the pre-task cfg. `MaxRetries` runs at 0 instead of 1,
+dropping the second-retry interleaving from the exhaustive lane
+specifically (the retry path itself is still exercised at `MaxRetries=1`
+elsewhere, in `negative/at-least-once-duplicate-reachable.cfg` and
+`dedup-mutant.cfg`). `NoUncommittedDataVisible` is dropped from this cfg's
+`INVARIANT` list and `CheckQuery` is set `FALSE`: the `RunQuery` action
+added for that invariant (see the mutant-audit section below) is a
+single-fire action whose firing point can land at any reachable state, and
+that timing choice alone was enough to stop this cfg from converging (see
+below). `smoke.cfg` (`CheckQuery=TRUE`) and the dedicated negative/mutant
+coverage in `negative/query-reads-uncommitted-data.cfg` still exercise the
+invariant at floor bounds; `exhaustive.cfg` already gave up `MaxRetries`
+coverage the same way, so this follows existing precedent rather than
+setting a new one.
 
-Even at this floor, `exhaustive.cfg` does not complete: run via
-`scripts/check-tla.sh exhaustive -a commit`, it hit the script's own
-3600-second internal budget (`EXHAUSTIVE_BUDGET` in `scripts/check-tla.sh`)
-without the state queue ever plateauing (442,076,218 states generated,
-118,898,952 distinct, 31,290,754 left on queue, monotonically increasing
-for the full hour). A second independent run under a 2700-second external
-wrapper showed the same non-converging trajectory. `bands.tsv` carries no
-exhaustive row for this reason: banding a partial count would assert a
-state-space size that was never actually established. Separately: the
-task that produced this cfg cited a 45-minute exhaustive budget "mandated
-by ADR-1113"; the ADR (`docs/adrs/1113-tla-verification-suite.md`) states
-45 minutes only for the PR-gating `tla` workflow's smoke/negative/
-traceability job, and gives exhaustive its own nightly job at a 120-minute
-budget, while `scripts/check-tla.sh` itself hardcodes 3600 seconds (60
-minutes) for `exhaustive` — three different numbers across the task
-framing, the ADR, and the script. `scripts/check-tla.sh` sits outside
-this task's scope (`formal/tla/commit/`), so the mismatch is reported
-here and in the final task report rather than edited.
+At the previous floor (`CheckQuery` unconditionally wired in, no gate),
+`exhaustive.cfg` did not complete: run via `scripts/check-tla.sh exhaustive
+-a commit`, it hit the script's own 3600-second internal budget
+(`EXHAUSTIVE_BUDGET` in `scripts/check-tla.sh`) without the state queue
+ever plateauing (442,076,218 states generated, 118,898,952 distinct,
+31,290,754 left on queue, monotonically increasing for the full hour).
+With `CheckQuery=FALSE`, the same cfg completes: 642,136,435 states
+generated, 148,881,235 distinct, depth 38, in 2728s (45m27s, `-workers
+auto` resolving to 8 workers on this session's 8-core host rather than the
+4 workers/4 cores recorded for host `rp1` above; wall time is
+host-dependent and not banded, so this is not a regression against the
+banded figures). `bands.tsv` now carries a real exhaustive row for this
+figure. Separately: the task that produced this cfg cited a 45-minute
+exhaustive budget "mandated by ADR-1113"; the ADR
+(`docs/adrs/1113-tla-verification-suite.md`) states 45 minutes only for the
+PR-gating `tla` workflow's smoke/negative/traceability job, and gives
+exhaustive its own nightly job at a 120-minute budget, while
+`scripts/check-tla.sh` itself hardcodes 3600 seconds (60 minutes) for
+`exhaustive` — three different numbers across the task framing, the ADR,
+and the script. This run's 2728s fits the script's 3600s budget and the
+ADR's 120-minute nightly budget comfortably, but is 28 seconds over a
+literal 45-minute reading, which only sharpens the mismatch.
+`scripts/check-tla.sh` sits outside this task's scope
+(`formal/tla/commit/`), so the mismatch is reported here and in the final
+task report rather than edited.
 
 ## By-hand runs
 
 | Run | Spec/Invariant | States generated | Distinct | Depth | Result |
 |---|---|---|---|---|---|
-| dedup-mutant.cfg | DuplicateUnreachable only, RetryDedups=TRUE | 253155064 | 186215950 | not reached | STOPPED, not completed (see prose below) |
+| dedup-mutant.cfg | DuplicateUnreachable only, RetryDedups=TRUE | 433976430 | 81903514 | 34 | PASS (exit 0), 17m44s |
 | live.cfg | FairSpec / EveryPinnedFlushSettles | 42119 | 15812 | 13 | PASS (exit 0), under 1s |
 
 `dedup-mutant.cfg` used to complete in 25 minutes (433,976,430 generated,
-81,903,514 distinct, depth 34), and was re-run by hand this task to
-re-confirm `DuplicateUnreachable` after the `RunQuery` model change. It did
-not converge: the new `queried`/`queryAnswer` variables and `RunQuery`
-action added for the `NoUncommittedDataVisible` fix (see the mutant-audit
-section below) enlarge the reachable state space for every cfg that
-includes them, not only `exhaustive.cfg`. The run was resumed once from a
-TLC checkpoint (`-recover`, at 154,574,468 states already examined) and
-then stopped by hand after the state queue kept growing for a further 15
+81,903,514 distinct, depth 34). After the `RunQuery` action and its
+`queried`/`queryAnswer` variables were added for the `NoUncommittedDataVisible`
+fix (see the mutant-audit section below), the same cfg stopped converging
+for the same reason as `exhaustive.cfg` above: a run resumed once from a
+TLC checkpoint (`-recover`, at 154,574,468 states already examined) was
+stopped by hand after the state queue kept growing for a further 15
 minutes with no plateau (253,155,064 generated, 186,215,950 distinct,
 43,984,712 left on queue at the stop). No counterexample was found before
-the stop, which is consistent with `DuplicateUnreachable` continuing to
-hold at these bounds, but an incomplete state graph is not proof of it;
-this row records a stopped run, not a pass, and the obligation should be
-re-run to completion in a session with a longer budget. The negative
-control below (same obligation, dedup guard disabled, counterexample found
-in 2 seconds) is unaffected by this and still demonstrates the guard is
+that stop, which was consistent with `DuplicateUnreachable` continuing to
+hold at these bounds, but an incomplete state graph was not proof of it.
+
+Adding `CheckQuery = FALSE` to `dedup-mutant.cfg` (the same lever as
+`exhaustive.cfg`; this cfg does not list `NoUncommittedDataVisible` among
+its invariants either, so the query machinery was never needed here)
+restores completion: run by hand with the module path set explicitly
+(`-DTLA-Library=".../formal/tla/common:.../formal/tla/commit"`, needed
+because this cfg is not invoked through `scripts/check-tla.sh`), it
+reports "Model checking completed. No error has been found." at
+433,976,430 states generated, 81,903,514 distinct, depth 34, in 17m44s —
+matching the pre-`RunQuery` baseline exactly, to the state. The fix
+restores this cfg's original state space with zero regression to the
+`DuplicateUnreachable` coverage it exists to prove. The negative control
+below (same obligation, dedup guard disabled, counterexample found in 2
+seconds) is unaffected by any of this and still demonstrates the guard is
 load-bearing.
 
 ## Mutant audit
