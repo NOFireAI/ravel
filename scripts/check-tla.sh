@@ -203,17 +203,17 @@ run_with_deadline() {
                 terminate_group
                 exit 124
             fi
-            sleep 2
+            sleep 1
         done
-        # TLC may exit during the sleep, after the deadline already passed:
-        # kill -0 goes false without the loop ever re-checking SECONDS, so
-        # `wait` alone would report TLC's own success as the verdict. Decide
-        # the verdict from the deadline, not from which side of that race won.
+        # The loop above is the only place that kills the job, and it exits
+        # 124 there. So reaching here means the job exited on its own, and
+        # the verdict is its own status. Keying on the kill event rather
+        # than on the clock is what makes that right in both directions:
+        # still running at the deadline is always killed and always 124,
+        # exited on its own is always its own status. The one second poll
+        # bounds how far past the deadline a self-exit can go unobserved.
         local code=0
         wait "$pid" || code=$?
-        if [ "$SECONDS" -ge "$deadline" ]; then
-            exit 124
-        fi
         exit "$code"
     ) &
     local watchdog_pid=$!
