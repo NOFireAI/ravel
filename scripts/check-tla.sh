@@ -14,7 +14,8 @@
 #   ci           [-a AREA]   smoke + negative + traceability under one run id
 #   all          [-a AREA]   ci, then exhaustive, under one run id
 #
-# Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java).
+# Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java
+# or no GNU timeout(1)).
 #
 # The TLC jar is resolved once and checksum-pinned. Set RAVEL_TLA_TOOLS_JAR to
 # an operator-supplied jar (verified against the pin, never downloaded); else it
@@ -29,6 +30,9 @@ TLA_JAR_URL="https://github.com/tlaplus/tlaplus/releases/download/v${TLA_VERSION
 
 SMOKE_BUDGET=300
 EXHAUSTIVE_BUDGET=3600
+TIMEOUT_KILL_AFTER=30
+
+TIMEOUT_BIN=""
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 FORMAL_DIR="$REPO_ROOT/formal/tla"
@@ -61,6 +65,28 @@ resolve_java() {
     fi
     JAVA="$java"
     note "java: $java (version $ver)"
+}
+
+# resolve_timeout: pick GNU timeout(1) once, before any lane launches
+# anything, so a run that would otherwise start unbounded refuses instead.
+# Only GNU coreutils' timeout supports --kill-after, which is the mechanism
+# every budget in this script relies on; BSD/macOS ship no `timeout` at all,
+# so the coreutils one arrives as `gtimeout` there (Homebrew). A `timeout`
+# on PATH that isn't GNU coreutils (some minimal containers ship a look-alike)
+# is rejected the same as no binary at all: it silently drops --kill-after
+# and turns a hang into an unbounded run instead of a report.
+resolve_timeout() {
+    local candidate
+    for candidate in timeout gtimeout; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && "$candidate" --version 2>/dev/null | grep -qi 'GNU coreutils'; then
+            TIMEOUT_BIN="$candidate"
+            note "timeout: $candidate (GNU coreutils)"
+            return 0
+        fi
+    done
+    note "GNU timeout(1) not found; on macOS run: brew install coreutils"
+    exit 2
 }
 
 # sha256 of a file: coreutils sha256sum where present, else the shasum that
@@ -168,108 +194,18 @@ record_row() {
         "$RUN_ID" "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$LAST_RUN"
 }
 
-# run_with_deadline <budget-seconds> <logfile> <cwd> <cmd...>
-# Pure-shell fallback for timeout(1)/gtimeout(1) when neither is on PATH.
-# Runs <cmd...> in <cwd> as a backgrounded job under job control, which gives
-# it its own process group, so a JVM's own children can't survive the
-# wrapper the way they would from a plain `kill $pid`. Returns 124 on
-# expiry, matching timeout(1)'s convention, so callers already keyed off
-# that exit code work unchanged.
-#
-# The deadline is enforced by a timer running alongside the job, not by
-# polling: a poll interval can't tell "exited just before the deadline"
-# from "exited just after it" apart, since both look identical between two
-# polls. The timer fires once at exactly the budget, checks the job is
-# still alive right there, and only then kills it and records the timeout
-# (in that order, so a job that finishes in the same instant the timer
-# expires is checked before, not after, the kill). The verdict is keyed on
-# whether that record was made, never on a clock reading: still alive at
-# the deadline is always killed and always 124, exited on its own before
-# the timer acts is always its own status.
-run_with_deadline() {
-    local budget="$1" logfile="$2" cwd="$3"
-    shift 3
-    local flag
-    flag="$(mktemp -u "${TMPDIR:-/tmp}/check-tla-deadline.XXXXXX")" || return 1
-    (
-        set -m
-        cd "$cwd" && "$@" > "$logfile" 2>&1 &
-        local pid=$!
-        local timer_pid=""
-
-        terminate_group() {
-            kill -TERM -"$pid" 2>/dev/null
-            sleep 1
-            kill -KILL -"$pid" 2>/dev/null
-            wait "$pid" 2>/dev/null
-        }
-        cancel_timer() {
-            [ -n "$timer_pid" ] || return 0
-            kill -TERM -"$timer_pid" 2>/dev/null
-            wait "$timer_pid" 2>/dev/null
-        }
-        on_term() { terminate_group; cancel_timer; exit 143; }
-        on_int()  { terminate_group; cancel_timer; exit 130; }
-        on_hup()  { terminate_group; cancel_timer; exit 129; }
-        trap on_term TERM
-        trap on_int INT
-        trap on_hup HUP
-
-        # The timer job: its `sleep` and the `if` after it share the timer
-        # process's own group (set -m puts every backgrounded job in its
-        # own group), so killing that one pid's group from cancel_timer
-        # reaps the sleep too and nothing outlives this function.
-        ( sleep "$budget"
-          if kill -0 "$pid" 2>/dev/null; then
-              : > "$flag"
-              terminate_group
-          fi
-        ) &
-        timer_pid=$!
-
-        local code=0
-        wait "$pid" || code=$?
-        cancel_timer
-
-        if [ -f "$flag" ]; then
-            exit 124
-        fi
-        exit "$code"
-    ) &
-    local watchdog_pid=$!
-    # The watchdog subshell keeps our own process group; only the TLC job it
-    # backgrounds under `set -m` gets a group of its own. So a plain
-    # `kill <our-pid>` from outside (a terminal interrupt, or a harness
-    # killing this script) never reaches the subshell on its own. Forward
-    # the signal to it directly so its own trap, where TLC's pid is in
-    # scope, actually runs and can tear down TLC's group.
-    trap 'kill -TERM "$watchdog_pid" 2>/dev/null' TERM
-    trap 'kill -INT  "$watchdog_pid" 2>/dev/null' INT
-    trap 'kill -HUP  "$watchdog_pid" 2>/dev/null' HUP
-    # A forwarded signal interrupts this wait before the watchdog has
-    # actually torn down TLC's group: bash returns wait early with
-    # 128+signum right when the trap runs, not when watchdog_pid exits.
-    # Keep waiting on the same pid (valid until it's reaped) so this
-    # function can't return, and rm the flag, while that teardown is
-    # still in flight. Once wait completes without the pid still being
-    # alive, its exit status is the watchdog's real one, which for a
-    # forwarded signal is already the conventional 128+signum from the
-    # watchdog's own on_term/on_int/on_hup handler.
-    local code=0
-    while :; do
-        code=0
-        wait "$watchdog_pid" || code=$?
-        kill -0 "$watchdog_pid" 2>/dev/null || break
-    done
-    trap - TERM INT HUP
-    rm -f "$flag"
-    return "$code"
-}
-
 # --- TLC invocation ---------------------------------------------------------
 # Runs TLC on one cfg. Echoes the log path. Returns TLC's exit code.
 # CHECK_DEADLOCK FALSE in a cfg means the model has intentional stutter/terminal
 # states, so pass -deadlock (TLC's flag that DISABLES the deadlock check).
+#
+# The wall-clock ceiling is GNU timeout(1), resolved once into $TIMEOUT_BIN
+# by resolve_timeout before any area runs. `--kill-after=$TIMEOUT_KILL_AFTER`
+# sends TERM at the budget and, if the JVM ignores it, KILL after the grace
+# period: that turns "ignores TERM" from an unbounded hang into a bounded
+# one instead of needing a second layer to catch it. timeout(1) exits 124 on
+# its own TERM, and 137 (128+9) when it had to escalate to KILL; both are
+# mapped to 124 here so callers keyed off that one code work either way.
 run_tlc() {
     local area="$1" module="$2" cfg="$3" budget="$4" logfile="$5"
     local area_dir="$FORMAL_DIR/$area"
@@ -279,32 +215,17 @@ run_tlc() {
     fi
     local metadir="$CACHE_DIR/meta/$area"
     mkdir -p "$metadir"
-    # The wall-clock ceiling prefers coreutils timeout (gtimeout from Homebrew
-    # coreutils on macOS); without either, run_with_deadline enforces it with
-    # a pure-shell watchdog instead of leaving the run unbounded.
-    local -a wrap=()
-    if [ -z "${TIMEOUT_BIN+x}" ]; then
-        if command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN=timeout
-        elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN=gtimeout
-        else
-            TIMEOUT_BIN=""
-            note "neither timeout nor gtimeout on PATH: using shell watchdog for wall-clock ceiling"
-        fi
-    fi
-    if [ -n "$TIMEOUT_BIN" ]; then wrap=("$TIMEOUT_BIN" "$budget"); fi
     # The library path carries the shared common/ module first, then the area
     # dir, so any area can EXTEND or INSTANCE RavelObjectStore. The area dir
     # comes second so a same-named module in the area still wins locally.
     local libpath="$FORMAL_DIR/common:$area_dir"
     local code=0
-    if [ -n "$TIMEOUT_BIN" ]; then
-        ( cd "$area_dir" && "${wrap[@]}" "$JAVA" -XX:+UseParallelGC \
-            -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
-            -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
-    else
-        run_with_deadline "$budget" "$logfile" "$area_dir" \
-            "$JAVA" -XX:+UseParallelGC -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
-            -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" || code=$?
+    ( cd "$area_dir" && "$TIMEOUT_BIN" "--kill-after=$TIMEOUT_KILL_AFTER" "$budget" \
+        "$JAVA" -XX:+UseParallelGC -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
+        -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
+    if [ "$code" -eq 137 ]; then
+        note "$area/$module: ignored TERM at the ${budget}s budget, needed the ${TIMEOUT_KILL_AFTER}s kill-after grace period"
+        code=124
     fi
     return $code
 }
@@ -643,6 +564,14 @@ main() {
     esac
 
     resolve_java
+    # Resolved once, before any lane launches anything, and even for a lane
+    # that discovers zero configs to run: a developer without GNU coreutils
+    # must hear about it on the first invocation, not on the first slow run.
+    # traceability enforces no budget and needs no timeout binary at all.
+    case "$cmd" in
+        traceability) : ;;
+        *) resolve_timeout ;;
+    esac
 
     local areas
     if [ -n "$only_area" ]; then

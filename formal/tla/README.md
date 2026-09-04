@@ -46,15 +46,18 @@ config. New areas planned by ADR-1113:
 Requires Java 17 or newer (Temurin 21 is what CI uses). The harness resolves
 Java from `RAVEL_TLA_JAVA` if set, else `java` on `PATH`, and exits 2 if none
 is usable. It needs network access on first run only to fetch the TLC jar,
-unless you supply one with `RAVEL_TLA_TOOLS_JAR` (see below). The per-model
-wall-clock ceiling prefers coreutils `timeout` (`gtimeout` from Homebrew
-coreutils on macOS). Without either, a pure-shell watchdog enforces the same
-budget: it runs TLC in its own process group, and on expiry records the
-timeout and terminates the whole group, so an over-budget run is reported as
-a timeout rather than left running. The verdict follows whether the watchdog
-killed the run, not a clock reading, so a run that finishes on its own keeps
-its own exit status. CI and the fleet executors have `timeout` and take the
-first path.
+unless you supply one with `RAVEL_TLA_TOOLS_JAR` (see below).
+
+The per-model wall-clock ceiling requires GNU `timeout(1)`. Linux ships it as
+`timeout`; on macOS install it with `brew install coreutils`, which provides
+it as `gtimeout`. The harness resolves the binary once at startup, before
+any model runs, and exits 2 with a one-line refusal if neither is GNU
+coreutils' `timeout` (a look-alike that doesn't support `--kill-after` is
+rejected the same as no binary at all). Every TLC invocation runs under
+`timeout --kill-after=30 <budget>`: TERM at the budget, KILL 30 seconds
+later if TERM was ignored. Either way the run is reported as a timeout, not
+left running and not read as a pass. CI runs on Ubuntu, which ships GNU
+`timeout`, so it needs no extra setup.
 
 ```sh
 scripts/check-tla.sh smoke            # fast safety, every area (budget 300s/cfg)
