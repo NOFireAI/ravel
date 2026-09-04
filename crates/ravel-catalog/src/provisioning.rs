@@ -1767,6 +1767,13 @@ mod tests {
     use ravel_object_store::{ObjectStoreBackend, PutMode, PutOptions};
     use std::sync::Arc;
 
+    /// Serializes every test that reads or asserts on the process-global
+    /// [`SHARD_COUNT_DRIFTS`] counter. `cargo test` (unlike nextest) runs a
+    /// binary's tests on threads within one process, so an unguarded
+    /// concurrent increment from another counter-touching test can land
+    /// between a test's `before` read and its `assert_eq!` on the delta.
+    static SHARD_COUNT_DRIFT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn tenant() -> TenantHash {
         TenantHash([0xABu8; 16])
     }
@@ -1921,6 +1928,7 @@ mod tests {
     /// `.expect(...)` on the `Ok` value below panicked.
     #[tokio::test]
     async fn record_present_above_live_default_is_present_not_refused() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let store = mem();
         seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
         let out = validate_or_adopt(
@@ -1946,6 +1954,7 @@ mod tests {
     /// 8, actual: 4 }`; now it is tolerated and returns the present-record check.
     #[tokio::test]
     async fn record_present_below_live_default_is_present_not_refused() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let store = mem();
         seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
         let out = validate_or_adopt(
@@ -1968,12 +1977,14 @@ mod tests {
 
     /// ADR-0082 drift metric: one validation of a drifted record increments the
     /// drift counter exactly once, and a validation of a matching record
-    /// increments it zero times. The counter is process-global; the gate
-    /// (`scripts/affected-tests.sh`) runs under nextest, which executes each test
-    /// in its own process, so this exact delta is not shared with the other
-    /// drift tests in this binary.
+    /// increments it zero times. The counter is process-global, so this test
+    /// holds [`SHARD_COUNT_DRIFT_TEST_LOCK`] for its whole body to keep its
+    /// exact delta correct under a plain `cargo test` run, where all tests in
+    /// this binary share one process (nextest's process-per-test isolation
+    /// would make the lock unnecessary, but cannot be relied on).
     #[tokio::test]
     async fn drift_counter_increments_once_for_drift_zero_for_match() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let store = mem();
         // Drifted record (recorded 4, live default 2): exactly one increment.
         seed_record(store.as_ref(), &tenant(), Signal::Metrics, 4).await;
@@ -2025,6 +2036,7 @@ mod tests {
     /// detected.
     #[tokio::test]
     async fn drifted_record_with_corrupt_generations_does_not_count_as_drift() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let store = mem();
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let record = sysproto::ProvisioningRecord {
@@ -2081,6 +2093,7 @@ mod tests {
     /// `CorruptGenerations` before drift is ever counted.
     #[tokio::test]
     async fn drifted_record_with_nonzero_first_activation_does_not_count_as_drift() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let store = mem();
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let record = sysproto::ProvisioningRecord {
