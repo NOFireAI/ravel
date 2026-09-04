@@ -26,7 +26,7 @@ otherwise.
 | negative/no-cross-shard-atomicity.cfg | 243 | 174 | n/a | 1 | VIOLATED as required (NoCrossShardAtomicityUnreachable) |
 | negative/query-reads-uncommitted-data.cfg | 77 | 65 | n/a | 1 | VIOLATED as required (NoUncommittedDataVisible) |
 | traceability | n/a | n/a | n/a | n/a | PASS, 21 rows resolve |
-| exhaustive.cfg | 642136435 | 148881235 | 38 | 2728 | PASS |
+| exhaustive.cfg | 17892751 | 5466239 | 36 | 181 | PASS |
 
 The negative rows are the required outcome: each config disables a guard or
 flips a broken-behaviour switch, and TLC finding the counterexample proves
@@ -44,9 +44,9 @@ identity-reuse coverage needs — a single content value can't distinguish
 reuse-with-same-content from reuse-with-different-content),
 `FlushLifetime=1`/`MaxTicks=2` (the
 floor `ASSUME FlushLifetime > 0` and deadline-reachability allow), and
-`MaxRetries=0`/`Writers={w1}` (already at their floor). Two coverage items
-are given up versus the pre-task cfg. `MaxRetries` runs at 0 instead of 1,
-dropping the second-retry interleaving from the exhaustive lane
+`MaxRetries=0`/`Writers={w1}` (already at their floor). Three coverage
+items are given up versus the pre-task cfg. `MaxRetries` runs at 0 instead
+of 1, dropping the second-retry interleaving from the exhaustive lane
 specifically (the retry path itself is still exercised at `MaxRetries=1`
 elsewhere, in `negative/at-least-once-duplicate-reachable.cfg` and
 `dedup-mutant.cfg`). `NoUncommittedDataVisible` is dropped from this cfg's
@@ -56,9 +56,14 @@ single-fire action whose firing point can land at any reachable state, and
 that timing choice alone was enough to stop this cfg from converging (see
 below). `smoke.cfg` (`CheckQuery=TRUE`) and the dedicated negative/mutant
 coverage in `negative/query-reads-uncommitted-data.cfg` still exercise the
-invariant at floor bounds; `exhaustive.cfg` already gave up `MaxRetries`
-coverage the same way, so this follows existing precedent rather than
-setting a new one.
+invariant at floor bounds. `TokenNeverServesStale` is dropped the same way,
+with a new `CheckToken` constant gating `ResolveToken` and the
+`TombstoneBucket`/`SupersedeRecord` actions that feed it: the same
+single-fire, any-reachable-state pattern that made `RunQuery` costly here.
+`smoke.cfg` (`CheckToken=TRUE`) still proves it exhaustively at floor
+bounds. `exhaustive.cfg` already gave up `MaxRetries` and `CheckQuery`
+coverage the same way, so `CheckToken` follows existing precedent rather
+than setting a new one.
 
 At the previous floor (`CheckQuery` unconditionally wired in, no gate),
 `exhaustive.cfg` did not complete: run via `scripts/check-tla.sh exhaustive
@@ -72,25 +77,62 @@ auto` resolving to 8 workers on this session's 8-core host rather than the
 4 workers/4 cores recorded for host `rp1` above; wall time is
 host-dependent and not banded, so this is not a regression against the
 banded figures). `bands.tsv` now carries a real exhaustive row for this
-figure. Separately: the task that produced this cfg cited a 45-minute
-exhaustive budget "mandated by ADR-1113"; the ADR
-(`docs/adrs/1113-tla-verification-suite.md`) states 45 minutes only for the
-PR-gating `tla` workflow's smoke/negative/traceability job, and gives
-exhaustive its own nightly job at a 120-minute budget, while
-`scripts/check-tla.sh` itself hardcodes 3600 seconds (60 minutes) for
-`exhaustive` — three different numbers across the task framing, the ADR,
-and the script. This run's 2728s fits the script's 3600s budget and the
-ADR's 120-minute nightly budget comfortably, but is 28 seconds over a
-literal 45-minute reading, which only sharpens the mismatch.
-`scripts/check-tla.sh` sits outside this task's scope
-(`formal/tla/commit/`), so the mismatch is reported here and in the final
-task report rather than edited.
+figure. Separately, on the three budget figures that appear in ADR-1113 and the
+harness: they are not in conflict, and an earlier task spec conflated them.
+Sixty minutes is the per-configuration ceiling for `exhaustive`, which is
+what `scripts/check-tla.sh` encodes as `EXHAUSTIVE_BUDGET=3600` and the
+only one this configuration must meet. Forty-five minutes is the total
+budget of the PR-gating `tla` job, which runs smoke, negative and
+traceability and does not run `exhaustive` at all. One hundred and twenty
+minutes is the total budget of the nightly workflow, which is where
+`exhaustive` actually runs. Each number governs a different thing.
+
+With `CheckQuery=FALSE` alone, `exhaustive.cfg` fit the script's 3600s
+budget (2728s, 76%) but not with real margin: a second host measured this
+same cfg at 4142s, over budget, and reported PASS only because that host
+lacked `timeout`/`gtimeout` to enforce the ceiling, which `check-tla.sh`
+announces but does not fail on. A gate whose pass/fail outcome depends on
+whether the host has `timeout` installed is not a gate. `ResolveToken`
+(and `TombstoneBucket`/`SupersedeRecord`, which feed it) were the
+remaining unconditionally-enabled, single-fire, any-reachable-state
+actions, supporting only `TokenNeverServesStale`, and exhibiting the same
+blowup mechanism `RunQuery` did before `CheckQuery` existed. Adding a
+`CheckToken` constant, identical in mechanism to `CheckQuery`, and setting
+it `FALSE` here with `TokenNeverServesStale` dropped from this cfg's
+`INVARIANT` list cuts the run from 148,881,235 distinct/depth 38/2728s to
+17,892,751 generated, 5,466,239 distinct, depth 36, 181s, about 5% of the
+3600s ceiling and well under the 1500s target with real margin on either
+host. `smoke.cfg` (`CheckToken=TRUE`) re-run after the change produced
+byte-identical figures to its pre-change baseline (97,311 generated,
+29,064 distinct, depth 24), confirming the gate is inert when enabled and
+that `TokenNeverServesStale` is still proved exhaustively, just at
+`smoke.cfg`'s one-shard bounds instead of `exhaustive.cfg`'s two.
+
+Two-shard reachability for the coverage this cfg exists to keep was
+checked directly, not assumed. A scratch probe module
+(`MCProbe.tla`, outside the repository, extending `MCCommitProtocol`)
+asserted the negation of each invariant's non-vacuous antecedent as a
+must-be-violated `INVARIANT`, run under `exhaustive.cfg`'s exact
+(post-shrink) constants:
+
+- `~(marker = "written")`: VIOLATED (exit 12, depth 8), proving the
+  marker-write state, which requires `AllShardsDurable` across both
+  shards simultaneously, is reached.
+- `~(\E f \in FlushIds : ackKind[f] = "strict" /\ ~AllShardsDurable)`:
+  VIOLATED (exit 12, depth 6), proving a strict ack fires while the two
+  shards are not yet uniformly durable, the genuine cross-shard partial
+  interleaving `PartialReportingMatchesSignal` exists to catch.
+
+The flush-lifetime deadline obligation was re-checked rather than assumed
+carried over: `negative/deadline-reachable.cfg`, which pins these same
+constants, still reports `AbandonUnreachable` VIOLATED (exit 12) after the
+`CheckToken` change, at unchanged bounds.
 
 ## By-hand runs
 
 | Run | Spec/Invariant | States generated | Distinct | Depth | Result |
 |---|---|---|---|---|---|
-| dedup-mutant.cfg | DuplicateUnreachable only, RetryDedups=TRUE | 433976430 | 81903514 | 34 | PASS (exit 0), 17m44s |
+| dedup-mutant.cfg | DuplicateUnreachable only, RetryDedups=TRUE | 14974258 | 3443658 | 32 | PASS (exit 0), 1m24s |
 | live.cfg | FairSpec / EveryPinnedFlushSettles | 42119 | 15812 | 13 | PASS (exit 0), under 1s |
 
 `dedup-mutant.cfg` used to complete in 25 minutes (433,976,430 generated,
@@ -119,6 +161,16 @@ restores this cfg's original state space with zero regression to the
 below (same obligation, dedup guard disabled, counterexample found in 2
 seconds) is unaffected by any of this and still demonstrates the guard is
 load-bearing.
+
+Adding `CheckToken = FALSE` to `dedup-mutant.cfg`, on top of its existing
+`CheckQuery = FALSE` and for the same reason (this cfg does not list
+`TokenNeverServesStale` either), cuts it further. Run by hand the same way
+as before, it reports "Model checking completed. No error has been
+found." at 14,974,258 states generated, 3,443,658 distinct, depth 32, in
+1m24s, down from 17m44s. `DuplicateUnreachable` coverage is unaffected;
+the negative control (`negative/at-least-once-duplicate-reachable.cfg`,
+same obligation, dedup guard disabled) still finds its counterexample in
+2 seconds.
 
 ## Mutant audit
 
