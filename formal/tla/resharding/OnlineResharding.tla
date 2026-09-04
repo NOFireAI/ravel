@@ -142,16 +142,6 @@ ActiveCount(g, h) ==
     LET A == { i \in 1..Len(g) : g[i].act <= h }
     IN IF A = {} THEN g[1].count ELSE g[MaxIdx(A)].count
 
-\* scan_count: activated generations, each held for `slack` hours past its
-\* successor's activation.
-Contributes(g, i, h, slack) ==
-    /\ g[i].act <= h
-    /\ (i = Len(g) \/ h < g[i + 1].act + slack)
-
-ScanCount(g, h, slack) ==
-    LET Cs == { g[i].count : i \in { i \in 1..Len(g) : Contributes(g, i, h, slack) } }
-    IN IF Cs = {} THEN g[1].count ELSE MaxOf(Cs)
-
 \* max_scan_count_over_range: one shard bound covering every hour in [f, t].
 RangeScanCount(g, f, t, slack) ==
     LET Cs == { g[i].count :
@@ -678,9 +668,15 @@ LeadCoversRefreshHorizon ==
 \* the appender is never required to act.
 FairSpec ==
     /\ Spec
-    \* The writer's refresh loop retries on its own; nothing external is
-    \* required to make a pending refresh-and-admit succeed.
-    /\ \A w \in Writers : WF_vars(AdmitAfterRefresh(w))
+    \* Strong, not weak: FlushClose/FlushOpen can toggle CanAdmit's "open
+    \* flush" guard every step, so this action is never continuously enabled,
+    \* only enabled infinitely often, which is exactly the gap weak fairness
+    \* leaves open. Strong fairness is the right assumption because
+    \* ravel-ingest's write loop (router.rs) never suspends with a flush
+    \* closed: closing one and opening the next are back-to-back steps of the
+    \* same loop, so the real writer keeps re-entering the enabled state on
+    \* its own, with no external event required, for as long as it runs.
+    /\ \A w \in Writers : SF_vars(AdmitAfterRefresh(w))
     \* A writer with no open flush always opens one on its own next tick.
     /\ \A w \in Writers : WF_vars(FlushOpen(w))
     \* An open flush is always closed once its window elapses.
