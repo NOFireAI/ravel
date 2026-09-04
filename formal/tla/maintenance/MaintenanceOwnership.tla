@@ -331,7 +331,7 @@ PutPart(u, v) ==
 DoPublish(u, v) ==
     LET rk  == RecordKey(u)
         rp  == Present(rk)
-        wv  == IF rp /\ firstRecord[u] # NoRec THEN firstRecord[u][2] ELSE v
+        wv  == IF rp THEN ContentOf(rk)[2] ELSE v
         wpk == PartKey(u, wv)
     IN
     IF ~rp
