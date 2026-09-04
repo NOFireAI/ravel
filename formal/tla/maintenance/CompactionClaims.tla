@@ -80,6 +80,7 @@ OContent == {NoC, Corrupt, Scr} \cup ClaimContentSet
               \cup {<<u, v>> : u \in Units, v \in Variants}
 
 ASSUME NoC # Corrupt /\ NoC # Scr /\ Corrupt # Scr
+ASSUME Corrupt \notin ClaimContentSet
 ASSUME NoRec \notin OContent
 
 VARIABLES
