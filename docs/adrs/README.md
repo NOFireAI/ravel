@@ -146,3 +146,4 @@ the reservation commit that used to work around it.
 | [1170](1170-process-memory-budget.md) | One process-wide memory budget: a `MemoryBudget` accountant the tenant accountants adapt to, byte reservations at the fetch layer where the unit is known, a static carve under one number, and the aggregate logged and gauged | Proposed |
 | [1195](1195-unbundle-fetch-concurrency.md) | Unbundle `--fetch-concurrency`, and make GET concurrency a process-wide limit | Proposed |
 | [1196](1196-fetch-objective-cost-first-default-latency-first-policy.md) | Keep the cost-first fetch default, add a latency-first policy | Proposed |
+| [1199](1199-bounded-query-io-and-tail-checkpoints.md) | Bounded query I/O accounting, and a pre-registered measured gate deciding whether an L0.5 tail checkpoint gets built at all | Proposed |
