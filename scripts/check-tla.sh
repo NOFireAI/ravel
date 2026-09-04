@@ -171,19 +171,31 @@ record_row() {
 # run_with_deadline <budget-seconds> <logfile> <cwd> <cmd...>
 # Pure-shell fallback for timeout(1)/gtimeout(1) when neither is on PATH.
 # Runs <cmd...> in <cwd> as a backgrounded job under job control, which gives
-# it its own process group, then polls its liveness. On expiry it kills the
-# whole group (not just the job leader), so a JVM's own children can't
-# survive the wrapper the way they would from a plain `kill $pid`. Returns
-# 124 on expiry, matching timeout(1)'s convention, so callers already keyed
-# off that exit code work unchanged.
+# it its own process group, so a JVM's own children can't survive the
+# wrapper the way they would from a plain `kill $pid`. Returns 124 on
+# expiry, matching timeout(1)'s convention, so callers already keyed off
+# that exit code work unchanged.
+#
+# The deadline is enforced by a timer running alongside the job, not by
+# polling: a poll interval can't tell "exited just before the deadline"
+# from "exited just after it" apart, since both look identical between two
+# polls. The timer fires once at exactly the budget, checks the job is
+# still alive right there, and only then kills it and records the timeout
+# (in that order, so a job that finishes in the same instant the timer
+# expires is checked before, not after, the kill). The verdict is keyed on
+# whether that record was made, never on a clock reading: still alive at
+# the deadline is always killed and always 124, exited on its own before
+# the timer acts is always its own status.
 run_with_deadline() {
     local budget="$1" logfile="$2" cwd="$3"
     shift 3
+    local flag
+    flag="$(mktemp -u "${TMPDIR:-/tmp}/check-tla-deadline.XXXXXX")" || return 1
     (
         set -m
         cd "$cwd" && "$@" > "$logfile" 2>&1 &
         local pid=$!
-        local deadline=$((SECONDS + budget))
+        local timer_pid=""
 
         terminate_group() {
             kill -TERM -"$pid" 2>/dev/null
@@ -191,29 +203,37 @@ run_with_deadline() {
             kill -KILL -"$pid" 2>/dev/null
             wait "$pid" 2>/dev/null
         }
-        on_term() { terminate_group; exit 143; }
-        on_int()  { terminate_group; exit 130; }
-        on_hup()  { terminate_group; exit 129; }
+        cancel_timer() {
+            [ -n "$timer_pid" ] || return 0
+            kill -TERM -"$timer_pid" 2>/dev/null
+            wait "$timer_pid" 2>/dev/null
+        }
+        on_term() { terminate_group; cancel_timer; exit 143; }
+        on_int()  { terminate_group; cancel_timer; exit 130; }
+        on_hup()  { terminate_group; cancel_timer; exit 129; }
         trap on_term TERM
         trap on_int INT
         trap on_hup HUP
 
-        while kill -0 "$pid" 2>/dev/null; do
-            if [ "$SECONDS" -ge "$deadline" ]; then
-                terminate_group
-                exit 124
-            fi
-            sleep 1
-        done
-        # The loop above is the only place that kills the job, and it exits
-        # 124 there. So reaching here means the job exited on its own, and
-        # the verdict is its own status. Keying on the kill event rather
-        # than on the clock is what makes that right in both directions:
-        # still running at the deadline is always killed and always 124,
-        # exited on its own is always its own status. The one second poll
-        # bounds how far past the deadline a self-exit can go unobserved.
+        # The timer job: its `sleep` and the `if` after it share the timer
+        # process's own group (set -m puts every backgrounded job in its
+        # own group), so killing that one pid's group from cancel_timer
+        # reaps the sleep too and nothing outlives this function.
+        ( sleep "$budget"
+          if kill -0 "$pid" 2>/dev/null; then
+              : > "$flag"
+              terminate_group
+          fi
+        ) &
+        timer_pid=$!
+
         local code=0
         wait "$pid" || code=$?
+        cancel_timer
+
+        if [ -f "$flag" ]; then
+            exit 124
+        fi
         exit "$code"
     ) &
     local watchdog_pid=$!
@@ -229,6 +249,7 @@ run_with_deadline() {
     local code=0
     wait "$watchdog_pid" || code=$?
     trap - TERM INT HUP
+    rm -f "$flag"
     return "$code"
 }
 
