@@ -831,8 +831,8 @@ pub struct Cli {
     /// catalog cache at a smaller share (they are separate LRU caches, so one
     /// number would double-commit RAM). Read at startup only; there is no live
     /// resize. Ignored when `--disable-cache` is set. Default when unset:
-    /// derived, 80% of MemTotal for the fetcher cache and 5% for the catalog
-    /// byte cache; reference host (16 cores, 30 GB): 25,769,803,776 and
+    /// derived, 25% of MemTotal for the fetcher cache and 5% for the catalog
+    /// byte cache; reference host (16 cores, 30 GB): 8,053,063,680 and
     /// 1,610,612,736. Fallback when MemTotal is unknown: 256 MiB each.
     ///
     /// Omitted, the value is DERIVED from the host
@@ -1552,9 +1552,30 @@ pub const FETCH_CONCURRENCY_PER_CORE: usize = 2;
 /// fan-out rather than dropping below it.
 pub const MIN_DERIVED_FETCH_CONCURRENCY: usize = 8;
 
-/// Share of `MemTotal` the derived `--cache-max-bytes` takes. 80% on the
-/// 30 GB reference host is the ~24 GiB read cache of the #968 measurement.
-pub const CACHE_MEMORY_PERCENT: u64 = 80;
+/// Share of `MemTotal` the derived `--cache-max-bytes` takes.
+///
+/// 25% rather than a larger share because the cache does not have the machine
+/// to itself. Measured on the 30 GiB reference host with ten concurrent
+/// connections (issue #1170), the query and fetch working set peaks at
+/// 17.2-20.8 GB and does NOT vary with the cache ceiling: it is an independent
+/// claim on the same memory. The budget is therefore a subtraction, not a
+/// preference.
+///
+/// | cache cap | error ratio | peak RSS | peak non-cache |
+/// |---|---|---|---|
+/// | 4 GiB | 0.035 | 20.0 GB | 18.1 GB |
+/// | 8 GiB | 0.044 | 23.7 GB | 18.3 GB |
+/// | 12 GiB | 0.997 | 24.8 GB | 17.2 GB |
+///
+/// The cliff between 8 and 12 GiB is where the sum crosses what the host has.
+/// At the previous 80% this resolved to 26.3 GB against a query path needing
+/// 20 GB on the same box, which is not satisfiable at any load: the server
+/// reached 31.4 GB and was OOM-killed roughly four minutes into the
+/// concurrency phase, taking the run with it.
+///
+/// This buys headroom; it does not by itself make the process fit. Bounding the
+/// query and fetch working set is #1170's remaining subject.
+pub const CACHE_MEMORY_PERCENT: u64 = 25;
 
 /// Share of `MemTotal` the derived catalog byte cache takes, a SEPARATE ceiling
 /// from [`CACHE_MEMORY_PERCENT`]. The fetcher cache (`store::build_cache`) and
@@ -4868,7 +4889,7 @@ mod tests {
     /// produced "about 24 GiB" would be a different rule.
     ///
     /// Prove-the-test: flip `CACHE_MEMORY_PERCENT` from 80 to 75 and the cache
-    /// assertion reads 24,159,191,040 against the expected 25,769,803,776; flip
+    /// assertion reads 24,159,191,040 against the expected 8,053,063,680; flip
     /// `FETCH_CONCURRENCY_PER_CORE` from 2 to 1 and the concurrency assertion
     /// reads 16 against the expected 32.
     #[test]
@@ -4876,7 +4897,7 @@ mod tests {
         let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
 
         assert_eq!(resolved.fetch_concurrency, 32);
-        assert_eq!(resolved.cache_max_bytes, 25_769_803_776);
+        assert_eq!(resolved.cache_max_bytes, 8_053_063_680);
         // The catalog byte cache derives at its own 5% share, a separate
         // ceiling from the fetcher cache's 80%, so the pair does not commit
         // 160% of RAM.
@@ -4917,7 +4938,7 @@ mod tests {
         let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
 
         assert_eq!(resolved.fetch_concurrency, 8);
-        assert_eq!(resolved.cache_max_bytes, 6_871_947_673);
+        assert_eq!(resolved.cache_max_bytes, 2_147_483_647);
         // Catalog cache is 5% of the same 8 GiB, truncated.
         assert_eq!(resolved.catalog_cache_max_bytes, 429_496_729);
         assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
@@ -4985,7 +5006,7 @@ mod tests {
     /// Prove-the-test: drop the `Some(n) => (n, PERF_SOURCE_FLAG)` arm from any
     /// one match in `resolve_performance_defaults` and that field's assertion
     /// reads its derived value against the expected flag value (for
-    /// `cache_max_bytes`: 25,769,803,776 against the expected 4096).
+    /// `cache_max_bytes`: 8,053,063,680 against the expected 4096).
     #[test]
     fn an_explicit_flag_overrides_each_derived_value_independently() {
         let derived = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
@@ -5137,14 +5158,14 @@ mod tests {
     /// pre-#1141 coupling. Exact integers, one host shape each.
     ///
     /// Prove-the-test: change [`CATALOG_CACHE_MEMORY_PERCENT`] from 5 to 80 and
-    /// the reference assertion reads 25,769,803,776 against the expected
+    /// the reference assertion reads 8,053,063,680 against the expected
     /// 1,610,612,736; drop the `(Some(n), _)` arm of the catalog match and the
     /// explicit-flag case reads the derived 1,610,612,736 against 12,345,678.
     #[test]
     fn the_catalog_cache_derives_at_its_own_share_and_the_flag_couples_both() {
         // Reference profile: fetcher 80%, catalog 5% of the same total.
         let reference = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
-        assert_eq!(reference.cache_max_bytes, 25_769_803_776);
+        assert_eq!(reference.cache_max_bytes, 8_053_063_680);
         assert_eq!(reference.catalog_cache_max_bytes, 1_610_612_736);
 
         // 4 cores / 8 GiB.
@@ -5370,7 +5391,7 @@ mod tests {
     ///
     /// Prove-the-test: change `main`'s `cache_max_bytes: performance.cache_max_bytes`
     /// back to a raw flag read and the unset case can no longer produce
-    /// 25,769,803,776 at all.
+    /// 8,053,063,680 at all.
     #[test]
     fn cache_max_bytes_resolves_from_the_flag_or_the_host() {
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
@@ -5438,7 +5459,7 @@ mod tests {
     /// literal integers rather than recomputed from the percentages, so a
     /// change to the rule has to restate the number it produces.
     const REFERENCE_FETCH_CONCURRENCY: usize = 32;
-    const REFERENCE_CACHE_MAX_BYTES: u64 = 25_769_803_776;
+    const REFERENCE_CACHE_MAX_BYTES: u64 = 8_053_063_680;
     const REFERENCE_SQL_MAX_QUERY_BYTES: usize = 8_053_063_680;
     const REFERENCE_SQL_TENANT_MAX_BYTES: usize = 16_106_127_360;
 

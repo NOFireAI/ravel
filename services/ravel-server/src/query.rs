@@ -527,12 +527,12 @@ mod catalog_cache_tests {
     /// `ResolvedPerformanceDefaults::catalog_cache_max_bytes`). The catalog
     /// cache is a SEPARATE ceiling from the fetcher cache: on the reference
     /// profile it resolves to 5% of `MemTotal` (1,610,612,736) while the fetcher
-    /// cache `store::build_cache` bounds stays at 80% (25,769,803,776), so the
+    /// cache `store::build_cache` bounds stays at 25% (8,053,063,680), so the
     /// two independent LRU caches do not each claim the full share. An explicit
     /// `--cache-max-bytes` sets both equal.
     ///
-    /// Prove-the-test: pass `resolved.cache_max_bytes` (the fetcher 80% number)
-    /// to `build_catalog` here and the first assertion reads 25,769,803,776
+    /// Prove-the-test: pass `resolved.cache_max_bytes` (the fetcher 25% number)
+    /// to `build_catalog` here and the first assertion reads 8,053,063,680
     /// against the expected 1,610,612,736.
     #[test]
     fn the_derived_cache_max_bytes_reaches_the_catalog_byte_cache() {
@@ -545,7 +545,7 @@ mod catalog_cache_tests {
             .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
             .expect("performance defaults resolve");
         // The two caches derive to different ceilings on the same host.
-        assert_eq!(resolved.cache_max_bytes, 25_769_803_776);
+        assert_eq!(resolved.cache_max_bytes, 8_053_063_680);
         assert_eq!(resolved.catalog_cache_max_bytes, 1_610_612_736);
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
