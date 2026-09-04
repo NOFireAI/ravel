@@ -838,9 +838,12 @@ enum TenancyCommand {
     /// object-store prefix (`t/<hash>/`) on stdout and nothing else (issue
     /// #1180): the one entry point for turning a tenant id into the prefix a
     /// bytes-summed total, a lifecycle rule, or an erasure check needs,
-    /// instead of scraping it off a failure message. Exits nonzero if the
-    /// bucket's scheme needs a key that was not supplied via the global
-    /// `--tenant-hash-key-file` / `--tenant-hash-unkeyed`.
+    /// instead of scraping it off a failure message. Exits nonzero when the
+    /// bucket's marker is `v2-keyed` and the global `--tenant-hash-key-file`
+    /// was not given: that flag supplies the key the derivation needs. The
+    /// global `--tenant-hash-unkeyed` is not an alternative way to satisfy a
+    /// keyed marker: it selects the `v1-unkeyed` derivation, and is itself
+    /// rejected against a keyed bucket.
     Resolve {
         /// Tenant id to resolve (hashed under the bucket's pinned scheme).
         tenant: String,
