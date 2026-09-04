@@ -131,6 +131,25 @@ here next to the constants, not left implied.**
 - The query engine below the scan set, and fold internals beyond the HEAD
   ceiling stamp.
 - Multi-tenant interference: the model is single-tenant.
+- **The pre-ADR-0052 zero-generation HEAD sentinel.** `head_generations_acceptable`
+  in `crates/ravel-catalog/src/snapshot_resolve.rs` treats a HEAD's
+  `shard_generation_count = 0` (a legacy head written before generation
+  tracking existed) the same as `shard_generation_count = 1`: the first
+  unknown generation index is `shard_generation_count.max(1)` either way.
+  `HeadRecs` in this model restricts `genCount` to `1..(MaxGenerations + 1)`,
+  so it cannot represent `genCount = 0` directly, but `Acceptable(hd, g)`
+  already clamps with the same expression (`IF hd.genCount > 1 THEN
+  hd.genCount ELSE 1`), so `genCount = 0` and `genCount = 1` produce
+  identical results in every branch of `Acceptable` for every reachable
+  `g` (both map to the same `fu`, and the `hd.genCount >= Len(g)` guard
+  agrees on outcome for the one case, `Len(g) = 1`, where the raw values
+  differ). Widening `HeadRecs` to admit `genCount = 0` would add a
+  distinct state with a provably identical outcome to one already
+  checked, not new coverage. `Fold` also never stamps a head below
+  `Len(Gens) >= 1`, so nothing in this model can produce `genCount = 0`
+  short of adding a dedicated legacy-bootstrap action for a case this
+  argument shows is redundant. Left unmodeled for that reason, not from
+  oversight.
 
 ## Running the checks
 
