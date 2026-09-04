@@ -101,7 +101,7 @@ the process, which this ADR does not propose.
 three. Supplying it together with any of the new flags is a **startup error**
 naming both, not a silent precedence rule.
 
-**Compatibility changes are named, not denied.** Two behaviours change for
+**Compatibility changes are named, not denied.** Three behaviours change for
 existing deployments:
 
 - **RSEG fetchers are raised and then shared.** They move from the compiled
@@ -115,7 +115,7 @@ existing deployments:
 - The distributed fragment path stops being able to exceed the node limit by
   constructing a fetcher per fragment.
 
-Both are the point of the change. Neither is invisible, so the release notes say
+All three are the point of the change. None is invisible, so the release notes say
 so rather than claiming no deployment is affected.
 
 ## Rejected alternatives
