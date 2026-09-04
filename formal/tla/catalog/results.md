@@ -207,7 +207,7 @@ changed.
 Issue #1121 round six (finding 7: whole-entry dedup could serve one record
 identity twice when it appeared in two overlapping L1 outputs) replaced
 `Dedup`'s whole-entry survivor selection with a contribution-level one:
-`Dedup` now returns `SUBSET (AllEntries \X Records)` pairs
+`Dedup` now returns a subset of `AllEntries \X Records`
 (`ContribSurvivors`), so the pass can drop one `(entry, identity)`
 contribution without dropping the entry that carries other identities. This
 changed `TypeOK`'s type for `qy.pinned`, `qy.pinnedAtAttempt`, and
