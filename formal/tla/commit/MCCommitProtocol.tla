@@ -35,7 +35,20 @@ NoCrossShardAtomicityUnreachable ==
 \* commit records holding the same content. AtLeastOnce alone is satisfied by
 \* exactly-once delivery, so this obligation is what the deduplicating
 \* negative control fails.
-DuplicateUnreachable == duplicates = 0
+\* Derived from the STORE: two distinct commit records, both durable, holding
+\* the same content. That is the at-least-once outcome of a client retry whose
+\* first acknowledgement was lost. RetryDedups suppresses the second WRITE, so
+\* flipping it makes this obligation stop firing.
+DuplicateUnreachable ==
+    ~(\E f, g \in FlushIds :
+        /\ retryOf[g] = f
+        /\ Store!Present(CommitKey(f))
+        /\ Store!Present(CommitKey(g)))
+
+\* The flush-lifetime deadline must be REACHABLE, or every property about
+\* abandonment is vacuous at these bounds. Clock room is necessary and not
+\* sufficient, so this is checked rather than inferred from the constants.
+AbandonUnreachable == ~(\E f \in FlushIds : phase[f] = "abandoned")
 
 \* --- Liveness --------------------------------------------------------------
 \* Under weak fairness on the store retry and the flush task only, a pinned
