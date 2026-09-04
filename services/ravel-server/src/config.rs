@@ -1580,7 +1580,7 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// Share of `MemTotal` the derived catalog byte cache takes, a SEPARATE ceiling
 /// from [`CACHE_MEMORY_PERCENT`]. The fetcher cache (`store::build_cache`) and
 /// the catalog byte cache (`query::build_catalog`) are two independent LRU
-/// caches, so deriving both at 80% would let the pair commit 160% of `MemTotal`.
+/// caches, so deriving both at the fetcher's share would double the pair's claim.
 /// 5% on the 30 GB reference host is ~1.5 GiB of catalog objects, enough for a
 /// wide fold's HEAD/part working set without doubling the fetcher's claim. An
 /// explicit `--cache-max-bytes` still bounds both caches at that one value.
@@ -1661,7 +1661,7 @@ pub struct ResolvedPerformanceDefaults {
     /// Reaches the catalog byte cache's byte ceiling
     /// (`query::build_catalog`), a SEPARATE LRU from the fetcher cache. Derived
     /// at [`CATALOG_CACHE_MEMORY_PERCENT`] rather than sharing
-    /// [`Self::cache_max_bytes`]'s 80%; an explicit `--cache-max-bytes` sets
+    /// [`Self::cache_max_bytes`]'s 25%; an explicit `--cache-max-bytes` sets
     /// both equal.
     pub catalog_cache_max_bytes: u64,
     /// Reaches `SqlConfig::max_query_bytes`. Never above
@@ -1705,8 +1705,8 @@ pub struct PerformanceSources {
 /// `percent` percent of `total`, as integer arithmetic in `u128` so the product
 /// cannot overflow for any `u64` total.
 ///
-/// Rounding is TRUNCATION toward zero: 80% of 8 GiB is 6,871,947,673 bytes, not
-/// 6,871,947,674. These are ceilings on resident bytes, so rounding down is the
+/// Rounding is TRUNCATION toward zero: 5% of 8 GiB is 429,496,729 bytes, not
+/// 429,496,730. These are ceilings on resident bytes, so rounding down is the
 /// safe direction, and a fixed rule makes the resolved figure reproducible from
 /// the host's `MemTotal` by hand.
 fn percent_of(total: u64, percent: u64) -> u64 {
@@ -1786,7 +1786,7 @@ pub fn resolve_performance_defaults(
 
     // The catalog byte cache is a SEPARATE LRU from the fetcher cache, so an
     // unset flag derives it at its own smaller share rather than committing a
-    // second 80% of RAM. An explicit `--cache-max-bytes` bounds both at that
+    // second 25% of RAM. An explicit `--cache-max-bytes` bounds both at that
     // one value (the pre-#1141 coupling).
     let (catalog_cache_max_bytes, catalog_cache_source) =
         match (flags.cache_max_bytes, host.mem_total_bytes) {
@@ -4888,8 +4888,8 @@ mod tests {
     /// that measurement ran under. Exact integers, not ranges: a rule that
     /// produced "about 24 GiB" would be a different rule.
     ///
-    /// Prove-the-test: flip `CACHE_MEMORY_PERCENT` from 80 to 75 and the cache
-    /// assertion reads 24,159,191,040 against the expected 8,053,063,680; flip
+    /// Prove-the-test: flip `CACHE_MEMORY_PERCENT` from 25 to 20 and the cache
+    /// assertion reads 6,442,450,944 against the expected 8,053,063,680; flip
     /// `FETCH_CONCURRENCY_PER_CORE` from 2 to 1 and the concurrency assertion
     /// reads 16 against the expected 32.
     #[test]
@@ -4899,8 +4899,8 @@ mod tests {
         assert_eq!(resolved.fetch_concurrency, 32);
         assert_eq!(resolved.cache_max_bytes, 8_053_063_680);
         // The catalog byte cache derives at its own 5% share, a separate
-        // ceiling from the fetcher cache's 80%, so the pair does not commit
-        // 160% of RAM.
+        // ceiling from the fetcher cache's 25%, so the pair does not commit
+        // 50% of RAM.
         assert_eq!(resolved.catalog_cache_max_bytes, 1_610_612_736);
         assert_eq!(resolved.sql_max_query_bytes, 8_053_063_680);
         assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
@@ -4926,19 +4926,22 @@ mod tests {
 
     /// A smaller host gets proportional, safe values from the same rules: 4
     /// cores and 8 GiB. The fetch concurrency lands exactly on the floor here
-    /// (2 * 4 == 8 == MIN_DERIVED_FETCH_CONCURRENCY), and the cache figure is
-    /// the truncated 80% that the documented rounding rule produces.
+    /// (2 * 4 == 8 == MIN_DERIVED_FETCH_CONCURRENCY). At 25% the cache share
+    /// divides 8 GiB evenly, so the truncation the rounding rule specifies is
+    /// only observable on the catalog cache's 5% here.
     ///
     /// Prove-the-test: round the percentage up (`(product + 99) / 100` in
-    /// `percent_of`) and the cache assertion reads 6,871,947,674 against the
-    /// expected 6,871,947,673.
+    /// `percent_of`) and the CATALOG assertion reads 429,496,730 against the
+    /// expected 429,496,729. The cache assertion cannot serve as the rounding
+    /// witness at this size: 8 GiB * 25% is exact, so both rules agree on
+    /// 2,147,483,648 and the mutation would pass unnoticed.
     #[test]
     fn small_host_resolves_proportional_settings() {
         let host = HostProfile::new(4, Some(8 * 1024 * 1024 * 1024));
         let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
 
         assert_eq!(resolved.fetch_concurrency, 8);
-        assert_eq!(resolved.cache_max_bytes, 2_147_483_647);
+        assert_eq!(resolved.cache_max_bytes, 2_147_483_648);
         // Catalog cache is 5% of the same 8 GiB, truncated.
         assert_eq!(resolved.catalog_cache_max_bytes, 429_496_729);
         assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
@@ -5153,7 +5156,7 @@ mod tests {
 
     /// The catalog byte cache is a SEPARATE derived ceiling from the fetcher
     /// cache (issue #1141): unset, it takes 5% of `MemTotal` while the fetcher
-    /// cache takes 80%, so the two independent LRU caches do not each claim the
+    /// cache takes 25%, so the two independent LRU caches do not each claim the
     /// full share; an explicit `--cache-max-bytes` sets both equal, the
     /// pre-#1141 coupling. Exact integers, one host shape each.
     ///
@@ -5163,7 +5166,7 @@ mod tests {
     /// explicit-flag case reads the derived 1,610,612,736 against 12,345,678.
     #[test]
     fn the_catalog_cache_derives_at_its_own_share_and_the_flag_couples_both() {
-        // Reference profile: fetcher 80%, catalog 5% of the same total.
+        // Reference profile: fetcher 25%, catalog 5% of the same total.
         let reference = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
         assert_eq!(reference.cache_max_bytes, 8_053_063_680);
         assert_eq!(reference.catalog_cache_max_bytes, 1_610_612_736);

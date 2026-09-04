@@ -561,7 +561,7 @@ mod catalog_cache_tests {
             catalog.config().byte_cache_max_bytes,
             1_610_612_736,
             "the catalog byte cache must be bounded by the derived catalog ceiling (5% of \
-             MemTotal), not the fetcher cache's 80% and not the compiled-in 256 MiB"
+             MemTotal), not the fetcher cache's 25% and not the compiled-in 256 MiB"
         );
 
         // An explicit --cache-max-bytes couples both caches at that one value.
