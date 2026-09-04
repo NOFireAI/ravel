@@ -500,7 +500,7 @@ pub struct Cli {
     /// query whose pool grow would exceed it aborts rather than growing without
     /// bound. Process-wide, not per-tenant (per-tenant SQL budgets wait on the
     /// limits-file's per-tenant enforcement gap, ADR-0088). Default when unset:
-    /// derived, 25% of MemTotal; reference host (16 cores, 30 GB): 8,053,063,680.
+    /// derived, 25% of MemTotal; reference host (16 cores, 30 GiB): 8,053,063,680.
     /// Fallback when MemTotal is unknown: 256 MiB.
     ///
     /// Omitted, the value is DERIVED from the host
@@ -520,7 +520,7 @@ pub struct Cli {
     /// one tenant's wide scans cannot starve another tenant's query pool. Sits
     /// above `--sql-max-query-bytes` (the per-query ceiling). Process-wide, not
     /// itself per-tenant-overridable (ADR-0088). Default when unset: derived,
-    /// 50% of MemTotal; reference host (16 cores, 30 GB): 16,106,127,360.
+    /// 50% of MemTotal; reference host (16 cores, 30 GiB): 16,106,127,360.
     /// Fallback when MemTotal is unknown: 1 GiB.
     ///
     /// Omitted, the value is DERIVED from the host
@@ -659,7 +659,7 @@ pub struct Cli {
     /// `crates/ravel-sql/src/session.rs`), and S3 GET concurrency (ADR-0087).
     /// Raising it widens all three together; sizing it is a memory-vs-latency
     /// trade against the host's cores and the store's request budget. Default
-    /// when unset: derived, max(8, 2 x cores); reference host (16 cores, 30 GB):
+    /// when unset: derived, max(8, 2 x cores); reference host (16 cores, 30 GiB):
     /// 32. Floor of 8 (the compiled-in default) on a 1-2 core host; this rule is
     /// core-derived, so MemTotal being unknown does not change it.
     ///
@@ -677,7 +677,7 @@ pub struct Cli {
     /// directly (only the narrow `SegmentOrigin::Recent` set, roughly the last
     /// couple of hours, is exempt); this flag is what lets an operator raise it
     /// for such a workload. Default when unset: derived (host-independent):
-    /// 1,000,000; reference host (16 cores, 30 GB): 1,000,000. A segment-count
+    /// 1,000,000; reference host (16 cores, 30 GiB): 1,000,000. A segment-count
     /// cap is a plan-width bound, not resident bytes, so it does not scale with
     /// MemTotal and has no memory fallback.
     ///
@@ -832,7 +832,7 @@ pub struct Cli {
     /// number would double-commit RAM). Read at startup only; there is no live
     /// resize. Ignored when `--disable-cache` is set. Default when unset:
     /// derived, 25% of MemTotal for the fetcher cache and 5% for the catalog
-    /// byte cache; reference host (16 cores, 30 GB): 8,053,063,680 and
+    /// byte cache; reference host (16 cores, 30 GiB): 8,053,063,680 and
     /// 1,610,612,736. Fallback when MemTotal is unknown: 256 MiB each.
     ///
     /// Omitted, the value is DERIVED from the host
@@ -920,7 +920,7 @@ pub struct Cli {
     /// `max_query_duration` (ADR-0050 section 4). Feeds the real
     /// `QueryEngine` (`EngineConfig::deadline`) as well as the validation, so
     /// the value validated is the value enforced. Default when unset: derived
-    /// (host-independent): 11m; reference host (16 cores, 30 GB): 11m. A
+    /// (host-independent): 11m; reference host (16 cores, 30 GiB): 11m. A
     /// deadline is wall-clock, not resident bytes, so it does not scale with
     /// MemTotal and has no memory fallback.
     ///
@@ -1581,7 +1581,7 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// from [`CACHE_MEMORY_PERCENT`]. The fetcher cache (`store::build_cache`) and
 /// the catalog byte cache (`query::build_catalog`) are two independent LRU
 /// caches, so deriving both at the fetcher's share would double the pair's claim.
-/// 5% on the 30 GB reference host is ~1.5 GiB of catalog objects, enough for a
+/// 5% on the 30 GiB reference host is ~1.5 GiB of catalog objects, enough for a
 /// wide fold's HEAD/part working set without doubling the fetcher's claim. An
 /// explicit `--cache-max-bytes` still bounds both caches at that one value.
 pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
@@ -4884,7 +4884,7 @@ mod tests {
     }
 
     /// Issue #1141's headline: with no flags at all, the reference host of the
-    /// #968 ClickBench result (16 cores, 30 GB) resolves to exactly the settings
+    /// #968 ClickBench result (16 cores, 30 GiB) resolves to exactly the settings
     /// that measurement ran under. Exact integers, not ranges: a rule that
     /// produced "about 24 GiB" would be a different rule.
     ///
@@ -5451,7 +5451,7 @@ mod tests {
         );
     }
 
-    /// The reference host of issue #1141: the 16-core / 30 GB box the #968
+    /// The reference host of issue #1141: the 16-core / 30 GiB box the #968
     /// ClickBench result was measured on. Every test in this module resolves
     /// against this injected profile; none reads the real host, so a green run
     /// on a 4-core CI runner means the same thing as on a 64-core one.
