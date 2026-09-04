@@ -246,8 +246,21 @@ run_with_deadline() {
     trap 'kill -TERM "$watchdog_pid" 2>/dev/null' TERM
     trap 'kill -INT  "$watchdog_pid" 2>/dev/null' INT
     trap 'kill -HUP  "$watchdog_pid" 2>/dev/null' HUP
+    # A forwarded signal interrupts this wait before the watchdog has
+    # actually torn down TLC's group: bash returns wait early with
+    # 128+signum right when the trap runs, not when watchdog_pid exits.
+    # Keep waiting on the same pid (valid until it's reaped) so this
+    # function can't return, and rm the flag, while that teardown is
+    # still in flight. Once wait completes without the pid still being
+    # alive, its exit status is the watchdog's real one, which for a
+    # forwarded signal is already the conventional 128+signum from the
+    # watchdog's own on_term/on_int/on_hup handler.
     local code=0
-    wait "$watchdog_pid" || code=$?
+    while :; do
+        code=0
+        wait "$watchdog_pid" || code=$?
+        kill -0 "$watchdog_pid" 2>/dev/null || break
+    done
     trap - TERM INT HUP
     rm -f "$flag"
     return "$code"
