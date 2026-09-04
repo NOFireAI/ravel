@@ -58,8 +58,11 @@ CONSTANTS
     LThief            \* the only thief under LivenessMode
 
 ASSUME LHolder \in Workers /\ LThief \in Workers
+ASSUME LHolder # LThief
+ASSUME LivenessMode \in BOOLEAN
 ASSUME DeclaredLease \in Nat /\ MaxObservedLease \in Nat
 ASSUME MaxV \in Nat /\ MaxTime \in Nat
+ASSUME Units # {}
 
 EffLease == IF DeclaredLease < MaxObservedLease THEN DeclaredLease ELSE MaxObservedLease
 
@@ -75,6 +78,9 @@ OKeys == {ClaimKey(u) : u \in Units}
            \cup {ScratchKey}
 OContent == {NoC, Corrupt, Scr} \cup ClaimContentSet
               \cup {<<u, v>> : u \in Units, v \in Variants}
+
+ASSUME NoC # Corrupt /\ NoC # Scr /\ Corrupt # Scr
+ASSUME NoRec \notin OContent
 
 VARIABLES
     store, lastModified, versionCounter, uploads, listState,

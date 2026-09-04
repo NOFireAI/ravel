@@ -104,6 +104,8 @@ PersistWorker == CHOOSE w \in Workers : \A x \in Workers : w =< x
 RealWeight(u, w) == u * 100 + w
 Weight(u, m) == IF m = PH THEN PhantomWeight ELSE RealWeight(u, m)
 
+ASSUME PhantomWeight \in Nat /\ \A u \in Units, w \in Workers : PhantomWeight > RealWeight(u, w)
+
 \* --- compaction plane keys and contents (drive the store instance) ----------
 RecordKey(u)  == <<"rec", u>>
 PartKey(u, v) == <<"part", u, v>>
@@ -125,6 +127,8 @@ HbContent(w)   == MaintTok
 MemoContent(w) == MaintTok
 OContent == {NoC, MaintTok}
               \cup {<<u, v>> : u \in Units, v \in Variants}
+
+ASSUME NoRec \notin OContent
 
 VARIABLES
     \* --- the object store instance (compaction plane) ---
