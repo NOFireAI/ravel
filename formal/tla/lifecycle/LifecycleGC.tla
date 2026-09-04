@@ -483,8 +483,19 @@ RequestErasure ==
 \* the inputs superseded (resolve_rewrite_supersession). The HEAD is NOT switched
 \* here; a later HeadAdvance drops the superseded inputs, so between the two the
 \* inputs are still HEAD-named and the superseded sweep must hold them.
+\*
+\* Gated on the erasure request already existing and on no prior supersession
+\* (finding 2, round four): erasure_rewrite.rs only rewrites a bucket for its
+\* pending_erasure_requests (.dreq present, no matching .done), and
+\* ErasureRewriteOutcome::AlreadyApplied skips a bucket already rewritten for
+\* every applicable pending request, so a second rewrite can't follow the
+\* first request's cleanup. Without these, the model could materialise rwA and
+\* supersede the raw inputs before any erasure request exists, an ordering the
+\* implementation never produces.
 PerformRewrite ==
     /\ ~PresentObj("rwA")
+    /\ PresentObj("dreqR1")
+    /\ superseded = {}
     /\ S!PutOverwrite("rwA", "dat")
     /\ superseded' = superseded \cup RawInputs
     /\ supersededAt' = clock
