@@ -29,8 +29,9 @@ as such and not checked here.
 - A HEAD with three read states (present, absent, unreadable) so the sweeps see
   a real fold that can lag, clear, or fail to read.
 - Actors: the environment (clock, HEAD state, hold refresh, query pin), the
-  erasure and rewrite maintainer, the retention maintainer, and the physical GC
-  maintainer (superseded and request-marker sweeps).
+  erasure and rewrite maintainer, the retention maintainer (data-object sweep
+  and the final tombstone sweep), and the physical GC maintainer (superseded
+  and request-marker sweeps).
 - A witness, `lastGc`, that records what a delete (or, for `CompleteErasure`,
   a completion write) OBSERVED at its own step: the hold state, the refresh
   state, the permitted-query needs, the HEAD-named subset, and whether a held
@@ -41,14 +42,23 @@ as such and not checked here.
 
 ## Invariants
 
-Thirteen safety invariants including `TypeOK`; see `traceability.md` for the
+Fourteen safety invariants including `TypeOK`; see `traceability.md` for the
 one-line meaning of each and its Rust source. The load-bearing ones:
 `NoDeleteInsideProtectionWindow`, `HeldObjectNeverDeleted`,
 `RefreshFailureNeverSweeps`, `TombstoneExcludesBeforeDelete`,
+`TombstoneNotDeletedBeforeBucketEmpty`,
 `ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`,
 `CompletionImpliesNoPreRewriteExposure`, `CompletionRespectsLegalHold`,
 `DreqRemovalCannotResurrect`, `DreqSweepRespectsLegalHold`,
 `IdenticalInputSetsDoNotCollide`, `HeadNamedObjectNeverDeletedBySupersededSweep`.
+
+`TombstoneNotDeletedBeforeBucketEmpty` pins the last step of
+`physical_sweep`: the tombstone itself is only deleted once a fresh listing
+(`bucket_is_empty_but_tombstone`) shows every other data object in the
+bucket already gone. Kept as its own invariant rather than folded into
+`TombstoneExcludesBeforeDelete`, which pins the opposite ordering (the
+tombstone exists before any data delete): each rule's claim stays
+independently falsifiable.
 
 `CompletionRespectsLegalHold` and `DreqSweepRespectsLegalHold` pin the same
 legal-hold-wins-over-erasure rule (ADR-0064 section 6) that
@@ -92,7 +102,7 @@ already pin what the output serves and how its identity is bound.
 
 Eight boolean CONSTANTS gate the model's guards; all are at their shipped value
 in `smoke.cfg` and `exhaustive.cfg`. Each `negative/*.cfg` flips exactly one,
-runs with `FullEnv = TRUE` and the full thirteen-invariant list from
+runs with `FullEnv = TRUE` and the full fourteen-invariant list from
 `smoke.cfg` (finding 5), and names the single invariant it must break, so a
 guard silently deleted from the spec fails a control rather than passing
 unnoticed under a reduction that happened to dodge the other invariants. There
@@ -107,16 +117,17 @@ switch TRUE.
 
 ## Non-vacuity
 
-An invariant that no reachable behaviour can break is decoration. Six of them
+An invariant that no reachable behaviour can break is decoration. Seven of them
 are shown breakable by mutating the BEHAVIOUR (not a switch) in a scratch copy
 and running TLC: `HeldObjectNeverDeleted`, `TombstoneExcludesBeforeDelete`,
+`TombstoneNotDeletedBeforeBucketEmpty`,
 `ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`
 (the "kept" direction), `CompletionRespectsLegalHold`, and
 `DreqRemovalCannotResurrect`. The mutations and the exact TLC violation lines
 are recorded under `counterexamples/*-mutant.md`. The seven negative controls
 provide the same evidence for their target invariants by switch (one target,
 `RewriteOutputsAreInputsMinusErased`, is also covered by a behaviour mutant
-above), so all twelve named safety invariants have a recorded TLC violation.
+above), so all thirteen named safety invariants have a recorded TLC violation.
 
 ## State-space control
 

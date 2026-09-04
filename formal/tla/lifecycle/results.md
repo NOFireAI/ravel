@@ -9,19 +9,18 @@ named Rust tests, not proved.
 
 ## Smoke
 
-`smoke.cfg` against `Spec`, all thirteen invariants, `VIEW View`, `MaxClock = 2`,
+`smoke.cfg` against `Spec`, all fourteen invariants, `VIEW View`, `MaxClock = 2`,
 `FullEnv = TRUE`, every switch at its shipped value.
 
 - Result: PASS.
-- States generated: 464571. Distinct: 79358. Diameter (depth): 19. Wall: 6 s.
-- Band (`bands.tsv`): distinct within 79200 to 79500. Observed 79358 is inside.
-- The distinct-state count moved down from the prior round's committed band
-  (80500-81000) after this round's finding 2 fix: widening `HeldInputServes`
-  to `DataObjects` and dropping its `ServesSubject` conjunct (checkpoint
-  finding 2) makes the legal-hold gate fire, and therefore prune the reachable
-  state graph, in states it previously let through. `bands.tsv` is re-measured
-  against this round's final model and updated to 79200-79500; the depth (19)
-  is unchanged.
+- States generated: 465912. Distinct: 82284. Diameter (depth): 21. Wall: under 10 s.
+- Band (`bands.tsv`): distinct within 82150 to 82420. Observed 82284 is inside.
+- The distinct-state count and depth both moved up from the prior round's
+  committed band (79200-79500, depth 19) after round four's three fixes
+  (below): each widens the reachable state graph rather than pruning it (an
+  absent HEAD now permits a delete it used to block; `SweepTombstone` adds a
+  wholly new reachable state per swept bucket). `bands.tsv` is re-measured
+  against this round's final model and updated to 82150-82420, depth 21.
 
 ## Negative controls
 
@@ -58,7 +57,7 @@ few actions.
 
 ## Non-vacuity mutants
 
-Six invariants are shown breakable by mutating the behaviour (not a switch) in
+Seven invariants are shown breakable by mutating the behaviour (not a switch) in
 a scratch copy under `/tmp` and running TLC against `smoke.cfg` (or, where noted,
 a scratch cfg narrowed to one target invariant the same way a negative control
 is). Exact lines:
@@ -91,14 +90,20 @@ is). Exact lines:
   specifically rather than the `ErasedSubjectNeverServedAfterRequest` a
   full-list run reports first for the same state):
   `Error: Invariant DreqRemovalCannotResurrect is violated.`
+- `TombstoneNotDeletedBeforeBucketEmpty` (round four, finding 3: removed the
+  `\A o \in DataObjects : Bucket(o) = "b1" => ~PresentObj(o)` conjunct from a
+  scratch copy of `SweepTombstone`, so it deletes the tombstone while a raw
+  input in the same bucket is still present):
+  `Error: Invariant TombstoneNotDeletedBeforeBucketEmpty is violated.`
 
 Details under `counterexamples/held-object-mutant.md`,
 `counterexamples/tombstone-mutant.md`, `counterexamples/erased-subject-mutant.md`,
 `counterexamples/rewrite-output-surviving-record-mutant.md`,
 `counterexamples/completion-ignores-legal-hold-mutant.md`,
-`counterexamples/dreq-removal-pinned-reader-mutant.md`. Together with the
+`counterexamples/dreq-removal-pinned-reader-mutant.md`,
+`counterexamples/sweep-tombstone-empty-bucket-mutant.md`. Together with the
 seven negative controls (one of which, `rewrite-keeps-erased-records`, targets
-an invariant already covered by a mutant above), all twelve named safety
+an invariant already covered by a mutant above), all thirteen named safety
 invariants have a recorded TLC violation, so none is vacuously true.
 
 ## Per-invariant store/witness audit
@@ -115,6 +120,9 @@ flag the action sets to certify itself, and none reduces to a constant.
 - `RefreshFailureNeverSweeps`: reads `lastGc.refreshWasFailed` and `lastGc.deleted`.
 - `TombstoneExcludesBeforeDelete`: reads the store (`PresentObj("tombB1")`),
   `tombRetiredAt`, and the witness rule/deleted.
+- `TombstoneNotDeletedBeforeBucketEmpty`: reads `lastGc.rule` and the store
+  (`PresentObj(o)` over `DataObjects` in the bucket), not a bookkeeping flag
+  `SweepTombstone` sets about itself.
 - `ErasedSubjectNeverServedAfterRequest`: reads the store and HEAD via
   `ServedRead`, and `erasureRequested`.
 - `RewriteOutputsAreInputsMinusErased`: reads the materialised output content
@@ -473,10 +481,14 @@ Shipped fix: `MaxClock = 3`, one clock tick above smoke's `MaxClock = 2` and
 the smallest bound above smoke this task measured. Run directly (not via a
 separate orchestrator lane):
 
-- Result: PASS. States generated: 2357319. Distinct: 387264. Diameter
-  (depth): 21. Wall: 49s.
-- Band (`bands.tsv`): distinct within 387000 to 387500. Observed 387264 is
-  inside.
+- Result: PASS. States generated: 2455254. Distinct: 413443. Diameter
+  (depth): 22. Wall: 43s (round four; two runs, both 42-43s, both exactly
+  2455254/413443/22, well inside the 3600s executor ceiling).
+- Band (`bands.tsv`): distinct within 413300 to 413600, depth 22 to 22.
+  Observed 413443/22 is inside; re-measured this round after the three
+  fixes below moved the state count and depth up from the prior committed
+  band (387000-387500, depth 21), for the same reason as smoke: each fix
+  widens reachable behaviour rather than pruning it.
 - Coverage given up: `MaxClock = 4`'s extra tick buys one additional
   interleaving depth of environment churn (an extra hold/release or
   head-read flip cycle) beyond what `MaxClock = 3` reaches; it does not
@@ -579,3 +591,100 @@ the three fixes above and produced the same figures already recorded in this
 document (smoke: 464571/79358/19; exhaustive: 2357319/387264/21; all seven
 negative controls VIOLATED as expected; all fifteen traceability rows
 resolve); `bands.tsv` is unchanged.
+
+## Round four findings (issue #1122)
+
+A further adversarial code review, comparing the model against the shipped
+Rust implementation rather than re-reading the model alone, raised three
+Major findings. Disposition:
+
+1. (MAJOR) `RetentionSweep` and `SupersededSweep` gated deletion on
+   `HeadDeletable` (`headState = "present"`), blocking any delete whenever
+   the modeled HEAD read came back absent. The real gates,
+   `reachability.rs::bucket_gate` and `object_gate`, treat an absent HEAD as
+   `Covering::Clear` per ADR-0020 (a missing HEAD degrades to a fresh
+   listing; it does not block a sweep) and block only on an unreadable HEAD.
+   So an absent HEAD, which the code sweeps through, the model refused to
+   sweep at all: a real bucket that had already lost its HEAD object would
+   sit un-swept in the model long after the code would have collected it,
+   understating what the maintainer actually deletes. Fixed by gating both
+   sweeps on `HeadReadable` (present or absent, not unreadable) and checking
+   bucket/object emptiness against `EffectiveHead`, which reads as empty
+   when the HEAD state is absent, rather than the raw `head` variable, so
+   the model's notion of "nothing names this object" matches what a real
+   reader observes on both a present-and-empty and an absent HEAD.
+   Relaxing the gate exposed a second, latent gap: `SetHeadState` let
+   `headState` flip to `"absent"` while `head` still named an object, a
+   transition no real GET can produce (a GET of an existing key never
+   returns absent on this store), and with the sweep gate relaxed this let
+   `HeadNamedObjectNeverDeletedBySupersededSweep` be violated by a
+   head-unchanged flip from absent to present straight after a delete,
+   asserting the same object was reachable, deleted, and reachable again.
+   Fixed by requiring `head = {}` whenever `SetHeadState` reports absent.
+   Two reachability probes (`counterexamples/absent-head-delete-probes.md`)
+   confirm both sweeps still reach a delete under a genuinely absent HEAD
+   after the fix, and the existing superseded-sweep-ungated negative control
+   still fires against the restated invariant.
+2. (MAJOR) `PerformRewrite` was gated only on its own output not existing
+   yet, with no requirement that an erasure request exist first and no
+   requirement that no rewrite had already superseded the inputs. The model
+   could therefore materialize a rewrite output and supersede the raw
+   inputs before any erasure request existed at all, an ordering
+   `erasure_rewrite.rs` never produces: `pending_erasure_requests` only
+   rewrites a bucket that has a `.dreq` and no matching `.done`, and
+   `ErasureRewriteOutcome::AlreadyApplied` skips a bucket already rewritten
+   for every pending request, so a live implementation never runs the
+   rewrite except in response to a request, and never runs it twice for the
+   same request. Fixed by adding `PresentObj("dreqR1")` and
+   `superseded = {}` as gating conjuncts on `PerformRewrite`. A
+   reachability probe (`counterexamples/perform-rewrite-reachable-probe.md`)
+   confirms the action still fires, through the same
+   `RequestErasure`-then-rewrite ordering the implementation requires.
+3. (MAJOR) `physical_sweep` (`crates/ravel-maintain/src/retention.rs`)
+   deletes a swept bucket's commit records, compaction records, data
+   objects, and L1 parts, then calls `bucket_is_empty_but_tombstone` to
+   verify a fresh listing shows only the tombstone remaining, then deletes
+   the tombstone itself (through the same `LeaseCheck` instance used for
+   every other delete in the function) and reports the bucket swept. The
+   model stopped one step early, at the data-object delete: no reachable
+   state showed the tombstone itself gone, so the model understated how far
+   a real sweep actually clears a retired bucket. Fixed by adding
+   `SweepTombstone`, gated the same way the code is: the same
+   `HeadReadable`/`EffectiveHead` bucket gate `RetentionSweep` now uses (see
+   finding 1 above), the same refresh-failure fail-closed guard the other
+   sweeps carry (the code's `LeaseCheck` also guards the tombstone delete,
+   so a failed refresh blocks it too), and the bucket holding nothing but
+   the tombstone. Added `TombstoneNotDeletedBeforeBucketEmpty`, split out
+   from the existing `TombstoneExcludesBeforeDelete` rather than folded
+   into it, so the two claims (tombstone exists before any data delete;
+   tombstone outlives every data delete) stay independently falsifiable. A
+   reachability probe (`counterexamples/sweep-tombstone-reachable-probe.md`,
+   trace `RetireBucket -> DropRetiredBucketFromHead -> Tick ->
+   RetentionSweep -> SweepTombstone`) confirms the new action fires. A
+   non-vacuity mutant that drops the bucket-empty precondition
+   (`counterexamples/sweep-tombstone-empty-bucket-mutant.md`) shows the new
+   invariant catching a tombstone deleted while a raw input in the same
+   bucket is still present. Wiring the new action in first surfaced that it
+   needed the refresh-failure guard fixed 3 lacked initially: an early
+   smoke run without it broke `RefreshFailureNeverSweeps`, confirming the
+   tombstone delete is subject to the same fail-closed semantics as every
+   other sweep, not a special case.
+
+All three findings widen the reachable state graph rather than pruning it
+(an absent HEAD now permits deletes it used to block; `SweepTombstone` adds
+a wholly new reachable state per swept bucket), so smoke and exhaustive
+figures both moved up and `bands.tsv` is re-measured against this round's
+model, not carried forward:
+
+- Smoke: 464571/79358/19 (prior committed band) to 465912 states generated,
+  82284 distinct, depth 21 (new band 82150-82420, depth 21-21).
+- Exhaustive: 2357319/387264/21 (prior committed band) to 2455254 states
+  generated, 413443 distinct, depth 22, 43s wall (new band 413300-413600,
+  depth 22-22), run twice with identical figures both times, well inside
+  the 3600s executor ceiling.
+
+Smoke, negative controls, traceability, and exhaustive were all re-run after
+the three fixes above against the updated `bands.tsv`: smoke PASS
+(465912/82284/21, inside band), exhaustive PASS (2455254/413443/22, inside
+band, 42-43s both runs), all seven negative controls VIOLATED as expected,
+all sixteen traceability rows resolve, `check_docs.py` clean.
