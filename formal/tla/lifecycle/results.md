@@ -570,8 +570,9 @@ Disposition:
    `lastGc.atClock \in 0..MaxClock` to `TypeOK`. Re-run: `smoke.cfg` PASS,
    464571 states generated, 79358 distinct, depth 19, unchanged from the
    recorded band (invariants do not restrict the transition relation, so
-   widening `TypeOK` could not and did not change the reachable state
-   count).
+   strengthening `TypeOK` could not and did not change the reachable state
+   count; the added conjuncts narrow the states it accepts, they do not
+   widen them).
 
 Smoke, negative controls, traceability, and exhaustive were all re-run after
 the three fixes above and produced the same figures already recorded in this
