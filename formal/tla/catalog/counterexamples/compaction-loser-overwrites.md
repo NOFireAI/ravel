@@ -11,20 +11,24 @@ Violated invariant: `CompactionRecordImmutable` (safety, TLC exit 12).
 
 ## Trace shape (from the recorded run)
 
-1. State 2: `DoCommit` ingests an L0 input into the hour.
-2. State 3: `DoTick` advances the clock past the maintenance seal, so the hour
-   is compactable.
-3. State 4: `DoCompact` publishes an L1 compaction record over the hour and
-   wins the `CreateIfAbsent`, so `crec[H][g]` is now `used` and immutable.
-4. State 5: `DoCommit` ingests a further input.
-5. State 6: `DoCompactLoser` runs. With the switch set, the loser does not read
-   the winner's record back; it overwrites `crec[H][g]` with its own
-   recomputation, and the witness records `lastCompact.loserFired = TRUE` and
-   `lastCompact.mutated = TRUE`.
+1. State 2: `DoCommit` ingests `rA` into hour 0's L0 set.
+2. State 3: `DoCommit` ingests `rA` into hour 1's L0 set.
+3. State 4: `DoTick` advances the clock past the maintenance seal, so hour 0 is
+   compactable.
+4. State 5: `DoCompact` publishes an L1 compaction record over hour 0 and wins
+   the `CreateIfAbsent`, so `crec[0][g1] = [used |-> TRUE, in |-> {rA},
+   out |-> {rA}, at |-> 1]`.
+5. State 6: `DoCompactLoser` runs on hour 0. With the switch set, the loser
+   does not read the winner's record back; it recomputes from `l0[0]` and
+   overwrites `crec[0][g1]` with its own output, and the witness records
+   `lastCompact = [loserFired |-> TRUE, outcome |-> "overwrite"]`.
 
-At State 6 `lastCompact.loserFired` holds while `lastCompact.mutated` is also
-true, so `CompactionRecordImmutable` (`loserFired => ~mutated`) is false: a loser
-mutated a published immutable record.
+At State 6 `lastCompact.loserFired` holds while `lastCompact.outcome =
+"overwrite"`, so `CompactionRecordImmutable` (`loserFired => outcome #
+"overwrite"`) is false: a loser mutated a published immutable record.
+
+Recorded run: 971 states generated, 532 distinct states found, depth 7 of
+search, exit 12.
 
 ## Why it is the right control
 
