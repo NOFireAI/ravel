@@ -12,7 +12,7 @@ A scratch module under `/tmp`, `EXTENDS MCLifecycleGC`, checked with
 `SPECIFICATION Spec`, `VIEW View`, `INVARIANT TypeOK` plus the probe,
 `smoke.cfg`'s constants.
 
-```
+```tla
 ProbeReachesSweepTombstone ==
     lastGc.rule # "tombstone"
 ```

@@ -883,14 +883,14 @@ Non-vacuity: a scratch mutant (`counterexamples/raw-input-immutable-mutant.md`)
 adds a `MutateRawInput` action, disjuncted into `Next`, that clears
 `objContent["raw1"]`. Against `smoke.cfg` with the new invariant in the list:
 
-```
+```text
 Error: Invariant RawInputContentAssumedImmutable is violated.
 ```
 
 (TLC exit 12, depth 4, 6 states generated / 6 distinct.) The unmutated model
 passes clean with the same invariant list:
 
-```
+```text
 check-tla: lifecycle/MCLifecycleGC smoke: PASS  states=276015 distinct=50102 depth=21 3s
 ```
 

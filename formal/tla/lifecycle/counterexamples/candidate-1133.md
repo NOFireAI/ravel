@@ -15,7 +15,7 @@ Invariant checked: `NoDeleteInsideProtectionWindow`. Result: violated, TLC exit
 
 Exact TLC line:
 
-```
+```text
 Error: Invariant NoDeleteInsideProtectionWindow is violated.
 ```
 

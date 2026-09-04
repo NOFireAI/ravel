@@ -9,7 +9,7 @@ conjuncts (`~PresentObj("doneR1")`, predecessor presence) are in place.
 A scratch module under `/tmp`, `EXTENDS MCLifecycleGC`, adding the same
 formula as `reachability-probes.md`'s `ProbeReachesRewriteSupersession`:
 
-```
+```tla
 ProbeReachesPerformRewrite ==
     ~(PresentObj("rwA") /\ RawInputs \subseteq superseded)
 ```
@@ -22,7 +22,7 @@ value, `MaxClock = 2`.
 
 TLC exit 12:
 
-```
+```text
 Error: Invariant ProbeReachesPerformRewrite is violated.
 ```
 

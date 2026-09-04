@@ -6,7 +6,7 @@ switches at base.
 
 Target invariant: `RewriteOutputsAreInputsMinusErased`. TLC exit 12.
 
-```
+```text
 Error: Invariant RewriteOutputsAreInputsMinusErased is violated.
 ```
 
