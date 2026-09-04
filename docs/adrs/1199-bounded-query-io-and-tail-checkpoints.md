@@ -28,7 +28,21 @@ from `0f2f875c`, run on a 16 vCPU box against real S3 in the same region.
 Same answer, 667x the requests and 43x the wall time. The unit cost is one GET
 and about 1.6 ms per unfolded record, paid by every cold process.
 
-Three things about that table need stating precisely.
+A sweep over record count (issue #1215, same box, bucket and binary, tenant
+prefix wiped before each point) makes the shape exact:
+
+| records | GETs | LISTs | resolve wall | per record | after fold |
+| --- | --- | --- | --- | --- | --- |
+| 1,000 | 1,001 | 5 | 1.689 s | 1.69 ms | 2 GET, 0.102 s |
+| 5,000 | 5,001 | 9 | 8.331 s | 1.67 ms | 2 GET, 0.193 s |
+| 10,000 | 10,001 | 13 | 16.157 s | 1.62 ms | 2 GET, 0.377 s |
+| 25,000 | 25,001 | 29 | 53.055 s | 2.12 ms | 2 GET, 0.707 s |
+
+GETs are exactly `records + 1` at every point. Resolve after a fold is flat at
+2 GETs across a 25x range: the fold collapses this problem completely, which is
+why decision 2 comes before decision 3.
+
+Three things about these numbers need stating precisely.
 
 **The measured hours are sealed and unfolded, not open.** The benchmark drives
 `now_ns` three hours past the last hour it wrote, which clears the seal margins,
@@ -38,20 +52,24 @@ direction that matters: resolve cost is linear in unfolded record count at one
 GET per record, and the open hour is the region where the fold is structurally
 forbidden from removing that cost.
 
-**The pre-registered LIST figure missed, and the reason is not yet established.**
-The prediction was ~100 LISTs, assuming one per (shard, hour). The measurement
-is 13, before the fold and after it. There are two listing paths
-(`Catalog::resolve_impl`): a per-(shard, hour) loop, and a per-shard recursive
-prefix scan taken when the estimated bucket count reaches
-`prefix_list_crossover_requests` (720 by default). At 4 shards over roughly 30
-hours, neither path's arithmetic reproduces 13 on its own, so this ADR asserts
-no explanation for the number. Establishing it is a deliverable of decision 1: a
-figure nobody can derive from first principles is the argument for measuring it
-rather than predicting it.
+**The LIST figure scales with record count, and the pre-registered prediction
+that it was constant is falsified.** The Stage 0 point alone (13, before and
+after the fold) suggested a constant. The sweep gives 5, 9, 13, 29 against
+`ceil(records / 1000) + 4`, and `LIST_PAGE_SIZE` is 1000
+(`crates/ravel-object-store/src/s3.rs:114`): this is one page per 1000 records
+plus a small fixed term, so the per-shard recursive prefix scan is the path that
+runs. A per-(shard, hour) loop would have issued a bucket-driven figure near 120
+at every point, flat in record count, which none of the four points show.
 
-**What the LIST figure does establish** is that listing did not scale with
-record count in this run: 13 requests against 10,001, unchanged by a fold that
-removed 99.98% of the GETs. The per-record GET is the term worth attacking.
+One code question survives the measurement and belongs to decision 1's
+investigation: the prefix path is selected when the estimated bucket count
+reaches `prefix_list_crossover_requests` (720 by default), and this window's
+estimate is around 120. Either that estimate spans more than the window
+suggests, or the selection is not the branch it appears to be.
+
+**What the LIST figure establishes** is a ratio, not a constant: 29 LISTs
+against 25,001 GETs. Listing is real, paginated, and roughly a thousandth of the
+GET term. The per-record GET is what is worth attacking.
 
 ### The multiplier nobody has measured
 
@@ -62,7 +80,8 @@ evidence. Tail size is set by configuration, not by physics:
   `max_flush_lifetime` (1h) + `clock_skew_allowance` (5m) +
   `fold_safety_margin` (15m), and the fold task wakes every
   `fold_interval_secs` (300). A record therefore sits in the listing path for
-  roughly 1h25m to 3h25m after it lands.
+  roughly 1h25m to 2h25m after it lands, depending on where in the hour it
+  landed.
 - Records per hour is ingest bytes divided by `target_bytes`, 8 MiB by default,
   times the number of independently flushing shards.
 
@@ -119,8 +138,13 @@ records, per query:
   needs a previous stage's bytes to know its own keys.
 - `list_page_depth`: serial LIST pages, reported separately because page `n+1`
   needs page `n`'s continuation token and no parallelism removes that.
-- `service_batches`: batches forced by a concurrency permit, so that 64 GETs
-  under 16 permits reads as four waves rather than as depth 1.
+- `service_batches`: the capacity quotient `ceil(stage requests / permit limit)`
+  summed over stages, so 64 GETs under 16 permits reads as four batches rather
+  than as depth 1. Defined as a quotient, deliberately, not as observed
+  overlapping waves: a permit frees as each request completes, so an
+  observation-based figure varies run to run for identical work, and a figure
+  the same execution reports differently twice cannot gate anything. It is an
+  upper bound on waves, and the docs must say so.
 - `unfolded_records_resolved`: how many records this resolve took from the
   listing path rather than from a snapshot part. This is the multiplier above,
   measured per query instead of estimated.
@@ -168,8 +192,11 @@ varies it against both.
 
 Deliverable: a measured table of tail record count and cold resolve cost across
 that knob space on a real corpus, and a defaults recommendation. Raising
-`target_bytes` alone is worth roughly 8x on record count at 64 MiB, which is the
-same order the checkpoint promises, with no new durable object.
+Raising `target_bytes` to 64 MiB is worth roughly 8x on record count **for
+byte-driven shards only**: a shard whose buffer never reaches the target flushes
+on the timer instead, and raising the target changes nothing for it. That is the
+same interaction as above, and it is why the recommendation comes from the
+experiment rather than from the arithmetic.
 
 ### 3. The tail checkpoint is specified here and NOT built
 
@@ -271,9 +298,14 @@ both hold over a 24-hour window on a real workload:
   measured 1.6 ms per record that is about 3.2 seconds of resolve before a
   predicate rejects anything, which is the point where resolve stops being a
   rounding error against a query budget.
-- At least **10%** of resolves over recent data are cold, measured by the
-  existing record-cache hit and miss counters on the resolve path rather than
-  by inference about pod lifetimes.
+- At least **10%** of resolves over recent data are cold. This needs a
+  per-resolve indicator that does not exist yet: the record-cache counters are
+  record-level, and a single resolve mixes hits and misses, so a pooled hit
+  ratio cannot say how many resolves were cold. Issue #1219 adds
+  `unfolded_records_served_from_cache` per resolve, and a resolve counts as cold
+  when fewer than half its unfolded records came from the cache. Until that
+  figure exists the gate cannot be evaluated, and no substitute inference about
+  pod lifetimes is admissible.
 
 Both thresholds are pre-registered here, before the measurement, so the result
 can miss. If either fails, the checkpoint is not built: the epic closes with the
