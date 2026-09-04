@@ -27,8 +27,11 @@ one flush. A crash **retires** its identity rather than reusing it, because
 the restarted process mints a fresh writer id; a different pair models that
 restarted process.
 
-Query visibility is exactly "a commit record exists". Nothing here models
-segment contents, series identity or query evaluation.
+The read path is a separate `RunQuery` action, not a predicate over the
+store: it runs once per behaviour and writes its answer to `queryAnswer`,
+built from `Visible`, so `NoUncommittedDataVisible` checks what the query
+actually returned rather than the store state it was built from. Nothing
+here models segment contents, series identity or query evaluation.
 
 ## Assumptions, stated rather than checked
 
