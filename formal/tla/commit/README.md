@@ -52,7 +52,24 @@ segment contents, series identity or query evaluation.
   must be able to **reach** a state with one shard durable and another not;
   see the reachability obligations below.
 
-## Two obligations that are the absence of a guarantee
+## Where the client resend fires
+
+A resend carries the same series, so the router picks the same shard. The
+model therefore requires a resend to reuse the shard of the attempt it
+resends, which makes it a different writer's attempt on that shard. The
+duplicate configurations use two writers and one shard for exactly this
+reason, and `ClientRetry` is disabled in every other configuration,
+including `smoke.cfg` and `exhaustive.cfg`. Those two cover the single
+attempt and its store-level retries, not the client resend.
+
+`smoke.cfg` runs with one writer and one shard, so `ClientRetry` has no
+enabled instance there: the action needs a second writer on the same shard
+to serve as the resend. This does not lose coverage, because the duplicate
+obligation and the dedup mutant are both settled on their own dedicated
+configurations (`negative/at-least-once-duplicate-reachable.cfg` and
+`dedup-mutant.cfg`), not on smoke.
+
+## Three obligations that are the absence of a guarantee
 
 TLC checks invariants, so each is written as a predicate that must **fail**.
 The run is correct exactly when TLC reports the violation, and a variant that
@@ -69,9 +86,16 @@ exactly the harness's negative contract:
   satisfied by exactly-once delivery, which is why this obligation exists.
   `dedup-mutant.cfg` is the same configuration with `RetryDedups` set: the
   duplicate becomes unreachable and TLC exits 0, which is what proves the
-  obligation is not vacuous. The harness's negative lane accepts only a
-  must-violate expectation, so that one run is done by hand and recorded in
-  `results.md`.
+  obligation is not vacuous. The switch suppresses the commit PUT itself,
+  not the resend decision: a check made before either write cannot exclude
+  the other, because both writers pass it. The harness's negative lane
+  accepts only a must-violate expectation, so that one run is done by hand
+  and recorded in `results.md`.
+- `negative/deadline-reachable.cfg`, at the exhaustive constants. The
+  flush-lifetime deadline must be reachable there, or every property about
+  abandonment is vacuous at those bounds. Clock room is necessary and not
+  sufficient, so the model checks it instead of inferring it from
+  `FlushLifetime` and `MaxTicks`.
 
 ## A modelling error the invariants caught
 
