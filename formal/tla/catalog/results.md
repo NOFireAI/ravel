@@ -12,29 +12,29 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
-| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 3422524 | 31 | PASS | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 3422524 | 31 | PASS | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
-| negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/compaction-loser-overwrites.cfg | Spec | first counterexample | n/a | CompactionRecordImmutable violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/reconcile-on-tick.cfg | Spec | first counterexample | n/a | ReconcileOnlyOnWatermarkAdvance violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/snapshot-changes-mid-attempt.cfg | Spec | first counterexample | n/a | PinnedSnapshotStableWithinAttempt violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/lost-cas-proceeds.cfg | Spec | first counterexample | n/a | NoLiveCommitOmittedByLostCas violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/metrics-dedup-dropped.cfg | Spec | first counterexample | n/a | SignalDedupContract violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/sweep-superseded-no-head-gate.cfg | Spec | first counterexample | n/a | HeadNamedObjectNeverDeleted violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/query-fails-closed-on-missing-index.cfg | Spec | first counterexample | n/a | MissingIndexDegradesToListing violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/corrupt-head-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/part-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/entry-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
-| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
-| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
-| negative/head-corruption-nonvacuity.cfg | Spec | first counterexample | n/a | NoHeadCorrupted violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
-| negative/part-unreadable-nonvacuity.cfg | Spec | first counterexample | n/a | NoPartUnreadable violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
-| negative/entry-undecodable-nonvacuity.cfg | Spec | first counterexample | n/a | NoEntryUndecodable violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
+| negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/compaction-loser-overwrites.cfg | Spec | first counterexample | n/a | CompactionRecordImmutable violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/reconcile-on-tick.cfg | Spec | first counterexample | n/a | ReconcileOnlyOnWatermarkAdvance violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/snapshot-changes-mid-attempt.cfg | Spec | first counterexample | n/a | PinnedSnapshotStableWithinAttempt violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/lost-cas-proceeds.cfg | Spec | first counterexample | n/a | NoLiveCommitOmittedByLostCas violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/metrics-dedup-dropped.cfg | Spec | first counterexample | n/a | SignalDedupContract violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/sweep-superseded-no-head-gate.cfg | Spec | first counterexample | n/a | HeadNamedObjectNeverDeleted violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/query-fails-closed-on-missing-index.cfg | Spec | first counterexample | n/a | MissingIndexDegradesToListing violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/corrupt-head-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/part-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/entry-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/head-corruption-nonvacuity.cfg | Spec | first counterexample | n/a | NoHeadCorrupted violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/part-unreadable-nonvacuity.cfg | Spec | first counterexample | n/a | NoPartUnreadable violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/entry-undecodable-nonvacuity.cfg | Spec | first counterexample | n/a | NoEntryUndecodable violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
 
 The twenty `negative/` configs each flip exactly one switch (or, for
 `carryforward-nonvacuity.cfg`, `frontier-reconcile-nonvacuity.cfg`,
@@ -43,10 +43,18 @@ The twenty `negative/` configs each flip exactly one switch (or, for
 check a refuted probe) and must exit 12 reporting exactly the named
 property; each `.expect` pins that exit code and property, and the negative
 lane fails if any config passes or reports a different property. All twenty
-were last run together with smoke and exhaustive as run id
-`20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7`
-(`.cache/tla/last-run.tsv`); the Run column above and below cites that id
-uniformly.
+were run together with smoke and exhaustive in one `scripts/check-tla.sh all
+-a catalog` invocation, run id `20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2`
+(`.cache/tla/last-run.tsv`); the Run column above cites that id uniformly
+because `all` truncates `.cache/tla/last-run.tsv` and generates one run id
+per invocation, so every config it runs shares that id in the same tsv. An
+earlier revision of this table cited two different run ids across these rows
+while this paragraph claimed one: `smoke`, `negative`, `traceability`, and
+`exhaustive` had been run as four separate `check-tla.sh` invocations, each
+minting its own run id, and the rows were hand-merged from more than one such
+invocation (issue #1121 finding 2). `carryforward.cfg` is not part of `all`
+and keeps the separate run id and figures from when it was last run; see the
+note below the bands table.
 
 `counterexamples/late-supersession-shrink.cfg` is a recorded temporal shrink,
 not a gate: run under `FairSpec` with `PROPERTY LateSupersessionEventuallyReflected`
@@ -185,6 +193,15 @@ NOT deterministic: they stop at the first counterexample TLC finds, and under
 `-workers auto` which state that is varies between runs, so a negative gets no
 band. Each negative is pinned instead by its `.expect` file.
 
+Issue #1121 round five (finding 1: `DedupSurvivors`, replacing the
+independent-per-identity `Dedup` selection) added `DedupPreservesCoverage`
+as a permanent `INVARIANT` in `smoke.cfg` and `exhaustive.cfg`. Neither
+config's bounds reach the two-shared-source conflict the fix addresses, so
+both reproduce their round-four baselines exactly: smoke at 3463504
+distinct states, depth 33; exhaustive at 3422524 distinct states, depth 31
+in 790 seconds, well inside the 3600-second ceiling. Neither band above
+changed.
+
 ## Invariant derivation audit
 
 Every invariant observes the modelled STORE (objects present, their content, the
@@ -203,11 +220,12 @@ authority; the table restates it.
 | SnapshotEntriesBelowWatermark | STORE: the HEAD register |
 | PinnedSnapshotStableWithinAttempt | WITNESS: `qy.pinnedAtAttempt` (resolve-time view) versus `qy.pinned` (served now) |
 | NoLiveCommitOmittedByLostCas | STORE/WITNESS: HEAD register, the L0 plane, and `maxValidWm` (highest watermark ever on a valid HEAD) |
-| MissingIndexDegradesToListing | WITNESS: `qy.pinned` (what was served) versus `qy.resolvedView` (what the store listing said should be served, computed without the `QueryFailsClosedOnMissingIndex` switch); the two coincide by construction whenever the index was readable, so no separate readable/unreadable antecedent is needed |
+| MissingIndexDegradesToListing | WITNESS: `qy.pinnedAtAttempt` (what was served at resolve time) versus `qy.resolvedView` (what the store listing said should be served, computed without the `QueryFailsClosedOnMissingIndex` switch); pinned at attempt rather than `qy.pinned` so a later `DoQueryTamper` mutation of `qy.pinned` cannot mask what the resolve itself served |
 | CorruptHeadFailsClosedOnDeletePaths | WITNESS: `lastDelete.headStatus`, the HEAD status at the last real object removal |
 | HeadNamedObjectNeverDeleted | STORE: the HEAD register, the L0 plane, and the L1 compaction-record plane |
 | TombstonedBucketContributesNothing | WITNESS: `lastHead.entries`, `lastHead.tombAtWrite`, `lastHead.reconcileLo`, and `lastHead.frontierReconciled` of the last fold |
 | SignalDedupContract | WITNESS: `qy.dupServed`, recomputed (`RawDupIdentities`) on the entry set the query actually served after `Dedup` ran on it, not on the switch that gates `Dedup` |
+| DedupPreservesCoverage | STORE: recomputes `Sources` and `Dedup` fresh against `FallbackView` at every reachable state, rather than reading any witness the model set for itself |
 
 ## Non-vacuity: behaviour mutant per invariant
 
@@ -234,6 +252,22 @@ the shared delete-gate guard.
 | CorruptHeadFailsClosedOnDeletePaths | switch `DeletePathIgnoresUndecodableEntry` | negative/entry-corruption-ignores-delete-gate.cfg, exit 12 |
 | SnapshotEntriesBelowWatermark | switch `FoldNamesEntryAboveWatermark` | negative/fold-names-entry-above-watermark.cfg, exit 12 |
 | TombstonedBucketContributesNothing | switch `FoldIncludesTombstonedEntries` | negative/fold-includes-tombstoned-entries.cfg, exit 12 |
+
+`DedupPreservesCoverage` (finding 1, issue #1121 round five) is proven
+non-vacuous by a different route than the switch-and-negative-control
+pattern above, and has no row in the mutant table or a `negative/*.cfg`
+counterpart: it is STORE-derived (recomputes `Dedup` fresh against
+`FallbackView` at every reachable state), and the bug it catches is a
+defect in `Dedup` itself, not a behaviour a switch can re-enable. It is
+shown load-bearing instead by a historical before/after demonstration:
+violated against the pre-fix `Dedup` (827 states generated, 463 distinct,
+depth 6, exit 12), and holding against the fixed `Dedup` by simulation,
+since exhaustive re-exploration at the probe's bounds turned out to be
+intractable (both the buggy and fixed `Dedup` generate tens of millions of
+states there; TLC's small pre-fix count is a first-violation halt, not the
+size of the reachable graph). See
+`counterexamples/dedup-starvation-fixed.md` for the full trace and
+methodology.
 
 The bounded incremental fold's carry-forward branch is shown non-vacuous
 separately by `negative/carryforward-nonvacuity.cfg`, which checks the refuted
