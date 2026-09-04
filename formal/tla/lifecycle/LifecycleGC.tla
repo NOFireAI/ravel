@@ -134,15 +134,6 @@ ErasedBy(reqs) == IF "r1" \in reqs THEN {"s1"} ELSE {}
 \* records until an action writes it.
 InitContent(o) == IF o \in RawInputs THEN {"rec1", "rec2"} ELSE {}
 
-\* The record set the rewrite output should serve: its predecessors' records minus
-\* the records whose subject the applied requests erased. RewriteKeepsErasedRecords
-\* drops the minus (finding 3 behaviour mutant).
-RewriteOutputContent ==
-    LET inRecs == UNION { InitContent(i) : i \in Predecessors("rwA") }
-    IN IF RewriteKeepsErasedRecords
-           THEN inRecs
-           ELSE { r \in inRecs : RecordSubject(r) \notin ErasedBy(AppliedReqs("rwA")) }
-
 \* Rewrite descriptors for the identity-collision property: same input set, a
 \* different applied-request set. The shipped key binds the sorted applied ids
 \* (compute_rewrite_input_set_hash); the switch drops them so the two collide.
@@ -208,6 +199,19 @@ PresentObj(o) == store[o].present
 \* A subject is served by object o iff a record of that subject is in o's stored
 \* content (finding 3: serving is a fact about stored content, not a static CASE).
 ServesSubject(o, s) == \E r \in objContent[o] : RecordSubject(r) = s
+
+\* The record set the rewrite output should serve: its predecessors' records minus
+\* the records whose subject the applied requests erased. RewriteKeepsErasedRecords
+\* drops the minus (finding 3 behaviour mutant). Reads objContent, not InitContent
+\* (issue #1122, finding 1): resolve_live_inputs re-lists the bucket and reads
+\* current object bodies at rewrite time, never the initial content, so a raw
+\* input mutated or replaced before the rewrite runs must feed the rewrite what
+\* is actually there.
+RewriteOutputContent ==
+    LET inRecs == UNION { objContent[i] : i \in Predecessors("rwA") }
+    IN IF RewriteKeepsErasedRecords
+           THEN inRecs
+           ELSE { r \in inRecs : RecordSubject(r) \notin ErasedBy(AppliedReqs("rwA")) }
 
 \* State-space view: the invariants and every gate read object PRESENCE, never the
 \* store's version, content, upload or listing bookkeeping. Projecting those away
@@ -492,10 +496,22 @@ RequestErasure ==
 \* first request's cleanup. Without these, the model could materialise rwA and
 \* supersede the raw inputs before any erasure request exists, an ordering the
 \* implementation never produces.
+\*
+\* Two further gates (issue #1122, finding 1): ~PresentObj("doneR1") mirrors
+\* pending_erasure_requests filtering out any .dreq with a matching .done, so a
+\* completed erasure is never seen as still pending; RetireBucket followed by
+\* DropRetiredBucketFromHead can otherwise make CompleteErasure fire (writing
+\* doneR1) while superseded is still {}, leaving this action able to run after
+\* completion. The predecessor-presence conjunct mirrors resolve_live_inputs
+\* reading the bucket fresh at rewrite time; RetentionSweep can otherwise delete
+\* a raw input while dreqR1 is present and superseded = {}, letting this action
+\* derive rwA's content from an input that is no longer there.
 PerformRewrite ==
     /\ ~PresentObj("rwA")
     /\ PresentObj("dreqR1")
+    /\ ~PresentObj("doneR1")
     /\ superseded = {}
+    /\ \A i \in Predecessors("rwA") : PresentObj(i)
     /\ S!PutOverwrite("rwA", "dat")
     /\ superseded' = superseded \cup RawInputs
     /\ supersededAt' = clock
