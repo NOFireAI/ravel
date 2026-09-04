@@ -506,11 +506,20 @@ RequestErasure ==
 \* reading the bucket fresh at rewrite time; RetentionSweep can otherwise delete
 \* a raw input while dreqR1 is present and superseded = {}, letting this action
 \* derive rwA's content from an input that is no longer there.
+\*
+\* Fourth gate, ~PresentObj("tombB1") (issue #1122, round five's noted gap):
+\* erasure_rewrite_bucket reads list_bucket fresh and returns
+\* ErasureRewriteOutcome::Tombstoned whenever the listing's tombstone_key is
+\* present, refusing to rewrite at all. RetireBucket has no dependency on
+\* dreqR1, doneR1 or superseded, so tombB1 can be present while the other
+\* three conjuncts above all still pass; this gate is the only thing that
+\* excludes that state.
 PerformRewrite ==
     /\ ~PresentObj("rwA")
     /\ PresentObj("dreqR1")
     /\ ~PresentObj("doneR1")
     /\ superseded = {}
+    /\ ~PresentObj("tombB1")
     /\ \A i \in Predecessors("rwA") : PresentObj(i)
     /\ S!PutOverwrite("rwA", "dat")
     /\ superseded' = superseded \cup RawInputs

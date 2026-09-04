@@ -773,3 +773,73 @@ both fixes above against the updated `bands.tsv`: smoke PASS
 (393481/71018/21, inside band), exhaustive PASS (1947121/334207/22, inside
 band, 67-77s across two runs), all seven negative controls VIOLATED as
 expected, all sixteen traceability rows resolve, `check_docs.py` clean.
+
+## Round six findings (issue #1122)
+
+Round five reported one gap as out of its scope and needing its own
+decision: `erasure_rewrite_bucket` (`crates/ravel-maintain/src/erasure_rewrite.rs`)
+does a fresh `list_bucket` read at the top of the function and returns
+`ErasureRewriteOutcome::Tombstoned` whenever `listing.tombstone_key.is_some()`,
+refusing to rewrite a tombstoned bucket at all. `PerformRewrite`'s guard set
+had no equivalent: `RetireBucket` (writing `tombB1`) has no dependency on
+`dreqR1`, `doneR1`, or `superseded`, so `tombB1` can be present while every
+one of `PerformRewrite`'s existing conjuncts still passes, and the model
+could rewrite a bucket the shipped code had already refused.
+
+Decision: model it. Fixed by adding `~PresentObj("tombB1")` as a fifth
+gating conjunct on `PerformRewrite`, testing the same object the shipped
+code tests (the tombstone key's presence in a fresh listing), not a proxy
+for it.
+
+Proved both ways with three probes (`counterexamples/perform-rewrite-tombstone-guard-probe.md`
+has the full probe module and traces):
+
+- Without the new guard, `ProbeNoRewriteOverTombstonedBucket`
+  (`PresentObj("tombB1") => ~(ENABLED PerformRewrite)`) is VIOLATED: TLC exit
+  12, 324 states generated, 169 distinct, at a state with `tombB1` present
+  and `raw1`, `dreqR1` present, `doneR1` absent, `superseded = {}`.
+- With the new guard, the same invariant HOLDS: TLC exit 0, "Model checking
+  completed. No error has been found.", 276015 states generated, 50102
+  distinct, depth 21.
+- With the new guard, `ProbeReachesPerformRewrite`
+  (`~(PresentObj("rwA") /\ RawInputs \subseteq superseded)`) is still
+  VIOLATED (reachable): TLC exit 12, 203 states generated, 113 distinct, via
+  the ordinary `RequestErasure` then `PerformRewrite` path with no
+  tombstone ever written -- the guard excludes the tombstoned state without
+  killing the action.
+
+The guard narrows reachable behavior (a previously reachable
+tombstoned-then-rewritten ordering is now excluded), so smoke and
+exhaustive state counts both fall and `bands.tsv` is re-measured against
+this round's model:
+
+- Smoke: 393481/71018/21 (prior committed band 70950-71090, depth 21) to
+  276015 states generated, 50102 distinct, depth 21 (new band
+  50040-50160, depth 21-21).
+- Exhaustive: 1947121/334207/22 (prior committed band 334100-334300, depth
+  22) to 1340669 states generated, 230815 distinct, depth 22, 62s per run
+  (new band 230750-230900, depth 22-22), run twice with identical figures
+  both times, well inside the 3600s executor ceiling.
+
+The drop is 20916 distinct states at smoke (29.5%) and 103392 at
+exhaustive (30.9%). The guard closes an entire family of continuations
+following one condition (`RetireBucket` firing, then every clock tick and
+interleaving that used to still let `PerformRewrite` fire), so a
+double-digit-percentage drop in this small bounded instance is the
+expected size for closing that one ordering, not a sign the guard excludes
+more than intended.
+
+Traceability gained one row: `PerformRewrite` (tombstone guard) cites
+`crates/ravel-maintain/src/erasure_rewrite.rs::erasure_rewrite_bucket::ErasureRewriteOutcome::Tombstoned`,
+with a noted gap that no production test isolates the tombstoned-bucket
+branch of `erasure_rewrite_bucket` from its other refusal outcomes.
+
+Smoke, negative controls, traceability, and exhaustive were all re-run
+after this fix against the updated `bands.tsv`: smoke PASS
+(276015/50102/21, inside band), exhaustive PASS (1340669/230815/22, inside
+band, 62s across two runs), all seven negative controls VIOLATED as
+expected, all seventeen traceability rows resolve, `check_docs.py` clean.
+
+No new CodeRabbit findings on pull request 1206 were folded in: the `gh`
+CLI is unavailable in this executor's environment, so the pull request
+could not be checked. This should be verified separately before merge.
