@@ -203,17 +203,22 @@ run_with_deadline() {
                 terminate_group
                 exit 124
             fi
-            sleep 2
+            sleep 1
         done
-        # TLC may exit during the sleep, after the deadline already passed:
-        # kill -0 goes false without the loop ever re-checking SECONDS, so
-        # `wait` alone would report TLC's own success as the verdict. Decide
-        # the verdict from the deadline, not from which side of that race won.
+        # The loop above is the only place that kills the job, and it exits
+        # 124 itself right where the kill happens. So reaching here means
+        # kill -0 went false because the job exited on its own, killed by
+        # nobody: the verdict is its own status, full stop. Re-checking the
+        # clock here (round two's approach) is wrong in the opposite
+        # direction from what round two fixed: a job that finishes a moment
+        # after the deadline, on its own, gets reported TIMEOUT even though
+        # nothing here killed it. Keying the verdict on the kill event
+        # instead of the clock is right in both directions: still-running at
+        # the deadline is always killed and always 124; exited on its own is
+        # always its own status. The 1s poll (was 2s) just bounds how late
+        # "a moment after" can be, against budgets measured in minutes.
         local code=0
         wait "$pid" || code=$?
-        if [ "$SECONDS" -ge "$deadline" ]; then
-            exit 124
-        fi
         exit "$code"
     ) &
     local watchdog_pid=$!
