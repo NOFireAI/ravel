@@ -481,3 +481,49 @@ Set `FlushBound = 2` and re-ran: still `EveryAdmittedWriteInScanSet`
 VIOLATED, 124721 distinct states, 4 seconds (see the negative-controls table
 above, from the same coherent run). The claim and the configuration now
 agree.
+
+### Finding 2: `no-writer-fence` conflated the fence flag with the skew
+
+`negative/no-writer-fence.cfg` changes two things relative to a shipped
+config at once: `WriterFenceEnabled = FALSE` and `AppenderSkew = 2`. Its
+violation of `StaleWriterFailsClosed` does not, on its own, show that the
+fence flag is the cause rather than the skew; the skew is a genuine
+enabling condition (documented in that file's header: it is what drives
+the writer's cached view past the grace horizon within this small a
+model), but the config never isolates it from the fence.
+
+Added `writer-fence-comparison.cfg`: byte-for-byte identical to
+`negative/no-writer-fence.cfg` (same `AppenderSkew = 2`, same `MaxHour = 4`,
+same everything) except `WriterFenceEnabled = TRUE`. A difference in
+outcome between the two can then only come from the fence.
+
+The fence-enabled arm cannot be driven to exhaustive completion with TLC's
+default BFS search: with the fence closing the gap there is no violation
+to stop the search early on, and at these dimensions the reachable space
+does not converge. Confirmed empirically before falling back to
+simulation: full BFS was still climbing past 65,000,000 distinct states
+after 45 minutes at the config's own `MaxHour = 4`, and past 8,000,000
+distinct states after 6 minutes even at a much-reduced `MaxHour = 2` and
+`AppenderSkew = 1`, showing the growth is not primarily driven by either
+knob and a further reduction would not plausibly make it tractable. This
+matches the state-space-explosion pattern already documented above for
+`AppenderSkew > 0` configs under a full, no-early-exit search; nothing in
+this repo has previously driven that config class to full completion in
+either direction, since every existing `AppenderSkew > 0` negative control
+only ever runs TLC's error-search mode and stops at its first violation.
+
+Ran the fence-enabled arm instead with TLC random simulation, at the same
+dimensions:
+
+```
+tlc2.TLC -config writer-fence-comparison.cfg -simulate num=100000000 \
+  -depth 100 MCOnlineResharding
+```
+
+63,203,643 states checked in 300 seconds (the run is budget-bounded, not
+traversal-bounded: `-simulate` does not terminate on its own short of
+`num` traces). Zero `TypeOK` or `StaleWriterFailsClosed` violations found.
+This is strong evidence, not an exhaustive proof, that the fence flag
+alone, holding `AppenderSkew = 2` and every other dimension fixed, is what
+`negative/no-writer-fence.cfg`'s violation depends on, not the shared skew
+condition both configs carry.
