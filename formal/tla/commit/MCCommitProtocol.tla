@@ -16,11 +16,12 @@ EXTENDS CommitProtocol, TLC
 Symmetry == Permutations(Writers)
 
 \* --- Reachability obligations ---------------------------------------------
-\* Two properties of this protocol are the ABSENCE of a guarantee. TLC checks
-\* an invariant, so each is written as a predicate that must FAIL: the run is
+\* Several properties of this protocol are the ABSENCE of a guarantee, or an
+\* action that a low-enough constant can disable outright. TLC checks an
+\* invariant, so each is written as a predicate that must FAIL: the run is
 \* correct exactly when TLC reports the violation, and a variant that removed
-\* the behaviour would leave it green. Both are run in their own cfg
-\* (reach.cfg) rather than alongside the safety set.
+\* the behaviour would leave it green. Each is run in its own negative/*.cfg
+\* rather than alongside the safety set.
 
 \* Ravel offers no cross-shard atomicity. A state with one shard's commit
 \* durable and another's not must be reachable.
@@ -49,6 +50,35 @@ DuplicateUnreachable ==
 \* abandonment is vacuous at these bounds. Clock room is necessary and not
 \* sufficient, so this is checked rather than inferred from the constants.
 AbandonUnreachable == ~(\E f \in FlushIds : phase[f] = "abandoned")
+
+\* At MaxRetries=0 the three retry actions below are permanently disabled
+\* (their `retries[f] < MaxRetries` guard can never hold), so a cfg that
+\* never sets MaxRetries > 0 leaves them, and everything they alone
+\* exercise, unreachable. Each predicate restates the action's own
+\* enabling conjuncts (the store call itself has no further guard: every
+\* branch of PutCreateIfAbsent/TransientFailure always has a successor), so
+\* a VIOLATED report here proves the action fires, not merely that its
+\* precondition looks satisfiable on paper.
+PutDataLostResponseUnreachable ==
+    ~(\E f \in FlushIds :
+        /\ phase[f] = "pinned"
+        /\ ~Expired(f)
+        /\ ~shardDead[f[2]]
+        /\ retries[f] < MaxRetries)
+
+PutCommitLostResponseUnreachable ==
+    ~(\E f \in FlushIds :
+        /\ phase[f] = "data"
+        /\ ~DedupSuppressed(f)
+        /\ ~Expired(f)
+        /\ ~shardDead[f[2]]
+        /\ retries[f] < MaxRetries)
+
+TransientFailureUnreachable ==
+    ~(\E f \in FlushIds :
+        /\ phase[f] \in {"pinned", "data"}
+        /\ ~Expired(f)
+        /\ retries[f] < MaxRetries)
 
 \* --- Liveness --------------------------------------------------------------
 \* Under weak fairness on the store retry and the flush task only, a pinned
