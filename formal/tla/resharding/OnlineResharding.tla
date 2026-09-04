@@ -142,16 +142,6 @@ ActiveCount(g, h) ==
     LET A == { i \in 1..Len(g) : g[i].act <= h }
     IN IF A = {} THEN g[1].count ELSE g[MaxIdx(A)].count
 
-\* scan_count: activated generations, each held for `slack` hours past its
-\* successor's activation.
-Contributes(g, i, h, slack) ==
-    /\ g[i].act <= h
-    /\ (i = Len(g) \/ h < g[i + 1].act + slack)
-
-ScanCount(g, h, slack) ==
-    LET Cs == { g[i].count : i \in { i \in 1..Len(g) : Contributes(g, i, h, slack) } }
-    IN IF Cs = {} THEN g[1].count ELSE MaxOf(Cs)
-
 \* max_scan_count_over_range: one shard bound covering every hour in [f, t].
 RangeScanCount(g, f, t, slack) ==
     LET Cs == { g[i].count :
