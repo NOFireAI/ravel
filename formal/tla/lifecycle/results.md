@@ -843,3 +843,76 @@ expected, all seventeen traceability rows resolve, `check_docs.py` clean.
 No new CodeRabbit findings on pull request 1206 were folded in: the `gh`
 CLI is unavailable in this executor's environment, so the pull request
 could not be checked. This should be verified separately before merge.
+
+## Round seven findings (issue #1122)
+
+One Major review finding on `PerformRewrite`: no `Next` action can change
+`objContent["raw1"]`, `Init` fixes it to `InitContent`, and `PerformRewrite`
+only writes `objContent["rwA"]`, so every reachable rewrite consumes initial
+content and the round-five change of `RewriteOutputContent` from
+`InitContent` to the current-state `objContent` has no raw-input predecessor
+left to distinguish it from `InitContent`.
+
+Decision: restrict scope, do not add a raw-input replacement transition.
+Data objects are immutable in Ravel by system invariant
+(docs/object-store-contract.md; `put_data_object` in
+`crates/ravel-commit/src/publish.rs` always uses `PutOptions::create_if_absent`),
+so a transition that replaced a raw input's content would model behaviour
+the storage layer forbids, and every property proved over that transition
+would be a property of a system that does not exist.
+
+Checked whether the current-state read is exercised anyway through a
+rewrite-of-rewrite: it is not, in this model. `RewriteOut` names exactly one
+object (`rwA`), `Predecessors("rwA")` is fixed to `RawInputs`, and no action
+produces a second rewrite object for a further rewrite to take as a
+predecessor, so a predecessor that is itself a rewrite output is
+unreachable in `smoke.cfg`, `exhaustive.cfg`, or any configuration in this
+area. The current-state read is not vacuous in general (it matters for a
+rewrite-of-rewrite predecessor, whose content `PerformRewrite` does write),
+only unexercised by this specific finite instance.
+
+Added `RawInputContentAssumedImmutable`
+(`\A o \in RawInputs : objContent[o] = InitContent(o)`) to pin the
+assumption so a future edit cannot silently add a raw-input mutation without
+tripping a checked invariant. Named to read as an environmental assumption
+being asserted, not a protocol property being proven (unlike the thirteen
+load-bearing invariants above, it does not follow from anything else in the
+model; it is taken as given). Checked in `smoke.cfg` and `exhaustive.cfg`.
+
+Non-vacuity: a scratch mutant (`counterexamples/raw-input-immutable-mutant.md`)
+adds a `MutateRawInput` action, disjuncted into `Next`, that clears
+`objContent["raw1"]`. Against `smoke.cfg` with the new invariant in the list:
+
+```
+Error: Invariant RawInputContentAssumedImmutable is violated.
+```
+
+(TLC exit 12, depth 4, 6 states generated / 6 distinct.) The unmutated model
+passes clean with the same invariant list:
+
+```
+check-tla: lifecycle/MCLifecycleGC smoke: PASS  states=276015 distinct=50102 depth=21 3s
+```
+
+Corrected `RewriteOutputContent`'s comment, which previously implied the
+current-state read was exercised for a mutated-or-replaced raw input; it now
+states that the read is not exercised for a raw-input predecessor (immutable
+by assumption) and matters for a rewrite-of-rewrite predecessor instead,
+which this model does not reach.
+
+An invariant does not change the reachable state space (it only narrows
+which states TLC accepts, not which it generates), so `bands.tsv` is
+unchanged and both lanes were re-measured against it:
+
+- Smoke: 276015 states generated, 50102 distinct, depth 21 (unchanged from
+  the round-six band 50040-50160, depth 21-21; observed 50102 is inside).
+- Exhaustive: 1340669 states generated, 230815 distinct, depth 22, 30s wall
+  (unchanged from the round-six band 230750-230900, depth 22-22; observed
+  230815 is inside), well inside the 3600s executor ceiling.
+
+Smoke, negative controls, traceability, and exhaustive were all re-run after
+this fix: smoke PASS (276015/50102/21, inside band, unchanged), negative
+PASS (all seven controls VIOLATED as expected, unaffected since none
+targets raw-input content), traceability PASS (eighteen rows resolve, one
+new row for `RawInputContentAssumedImmutable`), exhaustive PASS
+(1340669/230815/22, inside band, unchanged, 30s), `check_docs.py` clean.
