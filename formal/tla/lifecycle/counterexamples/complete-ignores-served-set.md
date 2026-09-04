@@ -6,7 +6,7 @@ subject). All other switches at base.
 
 Target invariant: `CompletionImpliesNoPreRewriteExposure`. TLC exit 12.
 
-```
+```text
 Error: Invariant CompletionImpliesNoPreRewriteExposure is violated.
 ```
 

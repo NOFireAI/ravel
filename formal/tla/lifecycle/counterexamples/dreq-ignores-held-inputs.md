@@ -12,7 +12,7 @@ fire the invariant that names that clause, not the unrelated
 reachability and never claimed anything about a held-but-unreachable input).
 TLC exit 12.
 
-```
+```text
 Error: Invariant DreqSweepRespectsLegalHold is violated.
 ```
 

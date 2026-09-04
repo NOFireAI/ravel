@@ -15,7 +15,7 @@ time, `exhaustive.cfg`'s constants (`MaxClock = 3`, every switch at its
 shipped value). Each probe is checked alone so its own violation is
 unambiguous.
 
-```
+```tla
 ProbeReachesRewriteSupersession ==
     ~(PresentObj("rwA") /\ RawInputs \subseteq superseded)
 

@@ -8,7 +8,7 @@ held object exists and the invariant catches it.
 Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. The
 legal-hold gate is removed from the sweep bodies:
 
-```
+```tla
 -    /\ ~HeldObject(o, heldBuckets)
 ```
 
@@ -19,7 +19,7 @@ the run used the base `smoke.cfg` with every switch at its shipped value.
 
 TLC exit 12. Exact line:
 
-```
+```text
 Error: Invariant HeldObjectNeverDeleted is violated.
 ```
 

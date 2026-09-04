@@ -15,7 +15,7 @@ derive `rwA`'s content from an input no longer in the store.
 
 A scratch module under `/tmp`, `EXTENDS MCLifecycleGC`, adding:
 
-```
+```tla
 ProbeNoRewriteWithMissingPredecessor ==
     (\E i \in Predecessors("rwA") : ~PresentObj(i)) => ~(ENABLED PerformRewrite)
 ```
@@ -28,7 +28,7 @@ View`, every switch at `smoke.cfg`'s shipped value, `MaxClock = 2`.
 `PerformRewrite` with `~PresentObj("doneR1")` present but no predecessor
 presence conjunct. TLC exit 12:
 
-```
+```text
 Error: Invariant ProbeNoRewriteWithMissingPredecessor is violated.
 ```
 
@@ -43,7 +43,7 @@ the first violation).
 `PerformRewrite` gated additionally on `\A i \in Predecessors("rwA") :
 PresentObj(i)`. TLC exit 0. Exact line:
 
-```
+```text
 Model checking completed. No error has been found.
 ```
 

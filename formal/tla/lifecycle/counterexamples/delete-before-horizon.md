@@ -5,7 +5,7 @@ Switch: `DeleteBeforeHorizon = TRUE` (drops the retention horizon gate
 
 Target invariant: `NoDeleteInsideProtectionWindow`. TLC exit 12.
 
-```
+```text
 Error: Invariant NoDeleteInsideProtectionWindow is violated.
 ```
 

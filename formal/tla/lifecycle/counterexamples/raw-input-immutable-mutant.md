@@ -9,7 +9,7 @@ it, even though no such behaviour is part of the shipped `Next`.
 Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. A new
 action is added and disjuncted into `Next`:
 
-```
+```tla
 MutateRawInput ==
     /\ PresentObj("raw1")
     /\ objContent["raw1"] # {}
@@ -29,7 +29,7 @@ its shipped value and the full smoke invariant list, including
 
 TLC exit 12 at depth 4. Exact line:
 
-```
+```text
 Error: Invariant RawInputContentAssumedImmutable is violated.
 ```
 
@@ -41,7 +41,7 @@ to `{}`, so `objContent["raw1"] = InitContent("raw1")` fails immediately.
 The unmutated model (no `MutateRawInput` action, same `smoke.cfg`) passes
 with `RawInputContentAssumedImmutable` in the invariant list:
 
-```
+```text
 check-tla: lifecycle/MCLifecycleGC smoke: PASS  states=276015 distinct=50102 depth=21 3s
 ```
 

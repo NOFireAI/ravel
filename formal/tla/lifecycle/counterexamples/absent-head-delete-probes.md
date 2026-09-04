@@ -16,7 +16,7 @@ A scratch module under `/tmp`, `EXTENDS MCLifecycleGC`, checked with
 `SPECIFICATION Spec`, `VIEW View`, `INVARIANT TypeOK` plus one probe at a
 time, `smoke.cfg`'s constants.
 
-```
+```tla
 ProbeReachesRetentionDeleteUnderAbsentHead ==
     ~(headState = "absent" /\ lastGc.rule = "retention")
 

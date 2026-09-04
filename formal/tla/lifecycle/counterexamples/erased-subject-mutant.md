@@ -10,7 +10,7 @@ Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. The
 erasure request stops writing its `.dreq` marker, so the read-time erasure
 filter `~PresentObj("dreqR1")` never engages:
 
-```
+```tla
 -    /\ S!PutCreateIfAbsent("dreqR1", "dat")
 +    /\ UNCHANGED storeVars
 ```
@@ -22,7 +22,7 @@ fires. The run used the base `smoke.cfg`.
 
 TLC exit 12. Exact line:
 
-```
+```text
 Error: Invariant ErasedSubjectNeverServedAfterRequest is violated.
 ```
 

@@ -14,7 +14,7 @@ so `tombB1` can be present while every one of those conjuncts still holds.
 
 A scratch module under `/tmp`, `EXTENDS MCLifecycleGC`, adding:
 
-```
+```tla
 ProbeNoRewriteOverTombstonedBucket ==
     PresentObj("tombB1") => ~(ENABLED PerformRewrite)
 
@@ -31,7 +31,7 @@ value, `MaxClock = 2`.
 `PerformRewrite` with only its pre-existing five conjuncts (no
 `~PresentObj("tombB1")`), `ProbeNoRewriteOverTombstonedBucket`. TLC exit 12:
 
-```
+```text
 Error: Invariant ProbeNoRewriteOverTombstonedBucket is violated.
 ```
 
@@ -45,7 +45,7 @@ the old guard set's `ENABLED PerformRewrite` is still true there.
 `PerformRewrite` gated additionally on `~PresentObj("tombB1")`,
 `ProbeNoRewriteOverTombstonedBucket`. TLC exit 0:
 
-```
+```text
 Model checking completed. No error has been found.
 ```
 
@@ -56,7 +56,7 @@ Model checking completed. No error has been found.
 
 Same fixed model, `ProbeReachesPerformRewrite`. TLC exit 12:
 
-```
+```text
 Error: Invariant ProbeReachesPerformRewrite is violated.
 ```
 

@@ -9,7 +9,7 @@ subject.
 
 A scratch module under `/tmp`, `EXTENDS MCLifecycleGC`, adding:
 
-```
+```tla
 ProbeNoCompletionUnderBucketHold ==
     ("b1" \in heldBuckets /\ (\E o \in DataObjects : Bucket(o) = "b1" /\ PresentObj(o)))
         => ~(ENABLED CompleteErasure)
@@ -31,7 +31,7 @@ predicate was therefore already equivalent to a content-blind "held and
 present" check for `raw1`, by coincidence, while the same requirement made a
 held `rwA` invisible to the gate. TLC exit 12 with this scope-only widening:
 
-```
+```text
 Error: Invariant ProbeNoCompletionUnderBucketHold is violated.
 ```
 
@@ -48,7 +48,7 @@ generated, 7234 distinct states found).
 `bucket_is_held`'s and `chain_groups_held_by_legal_hold`'s own content-blind,
 per-live-key gating. TLC exit 0. Exact line:
 
-```
+```text
 Model checking completed. No error has been found.
 ```
 

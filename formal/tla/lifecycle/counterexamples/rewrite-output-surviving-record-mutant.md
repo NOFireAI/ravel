@@ -14,7 +14,7 @@ Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. The
 rewrite output drops the surviving record outright, regardless of the
 `RewriteKeepsErasedRecords` switch:
 
-```
+```tla
 -    IN IF RewriteKeepsErasedRecords
 -           THEN inRecs
 -           ELSE { r \in inRecs : RecordSubject(r) \notin ErasedBy(AppliedReqs("rwA")) }
@@ -30,7 +30,7 @@ its shipped value.
 
 TLC exit 12. Exact line:
 
-```
+```text
 Error: Invariant RewriteOutputsAreInputsMinusErased is violated.
 ```
 

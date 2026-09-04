@@ -6,7 +6,7 @@ applied requests hash to the same key). All other switches at base.
 
 Target invariant: `IdenticalInputSetsDoNotCollide`. TLC exit 12.
 
-```
+```text
 Error: Invariant IdenticalInputSetsDoNotCollide is violated.
 ```
 

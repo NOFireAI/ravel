@@ -9,7 +9,7 @@ serves the erased subject, which `CompletionRespectsLegalHold` then catches.
 Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. The
 unconditional gate is deleted from `CompleteErasure`:
 
-```
+```tla
      /\ (CompleteIgnoresServedSet \/ ~ServesNow("s1"))
 -    /\ ~HeldInputServes("s1")
      /\ clock > 0
@@ -23,7 +23,7 @@ has no switch of its own in either the model or the code).
 
 TLC exit 12. Exact line:
 
-```
+```text
 Error: Invariant CompletionRespectsLegalHold is violated.
 ```
 
@@ -43,7 +43,7 @@ Re-applied the same one-line removal to the post-finding-2 model (`DataObjects`,
 no `ServesSubject` conjunct; see `rewrite-output-hold-probe.md`) against the
 same base `smoke.cfg`. TLC exit 12. Exact line:
 
-```
+```text
 Error: Invariant CompletionRespectsLegalHold is violated.
 ```
 

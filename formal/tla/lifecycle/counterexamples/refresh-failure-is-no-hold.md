@@ -6,7 +6,7 @@ All other switches at base.
 
 Target invariant: `RefreshFailureNeverSweeps`. TLC exit 12.
 
-```
+```text
 Error: Invariant RefreshFailureNeverSweeps is violated.
 ```
 

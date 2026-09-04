@@ -14,7 +14,7 @@ after which the old guard set still permitted `PerformRewrite`.
 
 A scratch module under `/tmp`, `EXTENDS MCLifecycleGC`, adding:
 
-```
+```tla
 ProbeNoRewriteAfterCompletion ==
     PresentObj("doneR1") => ~(ENABLED PerformRewrite)
 ```
@@ -27,7 +27,7 @@ View`, every switch at `smoke.cfg`'s shipped value, `MaxClock = 2`.
 `PerformRewrite` with only its pre-existing three conjuncts (no
 `~PresentObj("doneR1")`). TLC exit 12:
 
-```
+```text
 Error: Invariant ProbeNoRewriteAfterCompletion is violated.
 ```
 
@@ -41,7 +41,7 @@ generated, 1052 distinct, run stopped at the first violation).
 `PerformRewrite` gated additionally on `~PresentObj("doneR1")`. TLC exit 0.
 Exact line:
 
-```
+```text
 Model checking completed. No error has been found.
 ```
 

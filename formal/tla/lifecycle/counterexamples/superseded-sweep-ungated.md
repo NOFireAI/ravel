@@ -6,7 +6,7 @@ switches at base.
 
 Target invariant: `HeadNamedObjectNeverDeletedBySupersededSweep`. TLC exit 12.
 
-```
+```text
 Error: Invariant HeadNamedObjectNeverDeletedBySupersededSweep is violated.
 ```
 

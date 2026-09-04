@@ -14,7 +14,7 @@ specifically instead of whichever invariant a full-list run reports first).
 Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. The
 unconditional live-reachability gate is deleted from `DreqSweep`:
 
-```
+```tla
      /\ clock >= dreqHorizon
 -    /\ ~ServesAny("s1")
      /\ (DreqIgnoresHeldInputs \/ ~HeldInputServes("s1"))
@@ -28,7 +28,7 @@ except the invariant list is narrowed to `TypeOK` plus
 
 TLC exit 12. Exact line:
 
-```
+```text
 Error: Invariant DreqRemovalCannotResurrect is violated.
 ```
 

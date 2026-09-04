@@ -8,7 +8,7 @@ that runs before its tombstone exists is reachable and the invariant catches it.
 Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. The
 tombstone-present precondition is removed from both sweep-enabling actions:
 
-```
+```tla
 -    /\ PresentObj("tombB1")
 ```
 
@@ -25,7 +25,7 @@ clause are untouched. The run used the base `smoke.cfg`.
 
 TLC exit 12. Exact line:
 
-```
+```text
 Error: Invariant TombstoneExcludesBeforeDelete is violated.
 ```
 

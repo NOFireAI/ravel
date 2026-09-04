@@ -9,7 +9,7 @@ object is reachable and the invariant catches it.
 Behaviour edit (not a switch), applied to a scratch copy under `/tmp`. The
 bucket-empty precondition is removed from `SweepTombstone`:
 
-```
+```tla
 -    /\ \A o \in DataObjects : Bucket(o) = "b1" => ~PresentObj(o)
 ```
 
@@ -20,7 +20,7 @@ at its shipped value.
 
 TLC exit 12. Exact line:
 
-```
+```text
 Error: Invariant TombstoneNotDeletedBeforeBucketEmpty is violated.
 ```
 
