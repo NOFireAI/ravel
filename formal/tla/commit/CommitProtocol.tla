@@ -77,12 +77,6 @@ ASSUME HasIdemKey \in BOOLEAN
 \* Only logs and spans carry idempotency markers; the metrics path has none.
 MarkersApply == HasIdemKey /\ Signal \in {"logs", "spans"}
 
-\* Only logs report the durable tokens of a partial multi-shard commit.
-\* Metrics and spans return on the first failing shard and drop the sibling
-\* tokens (IngestRouter::write_points and SpanIngestRouter, versus
-\* LogIngestRouter::await_strict_acks).
-ReportsPartial == Signal = "logs"
-
 \* A pinned flush is one (writer, shard) pair. The writer carries writer_id and
 \* epoch; seq is allocated at pin time and never reused, so within one model run
 \* a pair names one flush.
@@ -634,11 +628,14 @@ TokenNeverServesStale ==
         /\ (r.outcome = "tombstoned"    => r.tomb /\ ~r.present)
         /\ (r.outcome = "superseded"    => r.sup /\ ~r.present)
 
-\* Logs report the durable tokens of a partial commit; metrics and spans do
-\* not. Stated over what the model may claim, so a variant that invents
-\* cross-signal reporting fails.
+\* Every signal reports the durable tokens of a partial multi-shard commit:
+\* IngestRouter::write_points, LogIngestRouter::await_strict_acks and
+\* SpanIngestRouter::write each carry a PartialWrite{durable} variant now, so
+\* no signal is exempt from a strict ack implying its own record is durable.
+\* This used to hold only `~ReportsPartial` (Signal = "logs" was the
+\* exception); that asymmetry is retired, not current behaviour, so the
+\* guard is gone rather than restated.
 PartialReportingMatchesSignal ==
-    ~ReportsPartial =>
-        \A f \in FlushIds : ackKind[f] = "strict" => Visible(f)
+    \A f \in FlushIds : ackKind[f] = "strict" => Visible(f)
 
 ===============================================================================
