@@ -688,3 +688,88 @@ the three fixes above against the updated `bands.tsv`: smoke PASS
 (465912/82284/21, inside band), exhaustive PASS (2455254/413443/22, inside
 band, 42-43s both runs), all seven negative controls VIOLATED as expected,
 all sixteen traceability rows resolve, `check_docs.py` clean.
+
+## Round five findings (issue #1122)
+
+A further adversarial code review, again checked against the shipped Rust
+before touching the model, raised one Major and one Minor finding.
+Disposition:
+
+1. (MAJOR) `PerformRewrite` was still incomplete in two ways beyond round
+   four's gate. First, completion did not close the rewrite: `CompleteErasure`
+   writes `doneR1` but the model never checked for it, so `RetireBucket`
+   followed by `DropRetiredBucketFromHead` can make `CompleteErasure` fire
+   while `superseded` is still `{}`, after which the old three-conjunct gate
+   still let `PerformRewrite` fire against an erasure that had already
+   completed. `pending_erasure_requests`
+   (`crates/ravel-maintain/src/erasure_rewrite.rs`) never lets this happen in
+   the shipped code: it filters out any `.dreq` whose `request_id` has a
+   matching `.done`, so a completed request is never seen as pending again.
+   Second, the rewrite did not check that what it rewrites still exists:
+   `RewriteOutputContent` derived from `InitContent`, a static function of
+   initial content, so `Tick` followed by `RetentionSweep(raw1)` could delete
+   a predecessor while `dreqR1` was present and `superseded = {}`, and the
+   model would still derive `rwA`'s content from the now-deleted `raw1`.
+   `erasure_rewrite_bucket` never does this either: `resolve_live_inputs`
+   does a fresh `list_bucket` read at rewrite time and derives the output
+   only from inputs still present. Fixed by adding `~PresentObj("doneR1")`
+   and `\A i \in Predecessors("rwA") : PresentObj(i)` as gating conjuncts on
+   `PerformRewrite`, and changing `RewriteOutputContent` to read `objContent`
+   (the current-state variable) instead of `InitContent`. Three probes
+   (`counterexamples/perform-rewrite-completion-guard-probe.md`,
+   `perform-rewrite-predecessor-presence-probe.md`,
+   `perform-rewrite-still-reachable-after-guards-probe.md`) show each new
+   guard closing its reachable bad state (TLC exit 12 without the guard,
+   exit 0 with it) and confirm `PerformRewrite` still fires at all
+   afterward (TLC exit 12 on the positive reachability probe).
+
+   One related gap noted but out of scope for this fix: `erasure_rewrite_bucket`
+   returns `ErasureRewriteOutcome::Tombstoned` and refuses to rewrite a
+   tombstoned bucket at all; the model has no equivalent gate on
+   `PerformRewrite`. The two new guards above do not stand in for it:
+   `RetireBucket` (writing `tombB1`) has no dependency on the raw input's
+   presence or on any erasure request, so `tombB1` can be present while
+   `raw1` is still present, `dreqR1` is present, `doneR1` is absent, and
+   `superseded = {}` -- a state where the fixed `PerformRewrite` still
+   fires despite the bucket already being tombstoned in the shipped code's
+   sense. This is a genuine, currently unaddressed gap between the model
+   and the code, reported here rather than silently folded into this
+   fix since it is a distinct question from either finding this round.
+
+2. (MINOR) The traceability row for `SweepTombstone` /
+   `TombstoneNotDeletedBeforeBucketEmpty` claimed the model's guarantee
+   covers the bucket's data objects, compaction records, and commit
+   records. The model only inspects `DataObjects` (raw inputs and the
+   rewrite output); `bucket_is_empty_but_tombstone`
+   (`crates/ravel-maintain/src/retention.rs`) additionally lists a
+   `commit_prefix` (covering commit and compaction records) and a separate
+   `l1_prefix` (L1 parts), neither of which the model or its invariant
+   checks. Narrowed the row to name only `DataObjects` and call out the
+   three object classes outside the model's scope, rather than widen the
+   model for a Minor traceability gap.
+
+Both `PerformRewrite` guards narrow reachable behavior (a previously
+reachable completed-then-rewritten and swept-then-rewritten ordering are
+now excluded), so smoke and exhaustive state counts both fall and
+`bands.tsv` is re-measured against this round's model:
+
+- Smoke: 465912/82284/21 (prior committed band) to 393481 states generated,
+  71018 distinct, depth 21 (new band 70950-71090, depth 21-21).
+- Exhaustive: 2455254/413443/22 (prior committed band) to 1947121 states
+  generated, 334207 distinct, depth 22, 67-77s wall (new band
+  334100-334300, depth 22-22), run twice with identical figures both
+  times, well inside the 3600s executor ceiling.
+
+The drop is 13718 distinct states at smoke (13.7%) and 79236 at exhaustive
+(19.2%). Both guards each close an entire family of continuations following
+one bug condition (every clock tick and interleaving reachable after an
+early `CompleteErasure` for guard one, after an early `RetentionSweep(raw1)`
+for guard two), so a double-digit-percentage drop in this small bounded
+instance is the expected size for closing two such orderings, not a sign
+either guard excludes more than intended.
+
+Smoke, negative controls, traceability, and exhaustive were all re-run after
+both fixes above against the updated `bands.tsv`: smoke PASS
+(393481/71018/21, inside band), exhaustive PASS (1947121/334207/22, inside
+band, 67-77s across two runs), all seven negative controls VIOLATED as
+expected, all sixteen traceability rows resolve, `check_docs.py` clean.
