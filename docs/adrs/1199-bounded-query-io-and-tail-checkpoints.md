@@ -54,19 +54,29 @@ forbidden from removing that cost.
 
 **The LIST figure scales with record count, and the pre-registered prediction
 that it was constant is falsified.** The Stage 0 point alone (13, before and
-after the fold) suggested a constant. The sweep gives 5, 9, 13, 29, and
-`shards * ceil(records / shards / 1000) + 1` reproduces all four exactly:
-`LIST_PAGE_SIZE` is 1000 (`crates/ravel-object-store/src/s3.rs:114`), each of
-the 4 shards paginates its own records, and the `+ 1` is the pending-erasure
-LIST that runs alongside. So the listing is one page per 1000 records **per
-shard**, which is the per-shard recursive prefix scan, not the per-(shard, hour)
-loop: that loop would have issued a bucket-driven figure near 120 at every
-point, flat in record count, which none of the four show.
+after the fold) suggested a constant. The sweep gives 5, 9, 13, 29, and the
+per-shard page count reproduces all four exactly:
 
-The per-shard denominator matters for more than arithmetic. Page count falls as
-shard count rises for a fixed record count, so a wide tenant pays fewer, larger
-listings and a narrow one pays more, smaller ones. Any later claim about LIST
-depth has to name the shard count it was measured at.
+```text
+LISTs = sum over shards of ceil(records_in_shard / 1000) + 1
+```
+
+`LIST_PAGE_SIZE` is 1000 (`crates/ravel-object-store/src/s3.rs:114`), each shard
+paginates its own records, and the `+ 1` is the pending-erasure LIST that runs
+alongside. The benchmark spreads records evenly, so at 4 shards this collapses
+to `4 * ceil(records / 4 / 1000) + 1`: 5, 9, 13, 29. Production distribution is
+not even, and the sum is the form that holds either way. This is the per-shard
+recursive prefix scan, not the per-(shard, hour) loop: that loop would have
+issued a bucket-driven figure near 120 at every point, flat in record count,
+which none of the four show.
+
+The per-shard denominator matters for more than arithmetic, and it runs the
+opposite way to intuition. Every shard rounds its own partial page up, so page
+count is **non-decreasing in shard count** for a fixed record total: 10,000
+records cost 11 pages at 2 shards, 13 at 4, and 17 at 8, with a floor of
+`shards + 1` once each shard holds under 1000 records. A wide tenant pays more
+listings than a narrow one for the same data, while its GET term is unchanged.
+Any claim about LIST depth has to name the shard count it was measured at.
 
 One code question survives the measurement and belongs to decision 1's
 investigation: the prefix path is selected when the estimated bucket count
@@ -74,9 +84,13 @@ reaches `prefix_list_crossover_requests` (720 by default), and this window's
 estimate is around 120. Either that estimate spans more than the window
 suggests, or the selection is not the branch it appears to be.
 
-**What the LIST figure establishes** is a ratio, not a constant: 29 LISTs
-against 25,001 GETs. Listing is real, paginated, and roughly a thousandth of the
-GET term. The per-record GET is what is worth attacking.
+**What the LIST figure establishes** is a ratio at a stated shard count, not a
+constant: 29 LISTs against 25,001 GETs at 4 shards. Listing is real, paginated,
+and here roughly a thousandth of the GET term, but it grows with shard count
+while the GET term does not, so the ratio narrows on a wide tenant. The
+per-record GET is still what is worth attacking, and the shard-count sensitivity
+of the LIST term is a figure decision 1 must report rather than an assumption
+this ADR carries.
 
 ### The multiplier nobody has measured
 
