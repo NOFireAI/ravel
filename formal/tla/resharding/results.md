@@ -410,18 +410,42 @@ Back to state 6: <WriterCrash ...>
 The counter-example is an infinite `WriterCrash`/`FlushOpen` loop: a writer
 crashes, reopens a flush, crashes again before closing it, forever, so it
 never completes a flush and never routes a record on the new generation.
-`WriterCrash` carries no fairness constraint anywhere in `FairSpec` (nor
-should it get one arbitrarily — the comments now beside each `WF_vars`
-conjunct in `OnlineResharding.tla` state what each is justified by, and
-"a writer never crashes" is not something the implementation guarantees).
+`WriterCrash` carries no fairness constraint anywhere in `FairSpec`, and it
+does not need one — the loop's actual gap is elsewhere.
 
-This is a real finding, not a spec bug to fix by widening fairness:
-`EventuallyRoutedOnNewGeneration` holds only under the added hypothesis that
-a writer does not crash infinitely often (a fairness assumption stronger
-than anything `FairSpec` currently encodes, and stronger than anything the
-real system guarantees about crash frequency). Recorded here rather than
-hidden by deleting the property or adding `WF_vars(WriterCrash(w))` to make
-it pass.
+### Finding C, revisited (issue #1123 second review): weak fairness was too weak
+
+`AdmitAfterRefresh(w)` had only `WF_vars` in `FairSpec`. The crash loop above
+toggles `flushes[w].open` every step (`WriterCrash` closes it, `FlushOpen`
+reopens it), so `CanAdmit(w)` — and with it `AdmitAfterRefresh(w)` — is
+enabled for exactly one step at a time, never continuously. Weak fairness
+only forces an action that stays enabled without interruption; an action
+enabled-then-disabled-then-enabled forever is never forced under WF, so the
+loop above was a real gap in the fairness assumption, not a crash-frequency
+problem.
+
+Fixed by widening `AdmitAfterRefresh(w)` to `SF_vars` (`OnlineResharding.tla`):
+strong fairness forces an action that is enabled infinitely often, which the
+crash loop's admit window is, so the same loop can no longer satisfy
+`FairSpec`. The comment beside the conjunct records why strong fairness is
+the right assumption rather than a convenience: `ravel-ingest`'s write loop
+(`router.rs`) never suspends with a flush closed, closing one and opening
+the next are back-to-back steps of the same loop, so the real writer keeps
+re-entering the enabled state on its own for as long as it runs, with no
+external event required — exactly the "infinitely often, unassisted"
+shape strong fairness assumes.
+
+**Re-run result: PASS.** `live.cfg` at the same dimensions, now under the
+widened `FairSpec`:
+
+```
+Model checking completed. No error has been found.
+31045026 states generated, 3817433 distinct states found, depth 18.
+```
+
+11 minutes 36 seconds. No counter-example was found: with the crash loop's
+admit window ruled out by strong fairness, `EventuallyRoutedOnNewGeneration`
+holds at `live.cfg`'s dimensions with no added crash-frequency hypothesis.
 
 ### Finding D: exhaustive did not complete
 
