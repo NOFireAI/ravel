@@ -12,8 +12,8 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260903T221635Z-3bf1df10b3cd1e65d40c1ebe9ae9ff9b2b0baa34 |
-| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 13690096 | 33 | PASS | 20260903T222041Z-5796e637494e9b50af404421586e7f2fd1954538 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
+| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 3422524 | 31 | PASS | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
 | negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
 | negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
@@ -29,19 +29,24 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 | negative/part-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
 | negative/entry-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
 | negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
-| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | 20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1 |
+| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
+| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
+| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
+| negative/head-corruption-nonvacuity.cfg | Spec | first counterexample | n/a | NoHeadCorrupted violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
+| negative/part-unreadable-nonvacuity.cfg | Spec | first counterexample | n/a | NoPartUnreadable violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
+| negative/entry-undecodable-nonvacuity.cfg | Spec | first counterexample | n/a | NoEntryUndecodable violated (probe), exit 12 | 20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7 |
 
-The seventeen `negative/` configs each flip exactly one switch (or, for
-`carryforward-nonvacuity.cfg`, `frontier-reconcile-nonvacuity.cfg`, and
-`compaction-loser-diverged-nonvacuity.cfg`, check a refuted probe) and must
-exit 12 reporting exactly the named property; each
-`.expect` pins that exit code and property, and the negative lane fails if any
-config passes or reports a different property. All seventeen were last run
-together as run id `20260903T213944Z-09c75c8132677327d991b82ba18d8bcb0c836fd1`
+The twenty `negative/` configs each flip exactly one switch (or, for
+`carryforward-nonvacuity.cfg`, `frontier-reconcile-nonvacuity.cfg`,
+`compaction-loser-diverged-nonvacuity.cfg`, `head-corruption-nonvacuity.cfg`,
+`part-unreadable-nonvacuity.cfg`, and `entry-undecodable-nonvacuity.cfg`,
+check a refuted probe) and must exit 12 reporting exactly the named
+property; each `.expect` pins that exit code and property, and the negative
+lane fails if any config passes or reports a different property. All twenty
+were last run together with smoke and exhaustive as run id
+`20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7`
 (`.cache/tla/last-run.tsv`); the Run column above and below cites that id
-uniformly rather than the ad hoc identifiers a prior round left on two rows.
+uniformly.
 
 `counterexamples/late-supersession-shrink.cfg` is a recorded temporal shrink,
 not a gate: run under `FairSpec` with `PROPERTY LateSupersessionEventuallyReflected`
@@ -121,19 +126,56 @@ rounds' costs. `exhaustive.cfg`'s graph grows by a comparable factor from the
 same two new actions; see the Exhaustive band below for the fresh
 measurement this round took.
 
-`exhaustive.cfg` is now run for real this round (issue #1121 round three,
-finding 5): it completed within the 3600-second budget at 2932 seconds,
-`13690096` distinct states, depth `33`, `PASS`, run id
-`20260903T222041Z-5796e637494e9b50af404421586e7f2fd1954538`. No constant
-shrink was needed to fit the budget, unlike smoke's finding 6 (`Records`
-stays `{rA, rB}`, `CompIds` stays `{g1, g2}`); the growth from finding 1's two
-new one-shot actions still applies to exhaustive's larger bounds, but
-`-workers auto` on the exhaustive host's core count comfortably finishes the
-larger graph inside the hour. Band recorded above and in `bands.tsv`:
-`[13680000, 13700000]` distinct states, depth `[33, 33]`. The prior round's
-stale band (`1185000-1198000` distinct states, depth 31) predates finding 1
-entirely and was already removed rather than left unmeasured; this is its
-replacement, measured against the current model.
+Issue #1121 round four then found that round three's growth, measured
+against `exhaustive.cfg`'s larger bounds rather than smoke's, blew the
+60-minute per-configuration ceiling (`EXHAUSTIVE_BUDGET=3600` in
+`scripts/check-tla.sh`): `13690096` distinct states, depth `33`, `21204`
+seconds (353 minutes), against the round-two baseline of `3422524` distinct
+states, depth `31`, `1115` seconds -- a 4x growth in states and 19x in wall
+clock from finding 1's two new one-shot actions (`DoCorruptPart`,
+`DoPoisonEntry`), each reachable from nearly every state once a part or
+entry exists to corrupt. It was recorded PASS only because the host running
+that measurement lacked `timeout`/`gtimeout` to enforce the ceiling; under
+CI's enforcement it would be killed and reported TIMEOUT.
+
+The fix (round four) is a new constant, `EnableDeletePathCorruption`, that
+gates `DoCorruptPart` and `DoPoisonEntry` out of `Next` entirely. This is
+lever 2 of the three suggested in issue #1121 (gate the new triggers behind
+a constant on only in configs checking the invariant against them), chosen
+over lever 1 (bound to one occurrence per behaviour) because that bound was
+already in place before round four -- both actions were already one-shot
+(`partCorruptionUsed`, `entryCorruptionUsed`) and fixed to a single
+canonical hour, the same shape as the pre-existing `DoCorruptHead`; the cost
+was from being unconditionally enabled at nearly every reachable state, not
+from repetition. Lever 3 (shrinking constants) was not needed once lever 2
+applied, so no coverage was traded away by narrowing `Hours`, `Records`, or
+similar bounds.
+
+`exhaustive.cfg` sets `EnableDeletePathCorruption = FALSE`: it now checks
+`CorruptHeadFailsClosedOnDeletePaths` against the HEAD-status trigger only
+(`DoCorruptHead`, which stays ungated and unconditional in every
+configuration). `smoke.cfg` sets `EnableDeletePathCorruption = TRUE` and is
+the configuration that still checks the invariant against all three
+triggers together (HEAD-status, covering-part, entry-identity);
+`carryforward.cfg` sets it `FALSE`, matching exhaustive.
+
+With the gate off, `exhaustive.cfg` reverts to exactly the round-two graph:
+`3422524` distinct states, depth `31`, `PASS` in 362 seconds (well inside
+the 3600-second ceiling), run id
+`20260904T084623Z-fe770728243fd8e009a9c765ac56521babffadb7`. Band recorded
+above and in `bands.tsv`: `[3415000, 3430000]` distinct states, depth
+`[31, 31]`, mirroring smoke's existing margin proportion. The round-three
+band (`[13680000, 13700000]` distinct states, depth `[33, 33]`) is retired:
+it described a graph exhaustive.cfg no longer generates.
+
+Gating the two triggers out of `Next` does not by itself prove they remain
+reachable wherever a config still enables them. Three new non-vacuity
+probes cover that: `HeadCorruptedExercised`/`NoHeadCorrupted`,
+`PartUnreadableExercised`/`NoPartUnreadable`, and
+`EntryUndecodableExercised`/`NoEntryUndecodable`, each checked as the sole
+`INVARIANT` in its own `negative/*-nonvacuity.cfg` (see Non-vacuity below).
+All three ran VIOLATED (exit 12) as expected, proving each fail-closed
+trigger is independently reachable, not dead code behind the new gate.
 
 `carryforward.cfg` gets no band row: it is a targeted three-hour carry-forward
 pass, not the banded gate config, and its full graph (4,481,272 distinct
@@ -232,6 +274,27 @@ no store state to ground a third fail-closed branch honestly; adding one would
 be a compliance flag standard (a) forbids, not a real gap-closing fix. This is
 a disclosed modeling limitation, not a silently dropped finding.
 
+Issue #1121 round four gated `DoCorruptPart` and `DoPoisonEntry` behind
+`EnableDeletePathCorruption` to fit exhaustive.cfg's 60-minute ceiling (see
+Bands above), which sets that constant `FALSE`. Each of
+`CorruptHeadFailsClosedOnDeletePaths`'s three fail-closed triggers is shown
+independently reachable, wherever the config that enables it, by its own
+non-vacuity probe: `negative/head-corruption-nonvacuity.cfg` checks the
+refuted probe `NoHeadCorrupted` (`EnableDeletePathCorruption = FALSE`, since
+`DoCorruptHead` stays ungated in every config); `negative/part-unreadable-nonvacuity.cfg`
+checks `NoPartUnreadable` and `negative/entry-undecodable-nonvacuity.cfg`
+checks `NoEntryUndecodable` (both `EnableDeletePathCorruption = TRUE`, since
+`DoCorruptPart`/`DoPoisonEntry` cannot fire otherwise). All three exit 12 as
+expected: `NoHeadCorrupted` at depth 2 (12174 states generated, 6488
+distinct), `NoPartUnreadable` in one step from Init (42 states, 37 distinct),
+`NoEntryUndecodable` in one step from Init (51 states, 46 distinct). This
+proves the gate removes only branching, not the underlying behaviour: the
+same triggers `negative/corrupt-head-ignores-delete-gate.cfg`,
+`negative/part-corruption-ignores-delete-gate.cfg`, and
+`negative/entry-corruption-ignores-delete-gate.cfg` mutate against remain
+reachable everywhere the invariant is checked, including in exhaustive.cfg's
+own HEAD-status-only coverage.
+
 ## Fairness
 
 `FairSpec` adds only per-action weak fairness: `WF_vars(DoTick)`,
@@ -245,9 +308,13 @@ present only so `QueryTerminates` can hold under the bounded clock.
 `Hours = {0, 1}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 3`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
 `RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
-mutation switches FALSE, `SYMMETRY Symmetry`. `Records` shrank from `{rA, rB}`
-to `{rA}` this round (finding 6, see Bands above) to keep the smoke run
-inside the fixed 300-second wall-clock budget.
+mutation switches FALSE, `EnableDeletePathCorruption = TRUE`,
+`SYMMETRY Symmetry`. `Records` shrank from `{rA, rB}` to `{rA}` this round
+(finding 6, see Bands above) to keep the smoke run inside the fixed
+300-second wall-clock budget. `EnableDeletePathCorruption = TRUE` (issue
+#1121 round four) makes smoke.cfg the configuration that checks
+`CorruptHeadFailsClosedOnDeletePaths` against all three fail-closed triggers
+together; see Bands above.
 
 ## Exhaustive constants
 
@@ -255,12 +322,17 @@ inside the fixed 300-second wall-clock budget.
 `Hours = {0, 1}`, `Records = {rA, rB}`, `CompIds = {g1, g2}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
 `RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
-mutation switches FALSE, `FairSpec` (no symmetry, so liveness is checked
-soundly). Two records and a second compaction identity keep the multiset and
-dedup conflicts non-vacuous. The version-matched HEAD CAS is exercised without a
-second modeled folder because `DoRivalFoldWin` advances HEAD and bumps its
-object version under an in-flight fold, so that fold reaches its CAS with a stale
-base version and takes the losing branch.
+mutation switches FALSE, `EnableDeletePathCorruption = FALSE`, `FairSpec`
+(no symmetry, so liveness is checked soundly). Two records and a second
+compaction identity keep the multiset and dedup conflicts non-vacuous. The
+version-matched HEAD CAS is exercised without a second modeled folder because
+`DoRivalFoldWin` advances HEAD and bumps its object version under an
+in-flight fold, so that fold reaches its CAS with a stale base version and
+takes the losing branch. `EnableDeletePathCorruption = FALSE` (issue #1121
+round four) drops `DoCorruptPart`/`DoPoisonEntry` from this config's `Next`
+to fit the 60-minute ceiling; exhaustive.cfg now checks
+`CorruptHeadFailsClosedOnDeletePaths` against the HEAD-status trigger only.
+See Bands above.
 
 ## Carry-forward constants
 
@@ -268,7 +340,8 @@ base version and takes the losing branch.
 `Hours = {0, 1, 2}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
 `MaxOps = 2`, `FoldSealDelay = 0`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
 `RetentionHorizon = 2`, `LagBound = 2`, `DedupBySignal = TRUE`, all twelve
-mutation switches FALSE, `SYMMETRY Symmetry`. Three hours let a valid HEAD fold
+mutation switches FALSE, `EnableDeletePathCorruption = FALSE`,
+`SYMMETRY Symmetry`. Three hours let a valid HEAD fold
 at successive watermarks; both seal delays are zero so all three hours seal
 within `MaxClock = 3`. The compact-strictly-before-fold gap (`FoldSealDelay = 1`)
 is orthogonal to carry-forward and is covered by the smoke and exhaustive
