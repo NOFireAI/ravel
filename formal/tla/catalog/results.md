@@ -12,39 +12,41 @@ Temurin OpenJDK 21.0.12 on x86_64 Linux, `-workers auto` on a 4-core host.
 
 | Config | Spec | Distinct states | Depth | Result | Run |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 3422524 | 31 | PASS | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| smoke.cfg | Spec (safety, symmetry-reduced) | 3463504 | 33 | PASS | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| exhaustive.cfg | FairSpec (safety + QueryTerminates liveness) | 3422524 | 31 | PASS | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
 | carryforward.cfg | Spec (safety, three-hour carry-forward) | 4481272 | 37 | PASS | tlc-carryforward-1845293 |
-| negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/compaction-loser-overwrites.cfg | Spec | first counterexample | n/a | CompactionRecordImmutable violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/reconcile-on-tick.cfg | Spec | first counterexample | n/a | ReconcileOnlyOnWatermarkAdvance violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/snapshot-changes-mid-attempt.cfg | Spec | first counterexample | n/a | PinnedSnapshotStableWithinAttempt violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/lost-cas-proceeds.cfg | Spec | first counterexample | n/a | NoLiveCommitOmittedByLostCas violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/metrics-dedup-dropped.cfg | Spec | first counterexample | n/a | SignalDedupContract violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/sweep-superseded-no-head-gate.cfg | Spec | first counterexample | n/a | HeadNamedObjectNeverDeleted violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/query-fails-closed-on-missing-index.cfg | Spec | first counterexample | n/a | MissingIndexDegradesToListing violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/corrupt-head-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/part-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/entry-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/head-corruption-nonvacuity.cfg | Spec | first counterexample | n/a | NoHeadCorrupted violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/part-unreadable-nonvacuity.cfg | Spec | first counterexample | n/a | NoPartUnreadable violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
-| negative/entry-undecodable-nonvacuity.cfg | Spec | first counterexample | n/a | NoEntryUndecodable violated (probe), exit 12 | 20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2 |
+| negative/head-names-unwritten-part.cfg | Spec | first counterexample | n/a | HeadNamesOnlyCompleteParts violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/compaction-swaps-record.cfg | Spec | first counterexample | n/a | CompactionPreservesMultiset violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/compaction-loser-overwrites.cfg | Spec | first counterexample | n/a | CompactionRecordImmutable violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/reconcile-on-tick.cfg | Spec | first counterexample | n/a | ReconcileOnlyOnWatermarkAdvance violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/snapshot-changes-mid-attempt.cfg | Spec | first counterexample | n/a | PinnedSnapshotStableWithinAttempt violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/lost-cas-proceeds.cfg | Spec | first counterexample | n/a | NoLiveCommitOmittedByLostCas violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/metrics-dedup-dropped.cfg | Spec | first counterexample | n/a | SignalDedupContract violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/sweep-superseded-no-head-gate.cfg | Spec | first counterexample | n/a | HeadNamedObjectNeverDeleted violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/carryforward-nonvacuity.cfg | Spec | first counterexample | n/a | NoCarryForward violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/query-fails-closed-on-missing-index.cfg | Spec | first counterexample | n/a | MissingIndexDegradesToListing violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/corrupt-head-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/part-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/entry-corruption-ignores-delete-gate.cfg | Spec | first counterexample | n/a | CorruptHeadFailsClosedOnDeletePaths violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/fold-names-entry-above-watermark.cfg | Spec | first counterexample | n/a | SnapshotEntriesBelowWatermark violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/fold-includes-tombstoned-entries.cfg | Spec | first counterexample | n/a | TombstonedBucketContributesNothing violated, exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/frontier-reconcile-nonvacuity.cfg | Spec | first counterexample | n/a | NoFrontierReconcile violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/compaction-loser-diverged-nonvacuity.cfg | Spec | first counterexample | n/a | NoCompactionLoserDivergence violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/head-corruption-nonvacuity.cfg | Spec | first counterexample | n/a | NoHeadCorrupted violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/part-unreadable-nonvacuity.cfg | Spec | first counterexample | n/a | NoPartUnreadable violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/entry-undecodable-nonvacuity.cfg | Spec | first counterexample | n/a | NoEntryUndecodable violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
+| negative/overlap-nonvacuity.cfg | Spec | first counterexample | n/a | NoOverlappingL1Output violated (probe), exit 12 | 20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739 |
 
-The twenty `negative/` configs each flip exactly one switch (or, for
+The twenty-one `negative/` configs each flip exactly one switch (or, for
 `carryforward-nonvacuity.cfg`, `frontier-reconcile-nonvacuity.cfg`,
 `compaction-loser-diverged-nonvacuity.cfg`, `head-corruption-nonvacuity.cfg`,
-`part-unreadable-nonvacuity.cfg`, and `entry-undecodable-nonvacuity.cfg`,
-check a refuted probe) and must exit 12 reporting exactly the named
-property; each `.expect` pins that exit code and property, and the negative
-lane fails if any config passes or reports a different property. All twenty
-were run together with smoke and exhaustive in one `scripts/check-tla.sh all
--a catalog` invocation, run id `20260904T162616Z-a2ee42805757ae6eca1bd4903bece9fcb9ac8bd2`
+`part-unreadable-nonvacuity.cfg`, `entry-undecodable-nonvacuity.cfg`, and
+`overlap-nonvacuity.cfg`, check a refuted probe) and must exit 12 reporting
+exactly the named property; each `.expect` pins that exit code and
+property, and the negative lane fails if any config passes or reports a
+different property. All twenty-one were run together with smoke and
+exhaustive in one `scripts/check-tla.sh all
+-a catalog` invocation, run id `20260904T191103Z-603bb3e163736f80cd14b07574344d946567a739`
 (`.cache/tla/last-run.tsv`); the Run column above cites that id uniformly
 because `all` truncates `.cache/tla/last-run.tsv` and generates one run id
 per invocation, so every config it runs shares that id in the same tsv. An
@@ -202,6 +204,27 @@ distinct states, depth 33; exhaustive at 3422524 distinct states, depth 31
 in 790 seconds, well inside the 3600-second ceiling. Neither band above
 changed.
 
+Issue #1121 round six (finding 7: whole-entry dedup could serve one record
+identity twice when it appeared in two overlapping L1 outputs) replaced
+`Dedup`'s whole-entry survivor selection with a contribution-level one:
+`Dedup` now returns `SUBSET (AllEntries \X Records)` pairs
+(`ContribSurvivors`), so the pass can drop one `(entry, identity)`
+contribution without dropping the entry that carries other identities. This
+changed `TypeOK`'s type for `qy.pinned`, `qy.pinnedAtAttempt`, and
+`qy.resolvedView` from `SUBSET AllEntries` to `SUBSET (AllEntries \X
+Records)`, and `DoQueryRun`'s deletion check now reads `c[1]` off each
+contribution rather than the entry directly. Both `smoke.cfg` (one record)
+and `exhaustive.cfg` (two records, `MaxOps = 2`) reproduce their round-five
+baselines exactly: smoke at 3463504 distinct states, depth 33, 109 seconds;
+exhaustive at 3422524 distinct states, depth 31, 510 seconds, well inside
+the 3600-second ceiling. The richer per-identity representation adds no new
+distinguishable states at either config's bounds: a given pinned entry set
+still resolves to exactly one contribution set under `Serves`, so it carries
+more information forward without adding branching, the same shape finding 6
+described for `lastCompact.outcome`. Neither band above changed. See
+`overlap.cfg` (Overlap constants below) and `counterexamples/overlap-nonvacuity.md`
+for the config that does reach the fixed case.
+
 ## Invariant derivation audit
 
 Every invariant observes the modelled STORE (objects present, their content, the
@@ -329,6 +352,22 @@ same triggers `negative/corrupt-head-ignores-delete-gate.cfg`,
 reachable everywhere the invariant is checked, including in exhaustive.cfg's
 own HEAD-status-only coverage.
 
+The overlapping-L1-output case (finding 7, issue #1121 round six) is shown
+non-vacuous the same way, by `negative/overlap-nonvacuity.cfg`, which checks
+the refuted probe `NoOverlappingL1Output` and exits 12: at three-record,
+two-hour bounds the same record identity is committed into two different
+hours and separately compacted in each, so two published L1 outputs whose
+`out` sets overlap are reachable, not a case the model's per-hour commit
+check happens to rule out. `SignalDedupContract` is then shown to fail
+against the pre-fix whole-entry `Dedup` at those same bounds (94884 states
+generated, 45619 distinct states found, depth 10, exit 12) and to hold
+against the fixed contribution-level `Dedup` by random simulation, since
+exhaustive re-exploration at the probe's bounds turned out to be intractable
+the same way `dedup-starvation-fixed.md` records for `DedupPreservesCoverage`
+(23,990,591 states generated in about five minutes and still climbing): 3000
+traces to depth 14, 42046 states checked, no violation, exit 0. See
+`counterexamples/overlap-nonvacuity.md` for the full trace and methodology.
+
 ## Fairness
 
 `FairSpec` adds only per-action weak fairness: `WF_vars(DoTick)`,
@@ -340,7 +379,7 @@ present only so `QueryTerminates` can hold under the bounded clock.
 
 `Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
 `Hours = {0, 1}`, `Records = {rA}`, `CompIds = {g1}`, `MaxClock = 3`,
-`MaxOps = 3`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
+`MaxOps = 2`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
 `RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
 mutation switches FALSE, `EnableDeletePathCorruption = TRUE`,
 `SYMMETRY Symmetry`. `Records` shrank from `{rA, rB}` to `{rA}` this round
@@ -381,3 +420,22 @@ within `MaxClock = 3`. The compact-strictly-before-fold gap (`FoldSealDelay = 1`
 is orthogonal to carry-forward and is covered by the smoke and exhaustive
 configs. Under this config the full safety invariant set holds while the
 incremental fold carries a below-floor hour forward verbatim.
+
+## Overlap constants
+
+`Keys = {hk}`, `Content = {hd, nc}` (`NoContent = nc`), `Clients = {f1}`,
+`Hours = {0, 1}`, `Records = {rA, rB, rC}`, `CompIds = {g1}`, `MaxClock = 3`,
+`MaxOps = 6`, `FoldSealDelay = 1`, `MaintSealDelay = 0`, `ProtectionHorizon = 1`,
+`RetentionHorizon = 2`, `LagBound = 1`, `DedupBySignal = TRUE`, all twelve
+mutation switches FALSE, `EnableDeletePathCorruption = FALSE`,
+`SYMMETRY Symmetry`. A third record and a wider `MaxOps` than smoke or
+exhaustive let the same record identity be committed into two different
+hours (`DoCommit` only checks the current hour's L0 set) and separately
+compacted in each, producing two published L1 outputs whose `out` sets
+overlap (finding 7). This is the case `smoke.cfg` (one record) and
+`exhaustive.cfg` (two records, `MaxOps = 2`) cannot reach. `overlap.cfg`
+gets no band row, the same as `carryforward.cfg`: it is a targeted safety
+pass, not the banded gate config, and the fixed model's full graph at these
+bounds did not finish exploring within five minutes (see Bands above and
+`counterexamples/overlap-nonvacuity.md`). Paired non-vacuity probe:
+`negative/overlap-nonvacuity.cfg`, same bounds, checks `NoOverlappingL1Output`.

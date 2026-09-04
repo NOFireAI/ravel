@@ -285,47 +285,79 @@ ObjectDeleted(e) ==
 Serves(e, r) ==
     \/ (e[1] = "l0" /\ e[3] = r)
     \/ (e[1] = "l1" /\ r \in crec[e[2]][e[3]].out)
-\* The identities a served entry set serves more than once (a two-source
-\* conflict): recomputed on whatever set was actually served, so a broken
-\* dedup is visible on the served entries themselves, never on a control flag.
-RawDupIdentities(P) == { r \in Records : Cardinality({ e \in P : Serves(e, r) }) > 1 }
 
-\* The metrics query collapses a two-source conflict to a single served entry
-\* per identity; logs/spans (or the DropMetricsDedup mutant) serve every
-\* source untouched. Dedup performs that collapse on the served set itself, so
-\* RawDupIdentities recomputed on its output is a store-derived witness, not a
-\* restatement of DedupApplies.
+\* The identities a served contribution set serves more than once (a
+\* two-source conflict): recomputed on whatever was actually served, so a
+\* broken dedup is visible on the served contributions themselves, never on a
+\* control flag. C is a set of <<entry, identity>> contributions (see Dedup
+\* below), not raw entries: an L1 part covering two identities is one entry
+\* but two contributions, and only a genuine two-ENTRY conflict on the same
+\* identity counts as a duplicate.
+RawDupIdentities(C) == { r \in Records : Cardinality({ c \in C : c[2] = r }) > 1 }
+
+\* The metrics query collapses a two-source conflict to a single served
+\* contribution per identity; logs/spans (or the DropMetricsDedup mutant)
+\* serve every source untouched. Dedup performs that collapse on the served
+\* set itself, so RawDupIdentities recomputed on its output is a store-derived
+\* witness, not a restatement of DedupApplies.
 DedupApplies == DedupBySignal /\ ~DropMetricsDedup
 Sources(r, P) == { e \in P : Serves(e, r) }
 
+\* Every <<entry, identity>> pair P actually serves, flattening a set of
+\* entries into the contributions they carry. This is what an undeduped
+\* reader (logs/spans, or DropMetricsDedup) serves: every source untouched,
+\* so two entries sharing an identity both contribute it and RawDupIdentities
+\* sees the conflict.
+AllContribs(P) == { c \in (P \X Records) : Serves(c[1], c[2]) }
+
 \* Survivor selection, most-constrained identity first: an identity with fewer
 \* sources is processed before one with more, so a forced survivor (an
-\* identity with exactly one source) is protected before a flexible identity
-\* picks an independent alternative that would otherwise starve it of that
-\* same shared source. An identity whose source set already overlaps
-\* Protected reuses the existing survivor instead of adding one, which is what
-\* keeps a shared L1 part serving two identities at once from also counting as
-\* two of Sources(r, P) for either. Picking per identity independently (the
-\* prior definition) had no such ordering: two identities sharing one L1
-\* source could choose different survivors, and the shared source then fell
-\* out of both removal sets' complement and was dropped, leaving the identity
-\* whose only source that was with none (issue #1121 Finding 1).
-RECURSIVE DedupSurvivors(_, _, _)
-DedupSurvivors(P, RS, Protected) ==
-    IF RS = {} THEN Protected
+\* identity with exactly one source) is assigned its entry before a flexible
+\* identity picks an independent alternative that would otherwise starve it of
+\* that same shared source. An identity whose source set already overlaps an
+\* already-assigned entry reuses that entry rather than picking a fresh one,
+\* which is what lets a shared L1 part go on serving two identities at once.
+\* Picking per identity independently (the prior definition) had no such
+\* ordering: two identities sharing one L1 source could choose different
+\* survivors, and the shared source then fell out of both removal sets'
+\* complement and was dropped, leaving the identity whose only source that was
+\* with none (issue #1121 Finding 1).
+\*
+\* Assigned tracks <<entry, identity>> CONTRIBUTIONS, not protected whole
+\* entries (issue #1121 round six, finding: the same record identity can be
+\* committed into two different hours -- DoCommit only checks the current
+\* hour's l0 set -- and separately compacted in each, so the part set can hold
+\* two L1 outputs that overlap, e.g. one covering {A, B} and another covering
+\* {B, C}). Protecting whole entries kept BOTH overlapping parts once A forced
+\* one and C forced the other, and B rode along on both, duplicated. Tracking
+\* per-identity contributions instead lets B's forced survivor (whichever
+\* overlapping entry it reuses, by the same-entry-reuse rule above) serve B
+\* while the OTHER entry keeps serving only the identity that actually forced
+\* it, not every identity in its out set.
+RECURSIVE ContribSurvivors(_, _, _)
+ContribSurvivors(P, RS, Assigned) ==
+    IF RS = {} THEN Assigned
     ELSE LET r == CHOOSE x \in RS :
                  \A y \in RS : Cardinality(Sources(x, P)) <= Cardinality(Sources(y, P))
              Src == Sources(r, P)
-         IN IF \/ Src = {}
-               \/ Src \cap Protected # {}
-            THEN DedupSurvivors(P, RS \ {r}, Protected)
-            ELSE DedupSurvivors(P, RS \ {r}, Protected \cup {CHOOSE e \in Src : TRUE})
+             AssignedEntries == { c[1] : c \in Assigned }
+         IN IF Src = {}
+            THEN ContribSurvivors(P, RS \ {r}, Assigned)
+            ELSE LET e == IF Src \cap AssignedEntries # {}
+                          THEN CHOOSE x \in Src \cap AssignedEntries : TRUE
+                          ELSE CHOOSE x \in Src : TRUE
+                 IN ContribSurvivors(P, RS \ {r}, Assigned \cup {<<e, r>>})
 
+\* The served view: one <<entry, identity>> contribution per identity that has
+\* a source, under dedup; every contribution any source carries, unfiltered,
+\* when dedup does not apply. Both branches return the same shape (a subset of
+\* AllEntries \X Records) so qy.pinned has one type regardless of DedupApplies.
 Dedup(P) ==
-    IF ~DedupApplies THEN P
-    ELSE LET Protected == DedupSurvivors(P, Records, {})
-         IN { e \in P : \/ e \in Protected
-                        \/ ~ \E r \in Records : Serves(e, r) }
+    IF ~DedupApplies THEN AllContribs(P)
+    ELSE ContribSurvivors(P, Records, {})
+
+\* The identities a contribution set actually names a source for.
+ServedIdentities(C) == { c[2] : c \in C }
 
 \* Whether the reader can resolve a snapshot from HEAD. HeadNamesOnlyComplete
 \* Parts already proves a valid HEAD always names an existing snapshot part
@@ -357,8 +389,9 @@ TypeOK ==
     /\ snapParts \subseteq SnapPart
     /\ foldStage \in [Folders -> StageRec]
     /\ qy \in [phase: {"idle", "pinned", "done", "invalid"}, attempt: 0..2,
-               pinned: SUBSET AllEntries, pinnedAtAttempt: SUBSET AllEntries,
-               resolvedView: SUBSET AllEntries, dupServed: SUBSET Records,
+               pinned: SUBSET (AllEntries \X Records),
+               pinnedAtAttempt: SUBSET (AllEntries \X Records),
+               resolvedView: SUBSET (AllEntries \X Records), dupServed: SUBSET Records,
                headStatusAtResolve: {"none"} \cup Statuses]
     /\ lastHead \in [kind: {"none", "fold", "recTick", "corrupt", "unsupported"},
                      wmBefore: Int, wmAfter: Int, entriesChanged: BOOLEAN,
@@ -771,11 +804,12 @@ DoTombstone(H) ==
 \* crates/ravel-query/src/engine.rs::QueryEngine::resolve_snapshot_with_retry.
 \* A valid HEAD with a readable index part pins the snapshot; any other state
 \* degrades to a listing (fail-open), never an error. pinned/pinnedAtAttempt
-\* record what the resolve SERVED (via QueryServedView); resolvedView records
-\* what the store SAID should be served (the fail-open witness, computed
-\* without QueryFailsClosedOnMissingIndex), so a mutant that serves an empty
-\* result on an unreadable index diverges the two. dupServed records the
-\* identities the query returned more than once.
+\* record what the resolve SERVED (via QueryServedView, a set of <<entry,
+\* identity>> contributions); resolvedView records what the store SAID should
+\* be served (the fail-open witness, computed without
+\* QueryFailsClosedOnMissingIndex), so a mutant that serves an empty result on
+\* an unreadable index diverges the two. dupServed records the identities the
+\* query returned more than once.
 DoQueryResolve ==
     /\ qy.phase = "idle"
     /\ LET v == QueryServedView IN
@@ -790,9 +824,11 @@ DoQueryResolve ==
 
 \* A pinned entry whose object was swept forces one re-resolve; a second miss is
 \* terminal (crates/ravel-query/src/error.rs::QueryError::SnapshotInvalidated).
+\* qy.pinned holds contributions, but object presence is a property of the
+\* physical entry each one names (c[1]), not of the identity it serves.
 DoQueryRun ==
     /\ qy.phase = "pinned"
-    /\ IF \A e \in qy.pinned : ~ObjectDeleted(e)
+    /\ IF \A c \in qy.pinned : ~ObjectDeleted(c[1])
          THEN qy' = [qy EXCEPT !.phase = "done"]
          ELSE IF qy.attempt < 2
                 THEN LET v == QueryServedView IN
@@ -813,7 +849,7 @@ DoQueryTamper ==
     /\ SnapshotChangesMidAttempt
     /\ qy.phase = "pinned"
     /\ qy.pinned # {}
-    /\ qy' = [qy EXCEPT !.pinned = qy.pinned \ {CHOOSE e \in qy.pinned : TRUE}]
+    /\ qy' = [qy EXCEPT !.pinned = qy.pinned \ {CHOOSE c \in qy.pinned : TRUE}]
     /\ UNCHANGED <<clock, budget, l0, crec, lastCompact, tomb, head, snapParts, foldStage,
                    lastHead, lastDelete, maxValidWm, corruptionUsed, unsupportedUsed, partUnreadable, entryUndecodable,
                    partCorruptionUsed, entryCorruptionUsed>>
@@ -1051,9 +1087,12 @@ SignalDedupContract ==
 \* any witness, so it checks the operator itself at every reachable state, not
 \* just at a query resolve. Complements SignalDedupContract, which catches a
 \* surviving duplicate but not a survivor dropped outright (issue #1121
-\* Finding 1).
+\* Finding 1). Dedup's output is a contribution set, not an entry set, so
+\* coverage means the identity is NAMED by some contribution, not that it
+\* still has a Sources(_, _) entry (a contribution's own entry can still
+\* carry the identity while no longer being that identity's assigned source).
 DedupPreservesCoverage ==
-    \A r \in Records : Sources(r, FallbackView) # {} => Sources(r, Dedup(FallbackView)) # {}
+    \A r \in Records : Sources(r, FallbackView) # {} => r \in ServedIdentities(Dedup(FallbackView))
 
 \* Non-vacuity probe for the bounded incremental fold. True once a fold has
 \* carried forward at least one entry from a hour below its reconcile floor
@@ -1126,6 +1165,26 @@ NoPartUnreadable == ~PartUnreadableExercised
 EntryUndecodableExercised == \E H \in Hours : entryUndecodable[H]
 
 NoEntryUndecodable == ~EntryUndecodableExercised
+
+\* Non-vacuity probe for the overlapping-L1-output case (issue #1121 round
+\* six, finding: deduplicate identity contributions, not whole entries). True
+\* once two published L1 records in DIFFERENT hours share an output identity:
+\* DoCommit only checks the current hour's l0 set, so the same record identity
+\* can be committed into two hours and separately compacted there, giving two
+\* L1 parts whose out sets overlap. Used only as a refuted control:
+\* NoOverlappingL1Output is checked as an INVARIANT in
+\* negative/overlap-nonvacuity.cfg, whose bounds (three records, two hours)
+\* make that double-commit-then-compact interleaving reachable; TLC reporting
+\* NoOverlappingL1Output violated proves the overlap is genuinely reached, not
+\* a case the paired overlap.cfg happens to never hit.
+OverlappingL1OutputExercised ==
+    \E H1, H2 \in Hours, g1, g2 \in CompIds :
+        /\ H1 # H2
+        /\ crec[H1][g1].used
+        /\ crec[H2][g2].used
+        /\ crec[H1][g1].out \cap crec[H2][g2].out # {}
+
+NoOverlappingL1Output == ~OverlappingL1OutputExercised
 
 ----------------------------------------------------------------------------
 \* Named temporal properties (checked against FairSpec only).
