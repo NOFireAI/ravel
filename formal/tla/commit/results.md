@@ -6,28 +6,91 @@ instantiates the shared store module. Per-run figures land in
 harness fails a PASS run whose distinct-state count or depth falls outside
 them.
 
-Toolchain: TLC 2.19 (tla2tools 1.7.4), OpenJDK 25 on an arm64 macOS laptop,
-`-workers auto`. Wall times are host-dependent and are not banded.
+Toolchain: TLC 2.19 (tla2tools 1.7.4), Eclipse Temurin 21 JRE, Linux amd64,
+`-workers auto`, host `ci-16gb-fsn1-1`. Wall times are host-dependent and
+are not banded. Run id `20260903T170727Z-24f728bd820bde8f80ba2dddb496331e30048577`
+unless noted otherwise.
 
-| Config | Spec | Distinct states | Depth | Wall time | Result |
+## Configuration runs
+
+| Config | States generated | Distinct | Depth | Seconds | Result |
 |---|---|---|---|---|---|
-| smoke.cfg | Spec (safety) | 5466239 | 36 | 52s | PASS |
-| exhaustive.cfg | Spec (safety, retry budget and deadline) | 30385359 | 38 | 4m49s | PASS |
-| live.cfg | FairSpec (liveness) | 649 | n/a | under 1s | PASS |
-| negative/no-cross-shard-atomicity.cfg | Spec, reachability obligation | short prefix | n/a | under 1s | NoCrossShardAtomicityUnreachable violated, exit 12 (required) |
-| negative/at-least-once-duplicate-reachable.cfg | Spec, reachability obligation | short prefix | n/a | under 1s | DuplicateUnreachable violated, exit 12 (required) |
-| negative/commit-before-data.cfg | Spec | short prefix | n/a | under 1s | NoCommitWithoutData violated, exit 12 |
-| negative/mismatched-identity-idempotent.cfg | Spec | short prefix | n/a | under 1s | OneIdentityOneContent violated, exit 12 |
-| negative/ack-before-commit.cfg | Spec | short prefix | n/a | under 1s | StrictAckImpliesDurable violated, exit 12 |
-| negative/marker-before-all-shards.cfg | Spec | short prefix | n/a | under 1s | MarkerImpliesAllShardsDurable violated, exit 12 |
-| dedup-mutant.cfg | Spec | full | n/a | under 1s | no violation, exit 0: with RetryDedups set the duplicate is unreachable, which is what proves the obligation above is not vacuous. Run by hand, not in the negative lane |
+| smoke.cfg | 29366 | 9758 | 23 | 1 | PASS |
+| negative/ack-before-commit.cfg | 2 | 2 | n/a | 1 | VIOLATED as required (StrictAckImpliesDurable) |
+| negative/at-least-once-duplicate-reachable.cfg | 64817 | 26486 | n/a | 2 | VIOLATED as required (DuplicateUnreachable) |
+| negative/commit-before-data.cfg | 44 | 41 | n/a | 1 | VIOLATED as required (NoCommitWithoutData) |
+| negative/deadline-reachable.cfg | 21228 | 9420 | n/a | 2 | VIOLATED as required (AbandonUnreachable) |
+| negative/marker-before-all-shards.cfg | 779 | 505 | n/a | 1 | VIOLATED as required (MarkerImpliesAllShardsDurable) |
+| negative/mismatched-identity-idempotent.cfg | 26950 | 12816 | n/a | 2 | VIOLATED as required (OneIdentityOneContent) |
+| negative/no-cross-shard-atomicity.cfg | 243 | 174 | n/a | 1 | VIOLATED as required (NoCrossShardAtomicityUnreachable) |
+| traceability | n/a | n/a | n/a | n/a | PASS, 21 rows resolve |
+| exhaustive.cfg | 397331556 | 111604592 | not reached | 2247 | STOPPED, not a violation |
 
-The safety models run to a complete state graph, so their distinct-state
-count and depth are deterministic and the bands carry a few percent of margin
-only to absorb a future toolchain change. The negative controls stop at the
-first counterexample TLC finds, which under `-workers auto` is not
-deterministic, so they carry no band; each is pinned instead by its `.expect`
-file, which names both the exit code and the property that must be reported.
+The negative rows are the required outcome: each config disables a guard or
+flips a broken-behaviour switch, and TLC finding the counterexample proves
+the corresponding property is load-bearing, not vacuous. Each is pinned by
+its `.expect` file, which names the exit code and the property the log must
+report; all seven `.expect` files were checked against the logs above and
+match exactly.
+
+`exhaustive.cfg` did not complete in this session. It was launched under
+`scripts/check-tla.sh all -a commit` and left running with a disk-floor and
+30-minute watchdog. The watchdog process did not survive as a running
+background job (a defect in how it was backgrounded, not in the model or
+the script), so the run continued unwatched past the 30-minute cap; it was
+found still running at 37 minutes 27 seconds on the next poll and stopped
+by hand at that point (`TLC exit 137`, SIGKILL). The figures above are the
+last progress line TLC printed before the kill, not a completed state
+graph, and `bands.tsv` carries no exhaustive row for this reason: banding
+a partial count would assert a state-space size that was never actually
+established. A completed exhaustive figure remains open for a future run
+with a working watchdog and a longer session budget.
+
+## By-hand runs
+
+| Run | Spec/Invariant | States generated | Distinct | Depth | Result |
+|---|---|---|---|---|---|
+| dedup-mutant.cfg | DuplicateUnreachable only, RetryDedups=TRUE | 433976430 | 81903514 | 34 | PASS (exit 0), "Model checking completed. No error has been found.", 25min 00s |
+| live.cfg | FairSpec / EveryPinnedFlushSettles | 12690 | 5398 | 12 | PASS (exit 0), under 1s |
+
+`dedup-mutant.cfg` is the proof that `DuplicateUnreachable` is not
+vacuously true: with the dedup guard enabled (`RetryDedups=TRUE`), TLC
+explored the complete state graph at these bounds and found no state where
+a retried commit produces a duplicate. Paired with the negative control
+below (same obligation, guard disabled, counterexample found in 2 seconds),
+this shows the guard is what makes the property hold, not an unreachable
+antecedent.
+
+## Mutant audit
+
+One behaviour mutation per invariant, either a scratch copy of the two
+`.tla` files outside the repository (mutated file and mutation described
+below, temp dir removed afterward) or, where an existing negative-control
+switch already is that mutation, a citation of that control instead of a
+redundant new one. Every row's TLC line was read from this session's own
+logs or console output, not carried over from an earlier run.
+
+| Invariant | What it observes | Mutation | TLC line |
+|---|---|---|---|
+| NoCommitWithoutData | the store's data-object presence for a flush before its commit record can exist | cited control: `negative/commit-before-data.cfg`, `CommitBeforeData=TRUE` lets `PutCommit` fire before the data PUT | `Error: Invariant NoCommitWithoutData is violated.` |
+| NoUncommittedDataVisible | `Visible` against `DurableSet` | none possible: the invariant is `(P /\ Q) => Q`, a propositional tautology true regardless of state or store content, so no behaviour mutation can make it fail | not applicable, see note below |
+| StrictAckImpliesDurable | `DurableSet` (store witness) whenever a strict ack was recorded | cited control: `negative/ack-before-commit.cfg`, `AckAtEnqueue=TRUE` lets the ack fire before the commit PUT succeeds | `Error: Invariant StrictAckImpliesDurable is violated.` |
+| OneIdentityOneContent | the content actually durable under a commit key versus the pinned content for that identity | cited control: `negative/mismatched-identity-idempotent.cfg`, `SkipHashCompare=TRUE` drops the content-hash compare on identity reuse | `Error: Invariant OneIdentityOneContent is violated.` |
+| SplitBrainStopsTheShard | `shardDead` for a shard that produced a split-brain outcome | scratch mutation: dropped the `shardDead' = IF split THEN ... ELSE shardDead` effect, replaced with `shardDead' = shardDead` (split-brain no longer kills the shard), run against `smoke.cfg` | `Error: Invariant SplitBrainStopsTheShard is violated.` |
+| RetrySamePinnedFlushIdempotent | the durable content written by a retried `PutCreateIfAbsent` against what the writer pinned | scratch mutation: changed the retry's `Store!PutCreateIfAbsent(k, pinned[f])` to write the sentinel `NoC` instead, run against `smoke.cfg` | `Error: Invariant RetrySamePinnedFlushIdempotent is violated.` |
+| NoPublishAfterAbandon | the `publishedAt` witness against `Expired(f)`, i.e. no store write after the flush-lifetime deadline | scratch mutation: removed the `~Expired(f)` guard from `PutCommit`'s conjunction list, run against a scratch cfg with room for the deadline to elapse (`FlushLifetime=1, MaxTicks=3`, single writer/shard) | `Error: Invariant NoPublishAfterAbandon is violated.` |
+| MarkerImpliesAllShardsDurable | `AllShardsDurable` before the idempotency marker is written | cited control: `negative/marker-before-all-shards.cfg`, `MarkerAfterFirstShard=TRUE` writes the marker after only one shard is durable | `Error: Invariant MarkerImpliesAllShardsDurable is violated.` |
+| PartialReportingMatchesSignal | per-shard reporting against the declared `Signal`'s shard set | diagnostic cfg (not a repo file): `Signal="metrics"`, `Shards={s1,s2}`, `AckAtEnqueue=TRUE`, invariant listed alone. Real: genuinely violable in isolation, but in every shipped cfg it is strictly weaker than `StrictAckImpliesDurable` and always shadowed by it (same states violate both, and TLC reports the earlier-listed invariant first), so no shipped cfg reports it directly | `Error: Invariant PartialReportingMatchesSignal is violated.` (diagnostic cfg only; shipped cfgs report `StrictAckImpliesDurable` on the same states) |
+| TokenNeverServesStale | `ResolveToken`'s reported outcome against a live `Store!Present` read for the commit key | scratch mutation: changed `ResolveToken` to set `outcome |-> "served"` unconditionally instead of from the live presence read, so `present` can be FALSE while `outcome` still claims "served", run against `smoke.cfg` | `Error: Invariant TokenNeverServesStale is violated.` |
+| DuplicateUnreachable | reachability of a state with two distinct successful commits for one pinned identity under retry | cited control: `negative/at-least-once-duplicate-reachable.cfg`, `RetryDedups=FALSE` (dedup guard absent, ordinary at-least-once retry) | `Error: Invariant DuplicateUnreachable is violated.` |
+
+`NoUncommittedDataVisible` reads, in the source, as `(P /\ Q) => Q` over
+`Visible` and `DurableSet`: the consequent is one conjunct of the
+antecedent. That makes it a propositional tautology, true for every
+assignment of `P` and `Q`, independent of any reachable state or any
+mutation to the actions that produce them. No behaviour mutation can make
+a tautology fail; this is a property of the formula, not a gap in the
+mutation search.
 
 ## What the correct-form runs found
 
