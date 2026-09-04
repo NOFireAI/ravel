@@ -151,14 +151,19 @@ VARIABLES
     seedFresh,       \* [Workers -> [fresh: Int, snap: Int]] the seeded freshness
                      \* actually stored by the last seed, and the source snapshot
                      \* time it must not exceed (0/0 before any seed)
-    vanishedOnce     \* [Units -> [Variants -> BOOLEAN]] a winner part has already
+    vanishedOnce,    \* [Units -> [Variants -> BOOLEAN]] a winner part has already
                      \* transiently vanished once (bounds the vanish/re-PUT cycle)
+    hbWriteCount,    \* [Workers -> 0..2] durable heartbeat writes issued, capped
+                     \* at two so a second Overwrite of an already-present key is
+                     \* reachable without driving versionCounter without end
+    memoWriteCount   \* [Workers -> 0..2] durable memo writes issued, same cap
 
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           now, hbStamp, crashed, cachedLive, memoSnap,
           firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-          partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+          partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+          hbWriteCount, memoWriteCount>>
 
 \* The publication-resolution outcome alphabet (ADR-1113 D3), mirroring
 \* publish.rs::resolve_already_exists: the CreateIfAbsent winner is Published; a
@@ -216,6 +221,8 @@ OTypeOK ==
     /\ recVer \in [Units -> Nat]
     /\ seedFresh \in [Workers -> [fresh: Int, snap: Int]]
     /\ vanishedOnce \in [Units -> [Variants -> BOOLEAN]]
+    /\ hbWriteCount \in [Workers -> 0..2]
+    /\ memoWriteCount \in [Workers -> 0..2]
 
 Init ==
     /\ StoreInit
@@ -233,6 +240,8 @@ Init ==
     /\ recVer = [u \in Units |-> 0]
     /\ seedFresh = [w \in Workers |-> [fresh |-> 0, snap |-> 0]]
     /\ vanishedOnce = [u \in Units |-> [v \in Variants |-> FALSE]]
+    /\ hbWriteCount = [w \in Workers |-> 0]
+    /\ memoWriteCount = [w \in Workers |-> 0]
 
 \* --- Membership actions -----------------------------------------------------
 
@@ -248,31 +257,37 @@ WriteHeartbeat(w) ==
     /\ hbStamp' = [hbStamp EXCEPT ![w] = now]
     /\ UNCHANGED <<sVars, now, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* The durable heartbeat OBJECT write (Overwrite of sys/maintain/workers/<id>),
-\* self-owned and never a CAS. Bounded to once per key: the put mode does not vary
-\* with frequency, so a single write suffices to observe it. The witness records
-\* the key's stored version before and after, so the invariant observes that the
-\* write landed unconditionally (a fresh version) rather than a self-report.
+\* self-owned and never a CAS. Bounded to twice per key: the put mode does not
+\* vary with frequency, so a second write suffices to observe an Overwrite of an
+\* already-present key (the first write can only ever create). The witness
+\* records the key's stored version before and after, so the invariant observes
+\* that the write landed unconditionally (a fresh version) rather than a
+\* self-report.
 PersistHeartbeat(w) ==
     /\ w = PersistWorker
     /\ ~crashed[w]
-    /\ ~Present(HbKey(w))
+    /\ hbWriteCount[w] < 2
     /\ PutOverwrite(HbKey(w), HbContent(w))
     /\ lastMaint' = [class |-> "heartbeat",
                      verBefore |-> VersionOf(HbKey(w)),
                      verAfter |-> store'[HbKey(w)].version]
+    /\ hbWriteCount' = [hbWriteCount EXCEPT ![w] = @ + 1]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   memoWriteCount>>
 
 Tick ==
     /\ now < MaxT
     /\ now' = now + 1
     /\ UNCHANGED <<sVars, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 Crash(w) ==
     /\ AllowCrash
@@ -280,7 +295,8 @@ Crash(w) ==
     /\ crashed' = [crashed EXCEPT ![w] = TRUE]
     /\ UNCHANGED <<sVars, now, hbStamp, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* A restart takes a fresh incarnation heartbeat (the old key lingers, abstracted
 \* per the header): re-heartbeat at the current clock.
@@ -290,7 +306,8 @@ Revive(w) ==
     /\ hbStamp' = [hbStamp EXCEPT ![w] = now]
     /\ UNCHANGED <<sVars, now, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* WorkerSet::live_set snapshotted once at the head of a discovery cycle
 \* (run_discovery_cycle threads one live set through every unit).
@@ -299,7 +316,8 @@ ComputeLive(w) ==
     /\ cachedLive' = [cachedLive EXCEPT ![w] = LiveView(w)]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* --- Compaction publication -------------------------------------------------
 
@@ -311,7 +329,8 @@ PutPart(u, v) ==
     /\ PutCreateIfAbsent(PartKey(u, v), <<u, v>>)
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* The winner's terminal record PUT (CreateIfAbsent) and the loser's convergence
 \* over the shared object store, resolving exactly as
@@ -368,7 +387,8 @@ WorkerRecord(w, u) ==
     /\ DoPublish(u, Canon)
     /\ attemptedByOwner' = [attemptedByOwner EXCEPT ![u] = TRUE]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   cliCorrect, lastMaint, partTomb, seedFresh, vanishedOnce>>
+                   cliCorrect, lastMaint, partTomb, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* The ungated CLI path (services/ravel-cli/src/maintain.rs): publishes any unit
 \* and any variant with no heartbeat and no ownership. A CLI actor is always a
@@ -381,7 +401,8 @@ CliRecord(u, v) ==
     /\ DoPublish(u, v)
     /\ cliCorrect' = TRUE
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
-                   attemptedByOwner, lastMaint, partTomb, seedFresh, vanishedOnce>>
+                   attemptedByOwner, lastMaint, partTomb, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* --- Maintain memo ----------------------------------------------------------
 
@@ -396,7 +417,8 @@ WriteMemo(w) ==
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> now, verU |-> now]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* A future/skewed entry: the snapshot records an entry verified AFTER its own
 \* snapshot_unix_ns (a clock ahead of the snapshot-writing clock). This is the
@@ -408,23 +430,27 @@ FutureEntry(w) ==
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> now, verU |-> now + 1]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* write_memo_snapshot: the durable memo OBJECT write (Overwrite of
-\* sys/maintain/memo/<id>), self-owned and never a CAS. Bounded to once per key
-\* for the same reason as PersistHeartbeat: the put mode is frequency-invariant.
-\* The witness reads the stored version before and after.
+\* sys/maintain/memo/<id>), self-owned and never a CAS. Bounded to twice per key
+\* for the same reason as PersistHeartbeat: a second write observes an Overwrite
+\* of an already-present key. The witness reads the stored version before and
+\* after.
 PersistMemo(w) ==
     /\ w = PersistWorker
     /\ ~crashed[w]
-    /\ ~Present(MemoKey(w))
+    /\ memoWriteCount[w] < 2
     /\ PutOverwrite(MemoKey(w), MemoContent(w))
     /\ lastMaint' = [class |-> "memo",
                      verBefore |-> VersionOf(MemoKey(w)),
                      verAfter |-> store'[MemoKey(w)].version]
+    /\ memoWriteCount' = [memoWriteCount EXCEPT ![w] = @ + 1]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount>>
 
 \* Corruption of a snapshot is treated as absent: snapNs = -1 removes it from the
 \* seed set (MemoSnapshotError, corruption treated as absent).
@@ -432,7 +458,8 @@ CorruptMemo(w) ==
     /\ memoSnap' = [memoSnap EXCEPT ![w] = [snapNs |-> -1, verU |-> memoSnap[w].verU]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* Valid snapshots for w to seed from: not corrupt, and within the bidirectional
 \* staleness gate of w's clock.
@@ -463,7 +490,8 @@ SeedMemo(w) ==
                                  [fresh |-> clamped, snap |-> s.snapNs]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, vanishedOnce>>
+                   partTomb, lastPub, recVer, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* A published winner part transiently disappears (a tombstone race, GC, or a
 \* delayed listing), and is re-PUTtable: a later convergence re-creates the
@@ -481,7 +509,8 @@ VanishPart(u) ==
     /\ vanishedOnce' = [vanishedOnce EXCEPT ![u][firstRecord[u][2]] = TRUE]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, seedFresh>>
+                   partTomb, lastPub, recVer, seedFresh,
+                   hbWriteCount, memoWriteCount>>
 
 \* The winner part vanishes and is tombstoned: it cannot be re-PUT (the rerun in
 \* tombstone_race.rs::rerun_with_revanished_part_fails_typed_not_converged sees a
@@ -496,7 +525,8 @@ TombstonePart(u) ==
          ELSE UNCHANGED sVars
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   lastPub, recVer, seedFresh, vanishedOnce>>
+                   lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 Next ==
     \/ \E w \in Workers : WriteHeartbeat(w)
