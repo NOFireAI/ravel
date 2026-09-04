@@ -91,13 +91,16 @@ VARIABLES
     recVer,          \* [Units -> 0..MaxV] the store version the terminal record was
                      \* published at (0 = unpublished); latched from the store at
                      \* the CreateIfAbsent winner and asserted never to move again
-    lastPub          \* the outcome of the most recent publish resolution, with a
+    lastPub,         \* the outcome of the most recent publish resolution, with a
                      \* store-observed part witness (never a self-reported label)
+    vanishedOnce     \* [Units -> [Variants -> BOOLEAN]] a winner part has already
+                     \* transiently vanished once (bounds the vanish/re-PUT cycle)
 
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-          lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
+          lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub,
+          vanishedOnce>>
 
 \* The publication-resolution outcome alphabet (ADR-1113 D3), mirroring
 \* publish.rs::resolve_already_exists: the CreateIfAbsent winner is Published;
@@ -152,6 +155,7 @@ CTypeOK ==
     /\ partTomb \in [Units -> [Variants -> BOOLEAN]]
     /\ recVer \in [Units -> VerRange]
     /\ lastPub \in [outcome: PubOutcomes, winnerPartPresent: BOOLEAN]
+    /\ vanishedOnce \in [Units -> [Variants -> BOOLEAN]]
 
 Init ==
     /\ StoreInit
@@ -168,6 +172,7 @@ Init ==
     /\ partTomb = [u \in Units |-> [v \in Variants |-> FALSE]]
     /\ recVer = [u \in Units |-> 0]
     /\ lastPub = [outcome |-> "none", winnerPartPresent |-> FALSE]
+    /\ vanishedOnce = [u \in Units |-> [v \in Variants |-> FALSE]]
 
 \* --- claim lifecycle --------------------------------------------------------
 
@@ -184,14 +189,15 @@ Acquire(w, u) ==
                        afterContent |-> store'[ClaimKey(u)].content]
     /\ claimBorn' = [claimBorn EXCEPT ![u] = TRUE]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, lastGuarded, stolen,
-                   partTomb, recVer, lastPub>>
+                   partTomb, recVer, lastPub, vanishedOnce>>
 
 \* claim.rs::observe -- one GET plus one HEAD; records the observed version.
 Observe(w, u) ==
     /\ ClaimPresent(u)
     /\ obsVer' = [obsVer EXCEPT ![w][u] = ClaimVer(u)]
     /\ UNCHANGED <<sVars, timeUsed, heldVer, firstRecord, claimBorn,
-                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub,
+                   vanishedOnce>>
 
 \* claim.rs::renew -- CasVersion on the held token; PreconditionFailed is
 \* ClaimLost (the token is dropped). Only the holder attempts it (its token).
@@ -210,7 +216,7 @@ Renew(w, u) ==
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded,
-                   stolen, partTomb, recVer, lastPub>>
+                   stolen, partTomb, recVer, lastPub, vanishedOnce>>
 
 \* claim.rs::steal -- CasVersion on the observed version, gated on expiry and a
 \* readable payload. StealRefused (NotExpired/UnreadableClaim) issues no store
@@ -232,7 +238,7 @@ Steal(w, u) ==
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded,
-                   partTomb, recVer, lastPub>>
+                   partTomb, recVer, lastPub, vanishedOnce>>
 
 \* claim.rs::mark_completed -- CasVersion; PreconditionFailed is NotOwner.
 MarkCompleted(w, u) ==
@@ -250,7 +256,7 @@ MarkCompleted(w, u) ==
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn, lastGuarded,
-                   stolen, partTomb, recVer, lastPub>>
+                   stolen, partTomb, recVer, lastPub, vanishedOnce>>
 
 \* A claim payload becomes unreadable (corruption). Treated as absent by readers
 \* and never stolen. No metadata changes (raw corruption, not a store write).
@@ -262,7 +268,7 @@ CorruptClaim(u) ==
                    [present |-> TRUE, content |-> Corrupt, version |-> ClaimVer(u)]]
     /\ UNCHANGED <<lastModified, versionCounter, uploads, listState, timeUsed,
                    heldVer, obsVer, firstRecord, claimBorn, lastClaimOp,
-                   lastGuarded, stolen, partTomb, recVer, lastPub>>
+                   lastGuarded, stolen, partTomb, recVer, lastPub, vanishedOnce>>
 
 \* Logical time advances (an unrelated store write bumps the version domain that
 \* last_modified lives in). Bounded by MaxTime, separately from the write bound,
@@ -274,7 +280,7 @@ TimePass ==
     /\ PutOverwrite(ScratchKey, Scr)
     /\ timeUsed' = timeUsed + 1
     /\ UNCHANGED <<heldVer, obsVer, firstRecord, claimBorn, lastClaimOp,
-                   lastGuarded, stolen, partTomb, recVer, lastPub>>
+                   lastGuarded, stolen, partTomb, recVer, lastPub, vanishedOnce>>
 
 \* --- compaction publication (never reads the claim) -------------------------
 
@@ -287,7 +293,8 @@ PutPart(u, v) ==
     /\ (~LivenessMode \/ \A x \in Units : ClaimPresent(x))
     /\ PutCreateIfAbsent(PartKey(u, v), <<u, v>>)
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub,
+                   vanishedOnce>>
 
 \* The winner's terminal record PUT (CreateIfAbsent) and the loser's convergence
 \* over the shared object store, resolving exactly as publish.rs and
@@ -346,7 +353,7 @@ GuardedPublish(w, u, v) ==
     /\ DoPublish(u, v)
     /\ lastGuarded' = [fired |-> TRUE, held |-> HoldsClaim(w, u)]
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, lastClaimOp,
-                   stolen, partTomb>>
+                   stolen, partTomb, vanishedOnce>>
 
 \* The ungated publish: the --no-claim CLI path and a paused stale worker that
 \* ignores its checkpoints and reaches the publication path anyway. Publishes
@@ -357,7 +364,7 @@ UngatedPublish(u, v) ==
     /\ ~LivenessMode
     /\ DoPublish(u, v)
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn, lastClaimOp,
-                   lastGuarded, stolen, partTomb>>
+                   lastGuarded, stolen, partTomb, vanishedOnce>>
 
 \* The cancellation checkpoint that finds the claim already lost abandons the
 \* run: it publishes nothing (the store is unchanged) and records the Abandoned
@@ -372,7 +379,7 @@ AbandonPublish(w, u, v) ==
                                            THEN Present(PartKey(u, v))
                                            ELSE Present(PartKey(u, firstRecord[u][2]))]
     /\ UNCHANGED <<sVars, timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-                   lastClaimOp, lastGuarded, stolen, partTomb, recVer>>
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, vanishedOnce>>
 
 \* A published winner part transiently disappears (a tombstone race, GC, or a
 \* delayed listing), and is re-PUTtable: a later convergence re-creates the
@@ -385,7 +392,9 @@ VanishPart(u) ==
     /\ firstRecord[u] # NoRec
     /\ Present(PartKey(u, firstRecord[u][2]))
     /\ ~partTomb[u][firstRecord[u][2]]
+    /\ ~vanishedOnce[u][firstRecord[u][2]]
     /\ Delete(PartKey(u, firstRecord[u][2]))
+    /\ vanishedOnce' = [vanishedOnce EXCEPT ![u][firstRecord[u][2]] = TRUE]
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
                    lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
 
@@ -401,7 +410,7 @@ TombstonePart(u) ==
          THEN Delete(PartKey(u, firstRecord[u][2]))
          ELSE UNCHANGED sVars
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-                   lastClaimOp, lastGuarded, stolen, recVer, lastPub>>
+                   lastClaimOp, lastGuarded, stolen, recVer, lastPub, vanishedOnce>>
 
 Next ==
     \/ \E w \in Workers, u \in Units : Acquire(w, u)

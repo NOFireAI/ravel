@@ -49,7 +49,7 @@ BrokenComplete(w, u) ==
                            beforeContent |-> ClaimContentOf(u),
                            afterContent |-> store'[ClaimKey(u)].content]
     /\ UNCHANGED <<timeUsed, obsVer, firstRecord, claimBorn,
-                   lastGuarded, stolen, partTomb, recVer, lastPub>>
+                   lastGuarded, stolen, partTomb, recVer, lastPub, vanishedOnce>>
 
 \* Broken: an unconditional DELETE of the claim key, touching no witness. The
 \* store-level NoUnconditionalClaimDelete catches it: the claim key drops from
@@ -60,7 +60,8 @@ DeleteClaim(u) ==
     /\ ClaimPresent(u)
     /\ Delete(ClaimKey(u))
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub,
+                   vanishedOnce>>
 
 \* Broken: when the claim is held, the publish path overwrites the terminal
 \* record instead of CreateIfAbsent, so a holder can mutate the record to a
@@ -76,7 +77,8 @@ BrokenClaimPublish(w, u, v) ==
                             THEN [firstRecord EXCEPT ![u] = <<u, v>>]
                             ELSE firstRecord
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn,
-                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub>>
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, lastPub,
+                   vanishedOnce>>
 
 \* Broken: the guarded (checkpoint) publish drops its HoldsClaim check and
 \* publishes regardless. The witness still reads the store (held |-> HoldsClaim),
@@ -88,7 +90,7 @@ BrokenGuardedPublish(w, u, v) ==
     /\ DoPublish(u, v)
     /\ lastGuarded' = [fired |-> TRUE, held |-> HoldsClaim(w, u)]
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, claimBorn,
-                   lastClaimOp, stolen, partTomb>>
+                   lastClaimOp, stolen, partTomb, vanishedOnce>>
 
 \* Broken: a loser whose input set diverges from the winner overwrites the
 \* terminal record instead of alarming. The overwrite re-writes identical content,
@@ -107,7 +109,7 @@ BrokenDivergePublish(u, v) ==
         /\ lastPub' = [outcome |-> "InputSetHashDivergence",
                        winnerPartPresent |-> Present(PartKey(u, firstRecord[u][2]))]
     /\ UNCHANGED <<timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-                   lastClaimOp, lastGuarded, stolen, partTomb, recVer>>
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, vanishedOnce>>
 
 \* Broken: a resolution whose winner part vanished and is tombstoned (not
 \* re-PUTtable) reports Converged. It self-reports the "Converged" label while
@@ -124,7 +126,7 @@ BrokenMissingPartConverge(u, v) ==
     /\ lastPub' = [outcome |-> "Converged",
                    winnerPartPresent |-> Present(PartKey(u, v))]
     /\ UNCHANGED <<sVars, timeUsed, heldVer, obsVer, firstRecord, claimBorn,
-                   lastClaimOp, lastGuarded, stolen, partTomb, recVer>>
+                   lastClaimOp, lastGuarded, stolen, partTomb, recVer, vanishedOnce>>
 
 MCNext ==
     \/ Next
