@@ -8,7 +8,7 @@
 
 `--fetch-concurrency` is one flag driving four consumers:
 
-```
+```text
 crates/ravel-query/src/engine.rs:358, :369        with_max_concurrent_gets()  RLOG GET semaphore
 services/ravel-server/src/query.rs:333            with_max_concurrent_gets()  RLOG GET semaphore
 crates/ravel-sql/src/session.rs:540               with_target_partitions()    DataFusion partitions
@@ -72,7 +72,13 @@ flowchart LR
 | `--sql-partition-count` | count of partitions | DataFusion `target_partitions` (`crates/ravel-sql/src/session.rs:540`) | `max(8, 2 x cores)` |
 | `--promql-fetch-fanout` | count of in-flight futures | `buffer_unordered` width (`crates/ravel-query/src/engine.rs:1366,1784,2092`) | `max(8, 2 x cores)` |
 
-Every unit is a positive integer count; zero is rejected at startup. All three
+Every unit is a positive integer count. Zero is rejected during configuration
+resolution, before any fetcher or SQL session is constructed, and
+`EngineConfig::validate` gains the same check for direct construction. Today
+nothing rejects it: `with_max_concurrent_gets` silently converts zero to one
+and the SQL session applies `.max(1)` to the partition count, so an operator
+who sets zero gets one without being told. A refused startup is the honest
+answer to a value that has no meaning. All three
 formulas are today's single derived default, so **no default moves**: the split
 changes which knob an operator turns, not what an untouched deployment does. The
 `max(8, ...)` floor and the `2 x cores` factor come from
@@ -104,9 +110,15 @@ naming both, not a silent precedence rule.
 **Compatibility changes are named, not denied.** Three behaviours change for
 existing deployments:
 
-- **RSEG fetchers are raised and then shared.** They move from the compiled
+- **RSEG fetchers start honouring the limit, and are shared.** For a
+  deployment with no explicit legacy value they move from the compiled
   `DEFAULT_MAX_CONCURRENT_GETS = 16` to the derived default, 32 on a 16-core
-  host, and become subject to a shared ceiling they previously escaped.
+  host. For a deployment that set `--fetch-concurrency` explicitly, the
+  alias now reaches RSEG too, so RSEG moves to THAT value: a deployment on
+  `--fetch-concurrency=8` takes RSEG from 16 down to 8, and one on `64`
+  raises it to 64. Either way RSEG becomes subject to a shared ceiling it
+  previously escaped, and either way the change is a consequence of the
+  operator's existing setting finally applying where it was documented to.
 - **RSPAN fetchers are constrained for the first time.** `SpanSegmentFetcher`
   has no semaphore today, so its GET concurrency is bounded only by its caller.
   Wiring it to the limiter is a restriction, not a raise, and it is the one
