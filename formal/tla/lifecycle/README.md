@@ -69,6 +69,17 @@ placed or released strictly after a legitimate completion or sweep does not
 retroactively fail them; this is the same reason `NoDeleteInsideProtectionWindow`
 reads `lastGc` instead of the live `supersededAt`/query state.
 
+`NoDeleteInsideProtectionWindow` has a dedicated horizon clause per
+horizon-gated rule (retention, superseded, `.dreq`), each comparing
+`lastGc.atClock` against the recorded time the horizon is measured from. The
+`.dreq` clause (`lastGc.rule = "dreq" => lastGc.atClock >= dreqHorizon`) is
+separate from the invariant's `permittedNeeds`-intersection clause, which
+cannot say anything about `.dreq`: `.dreq` is a control object,
+`permittedNeeds` is always a subset of `DataObjects`, so that clause is
+structurally empty whenever `lastGc.rule = "dreq"` (issue #1122). Proved
+non-vacuous by removing `DreqSweep`'s horizon guard in a scratch copy and
+recording the resulting TLC violation (`results.md`).
+
 The config horizon inequality (protection_horizon at or above
 max_query_duration plus grace plus clock_skew) is an `ASSUME` on the constants,
 not a checked invariant: it is a precondition on config rather than a
@@ -146,17 +157,25 @@ exactly at `MaxClock` can never clear, because `Tick`'s own guard requires
 
 Both properties are now stated as explicit antecedents grounded in the real
 enabling condition of the action each is waiting on, instead of a quiescence
-hypothesis:
+hypothesis. Neither antecedent includes the condition its own awaited action
+negates as a side effect (a later review, issue #1122, found the first
+attempt at this restatement still included that condition, making the
+leads-to trivially true regardless of whether the action ever fired):
 
-- `EventuallySwept`: for each raw input, if `SupersededSweep`'s own guard
-  (superseded, present, not legal-held, past the horizon or query-permitted,
-  not gated off by the sweep gate, HEAD present, no unrecovered failed
-  refresh) holds *permanently* from some point on (`<>[]`), the input is
-  eventually gone.
-- `EventuallyCompleted`: if `CompleteErasure`'s own guard (`.done` absent,
-  `.dreq` present, HEAD present, served-set clear, no held input serving the
-  subject, clock past zero) holds permanently from some point on, `.done`
-  eventually exists.
+- `EventuallySwept`: for each raw input, if `SupersededSweep`'s own guard,
+  minus the object's own presence (superseded, not legal-held, past the
+  horizon or query-permitted, not gated off by the sweep gate, HEAD present,
+  no unrecovered failed refresh), holds *permanently* from some point on
+  (`<>[]`), the input is eventually gone. Presence is excluded because
+  `SupersededSweep` is the action being awaited and removing the object is
+  its own effect; an antecedent that also demanded the object stay present
+  could never hold permanently once the action's other guards did, making
+  the property trivially true no matter what the protocol did.
+- `EventuallyCompleted`: if `CompleteErasure`'s own guard, minus `.done`'s
+  own absence (`.dreq` present, HEAD present, served-set clear, no held
+  input serving the subject, clock past zero), holds permanently from some
+  point on, `.done` eventually exists. `.done`'s absence is excluded for the
+  same reason: writing `.done` is `CompleteErasure`'s own effect.
 
 This task did not run the exhaustive configuration (forbidden for this task;
 the orchestrator runs it and its outcome is recorded in `results.md`). It

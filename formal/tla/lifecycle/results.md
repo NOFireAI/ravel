@@ -489,3 +489,92 @@ legal hold that actually blocks a completion, the protection horizon gating
 a delete, and the .dreq hold blocking the request-marker sweep. All four
 probes violate (TLC exit 12), so all four remain reachable at the shrunk
 bound.
+
+## Round three findings (issue #1122)
+
+A further adversarial review of the pull request raised three findings.
+Disposition:
+
+1. (MAJOR) `EventuallySwept` and `EventuallyCompleted` were self-negating:
+   `EventuallySwept`'s antecedent required `PresentObj(o)`, but the action
+   the leads-to describes, `SupersededSweep`, deletes `o` as its own effect,
+   so the antecedent could never hold permanently once the action's other
+   guards held; the leads-to was therefore trivially true regardless of
+   whether the protocol actually swept anything. `EventuallyCompleted` had
+   the same shape with `~PresentObj("doneR1")`, negated by `CompleteErasure`
+   writing `.done`. Fixed by dropping exactly the self-negating conjunct from
+   each antecedent (`PresentObj(o)` from `EventuallySwept`,
+   `~PresentObj("doneR1")` from `EventuallyCompleted`), keeping the `~>`
+   connective and every other conjunct (including `<>[]`) unchanged. Both
+   properties re-run alone, in the same per-property reduced configuration
+   the earlier rounds established (`TypeOK` plus the one `PROPERTY`,
+   `FullEnv = TRUE`, `SPECIFICATION FairSpec`, every switch at its shipped
+   value, `MaxClock = 2`, run in a scratch cfg not committed):
+   - `EventuallySwept`: TLC exit 0, `Model checking completed. No error has
+     been found.` (464571 states generated, 79358 distinct, depth 19).
+   - `EventuallyCompleted`: TLC exit 0, `Model checking completed. No error
+     has been found.` (464571 states generated, 79358 distinct, depth 19).
+   Both properties also re-verified together against the full model
+   (`exhaustive.cfg`, `FairSpec`, every safety invariant, `MaxClock = 3`):
+   PASS, 2357319 states generated, 387264 distinct, depth 21, 48s, matching
+   the previously recorded band exactly, so removing the self-negating
+   conjuncts changed neither property's outcome nor the reachable state
+   count.
+2. (MINOR by label, treated as load-bearing) The `.dreq` horizon clause of
+   `NoDeleteInsideProtectionWindow` was vacuous: the only clause covering
+   `lastGc.rule = "dreq"` was
+   `lastGc.rule \in HorizonGatedRules => (lastGc.deleted \cap
+   lastGc.permittedNeeds) = {}`, and for the `"dreq"` rule
+   `lastGc.deleted = {"dreqR1"}` (a control object) while
+   `lastGc.permittedNeeds` is always a subset of `DataObjects`
+   (`PermittedNeeds` reads `query.needs`, which `PinQuery` draws only from
+   `head \subseteq DataObjects`), so the intersection is empty in every
+   state and the clause cannot fail no matter what `DreqSweep` gates on.
+   Removing `DreqSweep`'s horizon guard confirmed this: it did not make the
+   existing clause fire. Fixed by adding a dedicated clause,
+   `lastGc.rule = "dreq" => lastGc.atClock >= dreqHorizon`, stated the same
+   way as the existing retention/superseded horizon clauses (reading the
+   live `dreqHorizon`, which is frozen the moment `RequestErasure` sets it
+   and never changes again, the same per-step-witness reasoning already
+   applied to `tombRetiredAt`/`supersededAt`). Proved non-vacuous by
+   removing `DreqSweep`'s `clock >= dreqHorizon` conjunct in a scratch copy
+   outside the repository (`/tmp`, not committed) and running TLC against
+   `smoke.cfg`: `Error: Invariant NoDeleteInsideProtectionWindow is
+   violated.` (TLC exit 12; 12671 states generated, 3914 distinct states
+   found). The reported trace's final state has `lastGc = [rule |-> "dreq",
+   deleted |-> {"dreqR1"}, atClock |-> 1, ...]` with `dreqHorizon = 2`, so
+   `1 >= 2` is false and the new clause is what fails; the retention and
+   superseded clauses stay vacuously true (wrong rule) and the
+   `permittedNeeds` clause stays vacuously true for the reason above,
+   confirming the new clause, not an existing one, caught the removed
+   guard.
+   Audit of the same invariant's other clauses for the same
+   control-object/data-object emptiness: the `permittedNeeds` intersection
+   clause is meaningful for `"retention"` and `"superseded"` (both rules
+   only ever delete `DataObjects`, which `permittedNeeds` also ranges over)
+   and vacuous only for `"dreq"`, now covered by the new clause instead.
+   `HeldObjectNeverDeleted` reads `lastGc.held`, computed as `\E o \in
+   lastGc.deleted : HeldObject(o, heldBuckets)`; for the `"dreq"` rule this
+   is always `FALSE` too (`HeldObject` filters to `DataObjects`, and
+   `dreqR1` is a control object), but that is not a mistaken check: legal
+   holds never cover the `.dreq` prefix (README, "Abstraction boundary"),
+   so `.dreq` deletions are correctly exempt from this invariant, and the
+   hold-over-`.dreq` case is already covered on purpose by the separate,
+   already-proven-non-vacuous `DreqSweepRespectsLegalHold`. No other clause
+   in `NoDeleteInsideProtectionWindow`, or elsewhere in the invariant list,
+   intersects a control-object-typed field with a data-object-typed one.
+3. (TRIVIAL) `TypeOK` did not conjoin the shared store module's own type
+   invariant (`S!StoreTypeOK`), so `lastModified`, `uploads`, and
+   `listState` were unconstrained, and `lastGc.atClock` had no type
+   constraint at all. Fixed: added `S!StoreTypeOK` and
+   `lastGc.atClock \in 0..MaxClock` to `TypeOK`. Re-run: `smoke.cfg` PASS,
+   464571 states generated, 79358 distinct, depth 19, unchanged from the
+   recorded band (invariants do not restrict the transition relation, so
+   widening `TypeOK` could not and did not change the reachable state
+   count).
+
+Smoke, negative controls, traceability, and exhaustive were all re-run after
+the three fixes above and produced the same figures already recorded in this
+document (smoke: 464571/79358/19; exhaustive: 2357319/387264/21; all seven
+negative controls VIOLATED as expected; all fifteen traceability rows
+resolve); `bands.tsv` is unchanged.

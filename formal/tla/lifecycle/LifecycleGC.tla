@@ -275,6 +275,7 @@ ServedRead(s) == ServesAny(s) /\ ~PresentObj("dreqR1")
 RecT == [present: BOOLEAN, content: {"dat","nc"}, version: Nat]
 
 TypeOK ==
+    /\ S!StoreTypeOK
     /\ store \in [Objects -> RecT]
     /\ versionCounter \in Nat
     /\ head \subseteq DataObjects
@@ -294,6 +295,7 @@ TypeOK ==
     /\ sysgc \in [ph: Nat, mqd: Nat, grace: Nat, skew: Nat]
     /\ lastGc.rule \in {"none","superseded","retention","dreq","complete"}
     /\ lastGc.deleted \subseteq Objects
+    /\ lastGc.atClock \in 0..MaxClock
     /\ lastGc.held \in BOOLEAN
     /\ lastGc.refreshWasFailed \in BOOLEAN
     /\ lastGc.permittedNeeds \subseteq DataObjects
@@ -653,20 +655,36 @@ Terminal ==
 \* Named safety invariants
 --------------------------------------------------------------------------------
 
-\* Two clauses, both read from the witness of the delete that actually happened
+\* Four clauses, all read from the witness of the delete that actually happened
 \* (its observed clock, its deleted set) against recorded state, never a switch:
 \*  1. A retention delete happened no earlier than retired_at + protection_horizon
 \*     (delete-before-horizon drops that gate, so this clause fires).
-\*  2. No horizon-gated delete removed an object a permitted in-flight query still
+\*  2. A superseded-input delete happened no earlier than supersededAt +
+\*     protection_horizon.
+\*  3. A .dreq delete happened no earlier than its own horizon (dreqHorizon,
+\*     frozen once RequestErasure sets it, so reading it live is the same
+\*     per-step witness reasoning as tombRetiredAt/supersededAt above). Unlike
+\*     the other two rules, .dreq has no dedicated switch that drops this gate
+\*     in the shipped model; a scratch removal of the gate from DreqSweep is
+\*     what proves this clause can fire (results.md).
+\*  4. No horizon-gated delete removed an object a permitted in-flight query still
 \*     needs (a query is permitted while within max_query_duration of its pin).
 \*     Candidate #1133 (HorizonGuardsPinnedQueries FALSE, the shipped delete that
 \*     gates on horizon AND head-empty but not on pinned queries) makes a query
-\*     pinned on a stale HEAD that a late fold then drops fire this clause.
+\*     pinned on a stale HEAD that a late fold then drops fire this clause. This
+\*     clause is structurally unable to fire for lastGc.rule = "dreq": .dreq is
+\*     a control object, lastGc.permittedNeeds is always a subset of
+\*     DataObjects (PermittedNeeds reads query.needs, which PinQuery draws only
+\*     from head \subseteq DataObjects), so the intersection is empty in every
+\*     state regardless of any guard. That is why clause 3 above, not this one,
+\*     is the .dreq horizon check.
 NoDeleteInsideProtectionWindow ==
     /\ ( lastGc.rule = "retention" =>
              lastGc.atClock >= tombRetiredAt["b1"] + sysgc.ph )
     /\ ( lastGc.rule = "superseded" =>
              lastGc.atClock >= supersededAt + sysgc.ph )
+    /\ ( lastGc.rule = "dreq" =>
+             lastGc.atClock >= dreqHorizon )
     /\ ( lastGc.rule \in HorizonGatedRules =>
              (lastGc.deleted \cap lastGc.permittedNeeds) = {} )
 
@@ -795,9 +813,16 @@ FairSpec ==
 \* where they never fire yet the old hypothesis's properties still failed.
 \* This form is checkable at any MaxClock: confirmed at MaxClock=2 and
 \* MaxClock=4 against the reduced per-property configuration (results.md).
+\* PresentObj(o) is deliberately absent from this antecedent: SupersededSweep
+\* is the action the antecedent describes, and its own effect is to remove o,
+\* so an antecedent that also requires o present can never hold permanently
+\* once the action is enabled -- the leads-to would be trivially true no
+\* matter what the protocol did (finding, issue #1122). Dropping it leaves
+\* the antecedent stateable independently of whether o already happens to be
+\* gone, which is what makes the consequent a real claim.
 EventuallySwept ==
     \A o \in RawInputs :
-        <>[](o \in superseded /\ PresentObj(o) /\ ~HeldObject(o, heldBuckets)
+        <>[](o \in superseded /\ ~HeldObject(o, heldBuckets)
              /\ (DeleteBeforeHorizon \/ clock >= supersededAt + sysgc.ph)
              /\ QueryPermits(o) /\ SupersededGatePasses(o) /\ HeadDeletable
              /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)) ~>
@@ -807,8 +832,13 @@ EventuallySwept ==
 \* guard holds permanently. Same rationale as EventuallySwept: an explicit
 \* antecedent grounded in the action's real enabling condition, not a
 \* quiescence hypothesis the four unfair environment actions can falsify.
+\* ~PresentObj("doneR1") is deliberately absent from this antecedent for the
+\* same reason PresentObj(o) is absent from EventuallySwept's: CompleteErasure
+\* is the action being described, and its own effect is to write .done, so an
+\* antecedent that also requires .done absent can never hold permanently once
+\* the action is enabled (finding, issue #1122).
 EventuallyCompleted ==
-    <>[](~PresentObj("doneR1") /\ PresentObj("dreqR1") /\ HeadDeletable
+    <>[](PresentObj("dreqR1") /\ HeadDeletable
          /\ (CompleteIgnoresServedSet \/ ~ServesNow("s1"))
          /\ ~HeldInputServes("s1") /\ clock > 0) ~>
         PresentObj("doneR1")
