@@ -1,2 +1,3 @@
 cfg	min_distinct	max_distinct	min_depth	max_depth
 smoke.cfg	29064	29064	24	24
+exhaustive.cfg	148881235	148881235	38	38

@@ -53,8 +53,17 @@ CONSTANTS
     AckAtEnqueue,           \* acknowledge before anything is durable
     MarkerAfterFirstShard,  \* write the marker before every shard is durable
     RetryDedups,            \* a retry after a lost ack silently deduplicates
-    QueryReadsDataDirectly  \* a query answers from the data object, skipping
+    QueryReadsDataDirectly, \* a query answers from the data object, skipping
                             \* the commit record
+    CheckQuery              \* the read-path query is modelled at all. FALSE
+                            \* in every cfg that does not list
+                            \* NoUncommittedDataVisible among its INVARIANTs:
+                            \* RunQuery's single firing can land at any of the
+                            \* behaviour's reachable states, and that timing
+                            \* choice alone enlarges the state space enough to
+                            \* stop exhaustive.cfg and dedup-mutant.cfg from
+                            \* converging. A cfg that never asks the question
+                            \* does not need to pay for the answer.
 
 ASSUME Writers # {}
 ASSUME Shards # {}
@@ -486,8 +495,12 @@ ResolveToken(f) ==
 \* The read path, abstracted to what an answer contains rather than how it was
 \* computed. One run per behaviour, like the other single-fire query actions:
 \* the interleavings that matter are what the store held when it ran, not how
-\* many times it is asked.
+\* many times it is asked. Gated on CheckQuery: even at one firing, WHEN it
+\* fires is itself a choice TLC explores at every reachable state, so a cfg
+\* that does not check NoUncommittedDataVisible turns the action off outright
+\* rather than pay for that choice.
 RunQuery ==
+    /\ CheckQuery
     /\ ~queried
     /\ queried' = TRUE
     /\ queryAnswer' = {f \in FlushIds :
