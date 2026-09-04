@@ -138,9 +138,11 @@ fn command_hashes_tenant(command: &Command) -> bool {
 /// so a write there under the silent v1-unkeyed fallback lands under a prefix
 /// nothing addresses once the bucket is eventually bootstrapped keyed.
 ///
-/// `catalog fold`, `maintain compact-bucket`/`compact-tenant`, and `commit
-/// reconstruct` also write and hash a tenant, but are out of this fix's scope
-/// (see the final report): they are left on the lenient default.
+/// Exhaustive match, no catch-all: adding a `Command` variant must fail to
+/// compile here until someone classifies it, so the gate fails closed on
+/// future commands instead of silently treating them as reads (this is the
+/// hole issue #1184's original `_ => false` left open). Mirrors
+/// `command_hashes_tenant` above: every group names why it is a write or not.
 fn command_is_write(command: &Command) -> bool {
     match command {
         Command::Load { .. } => true,
@@ -155,8 +157,74 @@ fn command_is_write(command: &Command) -> bool {
             matches!(command, HoldCommand::Set { .. } | HoldCommand::Clear { .. })
         }
         Command::Erase { command } => matches!(command, EraseCommand::Submit { .. }),
+        // sys/gc is a bucket-root object (see `command_hashes_tenant`), but
+        // `gc-config set` still clears this same write gate: see
+        // `gc_config_set_refuses_on_marker_less_bucket` and the final report
+        // for the tension this raises with deliverable 3 of issue #1184's
+        // follow-up (closing the `command_is_write` catch-all).
         Command::GcConfig { command } => matches!(command, GcConfigCommand::Set { .. }),
-        _ => false,
+        Command::Commit { command } => match command {
+            // Decode-only shapes never write, only read an existing record.
+            CommitCommand::Decode { .. }
+            | CommitCommand::DecodeCompaction { .. }
+            | CommitCommand::DecodeTombstone { .. } => false,
+            // Writes CreateIfAbsent-only commit records under
+            // `t/<tenant_hash>/<signal>/<shard>/...`, computed from
+            // `--tenant` (see `command_hashes_tenant`).
+            CommitCommand::Reconstruct { .. } => true,
+        },
+        Command::Catalog { command } => match command {
+            // `list`/`inspect`/`verify` only read the catalog and commit
+            // records; they never publish a snapshot.
+            CatalogCommand::List { .. }
+            | CatalogCommand::Inspect { .. }
+            | CatalogCommand::Verify { .. } => false,
+            // Publishes a new snapshot HEAD and part objects under
+            // `t/<tenant_hash>/<signal>/...`.
+            CatalogCommand::Fold { .. } => true,
+        },
+        Command::Maintain { command } => match command {
+            // Writes L1 segment objects and a compaction record under
+            // `t/<tenant_hash>/<signal>/<shard>/...`.
+            MaintainCommand::CompactBucket { .. } | MaintainCommand::CompactTenant { .. } => true,
+            // Deletes orphaned/superseded/unreferenced segment objects under
+            // `t/<tenant_hash>/<signal>/<shard>/...`.
+            MaintainCommand::Sweep { .. } => true,
+            // Rewrites objects to the target format version and raises the
+            // recorded format floor under `t/<tenant_hash>/...`.
+            MaintainCommand::Migrate { .. } => true,
+            // Read-only inspection/reporting: `status` reports maintenance
+            // state, `audit-versions` audits live format versions, and
+            // `verify-custody` re-verifies the content-addressed chain; none
+            // writes or deletes.
+            MaintainCommand::Status { .. }
+            | MaintainCommand::AuditVersions { .. }
+            | MaintainCommand::VerifyCustody { .. } => false,
+        },
+        // `store qualify` writes `sys/qualification`, a bucket-root object,
+        // never under `t/<tenant_hash>/`; gating it would also break the
+        // documented bootstrap order (it runs before the first server start,
+        // which is what writes `sys/tenancy` in the first place).
+        Command::Store { .. } => false,
+        Command::Tenant { command } => match command {
+            TenantCommand::Token { command } => match command {
+                // `list` only reads `sys/auth`.
+                TenantTokenCommand::List { .. } => false,
+                // `upsert`/`revoke` write `sys/auth`, a bucket-root object,
+                // never under `t/<tenant_hash>/`.
+                TenantTokenCommand::Upsert { .. } | TenantTokenCommand::Revoke { .. } => false,
+            },
+        },
+        // Pure inspection commands that take an explicit key/path or decode a
+        // marker directly (`tenancy show`/`resolve` resolve the scheme
+        // inline rather than through this gate, per `command_hashes_tenant`),
+        // plus `cache reclaim-legacy`, which never touches object storage.
+        Command::Segment { .. }
+        | Command::Rlog { .. }
+        | Command::Rspan { .. }
+        | Command::Idem { .. }
+        | Command::Tenancy { .. }
+        | Command::Cache { .. } => false,
     }
 }
 
@@ -2713,10 +2781,13 @@ mod tests {
         );
     }
 
-    /// Issue #1184's classification: exactly `load`, `typed-attr-column set`,
-    /// `hold set`/`clear`, `erase submit`, `provision adopt`/`reshard`, and
-    /// `gc-config set` write; their `show`/`list`/`status` siblings, and every
-    /// other command, do not.
+    /// Issue #1184's classification: `load`, `typed-attr-column set`, `hold
+    /// set`/`clear`, `erase submit`, `provision adopt`/`reshard`, `gc-config
+    /// set`, `commit reconstruct`, `catalog fold`, and the mutating `maintain`
+    /// subcommands write; their `show`/`list`/`status`/`decode`/`inspect`
+    /// siblings do not, and neither do the bucket-root writers `store
+    /// qualify` and `tenant token upsert`/`revoke` (see `command_is_write`'s
+    /// comments for why the latter two are deliberately left ungated).
     #[test]
     fn command_is_write_classifies_the_named_shapes() {
         let cases: &[(&[&str], bool)] = &[
@@ -2809,6 +2880,64 @@ mod tests {
             (&["ravel", "gc-config", "show"], false),
             (&["ravel", "tenancy", "show"], false),
             (&["ravel", "tenancy", "resolve", "t"], false),
+            (
+                &[
+                    "ravel",
+                    "commit",
+                    "reconstruct",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--shard",
+                    "0",
+                ],
+                true,
+            ),
+            (&["ravel", "commit", "decode", "some-key"], false),
+            (&["ravel", "catalog", "fold", "--tenant", "t"], true),
+            (&["ravel", "catalog", "list", "--tenant", "t"], false),
+            (
+                &[
+                    "ravel", "maintain", "sweep", "--tenant", "t", "--signal", "logs", "--shard",
+                    "0",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel", "maintain", "status", "--tenant", "t", "--signal", "logs", "--shard",
+                    "0", "--hour", "0",
+                ],
+                false,
+            ),
+            (&["ravel", "store", "qualify"], false),
+            (
+                &[
+                    "ravel",
+                    "tenant",
+                    "token",
+                    "upsert",
+                    "--deployment-key-file",
+                    "k",
+                    "--token",
+                    "tok",
+                    "--tenant",
+                    "t",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "tenant",
+                    "token",
+                    "list",
+                    "--deployment-key-file",
+                    "k",
+                ],
+                false,
+            ),
         ];
         for (args, expect_write) in cases {
             let cli =
