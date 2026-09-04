@@ -1,15 +1,16 @@
 # Resharding model: results
 
 Model checker: TLC from tla2tools 1.7.4 (sha256 verified by the harness).
-Run id: `20260903T042234Z-49ff7c78bf9d67949e0c4b7bbfcc232845d1125b`
+Run id: `20260904T143812Z-c7b636a7a5d2fbdc6c28ad9bd839749e63fcd9f8`
 (`scripts/check-tla.sh ci -a resharding`, a single coherent run of smoke,
-every negative control, and traceability).
+every negative control, and traceability, re-run for the issue #1123
+third-round review below).
 
 ## Smoke (safety)
 
 | cfg | result | states | distinct | depth | seconds |
 |---|---|---|---|---|---|
-| smoke.cfg | PASS | 7809360 | 958804 | 18 | 36 |
+| smoke.cfg | PASS | 7809360 | 958804 | 18 | 37 |
 
 Two writers and two requesters race an increase (3) and a decrease (1) from
 generation 0's count of 2, symmetry-reduced over both permutation groups, with
@@ -27,11 +28,15 @@ the harness fails unless TLC reports that one.
 
 | Control | Flipped from shipped | Property violated | distinct | seconds |
 |---|---|---|---|---|
-| scan-slack-zero | `S = 0` (shipped 3) | EveryAdmittedWriteInScanSet | 2761 | 2 |
-| appender-skew-unbounded | `AppenderSkew = 5` (tolerated 1) | EveryAdmittedWriteInScanSet | 146033 | 4 |
-| lead-one | `L = 1` (shipped 2) | LeadCoversRefreshHorizon | 199 | 1 |
-| no-writer-fence | `WriterFenceEnabled = FALSE` | StaleWriterFailsClosed | 75612 | 3 |
-| token-validated-against-count | `TokenValidatedAgainstCount = TRUE` | TokenResolvesAcrossReshards | 17452 | 2 |
+| scan-slack-zero | `S = 0` (shipped 3) | EveryAdmittedWriteInScanSet | 3512 | 2 |
+| appender-skew-unbounded | `AppenderSkew = 5` (tolerated 1) | EveryAdmittedWriteInScanSet | 124721 | 4 |
+| lead-one | `L = 1` (shipped 2) | LeadCoversRefreshHorizon | 174 | 2 |
+| no-writer-fence | `WriterFenceEnabled = FALSE` | StaleWriterFailsClosed | 48018 | 2 |
+| token-validated-against-count | `TokenValidatedAgainstCount = TRUE` | TokenResolvesAcrossReshards | 12709 | 3 |
+
+TLC's error-search runs stop at the first violation a worker finds, so the
+exact distinct-state count for a VIOLATED result varies run to run with
+worker scheduling; these are this run's figures, not a fixed constant.
 
 ### Two controls target the invariant their margin directly protects
 
@@ -410,18 +415,42 @@ Back to state 6: <WriterCrash ...>
 The counter-example is an infinite `WriterCrash`/`FlushOpen` loop: a writer
 crashes, reopens a flush, crashes again before closing it, forever, so it
 never completes a flush and never routes a record on the new generation.
-`WriterCrash` carries no fairness constraint anywhere in `FairSpec` (nor
-should it get one arbitrarily — the comments now beside each `WF_vars`
-conjunct in `OnlineResharding.tla` state what each is justified by, and
-"a writer never crashes" is not something the implementation guarantees).
+`WriterCrash` carries no fairness constraint anywhere in `FairSpec`, and it
+does not need one — the loop's actual gap is elsewhere.
 
-This is a real finding, not a spec bug to fix by widening fairness:
-`EventuallyRoutedOnNewGeneration` holds only under the added hypothesis that
-a writer does not crash infinitely often (a fairness assumption stronger
-than anything `FairSpec` currently encodes, and stronger than anything the
-real system guarantees about crash frequency). Recorded here rather than
-hidden by deleting the property or adding `WF_vars(WriterCrash(w))` to make
-it pass.
+### Finding C, revisited (issue #1123 second review): weak fairness was too weak
+
+`AdmitAfterRefresh(w)` had only `WF_vars` in `FairSpec`. The crash loop above
+toggles `flushes[w].open` every step (`WriterCrash` closes it, `FlushOpen`
+reopens it), so `CanAdmit(w)` — and with it `AdmitAfterRefresh(w)` — is
+enabled for exactly one step at a time, never continuously. Weak fairness
+only forces an action that stays enabled without interruption; an action
+enabled-then-disabled-then-enabled forever is never forced under WF, so the
+loop above was a real gap in the fairness assumption, not a crash-frequency
+problem.
+
+Fixed by widening `AdmitAfterRefresh(w)` to `SF_vars` (`OnlineResharding.tla`):
+strong fairness forces an action that is enabled infinitely often, which the
+crash loop's admit window is, so the same loop can no longer satisfy
+`FairSpec`. The comment beside the conjunct records why strong fairness is
+the right assumption rather than a convenience: `ravel-ingest`'s write loop
+(`router.rs`) never suspends with a flush closed, closing one and opening
+the next are back-to-back steps of the same loop, so the real writer keeps
+re-entering the enabled state on its own for as long as it runs, with no
+external event required — exactly the "infinitely often, unassisted"
+shape strong fairness assumes.
+
+**Re-run result: PASS.** `live.cfg` at the same dimensions, now under the
+widened `FairSpec`:
+
+```
+Model checking completed. No error has been found.
+31045026 states generated, 3817433 distinct states found, depth 18.
+```
+
+11 minutes 36 seconds. No counter-example was found: with the crash loop's
+admit window ruled out by strong fairness, `EventuallyRoutedOnNewGeneration`
+holds at `live.cfg`'s dimensions with no added crash-frequency hypothesis.
 
 ### Finding D: exhaustive did not complete
 
@@ -432,3 +461,69 @@ widening, completing in 8,503,664 states / 1,179,718 distinct / depth 20,
 recovers the dropped two-writer coverage as a separate reachability probe
 (`TwoWritersNeverConcurrentlyOpen` violated, 26 distinct states, depth 4).
 `bands.tsv`'s exhaustive.cfg row is updated from this real run.
+
+## Third-round findings (issue #1123 review, 2026-09-04)
+
+Five findings from a further review of the area. Finding 1 (liveness
+fairness) is recorded above under "Finding C, revisited". The rest follow.
+
+### Finding 3: appender-skew-unbounded's FlushBound contradicted its own claim
+
+`negative/appender-skew-unbounded.cfg` set `FlushBound = 1` while its header
+comment and `counterexamples/appender-skew-unbounded.md` both say every
+margin but the skew itself is shipped, and the shipped
+`FLUSH_BOUND_SLACK_HOURS` is 2 (see `exhaustive.cfg`, `smoke.cfg`). The
+violation itself never depended on this: a smaller `FlushBound` only
+narrows `CanAdmit`'s admit window, so the counterexample stays reachable at
+the wider, correct value.
+
+Set `FlushBound = 2` and re-ran: still `EveryAdmittedWriteInScanSet`
+VIOLATED, 124721 distinct states, 4 seconds (see the negative-controls table
+above, from the same coherent run). The claim and the configuration now
+agree.
+
+### Finding 2: `no-writer-fence` conflated the fence flag with the skew
+
+`negative/no-writer-fence.cfg` changes two things relative to a shipped
+config at once: `WriterFenceEnabled = FALSE` and `AppenderSkew = 2`. Its
+violation of `StaleWriterFailsClosed` does not, on its own, show that the
+fence flag is the cause rather than the skew; the skew is a genuine
+enabling condition (documented in that file's header: it is what drives
+the writer's cached view past the grace horizon within this small a
+model), but the config never isolates it from the fence.
+
+Added `writer-fence-comparison.cfg`: byte-for-byte identical to
+`negative/no-writer-fence.cfg` (same `AppenderSkew = 2`, same `MaxHour = 4`,
+same everything) except `WriterFenceEnabled = TRUE`. A difference in
+outcome between the two can then only come from the fence.
+
+The fence-enabled arm cannot be driven to exhaustive completion with TLC's
+default BFS search: with the fence closing the gap there is no violation
+to stop the search early on, and at these dimensions the reachable space
+does not converge. Confirmed empirically before falling back to
+simulation: full BFS was still climbing past 65,000,000 distinct states
+after 45 minutes at the config's own `MaxHour = 4`, and past 8,000,000
+distinct states after 6 minutes even at a much-reduced `MaxHour = 2` and
+`AppenderSkew = 1`, showing the growth is not primarily driven by either
+knob and a further reduction would not plausibly make it tractable. This
+matches the state-space-explosion pattern already documented above for
+`AppenderSkew > 0` configs under a full, no-early-exit search; nothing in
+this repo has previously driven that config class to full completion in
+either direction, since every existing `AppenderSkew > 0` negative control
+only ever runs TLC's error-search mode and stops at its first violation.
+
+Ran the fence-enabled arm instead with TLC random simulation, at the same
+dimensions:
+
+```
+tlc2.TLC -config writer-fence-comparison.cfg -simulate num=100000000 \
+  -depth 100 MCOnlineResharding
+```
+
+63,203,643 states checked in 300 seconds (the run is budget-bounded, not
+traversal-bounded: `-simulate` does not terminate on its own short of
+`num` traces). Zero `TypeOK` or `StaleWriterFailsClosed` violations found.
+This is strong evidence, not an exhaustive proof, that the fence flag
+alone, holding `AppenderSkew = 2` and every other dimension fixed, is what
+`negative/no-writer-fence.cfg`'s violation depends on, not the shared skew
+condition both configs carry.
