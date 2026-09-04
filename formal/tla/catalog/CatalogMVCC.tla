@@ -946,15 +946,18 @@ NoLiveCommitOmittedByLostCas ==
                     (r \notin SupersededInputs(H)) => <<"l0", H, r>> \in head.entries
 
 \* A query that could not read a valid HEAD served the store listing rather
-\* than erroring. Witness-derived: pinned is what the query served;
-\* resolvedView is what the store listing said should be served at that
+\* than erroring. Witness-derived: pinnedAtAttempt is what the resolve served;
+\* resolvedView is what the store listing said should be served at that same
 \* resolve, computed without QueryFailsClosedOnMissingIndex. The two coincide
 \* by construction whenever the index was readable, so the invariant carries
 \* no separate readable/unreadable antecedent: a fail-closed mutant (serve an
-\* empty result on an unreadable HEAD) is the only way to diverge pinned from
-\* resolvedView, and it does so unconditionally.
+\* empty result on an unreadable HEAD) is the only way to diverge them, and it
+\* does so unconditionally. Compared against pinnedAtAttempt rather than
+\* pinned: both are written together by DoQueryResolve/DoQueryRun and never
+\* by DoQueryTamper, so a mid-attempt tamper of pinned alone (the
+\* SnapshotChangesMidAttempt mutant) cannot also trip this invariant.
 MissingIndexDegradesToListing ==
-    qy.pinned = qy.resolvedView
+    qy.pinnedAtAttempt = qy.resolvedView
 
 \* A store deletion only ever ran while all three reachability-gate triggers
 \* cleared: HEAD readable, its covering snapshot part readable, and the
