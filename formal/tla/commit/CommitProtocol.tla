@@ -55,7 +55,7 @@ CONSTANTS
     RetryDedups,            \* a retry after a lost ack silently deduplicates
     QueryReadsDataDirectly, \* a query answers from the data object, skipping
                             \* the commit record
-    CheckQuery              \* the read-path query is modelled at all. FALSE
+    CheckQuery,             \* the read-path query is modelled at all. FALSE
                             \* in every cfg that does not list
                             \* NoUncommittedDataVisible among its INVARIANTs:
                             \* RunQuery's single firing can land at any of the
@@ -64,6 +64,16 @@ CONSTANTS
                             \* stop exhaustive.cfg and dedup-mutant.cfg from
                             \* converging. A cfg that never asks the question
                             \* does not need to pay for the answer.
+    CheckToken              \* the commit-token query is modelled at all. FALSE
+                            \* in every cfg that does not list
+                            \* TokenNeverServesStale among its INVARIANTs, for
+                            \* the same reason as CheckQuery: ResolveToken (and
+                            \* the TombstoneBucket/SupersedeRecord actions that
+                            \* feed it) fire once at an arbitrary reachable
+                            \* state, and that timing choice is exactly the
+                            \* pattern that stopped exhaustive.cfg and
+                            \* dedup-mutant.cfg from converging before
+                            \* CheckQuery existed.
 
 ASSUME Writers # {}
 ASSUME Shards # {}
@@ -449,6 +459,7 @@ ClientRetry(f, g) ==
 \* retired bucket to distinguish its outcomes, and letting every flush be
 \* retired independently multiplies the state space without adding coverage.
 TombstoneBucket(f) ==
+    /\ CheckToken
     /\ Visible(f)
     /\ tombstoned = {}
     /\ superseded = {}
@@ -458,6 +469,7 @@ TombstoneBucket(f) ==
     /\ UNCHANGED sVars
 
 SupersedeRecord(f) ==
+    /\ CheckToken
     /\ Visible(f)
     /\ tombstoned = {}
     /\ superseded = {}
@@ -472,6 +484,7 @@ SupersedeRecord(f) ==
 \* ones and each is decided from the STORE plus the tombstone and supersession
 \* state, never from what the writer believed.
 ResolveToken(f) ==
+    /\ CheckToken
     \* One token query per behaviour, for the same reason.
     /\ \A g \in FlushIds : tokenResult[g].outcome = "none"
     /\ pinned[f] # NoC
