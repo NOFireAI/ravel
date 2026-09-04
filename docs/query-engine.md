@@ -1667,6 +1667,77 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3HeadRequests`/`s3HeadBytes`, `s3ListBytes`, and
   `peakIntermediateBytes` (SQL executor only).
 
+### I/O dependency shape (issue #1214)
+
+`stats.phases` above answers "how many requests and bytes did each phase
+spend." It cannot answer a different question: how many of those requests
+had to run one after another because a later stage needed an earlier
+stage's bytes to know its own keys, versus how many ran in one concurrent
+round. **Dependency depth and phase cost are different dimensions**: a
+query can be cheap by `stats.phases` (few requests, few bytes) and still be
+slow because its requests chain, and a query can be expensive by request
+count and still be fast because every request ran at depth 1. Neither
+number predicts the other.
+
+`crates/ravel-query/src/io_shape.rs`'s `QueryIoShape` is recorded per query
+and rendered as `stats.io`, additive beside `stats.phases`:
+
+- `dependencyDepth`: the longest chain of object-store stages, across every
+  segment the query opened, where a stage needed a previous stage's bytes to
+  know its own keys. Four independent segment GETs report depth 1; a
+  footer-tail read whose bytes name a page's byte range, followed by that
+  page's dependent GET, reports depth 2. Classified structurally from each
+  segment's `object_size` against the fetcher's whole-object threshold (the
+  same size test `SegmentFetcher::open_segment` itself branches on), not
+  from a live per-request trace, matching `CostEstimate`'s existing
+  upper-envelope convention: a fully-cached large segment still reports
+  depth 2, because the plan has two dependent stages even when a cache
+  absorbs the second one.
+- `listPageDepth`: serial LIST pages, recorded independently of
+  `dependencyDepth` because pagination (`Catalog::list_shard_hours`) and the
+  GET dependency chain are different object-store mechanisms with different
+  causes. Reported as the resolve phase's total LIST request count, an
+  upper-bound serial depth: this crate cannot see from here whether two
+  shards' LIST pages ran concurrently with each other or one after another,
+  only that they happened (`ravel-catalog` owns that fan-out; out of this
+  task's scope to change).
+- `serviceBatches`: batches this query's per-segment fan-out was forced into
+  by its concurrency permit: `ceil(segment_count / fetch_concurrency)`. 64
+  segments under 16 concurrent permits is 4 batches at whatever depth those
+  segments' fetches classify at.
+- `unfoldedRecordsResolved`: the EXACT (never estimated) count of commit
+  records this query's resolve took from the recent (unfolded) listing path
+  rather than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073
+  decision 1). Exact because it gates a downstream fold-benefit decision an
+  approximation would silently corrupt.
+- `planClass`: `metadata_only` (a labels/label-values/series discovery query
+  that never reaches a page fetch), `selective_indexed` (the resolve's
+  postings-based pruning excluded at least one snapshot-sourced segment), or
+  `exhaustive_scan` (every listed segment in the resolved window was
+  opened). Decided before any segment is opened, from the query's shape and
+  the resolve's own pruning outcome, not from the fetch's actual cost.
+
+What is knowable from `ravel-query`, and what is not: the per-segment fetch
+pipeline this crate owns is visible here, so `dependencyDepth` reflects it
+directly. What is NOT knowable from this crate: the catalog snapshot
+resolve's own internal dependency chain
+(`Catalog::resolve_pruned_with_generations` and any HEAD-then-part-GET
+sequence it takes) lives entirely inside `ravel-catalog`; `dependencyDepth`
+therefore reports only the segment-fetch chain's depth, and the true
+end-to-end depth (resolve's own chain, however deep, prefixed to the
+segment-fetch chain) can only be equal to or greater than what is reported.
+A federated query (a metrics lane and a log lane, prefetched independently)
+folds both lanes' contributions together: `dependencyDepth`/
+`listPageDepth`/`serviceBatches` take the max across lanes (the longer
+chain wins, since the two lanes' chains ran alongside each other, not one
+after the other), `unfoldedRecordsResolved` sums across lanes (an exact
+total count), and `planClass` takes the more severe of the two
+(`exhaustive_scan` outranks `selective_indexed` outranks `metadata_only`),
+so a lane that never ran cannot understate a lane that did.
+
+`stats.io` carries no object keys, field values, predicates, or index
+terms: every figure is a structural count.
+
 ## PromQL conformance (ADR-0035)
 
 What Ravel supports, what it deliberately refuses, and what is merely

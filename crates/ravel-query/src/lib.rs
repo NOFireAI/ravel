@@ -10,6 +10,7 @@ pub mod erasure;
 mod error;
 mod fetcher;
 pub mod http;
+pub mod io_shape;
 mod limiter;
 mod log_fetcher;
 pub mod log_series;
