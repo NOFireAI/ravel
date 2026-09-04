@@ -188,9 +188,9 @@ leads-to trivially true regardless of whether the action ever fired):
   point on, `.done` eventually exists. `.done`'s absence is excluded for the
   same reason: writing `.done` is `CompleteErasure`'s own effect.
 
-This task did not run the exhaustive configuration (forbidden for this task;
-the orchestrator runs it and its outcome is recorded in `results.md`). It
-instead ran each property alone against the real, non-quiescent `Next` (all
+An earlier round did not run the exhaustive configuration, which is why the
+per-property runs below exist; that configuration is now run directly and its
+figures are in `results.md`. Those runs took each property alone against the real, non-quiescent `Next` (all
 four environment actions present and still unfair), in a cfg scoped to
 `TypeOK` plus that one property: both `EventuallySwept` and
 `EventuallyCompleted` pass at `MaxClock = 2` under this reduced configuration
@@ -214,5 +214,5 @@ scripts/check-tla.sh traceability -a lifecycle   # every source ref resolves
 ```
 
 `exhaustive.cfg` checks every invariant and both liveness properties against
-`FairSpec` over a larger clock horizon. It is not run by the executor; the
-orchestrator runs it. See `results.md`.
+`FairSpec` over a larger clock horizon. It is run as part of the gate lane and
+its measured figures are in `results.md` and `bands.tsv`.
