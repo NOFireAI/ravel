@@ -49,7 +49,7 @@ BrokenOwnerPublish(w, u, v) ==
     /\ attemptedByOwner' = [attemptedByOwner EXCEPT ![u] = TRUE]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    cliCorrect, lastMaint, partTomb, lastPub, recVer,
-                   seedFresh, vanishedOnce>>
+                   seedFresh, vanishedOnce, hbWriteCount, memoWriteCount>>
 
 \* Broken: a memo persistence write uses CasVersion against a stale version token
 \* (0) instead of Overwrite. The contract makes CasVersion a no-op both on an
@@ -66,7 +66,8 @@ BrokenMemoCas(w) ==
                      verAfter |-> store'[MemoKey(w)].version]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect,
-                   partTomb, lastPub, recVer, seedFresh, vanishedOnce>>
+                   partTomb, lastPub, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* Broken: seeding takes the raw verified stamp without clamping it to the source
 \* snapshot time and STORES that, so seedFresh records an in-memory entry that
@@ -88,7 +89,8 @@ BrokenSeed(w) ==
                                  [fresh |-> s.verU, snap |-> s.snapNs]]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, lastPub, recVer, vanishedOnce>>
+                   partTomb, lastPub, recVer, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* Broken: a loser whose input set diverges from the winner overwrites the
 \* terminal record instead of alarming. The overwrite re-writes identical content,
@@ -106,7 +108,8 @@ BrokenDivergePublish(u, v) ==
                        winnerPartPresent |-> Present(PartKey(u, firstRecord[u][2]))]
     /\ UNCHANGED <<now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, recVer, seedFresh, vanishedOnce>>
+                   partTomb, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 \* Broken: a resolution whose winner part vanished and is tombstoned (not
 \* re-PUTtable) reports Converged. It self-reports the "Converged" label while the
@@ -123,7 +126,8 @@ BrokenMissingPartConverge(u, v) ==
                    winnerPartPresent |-> Present(PartKey(u, v))]
     /\ UNCHANGED <<sVars, now, hbStamp, crashed, cachedLive, memoSnap,
                    firstRecord, attemptedByOwner, cliCorrect, lastMaint,
-                   partTomb, recVer, seedFresh, vanishedOnce>>
+                   partTomb, recVer, seedFresh, vanishedOnce,
+                   hbWriteCount, memoWriteCount>>
 
 MCNext ==
     \/ Next
