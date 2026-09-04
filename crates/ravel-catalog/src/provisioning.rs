@@ -267,6 +267,12 @@ pub enum GenerationDefect {
     AdjacentEqualCount,
     /// A generation's `shard_count` is outside `1..=10000`.
     CountOutOfRange,
+    /// `generations[0].activation_hour` is not 0. Every routing helper
+    /// (`active_shard_count`, `scan_count`, `max_scan_count_over_range`,
+    /// `shard_ceiling`) assumes generation 0 activates at hour 0 and so covers
+    /// every hour back to the epoch; a nonzero first activation leaves the
+    /// hours before it with no covering generation.
+    FirstActivationNonzero,
 }
 
 impl std::fmt::Display for GenerationDefect {
@@ -283,6 +289,7 @@ impl std::fmt::Display for GenerationDefect {
                 "adjacent generations have equal shard_count (a no-op reshard)"
             }
             GenerationDefect::CountOutOfRange => "a generation shard_count is outside 1..=10000",
+            GenerationDefect::FirstActivationNonzero => "generations[0].activation_hour is not 0",
         };
         f.write_str(s)
     }
@@ -781,6 +788,8 @@ pub fn read_generations(
             if g.shard_count == prev.shard_count {
                 return Err(corrupt(GenerationDefect::AdjacentEqualCount));
             }
+        } else if g.activation_hour != 0 {
+            return Err(corrupt(GenerationDefect::FirstActivationNonzero));
         }
         out.push(ShardGeneration {
             generation: g.generation,
@@ -2066,6 +2075,61 @@ mod tests {
         );
     }
 
+    /// The same drift-counter discipline for the `FirstActivationNonzero`
+    /// defect specifically: a drifted (recorded 4, live default 2) record
+    /// whose generation 0 carries a nonzero `activation_hour` is rejected as
+    /// `CorruptGenerations` before drift is ever counted.
+    #[tokio::test]
+    async fn drifted_record_with_nonzero_first_activation_does_not_count_as_drift() {
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 4,
+                activation_hour: 1,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        store
+            .put(&key, record.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed generation-0-nonzero-activation record");
+
+        let before = shard_count_drift_count();
+        let err = validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            2,
+            1_000,
+            AbsentPolicy::AdoptIfData,
+        )
+        .await
+        .expect_err("generation 0 at a nonzero activation_hour must be rejected, not tolerated");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptGenerations {
+                    defect: GenerationDefect::FirstActivationNonzero,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+        assert_eq!(
+            shard_count_drift_count(),
+            before,
+            "a rejected generation-0-nonzero-activation record must not increment the drift counter"
+        );
+    }
+
     #[tokio::test]
     async fn adoption_writes_record_when_all_shards_in_range() {
         let store = mem();
@@ -3077,6 +3141,70 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// An explicit generation 0 with a nonzero `activation_hour` is refused.
+    /// Every routing helper (`active_shard_count`, `scan_count`,
+    /// `max_scan_count_over_range`, `shard_ceiling`) is documented and relies
+    /// on generation 0 covering every hour back to the epoch; a record that
+    /// skips this check would be returned as a validated history to those
+    /// helpers with that assumption already false.
+    #[test]
+    fn read_generations_rejects_generation_zero_nonzero_activation() {
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 4,
+                activation_hour: 1,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let err = read_generations(&record, &key)
+            .expect_err("generation 0 at a nonzero activation_hour must be refused");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptGenerations {
+                    defect: GenerationDefect::FirstActivationNonzero,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// The well-formed counterpart to the test above: generation 0 at
+    /// `activation_hour` 0 is accepted unchanged.
+    #[test]
+    fn read_generations_accepts_generation_zero_at_hour_zero() {
+        let record = sysproto::ProvisioningRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: sysproto::Signal::Metrics as i32,
+            shard_count: 4,
+            created_unix_ns: 0,
+            generations: vec![sysproto::ShardGeneration {
+                generation: 0,
+                shard_count: 4,
+                activation_hour: 0,
+                appended_unix_ns: 0,
+            }],
+            format_floors: Vec::new(),
+        };
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let gens = read_generations(&record, &key)
+            .expect("generation 0 at activation_hour 0 is well-formed");
+        assert_eq!(gens.len(), 1);
+        assert_eq!(gens[0].generation, 0);
+        assert_eq!(gens[0].shard_count, 4);
+        assert_eq!(gens[0].activation_hour, 0);
     }
 
     /// [`read_generations_checked`] refuses a record from a future format
