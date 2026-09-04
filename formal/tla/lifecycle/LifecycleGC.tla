@@ -219,11 +219,16 @@ View ==
       query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt, supersededAt,
       objContent, variantKey, sysgc, lastGc>>
 
-\* A delete decision needs a real read of the current HEAD object. Only a present
-\* read authorises a decision about whether an object is still referenced; an
-\* absent or unreadable read fails closed (the sweep does not delete), because the
-\* true HEAD may still name the object (finding 5). HeadReadable is kept for the
-\* serving predicate, which treats a missing HEAD as naming nothing (fail-safe).
+\* A delete decision needs a readable HEAD, present or absent: an absent HEAD
+\* names nothing, so the delete may proceed exactly as if EffectiveHead were
+\* empty (ADR-0020: the catalog index is a pure optimization; a missing HEAD
+\* degrades to listing, it does not block). Only an unreadable HEAD fails
+\* closed, because a HEAD that exists but cannot be decoded may still name the
+\* object (reachability.rs bucket_gate/object_gate: `HeadStatus::Absent =>
+\* Covering::Clear`, `HeadStatus::Unreadable => Covering::Blocked`; finding 1,
+\* round four). HeadDeletable is the completion gate only (CompleteErasure):
+\* completion still needs a present HEAD to read the served set from, a
+\* narrower requirement the physical sweeps do not share.
 HeadDeletable == headState = "present"
 HeadReadable == headState # "unreadable"
 EffectiveHead == IF headState = "absent" THEN {} ELSE head
@@ -428,9 +433,18 @@ ReleaseHold(b) ==
     /\ NoGc
 
 \* The HEAD object read can fail (unreadable) or find the HEAD gone (absent).
+\* Unreadable can diverge from head at any content (an existing catalog object
+\* can fail to decode regardless of what it names). Absent cannot: under the
+\* object store's strong-consistency read of a single key, a GET on a HEAD that
+\* really names something never comes back 404 (finding 1, round four). Absent
+\* is only a truthful read outcome when head itself is already empty, so this
+\* action requires that rather than letting a "present, nonempty head" world
+\* report absent and then flip back to "present" with the same unchanged head,
+\* which would assert a real object was reachable, deleted, and reachable again.
 SetHeadState(s) ==
     /\ FullEnv
     /\ s # headState
+    /\ s = "absent" => head = {}
     /\ headState' = s
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, clock, superseded, heldBuckets,
@@ -544,18 +558,21 @@ DropRetiredBucketFromHead ==
 
 \* Retention physical sweep of one b1 data object. Gates on now >= retired_at +
 \* protection_horizon (DeleteBeforeHorizon drops this) AND the current HEAD naming
-\* nothing in the bucket. The head-empty check reads the real HEAD, and the pass
-\* runs only on a present HEAD read (HeadDeletable): an absent or unreadable read
-\* fails closed, because the true HEAD may still name the object (finding 5). A
-\* failed hold refresh skips the whole tick. A held object is never swept. Base
-\* additionally respects an in-window pinned query (HorizonGuardsPinnedQueries);
-\* candidate #1133 sets that FALSE.
+\* nothing in the bucket. The head-empty check reads EffectiveHead (an absent
+\* HEAD names nothing, so it is vacuously empty for this bucket), and the pass
+\* runs on any readable HEAD (HeadReadable): only an unreadable read fails
+\* closed, because a present-but-undecodable HEAD may still name the object
+\* (reachability.rs bucket_gate; finding 1, round four -- an absent HEAD used to
+\* block here too, stricter than the shipped gate). A failed hold refresh skips
+\* the whole tick. A held object is never swept. Base additionally respects an
+\* in-window pinned query (HorizonGuardsPinnedQueries); candidate #1133 sets
+\* that FALSE.
 QueryPermits(o) ==
     HorizonGuardsPinnedQueries =>
         ~(query.active /\ clock <= query.deadline /\ o \in query.needs)
 
 RetentionSweep(o) ==
-    /\ HeadDeletable
+    /\ HeadReadable
     /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
     /\ o \in DataObjects
     /\ Bucket(o) = "b1"
@@ -563,7 +580,7 @@ RetentionSweep(o) ==
     /\ PresentObj("tombB1")
     /\ (DeleteBeforeHorizon \/ clock >= tombRetiredAt["b1"] + sysgc.ph)
     /\ clock >= tombRetiredAt["b1"] + SweepRetentionWindow
-    /\ \A x \in head : Bucket(x) # "b1"
+    /\ \A x \in EffectiveHead : Bucket(x) # "b1"
     /\ ~HeldObject(o, heldBuckets)
     /\ QueryPermits(o)
     /\ S!Delete(o)
@@ -577,16 +594,18 @@ RetentionSweep(o) ==
 --------------------------------------------------------------------------------
 
 \* Superseded-input sweep of one raw input. Object-granular HEAD gate
-\* (reachability object_gate): an input the current HEAD still names is HELD. The
-\* pass runs only on a present HEAD read (HeadDeletable); an absent or unreadable
-\* read fails closed. The delete is horizon-gated (sweep.rs skips a record younger
+\* (reachability object_gate): an input EffectiveHead still names is HELD (an
+\* absent HEAD names nothing, so it never holds one). The pass runs on any
+\* readable HEAD (HeadReadable); only an unreadable read fails closed (finding
+\* 1, round four -- an absent HEAD used to block here too, stricter than the
+\* shipped gate). The delete is horizon-gated (sweep.rs skips a record younger
 \* than the protection horizon) and respects an in-window pinned query.
 \* SupersededSweepUngated drops the head-membership check.
 SupersededGatePasses(o) ==
-    IF SupersededSweepUngated THEN TRUE ELSE o \notin head
+    IF SupersededSweepUngated THEN TRUE ELSE o \notin EffectiveHead
 
 SupersededSweep(o) ==
-    /\ HeadDeletable
+    /\ HeadReadable
     /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)
     /\ o \in superseded
     /\ PresentObj(o)
@@ -769,12 +788,17 @@ DreqSweepRespectsLegalHold ==
 IdenticalInputSetsDoNotCollide ==
     PresentObj("rwA") => variantKey["v1"] # variantKey["v2"]
 
-\* An object the current HEAD still names must be present: no sweep may delete a
-\* HEAD-named raw input. Reads the store presence against the live HEAD set, so the
-\* object-granular gate is observed on the store, not a witness field.
-\* SupersededSweepUngated deletes a HEAD-named input and fires this.
+\* An object a real HEAD read still names must be present: no sweep may delete a
+\* HEAD-named raw input. Reads the store presence against EffectiveHead, the same
+\* view SupersededGatePasses gates on, not the raw `head` variable: `head` and
+\* `headState` are independent (SetHeadState churns the read outcome without
+\* touching `head`), so once finding 1 (round four) let the sweep proceed on an
+\* absent read, `head` can still name an input that no real reader can observe,
+\* and holding the sweep to that unobservable truth would demand more than the
+\* shipped gate (or any reader) can ever know. SupersededSweepUngated still
+\* deletes an EffectiveHead-named input and fires this.
 HeadNamedObjectNeverDeletedBySupersededSweep ==
-    \A o \in RawInputs : o \in head => PresentObj(o)
+    \A o \in RawInputs : o \in EffectiveHead => PresentObj(o)
 
 --------------------------------------------------------------------------------
 \* Liveness (checked against FairSpec only; see README and #1131, and the
@@ -824,7 +848,7 @@ EventuallySwept ==
     \A o \in RawInputs :
         <>[](o \in superseded /\ ~HeldObject(o, heldBuckets)
              /\ (DeleteBeforeHorizon \/ clock >= supersededAt + sysgc.ph)
-             /\ QueryPermits(o) /\ SupersededGatePasses(o) /\ HeadDeletable
+             /\ QueryPermits(o) /\ SupersededGatePasses(o) /\ HeadReadable
              /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)) ~>
             ~PresentObj(o)
 
