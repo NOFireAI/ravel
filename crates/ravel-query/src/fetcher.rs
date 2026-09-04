@@ -699,6 +699,15 @@ impl SegmentFetcher {
         self
     }
 
+    /// The whole-object threshold this fetcher opens segments with (see
+    /// [`Self::with_whole_object_threshold`]). Read-only counterpart used by
+    /// `io_shape`'s structural `dependency_depth` classification, which needs
+    /// the same size cutoff `open_segment` branches on without duplicating or
+    /// re-deriving it.
+    pub fn whole_object_threshold(&self) -> u64 {
+        self.whole_object_threshold
+    }
+
     /// Sets the in-flight byte-range GET bound. Shared across
     /// this fetcher's clones.
     #[must_use]

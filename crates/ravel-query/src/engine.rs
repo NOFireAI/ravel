@@ -19,7 +19,7 @@ use ravel_promql::{
 };
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::ReaderLimits;
-use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
 };
@@ -31,7 +31,8 @@ use crate::fetcher::{
     FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
     SegmentFetcher,
 };
-use crate::log_fetcher::{LogFetchError, LogSegmentFetcher};
+use crate::io_shape::{IoShapeCounts, PlanClass, QueryIoShape};
+use crate::log_fetcher::{DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogSegmentFetcher};
 use crate::log_series;
 use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
 use crate::segment_admission;
@@ -104,15 +105,23 @@ pub struct QueryStats {
     /// healthy. Surfaced into the query response's `warnings` array alongside
     /// the evaluator's own [`Annotations`] warnings.
     pub warnings: Vec<String>,
+    /// The query's I/O dependency shape (issue #1214): chain depth, LIST
+    /// pagination, concurrency-forced batching, exact unfolded-record count,
+    /// and pre-execution plan class. See `crate::io_shape` module docs for
+    /// what each figure means, and how it differs from `phase_accounting`'s
+    /// request/byte cost split above.
+    pub io_shape: QueryIoShape,
 }
 
 impl QueryStats {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         segments_fetched: u64,
         segments_pruned: u64,
         page_stats: FetchStats,
         phase_accounting: PhaseAccountingSnapshot,
         estimate: CostEstimate,
+        io_shape: QueryIoShape,
     ) -> Self {
         QueryStats {
             segments_fetched,
@@ -123,6 +132,7 @@ impl QueryStats {
             estimate,
             partial: false,
             warnings: Vec::new(),
+            io_shape,
         }
     }
 }
@@ -141,6 +151,7 @@ impl Default for QueryStats {
             estimate: CostEstimate::new(0, 0, 0, 0, 0),
             partial: false,
             warnings: Vec::new(),
+            io_shape: QueryIoShape::default(),
         }
     }
 }
@@ -817,6 +828,7 @@ impl QueryEngine {
                 now_ns,
                 name_filter.as_deref(),
                 1,
+                true, // metadata_only: discovery never fetches pages.
                 attempt,
             )
             .await?;
@@ -893,6 +905,7 @@ impl QueryEngine {
                 now_ns,
                 None,
                 1,
+                true, // metadata_only: log discovery never fetches pages.
                 attempt,
             )
             .await?;
@@ -1047,7 +1060,7 @@ impl QueryEngine {
         // second attempt exists to paper over, not a case worth duplicating
         // that machinery for.
         let log_accounting = PhaseAccounting::new();
-        let (log_snapshot, _log_generations) = self
+        let (log_snapshot, _log_generations, log_unfolded) = self
             .resolve_bounded(
                 tenant_hash,
                 Signal::Logs,
@@ -1159,6 +1172,48 @@ impl QueryEngine {
         stats.phase_accounting =
             combine_phase_accounting(&stats.phase_accounting, &log_accounting.snapshot());
         stats.accounting = stats.phase_accounting.pooled();
+
+        // Fold the log lane's own io_shape contribution into the metrics
+        // lane's, mirroring the `combine_phase_accounting` fold above.
+        // Unlike that fold, `dependency_depth`/`list_page_depth`/
+        // `service_batches` are "longest chain wins" (`IoShapeCounts`'s own
+        // max-based semantics), not sums: two lanes' chains ran alongside
+        // each other, not one after the other. `unfolded_records_resolved`
+        // IS additive (an exact total count across both lanes' resolves).
+        // The log lane's `whole_object_threshold` is not reachable from
+        // here (`BlockRangeFetcher::effective_whole_object_threshold` is
+        // private and, unlike `SegmentFetcher`'s fixed field, scales
+        // dynamically with `request_cost_bytes`); `DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`
+        // is used as a structural approximation, so a log fetcher configured
+        // with a non-default override can misclassify a segment's
+        // dependency_depth here.
+        let mut log_counts = IoShapeCounts {
+            dependency_depth: stats.io_shape.dependency_depth,
+            list_page_depth: stats.io_shape.list_page_depth,
+            service_batches: stats.io_shape.service_batches,
+        };
+        let log_depth = log_snapshot
+            .segments
+            .iter()
+            .map(|seg| crate::io_shape::depth_for_object(seg.object_size, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD))
+            .max()
+            .unwrap_or(0);
+        log_counts.record_dependency_chain(log_depth);
+        log_counts.record_service_batches(crate::io_shape::service_batches(
+            log_snapshot.segments.len() as u64,
+            self.config.fetch_concurrency.max(1) as u64,
+        ));
+        let log_list_requests = log_accounting.resolve().snapshot().s3_requests(AccountedOp::List);
+        log_counts.record_list_pages(log_list_requests.min(u64::from(u32::MAX)) as u32);
+        let log_plan_class = if log_snapshot.segments_pruned > 0 {
+            PlanClass::SelectiveIndexed
+        } else {
+            PlanClass::ExhaustiveScan
+        };
+        stats.io_shape = log_counts.into_shape(
+            stats.io_shape.unfolded_records_resolved + log_unfolded,
+            crate::io_shape::merge_plan_class(stats.io_shape.plan_class, log_plan_class),
+        );
 
         // ADR-1103 decision 5: a federated query answers a log selector
         // locally only, never fanning it to a remote cluster; the client is
@@ -1536,6 +1591,7 @@ impl QueryEngine {
                 now_ns,
                 name_filter.as_deref(),
                 fetch_multiplier,
+                false, // metadata_only: this path fetches scalar/histogram pages.
                 attempt,
             )
             .await?;
@@ -1559,6 +1615,13 @@ impl QueryEngine {
         now_ns: i64,
         name_filter: Option<&str>,
         fetch_multiplier: u64,
+        // `QueryIoShape::plan_class` is decided before any segment is opened
+        // (issue #1214): `true` for a discovery-only caller
+        // (`resolve_series_inner`/`resolve_log_series_inner`, neither of
+        // which reaches `fetch_scalar_pages`/`fetch_histogram_pages`),
+        // `false` for the metrics evaluation path, which then classifies by
+        // the resolve's own pruning outcome below.
+        metadata_only: bool,
         mut attempt: F,
     ) -> Result<(T, QueryStats), QueryError>
     where
@@ -1569,6 +1632,8 @@ impl QueryEngine {
         // attempts: `window` and `now_ns` do not change on retry, only the
         // snapshot resolve's outcome does.
         let catalog_requests = self.catalog.estimated_catalog_requests(window, now_ns);
+        let concurrency = self.config.fetch_concurrency.max(1) as u64;
+        let whole_object_threshold = self.fetcher.whole_object_threshold();
         // Fresh handle per attempt, created before `resolve_bounded` runs so
         // the same handle that goes on to fetch segments also receives
         // resolve's own catalog-side counters (ADR-0044 decision 1: "created
@@ -1577,7 +1642,7 @@ impl QueryEngine {
         // discarded first attempt's in-flight counts must not bleed into the
         // attempt that actually produced the result.
         let first_accounting = PhaseAccounting::new();
-        let (first, first_generations) = self
+        let (first, first_generations, first_unfolded) = self
             .resolve_bounded(
                 tenant_hash,
                 signal,
@@ -1591,13 +1656,21 @@ impl QueryEngine {
         let first_estimate = estimate_cost(&first, fetch_multiplier, catalog_requests);
         let first_segments = first.segments.len() as u64;
         let first_pruned = first.segments_pruned;
+        let first_io_shape = io_shape_for_resolve(
+            &first,
+            metadata_only,
+            whole_object_threshold,
+            concurrency,
+            &first_accounting,
+            first_unfolded,
+        );
         match attempt(first, first_generations, first_accounting.clone()).await {
             Err(QueryError::Fetch(FetchError::Store {
                 source: StoreError::NotFound,
                 ..
             })) => {
                 let second_accounting = PhaseAccounting::new();
-                let (second, second_generations) = self
+                let (second, second_generations, second_unfolded) = self
                     .resolve_bounded(
                         tenant_hash,
                         signal,
@@ -1611,6 +1684,14 @@ impl QueryEngine {
                 let second_estimate = estimate_cost(&second, fetch_multiplier, catalog_requests);
                 let second_segments = second.segments.len() as u64;
                 let second_pruned = second.segments_pruned;
+                let second_io_shape = io_shape_for_resolve(
+                    &second,
+                    metadata_only,
+                    whole_object_threshold,
+                    concurrency,
+                    &second_accounting,
+                    second_unfolded,
+                );
                 match attempt(second, second_generations, second_accounting.clone()).await {
                     Err(QueryError::Fetch(FetchError::Store {
                         source: StoreError::NotFound,
@@ -1624,6 +1705,7 @@ impl QueryEngine {
                             page_stats,
                             second_accounting.snapshot(),
                             second_estimate,
+                            second_io_shape,
                         ),
                     )),
                     Err(other) => Err(other),
@@ -1637,6 +1719,7 @@ impl QueryEngine {
                     page_stats,
                     first_accounting.snapshot(),
                     first_estimate,
+                    first_io_shape,
                 ),
             )),
             Err(other) => Err(other),
@@ -1659,7 +1742,7 @@ impl QueryEngine {
         now_ns: i64,
         name_filter: Option<&str>,
         accounting: &QueryAccounting,
-    ) -> Result<(Snapshot, Vec<ShardGeneration>), QueryError> {
+    ) -> Result<(Snapshot, Vec<ShardGeneration>, u64), QueryError> {
         // `resolve_pruned_with_generations` returns the shard-generation history
         // THIS resolve computed its scan set from (ADR-0103 decision 1(b)): the
         // pushdown eligibility gate reads exactly this copy, never a separately
@@ -1682,7 +1765,13 @@ impl QueryEngine {
         // 2). Their cost is bounded separately by the request budget
         // checked incrementally during fetch, below.
         segment_admission::admit(&snapshot, &origins, &self.config)?;
-        Ok((snapshot, generations))
+        // Exact count of segments this resolve took from the recent
+        // (unfolded) listing path rather than a folded snapshot part
+        // (`QueryIoShape::unfolded_records_resolved`, issue #1214): gates a
+        // downstream fold-benefit decision, so this must be the real count,
+        // never an estimate.
+        let unfolded_records_resolved = crate::io_shape::count_unfolded_records(&origins.origins);
+        Ok((snapshot, generations, unfolded_records_resolved))
     }
 
     /// Maps a log lane failure onto the same [`QueryError`] variants the
@@ -2170,6 +2259,56 @@ fn combine_phase_accounting(
         probe: a.probe.saturating_add(&b.probe),
         scan: a.scan.saturating_add(&b.scan),
     }
+}
+
+/// Builds one resolve attempt's [`QueryIoShape`] (issue #1214) entirely from
+/// values already produced by that attempt's resolve: the segment set's own
+/// `object_size`s (structural `dependency_depth`, see
+/// `io_shape::depth_for_object`), the resolved segment count against this
+/// query's concurrency permit (`service_batches`), the resolve phase's own
+/// LIST request count (`list_page_depth`, an upper-bound serial depth --
+/// see `crate::io_shape` module docs for why this crate cannot see whether
+/// two shards' LIST pages ran concurrently with each other), and the
+/// already-computed exact unfolded-record count and plan-class decision.
+///
+/// Deliberately does NOT thread any new instrumentation into the per-segment
+/// fetch loops (`fetch_all_samples_and_histograms`/`fetch_all_series`):
+/// every figure here is a pure function of the resolved `Snapshot` and the
+/// query's own configuration, computable before a single segment fetch
+/// starts.
+fn io_shape_for_resolve(
+    snapshot: &Snapshot,
+    metadata_only: bool,
+    whole_object_threshold: u64,
+    concurrency: u64,
+    accounting: &PhaseAccounting,
+    unfolded_records_resolved: u64,
+) -> QueryIoShape {
+    let mut counts = IoShapeCounts::default();
+    let depth = snapshot
+        .segments
+        .iter()
+        .map(|seg| crate::io_shape::depth_for_object(seg.object_size, whole_object_threshold))
+        .max()
+        .unwrap_or(0);
+    counts.record_dependency_chain(depth);
+    counts.record_service_batches(crate::io_shape::service_batches(
+        snapshot.segments.len() as u64,
+        concurrency,
+    ));
+    let resolve_list_requests = accounting
+        .resolve()
+        .snapshot()
+        .s3_requests(AccountedOp::List);
+    counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
+    let plan_class = if metadata_only {
+        PlanClass::MetadataOnly
+    } else if snapshot.segments_pruned > 0 {
+        PlanClass::SelectiveIndexed
+    } else {
+        PlanClass::ExhaustiveScan
+    };
+    counts.into_shape(unfolded_records_resolved, plan_class)
 }
 
 /// A locally-scoped series identity for a log-derived series returned from
