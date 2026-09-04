@@ -14,6 +14,8 @@ smoke.cfg           fast safety config (symmetry-reduced)
 exhaustive.cfg      full safety + liveness config
 carryforward.cfg    three-hour safety config that exercises the incremental fold
                     carry-forward branch (paired with its non-vacuity probe)
+overlap.cfg         three-record, two-hour safety config that exercises
+                    overlapping L1 outputs (paired with its non-vacuity probe)
 bands.tsv           per-config distinct-state and depth bands
 traceability.md     TLA+ action or property -> Rust source table
 results.md          recorded figures and the bands they must stay in
@@ -51,16 +53,21 @@ bucket is compactable strictly before it is foldable.
 `SnapshotEntriesBelowWatermark`, `PinnedSnapshotStableWithinAttempt`,
 `NoLiveCommitOmittedByLostCas`, `MissingIndexDegradesToListing`,
 `CorruptHeadFailsClosedOnDeletePaths`, `HeadNamedObjectNeverDeleted`,
-`TombstonedBucketContributesNothing`, and `SignalDedupContract`. Temporal
-(exhaustive only): `QueryTerminates`. `LateSupersessionEventuallyReflected` is
-defined but not checked: it is a recorded shrink (finite-model liveness
-limitation; see `counterexamples/late-supersession-shrink.md`).
+`TombstonedBucketContributesNothing`, `SignalDedupContract`, and
+`DedupPreservesCoverage`. Temporal (exhaustive only): `QueryTerminates`.
+`LateSupersessionEventuallyReflected` is defined but not checked: it is a
+recorded shrink (finite-model liveness limitation; see
+`counterexamples/late-supersession-shrink.md`).
 
-All twelve named invariants above are shown non-vacuous by a negative control
-that flips one switch and makes them falsifiable (see `negative/` and
-`counterexamples/`); none is left to a mutant note. Three configs are
-non-vacuity probes rather than switch mutants, each checking a refuted
-reachability property instead of flipping a switch:
+Twelve of the thirteen named invariants above are shown non-vacuous by a
+negative control that flips one switch and makes them falsifiable (see
+`negative/` and `counterexamples/`); none of those twelve is left to a
+mutant note. `DedupPreservesCoverage` is STORE-derived rather than
+switch-gated, so it has no `negative/*.cfg` counterpart; it is shown
+non-vacuous by a historical before/after demonstration instead (see
+`counterexamples/dedup-starvation-fixed.md`). Four configs are non-vacuity
+probes rather than switch mutants, each checking a refuted reachability
+property instead of flipping a switch:
 
 - `negative/carryforward-nonvacuity.cfg` checks `NoCarryForward` over
   three-hour bounds where a watermark-advancing fold is reachable, so TLC
@@ -77,6 +84,13 @@ reachability property instead of flipping a switch:
   `"diverged"` member of `lastCompact.outcome`'s widened alphabet (finding
   6) is reachable, not a value the model can define but never hit (see
   `counterexamples/compaction-loser-diverged-nonvacuity.md`).
+- `negative/overlap-nonvacuity.cfg` checks `NoOverlappingL1Output` over
+  three-record, two-hour bounds where the same record identity can be
+  committed into two different hours and separately compacted in each, so
+  TLC reporting it violated proves two published L1 outputs whose `out`
+  sets overlap are reachable (finding 7), not a case `smoke.cfg` or
+  `exhaustive.cfg`'s bounds ever reach (see `overlap.cfg` and
+  `counterexamples/overlap-nonvacuity.md`).
 
 ## Running
 
