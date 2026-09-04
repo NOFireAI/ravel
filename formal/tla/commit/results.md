@@ -250,7 +250,7 @@ of leaving `phase` unchanged at `"data"`, run against `smoke.cfg`'s
 constants (`MaxRetries=1`) with only `RetrySamePinnedFlushIdempotent`
 listed as `INVARIANT`. TLC reports:
 
-```
+```text
 Error: Invariant RetrySamePinnedFlushIdempotent is violated.
 ```
 
