@@ -492,7 +492,7 @@ enabling condition (documented in that file's header: it is what drives
 the writer's cached view past the grace horizon within this small a
 model), but the config never isolates it from the fence.
 
-Added `writer-fence-comparison.cfg`: byte-for-byte identical to
+Added `writer-fence-comparison.cfg`, with identical non-comment settings to
 `negative/no-writer-fence.cfg` (same `AppenderSkew = 2`, same `MaxHour = 4`,
 same everything) except `WriterFenceEnabled = TRUE`. A difference in
 outcome between the two can then only come from the fence.
