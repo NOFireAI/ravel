@@ -7,16 +7,17 @@ harness fails a PASS run whose distinct-state count or depth falls outside
 them.
 
 Toolchain: TLC 2.19 (tla2tools 1.7.4), Eclipse Temurin 21.0.12.1 JRE, Linux
-aarch64, `-workers auto` (4 workers, 4 cores), host `rp1`. Wall times are
-host-dependent and are not banded. Run id
-`20260903T213519Z-dcd6f6a1c1f69b4d520a8b9bfa33ee24994f8a72` unless noted
-otherwise.
+x86_64, `-workers auto` (8 workers, 8 cores). Wall times are host-dependent
+and are not banded. Run id
+`20260904T184559Z-ae2b218f783b8a3e325b1e85e35f2f2bdfef63c1` unless noted
+otherwise, from a single `scripts/check-tla.sh all -a commit` invocation
+covering smoke, negative, traceability and exhaustive together.
 
 ## Configuration runs
 
 | Config | States generated | Distinct | Depth | Seconds | Result |
 |---|---|---|---|---|---|
-| smoke.cfg | 97311 | 29064 | 24 | 2 | PASS |
+| smoke.cfg | 305165 | 76212 | 21 | 5 | PASS |
 | negative/ack-before-commit.cfg | 2 | 2 | n/a | 1 | VIOLATED as required (StrictAckImpliesDurable) |
 | negative/at-least-once-duplicate-reachable.cfg | 64817 | 26486 | n/a | 2 | VIOLATED as required (DuplicateUnreachable) |
 | negative/commit-before-data.cfg | 44 | 41 | n/a | 1 | VIOLATED as required (NoCommitWithoutData) |
@@ -24,16 +25,32 @@ otherwise.
 | negative/marker-before-all-shards.cfg | 779 | 505 | n/a | 1 | VIOLATED as required (MarkerImpliesAllShardsDurable) |
 | negative/mismatched-identity-idempotent.cfg | 26950 | 12816 | n/a | 2 | VIOLATED as required (OneIdentityOneContent) |
 | negative/no-cross-shard-atomicity.cfg | 243 | 174 | n/a | 1 | VIOLATED as required (NoCrossShardAtomicityUnreachable) |
+| negative/put-commit-lost-response-reachable.cfg | 21 | 20 | n/a | 1 | VIOLATED as required (PutCommitLostResponseUnreachable) |
+| negative/put-data-lost-response-reachable.cfg | 2 | 2 | n/a | 1 | VIOLATED as required (PutDataLostResponseUnreachable) |
 | negative/query-reads-uncommitted-data.cfg | 77 | 65 | n/a | 1 | VIOLATED as required (NoUncommittedDataVisible) |
+| negative/transient-failure-reachable.cfg | 2 | 2 | n/a | 1 | VIOLATED as required (TransientFailureUnreachable) |
 | traceability | n/a | n/a | n/a | n/a | PASS, 21 rows resolve |
-| exhaustive.cfg | 17892751 | 5466239 | 36 | 181 | PASS |
+| exhaustive.cfg | 17892751 | 5466239 | 36 | 131 | PASS |
 
-The negative rows are the required outcome: each config disables a guard or
-flips a broken-behaviour switch, and TLC finding the counterexample proves
-the corresponding property is load-bearing, not vacuous. Each is pinned by
-its `.expect` file, which names the exit code and the property the log must
-report; all eight `.expect` files were checked against the logs above and
-match exactly.
+The negative rows are the required outcome: each config disables a guard,
+flips a broken-behaviour switch, or (the three new `*-reachable.cfg` rows)
+asserts an action's own enabling conjuncts must never hold, and TLC finding
+the counterexample proves the corresponding property is load-bearing or the
+action reachable, not vacuous. Each is pinned by its `.expect` file, which
+names the exit code and the property the log must report; all eleven
+`.expect` files were checked against the logs above and match exactly.
+
+`smoke.cfg` moved from `MaxRetries=0` to `MaxRetries=1` (issue #1120): at
+`MaxRetries=0`, the three store-level retry actions
+(`PutDataLostResponse`, `PutCommitLostResponse`, `TransientFailure`) are
+permanently disabled, since each requires `retries[f] < MaxRetries`, and
+no cfg that lists the full safety `INVARIANT` set ever set `MaxRetries`
+above 0. `smoke.cfg` is now that cfg: it checks the same eleven safety
+invariants as before, with the retry actions reachable, in 4s against the
+300s smoke ceiling. The three new `negative/*-reachable.cfg` probes above
+prove each retry action fires under these exact constants, and the mutant
+audit below shows `RetrySamePinnedFlushIdempotent` is non-vacuous
+specifically through a retry action, not just through the initial write.
 
 `exhaustive.cfg` carries the smallest constants that still satisfy every
 coverage requirement on this suite: `Shards={s1,s2}` (two-shard
@@ -47,9 +64,11 @@ floor `ASSUME FlushLifetime > 0` and deadline-reachability allow), and
 `MaxRetries=0`/`Writers={w1}` (already at their floor). Three coverage
 items are given up versus the pre-task cfg. `MaxRetries` runs at 0 instead
 of 1, dropping the second-retry interleaving from the exhaustive lane
-specifically (the retry path itself is still exercised at `MaxRetries=1`
-elsewhere, in `negative/at-least-once-duplicate-reachable.cfg` and
-`dedup-mutant.cfg`). `NoUncommittedDataVisible` is dropped from this cfg's
+specifically (the retry path itself, including the three retry actions
+against the full safety invariant list, is exercised at `MaxRetries=1` in
+`smoke.cfg`, and the dedup guard specifically in
+`negative/at-least-once-duplicate-reachable.cfg` and `dedup-mutant.cfg`).
+`NoUncommittedDataVisible` is dropped from this cfg's
 `INVARIANT` list and `CheckQuery` is set `FALSE`: the `RunQuery` action
 added for that invariant (see the mutant-audit section below) is a
 single-fire action whose firing point can land at any reachable state, and
@@ -73,11 +92,14 @@ ever plateauing (442,076,218 states generated, 118,898,952 distinct,
 31,290,754 left on queue, monotonically increasing for the full hour).
 With `CheckQuery=FALSE`, the same cfg completes: 642,136,435 states
 generated, 148,881,235 distinct, depth 38, in 2728s (45m27s, `-workers
-auto` resolving to 8 workers on this session's 8-core host rather than the
-4 workers/4 cores recorded for host `rp1` above; wall time is
-host-dependent and not banded, so this is not a regression against the
-banded figures). `bands.tsv` now carries a real exhaustive row for this
-figure. Separately, on the three budget figures that appear in ADR-1113 and the
+auto` resolving to 8 workers on an 8-core host; wall time is host-dependent
+and not banded). This figure was itself superseded by the `CheckToken`
+shrink described below, and `bands.tsv` never carried a row for it: the
+642,136,435/148,881,235/depth-38 figure is pre-shrink and kept here only
+for reference, not the verified record. The figure `bands.tsv` actually
+carries, and the one this record names as verified, is the post-`CheckToken`
+17,892,751 generated/5,466,239 distinct/depth 36 figure below. Separately,
+on the three budget figures that appear in ADR-1113 and the
 harness: they are not in conflict, and an earlier task spec conflated them.
 Sixty minutes is the per-configuration ceiling for `exhaustive`, which is
 what `scripts/check-tla.sh` encodes as `EXHAUSTIVE_BUDGET=3600` and the
@@ -100,13 +122,18 @@ blowup mechanism `RunQuery` did before `CheckQuery` existed. Adding a
 `CheckToken` constant, identical in mechanism to `CheckQuery`, and setting
 it `FALSE` here with `TokenNeverServesStale` dropped from this cfg's
 `INVARIANT` list cuts the run from 148,881,235 distinct/depth 38/2728s to
-17,892,751 generated, 5,466,239 distinct, depth 36, 181s, about 5% of the
-3600s ceiling and well under the 1500s target with real margin on either
-host. `smoke.cfg` (`CheckToken=TRUE`) re-run after the change produced
-byte-identical figures to its pre-change baseline (97,311 generated,
-29,064 distinct, depth 24), confirming the gate is inert when enabled and
-that `TokenNeverServesStale` is still proved exhaustively, just at
-`smoke.cfg`'s one-shard bounds instead of `exhaustive.cfg`'s two.
+17,892,751 generated, 5,466,239 distinct, depth 36, 181s (131s on this
+session's host), about 5% of the 3600s ceiling and well under the 1500s
+target with real margin on either host. `smoke.cfg` (`CheckToken=TRUE`)
+re-run after the `CheckToken` change produced byte-identical figures to
+its pre-change baseline (97,311 generated, 29,064 distinct, depth 24, at
+the `MaxRetries=0` this cfg carried at the time), confirming the gate is
+inert when enabled and that `TokenNeverServesStale` is still proved
+exhaustively, just at `smoke.cfg`'s one-shard bounds instead of
+`exhaustive.cfg`'s two. `smoke.cfg`'s figures moved again, to
+305,165/76,212/depth 21, when `MaxRetries` was later raised to 1 for
+issue #1120 (see the configuration table above); that change did not
+revisit the `CheckToken` gate, so this paragraph's conclusion still holds.
 
 Two-shard reachability for the coverage this cfg exists to keep was
 checked directly, not assumed. A scratch probe module
@@ -212,6 +239,27 @@ Error: Invariant NoUncommittedDataVisible is violated.
 
 77 states generated, 65 distinct states found, matching the `.expect` file
 (`exit=12`, `property=NoUncommittedDataVisible`).
+
+`RetrySamePinnedFlushIdempotent` under retries specifically (issue #1120):
+the table row above already exercises this invariant, but not through a
+retry action. To show it is also non-vacuous once `MaxRetries=1` makes the
+retry actions reachable, a second scratch mutation changed
+`PutCommitLostResponse` to write the sentinel `"NoC"` to the commit key
+instead of `pinned[f]`, and to set `phase' = "committed"` directly instead
+of leaving `phase` unchanged at `"data"`, run against `smoke.cfg`'s
+constants (`MaxRetries=1`) with only `RetrySamePinnedFlushIdempotent`
+listed as `INVARIANT`. TLC reports:
+
+```
+Error: Invariant RetrySamePinnedFlushIdempotent is violated.
+```
+
+280 states generated, 179 distinct, depth 5. The counterexample's
+state-4 transition is labeled `<PutCommitLostResponse line 325, col 5 to
+line 338, col 149 of module CommitProtocol>`, and that state carries
+`retries=1`, `pinned=c2`, and the mutated commit-key content `"NoC"`,
+which together attribute the violation to the retry action firing, not
+merely to some earlier write.
 
 ## What the correct-form runs found
 
