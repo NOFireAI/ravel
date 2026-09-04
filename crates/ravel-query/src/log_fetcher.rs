@@ -3316,9 +3316,12 @@ impl BlockRangeFetcher {
     /// existing windowed methods all filter to one caller-named stream, which
     /// this fetcher's arbitrary ts-range/content/postings/bloom predicates do
     /// not fit); and (2) in `ravel-query`, restructuring every `covering_read`
-    /// caller (this function's 4 call sites) to fetch and parse PAGE_DIR,
-    /// SKIP_IDX, and FIELD_DIR ahead of the covering loop (today `covering_read`
-    /// knows nothing about block boundaries and writes `[0, total_size)`
+    /// caller (this function's 4 call sites) to fetch and parse the directory
+    /// sections ahead of the covering loop -- STREAM_DIR, SKIP_IDX and
+    /// FIELD_DIR for any object, plus PAGE_DIR for a version-4 one, since v3
+    /// carries no PAGE_DIR and its blocks are contiguous byte ranges
+    /// (`ravel_logseg::footer`) -- (today `covering_read` knows nothing about
+    /// block boundaries and writes `[0, total_size)`
     /// unconditionally), choose split points at block boundaries, and decode
     /// each sub-range's complete blocks immediately and discard its buffer
     /// before the next sub-range is fetched, instead of assembling into one
