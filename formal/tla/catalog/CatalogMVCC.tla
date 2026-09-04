@@ -297,10 +297,35 @@ RawDupIdentities(P) == { r \in Records : Cardinality({ e \in P : Serves(e, r) })
 \* restatement of DedupApplies.
 DedupApplies == DedupBySignal /\ ~DropMetricsDedup
 Sources(r, P) == { e \in P : Serves(e, r) }
+
+\* Survivor selection, most-constrained identity first: an identity with fewer
+\* sources is processed before one with more, so a forced survivor (an
+\* identity with exactly one source) is protected before a flexible identity
+\* picks an independent alternative that would otherwise starve it of that
+\* same shared source. An identity whose source set already overlaps
+\* Protected reuses the existing survivor instead of adding one, which is what
+\* keeps a shared L1 part serving two identities at once from also counting as
+\* two of Sources(r, P) for either. Picking per identity independently (the
+\* prior definition) had no such ordering: two identities sharing one L1
+\* source could choose different survivors, and the shared source then fell
+\* out of both removal sets' complement and was dropped, leaving the identity
+\* whose only source that was with none (issue #1121 Finding 1).
+RECURSIVE DedupSurvivors(_, _, _)
+DedupSurvivors(P, RS, Protected) ==
+    IF RS = {} THEN Protected
+    ELSE LET r == CHOOSE x \in RS :
+                 \A y \in RS : Cardinality(Sources(x, P)) <= Cardinality(Sources(y, P))
+             Src == Sources(r, P)
+         IN IF \/ Src = {}
+               \/ Src \cap Protected # {}
+            THEN DedupSurvivors(P, RS \ {r}, Protected)
+            ELSE DedupSurvivors(P, RS \ {r}, Protected \cup {CHOOSE e \in Src : TRUE})
+
 Dedup(P) ==
     IF ~DedupApplies THEN P
-    ELSE P \ UNION { IF Sources(r, P) = {} THEN {}
-                      ELSE Sources(r, P) \ {CHOOSE e \in Sources(r, P) : TRUE} : r \in Records }
+    ELSE LET Protected == DedupSurvivors(P, Records, {})
+         IN { e \in P : \/ e \in Protected
+                        \/ ~ \E r \in Records : Serves(e, r) }
 
 \* Whether the reader can resolve a snapshot from HEAD. HeadNamesOnlyComplete
 \* Parts already proves a valid HEAD always names an existing snapshot part
@@ -1020,6 +1045,15 @@ TombstonedBucketContributesNothing ==
 \* non-empty under metrics.
 SignalDedupContract ==
     DedupBySignal => qy.dupServed = {}
+
+\* Dedup must never remove the only source an identity had. Store-derived:
+\* recomputes Dedup fresh against the current FallbackView rather than reading
+\* any witness, so it checks the operator itself at every reachable state, not
+\* just at a query resolve. Complements SignalDedupContract, which catches a
+\* surviving duplicate but not a survivor dropped outright (issue #1121
+\* Finding 1).
+DedupPreservesCoverage ==
+    \A r \in Records : Sources(r, FallbackView) # {} => Sources(r, Dedup(FallbackView)) # {}
 
 \* Non-vacuity probe for the bounded incremental fold. True once a fold has
 \* carried forward at least one entry from a hour below its reconcile floor
