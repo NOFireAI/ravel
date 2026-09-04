@@ -202,11 +202,19 @@ ServesSubject(o, s) == \E r \in objContent[o] : RecordSubject(r) = s
 
 \* The record set the rewrite output should serve: its predecessors' records minus
 \* the records whose subject the applied requests erased. RewriteKeepsErasedRecords
-\* drops the minus (finding 3 behaviour mutant). Reads objContent, not InitContent
-\* (issue #1122, finding 1): resolve_live_inputs re-lists the bucket and reads
-\* current object bodies at rewrite time, never the initial content, so a raw
-\* input mutated or replaced before the rewrite runs must feed the rewrite what
-\* is actually there.
+\* drops the minus (finding 3 behaviour mutant). Reads objContent, not InitContent,
+\* because resolve_live_inputs re-lists the bucket and reads current object bodies
+\* at rewrite time (issue #1122, finding 1). For a raw-input predecessor this read
+\* is not exercised in this model: raw inputs are immutable by system invariant
+\* (RawInputContentAssumedImmutable, README.md), so objContent[i] for i \in RawInputs
+\* always equals InitContent(i) and no reachable behaviour can tell the two reads
+\* apart. The current-state read matters for a predecessor that is itself a
+\* rewrite output, whose content PerformRewrite does write; this model has only
+\* one rewrite object (RewriteOut = {"rwA"}) and Predecessors("rwA") is fixed to
+\* RawInputs, so that rewrite-of-rewrite case is not reachable here either. Kept
+\* as objContent, not InitContent, so the operator states what resolve_live_inputs
+\* actually does rather than the narrower thing this finite model happens to be
+\* able to observe.
 RewriteOutputContent ==
     LET inRecs == UNION { objContent[i] : i \in Predecessors("rwA") }
     IN IF RewriteKeepsErasedRecords
@@ -867,6 +875,20 @@ IdenticalInputSetsDoNotCollide ==
 \* deletes an EffectiveHead-named input and fires this.
 HeadNamedObjectNeverDeletedBySupersededSweep ==
     \A o \in RawInputs : o \in EffectiveHead => PresentObj(o)
+
+\* Environmental assumption, not a protocol property: a raw input's content
+\* never changes across a reachable behaviour. Data objects are immutable in
+\* Ravel (docs/object-store-contract.md, `put_data_object`'s CreateIfAbsent
+\* path), so no Next action models a raw-input replacement (issue #1122,
+\* finding 1). This pins that the model actually respects the assumption it is
+\* built on: the only writer of `objContent` for a raw input is `Init`, and no
+\* other action's UNCHANGED list omits it. If a future edit added a raw-input
+\* mutation, this is the invariant that would catch it, not
+\* `RewriteOutputsAreInputsMinusErased`, which only reads `objContent` for
+\* `rwA`. README.md's assumptions section explains why a replacement
+\* transition is out of scope rather than added.
+RawInputContentAssumedImmutable ==
+    \A o \in RawInputs : objContent[o] = InitContent(o)
 
 --------------------------------------------------------------------------------
 \* Liveness (checked against FairSpec only; see README and #1131, and the

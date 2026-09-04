@@ -42,15 +42,17 @@ as such and not checked here.
 
 ## Invariants
 
-Fourteen safety invariants including `TypeOK`; see `traceability.md` for the
-one-line meaning of each and its Rust source. The load-bearing ones:
-`NoDeleteInsideProtectionWindow`, `HeldObjectNeverDeleted`,
+Fifteen safety invariants including `TypeOK`; see `traceability.md` for the
+one-line meaning of each and its Rust source. The load-bearing protocol
+properties: `NoDeleteInsideProtectionWindow`, `HeldObjectNeverDeleted`,
 `RefreshFailureNeverSweeps`, `TombstoneExcludesBeforeDelete`,
 `TombstoneNotDeletedBeforeBucketEmpty`,
 `ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`,
 `CompletionImpliesNoPreRewriteExposure`, `CompletionRespectsLegalHold`,
 `DreqRemovalCannotResurrect`, `DreqSweepRespectsLegalHold`,
 `IdenticalInputSetsDoNotCollide`, `HeadNamedObjectNeverDeletedBySupersededSweep`.
+`RawInputContentAssumedImmutable` is not a protocol property; it pins an
+environmental assumption the model is built on (see "Assumptions" below).
 
 `TombstoneNotDeletedBeforeBucketEmpty` pins the last step of
 `physical_sweep`: the tombstone itself is only deleted once a fresh listing
@@ -98,6 +100,42 @@ the constant. The rewrite lineage is likewise not a separate invariant; the
 store-derived `RewriteOutputsAreInputsMinusErased` and `IdenticalInputSetsDoNotCollide`
 already pin what the output serves and how its identity is bound.
 
+## Assumptions
+
+Raw inputs are immutable: no `Next` action ever changes a raw input's stored
+content, and `RawInputContentAssumedImmutable` pins that assumption directly
+(`\A o \in RawInputs : objContent[o] = InitContent(o)`), checked in
+`smoke.cfg` and `exhaustive.cfg`. The name marks it as an environmental
+assumption being asserted, not a protocol property being proven: nothing in
+this model derives raw-input immutability from anything else, it is taken as
+given because data objects are immutable by system invariant (see
+`traceability.md` for the Rust path).
+
+A prior review (issue #1122, finding 1) asked whether `PerformRewrite`
+should instead gain a bounded raw-input replacement transition, since no
+reachable `Next` action changes `objContent["raw1"]` and the previous
+review round's fix to `RewriteOutputContent` (reading current `objContent`
+rather than frozen `InitContent`) has no raw-input predecessor left to
+exercise it. The decision is to restrict scope instead: a transition that
+replaces a raw input's content would model behaviour the object store
+forbids, and every property proved over it would be a property of a system
+that does not exist. `RawInputContentAssumedImmutable` makes that scope
+decision mechanical: a future edit that added such a transition would break
+this invariant immediately, in `smoke.cfg`, rather than silently widening
+the model to a rewrite the storage layer refuses.
+
+`RewriteOutputContent`'s current-state read is not vacuous for every
+predecessor, only for a raw-input one: it would matter for a predecessor
+that is itself a rewrite output, whose content `PerformRewrite` does write.
+This model does not reach that case. `RewriteOut` names exactly one rewrite
+object (`rwA`), `Predecessors("rwA")` is fixed to `RawInputs`, and no action
+produces a second rewrite object a further rewrite could take as input, so
+rewrite-of-rewrite is not reachable in `smoke.cfg`, `exhaustive.cfg`, or any
+other configuration in this area. The read is written the way
+`resolve_live_inputs` actually behaves (re-list and read current content)
+rather than the narrower thing this finite model happens to be able to
+observe.
+
 ## Switches and negative controls
 
 Eight boolean CONSTANTS gate the model's guards; all are at their shipped value
@@ -117,17 +155,20 @@ switch TRUE.
 
 ## Non-vacuity
 
-An invariant that no reachable behaviour can break is decoration. Seven of them
-are shown breakable by mutating the BEHAVIOUR (not a switch) in a scratch copy
-and running TLC: `HeldObjectNeverDeleted`, `TombstoneExcludesBeforeDelete`,
-`TombstoneNotDeletedBeforeBucketEmpty`,
+An invariant that no reachable behaviour can break is decoration. Eight of
+them are shown breakable by mutating the BEHAVIOUR (not a switch) in a
+scratch copy and running TLC: `HeldObjectNeverDeleted`,
+`TombstoneExcludesBeforeDelete`, `TombstoneNotDeletedBeforeBucketEmpty`,
 `ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`
-(the "kept" direction), `CompletionRespectsLegalHold`, and
-`DreqRemovalCannotResurrect`. The mutations and the exact TLC violation lines
-are recorded under `counterexamples/*-mutant.md`. The seven negative controls
-provide the same evidence for their target invariants by switch (one target,
-`RewriteOutputsAreInputsMinusErased`, is also covered by a behaviour mutant
-above), so all thirteen named safety invariants have a recorded TLC violation.
+(the "kept" direction), `CompletionRespectsLegalHold`,
+`DreqRemovalCannotResurrect`, and `RawInputContentAssumedImmutable` (a
+scratch action that mutates a raw input's content, disjuncted into `Next`,
+which is not part of the shipped model). The mutations and the exact TLC
+violation lines are recorded under `counterexamples/*-mutant.md`. The seven
+negative controls provide the same evidence for their target invariants by
+switch (one target, `RewriteOutputsAreInputsMinusErased`, is also covered by
+a behaviour mutant above), so all fourteen named safety invariants have a
+recorded TLC violation.
 
 ## State-space control
 
