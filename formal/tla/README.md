@@ -47,9 +47,14 @@ Requires Java 17 or newer (Temurin 21 is what CI uses). The harness resolves
 Java from `RAVEL_TLA_JAVA` if set, else `java` on `PATH`, and exits 2 if none
 is usable. It needs network access on first run only to fetch the TLC jar,
 unless you supply one with `RAVEL_TLA_TOOLS_JAR` (see below). The per-model
-wall-clock ceiling needs coreutils `timeout` (`gtimeout` from Homebrew
-coreutils on macOS); without either the run proceeds unbounded and the harness
-says so once. CI and the fleet executors always have `timeout`.
+wall-clock ceiling prefers coreutils `timeout` (`gtimeout` from Homebrew
+coreutils on macOS). Without either, a pure-shell watchdog enforces the same
+budget: it runs TLC in its own process group, and on expiry records the
+timeout and terminates the whole group, so an over-budget run is reported as
+a timeout rather than left running. The verdict follows whether the watchdog
+killed the run, not a clock reading, so a run that finishes on its own keeps
+its own exit status. CI and the fleet executors have `timeout` and take the
+first path.
 
 ```sh
 scripts/check-tla.sh smoke            # fast safety, every area (budget 300s/cfg)
