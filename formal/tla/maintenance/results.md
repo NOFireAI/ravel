@@ -9,22 +9,34 @@ This verifies the protocol designs; implementation conformance is argued in
 - Host: fleet executor (8 cores, 8 GB), `-workers auto` resolves to 8 TLC
   workers.
 - Smoke, negative, and traceability run id:
-  `20260903T193802Z-12bfb462ff18b3269f6cbccf5877a511ffe9bc61` prefix run
+  `20260904T172930Z-3feef83d9bd216e8ee2b57bcf1227ee0ea33e0da` prefix run
   (`scripts/check-tla.sh smoke|negative|traceability -a maintenance`).
-  Exhaustive run: same session, `scripts/check-tla.sh exhaustive -a
-  maintenance`. Figures below are copied verbatim from each subcommand's
-  `.cache/tla/last-run.tsv` output (the file is truncated per subcommand, so
-  figures were captured immediately after each call) or from the command's own
-  PASS/VIOLATED summary line. Both exhaustive configs were run this session and
-  completed; neither is a carried-over or unmeasured figure.
+  Exhaustive run id: `20260904T165818Z-3feef83d9bd216e8ee2b57bcf1227ee0ea33e0da`
+  (`scripts/check-tla.sh exhaustive -a maintenance`) -- each subcommand
+  invocation gets its own timestamped run id, so the ids differ even though
+  no `.tla` source changed between the two runs; both ran after the F1/F3
+  latch and write-counter changes and the F4/F6 ASSUME/dead-code changes had
+  all landed. Figures below are copied
+  verbatim from each subcommand's `.cache/tla/last-run.tsv` output (the file
+  is truncated per subcommand, so figures were captured immediately after
+  each call) or from the command's own PASS/VIOLATED summary line. Both
+  exhaustive configs were run this session and completed; neither is a
+  carried-over or unmeasured figure. `MCMaintenanceOwnership.exhaustive.cfg`'s
+  distinct-state count grew roughly thirteenfold over the prior recorded
+  figure (1,038,446 to 13,183,990) because F3's bounded second-write counters
+  (`hbWriteCount`, `memoWriteCount`) make every heartbeat/memo key reachable
+  in both its absent-write and present-write forms, not because of any
+  unbounded growth; the run still completes in about thirty minutes, well
+  inside the sixty-minute per-configuration budget. `bands.tsv` was
+  regenerated from this run rather than adjusted to fit the old figures.
 
 ## Configurations
 
 | cfg | TLC | states | distinct | depth | seconds | host | result |
 |---|---|---|---|---|---|---|---|
-| MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 44219729 | 2773760 | 20 | 83 | fleet executor | PASS |
-| MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 10538602 | 1038446 | 18 | 103 | fleet executor | PASS |
-| MCCompactionClaims.smoke.cfg | 1.7.4 | 57428832 | 9370767 | 17 | 127 | fleet executor | PASS |
+| MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 47377233 | 2773760 | 21 | 90 | fleet executor | PASS |
+| MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 136617032 | 13183990 | 20 | 1769 | fleet executor | PASS |
+| MCCompactionClaims.smoke.cfg | 1.7.4 | 65454526 | 11155721 | 17 | 161 | fleet executor | PASS |
 | MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 11 | 2 | fleet executor | PASS |
 | negative/ownership-as-publication-authority.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
 | negative/heartbeat-memo-cas.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
@@ -105,12 +117,15 @@ This is a bounded model check, not a proof for all sizes.
   graph is finite but still passed 4,600,000 distinct states at depth 13 of an
   eventual 20 without converging in any practical budget. The blowup tracks
   `Workers`, not `versionCounter` or `MaxT` -- the same no-VIEW configuration at
-  `Workers = {1}` completes at 1,038,446 distinct states, depth 18, in under
-  two minutes (see the Configurations table). `versionCounter` was ruled out as
-  a bounding lever for this: it is already bounded by the one-shot vanish latch
-  above, so constraining it further would not shrink the two-worker graph, only
-  mask the same blowup behind a different variable. `MCMaintenanceOwnership.
-  exhaustive.cfg` therefore runs at `Workers = {1}`; the two-worker race is
+  `Workers = {1}` completes at 13,183,990 distinct states, depth 20, in about
+  thirty minutes (see the Configurations table; this grew from 1,038,446
+  distinct states after the bounded second-write counters from F3 widened the
+  reachable heartbeat/memo write history at every depth). `versionCounter` was
+  ruled out as a bounding lever for this: it is already bounded by the
+  one-shot vanish latch above, so constraining it further would not shrink the
+  two-worker graph, only mask the same blowup behind a different variable.
+  `MCMaintenanceOwnership.exhaustive.cfg` therefore runs at `Workers = {1}`;
+  the two-worker race is
   covered exhaustively for safety only, via `MCView`, by smoke.cfg. See
   README.md, "Exhaustive coverage is split by worker count", for the full
   rationale and exactly which properties are covered at which worker count.
@@ -209,7 +224,7 @@ exit code are what a violated row asserts, and both are reproducible.
 | MergeAttemptsConverge | Ownership | store-derived (`lastPub.winnerPartPresent`, read from the store) | a loser reports `Converged` only when the winner part is observed present | `MissingPartReportsConverged = TRUE` | `mo-missing-part-reports-converged`: VIOLATED, exit 12 |
 | DivergentInputSetNeverMutates | Ownership | store-derived (record version delta) | a loser with a divergent input-set hash never advances the record's stored version | `DivergeOverwritesRecord = TRUE` | `mo-diverge-overwrites-record`: VIOLATED, exit 12 |
 | EveryEligibleUnitEventuallyAttempted | Ownership | witness-derived (`attemptedByOwner`) | under stable membership every unit is eventually attempted by an in-view owner | `Phantom = TRUE` (a lingering live member outranks every real worker) | `zero-ownership-phantom`: VIOLATED, exit 13 (documented liveness limitation, not a defect) |
-| OwnershipIsNotPublicationAuthority | Ownership | witness-derived (`cliCorrect`, an eventuality witness) | under fairness a non-owner (the CLI path) eventually publishes and the data stays correct | none; this is a reachability witness, not a hazard a mutant demonstrates | `MCMaintenanceOwnership.exhaustive.cfg` (`Workers = {1}`): PASS, 1038446 distinct, depth 18; see Configurations table and README.md's worker-count split for why this `PROPERTY` is checked at one worker, not two |
+| OwnershipIsNotPublicationAuthority | Ownership | witness-derived (`cliCorrect`, an eventuality witness) | under fairness a non-owner (the CLI path) eventually publishes and the data stays correct | none; this is a reachability witness, not a hazard a mutant demonstrates | `MCMaintenanceOwnership.exhaustive.cfg` (`Workers = {1}`): PASS, 13183990 distinct, depth 20; see Configurations table and README.md's worker-count split for why this `PROPERTY` is checked at one worker, not two |
 | ClaimGrantsNoPublicationAuthority | Claims | store-derived | same shape as `QueryVisibleDataCorrectUnderDuplicateOwnership`, over the claims model's store | `ClaimIsPublicationAuthority = TRUE` | `claim-as-publication-authority`: VIOLATED, exit 12 |
 | StaleOwnerCannotOverwriteNewerClaim | Claims | witness-derived (`lastClaimOp.beforeVer`/`afterVer`/`beforeContent`/`afterContent`, read from the store) | a claim CAS is `Ok` only against the current version; a non-`Ok` CAS changes nothing | `CompletionOverwrite = TRUE` | `claim-completion-without-cas`: VIOLATED, exit 12 |
 | NoUnconditionalClaimDelete | Claims | store-derived (absence of a delete on the claim prefix) | no path removes a claim key outside the modeled CAS operations | `AllowClaimDelete = TRUE` | `claim-delete-unconditional`: VIOLATED, exit 12 |

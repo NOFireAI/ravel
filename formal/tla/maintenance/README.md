@@ -90,7 +90,7 @@ At two workers the reachable graph under a temporal spec (no `VIEW` is sound
 there; see below) does not converge in any practical budget: a probe of the
 exact two-worker exhaustive constants passed 4,600,000 distinct states at
 depth 13 of an eventual 20 and was still growing. One worker is exhaustive and
-completes at 1,038,446 distinct states, depth 18, in under two minutes.
+completes at 13,183,990 distinct states, depth 20, in about thirty minutes.
 
 That leaves two different guarantees at two different worker counts, and
 neither substitutes for the other:
