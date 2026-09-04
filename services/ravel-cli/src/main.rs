@@ -2914,8 +2914,16 @@ mod tests {
             // stop an operator inspecting the plan on a marker-less bucket.
             (
                 &[
-                    "ravel", "maintain", "sweep", "--tenant", "t", "--signal", "logs", "--shard",
-                    "0", "--dry-run",
+                    "ravel",
+                    "maintain",
+                    "sweep",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--shard",
+                    "0",
+                    "--dry-run",
                 ],
                 false,
             ),
