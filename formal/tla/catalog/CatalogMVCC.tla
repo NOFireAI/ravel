@@ -99,7 +99,11 @@ CONSTANTS
     DeletePathIgnoresUnreadablePart, \* superseded-input sweep proceeds despite an unreadable covering part
     DeletePathIgnoresUndecodableEntry, \* superseded-input sweep proceeds despite an undecodable entry identity
     FoldNamesEntryAboveWatermark, \* a fold's scan admits an entry above its own watermark
-    FoldIncludesTombstonedEntries \* a fold's scan re-includes a tombstoned hour
+    FoldIncludesTombstonedEntries, \* a fold's scan re-includes a tombstoned hour
+    \* --- state-space budget switch (default TRUE; FALSE only where a config
+    \* needs the smaller graph) ---
+    EnableDeletePathCorruption \* DoCorruptPart/DoPoisonEntry may fire at all;
+                                \* see the comment beside them
 
 ASSUME NoContent \in Content
 ASSUME Keys # {}
@@ -689,8 +693,15 @@ DoSweepCatalogObjects ==
 \* quantified over Hours in Next, so it adds exactly one branch at every
 \* reachable state, the same shape as DoCorruptHead (which also acts on the
 \* whole HEAD register with no Hours parameter) rather than |Hours| branches.
+\* That one branch at every reachable state is still enough to roughly double
+\* a large graph, and paired with DoPoisonEntry below it grew exhaustive's
+\* state count 4x and its wall clock 19x (issue #1121 round three finding 1;
+\* see results.md). EnableDeletePathCorruption gates both actions out of Next
+\* entirely in configs that do not need the covering-part/entry triggers on
+\* top of the HEAD-status one; results.md says which configs keep it TRUE.
 DoCorruptPart ==
     LET H == CHOOSE h \in Hours : TRUE IN
+        /\ EnableDeletePathCorruption
         /\ ~partCorruptionUsed
         /\ ~partUnreadable[H]
         /\ partUnreadable' = [partUnreadable EXCEPT ![H] = TRUE]
@@ -707,9 +718,11 @@ DoCorruptPart ==
 \* object_gate cannot decide whether it names a delete candidate. One-shot
 \* (bounded by entryCorruptionUsed), independent of whether the part itself is
 \* also unreadable, and fixed to a single canonical hour for the same
-\* branching-factor reason as DoCorruptPart above.
+\* branching-factor reason as DoCorruptPart above, including the same
+\* EnableDeletePathCorruption gate.
 DoPoisonEntry ==
     LET H == CHOOSE h \in Hours : TRUE IN
+        /\ EnableDeletePathCorruption
         /\ ~entryCorruptionUsed
         /\ ~entryUndecodable[H]
         /\ entryUndecodable' = [entryUndecodable EXCEPT ![H] = TRUE]
@@ -1057,6 +1070,29 @@ NoFrontierReconcile == ~FrontierReconcileExercised
 CompactionLoserDiverged == lastCompact.outcome = "diverged"
 
 NoCompactionLoserDivergence == ~CompactionLoserDiverged
+
+\* Non-vacuity probes for CorruptHeadFailsClosedOnDeletePaths's three
+\* fail-closed triggers (issue #1121 round three finding 1, and the budget
+\* fix in round four that gated two of them behind EnableDeletePathCorruption
+\* -- see the comment beside DoCorruptPart). Each is checked as an INVARIANT
+\* in its own dedicated negative/*-nonvacuity.cfg; TLC reporting the negated
+\* form violated proves the trigger itself is reachable, independent of
+\* whether any config also exercises the DeletePathIgnoresX mutants against
+\* it. HeadCorruptedExercised needs no EnableDeletePathCorruption gate (it
+\* reads DoCorruptHead, which this round left ungated); the other two need
+\* their probe config to set EnableDeletePathCorruption = TRUE, since
+\* DoCorruptPart/DoPoisonEntry cannot fire otherwise.
+HeadCorruptedExercised == head.status = "corrupt"
+
+NoHeadCorrupted == ~HeadCorruptedExercised
+
+PartUnreadableExercised == \E H \in Hours : partUnreadable[H]
+
+NoPartUnreadable == ~PartUnreadableExercised
+
+EntryUndecodableExercised == \E H \in Hours : entryUndecodable[H]
+
+NoEntryUndecodable == ~EntryUndecodableExercised
 
 ----------------------------------------------------------------------------
 \* Named temporal properties (checked against FairSpec only).
