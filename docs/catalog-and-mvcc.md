@@ -188,8 +188,10 @@ validates against the winner rather than erroring. It lives under the
 tenant's own prefix, alongside that signal's `l0/` and `c/` shard data, not
 in the bucket-root `sys/` space, because it is per-tenant state. Every
 ingest, catalog-resolve, and maintenance touch reads the record and routes
-over the recorded shard count, so a query never resolves over a subset of
-shards. The recorded count is authoritative: it does not have to equal the
+over its generation history (`ravel_catalog::scan_count`, see below), never
+the scalar `shard_count` field alone, so a query never resolves over a
+subset of shards. The generation history is authoritative: it does not have
+to equal the
 process's live `--shards` value, which is only a default for tenants that have
 no record yet. A difference between the two (for example after lowering the
 global default) is tolerated and surfaced as an informational metric, not a
