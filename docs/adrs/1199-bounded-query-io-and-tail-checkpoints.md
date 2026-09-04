@@ -54,12 +54,19 @@ forbidden from removing that cost.
 
 **The LIST figure scales with record count, and the pre-registered prediction
 that it was constant is falsified.** The Stage 0 point alone (13, before and
-after the fold) suggested a constant. The sweep gives 5, 9, 13, 29 against
-`ceil(records / 1000) + 4`, and `LIST_PAGE_SIZE` is 1000
-(`crates/ravel-object-store/src/s3.rs:114`): this is one page per 1000 records
-plus a small fixed term, so the per-shard recursive prefix scan is the path that
-runs. A per-(shard, hour) loop would have issued a bucket-driven figure near 120
-at every point, flat in record count, which none of the four points show.
+after the fold) suggested a constant. The sweep gives 5, 9, 13, 29, and
+`shards * ceil(records / shards / 1000) + 1` reproduces all four exactly:
+`LIST_PAGE_SIZE` is 1000 (`crates/ravel-object-store/src/s3.rs:114`), each of
+the 4 shards paginates its own records, and the `+ 1` is the pending-erasure
+LIST that runs alongside. So the listing is one page per 1000 records **per
+shard**, which is the per-shard recursive prefix scan, not the per-(shard, hour)
+loop: that loop would have issued a bucket-driven figure near 120 at every
+point, flat in record count, which none of the four show.
+
+The per-shard denominator matters for more than arithmetic. Page count falls as
+shard count rises for a fixed record count, so a wide tenant pays fewer, larger
+listings and a narrow one pays more, smaller ones. Any later claim about LIST
+depth has to name the shard count it was measured at.
 
 One code question survives the measurement and belongs to decision 1's
 investigation: the prefix path is selected when the estimated bucket count
