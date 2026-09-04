@@ -233,7 +233,7 @@ control `negative/query-reads-uncommitted-data.cfg` (`QueryReadsDataDirectly
 = TRUE`) makes `RunQuery` answer from data presence instead of the commit
 record, and TLC reports the violation:
 
-```
+```text
 Error: Invariant NoUncommittedDataVisible is violated.
 ```
 
