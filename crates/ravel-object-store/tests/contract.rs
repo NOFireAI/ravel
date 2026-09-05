@@ -1052,6 +1052,78 @@ impl ObjectStoreBackend for RefusingMultipartStore {
     }
 }
 
+/// `PutCasVersion / CasOutcomeMatchesEffect` (formal/tla/common/traceability.md):
+/// a `CasVersion` put against a key that has never existed has no current
+/// version to match, so it must fail `PreconditionFailed`, the same outcome
+/// as a stale version against a present key, and apply nothing.
+#[tokio::test]
+async fn cas_version_on_absent_key_is_precondition_failed() {
+    let store = MemoryStore::new();
+    let key = "cas-absent/k";
+
+    // A well-formed but wrong version token: a real version issued for a
+    // different object, not a hand-rolled string (see
+    // `assert_cas_version_semantics` above for why this matters).
+    let other = store
+        .put(
+            "cas-absent/other",
+            Bytes::from_static(b"unrelated"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("unrelated put for a well-formed-but-wrong version token");
+
+    let err = store
+        .put(
+            key,
+            Bytes::from_static(b"v1"),
+            PutOptions {
+                mode: PutMode::CasVersion(other.version),
+                checksum: None,
+            },
+        )
+        .await
+        .expect_err("CasVersion against an absent key must fail without applying");
+    assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+    assert!(
+        matches!(store.head(key).await, Err(StoreError::NotFound)),
+        "losing CAS must not have created the key"
+    );
+}
+
+/// `Delete / VersionsNeverReused` (formal/tla/common/traceability.md): the
+/// version counter (`MemoryStore::next_id`) is never reset by a delete, so
+/// create/delete/create mints a fresh version and a CAS holding the
+/// pre-delete version fails against the recreated object.
+#[tokio::test]
+async fn cas_with_pre_delete_version_fails_after_recreate() {
+    let store = MemoryStore::new();
+    let key = "cas-pre-delete/k";
+
+    let put1 = store
+        .put(key, Bytes::from_static(b"v1"), PutOptions::default())
+        .await
+        .expect("initial create");
+    store.delete(key).await.expect("delete");
+    store
+        .put(key, Bytes::from_static(b"v2"), PutOptions::default())
+        .await
+        .expect("recreate after delete");
+
+    let err = store
+        .put(
+            key,
+            Bytes::from_static(b"v3"),
+            PutOptions {
+                mode: PutMode::CasVersion(put1.version),
+                checksum: None,
+            },
+        )
+        .await
+        .expect_err("CAS with the pre-delete version must fail after recreate");
+    assert!(matches!(err, StoreError::PreconditionFailed), "got {err:?}");
+}
+
 #[tokio::test]
 async fn memory_store_contract() {
     let store = MemoryStore::new();
