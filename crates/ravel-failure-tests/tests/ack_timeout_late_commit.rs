@@ -82,7 +82,9 @@ async fn ack_timeout_then_late_commit_is_durable_and_unobservable() {
 
     // Release the held PUT: the shard actor's flush, already in flight, is
     // not aborted by the caller's timeout and completes in the background.
-    gate.wait_until_held(1).await;
+    tokio::time::timeout(Duration::from_secs(5), gate.wait_until_held(1))
+        .await
+        .expect("the background flush must still hold the data-object PUT");
     for id in gate.held() {
         assert!(gate.release(id), "held call {id} released");
     }
