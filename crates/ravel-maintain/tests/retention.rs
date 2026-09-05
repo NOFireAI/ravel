@@ -30,7 +30,7 @@ use uuid::Uuid;
 
 use bytes::Bytes;
 use ravel_maintain::Clock;
-use ravel_types::{Signal, TimeRange};
+use ravel_types::{CommitToken, Signal, TimeRange};
 
 #[derive(Debug, Clone, Copy)]
 enum Sig {
@@ -1708,4 +1708,102 @@ async fn scan_reports_blocked_by_unreadable_head_counter() {
         "the fail-closed unreadable-HEAD block is counted distinctly"
     );
     assert_eq!(r2.blocked_by_snapshot, 0);
+}
+
+// --- #1113 traceability: TombstoneBucket / commit-token query --------------
+
+/// TombstoneBucket (commit traceability row 5): a commit-token query for a
+/// flush whose bucket was tombstoned through the real `write_tombstone`
+/// production path must answer tombstoned -- satisfied with zero segments --
+/// not a plain miss. The tombstone is reached by faulting the tombstone's own
+/// delete during the physical sweep (mirrors `partial_sweep_crash_then_
+/// converges`), so the commit record is already gone while the tombstone
+/// object still stands: exactly the state a client holding a stale token can
+/// observe.
+///
+/// To watch this FAIL, change `resolve_min_token_fallback` to ignore a
+/// tombstone match on the listed bucket (treat it the same as finding
+/// nothing): the `catalog.resolve` call then returns
+/// `CatalogError::UnsatisfiableToken` instead of a snapshot, so the
+/// `.expect("a tombstoned token resolves...")` panics.
+#[tokio::test]
+async fn tombstoned_bucket_token_query_reports_tombstoned() {
+    let inner = Arc::new(MemoryStore::new());
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Delete, ScriptedFault::Timeout)
+            .with_key_contains("retire.tmb")
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    let store = FaultStore::new(inner.clone(), plan);
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let writer_id = Uuid::from_u128(0x70);
+    let spec = InputSpec::new(
+        writer_id,
+        3,
+        1,
+        vec![raw_series("m", &[("k", "a")], &[(1_000, 1.0)])],
+    );
+    seed_input(&store, &spec).await;
+    let bucket = bucket();
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+
+    let tombstoned =
+        retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket)
+            .await
+            .expect("tombstone pass");
+    assert_eq!(tombstoned, RetentionOutcome::Tombstoned);
+
+    // Past the horizon: the physical sweep deletes the commit record and
+    // data, then the tombstone's own delete faults, leaving the tombstone in
+    // place with the record already gone.
+    clock.set(created + config.protection_horizon_ns + 1);
+    let err = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &bucket).await;
+    assert!(err.is_err(), "the tombstone delete fault aborts the sweep");
+    assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 1);
+    assert!(
+        has_tombstone(inner.as_ref(), &bucket).await,
+        "tombstone survives the crash, so exclusion still holds"
+    );
+    assert_eq!(
+        count_commit_records(inner.as_ref(), &bucket).await,
+        0,
+        "the commit record is already gone: the exact-key GET must miss"
+    );
+
+    let token = CommitToken {
+        shard: SHARD,
+        writer_id,
+        epoch: spec.epoch,
+        seq: spec.seq,
+        ingest_hour_bucket: HOUR,
+    };
+    let dyn_store: Arc<dyn ObjectStoreBackend> = inner.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        dyn_store,
+        ravel_catalog::CatalogConfig {
+            shard_count: SHARD + 1,
+            ..Default::default()
+        },
+    )
+    .expect("catalog");
+    let range = TimeRange {
+        start_ns: i64::from(HOUR) * NS_PER_HOUR,
+        end_ns: (i64::from(HOUR) + 1) * NS_PER_HOUR,
+    };
+    let snapshot = catalog
+        .resolve(
+            &tenant_hash(),
+            Signal::Metrics,
+            range,
+            &[token],
+            clock.now_ns(),
+        )
+        .await
+        .expect("a tombstoned token resolves, not UnsatisfiableToken");
+    assert!(
+        snapshot.segments.is_empty(),
+        "the tombstoned flush is satisfied with zero segments, not served stale data"
+    );
 }
