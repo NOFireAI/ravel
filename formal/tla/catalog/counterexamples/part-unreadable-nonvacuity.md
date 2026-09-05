@@ -5,8 +5,9 @@ checks `NoPartUnreadable` with `EnableDeletePathCorruption = TRUE` and no
 other corruption switch set. The probe MUST be violated: it proves
 `DoCorruptPart`, the covering-part trigger behind
 `CorruptHeadFailsClosedOnDeletePaths`, is reachable on its own wherever the
-constant is TRUE, independent of the HEAD-status and entry-identity triggers
-that `exhaustive.cfg` now gates out of `Next` to fit its budget.
+constant is TRUE, independent of the entry-identity trigger that
+`exhaustive.cfg` now gates out of `Next` to fit its budget. The HEAD-status
+trigger is not gated by this constant and stays in `Next` regardless.
 
 Violated invariant: `NoPartUnreadable` (probe, TLC exit 12).
 
@@ -18,7 +19,8 @@ violation at depth 4 (43 states generated, 38 distinct).
 ## Why it is here
 
 `exhaustive.cfg` sets `EnableDeletePathCorruption = FALSE` to fit its state
-budget, which drops all three delete-path corruption triggers from that
-run's reachable behaviour. Without this probe, a regression that made
-`DoCorruptPart` unreachable wherever the constant is TRUE could not be told
-apart from a config that simply never enables it.
+budget, which drops the entry-identity and covering-part triggers from that
+run's reachable behaviour (the HEAD-status trigger is not gated by this
+constant). Without this probe, a regression that made `DoCorruptPart`
+unreachable wherever the constant is TRUE could not be told apart from a
+config that simply never enables it.
