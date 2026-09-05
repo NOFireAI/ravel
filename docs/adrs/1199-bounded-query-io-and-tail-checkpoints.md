@@ -58,12 +58,13 @@ after the fold) suggested a constant. The sweep gives 5, 9, 13, 29, and the
 per-shard page count reproduces all four exactly:
 
 ```text
-LISTs = sum over shards of ceil(records_in_shard / 1000) + 1
+LISTs = sum over shards of max(1, ceil(records_in_shard / 1000)) + 1
 ```
 
 `LIST_PAGE_SIZE` is 1000 (`crates/ravel-object-store/src/s3.rs:114`), each shard
-paginates its own records, and the `+ 1` is the pending-erasure LIST that runs
-alongside. The benchmark spreads records evenly, so at 4 shards this collapses
+paginates its own records, the `max(1, ..)` is there because an empty shard
+still issues one LIST that returns one empty page, and the `+ 1` is the
+pending-erasure LIST that runs alongside. The benchmark spreads records evenly, so at 4 shards this collapses
 to `4 * ceil(records / 4 / 1000) + 1`: 5, 9, 13, 29. Production distribution is
 not even, and the sum is the form that holds either way.
 
@@ -74,10 +75,21 @@ suggests. `use_prefix` (`crates/ravel-catalog/src/catalog.rs:1631-1636`) require
 fires and the DEFAULT bounded path runs (`list_window_bounded` ->
 `list_shard_hours`, `catalog.rs:1897,1995`). Since issue #730 that path also
 issues one recursive paginated LIST per shard rather than one per (shard, hour),
-so both paths yield the same per-shard page count and the measurement cannot
-distinguish them. They differ only in an early break once a key's hour passes
-the window end (`catalog.rs:2050-2051`), which never triggers here because the
-benchmark resolves before any fold and writes nothing past that hour.
+so both paths yield the same per-shard page count and a request count alone
+cannot distinguish them.
+
+They are not otherwise interchangeable, and the difference matters for what
+decision 1 records. The bounded path issues its per-shard LISTs concurrently
+under the resolve-wide semaphore (`catalog.rs:1917-1921`); the prefix path
+drains them sequentially so the runtime request cap is checked page by page
+(`catalog.rs:2379-2382`). Equal request counts, different latency, and
+different serial depth: on the bounded path the serial LIST depth is the
+maximum page count over shards, while on the prefix path it is their sum. A
+`list_page_depth` figure that does not say which path produced it is not
+comparable across queries. The remaining difference is an early break once a
+key's hour passes the window end (`catalog.rs:2050-2051`), which never triggers
+in this benchmark because it resolves before any fold and writes nothing past
+that hour.
 
 The per-shard denominator matters for more than arithmetic, and it runs the
 opposite way to intuition. Every shard rounds its own partial page up, so page
@@ -330,13 +342,17 @@ own ADR.
 Build the tail checkpoint only if, after decision 2's knob defaults are applied,
 both hold over a 24-hour window on a real workload:
 
-- `unfolded_segments_resolved` at p99 is at least **2,000** per resolve. At the
-  measured 1.6 ms per record that is about 3.2 seconds of resolve before a
-  predicate rejects anything, which is the point where resolve stops being a
-  rounding error against a query budget. The threshold is denominated in
-  segments because that is what the read path can count; it equals a record
-  count exactly for an all-L0 tail, and over-reads for a tail whose resolved
-  records include compaction records.
+- `unfolded_segments_resolved` at p99 is at least **2,000** per resolve. The
+  threshold is denominated in segments because that is what the read path can
+  count. For an all-L0 tail, which is what the unsealed region is, one segment
+  is one commit record and the measured 1.6 ms per record makes 2,000 about 3.2
+  seconds of resolve before a predicate rejects anything: the point where
+  resolve stops being a rounding error against a query budget. That time
+  conversion holds ONLY for an all-L0 tail. A resolved compaction record
+  contributes several segments against one GET, so a tail carrying them reads
+  high against this threshold and its 2,000 segments cost less than 3.2
+  seconds. If such tails turn out to be common, the gate needs a
+  record-denominated figure rather than a rescaled segment one.
 - At least **10%** of resolves over recent data are cold. This needs a
   per-resolve indicator that does not exist yet: the record-cache counters are
   record-level, and a single resolve mixes hits and misses, so a pooled hit
