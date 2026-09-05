@@ -8,7 +8,7 @@ use ravel_cache::CacheLimits;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::http::{AppState, TenantResolver};
-use ravel_query::{EngineConfig, QueryAdmissionController, QueryEngine, ReadCache};
+use ravel_query::{EngineConfig, GetLimiter, QueryAdmissionController, QueryEngine, ReadCache};
 use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccountingSnapshot};
 
 /// The per-query `stats` object attached beside a query response's data
@@ -160,13 +160,14 @@ pub fn build_app_state(
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<ReadCache>,
     engine_config: EngineConfig,
+    get_limiter: Arc<GetLimiter>,
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
     distributed: Option<Arc<ravel_query::distrib::Distributed>>,
     federation: Option<Arc<ravel_query::distrib::Federation>>,
     metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
 ) -> AppState {
-    let mut engine = QueryEngine::new(catalog, store, engine_config);
+    let mut engine = QueryEngine::new(catalog, store, engine_config).with_get_limiter(get_limiter);
     if let Some(cache) = cache {
         engine = engine.with_cache(cache);
     }
@@ -265,6 +266,7 @@ pub fn build_sql_state(
     tenant_resolver: Arc<dyn TenantResolver>,
     cache: Option<ReadCache>,
     engine_config: EngineConfig,
+    get_limiter: Arc<GetLimiter>,
     max_query_bytes: usize,
     max_tenant_bytes: usize,
     parallel_final_aggregation: bool,
@@ -303,16 +305,16 @@ pub fn build_sql_state(
     }
     .with_spill_from_env()?;
     let max_deadline = config.engine.deadline;
-    let mut metrics_fetcher = SegmentFetcher::new(store.clone());
+    let mut metrics_fetcher =
+        SegmentFetcher::new(store.clone()).with_get_limiter(get_limiter.clone());
     // ADR-0107's read-shape crossover, from `--logs-block-range-threshold` via
     // `QueryBudgets::apply_to_engine`. This is the single wiring point for it, so
     // an operator who sets the flag to `u64::MAX` gets whole-object logs reads
     // (the pre-ADR-0107 shape) on every SQL logs scan this process serves.
-    // `--fetch-concurrency` is documented (ADR-0088) as the knob that bounds
-    // S3 GET concurrency; the logs fetcher keeps its own permit pool (ADR-0107
-    // decision 1, separate from RSEG's), so the bound has to be handed to it
-    // here or the pool stays at its compiled-in 16 whatever the flag says
-    // (issue #700).
+    // ADR-1195: GET concurrency is now the single process-wide `GetLimiter`
+    // (`--store-get-concurrency`, legacy `--fetch-concurrency`), shared with
+    // the metrics and spans fetchers via `with_get_limiter` below, not a
+    // private pool sized from the flag.
     // `--logs-request-cost-bytes` (ADR-0904) reaches the same fetcher the same
     // way: the request cost lives on the block-range fetcher this builder owns,
     // so the flag has to be handed over here or the fetcher keeps its
@@ -330,7 +332,7 @@ pub fn build_sql_state(
     // like the other three or the fetcher keeps its compiled-in 64 MiB.
     let mut logs_fetcher = LogSegmentFetcher::new(store.clone())
         .with_block_range_threshold(config.engine.logs_block_range_threshold)
-        .with_max_concurrent_gets(config.engine.fetch_concurrency)
+        .with_get_limiter(get_limiter.clone())
         .with_request_cost_bytes(config.engine.logs_request_cost_bytes)
         .with_max_fetch_run_bytes(config.engine.logs_max_fetch_run_bytes)
         .map_err(|err| anyhow::anyhow!("invalid logs fetch bound: {err}"))?;
@@ -339,7 +341,9 @@ pub fn build_sql_state(
     // the RSEG/RLOG fetchers it has no `with_cache` seam, and none is wired
     // here. Its `fetch_accounted` path is tenant-checked and accounted (ADR-0045
     // via #1080), so a `spans` query is isolated and metered like any other.
-    let span_fetcher = SpanSegmentFetcher::new(store.clone());
+    // ADR-1195: shares the same process-wide `GetLimiter` as the metrics and
+    // logs fetchers above, not a private pool.
+    let span_fetcher = SpanSegmentFetcher::new(store.clone()).with_get_limiter(get_limiter);
     if let Some(cache) = cache {
         metrics_fetcher = metrics_fetcher.with_cache(cache.clone());
         logs_fetcher = logs_fetcher.with_cache(cache);
@@ -421,6 +425,7 @@ mod catalog_cache_tests {
             Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             None,
             engine_config,
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             Arc::new(crate::metrics::QueryAccountingMetrics::new(
                 std::collections::HashSet::new(),
             )),
@@ -631,6 +636,7 @@ mod tests {
             tenant_resolver,
             None,
             non_default,
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
             false,
@@ -677,6 +683,7 @@ mod tests {
             Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             None,
             engine_config,
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             DEFAULT_MAX_TENANT_BYTES,
             false,
@@ -725,6 +732,7 @@ mod tests {
             Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
             None,
             EngineConfig::default(),
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
             budgets.sql_max_query_bytes,
             budgets.sql_tenant_max_bytes,
             budgets.sql_parallel_final_aggregation,

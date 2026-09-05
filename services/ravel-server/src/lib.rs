@@ -1070,6 +1070,18 @@ pub async fn start(
         tracker
     });
 
+    // ADR-1195: the single process-owned GET concurrency limiter. Every
+    // fetcher this process constructs (RSEG, RLOG, RSPAN, in-process or
+    // distributed) shares this one `Arc`, so `--store-get-concurrency` (or
+    // the legacy `--fetch-concurrency`) bounds concurrent object-store GETs
+    // process-wide rather than per fetcher. Built from `config.query_budgets`
+    // directly, ahead of `engine_config` below, because the distributed
+    // fragment service's fetcher is constructed before that point.
+    let get_limiter = Arc::new(
+        ravel_query::GetLimiter::new(config.query_budgets.store_get_concurrency)
+            .map_err(|err| anyhow::anyhow!("invalid store GET concurrency: {err}"))?,
+    );
+
     // --- ADR-0071 distributed read fan-out scaffolding ---
     // The coordinator (a `RoutingSliceFetcher` wrapped in a `Distributed`), the
     // worker-side `FragmentService`, and their shared `FragmentMetrics` are
@@ -1109,6 +1121,7 @@ pub async fn start(
             cache.clone(),
             Arc::new(SystemClock),
             metrics.clone(),
+            get_limiter.clone(),
         );
         // When this process runs a dedicated TLS fragment listener (ADR-0071
         // amendment decision 1), its coordinator dials remote workers' TLS
@@ -1293,6 +1306,7 @@ pub async fn start(
             config.tenant_resolver.clone(),
             cache.clone(),
             engine_config,
+            get_limiter.clone(),
             query_accounting.clone(),
             query_admission.clone(),
             distributed.clone(),
@@ -1336,6 +1350,7 @@ pub async fn start(
                 config.tenant_resolver.clone(),
                 cache.clone(),
                 engine_config,
+                get_limiter.clone(),
                 // ADR-0088: the per-query SQL pool ceiling and the per-tenant
                 // SQL ceiling, from `--sql-max-query-bytes` /
                 // `--sql-tenant-max-bytes`. Without threading these,
@@ -1454,6 +1469,7 @@ pub async fn start(
             store.clone(),
             config.tenant_resolver.clone(),
             Arc::new(SystemClock),
+            get_limiter.clone(),
         );
         http_router = http_router.merge(exemplars::router(exemplars_state));
         if let Some(mtls) = &config.mtls_listener {
@@ -1463,6 +1479,7 @@ pub async fn start(
                 store.clone(),
                 mtls.resolver.clone(),
                 Arc::new(SystemClock),
+                get_limiter.clone(),
             );
             mtls_router = mtls_router.merge(exemplars::router(mtls_exemplars_state));
         }
@@ -1505,8 +1522,14 @@ pub async fn start(
         // attached to the query paths above, cloned before `catalog` is
         // moved into `fold::spawn` below.
         if let Some(cache) = &cache {
-            cache_warm::warm_cache(store.clone(), catalog.clone(), cache.clone(), &SystemClock)
-                .await;
+            cache_warm::warm_cache(
+                store.clone(),
+                catalog.clone(),
+                cache.clone(),
+                &SystemClock,
+                get_limiter.clone(),
+            )
+            .await;
         }
     }
 

@@ -189,6 +189,11 @@ pub struct ExemplarsState {
     /// `ravel_query::admit`/`request_budget_exceeded` seam rather than a
     /// private copy of either check.
     pub engine_config: EngineConfig,
+    /// ADR-1195: the process-wide GET concurrency limiter, shared with every
+    /// fetcher this process builds. This endpoint's raw `store.get` (see
+    /// `read_segment_exemplars`) acquires a permit here rather than escaping
+    /// the process-wide bound as an uncounted GET.
+    pub get_limiter: Arc<ravel_query::GetLimiter>,
     /// Cap on the exemplars one request may materialize, enforced
     /// incrementally so the accumulation never grows past it. Defaults to
     /// [`DEFAULT_MAX_EXEMPLARS`]; `EngineConfig` has no exemplar knob to read
@@ -214,6 +219,7 @@ impl ExemplarsState {
         store: Arc<dyn ObjectStoreBackend>,
         tenant_resolver: Arc<dyn TenantResolver>,
         clock: Arc<dyn Clock>,
+        get_limiter: Arc<ravel_query::GetLimiter>,
     ) -> Self {
         let config = engine.config();
         ExemplarsState {
@@ -223,6 +229,7 @@ impl ExemplarsState {
             clock,
             deadline: config.deadline,
             engine_config: *config,
+            get_limiter,
             max_exemplars: DEFAULT_MAX_EXEMPLARS,
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
         }
@@ -575,6 +582,10 @@ async fn read_segment_exemplars(
     // under a concurrent publish-and-sweep: surface it as `SnapshotStale` so
     // the caller re-resolves once, exactly as the sample path does. Any other
     // store fault is fatal.
+    // ADR-1195: this raw GET goes through the process-wide `GetLimiter` too,
+    // like every fetcher-issued GET, so it counts against
+    // `--store-get-concurrency` instead of escaping the bound uncounted.
+    let _permit = state.get_limiter.acquire().await;
     let got = match state.store.get(data_object_key, GetRange::Full).await {
         Ok(got) => got,
         Err(StoreError::NotFound) => return Err(CollectError::SnapshotStale),
@@ -1796,6 +1807,7 @@ mod tests {
             clock: Arc::new(FixedClock(NOW)),
             deadline,
             engine_config,
+            get_limiter: Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             max_exemplars,
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
         };
@@ -1842,6 +1854,7 @@ mod tests {
                 max_segments: 1000,
                 ..EngineConfig::default()
             },
+            get_limiter: Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             max_exemplars: DEFAULT_MAX_EXEMPLARS,
             audit_sink: Arc::new(RecordingSink {
                 events: Arc::clone(&events),

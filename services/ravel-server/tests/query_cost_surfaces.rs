@@ -166,6 +166,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         None,
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::clone(&query_accounting),
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,

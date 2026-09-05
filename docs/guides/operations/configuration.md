@@ -956,22 +956,30 @@ overflow column and lose columnar access. Watch for that in
 
 ## Per-query budgets
 
-Four flags bound what one query may spend. Unset, each resolves at startup, but
-only some resolve from host resources: `--fetch-concurrency` follows the core
-count and the two SQL ceilings follow memory (shares of `MemTotal`, capped by
-the cgroup memory limit when the process runs in a container), while
-`--max-segments` is a fixed 1,000,000 on every host. Set, the flag value is
-used verbatim, with one reconciliation: the per-query SQL pool is clamped to an
-explicit per-tenant ceiling set below it, and the startup log says so. The
-reference-host column is a 16-core, 30 GB host, the shape the published
-ClickBench run used.
+Six flags bound what one query may spend. Unset, each resolves at startup, but
+only some resolve from host resources: `--store-get-concurrency`,
+`--sql-partition-count`, and `--promql-fetch-fanout` (or the legacy
+`--fetch-concurrency`, which sets all three) follow the core count, and the two
+SQL ceilings follow memory (shares of `MemTotal`, capped by the cgroup memory
+limit when the process runs in a container), while `--max-segments` is a fixed
+1,000,000 on every host. Set, the flag value is used verbatim, with one
+reconciliation: the per-query SQL pool is clamped to an explicit per-tenant
+ceiling set below it, and the startup log says so. The reference-host column
+is a 16-core, 30 GB host, the shape the published ClickBench run used.
 
 | Flag | Default (unset) | Reference host | Choose against |
 |---|---|---|---|
-| `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Host cores and the store's request budget. One knob with three coupled effects: it also sets the SQL scan partition count and the object-store request concurrency. |
+| `--fetch-concurrency` | derived: `max(8, 2 x cores)` | 32 | Legacy combined knob: sets `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout` together (source `legacy-flag`). Combining it with any of the three is a startup error naming both flags. |
+| `--store-get-concurrency` | derived: `max(8, 2 x cores)` | 32 | Permit count for the one process-wide `GetLimiter` every fetcher (RSEG, RLOG, RSPAN) shares. Host cores and the store's request budget. |
+| `--sql-partition-count` | derived: `max(8, 2 x cores)` | 32 | DataFusion `target_partitions` for every SQL session the server builds. Host cores and query parallelism vs. per-partition overhead. |
+| `--promql-fetch-fanout` | derived: `max(8, 2 x cores)` | 32 | PromQL/analytics per-query segment fetch fan-out. Host cores and the store's request budget. |
 | `--max-segments` | fixed: 1,000,000 (host-independent) | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
 | `--sql-max-query-bytes` | derived: 25% of MemTotal, 256 MiB if memory is unknown | 8,053,063,680 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. Held at or below `--sql-tenant-max-bytes`: an explicit value here raises a non-explicit (derived or fallback) tenant ceiling to fit, but an explicit tenant ceiling clamps this down and warns. |
 | `--sql-tenant-max-bytes` | derived: 50% of MemTotal, 1 GiB if memory is unknown | 16,106,127,360 | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
+
+A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
+`--sql-partition-count`, or `--promql-fetch-fanout` is a startup error naming
+that flag, raised before any fetcher, engine, or SQL session exists.
 
 Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
 80% of MemTotal, catalog byte cache a separate 5% ceiling, 256 MiB each if
@@ -987,6 +995,9 @@ with" without reading the unit file:
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO performance default resolved setting="store_get_concurrency" value=32 source="derived"
+INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
+INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="max_segments" value=1000000 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
 INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"

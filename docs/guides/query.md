@@ -403,7 +403,7 @@ truncation:
 | Segments touched | fixed: 1,000,000 (`--max-segments`) | `query matched {count} segments, exceeding the limit of {max}` |
 | Distinct series | 10,000 | `query matched {count} series, exceeding the limit of {max}` |
 | Samples materialized | 10,000,000 | `query matched {count} samples, exceeding the limit of {max}` |
-| Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--fetch-concurrency`) | (not user-visible; throughput knob only) |
+| Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--promql-fetch-fanout`, or `--store-get-concurrency` for the shared object-store GET ceiling) | (not user-visible; throughput knob only) |
 | Wall-clock deadline | fixed: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
 | Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
 | Bytes scanned | unlimited (opt in via `query_defaults.max_bytes_scanned`) | `query scanned {scanned} bytes, exceeding the budget of {max}` |
@@ -428,22 +428,33 @@ naming the pool, never a truncated result.
 
 ### Operator-configurable budgets (server flags)
 
-Four of these budgets are process-wide server flags. Unset, each resolves at
-startup, but only some resolve **from host resources**: `--fetch-concurrency`
-follows the core count and the two SQL ceilings follow memory (shares of
-`MemTotal`, capped by the cgroup memory limit in a container), while
-`--max-segments` is a fixed 1,000,000 on every host. Set, the flag value is
-used verbatim, except that the per-query SQL pool is clamped to an explicit
-per-tenant ceiling set below it (see the clamp rule below). All four are
-process-wide, not per-tenant. The "reference host" column is what a 16-core,
-30 GB host resolves to, the settings the published ClickBench run used.
+Six of these budgets are process-wide server flags. Unset, each resolves at
+startup, but only some resolve **from host resources**: `--store-get-concurrency`,
+`--sql-partition-count`, and `--promql-fetch-fanout` (or the legacy
+`--fetch-concurrency`, which sets all three) follow the core count, and the two
+SQL ceilings follow memory (shares of `MemTotal`, capped by the cgroup memory
+limit in a container), while `--max-segments` is a fixed 1,000,000 on every
+host. Set, the flag value is used verbatim, except that the per-query SQL pool
+is clamped to an explicit per-tenant ceiling set below it (see the clamp rule
+below). All are process-wide, not per-tenant. The "reference host" column is
+what a 16-core, 30 GB host resolves to, the settings the published ClickBench
+run used.
 
 | Flag | Reaches | Default (unset) | Reference host |
 |---|---|---|---|
-| `--fetch-concurrency <N>` | `EngineConfig::fetch_concurrency` | derived: `max(8, 2 x cores)` | 32 |
+| `--fetch-concurrency <N>` | legacy: sets all three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
+| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | derived: `max(8, 2 x cores)` | 32 |
+| `--sql-partition-count <N>` | `EngineConfig::sql_partition_count`, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
+| `--promql-fetch-fanout <N>` | `EngineConfig::promql_fetch_fanout`, per-selector fetch stream fan-out | derived: `max(8, 2 x cores)` | 32 |
 | `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
 | `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 25% of MemTotal (256 MiB if unknown) | 8,053,063,680 |
 | `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
+
+Combining `--fetch-concurrency` with any of `--store-get-concurrency`,
+`--sql-partition-count`, or `--promql-fetch-fanout` is a startup error naming
+both flags. A value of `0` in any of these four flags is a startup error
+naming that flag, raised during configuration resolution before any fetcher,
+engine, or SQL session exists.
 
 The per-query SQL pool never exceeds the per-tenant ceiling. Which side moves
 depends on what the operator set. An explicit `--sql-tenant-max-bytes` below
@@ -459,14 +470,21 @@ Every resolved value is logged at startup, one line per setting with its source
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO performance default resolved setting="store_get_concurrency" value=32 source="derived"
+INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
+INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
 ```
 
-`--fetch-concurrency` is a single knob with three coupled effects: it governs
-the PromQL/analytics per-query segment fetch fan-out, the SQL scan partition
-count (`target_partitions`), and object-store GET concurrency.
-Raising it widens all three together; size it against the host's cores and the
-store's request budget.
+`--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout`
+replace the old single `--fetch-concurrency` knob's three coupled effects with
+three independent ones: the process-wide object-store GET ceiling (one shared
+`Arc<GetLimiter>`, built once and handed to every fetcher- and
+engine-construction site in the process), the SQL scan partition count
+(`target_partitions`), and the PromQL/analytics per-query segment fetch
+fan-out. `--fetch-concurrency` still sets all three together for a config that
+predates the split (source `legacy-flag` in the startup log); combining it
+with any of the three is a startup error naming both flags.
 
 `--max-segments` caps how many segments a single query fans out over. Only the
 narrow recent set (`SegmentOrigin::Recent`, roughly the last couple of hours) is

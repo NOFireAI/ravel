@@ -172,6 +172,7 @@ async fn promql_with_federation(store: Arc<dyn ObjectStoreBackend>, tenant: &Ten
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         None,
         EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(QueryAccountingMetrics::new(HashSet::new())),
         ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,

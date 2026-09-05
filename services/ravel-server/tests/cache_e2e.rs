@@ -229,6 +229,7 @@ async fn cache_dir_attaches_disk_tier_and_a_query_is_served_from_a_disk_hit() {
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache),
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
