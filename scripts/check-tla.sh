@@ -79,7 +79,8 @@ resolve_timeout() {
     local candidate
     for candidate in timeout gtimeout; do
         if command -v "$candidate" >/dev/null 2>&1 \
-            && "$candidate" --version 2>/dev/null | grep -qi 'GNU coreutils'; then
+            && "$candidate" --version 2>/dev/null | grep -qi 'GNU coreutils' \
+            && "$candidate" --kill-after=1 1 true >/dev/null 2>&1; then
             TIMEOUT_BIN="$candidate"
             note "timeout: $candidate (GNU coreutils)"
             return 0
@@ -572,9 +573,8 @@ main() {
     # at all.
     case "$cmd" in
         traceability) : ;;
-        *) resolve_timeout ;;
+        *) resolve_timeout; resolve_java ;;
     esac
-    resolve_java
 
     local areas
     if [ -n "$only_area" ]; then
