@@ -1385,4 +1385,62 @@ mod tests {
         assert_eq!(listing.versions.len(), 1);
         assert_eq!(listing.versions[0].version_id, "v-prior-1");
     }
+
+    /// `PutOverwriteLostResponse / LostResponseEffectApplied`
+    /// (formal/tla/common/traceability.md): a lost-response write still
+    /// applies its durable effect even though the caller observes a
+    /// failure, modeled here by `FaultKind::DuplicateDelivery` on `Put`
+    /// (`FaultStore` calls the wrapped `put` for real, then returns
+    /// `Transient`, per its module doc). This proves only the
+    /// memory-oracle half of the row; the backend half stays an
+    /// assumption until a probe exists against a real S3-compatible
+    /// endpoint.
+    #[tokio::test]
+    async fn lost_ack_after_successful_put_leaves_object_visible() {
+        let key = "lost-ack/k";
+        let plan =
+            FaultPlan::empty().with_rule(Rule::new(Op::Put, ScriptedFault::DuplicateDelivery));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+
+        let err = store
+            .put(key, Bytes::from_static(b"v1"), PutOptions::default())
+            .await
+            .expect_err("a lost-response PUT must surface an error to the caller");
+        assert!(matches!(err, StoreError::Transient(_)), "got {err:?}");
+        assert_eq!(store.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+
+        let got = store
+            .get(key, GetRange::Full)
+            .await
+            .expect("the object must be visible even though the caller saw a failure");
+        assert_eq!(&got.data[..], b"v1");
+    }
+
+    /// `TransientFailure / TransientLeavesNothing`
+    /// (formal/tla/common/traceability.md): a transient failure applies
+    /// nothing, modeled here by `FaultKind::Transient` on `Put`
+    /// (`FaultStore` never calls the wrapped backend for that kind, per
+    /// its module doc). This proves only the memory-oracle half of the
+    /// row; the backend half stays an assumption until a probe exists
+    /// against a real S3-compatible endpoint.
+    #[tokio::test]
+    async fn failed_put_leaves_no_object() {
+        let key = "transient-put/k";
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Put, ScriptedFault::Transient("blip".into())));
+        let store = FaultStore::new(MemoryStore::new(), plan);
+
+        let err = store
+            .put(key, Bytes::from_static(b"v1"), PutOptions::default())
+            .await
+            .expect_err("the transient fault must surface as an error");
+        assert!(matches!(err, StoreError::Transient(_)), "got {err:?}");
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Transient), 1);
+
+        let err = store
+            .head(key)
+            .await
+            .expect_err("a failed PUT must leave no object, partial or otherwise");
+        assert!(matches!(err, StoreError::NotFound), "got {err:?}");
+    }
 }
