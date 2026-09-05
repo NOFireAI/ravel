@@ -306,6 +306,7 @@ mod tests {
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
+            None,
         )
         .expect("catalog")
     }

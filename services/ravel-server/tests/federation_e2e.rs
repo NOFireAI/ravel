@@ -289,7 +289,7 @@ async fn spawn_remote(
     credential: &str,
     tenant: &TenantId,
 ) -> Remote {
-    let catalog = build_catalog(store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog = build_catalog(store.clone(), 1, true, 0, None, None).expect("catalog");
     let metrics = Arc::new(FragmentMetrics::new());
     let admission = FragmentAdmission::new(8, metrics.clone());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -484,7 +484,7 @@ async fn federated_series_discovery_returns_union_and_warns_on_skip() {
             Duration::from_secs(3),
         ),
     ];
-    let catalog = build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog = build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog");
     let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
         .with_federation(Arc::new(Federation::new(clusters)));
 
@@ -567,7 +567,7 @@ async fn federated_series_discovery_fails_without_skip() {
         false,
         Duration::from_secs(3),
     );
-    let catalog = build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog = build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog");
     let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
         .with_federation(Arc::new(Federation::new(vec![cluster])));
 
@@ -619,7 +619,7 @@ async fn remote_failure_fails_query_by_default() {
         false,
         Duration::from_secs(3),
     );
-    let catalog = build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog = build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog");
     let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
         .with_federation(Arc::new(Federation::new(vec![cluster])));
 
@@ -676,7 +676,7 @@ async fn federated_query_marks_skipped_cluster_in_warnings() {
             Duration::from_secs(3),
         ),
     ];
-    let catalog = build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog");
+    let catalog = build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog");
     let engine = QueryEngine::new(catalog, local_store, EngineConfig::default())
         .with_federation(Arc::new(Federation::new(clusters)));
 
@@ -752,7 +752,7 @@ async fn federated_query_merges_remote_series() {
     publish_series(oracle_store.as_ref(), &acme, base, "local", 10.0, 1).await;
     publish_series(oracle_store.as_ref(), &acme, base, "remote", 20.0, 2).await;
     let oracle_engine = QueryEngine::new(
-        build_catalog(oracle_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(oracle_store.clone(), 1, true, 0, None, None).expect("catalog"),
         oracle_store,
         EngineConfig::default(),
     );
@@ -763,7 +763,7 @@ async fn federated_query_merges_remote_series() {
 
     // Federated: local store + one healthy remote.
     let fed_engine = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog"),
         local_store.clone(),
         EngineConfig::default(),
     )
@@ -796,7 +796,7 @@ async fn federated_query_merges_remote_series() {
     // Budget: the combined frames trip a cap the local-only fetch clears.
     let combined_bytes = fed_stats.accounting.total_s3_bytes();
     let local_engine = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog"),
         local_store.clone(),
         EngineConfig::default(),
     );
@@ -818,7 +818,7 @@ async fn federated_query_merges_remote_series() {
         ..EngineConfig::default()
     };
     let local_capped = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog"),
         local_store.clone(),
         capped,
     );
@@ -828,7 +828,7 @@ async fn federated_query_merges_remote_series() {
         .expect("the local-only fetch clears the cap");
 
     let fed_capped = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog"),
         local_store.clone(),
         capped,
     )
@@ -894,7 +894,7 @@ async fn federated_query_merges_remote_histogram_series() {
     publish_histogram_series(oracle_store.as_ref(), &acme, base, "local", 1.0, 1, 1).await;
     publish_histogram_series(oracle_store.as_ref(), &acme, base, "remote", 2.5, 3, 2).await;
     let oracle_engine = QueryEngine::new(
-        build_catalog(oracle_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(oracle_store.clone(), 1, true, 0, None, None).expect("catalog"),
         oracle_store,
         EngineConfig::default(),
     );
@@ -905,7 +905,7 @@ async fn federated_query_merges_remote_histogram_series() {
 
     // Federated: local store + one healthy histogram-serving remote.
     let fed_engine = QueryEngine::new(
-        build_catalog(local_store.clone(), 1, true, 0, None).expect("catalog"),
+        build_catalog(local_store.clone(), 1, true, 0, None, None).expect("catalog"),
         local_store.clone(),
         EngineConfig::default(),
     )

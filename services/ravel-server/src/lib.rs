@@ -388,6 +388,13 @@ pub struct ServerConfig {
     /// share one directory and no separate disk-capacity flag, not one number.
     /// `None` keeps the RAM-only path, byte-for-byte today's behavior.
     pub cache_dir: Option<std::path::PathBuf>,
+    /// `--catalog-resolve-concurrency`: the number of in-flight object-store
+    /// requests `Catalog::resolve_impl` keeps in flight at once, from
+    /// `Cli::catalog_resolve_concurrency`. `None` when the flag is unset,
+    /// which leaves `ravel_catalog::CatalogConfig`'s own default (currently
+    /// 128) in place; [`start`] passes this straight through to
+    /// [`query::build_catalog`].
+    pub catalog_resolve_concurrency: Option<usize>,
     /// The process-wide in-flight ingest-request ceiling, from
     /// `--max-inflight-ingest-requests` (default `Bounded(1024)`, `0` maps to
     /// `Unlimited`). [`start`] builds one shared
@@ -1023,6 +1030,7 @@ pub async fn start(
         config.disable_cache,
         config.catalog_cache_max_bytes,
         config.cache_dir.clone(),
+        config.catalog_resolve_concurrency,
     )?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the

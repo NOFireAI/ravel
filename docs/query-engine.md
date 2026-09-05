@@ -683,6 +683,46 @@ resolution limit), wall deadline (server maximum, default
 server maximum are clamped to it. Exceeding a budget returns a
 Prometheus-style error, never a partial silent result.
 
+### Catalog resolve GET concurrency
+
+Before a query can fetch a single segment, the catalog must resolve which
+segments exist for the requested tenant, signal, and time range:
+`Catalog::resolve_impl` lists shard-hour prefixes and then GETs the
+commit/compaction records those listings name. This is a separate phase
+from, and a separate knob from, the fetch-phase `GetLimiter` described
+below: resolve happens first and touches catalog metadata, fetch happens
+second and touches segment data.
+
+`CatalogConfig::resolve_get_concurrency` bounds how many of these listing
+and record-GET requests one `Catalog` instance keeps in flight at once, via
+a per-instance `tokio::sync::Semaphore`. It defaults to 128 and is rejected
+at construction time (a typed `CatalogError::InvalidConfig`, never a silent
+clamp to 1) if configured to `0`, since a zero-permit semaphore would
+deadlock every resolve. `ravel-server` exposes it as
+`--catalog-resolve-concurrency`; unset, the catalog's own default applies.
+
+The default was raised from a fixed 16 after measuring against real S3 on a
+10,000-record unsealed tail (one cold resolve each; every level below
+issues the same 10,001 GETs and 13 LISTs, so the difference is entirely
+concurrency, not request count):
+
+| Concurrency | Wall time |
+|---|---|
+| 16  | 23.157s |
+| 64  | 4.374s  |
+| 128 | 2.341s  |
+
+The basis for 128: a measured S3 GET round trip of about 30ms means 128
+requests in flight sustain roughly 128 / 0.030s ~= 4,300 GET/s, comfortably
+under S3's published guidance of about 5,500 GET/s per prefix, and every
+request this phase issues lands under one `m/c/<shard>/<hour>/` prefix per
+shard-hour.
+
+This bounds one `Catalog` instance, not the process: N concurrent cold
+queries, each building or reusing a `Catalog` with this default, can
+together put up to N * 128 record GETs in flight at once. A process-wide
+cap across instances is not implemented and is tracked as a follow-up.
+
 ### GET concurrency (ADR-1195)
 
 The "max concurrent GETs (8, ...)" figure above is the ceiling for the

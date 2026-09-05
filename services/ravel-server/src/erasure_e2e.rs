@@ -369,6 +369,7 @@ fn build_metrics_app(
         cli.disable_cache,
         crate::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
+        cli.catalog_resolve_concurrency,
     )
     .expect("catalog");
     let mut tokens = std::collections::HashMap::new();
@@ -756,6 +757,7 @@ mod logs {
             cli.disable_cache,
             crate::config::DEFAULT_CACHE_MAX_BYTES,
             cli.cache_dir.clone(),
+            cli.catalog_resolve_concurrency,
         )
         .expect("catalog");
         let mut tokens = std::collections::HashMap::new();
@@ -1066,6 +1068,7 @@ mod spans {
             cli.disable_cache,
             crate::config::DEFAULT_CACHE_MAX_BYTES,
             cli.cache_dir.clone(),
+            cli.catalog_resolve_concurrency,
         )
         .expect("catalog");
         let snapshot = catalog
