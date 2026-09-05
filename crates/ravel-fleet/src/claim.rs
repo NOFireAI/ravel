@@ -1070,6 +1070,72 @@ mod tests {
         );
     }
 
+    /// Test debt (formal/tla/TRACEABILITY.md: `GuardedPublish`, `AbandonPublish`,
+    /// `LostClaimNeverPublishesThroughGuardedPath`, all three mapped to one
+    /// "ClaimGuard-abandons-on-lost-claim" test against `renew`). No
+    /// `ClaimGuard` type exists in this crate: the guard is a caller
+    /// convention (publish a compaction result only when `renew` reports
+    /// `Renewed`, never on `ClaimLost`), implemented by callers in
+    /// `ravel-maintain`/`services/ravel-cli`, outside this task's scope. This
+    /// test pins the contract those callers depend on, with the guard
+    /// convention modeled locally: a renew that discovers the claim was
+    /// stolen returns `Renewal::ClaimLost`, the guarded publish step is
+    /// therefore skipped, and the store carries no trace of a publish -- only
+    /// the thief's claim.
+    #[tokio::test]
+    async fn claim_guard_abandons_publish_when_the_claim_is_lost() {
+        let store = MemoryStore::new();
+        let cfg = ClaimConfig::default();
+        let original = owner_at(1);
+        let thief = owner_at(2);
+
+        let (key, original_version, original_payload) = acquired(
+            acquire(&store, &identity(), &original, &cfg)
+                .await
+                .expect("acquire"),
+        );
+
+        let observed = held(
+            acquire(&store, &identity(), &thief, &cfg)
+                .await
+                .expect("acquire"),
+        );
+        let taken = steal(&store, &observed, &thief, &cfg, observed.expiry_unix_ms)
+            .await
+            .expect("steal");
+        assert!(matches!(taken, Steal::Acquired { .. }), "the steal lands");
+
+        let renewal = renew(&store, &key, &original_version, &original_payload, 99)
+            .await
+            .expect("renew is not an error");
+
+        // The guard convention every real caller of `renew` follows: publish
+        // the compaction result only on `Renewed`, never on `ClaimLost`.
+        let publish_key = "t/acme/compaction/result";
+        if let Renewal::Renewed { .. } = &renewal {
+            store
+                .put(
+                    publish_key,
+                    b"compaction result".to_vec().into(),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        checksum: None,
+                    },
+                )
+                .await
+                .expect("publish");
+        }
+
+        assert!(
+            matches!(renewal, Renewal::ClaimLost),
+            "a renewal on a stolen claim is ClaimLost, got {renewal:?}"
+        );
+        assert!(
+            store.head(publish_key).await.is_err(),
+            "a lost-claim renewal must never publish through the guarded path"
+        );
+    }
+
     /// Completion is CAS-guarded like every other write in this module: a
     /// process holding a stale version cannot flip the state, and the stored
     /// payload is byte-identical afterwards. This is what makes "never an
