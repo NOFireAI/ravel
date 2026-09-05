@@ -4497,28 +4497,28 @@ mod tests {
     }
 
     /// `crate::io_shape::depth_for_object` (issue #1214) mirrors the real
-    /// branches `open_segment` takes, not just two of its three. A small
-    /// object (`object_size` in `(0, threshold]`) resolves footer, catalog,
-    /// and pages from one GET: zero dependent stages, depth 1. Every other
-    /// case takes the footer-tail path, which is always followed by a
-    /// dependent page fetch (`decode_selected`'s own doc comment: "page
-    /// bytes are fetched afterwards by the caller from regions") -- a
-    /// second stage on top of the footer stage(s) -- and the footer stage
-    /// itself is either 1 GET (the tail guess covers the real footer) or 2
-    /// (a `FooterOutcome::NeedRange` chase), so the real chain is 2 or 3
-    /// stages. The pre-fix `depth_for_object` tested only
-    /// `object_size <= whole_object_threshold`, which is vacuously true for
-    /// `object_size == 0` against any non-negative threshold, and so wrongly
-    /// reported depth 1 -- the whole-object depth -- for a segment that
-    /// `open_segment` actually routes down the footer-tail path.
+    /// branches `open_segment` -> `decode_selected` -> `fetch_scalar_pages`
+    /// takes, not just the footer stage. A small object (`object_size` in
+    /// `(0, threshold]`) resolves footer, catalog, and pages from one GET:
+    /// zero dependent stages, depth 1. Every other case takes the
+    /// footer-tail path, whose footer stage is either 1 GET (the tail guess
+    /// covers the real footer) or 2 (a `FooterOutcome::NeedRange` chase),
+    /// followed by a dependent catalog `ensure_ranges` GET (LABEL_DICT /
+    /// SERIES_IDS / SERIES_META, at the object front, never inside the
+    /// footer-tail bytes) and a dependent page `ensure_ranges` GET (the run
+    /// ranges the catalog just named): up to 4 stages total. The pre-fix
+    /// `depth_for_object` tested only `object_size <= whole_object_threshold`,
+    /// which is vacuously true for `object_size == 0` against any
+    /// non-negative threshold, and so wrongly reported depth 1 -- the
+    /// whole-object depth -- for a segment that `open_segment` actually
+    /// routes down the footer-tail path.
     ///
-    /// Verified against real `open_segment` GET counts via `QueryAccounting`,
-    /// not hardcoded constants: `real_footer_gets + 1` (the dependent page
-    /// stage) must never exceed the predicted upper bound of 3, and must
-    /// equal it exactly in the forced-`NeedRange` case. Flip the
-    /// `object_size != 0 &&` guard back off in `depth_for_object` to watch
-    /// the `object_size == 0` assertion below fail: it would then predict 1,
-    /// not 3.
+    /// Every case below drives the real GET count through a full `.fetch()`
+    /// call against a counting store (`FaultStore`'s `sequence_progress`),
+    /// not a recomputation from a partial call (`open_segment` alone) that
+    /// cannot see the catalog or page stages. Flip the `object_size != 0 &&`
+    /// guard back off in `depth_for_object` to watch the `object_size == 0`
+    /// assertion in (c) fail: it would then predict 1, not 4.
     #[tokio::test]
     async fn depth_for_object_upper_bounds_the_real_footer_and_page_chain() {
         use crate::io_shape::depth_for_object;
@@ -4553,8 +4553,10 @@ mod tests {
         }
 
         // (b) Forced footer-tail path with a `NeedRange` chase (`suffix_len`
-        // too small to cover the footer): 2 footer-stage GETs plus the
-        // dependent page stage is 3, matching the upper bound exactly.
+        // too small to cover the footer): the real chain runs the whole
+        // pipeline (footer tail, NeedRange chase, catalog fetch, page
+        // fetch), counted from a full `.fetch()` against a counting store,
+        // not recomputed from `open_segment` alone.
         {
             let (mem, tenant_hash, seg_ref) = write_test_segment().await;
             let bytes = mem
@@ -4562,30 +4564,25 @@ mod tests {
                 .await
                 .expect("get bytes")
                 .data;
-            let store = store_from_bytes(&seg_ref.data_object_key, bytes).await;
-            let backend: Arc<dyn ObjectStoreBackend> = store;
-            let fetcher = SegmentFetcher::new(backend)
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
                 .with_whole_object_threshold(0)
-                .with_suffix_len(16);
-            let acct = QueryAccounting::new();
-            fetcher
-                .open_segment(tenant_hash, &seg_ref, &acct)
+                .with_suffix_len(16)
+                .fetch(tenant_hash, &seg_ref, &[])
                 .await
-                .expect("forced NeedRange chase open");
-            let footer_gets = acct.snapshot().s3_requests(AccountedOp::Get);
+                .expect("forced NeedRange chase fetch");
+            let real_chain = store.sequence_progress(0);
             assert_eq!(
-                footer_gets, 2,
+                real_chain, 4,
                 "a 16-byte suffix_len is too small to cover the footer, forcing a \
-                 NeedRange chase: exactly 2 footer-stage GETs"
-            );
-            let real_chain = footer_gets + 1; // + the dependent page fetch stage
-            assert_eq!(
-                real_chain, 3,
-                "2 footer GETs plus the dependent page fetch is a 3-stage chain"
+                 NeedRange chase, and this segment's catalog and page sections sit \
+                 outside the footer-tail bytes: footer tail + NeedRange chase + \
+                 catalog fetch + page fetch is a 4-GET chain"
             );
             assert_eq!(
                 depth_for_object(seg_ref.object_size, 0),
-                3,
+                4,
                 "predicted upper bound must equal the real chain exactly in the \
                  worst case"
             );
@@ -4594,11 +4591,11 @@ mod tests {
         // (c) `object_size == 0` (unknown size): takes the SAME footer-tail
         // path as (b), not the whole-object path, even though the pre-fix
         // code's `object_size <= whole_object_threshold` test was vacuously
-        // true for 0 against any non-negative threshold. The generous
-        // default `suffix_len` covers this small segment's footer in one
-        // GET, so the real chain is 2 (1 footer GET + 1 page stage) -- more
-        // than the pre-fix code's wrongly-predicted 1, and safely within the
-        // fixed code's upper bound of 3.
+        // true for 0 against any non-negative threshold. A 250-byte
+        // `suffix_len` covers this segment's footer in a single GET (no
+        // `NeedRange` chase) without reaching far enough back to also cover
+        // the catalog or page sections, so the real chain is 3 (footer +
+        // catalog + page), safely within the upper bound of 4.
         {
             let (mem, tenant_hash, seg_ref) = write_test_segment().await;
             let bytes = mem
@@ -4608,27 +4605,24 @@ mod tests {
                 .data;
             let mut sizeless = seg_ref.clone();
             sizeless.object_size = 0;
-            let store = store_from_bytes(&seg_ref.data_object_key, bytes).await;
-            let backend: Arc<dyn ObjectStoreBackend> = store;
-            let fetcher = SegmentFetcher::new(backend).with_whole_object_threshold(1_000_000);
-            let acct = QueryAccounting::new();
-            fetcher
-                .open_segment(tenant_hash, &sizeless, &acct)
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
+                .with_whole_object_threshold(1_000_000)
+                .with_suffix_len(250)
+                .fetch(tenant_hash, &sizeless, &[])
                 .await
-                .expect("sizeless open");
-            let footer_gets = acct.snapshot().s3_requests(AccountedOp::Get);
+                .expect("sizeless fetch");
+            let real_chain = store.sequence_progress(0);
             assert_eq!(
-                footer_gets, 1,
-                "the default suffix_len covers this small segment's footer in one GET"
-            );
-            let real_chain = footer_gets + 1;
-            assert!(
-                real_chain <= 3,
-                "real chain ({real_chain}) must not exceed the predicted upper bound"
+                real_chain, 3,
+                "a 250-byte suffix_len covers the footer without a NeedRange chase \
+                 and without reaching the catalog or page sections: footer + \
+                 catalog + page is a 3-GET chain"
             );
             assert_eq!(
                 depth_for_object(0, 1_000_000),
-                3,
+                4,
                 "object_size == 0 must take the footer-tail upper bound, not the \
                  whole-object depth of 1, even though 0 <= any non-negative \
                  threshold"
