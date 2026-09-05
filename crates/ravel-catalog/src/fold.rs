@@ -5159,6 +5159,91 @@ mod tests {
         );
     }
 
+    /// Test debt (formal/tla/TRACEABILITY.md, catalog row 1, `DoFoldCas`
+    /// fold-lifetime bound / `DoFoldRebase`): a fold that LISTs a bucket
+    /// before a compaction supersedes one of its L0 inputs, and whose own
+    /// publishing CAS lands only after that input's superseded-sweep horizon
+    /// has passed (so a real deployment's maintenance process would already
+    /// have physically deleted it), must never publish a snapshot that names
+    /// the swept input. `fold_reconcile_window_hours` (default 26, see
+    /// `config.rs`) is sized in hours-behind-watermark specifically so this
+    /// holds regardless of how much wall-clock time elapses: the reconcile
+    /// pass re-lists the bucket and excludes the input by matching the
+    /// compaction record's own input list, never by re-reading the (possibly
+    /// already-gone) input object itself.
+    #[tokio::test]
+    async fn fold_that_lists_before_a_compaction_and_cas_after_the_sweep_horizon_does_not_name_a_swept_input()
+     {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Hour 10 seals into its own part; hour 11 is the tail. This fold's
+        // LIST of hour 10 sees only the raw L0 segment: no compaction exists
+        // yet.
+        let now_1 = now_at_seal(11);
+        let writer_a = Uuid::new_v4();
+        let seg_a = publish_segment(&store, 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert_eq!(first.parts_total, 2);
+        assert_eq!(first.entry_count, 2);
+
+        // A compaction lands in the already-sealed, already-folded hour 10,
+        // superseding seg_a's L0 with one L1 part.
+        publish_compaction(&store, 0, 10, &[&seg_a], now_1).await;
+
+        // Simulate the superseded-input sweep: once `protection_horizon_ns`
+        // has elapsed past the compaction's own `created_unix_ns`, a real
+        // maintenance process would physically delete seg_a's commit record
+        // and data object (docs/deletion-and-gc.md's superseded-input sweep
+        // row). Do that directly here (ravel-maintain is out of this task's
+        // scope) so the SECOND fold below runs against a bucket where the
+        // swept input is already gone from the store, not merely superseded.
+        let commit_key = keys::commit_key_for_record(&seg_a).expect("commit key");
+        let data_key = keys::reconstruct_data_key(&seg_a).expect("data key");
+        store
+            .delete(&commit_key)
+            .await
+            .expect("delete swept commit record");
+        store
+            .delete(&data_key)
+            .await
+            .expect("delete swept data object");
+
+        // A later fold, its own CAS landing well past the sweep horizon: the
+        // reconcile window is sized in hours behind the fold's own watermark
+        // (not wall-clock time), so hour 10 is still reconciled even though
+        // real time has moved far beyond `protection_horizon_ns`.
+        let now_2 = now_1 + cfg.protection_horizon_ns + NS_PER_HOUR;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold must not fail even though the swept input is already gone");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let head2 = read_head(store.as_ref()).await;
+        let entries = collect_head_entries(store.as_ref(), &head2).await;
+        let hour10: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 10)
+            .collect();
+        assert_eq!(hour10.len(), 1, "hour 10 now has exactly the L1 part");
+        assert_eq!(hour10[0].level, 1, "hour 10's entry is the compaction L1");
+        assert!(
+            !entries.iter().any(|e| e.content_hash == seg_a.content_hash),
+            "the published fold must not name the swept input"
+        );
+    }
+
     /// Regression for issue #587: a fold used to skip postings entirely the
     /// moment any L1 (compacted) entry was present, because
     /// `fetch_segment_names` could only key and identity-check an L0 object.
