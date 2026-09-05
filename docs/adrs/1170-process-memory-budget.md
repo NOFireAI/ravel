@@ -275,11 +275,16 @@ allocation that calibration did not see, which is a finding, not a recalibration
   the existing cache residency and allocator gauges.
 - Pre-registered acceptance, same box, same tenant, same 600 s window at 10
   connections, three consecutive runs after the reserve is frozen: every
-  over-budget query ends in `ResourcesExhausted` or `FetchMemoryExhausted`;
-  error ratio at or below the 6 GiB arm's 3.9%; peak
-  `ravel_process_allocator_bytes{resident}` at or below the unique tracked
-  total plus the frozen reserve, where unique subtracts the handoff overlap
-  gauge; and zero kernel kills attributable to a tracked ledger. A kill is
+  over-budget query ends in a typed error, `ResourcesExhausted` (which is also
+  what a `CeilingBreach` surfaces as: the breach is the mechanism that records
+  an infallible-`grow` overshoot, and the query stream maps it to the same
+  `SqlError::ResourcesExhausted` on its next poll, `executor.rs:1805-1815,
+  1961-1980`) or `FetchMemoryExhausted`;
+  error ratio at or below the 6 GiB arm's 3.9%; and, pointwise over every
+  sample `t` of the window, `resident_t <= unique_t + frozen reserve`, which is
+  `max_t(resident_t - unique_t) <= frozen reserve` with both figures from the
+  SAME scrape, never a peak of one against a peak of the other, where unique
+  subtracts the handoff overlap gauge; and zero kernel kills attributable to a tracked ledger. A kill is
   attributable to the infallible `grow` path only if the server's last breach
   record names an unchecked delta larger than the reserve, and such a kill is
   itself a finding against the reserve's sizing, recorded and re-run, not
