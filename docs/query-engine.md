@@ -1667,6 +1667,178 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3HeadRequests`/`s3HeadBytes`, `s3ListBytes`, and
   `peakIntermediateBytes` (SQL executor only).
 
+### I/O dependency shape
+
+`stats.phases` above answers "how many requests and bytes did each phase
+spend." It cannot answer a different question: how many of those requests
+had to run one after another because a later stage needed an earlier
+stage's bytes to know its own keys, versus how many ran in one concurrent
+round. **Dependency depth and phase cost are different dimensions**: a
+query can be cheap by `stats.phases` (few requests, few bytes) and still be
+slow because its requests chain, and a query can be expensive by request
+count and still be fast because every request ran at depth 1. Neither
+number predicts the other.
+
+`crates/ravel-query/src/io_shape.rs`'s `QueryIoShape` is recorded per query
+and rendered as `stats.io`, additive beside `stats.phases`:
+
+- `dependencyDepth`: the longest chain of object-store stages, across every
+  segment the query opened, where a stage needed a previous stage's bytes to
+  know its own keys. Four independent segment GETs report depth 1; a
+  footer-tail read that may need a dependent catalog fetch and a dependent
+  page fetch reports depth 4, an upper bound, not a single true value: this
+  crate cannot tell from `object_size` alone whether the footer-tail guess
+  covered the real footer in one GET or needed a `FooterOutcome::NeedRange`
+  chase for another GET before the dependent catalog and page fetches, so it
+  reports the worst case rather than risk understating the chain. Classified
+  structurally from each
+  segment's `object_size` against the fetcher's whole-object threshold (the
+  same size test `SegmentFetcher::open_segment` itself branches on), not
+  from a live per-request trace, matching `CostEstimate`'s existing
+  upper-envelope convention: a fully-cached large segment still reports its
+  structural depth, because the plan has that many dependent stages even
+  when a cache absorbs one. A segment with unknown size (`object_size == 0`)
+  also takes the footer-tail path, not the whole-object path, and reports
+  the same upper bound.
+- `listPageDepth`: serial LIST pages, recorded independently of
+  `dependencyDepth` because pagination (`Catalog::list_shard_hours`) and the
+  GET dependency chain are different object-store mechanisms with different
+  causes. Reported as the resolve phase's total LIST request count, an
+  upper-bound serial depth: this crate cannot see from here whether two
+  shards' LIST pages ran concurrently with each other or one after another,
+  only that they happened (`ravel-catalog` owns that fan-out; out of this
+  task's scope to change).
+- `serviceBatches`: a LOWER bound on the serial service rounds this query's
+  per-segment fan-out needed, under a wave-synchronous model of the nested
+  fan-out. The metrics fetch is a NESTED fan-out with three levels of
+  admission, all of which bound the round count: an OUTER
+  `buffer_unordered(promql_fetch_fanout)` over distinct matcher plans
+  (`distinct_plans_by_matcher` in `crates/ravel-query/src/engine.rs`), which
+  admits at most `promql_fetch_fanout` plans at once, however many distinct
+  matcher sets the query has; each admitted plan's own INNER
+  `buffer_unordered(promql_fetch_fanout)` over that plan's segments
+  (`prefetch_metric_plans`/`fetch_all_samples_and_histograms`); and the one
+  shared `GetLimiter` described under "GET concurrency (ADR-1195)" above,
+  whose permit count is the resolved `store_get_concurrency` and which every
+  GET from every plan passes through regardless of which level admitted it.
+  That limiter is shared inside one `QueryEngine`, which is the scope this
+  figure models: it says nothing about GETs another engine in the same
+  process issues, and nothing about the RLOG whole-object funnel, which
+  takes no permit at all.
+  It is a lower bound, never an upper bound or an exact count, because the
+  OUTER `buffer_unordered` is a SLIDING window, not a wave-synchronous one:
+  as soon as one admitted plan finishes, the next plan is admitted
+  immediately, without waiting for its siblings. Modeling it as
+  wave-synchronous anyway -- one binding concurrency
+  (`min(promql_fetch_fanout * min(distinctMatcherSets,
+  promql_fetch_fanout), sharedGetPermits)`) dividing the total work
+  (`segment_count * distinctMatcherSets` GETs) in a single division --
+  undercounts whenever the outer window is not full for the query's whole
+  duration: 3 distinct matcher sets, 1 segment each, `promql_fetch_fanout`
+  2, and 1000 shared permits gives peak capacity `min(2 * 2, 1000) = 4`, so
+  that single division reports `ceil(3 / 4) = 1` round, but plans 1 and 2
+  admit together in the first round and plan 3 only after one of them
+  finishes, in a second round -- the real schedule needs at least 2 rounds,
+  not 1.
+  So this figure is computed per WAVE of the outer fan-out instead: `waves
+  = ceil(distinctMatcherSets / promql_fetch_fanout)`; for 0-based wave `w`,
+  `active_w = min(promql_fetch_fanout, distinctMatcherSets - w *
+  promql_fetch_fanout)` plans are admitted, `capacity_w =
+  min(promql_fetch_fanout * active_w, sharedGetPermits)` is that wave's
+  binding concurrency, and `batches_w = ceil(segment_count * active_w /
+  capacity_w)` is its own serial round count; `serviceBatches` sums
+  `batches_w` over every wave (distinct matcher sets, not the raw plan
+  count `stats.estimate` scales by -- a query naming two `SelectorPlan`s
+  that share one matcher set, `up + up offset 5m`, is fetched in one pass,
+  so its `serviceBatches` does not double). This sum is still a lower
+  bound, never exact: the sliding window can only pack work at least as
+  tightly as the wave-synchronous model assumes, never more loosely, so the
+  real scheduler takes at least this many rounds. 64 segments,
+  `promql_fetch_fanout` 8, two distinct matcher sets, and 16 shared permits:
+  one wave, `active_0 = 2`, `capacity_0 = min(16, 16) = 16`, `batches_0 =
+  ceil(128 / 16) = 8`. `promql_fetch_fanout` 1 with three distinct matcher
+  sets, 20 segments, and 1000 shared permits: three waves, each `active_w =
+  1`, `capacity_w = min(1, 1000) = 1`, `batches_w = ceil(20 / 1) = 20`,
+  summing to 60 -- not the 20 a single `min(1 * 3, 1000) = 3`-capacity
+  division would report, which would silently assume all 3 plans ran at
+  once when the outer stream never admits more than 1. A single-plan query
+  always has exactly one wave with `active_0 = 1`, reducing to
+  `ceil(segment_count / promql_fetch_fanout)`, since `min(promql_fetch_fanout,
+  sharedGetPermits)` is the fan-out width whenever the shared pool is at
+  least as large as one plan's own fan-out bound, as it is for any config
+  that leaves both ADR-1195 knobs unset (both then resolve to
+  `fetch_concurrency`). Lower `--store-get-concurrency` below
+  `--promql-fetch-fanout` and the limiter binds instead, for a single-plan
+  query too; this figure follows whichever bound is smaller.
+- `unfoldedSegmentsResolved`: the EXACT (never estimated) count of segments
+  this query's resolve took from the recent (unfolded) listing path rather
+  than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073 decision 1).
+  Exact because it gates a downstream fold-benefit decision an approximation
+  would silently corrupt. A SEGMENT count, not a commit-record count:
+  `SegmentOrigin` is parallel to `Snapshot::segments` (one entry per resolved
+  `SegmentRef`), and a multi-part L1 compaction record contributes one
+  `Recent` entry per part, so this figure counts every part, not the single
+  underlying compaction record. `ravel-query` cannot recover the record
+  count from `SegmentOrigin` alone, so the field is named for the quantity
+  it actually counts. Excludes `SegmentOrigin::TokenResolved`: a
+  read-your-write token match always costs its own GET by explicit key,
+  whether or not a fold has run, so folding can never remove that cost and
+  counting it here would overstate the fold benefit.
+- `planClass`: `metadata_only` (a labels/label-values/series discovery query
+  that never reaches a page fetch), `selective_indexed` (the resolve's
+  postings-based pruning excluded at least one snapshot-sourced segment),
+  `exhaustive_scan` (every listed segment in the resolved window was
+  opened), or `unclassified` (the lane's own resolve carries no signal this
+  crate can use to tell a pruned fetch from a full scan). The log lane
+  always reports `unclassified`: `resolve_bounded` always resolves
+  `Signal::Logs` with `name_filter: None` (ADR-1103's log discovery has no
+  name-postings filter to prune against), so `Snapshot::segments_pruned` is
+  structurally always 0 for that lane no matter how narrow the resolved
+  window actually is, and reporting `exhaustive_scan` on that basis alone
+  would be a fabricated severity this crate cannot back up. Decided before
+  any segment is opened, from the query's shape and the resolve's own
+  pruning outcome, not from the fetch's actual cost.
+
+What is knowable from `ravel-query`, and what is not: the per-segment fetch
+pipeline this crate owns is visible here, so `dependencyDepth` reflects it
+directly. What is NOT knowable from this crate: the catalog snapshot
+resolve's own internal dependency chain
+(`Catalog::resolve_pruned_with_generations` and any HEAD-then-part-GET
+sequence it takes) lives entirely inside `ravel-catalog`; `dependencyDepth`
+therefore reports only the segment-fetch chain's depth, and the true
+end-to-end depth (resolve's own chain, however deep, prefixed to the
+segment-fetch chain) can only be equal to or greater than what is reported.
+A federated query (a metrics lane and a log lane) folds both lanes'
+contributions together. The two lanes run STRICTLY SERIALLY -- the log
+lane's resolve is only reached after the metrics lane has already been
+awaited to completion, never alongside it -- and each field's combining
+rule follows from one criterion, not from the same criterion applied
+loosely three times:
+`listPageDepth` and `serviceBatches` are both SERIALIZATION-ROUND counts
+(the number of sequential rounds a lane's own fan-out actually waited
+through), and ADD across lanes for that reason: because the lanes never
+overlap, the rounds a query waits through end-to-end are one lane's rounds
+followed by the other's. A query whose metrics lane paginated 4 LIST pages
+and whose log lane paginated 2 more waited through 6 serial pages, not 4,
+and a query whose metrics fetch was forced into 3 concurrency-permit
+batches and whose log fetch needed 2 more waited through 5 serial batches,
+not `max(3, 2)`.
+`dependencyDepth` uses a DIFFERENT criterion -- DATA independence, not
+serialization order -- and stays max-based across lanes: the log lane's
+fetch chain has no DATA dependency on the metrics lane's bytes, so the two
+chains are independent chains that happen to run one after the other, and
+the reported figure is the longest independent chain, not their sum.
+`unfoldedSegmentsResolved` sums across lanes (an exact total count, with no
+ambiguity about how the two lanes' costs compose), and `planClass` takes
+the more severe of the two (`exhaustive_scan` outranks `selective_indexed`
+outranks `unclassified` outranks `metadata_only`), so a lane that never ran
+cannot understate a lane that did, and the log lane's `unclassified` result
+cannot fabricate a worse classification than a metrics lane that pruned
+correctly.
+
+`stats.io` carries no object keys, field values, predicates, or index
+terms: every figure is a structural count.
+
 ## PromQL conformance (ADR-0035)
 
 What Ravel supports, what it deliberately refuses, and what is merely

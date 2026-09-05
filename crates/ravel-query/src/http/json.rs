@@ -113,6 +113,15 @@ pub struct QueryStatsJson {
     /// count cannot say whether a query spent its requests resolving the
     /// catalog snapshot or scanning pages.
     pub phases: Vec<PhaseCostJson>,
+    /// The query's I/O dependency shape (issue #1214, `crate::io_shape`):
+    /// how many object-store stages had to run one after another versus in
+    /// one round, kept separate from `phases`' request/byte cost split.
+    /// Additive beside `phases`, never a replacement for it: `phases` answers
+    /// how much a query's requests cost, `io` answers how their requests
+    /// depended on each other. A cheap-by-`phases` query can still be slow
+    /// because of a deep `io.dependencyDepth`, and an expensive-by-`phases`
+    /// query can still be fast because every request in it ran at depth 1.
+    pub io: IoShapeJson,
     pub estimate: CostEstimateJson,
     /// True when at least one federated remote cluster was skipped because it
     /// was unavailable and its `skip_unavailable` opt-in was set
@@ -137,6 +146,7 @@ impl From<crate::QueryStats> for QueryStatsJson {
             segments_pruned: stats.segments_pruned,
             accounting: QueryAccountingJson::from_snapshot(&stats.accounting, &stats.page_stats),
             phases: phase_costs(&stats.phase_accounting),
+            io: stats.io_shape.into(),
             estimate: stats.estimate.into(),
             partial: stats.partial,
             warnings: stats.warnings.clone(),
@@ -331,6 +341,61 @@ fn phase_costs(snapshot: &PhaseAccountingSnapshot) -> Vec<PhaseCostJson> {
             }
         })
         .collect()
+}
+
+/// A query's I/O dependency shape (issue #1214), rendered under `stats.io`.
+/// See `crate::io_shape`'s module docs for what each figure means, what is
+/// and is not knowable from this crate, and why `dependencyDepth` and the
+/// `phases` cost split are different dimensions. Carries no object keys,
+/// field values, predicates, or index terms: every figure here is a
+/// structural count.
+#[derive(Debug, Serialize)]
+pub struct IoShapeJson {
+    /// The longest chain of object-store stages, across every segment this
+    /// query opened, where a stage needed a previous stage's bytes to know
+    /// its own keys. Four independent segment GETs report depth 1; a
+    /// segment whose footer read is followed by a dependent catalog fetch
+    /// and a dependent page fetch reports depth 4, an upper bound covering
+    /// a possible footer-range chase this crate cannot rule out from
+    /// `object_size` alone.
+    #[serde(rename = "dependencyDepth")]
+    pub dependency_depth: u32,
+    /// Serial LIST pages, recorded independently of `dependencyDepth`
+    /// because pagination and the GET dependency chain are different
+    /// object-store mechanisms with different causes.
+    #[serde(rename = "listPageDepth")]
+    pub list_page_depth: u32,
+    /// Batches this query's per-segment fan-out was forced into by its
+    /// concurrency permit: `ceil(segment_count / fetch_concurrency)`.
+    #[serde(rename = "serviceBatches")]
+    pub service_batches: u32,
+    /// EXACT count of SEGMENTS (`SegmentOrigin::Recent` entries, one per
+    /// resolved `SegmentRef`) this query's resolve took from the recent
+    /// (unfolded) listing path rather than a folded snapshot part. Not a
+    /// commit-record count: a multi-part L1 compaction record contributes
+    /// one entry per part, so this figure can exceed the number of
+    /// underlying records (`crate::io_shape` module docs).
+    #[serde(rename = "unfoldedSegmentsResolved")]
+    pub unfolded_segments_resolved: u64,
+    /// Pre-execution access-pattern classification: `metadata_only`,
+    /// `selective_indexed`, `exhaustive_scan`, or `unclassified` (a lane,
+    /// such as the log lane, whose own resolve carries no signal this crate
+    /// can use to tell a pruned fetch from a full scan --
+    /// `crate::io_shape::PlanClass::name`).
+    #[serde(rename = "planClass")]
+    pub plan_class: &'static str,
+}
+
+impl From<crate::io_shape::QueryIoShape> for IoShapeJson {
+    fn from(shape: crate::io_shape::QueryIoShape) -> Self {
+        IoShapeJson {
+            dependency_depth: shape.dependency_depth,
+            list_page_depth: shape.list_page_depth,
+            service_batches: shape.service_batches,
+            unfolded_segments_resolved: shape.unfolded_segments_resolved,
+            plan_class: shape.plan_class.name(),
+        }
+    }
 }
 
 /// Upper-envelope cost estimate (ADR-0044 decision 3), rendered under
@@ -1295,6 +1360,114 @@ mod tests {
             value.get("estimate").is_some(),
             "estimate must not be removed"
         );
+    }
+
+    #[test]
+    fn stats_json_carries_io_shape_with_every_figure_exactly_once() {
+        // ACCEPTANCE TEST (issue #1214). `io` sits beside `phases` in the
+        // stats object and must carry every `QueryIoShape` figure exactly
+        // once, under its own key, distinct from the per-phase cost split.
+        //
+        // Flip-line proof: replace `io: stats.io_shape.into()` with
+        // `io: IoShapeJson::from(crate::io_shape::QueryIoShape::default())`
+        // in `QueryStatsJson`'s `From<crate::QueryStats>` impl (severing the
+        // wire from the real `stats.io_shape`) and `io["dependencyDepth"]`
+        // reads `0`, not `2`.
+        let shape = crate::io_shape::QueryIoShape {
+            dependency_depth: 2,
+            list_page_depth: 13,
+            service_batches: 4,
+            unfolded_segments_resolved: 2_500,
+            plan_class: crate::io_shape::PlanClass::SelectiveIndexed,
+        };
+        let stats = crate::QueryStats {
+            io_shape: shape,
+            ..Default::default()
+        };
+        let json = QueryStatsJson::from(stats);
+        let value = serde_json::to_value(&json).expect("serializes");
+
+        let io = value.get("io").expect("io object present beside phases");
+        assert_eq!(io["dependencyDepth"], serde_json::json!(2));
+        assert_eq!(io["listPageDepth"], serde_json::json!(13));
+        assert_eq!(io["serviceBatches"], serde_json::json!(4));
+        assert_eq!(io["unfoldedSegmentsResolved"], serde_json::json!(2_500));
+        assert_eq!(io["planClass"], serde_json::json!("selective_indexed"));
+
+        // Every figure exactly once: no duplicate key, and no field beyond
+        // the five `QueryIoShape` carries (an object key, field value,
+        // predicate, or index term would show up here as an extra field).
+        let obj = io.as_object().expect("io is a JSON object");
+        assert_eq!(
+            obj.len(),
+            5,
+            "io carries exactly the five QueryIoShape figures, no more"
+        );
+
+        assert!(
+            value.get("phases").is_some(),
+            "io is additive beside phases, not a replacement for it"
+        );
+    }
+
+    #[test]
+    fn stats_json_io_object_has_each_figure_present_exactly_once_in_the_wire_text() {
+        // Deliberately distinct from `stats_json_carries_io_shape_with_every_figure_exactly_once`
+        // above: that test parses the wire text into a `serde_json::Value`
+        // first, and a `serde_json::Map` COLLAPSES a duplicate key on
+        // insert (last write wins), so a `Serialize` impl that emits one
+        // `QueryIoShape` figure twice under the same key would still show
+        // `obj.len() == 5` there -- present-or-more, not present-and-once.
+        // This test instead counts key occurrences in the raw serialized
+        // JSON TEXT, before any parser has a chance to collapse anything, so
+        // a figure emitted twice is caught as 2 occurrences and a figure
+        // dropped is caught as 0.
+        //
+        // Flip-line proof: in `IoShapeJson`, duplicate the `service_batches`
+        // field under its own `#[serde(rename = "serviceBatches")]` tag
+        // (two struct fields serializing to the same wire key) and populate
+        // both in the `From<QueryIoShape>` impl. `occurrences("serviceBatches")`
+        // then reads 2, not 1, and the assertion below fails.
+        let shape = crate::io_shape::QueryIoShape {
+            dependency_depth: 2,
+            list_page_depth: 13,
+            service_batches: 4,
+            unfolded_segments_resolved: 2_500,
+            plan_class: crate::io_shape::PlanClass::SelectiveIndexed,
+        };
+        let stats = crate::QueryStats {
+            io_shape: shape,
+            ..Default::default()
+        };
+        let json = QueryStatsJson::from(stats);
+        let text = serde_json::to_string(&json).expect("serializes");
+
+        // `io` renders no nested objects (every figure is a flat number or
+        // string), so the first `}` after `"io":{` is the io object's own
+        // close brace: slicing there scopes the occurrence count to `io`
+        // alone, not the whole envelope (which could otherwise hide a
+        // dropped `io` figure behind an unrelated same-named field
+        // elsewhere in `QueryStatsJson`).
+        let io_start = text
+            .find("\"io\":{")
+            .expect("io object present in wire text");
+        let io_rest = &text[io_start..];
+        let io_end = io_rest.find('}').map(|i| i + 1).expect("io object closes");
+        let io_text = &io_rest[..io_end];
+
+        for key in [
+            "\"dependencyDepth\"",
+            "\"listPageDepth\"",
+            "\"serviceBatches\"",
+            "\"unfoldedSegmentsResolved\"",
+            "\"planClass\"",
+        ] {
+            let occurrences = io_text.matches(key).count();
+            assert_eq!(
+                occurrences, 1,
+                "io.{key} must be present exactly once in the wire text, found {occurrences}"
+            );
+        }
     }
 
     #[test]
