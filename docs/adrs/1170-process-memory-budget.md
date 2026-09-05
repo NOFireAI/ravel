@@ -244,11 +244,21 @@ a calibration run that is separate from, and frozen before, the acceptance
 runs, so the acceptance assertion is not circular. Calibration: parts 1, 2 and
 4 landed, the budget set to unlimited so nothing is refused, the same
 10-connection window; the reserve is the maximum over the window of
-`ravel_process_allocator_bytes{stat="resident"}` minus the sum of every tracked
-ledger (`ravel_cache_resident_bytes` for both caches, `ravel_memory_reserved_
-bytes{component="sql"}`, `ravel_memory_reserved_bytes{component="fetch"}`),
-plus a 25% margin, rounded up to the next 256 MiB, and it must exceed the
-`partitions x max batch bytes` exposure in decision 1. That value lands as a
+`ravel_process_allocator_bytes{stat="resident"}` minus the UNIQUE tracked
+total, plus a 25% margin, rounded up to the next 256 MiB, and it must exceed
+the `partitions x max batch bytes` exposure in decision 1.
+
+The unique total is not the sum of the ledgers, because the handoff rule
+deliberately lets a buffer sit in two ledgers for the width of one call, and a
+sum that counts those bytes twice overstates what is tracked and undersizes
+the reserve. The fetch layer therefore keeps one more gauge,
+`ravel_memory_handoff_overlap_bytes`: a fetch guard adds its size to it the
+moment the receiving `try_grow` or cache insert succeeds and subtracts it on
+its own drop, so the gauge is exactly the bytes currently in two ledgers.
+`unique = cache_resident + sql_reserved + fetch_reserved - handoff_overlap`,
+exact by construction rather than bounded by a margin, and the same expression
+is what the acceptance assertion in decision 4 subtracts. The margin covers
+allocator slack and sampling, not accounting overlap. That value lands as a
 constant in the derivation with the calibration figures in its doc comment, the
 way `CACHE_MEMORY_PERCENT` carries the sweep, in a commit that precedes the
 first acceptance run. The acceptance runs then use the frozen value and can
@@ -260,13 +270,16 @@ allocation that calibration did not see, which is a finding, not a recalibration
 - `emit` logs one more line: the budget, the sum of hard caps, the shared
   remainder, and the overhead reserve, with `source=`.
 - Gauges: `ravel_memory_budget_bytes`, `ravel_memory_reserved_bytes{component=
-  "sql"|"fetch"}`, beside the existing cache residency and allocator gauges.
+  "sql"|"fetch"}`, and `ravel_memory_handoff_overlap_bytes` (the bytes
+  currently in two ledgers, so the unique tracked total is computable), beside
+  the existing cache residency and allocator gauges.
 - Pre-registered acceptance, same box, same tenant, same 600 s window at 10
   connections, three consecutive runs after the reserve is frozen: every
   over-budget query ends in `ResourcesExhausted` or `FetchMemoryExhausted`;
   error ratio at or below the 6 GiB arm's 3.9%; peak
-  `ravel_process_allocator_bytes{resident}` at or below budget plus the frozen
-  reserve; and zero kernel kills attributable to a tracked ledger. A kill is
+  `ravel_process_allocator_bytes{resident}` at or below the unique tracked
+  total plus the frozen reserve, where unique subtracts the handoff overlap
+  gauge; and zero kernel kills attributable to a tracked ledger. A kill is
   attributable to the infallible `grow` path only if the server's last breach
   record names an unchecked delta larger than the reserve, and such a kill is
   itself a finding against the reserve's sizing, recorded and re-run, not
