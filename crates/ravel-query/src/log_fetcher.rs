@@ -660,15 +660,19 @@ impl LogSegmentFetcher {
         self
     }
 
-    /// Bounds the in-flight object-store GETs of the block-range path (ADR-0107
-    /// decision 1's permit pool, [`DEFAULT_LOG_MAX_CONCURRENT_GETS`] by
-    /// default). This is the seam `--fetch-concurrency` (ADR-0088) reaches the
-    /// logs signal through; a scan planned at more partitions than this pool
-    /// has permits queues on it (issue #700).
+    /// Bounds the in-flight object-store GETs of BOTH RLOG paths with one
+    /// private [`crate::GetLimiter`] of `n` permits (0 is clamped to 1): the
+    /// fetcher's own whole-object funnel and the block-range path share it, so
+    /// a standalone fetcher built this way is governed by `n` on either path
+    /// and not by [`DEFAULT_LOG_MAX_CONCURRENT_GETS`]. This is the seam
+    /// `--fetch-concurrency` (ADR-0088) reaches the logs signal through; a scan
+    /// planned at more partitions than this pool has permits queues on it
+    /// (issue #700). A fetcher a `QueryEngine` owns is wired with
+    /// [`Self::with_get_limiter`] to the engine's shared limiter instead.
     #[must_use]
-    pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
-        self.block_range = self.block_range.with_max_concurrent_gets(n);
-        self
+    pub fn with_max_concurrent_gets(self, n: usize) -> Self {
+        let limiter = Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
+        self.with_get_limiter(limiter)
     }
 
     /// Wires this fetcher's OWN whole-object GETs and the block-range path to
