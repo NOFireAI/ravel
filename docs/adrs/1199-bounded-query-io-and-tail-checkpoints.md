@@ -297,6 +297,17 @@ change: state the mechanism, the measured rate, and the latency cost of the only
 knob that moves it, so that an operator raising `max_flush_delay` for a tenant
 is making that trade knowingly.
 
+One knob does move the tail without touching acknowledgement latency:
+`max_flush_lifetime`, the writer's abandon deadline, is the largest term in the
+residence window `[X + 20m, X + 1h25m]`. Lowering it on writer, fold and
+compactor together is sound (the seal lemma needs only the writer's per-attempt
+deadline, which `bound_to_deadline` enforces) and worth 35-45% of tail records
+at X = 15 min, not the 2x a first reading suggests, because the hour granularity
+and the 20 m of margin do not move with X. It is not a default to retune here:
+the three crates carry three untied copies of the value, the server fold reads
+no flag for it, and the documented deployment ordering reverses for lowering.
+Issue #1236 carries the analysis and the ADR it would need.
+
 ### 3. The tail checkpoint is specified here and NOT built
 
 The design below is settled so that the gate below has something concrete to
