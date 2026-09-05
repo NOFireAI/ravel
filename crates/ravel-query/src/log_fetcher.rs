@@ -72,7 +72,6 @@ use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreEr
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 use ravel_types::logstream::canonical_attr_bytes;
-use tokio::sync::Semaphore;
 use tracing::Instrument;
 
 /// Upper bound on STREAM_DIR entries accepted when decoding the directory out
@@ -657,6 +656,25 @@ impl LogSegmentFetcher {
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
         self.block_range = self.block_range.with_max_concurrent_gets(n);
         self
+    }
+
+    /// Wires the block-range path to a caller-owned [`crate::GetLimiter`]
+    /// (ADR-1195), so it draws GET permits from the same pool as every other
+    /// fetcher (and, via [`crate::QueryEngine::with_get_limiter`], every
+    /// other engine) holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: std::sync::Arc<crate::GetLimiter>) -> Self {
+        self.block_range = self.block_range.with_get_limiter(limiter);
+        self
+    }
+
+    /// The block-range path's current limiter, for a test to `Arc::ptr_eq`
+    /// against another fetcher's or an engine's, proving two fetchers
+    /// actually share one `GetLimiter` rather than each holding an
+    /// equal-but-distinct one.
+    #[cfg(test)]
+    pub(crate) fn get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
+        self.block_range.get_limiter_for_test()
     }
 
     /// Pins the block-range fetcher's suffix-probe length
@@ -3099,11 +3117,13 @@ pub struct BlockRangeFetcher {
     /// on [`Self::covering_read`] (issue #1007): this field only ever reports
     /// the wire side.
     peak_fetch_run: Arc<AtomicU64>,
-    /// Bounds in-flight byte-range GETs. Its own instance, never shared with
-    /// `SegmentFetcher`'s RSEG semaphore (ADR-0107 decision 1).
-    get_semaphore: Arc<Semaphore>,
+    /// Bounds in-flight byte-range GETs. By default its own private instance
+    /// (ADR-0107 decision 1); [`Self::with_get_limiter`] wires it to the one
+    /// process-shared limiter every query-side fetcher can hold instead
+    /// (ADR-1195).
+    get_limiter: Arc<crate::GetLimiter>,
     /// Reusable object-sized assembly buffers (issue #894), shared by every
-    /// clone of this fetcher the way `get_semaphore` is, so the one production
+    /// clone of this fetcher the way `get_limiter` is, so the one production
     /// `LogSegmentFetcher` pools across every read of the process rather than
     /// per query.
     assembly_pool: Arc<AssemblyBufferPool>,
@@ -3128,7 +3148,9 @@ impl BlockRangeFetcher {
             request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
             max_fetch_run_bytes: crate::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
             peak_fetch_run: Arc::new(AtomicU64::new(0)),
-            get_semaphore: Arc::new(Semaphore::new(DEFAULT_LOG_MAX_CONCURRENT_GETS)),
+            get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
+                DEFAULT_LOG_MAX_CONCURRENT_GETS,
+            )),
             assembly_pool: Arc::new(AssemblyBufferPool::default()),
             wire_bytes: PhaseWireByteCounter::new(),
         }
@@ -3436,8 +3458,25 @@ impl BlockRangeFetcher {
 
     #[must_use]
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
-        self.get_semaphore = Arc::new(Semaphore::new(n.max(1)));
+        self.get_limiter = Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
         self
+    }
+
+    /// Wires this fetcher to a caller-owned [`crate::GetLimiter`] (ADR-1195),
+    /// so it draws GET permits from the same pool as every other fetcher (and,
+    /// via [`crate::QueryEngine::with_get_limiter`], every other engine)
+    /// holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = limiter;
+        self
+    }
+
+    /// This fetcher's current limiter, for a test to `Arc::ptr_eq` against
+    /// another fetcher's or an engine's.
+    #[cfg(test)]
+    pub(crate) fn get_limiter_for_test(&self) -> &Arc<crate::GetLimiter> {
+        &self.get_limiter
     }
 
     /// Whether ADR-0046's read cache is wired into this fetcher. Every GET the
@@ -3467,14 +3506,7 @@ impl BlockRangeFetcher {
         phase: QueryPhase,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, LogFetchError> {
-        let _permit = self
-            .get_semaphore
-            .acquire()
-            .await
-            .map_err(|_| LogFetchError::Store {
-                key: key.to_string(),
-                source: StoreError::Transient("fetch concurrency semaphore closed".to_string()),
-            })?;
+        let _permit = self.get_limiter.acquire().await;
         let got = self
             .store
             .get(key, range)
@@ -5202,7 +5234,7 @@ impl BlockRangeFetcher {
 
         // Every coalesced run concurrently, not one await at a time (mirrors
         // `crate::fetcher::SegmentFetcher::ensure_ranges`' `join_all`). Awaiting
-        // the runs in series made `get_semaphore` inert: a sequential loop never
+        // the runs in series made `get_limiter` inert: a sequential loop never
         // has more than one GET in flight to bound.
         let runs = coalesce_extents(&missing, self.effective_coalesce_gap());
         let outcomes = futures::future::join_all(runs.iter().map(|run| {

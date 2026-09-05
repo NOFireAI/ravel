@@ -335,6 +335,24 @@ pub enum EngineConfigError {
         "logs_max_fetch_run_bytes must be non-zero: the segmented covering fallback divides by it"
     )]
     ZeroFetchBound,
+    /// [`EngineConfig::fetch_concurrency`] was zero (ADR-1195: "zero is
+    /// rejected during configuration resolution").
+    #[error("fetch_concurrency must be at least 1")]
+    ZeroFetchConcurrency,
+    /// A [`GetLimiter`](crate::GetLimiter) was built with, or
+    /// [`EngineConfig::store_get_concurrency`] resolved to, zero permits
+    /// (ADR-1195's `--store-get-concurrency`): a zero-permit limiter can
+    /// never issue a GET.
+    #[error("store GET concurrency must be at least 1")]
+    ZeroGetLimiterPermits,
+    /// [`EngineConfig::sql_partition_count`] resolved to zero (ADR-1195's
+    /// `--sql-partition-count`).
+    #[error("sql_partition_count must be at least 1")]
+    ZeroSqlPartitionCount,
+    /// [`EngineConfig::promql_fetch_fanout`] resolved to zero (ADR-1195's
+    /// `--promql-fetch-fanout`).
+    #[error("promql_fetch_fanout must be at least 1")]
+    ZeroPromqlFetchFanout,
 }
 
 /// [`crate::QueryEngine`] resource limits and concurrency. Every limit is
@@ -412,15 +430,65 @@ pub struct EngineConfig {
     /// ([`Self::validate`]): the segmented fallback divides by it. Defaults to
     /// [`DEFAULT_LOG_MAX_FETCH_RUN_BYTES`] (64 MiB).
     pub logs_max_fetch_run_bytes: u64,
+    /// Explicit override for concurrent object-store GETs, process-wide
+    /// (ADR-1195's `--store-get-concurrency`), fed to the one shared
+    /// [`crate::GetLimiter`] every query-side fetcher honours. `None` falls
+    /// back to [`Self::fetch_concurrency`] (no default moves): use
+    /// [`Self::store_get_concurrency`] to read the resolved value.
+    pub store_get_concurrency: Option<usize>,
+    /// Explicit override for DataFusion `target_partitions`
+    /// (ADR-1195's `--sql-partition-count`); wired into
+    /// `crates/ravel-sql/src/session.rs` by a follow-up task. `None` falls
+    /// back to [`Self::fetch_concurrency`]: use
+    /// [`Self::sql_partition_count`] to read the resolved value.
+    pub sql_partition_count: Option<usize>,
+    /// Explicit override for PromQL `buffer_unordered` fan-out width
+    /// (ADR-1195's `--promql-fetch-fanout`). `None` falls back to
+    /// [`Self::fetch_concurrency`]: use [`Self::promql_fetch_fanout`] to read
+    /// the resolved value.
+    pub promql_fetch_fanout: Option<usize>,
 }
 
 impl EngineConfig {
+    /// The resolved concurrent-GET permit count: the explicit
+    /// [`Self::store_get_concurrency`] override if set, else the legacy
+    /// [`Self::fetch_concurrency`] (ADR-1195: no default moves).
+    pub fn store_get_concurrency(&self) -> usize {
+        self.store_get_concurrency.unwrap_or(self.fetch_concurrency)
+    }
+
+    /// The resolved DataFusion partition count: the explicit
+    /// [`Self::sql_partition_count`] override if set, else the legacy
+    /// [`Self::fetch_concurrency`] (ADR-1195: no default moves).
+    pub fn sql_partition_count(&self) -> usize {
+        self.sql_partition_count.unwrap_or(self.fetch_concurrency)
+    }
+
+    /// The resolved PromQL fan-out width: the explicit
+    /// [`Self::promql_fetch_fanout`] override if set, else the legacy
+    /// [`Self::fetch_concurrency`] (ADR-1195: no default moves).
+    pub fn promql_fetch_fanout(&self) -> usize {
+        self.promql_fetch_fanout.unwrap_or(self.fetch_concurrency)
+    }
+
     /// Refuse a configuration the fetch layer cannot run on (ADR-0996 decision
     /// 2). Called at startup resolution; a bad value is a typed
     /// [`EngineConfigError`], never a silent clamp.
     pub fn validate(&self) -> Result<(), EngineConfigError> {
         if self.logs_max_fetch_run_bytes == 0 {
             return Err(EngineConfigError::ZeroFetchBound);
+        }
+        if self.fetch_concurrency == 0 {
+            return Err(EngineConfigError::ZeroFetchConcurrency);
+        }
+        if self.store_get_concurrency() == 0 {
+            return Err(EngineConfigError::ZeroGetLimiterPermits);
+        }
+        if self.sql_partition_count() == 0 {
+            return Err(EngineConfigError::ZeroSqlPartitionCount);
+        }
+        if self.promql_fetch_fanout() == 0 {
+            return Err(EngineConfigError::ZeroPromqlFetchFanout);
         }
         Ok(())
     }
@@ -444,6 +512,9 @@ impl Default for EngineConfig {
             logs_request_cost_bytes: crate::DEFAULT_LOG_REQUEST_COST_BYTES,
             logs_fetch_policy: LogsFetchPolicy::default(),
             logs_max_fetch_run_bytes: DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
+            store_get_concurrency: None,
+            sql_partition_count: None,
+            promql_fetch_fanout: None,
         }
     }
 }
@@ -800,5 +871,86 @@ mod tests {
         assert_eq!(cfg.validate(), Ok(()));
         cfg.logs_max_fetch_run_bytes = 0;
         assert_eq!(cfg.validate(), Err(EngineConfigError::ZeroFetchBound));
+    }
+
+    #[test]
+    fn zero_fetch_concurrency_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            fetch_concurrency: 0,
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.validate(), Err(EngineConfigError::ZeroFetchConcurrency));
+    }
+
+    /// ADR-1195: each of the three split knobs is validated on its RESOLVED
+    /// value, so a zero override is rejected even though `fetch_concurrency`
+    /// itself stays nonzero -- an operator turning one knob to 0 must not
+    /// silently fall back to the legacy value.
+    #[test]
+    fn zero_store_get_concurrency_override_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            store_get_concurrency: Some(0),
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(EngineConfigError::ZeroGetLimiterPermits)
+        );
+    }
+
+    #[test]
+    fn zero_sql_partition_count_override_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            sql_partition_count: Some(0),
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(EngineConfigError::ZeroSqlPartitionCount)
+        );
+    }
+
+    #[test]
+    fn zero_promql_fetch_fanout_override_is_refused_with_a_typed_error() {
+        let cfg = EngineConfig {
+            promql_fetch_fanout: Some(0),
+            ..EngineConfig::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(EngineConfigError::ZeroPromqlFetchFanout)
+        );
+    }
+
+    /// ADR-1195: no default moves. With all three knobs unset, every
+    /// accessor must return the legacy `fetch_concurrency` value, not some
+    /// new independent default.
+    #[test]
+    fn unset_knobs_all_resolve_to_fetch_concurrency() {
+        let cfg = EngineConfig {
+            fetch_concurrency: 8,
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.validate(), Ok(()));
+        assert_eq!(cfg.store_get_concurrency(), 8);
+        assert_eq!(cfg.sql_partition_count(), 8);
+        assert_eq!(cfg.promql_fetch_fanout(), 8);
+    }
+
+    /// Setting one knob overrides only that knob's accessor; the other two
+    /// still fall back to `fetch_concurrency` (ADR-1195: splitting the knob
+    /// changes which lever an operator turns, not what an untouched knob
+    /// resolves to).
+    #[test]
+    fn one_explicit_knob_overrides_only_its_own_accessor() {
+        let cfg = EngineConfig {
+            fetch_concurrency: 8,
+            promql_fetch_fanout: Some(3),
+            ..EngineConfig::default()
+        };
+        assert_eq!(cfg.validate(), Ok(()));
+        assert_eq!(cfg.promql_fetch_fanout(), 3);
+        assert_eq!(cfg.store_get_concurrency(), 8);
+        assert_eq!(cfg.sql_partition_count(), 8);
     }
 }

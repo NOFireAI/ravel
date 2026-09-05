@@ -683,6 +683,43 @@ resolution limit), wall deadline (server maximum, default
 server maximum are clamped to it. Exceeding a budget returns a
 Prometheus-style error, never a partial silent result.
 
+### GET concurrency (ADR-1195)
+
+The "max concurrent GETs (8, ...)" figure above is the *process-wide*
+ceiling, not a per-selector or per-fetcher one. Every query-side fetcher
+(RSEG `SegmentFetcher`, RLOG `LogSegmentFetcher`/`BlockRangeFetcher`, RSPAN
+`SpanSegmentFetcher`) draws its GET permits from one shared
+`ravel_query::GetLimiter`, an `Arc`-based wrapper over a `tokio::Semaphore`.
+`QueryEngine::new` builds this limiter once and hands the same `Arc` to
+every fetcher it owns; `QueryEngine::with_get_limiter` replaces it on all of
+them at once, letting a process share one ceiling across several engines.
+Before ADR-1195, each fetcher held its own independent semaphore, so N
+fetchers each configured to "8 concurrent GETs" could together put 8N GETs
+in flight against the store; the shared limiter closes that multiplication.
+`SpanSegmentFetcher` previously had no GET bound at all -- constructing one
+directly now gives it a private limiter sized to the fetcher module's
+default concurrent-GET constant, its first-ever concurrency bound, unless
+`with_get_limiter` wires it to the shared one instead.
+
+`EngineConfig::fetch_concurrency` remains the legacy uniform knob: a bare
+`EngineConfig::default()` (or any config that leaves the three knobs below
+unset) behaves exactly as before ADR-1195, because splitting the knob
+changes which lever an operator turns, not what an untouched deployment
+does. Three `Option<usize>` overrides on `EngineConfig` take precedence
+over it when set, each resolved through a same-named accessor method:
+
+- `store_get_concurrency` / `store_get_concurrency()` -- the resolved
+  permit count for the one shared `GetLimiter` described above.
+- `sql_partition_count` / `sql_partition_count()` -- DataFusion
+  `target_partitions`; exposed here, wired into
+  `crates/ravel-sql/src/session.rs` by a follow-up task.
+- `promql_fetch_fanout` / `promql_fetch_fanout()` -- the `buffer_unordered`
+  fan-out width PromQL's per-selector fetch streams use.
+
+`EngineConfig::validate` rejects zero on `fetch_concurrency` and on each
+knob's resolved value (an explicit override of `0`, not just an unset one),
+naming the specific knob in the returned `EngineConfigError`.
+
 ### Segment admission (ADR-0073)
 
 `max_segments` no longer counts every segment in the resolved snapshot. A
