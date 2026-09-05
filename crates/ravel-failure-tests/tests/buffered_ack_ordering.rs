@@ -88,19 +88,29 @@ async fn buffered_ack_returns_before_any_durable_object() {
         .await
         .expect("the buffered write must still flush to the store eventually");
 
-    // Release every PUT as it becomes held, until the data object lands.
-    for _ in 0..8 {
-        for id in gate.held() {
-            gate.release(id);
+    // Release every PUT as it becomes held while racing `shutdown` itself,
+    // instead of breaking out of the release loop early and then awaiting
+    // shutdown unconditionally: the flush can still hold a later PUT (the
+    // commit record) after the data object has landed, and an unconditional
+    // `router.shutdown().await` after that point can wait forever on a hold
+    // this loop never releases. Racing the two means the loop keeps
+    // releasing exactly until shutdown's own `done` acknowledgement fires,
+    // i.e. until the flush has actually completed, not merely until we
+    // observed one object of interest.
+    let mut shutdown = std::pin::pin!(router.shutdown());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            tokio::select! {
+                _ = &mut shutdown => break,
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
         }
-        let objects = list_all(store.as_ref(), "t/").await.expect("list");
-        if objects.iter().any(|o| o.key.contains("/l0/")) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    router.shutdown().await;
+    })
+    .await
+    .expect("router shutdown must complete once every held PUT is released");
     let objects_after = list_all(store.as_ref(), "t/").await.expect("list");
     assert!(
         objects_after.iter().any(|o| o.key.contains("/l0/")),
