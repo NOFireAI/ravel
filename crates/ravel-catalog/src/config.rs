@@ -166,12 +166,27 @@ pub const DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS: u64 = 720;
 /// number of concurrency-bound rounds does): 23.157s at 16 (the prior fixed
 /// constant), 4.374s at 64, 2.341s at 128.
 ///
-/// This bounds one `Catalog` instance, not the process: N concurrent cold
-/// queries against the same or different tenants, each building or reusing a
-/// `Catalog` with this default, can have up to N * 128 record GETs in flight
-/// at once. A process-wide cap across instances is not implemented here and
+/// This bounds one `Catalog` instance, not the process: `ravel-server`
+/// builds exactly one `Catalog` and shares it (via `Arc` clone, so one
+/// underlying `request_semaphore`) across every request, so N concurrent
+/// queries against that instance are capped at 128 in flight TOTAL, not N *
+/// 128. N * 128 in flight holds only across N distinct `Catalog` instances
+/// (e.g. separate CLI invocations or tests), never within one running
+/// server. A process-wide cap across instances is not implemented here and
 /// is tracked as a follow-up.
 pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
+
+/// Upper bound on `resolve_get_concurrency`, enforced by both
+/// [`crate::Catalog::new`] (typed [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig))
+/// and `ravel-server`'s `Cli::validate`. At the ~30ms per-round GET latency
+/// [`DEFAULT_RESOLVE_GET_CONCURRENCY`]'s doc comment measures against, 4,096
+/// in flight sustains roughly 4,096 / 0.030s ~= 136,000 GET/s, about
+/// twenty-five times S3's published per-prefix guidance of ~5,500 GET/s.
+/// Nothing above this is a sane operator value; anything above it is a typo,
+/// and unbounded it parses into a `usize` that panics inside
+/// `tokio::sync::Semaphore::new` (its `permits <= usize::MAX >> 3`
+/// invariant) at startup instead of failing with a typed error.
+pub const MAX_RESOLVE_GET_CONCURRENCY: usize = 4_096;
 
 /// Catalog configuration.
 ///

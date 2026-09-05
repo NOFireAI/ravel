@@ -718,10 +718,13 @@ under S3's published guidance of about 5,500 GET/s per prefix, and every
 request this phase issues lands under one `m/c/<shard>/<hour>/` prefix per
 shard-hour.
 
-This bounds one `Catalog` instance, not the process: N concurrent cold
-queries, each building or reusing a `Catalog` with this default, can
-together put up to N * 128 record GETs in flight at once. A process-wide
-cap across instances is not implemented and is tracked as a follow-up.
+This bounds one `Catalog` instance, not the process: `ravel-server` builds
+exactly one `Catalog` and shares it (an `Arc` clone per request, one
+underlying `request_semaphore`), so N concurrent queries against that
+instance are capped at 128 in flight TOTAL, not N * 128. N * 128 in flight
+holds only across N distinct `Catalog` instances (separate CLI invocations
+or tests), never within one running server. A process-wide cap across
+instances is not implemented and is tracked as a follow-up.
 
 ### GET concurrency (ADR-1195)
 

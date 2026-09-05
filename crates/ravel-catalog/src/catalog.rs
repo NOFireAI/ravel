@@ -467,9 +467,12 @@ impl crate::provisioning::AccountedRecordGet for GuardedRecordGet<'_> {
 
 impl Catalog {
     /// Errors if `config.shard_count == 0` (a resolvable catalog needs at
-    /// least one shard) or `config.resolve_get_concurrency == 0` (a
+    /// least one shard), `config.resolve_get_concurrency == 0` (a
     /// zero-permit semaphore would deadlock every resolve, never silently
-    /// clamped to 1).
+    /// clamped to 1), or `config.resolve_get_concurrency >
+    /// crate::config::MAX_RESOLVE_GET_CONCURRENCY` (past that ceiling,
+    /// `tokio::sync::Semaphore::new` panics instead of failing typed --
+    /// see that constant's doc comment for the basis).
     pub fn new(
         store: Arc<dyn ObjectStoreBackend>,
         config: CatalogConfig,
@@ -480,6 +483,11 @@ impl Catalog {
         if config.resolve_get_concurrency == 0 {
             return Err(CatalogError::InvalidConfig(
                 "resolve_get_concurrency must be > 0",
+            ));
+        }
+        if config.resolve_get_concurrency > crate::config::MAX_RESOLVE_GET_CONCURRENCY {
+            return Err(CatalogError::InvalidConfig(
+                "resolve_get_concurrency must be <= MAX_RESOLVE_GET_CONCURRENCY (4096)",
             ));
         }
         // `byte_cache_max_bytes == 0` is the disabled sentinel:
@@ -3641,7 +3649,7 @@ mod tests {
     use ravel_object_store::InstrumentedStore;
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
+        FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
 
@@ -4637,6 +4645,165 @@ mod tests {
             "every published segment is present once the fan-out drained \
              (concurrency = {concurrency})"
         );
+    }
+
+    /// Waits until `n` calls are held, but bounded: `GateHandle::wait_until_held`
+    /// parks forever if the fan-out under test never reaches `n`, which turns a
+    /// regression (a fan-out site still reading a fixed constant, capped below
+    /// `n`) into a hung test run instead of a failing assertion. Panics naming
+    /// the observed count on timeout.
+    async fn wait_until_held_bounded(gate: &GateHandle, n: usize) {
+        if tokio::time::timeout(Duration::from_secs(5), gate.wait_until_held(n))
+            .await
+            .is_err()
+        {
+            panic!(
+                "held {}, expected {n}: fan-out never reached the configured concurrency \
+                 within 5s",
+                gate.held_count()
+            );
+        }
+    }
+
+    /// Second acceptance case for the same fix (Issue #1238 review round 2):
+    /// `assert_fan_out_peaks_at` above publishes every record into ONE
+    /// `(shard, hour)` bucket, so it only exercises
+    /// `Catalog::prewarm_commit_records` (catalog.rs:2521) -- every other
+    /// `.buffered`/`buffer_unordered` fan-out site (catalog.rs:1932, 1970,
+    /// 2486, `snapshot_resolve.rs:751`) iterates a single element there and
+    /// cannot prove anything about its width. This drives
+    /// `load_snapshot_parts`'s buffered fan-out (`snapshot_resolve.rs:751`,
+    /// the snapshot-part load, the hot path for a FOLDED tenant): fold the
+    /// tenant first with `snapshot_part_max_entries: 1` so `concurrency * 4`
+    /// distinct sealed hours each seal into their own snapshot part,
+    /// comfortably more parts than the configured concurrency, then resolve
+    /// over a fresh catalog (empty part cache) and observe the exact number
+    /// of part GETs in flight at once.
+    ///
+    /// FLIP (pre-fix demonstration): revert `snapshot_resolve.rs:751` to a
+    /// literal `.buffered(16)`. At `concurrency = 32` the fan-out never
+    /// exceeds 16 in flight, so this fails with "held 16, expected 32"
+    /// (via `wait_until_held_bounded`) instead of hanging CI.
+    #[tokio::test]
+    async fn resolve_fan_out_reaches_the_configured_concurrency_after_fold() {
+        assert_folded_snapshot_fan_out_peaks_at(32).await;
+    }
+
+    async fn assert_folded_snapshot_fan_out_peaks_at(concurrency: usize) {
+        let store = Arc::new(MemoryStore::new());
+        let part_count = concurrency * 4;
+        let base_hour = 500_000u32;
+        let last_hour = base_hour + part_count as u32 - 1;
+        let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        let now_ns = (i64::from(last_hour) + 1) * NS_PER_HOUR + fold_margin;
+
+        // One entry per hour: at `snapshot_part_max_entries = 1` the fold
+        // seals every hour into its own part (fold.rs's
+        // `ceiling_crossing_produces_multiple_parts` establishes this split
+        // rule), so `part_count` distinct sealed hours produce exactly
+        // `part_count` snapshot parts.
+        for offset in 0..part_count as u32 {
+            let hour = base_hour + offset;
+            let created = (i64::from(hour) + 1) * NS_PER_HOUR - 1_000;
+            publish_segment(
+                &store,
+                0,
+                u64::from(offset) + 1,
+                hour,
+                created,
+                created - 1_000,
+                created,
+            )
+            .await;
+        }
+
+        let fold_cfg = CatalogConfig {
+            snapshot_part_max_entries: 1,
+            ..config(1)
+        };
+        let fold_catalog = Catalog::new(store.clone(), fold_cfg).expect("fold catalog");
+        let fold_report = fold_catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            fold_report.parts_total, part_count as u64,
+            "one entry per hour at snapshot_part_max_entries = 1 seals one part per hour"
+        );
+
+        // A fresh store handle (FaultStore around the same underlying
+        // MemoryStore) and a fresh Catalog (empty part cache), so
+        // `load_snapshot_parts` must fetch every part instead of serving any
+        // of them from cache.
+        let gated_store = Arc::new(FaultStore::new(store.clone(), FaultPlan::empty()));
+        let gate = gated_store.hold(Op::Get, Some(".csnap".to_string()), Occurrence::Always);
+        let resolve_catalog = Arc::new(
+            Catalog::new(
+                gated_store.clone(),
+                CatalogConfig {
+                    resolve_get_concurrency: concurrency,
+                    ..config(1)
+                },
+            )
+            .expect("resolve catalog"),
+        );
+
+        let range = TimeRange {
+            start_ns: i64::from(base_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        let acc = QueryAccounting::new();
+        let cat_task = resolve_catalog.clone();
+        let task = tokio::spawn(async move {
+            cat_task
+                .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now_ns, &acc)
+                .await
+        });
+
+        wait_until_held_bounded(&gate, concurrency).await;
+        assert_eq!(
+            gate.held_count(),
+            concurrency,
+            "exactly the configured number of snapshot-part GETs are in flight at once \
+             (concurrency = {concurrency})"
+        );
+
+        // Release the first wave and confirm the fan-out refills to exactly
+        // the same bound, not just once by chance.
+        for id in gate.held() {
+            gate.release(id);
+        }
+        wait_until_held_bounded(&gate, concurrency).await;
+        assert_eq!(
+            gate.held_count(),
+            concurrency,
+            "the fan-out refills to exactly the configured bound on a second wave \
+             (concurrency = {concurrency})"
+        );
+
+        let mut spins = 0;
+        while !task.is_finished() {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            spins += 1;
+            assert!(
+                spins < 10_000,
+                "resolve did not finish after releasing every held snapshot-part GET \
+                 (concurrency = {concurrency})"
+            );
+        }
+        task.await.expect("join resolve task").expect("resolve");
     }
 
     /// Issue #1238: `CatalogConfig::resolve_get_concurrency` defaults to 128,
