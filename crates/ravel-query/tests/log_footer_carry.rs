@@ -274,7 +274,7 @@ async fn footer_carried_subset_open_skips_the_probe() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let fetcher = ranged_fetcher(store, tail);
     let acc = QueryAccounting::new();
-    let (survivors, _stats, footer) = fetcher
+    let (survivors, _stats, footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &query, &acc)
         .await
         .expect("plan")
@@ -294,6 +294,7 @@ async fn footer_carried_subset_open_skips_the_probe() {
             &ColumnSelection::all(),
             &indices,
             Some(&footer),
+            None,
             &acc,
         )
         .await
@@ -326,6 +327,7 @@ async fn footer_carried_subset_open_skips_the_probe() {
             &query,
             &ColumnSelection::all(),
             &indices,
+            None,
             None,
             &acc2,
         )
@@ -366,7 +368,7 @@ async fn footer_carried_open_still_catches_an_etag_change() {
     let base = store_with_object(bytes).await;
     let plan_fetcher = ranged_fetcher(Arc::clone(&base) as Arc<dyn ObjectStoreBackend>, tail);
     let acc = QueryAccounting::new();
-    let (_survivors, _stats, footer) = plan_fetcher
+    let (_survivors, _stats, footer, _whole_object) = plan_fetcher
         .plan_segment(&seg, TENANT, &query, &acc)
         .await
         .expect("plan")
@@ -390,6 +392,7 @@ async fn footer_carried_open_still_catches_an_etag_change() {
             &ColumnSelection::all(),
             &indices,
             Some(&footer),
+            None,
             &QueryAccounting::new(),
         )
         .await;

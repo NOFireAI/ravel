@@ -293,6 +293,7 @@ pub struct CountingStore {
     inner: Arc<dyn ObjectStoreBackend>,
     puts: AtomicU64,
     gets: AtomicU64,
+    get_bytes: AtomicU64,
     heads: AtomicU64,
     lists: AtomicU64,
     deletes: AtomicU64,
@@ -304,6 +305,7 @@ impl CountingStore {
             inner,
             puts: AtomicU64::new(0),
             gets: AtomicU64::new(0),
+            get_bytes: AtomicU64::new(0),
             heads: AtomicU64::new(0),
             lists: AtomicU64::new(0),
             deletes: AtomicU64::new(0),
@@ -326,6 +328,12 @@ impl CountingStore {
 
     pub fn gets(&self) -> u64 {
         self.gets.load(Ordering::Acquire)
+    }
+
+    /// Bytes returned by every successful `get`, counting the actual response
+    /// payload (a ranged read counts its range, not `total_size`).
+    pub fn get_bytes(&self) -> u64 {
+        self.get_bytes.load(Ordering::Acquire)
     }
 
     pub fn lists(&self) -> u64 {
@@ -351,7 +359,10 @@ impl ObjectStoreBackend for CountingStore {
         range: ravel_object_store::GetRange,
     ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
         self.gets.fetch_add(1, Ordering::AcqRel);
-        self.inner.get(key, range).await
+        let outcome = self.inner.get(key, range).await?;
+        self.get_bytes
+            .fetch_add(outcome.data.len() as u64, Ordering::AcqRel);
+        Ok(outcome)
     }
 
     async fn head(

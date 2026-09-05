@@ -265,7 +265,8 @@ use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{
-    ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher, LogSegmentScan,
+    CarriedWholeObject, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
+    LogSegmentScan,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -2073,6 +2074,7 @@ impl RowFetchSource {
                 &self.columns,
                 &[block],
                 None,
+                None,
                 &self.accounting,
             )
             .await
@@ -2380,6 +2382,7 @@ impl ExecutionPlan for LogsScanExec {
             pending_range: None,
             current_indices: Vec::new(),
             current_footer: None,
+            current_whole_object: None,
             seg_columnar_blocks: 0,
             state,
         }))
@@ -2417,6 +2420,13 @@ struct SegPlan {
     /// instead. Carried to each per-partition subset open through [`OwnedSeg`] so
     /// the open reuses it and skips its own suffix probe.
     footer: Option<LogFooter>,
+    /// The whole-object bytes the plan fallback branch already fetched for
+    /// this segment (issue #835), when that branch resolved the entire
+    /// object. Carried to the subset open through [`OwnedSeg`] so it does not
+    /// pay a second wire GET for bytes the plan phase already holds. `None`
+    /// on the fast/skip-decidable footer branches (no block read) and on the
+    /// fallback's ranged crossover (not the whole object).
+    whole_object: Option<CarriedWholeObject>,
 }
 
 type CountsFuture = Pin<Box<dyn Future<Output = DFResult<Arc<PlanCounts>>> + Send>>;
@@ -2476,17 +2486,18 @@ async fn compute_plan_counts(
                 .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting),
         );
     }
-    let planned: Vec<Option<(usize, ScanStats, Option<LogFooter>)>> = futures::stream::iter(prunes)
-        .buffered(plan_concurrency.max(1))
-        .map_err(SqlError::from)
-        .try_collect()
-        .await?;
+    let planned: Vec<Option<(usize, ScanStats, Option<LogFooter>, Option<CarriedWholeObject>)>> =
+        futures::stream::iter(prunes)
+            .buffered(plan_concurrency.max(1))
+            .map_err(SqlError::from)
+            .try_collect()
+            .await?;
     let mut segs = Vec::with_capacity(segments.len());
     let mut total_blocks = 0usize;
     let mut full_reads = 0usize;
     for entry in planned {
         match entry {
-            Some((survivors, stats, footer)) => {
+            Some((survivors, stats, footer, whole_object)) => {
                 total_blocks += survivors;
                 // A relevant segment planned from the skip index carries its
                 // footer forward; the whole-object fallback (#761) carries none.
@@ -2497,6 +2508,7 @@ async fn compute_plan_counts(
                     survivors,
                     stats,
                     footer,
+                    whole_object,
                 }));
             }
             None => segs.push(None),
@@ -2521,6 +2533,11 @@ struct OwnedSeg {
     /// carried to the subset open so it skips its own suffix probe. `None` on the
     /// whole-segment fast path (no plan phase) and when the plan slow branch ran.
     footer: Option<LogFooter>,
+    /// The plan fallback's whole-object bytes for this segment (issue #835),
+    /// carried to the subset open so it does not pay a second wire GET.
+    /// `None` whenever [`SegPlan::whole_object`] was `None`, and always
+    /// `None` on the whole-segment fast path (no plan phase).
+    whole_object: Option<CarriedWholeObject>,
 }
 
 /// This partition's share of the block assignment, in one of two modes
@@ -2565,6 +2582,7 @@ fn owned_work(
                     ordinal: seg_idx,
                     indices,
                     footer: plan.footer.clone(),
+                    whole_object: plan.whole_object.clone(),
                 });
             }
         }
@@ -2581,6 +2599,7 @@ fn owned_work(
                     ordinal: seg_idx,
                     indices: (0..plan.survivors).collect(),
                     footer: plan.footer.clone(),
+                    whole_object: plan.whole_object.clone(),
                 });
             }
             seg_ordinal += 1;
@@ -2619,6 +2638,7 @@ fn owned_whole_segments(
                 ordinal: seg_idx,
                 indices: Vec::new(),
                 footer: None,
+                whole_object: None,
             });
         }
         ordinal += 1;
@@ -2777,6 +2797,7 @@ fn open_segment_subset(
     seg: SegmentRef,
     indices: Vec<usize>,
     footer: Option<LogFooter>,
+    whole_object: Option<CarriedWholeObject>,
 ) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
@@ -2789,6 +2810,7 @@ fn open_segment_subset(
                 &ctx.columns,
                 &indices,
                 footer.as_ref(),
+                whole_object,
                 &ctx.accounting,
             )
             .await
@@ -3059,6 +3081,12 @@ struct LogScanStream {
     /// 2), kept so the `attrs_raw` fallback re-opens the subset with the same
     /// footer it first used. `None` on the whole-segment fast path.
     current_footer: Option<LogFooter>,
+    /// The plan fallback's whole-object bytes for [`Self::current_seg`] (issue
+    /// #835), kept so the `attrs_raw` fallback re-opens the subset with the
+    /// same bytes instead of a second wire GET. `None` whenever the plan
+    /// phase did not carry whole-object bytes forward for this segment, and
+    /// always `None` on the whole-segment fast path.
+    current_whole_object: Option<CarriedWholeObject>,
     /// How many of this partition's blocks in the current segment the columnar
     /// fast path has already emitted. The `attrs_raw` fallback re-opens the
     /// segment over `current_indices` and skips this many positions so none is
@@ -3284,11 +3312,13 @@ impl Stream for LogScanStream {
                         ordinal,
                         indices,
                         footer,
+                        whole_object,
                     }) => {
                         this.current_seg = Some(seg.clone());
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = indices.clone();
                         this.current_footer = footer.clone();
+                        this.current_whole_object = whole_object.clone();
                         this.seg_columnar_blocks = 0;
                         this.block_cursor = 0;
                         // Whole-segment fast path reads the object in one GET
@@ -3317,6 +3347,7 @@ impl Stream for LogScanStream {
                                 seg,
                                 indices,
                                 footer,
+                                whole_object,
                             ))
                         };
                     }
@@ -3485,6 +3516,7 @@ impl Stream for LogScanStream {
                                     seg,
                                     this.current_indices.clone(),
                                     this.current_footer.clone(),
+                                    this.current_whole_object.clone(),
                                 )
                             };
                             this.state = LogScanState::ReopenRows {
