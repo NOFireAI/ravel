@@ -8,10 +8,12 @@
 //!   configured `shard_count` in the record as a tenant's data first lands, and
 //! - the startup static-tenant check ([`validate_static_provisioning`]), which
 //!   refuses to start only when a statically-known tenant's record is
-//!   unreadable, or when adopting the configured value would hide pre-ADR data.
-//!   A decodable record whose recorded `shard_count` differs from the live
-//!   `--shards` default is tolerated: routing uses the record's own generation
-//!   history (ADR-0082).
+//!   unreadable, has a structurally invalid generation history
+//!   ([`ProvisioningError::CorruptGenerations`]), or when adopting the
+//!   configured value would hide pre-ADR data. A decodable record with a valid
+//!   history whose recorded `shard_count` differs from the live `--shards`
+//!   default is tolerated: routing uses the record's own generation history
+//!   (ADR-0082).
 //!
 //! The catalog resolve consumer is wired in `ravel_catalog` itself
 //! (`Catalog::with_provisioning_enforcement`); the maintain per-tenant loop is
@@ -24,9 +26,10 @@
 //! [`ProvisioningCheck::FreshNoData`] for a (tenant, signal) with no record and
 //! no data, so an operator-managed cluster that starts with zero data and
 //! configured tenant tokens passes through cleanly; only pre-ADR data a lower
-//! `shard_count` would hide, or an unreadable record, refuses. A decodable
-//! record whose recorded `shard_count` differs from the live default is
-//! tolerated (ADR-0082).
+//! `shard_count` would hide, an unreadable record, or a record with a
+//! structurally invalid generation history, refuses. A decodable record with
+//! a valid history whose recorded `shard_count` differs from the live default
+//! is tolerated (ADR-0082).
 
 use std::collections::HashSet;
 use std::sync::Arc;
