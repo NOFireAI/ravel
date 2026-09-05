@@ -685,17 +685,28 @@ Prometheus-style error, never a partial silent result.
 
 ### GET concurrency (ADR-1195)
 
-The "max concurrent GETs (8, ...)" figure above is the *process-wide*
-ceiling, not a per-selector or per-fetcher one. Every query-side fetcher
-(RSEG `SegmentFetcher`, RLOG `LogSegmentFetcher`/`BlockRangeFetcher`, RSPAN
-`SpanSegmentFetcher`) draws its GET permits from one shared
-`ravel_query::GetLimiter`, an `Arc`-based wrapper over a `tokio::Semaphore`.
-`QueryEngine::new` builds this limiter once and hands the same `Arc` to
-every fetcher it owns; `QueryEngine::with_get_limiter` replaces it on all of
-them at once, letting a process share one ceiling across several engines.
+The "max concurrent GETs (8, ...)" figure above is the ceiling for the
+fetchers one `QueryEngine` owns, not a per-selector one. Inside an engine the
+RSEG `SegmentFetcher`, the RLOG `BlockRangeFetcher` (the block-range protocol
+that `LogSegmentFetcher` delegates to) and the RSPAN `SpanSegmentFetcher`
+draw their GET permits from one shared `ravel_query::GetLimiter`, an
+`Arc`-based wrapper over a `tokio::Semaphore`. `QueryEngine::new` builds this
+limiter once and hands the same `Arc` to the fetchers it owns;
+`QueryEngine::with_get_limiter` replaces it on all of them at once, so a
+process can share one ceiling across several engines.
+
+Two gaps remain until the server half of ADR-1195 lands. The ceiling is per
+engine, not per process: `ravel-server` and `ravel-sql` still construct
+engines and standalone fetchers with their own limiters. And the RLOG
+whole-object funnel (`LogSegmentFetcher::fetch_accounted` and
+`whole_object_bytes`, taken by every object at or below the block-range
+threshold) issues its GETs without a permit, as it did before ADR-1195; only
+the block-range protocol is bounded today.
+
 Before ADR-1195, each fetcher held its own independent semaphore, so N
 fetchers each configured to "8 concurrent GETs" could together put 8N GETs
-in flight against the store; the shared limiter closes that multiplication.
+in flight against the store; the shared limiter closes that multiplication
+for the fetchers it reaches.
 `SpanSegmentFetcher` previously had no GET bound at all -- constructing one
 directly now gives it a private limiter sized to the fetcher module's
 default concurrent-GET constant, its first-ever concurrency bound, unless
