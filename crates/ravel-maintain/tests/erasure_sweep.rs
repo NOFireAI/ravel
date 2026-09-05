@@ -21,11 +21,13 @@ use common::*;
 use prost::Message;
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::{erasure, signal};
+use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, ErasureRewriteOutcome, FixedClock, LeaseCheck,
-    LegalHoldCheck, MaintainMemo, NoLeases, PendingErasureRequest, SupersededSweepOutcome,
-    compact_bucket, erasure_rewrite_bucket, shard_hold_scopes, sweep_erasure_requests,
-    sweep_superseded, write_hold_set,
+    LegalHoldCheck, MaintainMemo, NoLeases, PendingErasureRequest, RetentionConfig,
+    RetentionOutcome, RetentionPolicy, SupersededSweepOutcome, bucket_erasure_completion,
+    compact_bucket, erasure_rewrite_bucket, retention_sweep_bucket, shard_hold_scopes,
+    sweep_erasure_requests, sweep_superseded, write_hold_set,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
@@ -549,6 +551,91 @@ async fn held_dreq_survives_past_horizon() {
     );
 }
 
+/// DreqSweep / DreqSweepRespectsLegalHold (lifecycle traceability row 27): a
+/// `.dreq` past its own horizon, with a valid `.done`, and never itself
+/// protected by any hold, is still kept when the rewrite's own superseded
+/// input chain is legally held -- distinct from [`held_dreq_survives_past_horizon`]
+/// above, where the hold covers the `del/` key directly. Here the hold covers
+/// only the shard's data/commit/L1 prefixes ([`shard_hold_scopes`]), which
+/// never overlap `del/`, so `lease.is_protected(dreq_key)` is false and the
+/// only path that can keep the request is rule 6 observing rule 2's own
+/// chain-level hold (`chain_groups_held_by_legal_hold`) through
+/// `held_by_superseded_inputs`.
+///
+/// Flip-line proof: in `sweep_erasure_requests_inner`, replace `let held =
+/// holds.request_ids.contains(&request_id_s) || !holds.truncated_buckets.is_empty();`
+/// with `let held = false;`: the held case then deletes the `.dreq` exactly
+/// like the control, failing `assert_eq!(held_out.deleted, 0, ...)` below.
+#[tokio::test]
+async fn dreq_sweep_keeps_request_markers_whose_chain_is_legally_held() {
+    let created = sealed_now_ns();
+    let b = bucket();
+
+    // Control: no hold anywhere. The rewrite's superseded chain is freely
+    // clearable, so rule 6 deletes the completed, past-horizon `.dreq`.
+    let control = MemoryStore::new();
+    let clock = FixedClock::new(created);
+    for spec in metrics_specs() {
+        seed_input(&control, &spec).await;
+    }
+    run_rewrite(&control, &clock).await;
+    let (control_dreq_key, _) = seed_dreq_done(&control, 42, Some(created)).await;
+    let control_out = sweep_dreq(&control, past_horizon(created), &NoLeases).await;
+    assert_eq!(
+        control_out.deleted, 1,
+        "control: nothing holds the chain, the marker is removed"
+    );
+    assert_eq!(control_out.held_by_superseded_inputs, 0);
+    assert!(!present(&control, &control_dreq_key).await);
+
+    // Held: a legal hold over the shard's real key prefixes (not `del/`)
+    // holds the whole supersession chain the rewrite produced. The `.dreq`'s
+    // own key is untouched by the hold, its `.done` is valid, and it is well
+    // past its horizon -- every rule-6 gate other than the chain-hold
+    // observation says "delete this."
+    let held = MemoryStore::new();
+    let clock = FixedClock::new(created);
+    for spec in metrics_specs() {
+        seed_input(&held, &spec).await;
+    }
+    run_rewrite(&held, &clock).await;
+    let (held_dreq_key, _) = seed_dreq_done(&held, 42, Some(created)).await;
+    for (i, scope) in shard_hold_scopes(&b.tenant_hash, b.signal, b.shard)
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        write_hold_set(
+            &held,
+            &b.tenant_hash,
+            Uuid::from_u128(300 + i as u128),
+            created,
+            scope,
+            "litigation hold",
+        )
+        .await
+        .unwrap();
+    }
+    let lease = LegalHoldCheck::refresh(&held, &b.tenant_hash)
+        .await
+        .unwrap();
+    assert!(
+        !lease.is_protected(&held_dreq_key),
+        "shard_hold_scopes never covers del/, so the dreq key itself is not held"
+    );
+
+    let held_out = sweep_dreq(&held, past_horizon(created), &lease).await;
+    assert_eq!(
+        held_out.deleted, 0,
+        "the held chain keeps the marker even though the dreq key itself is unheld"
+    );
+    assert_eq!(
+        held_out.held_by_superseded_inputs, 1,
+        "held specifically via the chain observation, not the dreq-key-held path"
+    );
+    assert!(present(&held, &held_dreq_key).await, ".dreq survives");
+}
+
 /// A completion with a zero `completed_unix_ns` is a fail-safe keep: a zero
 /// anchor would collapse the horizon gate to always-past.
 ///
@@ -562,4 +649,189 @@ async fn zero_completion_timestamp_keeps_dreq() {
     let out = sweep_dreq(&store, i64::MAX / 2, &NoLeases).await;
     assert_eq!(out.deleted, 0, "zero completion anchor is not a valid gate");
     assert!(present(&store, &dreq_key).await);
+}
+
+/// CompleteErasure / CompletionRespectsLegalHold (lifecycle traceability row
+/// 25): a legal hold covering the bucket blocks `bucket_erasure_completion`
+/// unconditionally, checked before the served-set read. Isolated from the
+/// served-set branch: the seeded input's event-time window does not overlap
+/// the pending request's window at all, so without a hold the served-set
+/// check alone already reports the bucket complete (`blocked` empty,
+/// `unresolved` false); the flip to `unresolved: true` under the hold is
+/// caused solely by the legal-hold gate, not by anything the served-set
+/// branch would have found.
+///
+/// Flip-line proof: in `bucket_erasure_completion`, delete the `if
+/// bucket_is_held(&listing, lease) { out.unresolved = true; return Ok(out); }`
+/// block. Completion then falls through to the served-set check, which (given
+/// the non-overlapping window) reports `unresolved: false`, failing
+/// `assert!(held.unresolved, ...)` below.
+#[tokio::test]
+async fn erasure_completion_refuses_while_a_legal_hold_covers_the_bucket() {
+    let store = MemoryStore::new();
+    let spec = InputSpec::new(
+        Uuid::from_u128(0x51),
+        1,
+        1,
+        vec![raw_series(
+            "victim",
+            &[("k", "a")],
+            &[(1_000, 1.0), (2_000, 2.0)],
+        )],
+    );
+    seed_input(&store, &spec).await;
+
+    let request_id = Uuid::from_u128(0x52);
+    let request = ErasureRequest {
+        format_version: 1,
+        tenant_hash: tenant_hash().0.to_vec(),
+        signal: signal::to_proto(Signal::Metrics) as i32,
+        request_id: request_id.to_string(),
+        created_unix_ns: 0,
+        predicate: vec![ErasurePredicateMatcher {
+            key: "__name__".to_string(),
+            value: "victim".to_string(),
+        }],
+        // Strictly after the seeded input's [1_000, 2_000] event-time range,
+        // so `bucket_may_overlap` is false regardless of the hold.
+        window_start_ns: 1_000_000,
+        window_end_ns: 2_000_000,
+        reason: String::new(),
+    };
+    let pending = vec![PendingErasureRequest {
+        request_key: keys::erasure_request_key(&tenant_hash(), Signal::Metrics, request_id)
+            .expect("dreq key"),
+        request,
+    }];
+
+    let clock = FixedClock::new(sealed_now_ns());
+    let config = cfg();
+
+    // Control: with no hold, the non-overlapping window alone already means
+    // the served-set check reports the bucket complete.
+    let control =
+        bucket_erasure_completion(&store, &clock, &config, &NoLeases, &bucket(), &pending)
+            .await
+            .expect("completion without hold");
+    assert!(
+        control.blocked.is_empty(),
+        "the request window does not overlap the seeded input"
+    );
+    assert!(
+        !control.unresolved,
+        "control: the served-set check alone would allow completion"
+    );
+
+    let scopes = shard_hold_scopes(&tenant_hash(), Signal::Metrics, SHARD).expect("shard scopes");
+    for (i, scope) in scopes.iter().enumerate() {
+        write_hold_set(
+            &store,
+            &tenant_hash(),
+            Uuid::from_u128(200 + i as u128),
+            0,
+            scope,
+            "litigation hold",
+        )
+        .await
+        .expect("set hold");
+    }
+    let lease = LegalHoldCheck::refresh(&store, &tenant_hash())
+        .await
+        .expect("refresh");
+
+    let held = bucket_erasure_completion(&store, &clock, &config, &lease, &bucket(), &pending)
+        .await
+        .expect("completion under hold");
+    assert!(
+        held.blocked.is_empty(),
+        "the hold gate returns before the served-set check ever populates blocked"
+    );
+    assert!(
+        held.unresolved,
+        "a bucket under legal hold stays unresolved regardless of the served-set outcome"
+    );
+}
+
+/// A retention config whose window for the test tenant is exactly the floor,
+/// so the tiny-timestamp fixtures (events at ts 1_000-3_000, `now` at
+/// [`sealed_now_ns`]) are always expired.
+fn retention_at_floor(config: &CompactorConfig) -> RetentionConfig {
+    let floor = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+    RetentionConfig::from_policy(
+        RetentionPolicy {
+            default: None,
+            tenants: vec![(TENANT.to_string(), floor)],
+        },
+        config,
+        DEFAULT_MAX_INGEST_LAG_NS,
+    )
+    .expect("valid retention config")
+}
+
+/// PerformRewrite / tombstone guard (lifecycle traceability row 29): once a
+/// bucket carries a retention tombstone, `erasure_rewrite_bucket` refuses to
+/// run at all -- checked against a fresh listing at rewrite time, not a
+/// cached decision. Isolated from the other refusal outcomes: the control
+/// runs the identical seeded bucket and pending request with no tombstone and
+/// gets `Rewritten`, so the flip to `Tombstoned` is caused solely by the
+/// tombstone-listing check, not by `NotSealed`/`NoApplicableRequests`/`Held`.
+///
+/// Flip-line proof: in `erasure_rewrite_bucket`, delete the `if
+/// listing.tombstone_key.is_some() { return Ok(ErasureRewriteOutcome::Tombstoned); }`
+/// block. The tombstoned case then falls through to the live-input resolution
+/// and rewrites the (physically already-swept) bucket instead of refusing,
+/// failing the `matches!(outcome, ErasureRewriteOutcome::Tombstoned)` assertion
+/// below.
+#[tokio::test]
+async fn erasure_rewrite_refuses_a_tombstoned_bucket_with_the_tombstoned_outcome() {
+    let created = sealed_now_ns();
+    let config = cfg();
+
+    // Control: the same seeded bucket and pending request, no tombstone. The
+    // rewrite proceeds normally, proving the fixture is otherwise rewritable.
+    let control = MemoryStore::new();
+    let clock = FixedClock::new(created);
+    for spec in metrics_specs() {
+        seed_input(&control, &spec).await;
+    }
+    let control_outcome = run_rewrite(&control, &clock).await;
+    assert!(
+        matches!(control_outcome, ErasureRewriteOutcome::Rewritten { .. }),
+        "control: an untombstoned bucket rewrites normally, got {control_outcome:?}"
+    );
+
+    // Tombstoned: retention expires and tombstones the bucket before the
+    // rewrite pass ever runs.
+    let store = MemoryStore::new();
+    for spec in metrics_specs() {
+        seed_input(&store, &spec).await;
+    }
+    let b = bucket();
+    let retention = retention_at_floor(&config);
+    let retention_outcome =
+        retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("retention pass");
+    assert_eq!(
+        retention_outcome,
+        RetentionOutcome::Tombstoned,
+        "the tiny-timestamp fixture is expired under the floor window"
+    );
+
+    let mut memo = MaintainMemo::with_default_interval();
+    let outcome = erasure_rewrite_bucket(
+        &store,
+        &clock,
+        &config,
+        &NoLeases,
+        &b,
+        &[pending_request(42, "victim")],
+        &mut memo,
+    )
+    .await
+    .expect("rewrite over a tombstoned bucket");
+    assert!(
+        matches!(outcome, ErasureRewriteOutcome::Tombstoned),
+        "a tombstoned bucket refuses the rewrite entirely, got {outcome:?}"
+    );
 }
