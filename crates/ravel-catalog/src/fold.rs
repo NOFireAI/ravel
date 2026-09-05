@@ -5165,73 +5165,107 @@ mod tests {
     /// publishing CAS lands only after that input's superseded-sweep horizon
     /// has passed (so a real deployment's maintenance process would already
     /// have physically deleted it), must never publish a snapshot that names
-    /// the swept input. `fold_reconcile_window_hours` (default 26, see
-    /// `config.rs`) is sized in hours-behind-watermark specifically so this
-    /// holds regardless of how much wall-clock time elapses: the reconcile
-    /// pass re-lists the bucket and excludes the input by matching the
-    /// compaction record's own input list, never by re-reading the (possibly
-    /// already-gone) input object itself.
+    /// the swept input. Nothing inside `Catalog::fold` samples a clock or
+    /// times its own duration (module docs above: "this crate never reads a
+    /// clock"); the guarantee comes from `DoFoldRebase`, the HEAD CAS retry
+    /// loop's `PreconditionFailed`/`AlreadyExists` branch: a delayed fold's
+    /// CAS loses to whichever fold's fresher listing published first, and the
+    /// loser re-reads HEAD and takes the no-op path instead of ever
+    /// publishing its own stale listing. A `FaultStore` hold on the delayed
+    /// fold's HEAD PUT freezes it after its LIST and before its CAS so a
+    /// second, unheld fold can win the race while the compaction and the
+    /// sweep both land in between.
     #[tokio::test]
     async fn fold_that_lists_before_a_compaction_and_cas_after_the_sweep_horizon_does_not_name_a_swept_input()
      {
-        let store = Arc::new(MemoryStore::new());
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let cfg = CatalogConfig {
             shard_count: 1,
             snapshot_part_max_entries: 1,
             ..Default::default()
         };
-        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+        let catalog = Arc::new(Catalog::new(store.clone(), cfg).expect("catalog"));
 
-        // Hour 10 seals into its own part; hour 11 is the tail. This fold's
-        // LIST of hour 10 sees only the raw L0 segment: no compaction exists
-        // yet.
+        // Hour 10 seals into its own part; hour 11 is the tail. Fold A's LIST
+        // of hour 10 sees only the raw L0 segment: no compaction exists yet.
         let now_1 = now_at_seal(11);
         let writer_a = Uuid::new_v4();
-        let seg_a = publish_segment(&store, 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
-        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
-        let first = catalog
-            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
-            .await
-            .expect("first fold");
-        assert_eq!(first.parts_total, 2);
-        assert_eq!(first.entry_count, 2);
+        let seg_a =
+            publish_segment(store.inner(), 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
 
-        // A compaction lands in the already-sealed, already-folded hour 10,
-        // superseding seg_a's L0 with one L1 part.
-        publish_compaction(&store, 0, 10, &[&seg_a], now_1).await;
+        // Hold fold A's HEAD PUT: HEAD is absent, so this is the very first
+        // (and only, until released) call that matches. Fold A's LIST has
+        // already completed by the time its PUT is attempted, so the hold
+        // freezes it exactly after LIST and before CAS.
+        let gate = store.hold(Op::Put, Some("HEAD".to_string()), Occurrence::Nth(1));
+        let cat_a = catalog.clone();
+        let fold_a = tokio::spawn(async move {
+            cat_a
+                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+                .await
+        });
+        gate.wait_until_held(1).await;
+        assert_eq!(gate.held_count(), 1, "fold A is blocked on its HEAD CAS");
+
+        // A compaction lands while fold A is paused, superseding seg_a's L0
+        // with one L1 part.
+        publish_compaction(store.inner(), 0, 10, &[&seg_a], now_1).await;
 
         // Simulate the superseded-input sweep: once `protection_horizon_ns`
         // has elapsed past the compaction's own `created_unix_ns`, a real
         // maintenance process would physically delete seg_a's commit record
         // and data object (docs/deletion-and-gc.md's superseded-input sweep
-        // row). Do that directly here (ravel-maintain is out of this task's
-        // scope) so the SECOND fold below runs against a bucket where the
-        // swept input is already gone from the store, not merely superseded.
+        // row; the delete blocker there is vacuous while HEAD is still
+        // absent, which is exactly fold A's paused state). Do that directly
+        // here (ravel-maintain is out of this task's scope) so fold B below
+        // runs, and fold A resumes, against a store where the swept input is
+        // already gone, not merely superseded.
         let commit_key = keys::commit_key_for_record(&seg_a).expect("commit key");
         let data_key = keys::reconstruct_data_key(&seg_a).expect("data key");
         store
+            .inner()
             .delete(&commit_key)
             .await
             .expect("delete swept commit record");
         store
+            .inner()
             .delete(&data_key)
             .await
             .expect("delete swept data object");
 
-        // A later fold, its own CAS landing well past the sweep horizon: the
-        // reconcile window is sized in hours behind the fold's own watermark
-        // (not wall-clock time), so hour 10 is still reconciled even though
-        // real time has moved far beyond `protection_horizon_ns`.
+        // Fold B: its own LIST of hour 10 sees the compaction directly (no
+        // reconcile pass needed, this is also a first/rebuild fold since HEAD
+        // is still absent while fold A is paused). Its CAS is not gated by
+        // the hold (`Occurrence::Nth(1)` matched only fold A's attempt), so
+        // it wins the race and publishes HEAD naming the L1 part, well past
+        // the sweep horizon.
         let now_2 = now_1 + cfg.protection_horizon_ns + NS_PER_HOUR;
         let second = catalog
             .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
             .await
-            .expect("second fold must not fail even though the swept input is already gone");
+            .expect("fold B must not fail even though the swept input is already gone");
         assert!(!second.no_op);
-        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+        assert!(second.rebuilt, "HEAD was still absent when fold B listed");
 
-        let head2 = read_head(store.as_ref()).await;
-        let entries = collect_head_entries(store.as_ref(), &head2).await;
+        // Release fold A: its own HEAD PUT now loses (`AlreadyExists`, HEAD
+        // was created by fold B while fold A was held), so it must rebase
+        // onto fold B's HEAD and take the no-op path rather than publish its
+        // own stale listing that still names seg_a.
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let first = fold_a
+            .await
+            .expect("join fold A")
+            .expect("fold A must rebase, not error");
+        assert!(
+            first.no_op,
+            "fold A must rebase onto fold B's HEAD, never publish its stale listing"
+        );
+
+        let head = read_head(store.inner()).await;
+        let entries = collect_head_entries(store.inner(), &head).await;
         let hour10: Vec<&SnapshotEntry> = entries
             .iter()
             .filter(|e| e.ingest_hour_bucket == 10)
