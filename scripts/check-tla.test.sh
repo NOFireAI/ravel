@@ -114,7 +114,11 @@ done
 javashim="$bdir/java"
 cat > "$javashim" <<EOF
 #!/usr/bin/env bash
-touch "$marker"
+# ':' and '>' are shell builtins/syntax, not external commands: the
+# restricted PATH built above deliberately carries no 'touch', so an
+# external touch here would fail silently and the marker would never
+# land regardless of whether java was actually invoked.
+: > "$marker"
 case "\$1" in
     -version) echo 'openjdk version "21.0.4" 2024-07-16' >&2; exit 0 ;;
 esac
