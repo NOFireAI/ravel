@@ -650,4 +650,42 @@ mod tests {
             "at most, and exactly, the cap runs concurrently"
         );
     }
+
+    /// Test debt (formal/tla/TRACEABILITY.md, `HeartbeatAndMemoNeverCas`): the
+    /// row asks for a test that both a heartbeat PUT and a "memo" PUT use
+    /// `PutMode::Overwrite`, not CAS. `write_heartbeat` issues exactly one PUT;
+    /// no "memo" write exists anywhere in `ravel-fleet`. The memo write is
+    /// `ravel_maintain::memo_snapshot::write_memo_snapshot`, in a different
+    /// crate, and the two are only ever driven together from
+    /// `services/ravel-server`'s maintain loop -- outside this task's scope.
+    /// This test pins what is true and testable here: the heartbeat PUT is an
+    /// unconditional overwrite. Proven behaviorally, since no store wrapper in
+    /// this workspace records the `PutMode` a call used: a second heartbeat
+    /// write to an already-populated key succeeds and its content wins, which
+    /// neither CAS variant (`CreateIfAbsent`, `CasVersion`) can do without the
+    /// caller reading and passing a precondition -- and `write_heartbeat` never
+    /// reads the key before writing it.
+    #[tokio::test]
+    async fn heartbeat_and_memo_puts_use_overwrite_not_cas() {
+        let store = MemoryStore::new();
+        let w = worker(0);
+
+        w.write_heartbeat(&store, 1_000)
+            .await
+            .expect("first heartbeat write succeeds");
+        w.write_heartbeat(&store, 2_000)
+            .await
+            .expect("second heartbeat write to the same key succeeds unconditionally");
+
+        let key = heartbeat_key(&w.process_id());
+        let got = store
+            .get(&key, GetRange::Full)
+            .await
+            .expect("get heartbeat");
+        let heartbeat = WorkerHeartbeat::decode(got.data.as_ref()).expect("decode heartbeat");
+        assert_eq!(
+            heartbeat.heartbeat_unix_ns, 2_000,
+            "the second write's content wins: no CAS precondition blocked it"
+        );
+    }
 }
