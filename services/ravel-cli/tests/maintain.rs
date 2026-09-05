@@ -5,6 +5,7 @@
 //! the proto field printing.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -18,6 +19,7 @@ use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
+use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{
@@ -26,6 +28,9 @@ use ravel_proto::commit::v1::{
 use ravel_segment::VERSION_V7;
 use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
+
+/// Nanoseconds per unix hour, the unit `ingest_hour_bucket` counts in.
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 fn store() -> Arc<dyn ObjectStoreBackend> {
     Arc::new(MemoryStore::new())
@@ -254,6 +259,202 @@ async fn compact_empty_bucket_is_below_min() {
     )
     .await
     .expect("compact dry-run runs");
+}
+
+fn logs_record(stream: u8, ts_ns: i64) -> LogRecord {
+    let mut id = [0u8; 16];
+    id[0] = stream;
+    LogRecord {
+        stream_id: LogStreamId(id),
+        stream_attrs: ravel_logseg::stream_attrs_bytes(
+            &[(
+                "service.name".into(),
+                AttrValue::Str(format!("svc-{stream}")),
+            )],
+            "scope",
+            "1",
+            &[],
+        ),
+        ts_ns,
+        observed_ts_ns: ts_ns,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "get /api ok".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: vec![("code".into(), AttrValue::I64(200))],
+    }
+}
+
+/// Seed two L0 `.rlog` objects (the default `min_compaction_inputs`) into one
+/// (shard, hour) bucket, exactly as an ingest log shard would, so
+/// `compact-bucket` actually compacts rather than reporting `BelowMinInputs`.
+/// `hour` is chosen by the caller far enough in the past that it is sealed
+/// against the CLI's own real wall clock (`compact` takes no injected
+/// `now_ns`; see `wall_clock` in `src/maintain.rs`).
+async fn seed_two_l0_logs(store: &MemoryStore, tenant: &str, shard: u32, hour: u32) {
+    let tenant_hash = TenantId::new(tenant).hash();
+    let base_ns = i64::from(hour) * NS_PER_HOUR;
+    for seq in 1..=2u64 {
+        let records: Vec<LogRecord> = (0..4)
+            .map(|i| {
+                logs_record(
+                    u8::try_from(i % 2).expect("fits u8"),
+                    base_ns + i64::from(i) * 1_000_000 + i64::try_from(seq).expect("fits i64"),
+                )
+            })
+            .collect();
+        let writer_id = Uuid::new_v4();
+        let identity = ObjectIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        };
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+        for r in &records {
+            writer.push(r.clone()).expect("push");
+        }
+        let bytes = Bytes::from(writer.finish().expect("finish L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(
+            &tenant_hash,
+            Signal::Logs,
+            shard,
+            writer_id,
+            1,
+            seq,
+            &content_hash,
+        )
+        .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put data object");
+
+        let streams: BTreeSet<LogStreamId> = records.iter().map(|r| r.stream_id).collect();
+        let min_ts = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+        let max_ts = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+        let created = base_ns + i64::try_from(seq).expect("fits i64") * 1_000_000;
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Logs,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: streams.len() as u64,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            created_unix_ns: created,
+            ingest_hour_bucket: hour,
+        })
+        .expect("build commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+}
+
+/// The CLI `compact-bucket` path publishes a compaction record straight
+/// through `ravel_maintain::compact_bucket`, with no worker-ownership check
+/// and no heartbeat write: `sys/maintain/workers/` (the worker-set liveness
+/// prefix, docs/catalog-and-mvcc.md) stays empty across the whole run.
+#[tokio::test]
+async fn cli_compact_bucket_publishes_without_holding_ownership() {
+    let store = MemoryStore::new();
+    let tenant = "acme";
+    seed_two_l0_logs(&store, tenant, 0, 100).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    compact(
+        store.clone(),
+        MEMORY,
+        tenant,
+        SignalArg::Logs,
+        0,
+        100,
+        false,
+        None,
+    )
+    .await
+    .expect("compaction runs");
+
+    let tenant_hash = TenantId::new(tenant).hash();
+    let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Logs, 0, 100);
+    let listing = ravel_maintain::read::list_bucket(store.as_ref(), &bucket)
+        .await
+        .expect("list bucket");
+    assert_eq!(
+        listing.compaction_record_keys.len(),
+        1,
+        "the CLI compaction published a compaction record"
+    );
+
+    let heartbeats = list_all(store.as_ref(), "sys/maintain/workers/")
+        .await
+        .expect("list workers prefix");
+    assert!(
+        heartbeats.is_empty(),
+        "the CLI compaction path took no worker heartbeat: {heartbeats:?}"
+    );
+}
+
+/// The same CLI `compact-bucket` run takes no advisory compaction claim
+/// either (`sys/maintain/claims/compaction/`, ADR-1029 Proposed): grepping the
+/// workspace for a caller of `ravel_fleet::claim` (`acquire`/`renew`/`steal`/
+/// `mark_completed`) outside `crates/ravel-fleet` finds none, matching
+/// docs/catalog-and-mvcc.md's "the primitive is landed... but has no callers
+/// today". The CLI path is ungated: it publishes with no claim participation
+/// at all.
+#[tokio::test]
+async fn cli_compact_bucket_publishes_with_no_claim_taken() {
+    let store = MemoryStore::new();
+    let tenant = "acme";
+    seed_two_l0_logs(&store, tenant, 0, 100).await;
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    compact(
+        store.clone(),
+        MEMORY,
+        tenant,
+        SignalArg::Logs,
+        0,
+        100,
+        false,
+        None,
+    )
+    .await
+    .expect("compaction runs");
+
+    let tenant_hash = TenantId::new(tenant).hash();
+    let bucket = ravel_maintain::Bucket::new(tenant_hash, Signal::Logs, 0, 100);
+    let listing = ravel_maintain::read::list_bucket(store.as_ref(), &bucket)
+        .await
+        .expect("list bucket");
+    assert_eq!(
+        listing.compaction_record_keys.len(),
+        1,
+        "the CLI compaction published a compaction record"
+    );
+
+    let claims = list_all(store.as_ref(), "sys/maintain/claims/compaction/")
+        .await
+        .expect("list claims prefix");
+    assert!(
+        claims.is_empty(),
+        "the CLI compaction path wrote no compaction claim: {claims:?}"
+    );
 }
 
 #[tokio::test]
