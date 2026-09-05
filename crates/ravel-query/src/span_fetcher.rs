@@ -312,7 +312,16 @@ impl SpanSegmentFetcher {
         }
 
         let key = &seg_ref.data_object_key;
-        let _permit = self.get_limiter.acquire().await;
+        let _permit = self
+            .get_limiter
+            .acquire()
+            .await
+            .map_err(|_| SpanFetchError::Store {
+                key: key.to_string(),
+                source: StoreError::Transient(
+                    "GetLimiter semaphore closed unexpectedly".to_string(),
+                ),
+            })?;
         let got = self
             .store
             .get(key, GetRange::Full)
@@ -541,7 +550,16 @@ impl SpanSegmentFetcher {
         let key = &seg_ref.data_object_key;
 
         let Some(cache) = &self.cache else {
-            let _permit = self.get_limiter.acquire().await;
+            let _permit = self
+                .get_limiter
+                .acquire()
+                .await
+                .map_err(|_| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "GetLimiter semaphore closed unexpectedly".to_string(),
+                    ),
+                })?;
             let got = self
                 .store
                 .get(key, GetRange::Full)
@@ -561,7 +579,9 @@ impl SpanSegmentFetcher {
         // tiered tier (see `ReadCache::get_or_fetch`).
         let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
-                let _permit = self.get_limiter.acquire().await;
+                let _permit = self.get_limiter.acquire().await.map_err(|_| {
+                    StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
+                })?;
                 let got = self.store.get(key, GetRange::Full).await?;
                 accounting.record_s3_request(AccountedOp::Get);
                 accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
@@ -1657,11 +1677,19 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
             .await
             .expect("one of the two fetches issues its GET within 30 s");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "the second GET must never become in-flight while the one permit is held"
+        );
         assert_eq!(
             gate.held_count(),
             1,
-            "one permit must cap in-flight GETs at exactly 1, not merely more than 0"
+            "one permit must cap in-flight GETs at exactly 1"
         );
 
         for id in gate.held() {
@@ -1692,6 +1720,99 @@ mod tests {
             .expect("fetch b")
             .expect("fetch b found the segment relevant");
         assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    /// The permits=1 test above cannot distinguish "at most 1", "exactly 1",
+    /// and "exactly the permit count": all three coincide at 1. This pins the
+    /// count itself: three concurrent fetches from two INDEPENDENTLY
+    /// constructed `SpanSegmentFetcher`s sharing one `GetLimiter::new(2)`
+    /// (ADR-1195) must peak at EXACTLY 2 in-flight GETs, never all 3.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_three_fetches_to_permit_count_two() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence};
+
+        let memory = MemoryStore::new();
+        let records = vec![span_with_attrs_and_events(trace(1), span(1), 100, 200)];
+        let seg = write_object(&memory, 0, &records).await;
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle =
+            fault.hold(ravel_object_store::fault::Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(2).expect("2 permits is valid"));
+        let fetcher_a = SpanSegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = SpanSegmentFetcher::new(backend).with_get_limiter(shared);
+        let query = all_query();
+
+        let seg_a = seg.clone();
+        let query_a = query;
+        let fa1 = fetcher_a.clone();
+        let handle_a1 =
+            tokio::spawn(async move { fa1.fetch(&seg_a, &query_a, None, None, &[]).await });
+        let seg_a2 = seg.clone();
+        let query_a2 = query;
+        let fa2 = fetcher_a.clone();
+        let handle_a2 =
+            tokio::spawn(async move { fa2.fetch(&seg_a2, &query_a2, None, None, &[]).await });
+        let seg_b = seg.clone();
+        let query_b = query;
+        let handle_b =
+            tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b, None, None, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("two of the three fetches issue their GET within 30 s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(3)
+            )
+            .await
+            .is_err(),
+            "two permits must cap in-flight GETs at exactly 2, never all 3"
+        );
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "peak in-flight GETs must be exactly 2, not 1 and not 3"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing two permits lets the third GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the third GET must be the only one held once the first two release"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a1 = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a1)
+            .await
+            .expect("fetch a1 completes within 30 s")
+            .expect("join fetch a1")
+            .expect("fetch a1")
+            .expect("fetch a1 found the segment relevant");
+        let a2 = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a2)
+            .await
+            .expect("fetch a2 completes within 30 s")
+            .expect("join fetch a2")
+            .expect("fetch a2")
+            .expect("fetch a2 found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a1.records.len(), 1);
+        assert_eq!(a2.records.len(), 1);
         assert_eq!(b.records.len(), 1);
     }
 }

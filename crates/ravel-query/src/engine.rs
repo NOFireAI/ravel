@@ -7553,6 +7553,14 @@ mod get_limiter_tests {
     /// owns, and record the new `Arc` as the engine's own, so a later
     /// `with_get_limiter` call (or another engine sharing this one) still sees
     /// the current limiter rather than the one `new` built privately.
+    ///
+    /// Three fetchers reach here, not two: RSEG's `fetcher`, RLOG's OWN
+    /// whole-object limiter, and RLOG's block-range limiter. Before the
+    /// ADR-1195 gap this closes, `log_fetcher`'s own whole-object GETs (the
+    /// funnel every RLOG object at or below `block_range_threshold` routes
+    /// through, which is the stock `cost-based`-policy ClickBench path) had no
+    /// limiter of their own to replace, so a test asserting only the
+    /// block-range side could not see that gap.
     #[test]
     fn with_get_limiter_replaces_every_owned_fetcher() {
         let engine = engine(Arc::new(MemoryStore::new()));
@@ -7567,6 +7575,10 @@ mod get_limiter_tests {
         ));
         assert!(Arc::ptr_eq(
             engine.log_fetcher.get_limiter_for_test(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            engine.log_fetcher.block_range_get_limiter_for_test(),
             &replacement
         ));
         assert!(!Arc::ptr_eq(

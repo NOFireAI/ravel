@@ -16,6 +16,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::EngineConfigError;
 
+/// [`GetLimiter::acquire`]'s semaphore closed before granting a permit. The
+/// semaphore is private to `GetLimiter`, which exposes no `close`, so no
+/// caller can ever trigger this; it exists so `acquire` fails typed instead
+/// of panicking if that invariant is ever violated.
+#[derive(Debug, thiserror::Error)]
+#[error("GetLimiter semaphore closed unexpectedly")]
+pub struct GetLimiterClosed;
+
 /// A bound on concurrent object-store GETs, shareable across fetchers and
 /// engines by cloning the `Arc` it is always held behind.
 pub struct GetLimiter {
@@ -52,19 +60,17 @@ impl GetLimiter {
 
     /// Acquires one owned permit. Owned rather than borrowed so a fetcher can
     /// hold it across an `.await` on the store GET itself without borrowing
-    /// this limiter; drop the permit to release it back to the pool.
-    pub fn acquire(&self) -> impl Future<Output = OwnedSemaphorePermit> {
+    /// this limiter; drop the permit to release it back to the pool. Errors
+    /// with [`GetLimiterClosed`] if the semaphore is ever closed, which no
+    /// current caller can trigger (see that type's doc), so a caller maps it
+    /// into its own error type rather than treating it as reachable today.
+    pub fn acquire(&self) -> impl Future<Output = Result<OwnedSemaphorePermit, GetLimiterClosed>> {
         let semaphore = Arc::clone(&self.semaphore);
         async move {
-            match semaphore.acquire_owned().await {
-                Ok(permit) => permit,
-                // A `Semaphore` only closes when `close()` is called on it,
-                // and no fetcher or engine ever reaches this `Arc` to do
-                // so: it is private to `GetLimiter`, which exposes no
-                // `close`. This arm is therefore unreachable, not merely
-                // rare.
-                Err(_) => unreachable!("GetLimiter's semaphore is never closed"),
-            }
+            semaphore
+                .acquire_owned()
+                .await
+                .map_err(|_| GetLimiterClosed)
         }
     }
 }
@@ -104,7 +110,7 @@ mod tests {
     #[tokio::test]
     async fn acquire_yields_an_owned_permit_and_releases_on_drop() {
         let limiter = GetLimiter::new(1).expect("1 permit is valid");
-        let permit = limiter.acquire().await;
+        let permit = limiter.acquire().await.expect("semaphore is never closed");
         assert_eq!(limiter.semaphore.available_permits(), 0);
         drop(permit);
         assert_eq!(limiter.semaphore.available_permits(), 1);

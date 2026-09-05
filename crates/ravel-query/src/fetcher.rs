@@ -746,7 +746,9 @@ impl SegmentFetcher {
         range: GetRange,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, StoreError> {
-        let _permit = self.get_limiter.acquire().await;
+        let _permit = self.get_limiter.acquire().await.map_err(|_| {
+            StoreError::Transient("GetLimiter semaphore closed unexpectedly".into())
+        })?;
         accounting.record_s3_request(AccountedOp::Get);
         let got = self.store.get(key, range).await?;
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
@@ -3447,16 +3449,24 @@ mod tests {
             .await
             .expect("one of the two fetches issues its GET within 30 s");
 
-        // Give the other fetch's task every chance to also reach the store: if
-        // the shared limiter did not actually bound concurrency, its GET would
-        // land here too and `held_count` would climb to 2 well within this
-        // window.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // The other fetch's GET must never become in-flight while the shared
+        // permit is held: if the shared limiter did not actually bound
+        // concurrency, `wait_until_held(2)` would resolve well within this
+        // window instead of timing out.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "one shared permit must cap in-flight GETs at exactly 1, \
+             not merely at more than 0"
+        );
         assert_eq!(
             gate.held_count(),
             1,
-            "one shared permit must cap in-flight GETs at exactly 1, \
-             not merely at more than 0"
+            "one shared permit must cap in-flight GETs at exactly 1"
         );
 
         for id in gate.held() {
