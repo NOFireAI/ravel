@@ -1,6 +1,6 @@
 # ADR-1113: TLA+ verification suite for the commit, catalog, lifecycle, resharding, and maintenance protocols
 
-Status: Proposed
+Status: Accepted (2026-09-04)
 
 ## Context
 
