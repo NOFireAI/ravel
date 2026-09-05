@@ -1006,11 +1006,11 @@ impl LogSegmentFetcher {
             // whole-object GET, then the STREAM_DIR resolve + `RlogReader` scan in
             // `scan_bytes`. They are named `page_fetch` and `decode` to match the
             // metric path's phase names. This entry point is reached by the
-            // unaccounted `fetch` (and by tests); the real production log/alerts/
-            // audit callers in `ravel-sql` go through
-            // `fetch_accounted_with_tenant`, which carries its own copy of these
-            // spans over its own (cache-aware) GET path. Wiring those callers onto
-            // an accounted funnel at all is separate, still-open future work.
+            // unaccounted `fetch` (and by tests). Production callers in
+            // `ravel-sql` do not come here: the logs scan uses
+            // `scan_accounted_with_tenant` and `_subset`, and the alerts and
+            // audit scans use `fetch_accounted_with_tenant`; each carries its
+            // own copy of these spans over its own (cache-aware) GET path.
             let fetch_span = tracing::debug_span!(
                 "page_fetch",
                 signal = "logs",
@@ -6197,13 +6197,13 @@ mod whole_object_get_limiter_tests {
     //! whole-object funnel (`fetch_accounted`, the path every object at or
     //! below `block_range_threshold` takes) issued its GET with no permit at
     //! all, so it could never be bounded no matter how the caller configured
-    //! `get_limiter`. `fetch_accounted` is used here rather than the
-    //! tenant-aware `fetch_accounted_with_tenant` because it takes the
-    //! whole-object path unconditionally (no threshold branch to thread a
-    //! tenant hash and cache through); the default `block_range_threshold`
-    //! (`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`, far larger than this test's
-    //! object) confirms the same funnel is what production's cost-based
-    //! default policy reaches for small objects.
+    //! `get_limiter`. The first tests drive `fetch_accounted`, which takes
+    //! the whole-object path unconditionally; the later ones drive the
+    //! production funnel `fetch_accounted_with_tenant` on objects below the
+    //! default `block_range_threshold` (`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`),
+    //! with and without a cache attached, so both `whole_object_bytes` permit
+    //! sites are covered on the path the cost-based default policy takes for
+    //! small objects.
 
     use super::*;
     use ravel_catalog::SegmentLevel;
