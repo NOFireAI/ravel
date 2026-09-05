@@ -1,8 +1,8 @@
 # put-data-lost-response-reachable
 
 Obligation, not a bug. `PutDataLostResponseUnreachable` is a predicate that
-must fail once `MaxRetries > 0`, or the retry coverage `smoke.cfg` exists to
-add is vacuous: nothing would ever exercise a writer retrying after losing
+must fail once `MaxRetries > 0`, or the retry coverage that `smoke.cfg`
+adds is vacuous: nothing would ever exercise a writer retrying after losing
 the data PUT's response.
 
 Violated invariant: `PutDataLostResponseUnreachable` (safety, TLC exit 12).
