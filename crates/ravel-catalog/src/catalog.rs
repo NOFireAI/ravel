@@ -4308,6 +4308,10 @@ mod tests {
     /// fails (1 vs the expected 2).
     #[tokio::test]
     async fn resolve_tolerates_provisioning_record_drift() {
+        // Reaches `validate_record` with recorded 4 against live 2, which
+        // increments the process-global drift counter; hold the same lock the
+        // exact-delta tests hold so a threaded run cannot interleave.
+        let _guard = crate::provisioning::tests::SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let store = Arc::new(MemoryStore::new());
         let now = 500_000 * NS_PER_HOUR + 30 * 60_000_000_000;
         publish_segment(&store, 0, 1, 500_000, now, now - 1_000, now).await;

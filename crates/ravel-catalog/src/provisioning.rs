@@ -1778,7 +1778,7 @@ pub async fn raise_format_floor(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use proptest::prelude::*;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
@@ -1791,7 +1791,7 @@ mod tests {
     /// binary's tests on threads within one process, so an unguarded
     /// concurrent increment from another counter-touching test can land
     /// between a test's `before` read and its `assert_eq!` on the delta.
-    static SHARD_COUNT_DRIFT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) static SHARD_COUNT_DRIFT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn tenant() -> TenantHash {
         TenantHash([0xABu8; 16])

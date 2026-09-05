@@ -191,9 +191,10 @@ to equal the
 process's live `--shards` value, which is only a default for tenants that have
 no record yet. A difference between the two (for example after lowering the
 global default) is tolerated and surfaced as an informational metric, not a
-refusal (ADR-0082). Only two cases still fail closed: adopting a value that
-would hide existing data, and an unreadable record whose true count cannot be
-trusted. A (tenant, signal) with pre-ADR data but no record is adopted once
+refusal (ADR-0082). Three cases still fail closed: adopting a value that
+would hide existing data, an unreadable record whose true count cannot be
+trusted, and a decodable record whose generation history fails structural
+validation (`CorruptGenerations`). A (tenant, signal) with pre-ADR data but no record is adopted once
 (the record is written from config) only when every observed shard index is
 below the configured `shard_count`; a higher observed index proves the value
 would hide data and refuses without writing.
