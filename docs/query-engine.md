@@ -710,11 +710,12 @@ replacement `BlockRangeFetcher` so builder order cannot drop it. Which
 limiter that is depends on who built the fetcher: the RLOG fetcher a
 `QueryEngine` owns draws from the engine's shared limiter, sized by
 `store_get_concurrency()`. The standalone RLOG fetcher that `ravel-server`'s
-SQL path builds (`build_sql_state`) still uses `with_max_concurrent_gets`,
-which reaches only the block-range protocol, so its whole-object funnel is
-bounded by the fetcher's private default until the server half wires it to
-the process limiter with `with_get_limiter`. The stock ClickBench path runs
-through that SQL fetcher, so it is not yet governed by
+SQL path builds (`build_sql_state`) uses `with_max_concurrent_gets`, which
+gives it a private limiter of `fetch_concurrency` permits shared by its
+whole-object and block-range paths; that limiter is separate from the
+process-wide one until the server half wires the fetcher to it with
+`with_get_limiter`. The stock ClickBench path runs through that SQL fetcher,
+so it is bounded by `fetch_concurrency` and not yet by
 `store_get_concurrency()`.
 
 Before ADR-1195, each fetcher held its own independent semaphore, so N
