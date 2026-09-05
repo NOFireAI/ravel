@@ -554,3 +554,150 @@ impl IngestRouter {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::AtomicI64;
+
+    use ravel_catalog::ShardGeneration;
+    use ravel_object_store::list_all;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId};
+
+    use super::*;
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    struct FrozenClock(AtomicI64);
+
+    impl Clock for FrozenClock {
+        fn now_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+
+        fn sleep(&self, _dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            // Never resolves: the test drives flushing explicitly via
+            // `flush_all`, not via the actor's age-based tick. A sleep that
+            // completes immediately turns the actor's `tokio::select!` loop
+            // into a synchronous spin that never yields to the executor.
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn test_point(tenant: &TenantId, metric: &str, ts_ns: i64, value: f64) -> NormalizedPoint {
+        let labels = LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(tenant, metric, &labels).expect("series id");
+        NormalizedPoint {
+            series_id,
+            labels: Arc::new(labels),
+            sample: Sample { ts_ns, value },
+            is_monotonic_sum: false,
+        }
+    }
+
+    /// Test debt (formal/tla/TRACEABILITY.md, ingest row 3, `DoAdmit` write
+    /// path): an admitted write lands on the shard `shard_for` selects for
+    /// the generation's active count at the write's hour, not on the
+    /// process's default (generation 0) count -- so a write flushed after a
+    /// reshard has activated is durable on the *new* topology's shard, and
+    /// that shard is independently confirmed both by the returned commit
+    /// token and by the commit record actually found in the store.
+    #[tokio::test]
+    async fn admitted_write_lands_on_the_shard_the_routed_count_selects() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        // Flush open checks the reading against the 2020 plausibility floor
+        // (crate::config::MIN_PLAUSIBLE_INGEST_CLOCK_NS), so the test clock
+        // must sit in real epoch-hour territory, not small offsets from 0.
+        let base_hour = crate::config::MIN_PLAUSIBLE_INGEST_CLOCK_NS / NS_PER_HOUR + 10;
+        let t0 = base_hour * NS_PER_HOUR;
+        let clock = Arc::new(FrozenClock(AtomicI64::new(t0)));
+        let router = IngestRouter::new(
+            IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            },
+            Arc::clone(&store),
+            Signal::Metrics,
+            clock.clone(),
+        );
+
+        let tenant = TenantId::new("acme");
+        // A reshard to 8 shards activates at the seed hour itself. Seeding
+        // this via `refresh_generations` (never touches the store) and
+        // writing at that same instant keeps the cached view fresh (well
+        // within the refresh interval `C`), so the write routes on this
+        // history directly instead of falling back to the process default.
+        let activation_hour = u32::try_from(base_hour).expect("fits u32");
+        router.refresh_generations(
+            tenant.hash(),
+            vec![
+                ShardGeneration {
+                    generation: 0,
+                    shard_count: 4,
+                    activation_hour: 0,
+                    appended_unix_ns: 0,
+                },
+                ShardGeneration {
+                    generation: 1,
+                    shard_count: 8,
+                    activation_hour,
+                    appended_unix_ns: 0,
+                },
+            ],
+            t0,
+        );
+
+        let point = test_point(&tenant, "cpu_usage", t0, 1.0);
+        let expected_shard = shard_for(&point.series_id, 8);
+
+        // The frozen clock never ages past `max_flush_delay` on its own, so
+        // `flush_all` must run concurrently with (not after) the write, and
+        // after (not before) the write's own enqueue; joining the two
+        // futures interleaves them correctly (crates/ravel-ingest/tests/
+        // acks_and_modes.rs uses the same pattern).
+        let (write_result, ()) = tokio::join!(
+            router.write(
+                tenant.clone(),
+                vec![point],
+                WriteMode::Strict,
+                Duration::from_secs(5),
+            ),
+            router.flush_all(),
+        );
+        let receipt = write_result.expect("strict write on the routed 8-shard generation succeeds");
+
+        assert_eq!(receipt.tokens.len(), 1, "one shard was involved");
+        assert_eq!(
+            receipt.tokens[0].shard, expected_shard,
+            "the receipt's token names the shard `shard_for` selects for the \
+             routed (post-reshard) count, not the process default"
+        );
+
+        let objects = list_all(store.as_ref(), "t/").await.expect("list");
+        let commit_key = objects
+            .iter()
+            .find(|o| o.key.contains("/c/"))
+            .expect("exactly one commit record")
+            .key
+            .clone();
+        let raw = store
+            .get(&commit_key, ravel_object_store::GetRange::Full)
+            .await
+            .expect("get commit record");
+        let decoded = ravel_commit::record::decode(&raw.data).expect("decode commit record");
+        assert_eq!(
+            decoded.shard, expected_shard,
+            "the commit record durably placed in the store names the same \
+             routed shard, not a stale generation-0 count"
+        );
+        assert_eq!(decoded.series_count, 1);
+        assert_eq!(decoded.sample_count, 1);
+    }
+}
