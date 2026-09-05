@@ -53,14 +53,14 @@ ambiguous or moved ref is a debugging trap later.
 
 ### Tier 1: deterministic gates
 
-Run `scripts/verify-dispatch-gates.sh <ref> <scratchpad-dir>`, where
-`<scratchpad-dir>` is a path **outside this repo's working tree** (the
-session's scratchpad directory is exactly right for this; never a
+Run `scripts/verify-dispatch-gates.sh --with-gates <ref> <scratchpad-dir>`,
+where `<scratchpad-dir>` is a path **outside this repo's working tree**
+(the session's scratchpad directory is exactly right for this; never a
 subdirectory of the repo itself: an untracked worktree left inside the
 repo blocks the next `fleet_dispatch` call, which refuses to run against
 a dirty primary checkout).
 
-The script:
+The script always:
 
 - Resolves `<ref>` to a SHA and creates a detached-HEAD worktree at that
   exact commit under the scratchpad path (not the ref name: a branch
@@ -74,14 +74,36 @@ The script:
   It does **not** mean disabling sccache: sccache is keyed on inputs and
   doesn't mask a genuine compile error, it just avoids redoing
   already-correct work, so leave `RUSTC_WRAPPER` alone.
-- Runs, workspace-wide regardless of which crate the branch touched (a
-  crate-scoped `-p` run is exactly what let a cross-crate rename break an
-  untouched crate's build):
-  `cargo fmt --all --check`, `cargo build --workspace --all-targets`,
-  `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo test --workspace`, `cargo test --doc --workspace`.
 - Stops at the first failure, printing the exact command and its real
   exit code, and always removes the worktree on exit (pass or fail).
+
+Two modes for what actually runs inside that worktree:
+
+- **`--with-gates`** (or `VERIFY_WITH_GATES=1`): runs the worktree's own
+  `scripts/gates.sh`, unscoped, workspace-wide. This is the default
+  recommendation now: `gates.sh` also covers the `sql` / `flight-sql`
+  feature lanes and the `ravel-bench` feature lanes the plain mode below
+  never builds, and on a clean tree it writes a gates-pass receipt keyed
+  by tree hash. That receipt is exactly what lets the merge step run
+  `FLEET_MERGE_SKIP_GATES=1 scripts/fleet-result-merge.sh` and skip its
+  own second full build instead of redoing the identical workspace-wide
+  gate a few minutes later. Print the `Gates receipt: <path>` line the
+  script emits on success; it is not needed to invoke the merge step
+  (the merge script recomputes the same path from the tree hash) but is
+  useful when a receipt-missing failure needs to be debugged.
+- **Plain mode** (no flag): runs, workspace-wide regardless of which
+  crate the branch touched (a crate-scoped `-p` run is exactly what let a
+  cross-crate rename break an untouched crate's build):
+  `cargo fmt --all --check`, `cargo build --workspace --all-targets`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace`, `cargo test --doc --workspace`. This does
+  **not** build the `sql` / `flight-sql` / `ravel-bench` lanes and does
+  **not** write a gates-pass receipt, so a merge that follows a plain-mode
+  verify run must NOT set `FLEET_MERGE_SKIP_GATES=1` (there is no receipt
+  for it to find, and the script refuses the skip without one). Use this
+  mode only when `--with-gates` itself is unavailable for some reason;
+  otherwise prefer `--with-gates` so the land chain pays for the full
+  gate list exactly once.
 
 Treat the script's own exit code as authoritative. If it's nonzero, tier 1
 is FAIL: capture the command, exit code, and the last ~40 lines of its
@@ -216,7 +238,9 @@ On tier-1 FAIL:
    output), so the executor isn't guessing at what broke.
 3. Re-run this skill against the fix's result branch.
 4. Tier-1 PASS now: proceed to the normal merge flow
-   (`scripts/fleet-result-merge.sh` / the merge-fleet-result skill).
+   (`scripts/fleet-result-merge.sh` / the merge-fleet-result skill). If
+   tier 1 ran with `--with-gates`, pass `FLEET_MERGE_SKIP_GATES=1` to the
+   merge script so it does not redo the same workspace-wide build.
 5. Tier-1 FAIL again (2nd consecutive failure): stop. Surface both
    reports to the user directly. Do not dispatch a third attempt without
    explicit direction.

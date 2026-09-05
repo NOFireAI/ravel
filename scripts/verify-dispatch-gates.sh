@@ -7,7 +7,7 @@
 # incremental target dir can mask a real compile error behind stale
 # cached artifacts (see the verify-dispatch skill).
 #
-# Usage: verify-dispatch-gates.sh <ref> <worktree-parent-dir>
+# Usage: verify-dispatch-gates.sh [--with-gates] <ref> <worktree-parent-dir>
 #
 # <ref> is anything `git worktree add` accepts: a branch, a tag, a SHA.
 # <worktree-parent-dir> MUST be outside this repo's working tree: a
@@ -20,10 +20,36 @@
 # on the first failure, prints which command failed and its exit code,
 # then exits with that code. Always removes the worktree on exit, success
 # or failure.
+#
+# --with-gates (or VERIFY_WITH_GATES=1): run scripts/gates.sh, unscoped,
+# from inside the cold worktree instead of the five hand-listed cargo
+# commands below. gates.sh also covers the sql / flight-sql / ravel-bench
+# feature lanes the five commands do not, and on a clean tree it writes a
+# gates-pass receipt keyed by tree hash (see gates.sh's "Gates-pass
+# receipt" section) that fleet-result-merge.sh's FLEET_MERGE_SKIP_GATES=1
+# reads to skip its own second full build. Without this flag, behavior is
+# byte-for-byte unchanged from before it existed.
+#
+# GATES_SH overrides the path to gates.sh (default: the worktree's own
+# scripts/gates.sh, so a branch that edits gates.sh is verified against
+# its own edit). Test-only escape hatch for substituting a stub.
 set -euo pipefail
 
+with_gates=0
+positional=()
+for arg in "$@"; do
+  case "${arg}" in
+    --with-gates) with_gates=1 ;;
+    *) positional+=("${arg}") ;;
+  esac
+done
+if [[ "${VERIFY_WITH_GATES:-0}" == "1" ]]; then
+  with_gates=1
+fi
+set -- "${positional[@]}"
+
 if [[ $# -lt 2 ]]; then
-  echo "usage: $0 <ref> <worktree-parent-dir>" >&2
+  echo "usage: $0 [--with-gates] <ref> <worktree-parent-dir>" >&2
   exit 64
 fi
 
@@ -73,14 +99,23 @@ run_gate() {
   return 0
 }
 
-# --locked pins the committed Cargo.lock so this cold-cache verification
-# resolves exactly what CI does; a divergent resolve here would defeat the
-# purpose of the isolated run. `cargo fmt` (rustfmt) rejects --locked after
-# the subcommand, so it takes the global-flag position.
-run_gate cargo --locked fmt --all --check
-run_gate cargo build --locked --workspace --all-targets
-run_gate cargo clippy --locked --workspace --all-targets -- -D warnings
-run_gate cargo test --locked --workspace
-run_gate cargo test --locked --doc --workspace
+if [[ ${with_gates} -eq 1 ]]; then
+  gates_sh="${GATES_SH:-${worktree_dir}/scripts/gates.sh}"
+  run_gate "${gates_sh}"
+
+  tree_hash="$(git -C "${worktree_dir}" rev-parse 'HEAD^{tree}')"
+  receipt_dir="$(cd "$(git -C "${worktree_dir}" rev-parse --git-common-dir)" && pwd)/gates-pass"
+  echo "==> Gates receipt: ${receipt_dir}/${tree_hash}"
+else
+  # --locked pins the committed Cargo.lock so this cold-cache verification
+  # resolves exactly what CI does; a divergent resolve here would defeat
+  # the purpose of the isolated run. `cargo fmt` (rustfmt) rejects --locked
+  # after the subcommand, so it takes the global-flag position.
+  run_gate cargo --locked fmt --all --check
+  run_gate cargo build --locked --workspace --all-targets
+  run_gate cargo clippy --locked --workspace --all-targets -- -D warnings
+  run_gate cargo test --locked --workspace
+  run_gate cargo test --locked --doc --workspace
+fi
 
 echo "TIER1 PASS"
