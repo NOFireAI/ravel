@@ -1413,7 +1413,13 @@ impl LogSegmentFetcher {
                 // were read, no block byte, so the touch is the scan a nonzero
                 // survivor count will drive. No whole-object bytes either, for
                 // the same reason as the fast path above.
-                return Ok(Some((survivors, plan_stats, Some(footer), survivors > 0, None)));
+                return Ok(Some((
+                    survivors,
+                    plan_stats,
+                    Some(footer),
+                    survivors > 0,
+                    None,
+                )));
             }
 
             // Fallback: a predicate the skip index cannot decide (a `has_word`/text
@@ -1463,10 +1469,18 @@ impl LogSegmentFetcher {
             // necessarily what the scan will select on a version-4 object (ADR-0699
             // decision 5), so it is not carried.
             let carried = match blocks_read {
-                None => Some(CarriedWholeObject { bytes: bytes.clone() }),
+                None => Some(CarriedWholeObject {
+                    bytes: bytes.clone(),
+                }),
                 Some(_) => None,
             };
-            Ok(Some((scan.remaining_blocks(), scan.stats(), None, touched, carried)))
+            Ok(Some((
+                scan.remaining_blocks(),
+                scan.stats(),
+                None,
+                touched,
+                carried,
+            )))
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -2882,6 +2896,15 @@ pub struct CarriedFooter<'a> {
 #[derive(Clone)]
 pub struct CarriedWholeObject {
     bytes: Bytes,
+}
+
+impl CarriedWholeObject {
+    /// The carried object's byte length, for a caller that needs to account
+    /// for held-but-not-yet-consumed carry bytes (issue #835's memory bound)
+    /// without decoding or copying them.
+    pub fn byte_len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
 }
 
 /// One candidate block's absolute byte extent in the object and its stored crc,

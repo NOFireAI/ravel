@@ -117,6 +117,52 @@
 //! not a general result about striping. Cache size, eviction, object size, and
 //! store latency all move it.
 //!
+//! # Whole-object fallback carry, and its memory bound (issue #835)
+//!
+//! `plan_segment`'s whole-object fallback (an undecidable block predicate, e.g.
+//! a text `has_word` arm the skip index cannot resolve) already reads the
+//! entire object to count survivors. Before #835 that read was thrown away:
+//! the scan phase re-opened the same object and, unless a read cache happened
+//! to be wired AND large enough to still hold every relevant object's bytes by
+//! the time the scan reached it, paid a second real wire GET for content the
+//! plan phase had just fetched. This is a different failure from issue #691's
+//! "an evicted plan entry is simply re-fetched by the scan" a few paragraphs
+//! up: #691 is about a cache-keyed footer/probe/section entry on the ABOVE-
+//! threshold ranged path, which by design may be re-fetched on a miss; #835 is
+//! about the whole object itself never being cache-size-dependent in the first
+//! place. Since #835, [`LogSegmentFetcher::plan_segment`]'s fallback branch carries its fetched
+//! bytes forward as a [`ravel_query::CarriedWholeObject`] (`SegPlan::whole_object`,
+//! threaded through [`OwnedSeg::whole_object`] to the subset open), so the
+//! object crosses the wire at most once per statement regardless of cache size
+//! or eviction; a reused read is charged to
+//! [`ravel_types::accounting::QueryAccounting::add_bytes_reused`], not folded
+//! into the GET-bytes figure the issuing (plan) phase already recorded.
+//!
+//! This carry has a real memory cost the design does not hide: every relevant
+//! segment's plan result -- survivor count, stats, footer, and now a carried
+//! whole-object body where the fallback fired -- is computed by one shared
+//! [`compute_plan_counts`] pass and held in `planned` until that pass's
+//! `try_collect` returns, because the [`tokio::sync::OnceCell`] barrier above
+//! means no partition drains anything until every segment's plan is known (the
+//! flattened block-striping assignment needs every segment's survivor count to
+//! compute unit `i`'s owning partition, not just the segments before it in
+//! isolation). `plan_concurrency` bounds only how many plan GETs are in flight
+//! at once; it does not bound how many already-completed results -- including
+//! their carried bytes -- are retained while the rest of the pass catches up.
+//! So for a statement whose predicate sends MANY relevant segments through the
+//! fallback at once (a broad, unindexed text search across a large corpus is
+//! the realistic case), peak memory during the barrier is the sum of every
+//! such segment's object bytes, bounded by the tenant's admitted segment count
+//! ([`ravel_query::SegmentAdmission`], 1024 by default) times average object
+//! size, not by `plan_concurrency` times object size. `compute_plan_counts`
+//! records this truthfully via
+//! [`ravel_types::accounting::QueryAccounting::observe_intermediate_bytes`]
+//! rather than leaving it invisible. Bringing the peak down to a concurrency
+//! bound needs the barrier itself to release progressively (assign and drain a
+//! segment's blocks as soon as its own prefix of survivor counts is known,
+//! rather than after the whole pass) -- a change to ADR-0102's partitioning
+//! protocol, not a fix scoped to this carry, and is not made here.
+//!
 //! # Streaming, and why no ordering is declared (ADR-0087)
 //!
 //! This stage declares **no** output ordering. It used to declare `ts`
@@ -2449,6 +2495,17 @@ fn plan_counts_future(
     })
 }
 
+/// One segment's [`LogSegmentFetcher::plan_segment`] result: survivor count,
+/// stats, a carried footer (skip-decidable branches), and a carried
+/// whole-object body (the fallback branch, issue #835). `None` when the
+/// segment was pruned by ts bounds alone and never reached the fetcher.
+type PlanSegmentResult = Option<(
+    usize,
+    ScanStats,
+    Option<LogFooter>,
+    Option<CarriedWholeObject>,
+)>;
+
 /// Prune every segment once (no block decode) to build the shared block plan.
 ///
 /// The prunes run `plan_concurrency` at a time (`buffered`, so `segs` keeps
@@ -2486,15 +2543,26 @@ async fn compute_plan_counts(
                 .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting),
         );
     }
-    let planned: Vec<Option<(usize, ScanStats, Option<LogFooter>, Option<CarriedWholeObject>)>> =
-        futures::stream::iter(prunes)
-            .buffered(plan_concurrency.max(1))
-            .map_err(SqlError::from)
-            .try_collect()
-            .await?;
+    let planned: Vec<PlanSegmentResult> = futures::stream::iter(prunes)
+        .buffered(plan_concurrency.max(1))
+        .map_err(SqlError::from)
+        .try_collect()
+        .await?;
     let mut segs = Vec::with_capacity(segments.len());
     let mut total_blocks = 0usize;
     let mut full_reads = 0usize;
+    // Every segment's plan result -- including a carried whole-object body,
+    // when the fallback fired -- is resident in `planned` (above) before this
+    // loop starts, because `try_collect` cannot yield until the whole stream
+    // is exhausted: `plan_concurrency` bounds only how many plan GETs run at
+    // once, not how many completed results are retained. So the true peak of
+    // carried-but-unconsumed whole-object bytes for this query is the sum
+    // below, taken at the barrier (this function's return), not a per-segment
+    // or per-concurrency figure. `observe_intermediate_bytes` records it
+    // truthfully rather than leaving it invisible; see this module's doc for
+    // why a further, concurrency-bounded reduction needs a barrier redesign
+    // this fix does not make.
+    let mut carried_bytes = 0u64;
     for entry in planned {
         match entry {
             Some((survivors, stats, footer, whole_object)) => {
@@ -2503,6 +2571,9 @@ async fn compute_plan_counts(
                 // footer forward; the whole-object fallback (#761) carries none.
                 if footer.is_none() {
                     full_reads += 1;
+                }
+                if let Some(w) = &whole_object {
+                    carried_bytes += w.byte_len();
                 }
                 segs.push(Some(SegPlan {
                     survivors,
@@ -2514,6 +2585,7 @@ async fn compute_plan_counts(
             None => segs.push(None),
         }
     }
+    ctx.accounting.observe_intermediate_bytes(carried_bytes);
     Ok(Arc::new(PlanCounts {
         segs,
         total_blocks,

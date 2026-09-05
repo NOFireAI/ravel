@@ -120,6 +120,14 @@ const SUFFIX_LEN: u64 = 8192;
 /// #761 could not remove.
 const MARKER_FEW: &str = "MARKERFEW";
 
+/// A marker word present in exactly the first block of exactly the first
+/// segment (nowhere else). A `has_word` query for it is, like `MARKER_FEW`,
+/// undecidable at the skip index, so every segment's plan phase still reads
+/// the whole object to count survivors (issue #835 fixture below) -- but only
+/// one segment actually survives, so the scan opens exactly one object and the
+/// other `SEGMENTS - 1` are never opened at all.
+const MARKER_RARE: &str = "MARKERRARE";
+
 /// The declared numeric column every record carries: `code = <block index>`
 /// (0..BLOCKS_PER_SEG). A `NumRange` prune arm on it (ClickBench q20/q37 shape)
 /// is skip-index decidable, so #761's fetch-side pruning applies. `code = 0`
@@ -169,6 +177,10 @@ fn body(seg: usize, blk: usize) -> String {
     let mut head = String::new();
     if blk == 0 {
         head.push_str(MARKER_FEW);
+        head.push(' ');
+    }
+    if seg == 0 && blk == 0 {
+        head.push_str(MARKER_RARE);
         head.push(' ');
     }
     let seed = (seg as u64) << 32 | blk as u64;
@@ -350,6 +362,19 @@ fn fetcher(store: Arc<dyn ObjectStoreBackend>, cache_bytes: u64) -> LogSegmentFe
         .with_block_range_threshold(0)
 }
 
+/// Same fetcher settings as [`fetcher`], with no read cache wired at all --
+/// the configuration issue #835 concerns, where a second wire GET for the
+/// same object cannot hide behind a cache hit of any size.
+fn fetcher_uncached(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
+    let block_range = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_suffix_len(SUFFIX_LEN)
+        .with_coalesce_gap(0)
+        .with_whole_object_threshold(0);
+    LogSegmentFetcher::new(store)
+        .with_block_range(block_range)
+        .with_block_range_threshold(0)
+}
+
 fn provider(
     snapshot: Snapshot,
     fetcher: LogSegmentFetcher,
@@ -411,15 +436,26 @@ struct Shape {
     plan_full_reads: usize,
     acc_gets: u64,
     acc_bytes: u64,
+    acc_bytes_reused: u64,
+    acc_peak_intermediate_bytes: u64,
 }
 
 async fn measure(label: &'static str, filters: &[Expr], cache_bytes: u64) -> Shape {
+    measure_opt(label, filters, Some(cache_bytes)).await
+}
+
+/// `cache_bytes: None` wires no read cache at all (see [`fetcher_uncached`]).
+async fn measure_opt(label: &'static str, filters: &[Expr], cache_bytes: Option<u64>) -> Shape {
     let base = Arc::new(MemoryStore::new());
     let snapshot = build_snapshot(base.as_ref()).await;
     let counting = CountingStore::new(base);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let acc = QueryAccounting::new();
-    let prov = provider(snapshot, fetcher(store, cache_bytes), acc.clone());
+    let fetch = match cache_bytes {
+        Some(bytes) => fetcher(store, bytes),
+        None => fetcher_uncached(store),
+    };
+    let prov = provider(snapshot, fetch, acc.clone());
     let plan = if filters.is_empty() {
         prov.plan(PARTS).expect("plan")
     } else {
@@ -439,13 +475,16 @@ async fn measure(label: &'static str, filters: &[Expr], cache_bytes: u64) -> Sha
         plan_full_reads: sum_metric(&plan, "plan_full_reads"),
         acc_gets: snap.s3_requests(AccountedOp::Get),
         acc_bytes: snap.total_s3_bytes(),
+        acc_bytes_reused: snap.bytes_reused,
+        acc_peak_intermediate_bytes: snap.peak_intermediate_bytes,
     }
 }
 
 fn report(s: &Shape) {
     eprintln!(
         "[{}] gets={} (full={} suffix={}) bytes={} blocks_scanned={}/{} rows={} \
-         plan_full_reads={} | accounting: gets={} bytes={}",
+         plan_full_reads={} | accounting: gets={} bytes={} bytes_reused={} \
+         peak_intermediate_bytes={}",
         s.label,
         s.gets,
         s.full_gets,
@@ -457,6 +496,8 @@ fn report(s: &Shape) {
         s.plan_full_reads,
         s.acc_gets,
         s.acc_bytes,
+        s.acc_bytes_reused,
+        s.acc_peak_intermediate_bytes,
     );
 }
 
@@ -522,11 +563,13 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "full scan decodes every block"
     );
     assert_eq!(full.rows, TOTAL_BLOCKS, "full scan returns every record");
-    // 649,900 = the eight version-4 objects' bytes exactly (81,144 B each plus
-    // rounding across the writer's per-object framing). One whole-object GET per
-    // segment and nothing else, so this is the object bytes and not a byte more.
+    // 649,903 = the eight version-4 objects' bytes exactly (segment 0 carries
+    // `MARKER_RARE` in addition to `MARKER_FEW`, so its object is a few bytes
+    // larger than the other seven after compression). One whole-object GET
+    // per segment and nothing else, so this is the object bytes and not a
+    // byte more.
     assert_eq!(
-        full.bytes, 649_900,
+        full.bytes, 649_903,
         "full scan reads exactly the object bytes"
     );
     assert_eq!(full.plan_full_reads, 0, "full scan skips the plan phase");
@@ -576,15 +619,16 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q37.bytes,
         q37_block_bytes
     );
-    // 165,355 = 99,147 page bytes (the 8 surviving blocks' pages across their
-    // eight column chunks; blocks differ slightly in encoded size, so the term
-    // is the measured sum, not blocks x a constant) + 65,536 probe bytes
-    // (8 x 8 KiB) + 672 front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR
-    // 22)). The page term is 15% of the full scan; the probe term is the fixed
-    // per-object directory cost, which on this deliberately tiny fixture is
-    // 40% of the total and on a production 1.3 MB object is a rounding error.
+    // 165,365 = 99,157 page bytes (the 8 surviving blocks' pages across their
+    // eight column chunks; blocks differ slightly in encoded size -- segment
+    // 0's surviving block also carries `MARKER_RARE` -- so the term is the
+    // measured sum, not blocks x a constant) + 65,536 probe bytes (8 x 8 KiB)
+    // + 672 front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR 22)). The page
+    // term is 15% of the full scan; the probe term is the fixed per-object
+    // directory cost, which on this deliberately tiny fixture is 40% of the
+    // total and on a production 1.3 MB object is a rounding error.
     assert_eq!(
-        q37.bytes, 165_355,
+        q37.bytes, 165_365,
         "q37 moves the surviving blocks' page bytes plus the probe and the two \
          front sections, not the object"
     );
@@ -625,11 +669,11 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q20.bytes,
         q20_block_bytes
     );
-    // 264,405 = 198,197 page bytes (16 surviving blocks) + the same 65,536 probe
+    // 264,415 = 198,207 page bytes (16 surviving blocks) + the same 65,536 probe
     // and 672 front-section bytes q37 pays: twice q37's page term, identical
     // fixed term.
     assert_eq!(
-        q20.bytes, 264_405,
+        q20.bytes, 264_415,
         "q20 moves twice q37's page bytes and the same fixed directory bytes"
     );
     assert!(
@@ -668,10 +712,15 @@ async fn selective_numeric_reads_only_surviving_blocks() {
 
 /// A text predicate (`has_word`) is bloom-pruned only at DECODE: the skip index
 /// cannot decide it, so #761's fetch-side pruning does not apply. The plan phase
-/// falls back to a whole-object read per segment (`plan_full_reads`), the scan
-/// still reads the whole object, and only the byte-decode is reduced (bloom
-/// leaves one block per segment). This pins the fallback the fix deliberately
-/// keeps for shapes the skip index cannot prune.
+/// falls back to a whole-object read per segment (`plan_full_reads`), and since
+/// #835 the scan reuses that plan-carried whole object rather than reading it
+/// again, so only the byte-decode is reduced (bloom leaves one block per
+/// segment). This pins the fallback the fix deliberately keeps for shapes the
+/// skip index cannot prune. The 64 MiB cache here is far larger than this
+/// fixture's ~650 KB corpus, which is exactly the configuration that used to
+/// mask issue #835's double wire GET as a cache hit -- see
+/// `text_predicate_no_second_wire_read_regardless_of_cache` below for the
+/// cache-size-independent assertion this test cannot make on its own.
 #[tokio::test]
 async fn text_predicate_falls_back_to_full_object_read() {
     let cache = 64 << 20;
@@ -693,13 +742,15 @@ async fn text_predicate_falls_back_to_full_object_read() {
     );
     assert_eq!(text.rows, SEGMENTS, "one matching record per segment");
     // The whole objects are read: bytes ~ a full scan plus the probes, the
-    // amplification #761 cannot remove for a text predicate. 715,612 = 649,900
-    // object bytes + 65,536 probe bytes (8 x 8 KiB) + 176 FIELD_DIR bytes
-    // (8 x 22, read to resolve the arms before the fallback decides), the plan
-    // phase's cost on top of the whole-object read its fallback then issues.
+    // amplification #761 cannot remove for a text predicate. 715,439 = 649,903
+    // object bytes + 65,536 probe bytes (8 x 8 KiB). No FIELD_DIR bytes here:
+    // `place_and_decode_field_dir` fires only when the query carries a
+    // `NumRange` arm to resolve (log_fetcher.rs, #761); `has_word` is a
+    // content predicate, not a NumRange arm, so the plan phase never fetches
+    // it for this shape.
     let full = measure("full_scan", &[], cache).await;
     assert_eq!(
-        text.bytes, 715_612,
+        text.bytes, 715_439,
         "text fallback: the whole objects plus one plan probe each"
     );
     assert!(
@@ -765,13 +816,206 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
         small.bytes,
         full.bytes
     );
-    // 264,405 with no eviction (16 surviving blocks' page bytes plus the fixed
-    // probe and front-section bytes) against 479,147 under pressure: the
+    // 264,415 with no eviction (16 surviving blocks' page bytes plus the fixed
+    // probe and front-section bytes) against 479,157 under pressure: the
     // difference is re-fetched probe and directory extents, never a re-read
-    // page. Both stay under the 649,900 a single full pass moves.
-    assert_eq!(big.bytes, 264_405, "q20 with no eviction");
+    // page. Both stay under the 649,903 a single full pass moves.
+    assert_eq!(big.bytes, 264_415, "q20 with no eviction");
     assert_eq!(
-        small.bytes, 479_147,
+        small.bytes, 479_157,
         "q20 under eviction: more directory re-reads, still under one full pass"
+    );
+}
+
+/// Issue #835's attribution fixture, the "prunes nothing" shape: `MARKER_FEW`
+/// matches one block in EVERY segment, so nothing is pruned at the segment
+/// level and every relevant segment's plan phase falls back to a whole-object
+/// read (same predicate as `text_predicate_falls_back_to_full_object_read`
+/// above, deliberately, so the two tests are directly comparable).
+///
+/// Before issue #835's fix, the scan phase re-opened every one of those
+/// objects from scratch: `PLAN` issued `SEGMENTS` (8) whole-object GETs,
+/// `SCAN` issued `SEGMENTS` (8) more for the identical bytes, `2 * SEGMENTS`
+/// (16) total and twice the corpus bytes on the wire -- masked to 8 and one
+/// corpus's worth of bytes only when a read cache happened to be wired AND
+/// sized larger than the whole corpus (`text_predicate_falls_back_to_full_object_read`'s
+/// 64 MiB cache is exactly that masking case; this fixture's corpus is only
+/// ~650 KB, so a real deployment's cache is not reliably bigger).
+///
+/// Since the fix, the plan's fetched bytes are carried forward
+/// (`ravel_query::CarriedWholeObject`) into the scan, so the wire cost is
+/// `SEGMENTS` (8) GETs and exactly the corpus bytes moved once -- identical to
+/// the big-cache figures, but now true under a cache too small to hold the
+/// corpus AND with no cache at all, which is the whole point: the object
+/// crosses the wire at most once regardless of cache size.
+#[tokio::test]
+async fn text_predicate_no_second_wire_read_regardless_of_cache() {
+    // Below the ~650 KB corpus: without the carry, at least some plan-phase
+    // entries would not survive to be reused by the scan.
+    let small = measure_opt(
+        "text_fallback (small cache)",
+        &[has_word(MARKER_FEW)],
+        Some(128 << 10),
+    )
+    .await;
+    let uncached = measure_opt("text_fallback (no cache)", &[has_word(MARKER_FEW)], None).await;
+    report(&small);
+    report(&uncached);
+
+    for s in [&small, &uncached] {
+        assert_eq!(
+            s.plan_full_reads, SEGMENTS,
+            "{}: every relevant segment's plan phase reads the whole object",
+            s.label
+        );
+        // The exact-count claim this fixture exists to pin: full_gets is
+        // SEGMENTS, NOT 2 * SEGMENTS -- the scan issues no whole-object GET of
+        // its own, regardless of cache size. (Total `gets` below is
+        // 2 * SEGMENTS because the plan phase's suffix probe, not the scan,
+        // adds the other half.)
+        assert_eq!(
+            s.full_gets, SEGMENTS as u64,
+            "{}: exactly one whole-object wire GET per segment total -- the \
+             plan's carried bytes cover the scan, never a second GET, \
+             regardless of cache size",
+            s.label
+        );
+        assert_eq!(
+            s.gets,
+            2 * SEGMENTS as u64,
+            "{}: one suffix probe plus one whole-object GET per segment, and \
+             nothing beyond that -- the scan adds no GET of any shape",
+            s.label
+        );
+        // 715,439: identical to the big-cache figure
+        // (`text_predicate_falls_back_to_full_object_read`), proving the byte
+        // cost no longer depends on cache size.
+        assert_eq!(
+            s.bytes, 715_439,
+            "{}: exactly the corpus bytes plus the fixed per-segment plan \
+             overhead, moved once, never twice",
+            s.label
+        );
+        assert_eq!(
+            s.acc_bytes, s.bytes,
+            "{}: accounting wire-bytes agrees with the raw store bytes",
+            s.label
+        );
+        assert_eq!(
+            s.acc_gets, s.gets,
+            "{}: accounting GET count agrees with the raw store GETs -- the \
+             reused read is not double-counted as a second GET",
+            s.label
+        );
+        assert_eq!(
+            s.blocks_scanned, SEGMENTS,
+            "{}: bloom still prunes to one block per segment at decode",
+            s.label
+        );
+        assert_eq!(
+            s.rows, SEGMENTS,
+            "{}: one matching record per segment",
+            s.label
+        );
+        // 649,903: the whole corpus (see `full.bytes` in the sibling test),
+        // charged as reused rather than folded into the GET-bytes figure the
+        // plan phase already recorded -- the truthful-accounting deliverable.
+        assert_eq!(
+            s.acc_bytes_reused, 649_903,
+            "{}: the scan's reuse of every carried whole object is charged via \
+             bytes_reused, not silently absorbed into acc_bytes",
+            s.label
+        );
+    }
+}
+
+/// Issue #835, the q37-style "prunes most" shape: `MARKER_RARE` is confined to
+/// one block of one segment out of `SEGMENTS`. The skip index still cannot
+/// decide a text predicate whether or not it ultimately matches, so EVERY
+/// relevant segment's plan phase reads the whole object to find out
+/// (`plan_full_reads == SEGMENTS`) -- but only the one segment containing the
+/// marker has a surviving block, so `owned_work` assigns no partition any
+/// work in the other `SEGMENTS - 1` segments and the scan phase never opens
+/// them. The one surviving segment's scan reuses its plan-carried bytes (no
+/// second GET), so the total wire GET count is exactly `SEGMENTS`: the plan
+/// pass moves every object once, and the scan adds nothing.
+#[tokio::test]
+async fn text_predicate_prunes_most_scan_adds_no_gets() {
+    let cache = 128 << 10; // below the ~650 KB corpus
+    let s = measure(
+        "text_fallback (prunes most)",
+        &[has_word(MARKER_RARE)],
+        cache,
+    )
+    .await;
+    report(&s);
+
+    assert_eq!(
+        s.plan_full_reads, SEGMENTS,
+        "every relevant segment's plan phase reads the whole object -- the \
+         skip index cannot decide a text predicate whether or not it matches"
+    );
+    assert_eq!(
+        s.full_gets, SEGMENTS as u64,
+        "exactly one whole-object GET per segment (the plan pass); the scan \
+         adds zero GETs for the surviving segment and none of the other \
+         SEGMENTS - 1 segments are ever opened"
+    );
+    assert_eq!(
+        s.gets,
+        2 * SEGMENTS as u64,
+        "one suffix probe plus one whole-object GET per segment (the plan \
+         pass over every segment); no GET of any shape beyond that"
+    );
+    assert_eq!(
+        s.blocks_scanned, 1,
+        "only the one segment carrying the marker survives"
+    );
+    assert_eq!(s.rows, 1, "exactly one matching record, from segment 0");
+    assert!(
+        s.acc_bytes_reused > 0,
+        "the one surviving segment's scan reuses its plan-carried bytes \
+         rather than issuing a second GET"
+    );
+}
+
+/// Issue #835's memory-bound requirement, honestly measured rather than
+/// assumed: peak memory held between the plan pass and the scan should
+/// ideally be bounded by fetch concurrency times object size, never by corpus
+/// size. This fixture pins what the shipped design actually achieves instead,
+/// and documents the gap rather than silently asserting the ideal bound would
+/// hold.
+///
+/// Every relevant segment's plan result -- survivor count, stats, footer, and
+/// any carried whole-object body -- is retained in `compute_plan_counts`'s
+/// `planned` list until its `try_collect` returns, because the shared
+/// `tokio::sync::OnceCell` barrier (see `logs_scan.rs`'s module doc, "Whole-
+/// object fallback carry, and its memory bound") means no partition drains
+/// anything until every segment's plan is known: the flattened block-striping
+/// assignment needs every segment's survivor count, not just the ones before
+/// it. So for `MARKER_FEW` (present in every segment, sending every one
+/// through the whole-object fallback at once), the peak intermediate-bytes
+/// figure `compute_plan_counts` now reports (`QueryAccounting::
+/// observe_intermediate_bytes`, previously unwired for this path) is the FULL
+/// corpus, not a small multiple of the object size -- `plan_concurrency`
+/// bounds only how many plan GETs are in flight at once, never how many
+/// already-completed results are retained meanwhile. Bringing this down to a
+/// true concurrency bound needs the barrier itself to release progressively
+/// (assign and drain a segment's blocks as soon as its own prefix of survivor
+/// counts is known, rather than after the whole pass) -- a change to
+/// ADR-0102's partitioning protocol, out of this fix's scope. This test keeps
+/// that gap visible and pinned rather than silently assumed away.
+#[tokio::test]
+async fn plan_barrier_peak_bytes_is_corpus_not_concurrency_bounded() {
+    let cache = 64 << 20;
+    let s = measure("text_fallback (peak bytes)", &[has_word(MARKER_FEW)], cache).await;
+    let full = measure("full_scan", &[], cache).await;
+    report(&s);
+
+    assert_eq!(
+        s.acc_peak_intermediate_bytes, full.bytes,
+        "peak carried-whole-object bytes at the plan barrier equals the \
+         entire corpus, not a fetch-concurrency-scaled fraction of it -- the \
+         gap this fix's final report names against the ideal bound"
     );
 }

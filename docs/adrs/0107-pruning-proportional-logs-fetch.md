@@ -356,3 +356,53 @@ bytes `RlogReader` re-parses to open the assembled buffer. The block-range
 (non-coverage) branch, reachable only when a caller forces the ranged path,
 places that tail region explicitly so a footer-carried open never assembles a
 buffer with a zeroed trailer.
+
+## Amendment 2026-09-05 (issue #835): the plan phase's whole-object fallback carries its bytes into the scan
+
+The amendment above carries a *footer* from the plan phase's predicate-free
+fast path so the scan skips its own probe. It does not cover the fallback
+this ADR's "Requests per object" section already describes: a predicate the
+skip index cannot decide (`has_word`/text, an `attrs` POSTINGS equality, a
+stream filter) makes `plan_segment` read the WHOLE object to count survivors,
+counted in `plan_full_reads`, and forwards no footer. Before #835 those bytes
+were then discarded: the scan that followed reopened the same object from
+scratch, so the object crossed the wire twice per statement -- masked to once
+only when a read cache happened to be wired and still large enough to hold
+every relevant object by the time the scan reached it. A tenant whose corpus
+exceeds the cache, or a query run with no cache at all, paid the second GET
+in full.
+
+Since #835, `plan_segment`'s fallback branch carries its fetched buffer
+forward as a `ravel_query::CarriedWholeObject` (threaded through
+`SegPlan::whole_object` in `ravel_sql::logs_scan`), and the scan's subset open
+consumes it instead of issuing its own GET when supplied. The object crosses
+the wire at most once per statement regardless of cache size or eviction. As
+with the footer carry, this needs no etag re-check of its own: the plan and
+scan of one statement resolve against the same immutable `SegmentRef` out of
+one resolved snapshot, and the whole-object cache key is already keyed on
+`seg_ref.content_hash`, so there is no live GET spanning the gap between the
+carried read and its reuse for a replaced object to slip through. The reused
+bytes are charged to `QueryAccounting::add_bytes_reused`, kept distinct from
+the GET-bytes figure the issuing plan phase already recorded, so a report
+can still tell a genuine wire GET from a carried reuse.
+
+This carry does not bound peak memory to a fetch-concurrency scale. Every
+relevant segment's plan result -- survivor count, stats, footer, and any
+carried whole-object body -- is retained by `compute_plan_counts` until its
+shared pass over every segment returns, because ADR-0102's flattened
+block-striping assignment needs every segment's survivor count before any
+partition can drain a block, not just the ones ahead of it. So a statement
+that sends many relevant segments through the fallback at once
+(a broad, unindexed text search across a large corpus) holds all of their
+carried bytes simultaneously at that barrier: peak memory is bounded by the
+tenant's admitted segment count (`ravel_query::SegmentAdmission`, 1024 by
+default) times average object size, not by fetch concurrency times object
+size. Reaching the tighter bound needs the barrier itself to release
+progressively instead of all at once, a change to this ADR's partitioning
+protocol that #835's fix does not make. `crates/ravel-sql/src/logs_scan.rs`'s
+module doc ("Whole-object fallback carry, and its memory bound (issue #835)")
+and `compute_plan_counts` report this peak via
+`QueryAccounting::observe_intermediate_bytes` rather than leaving it
+invisible, and
+`crates/ravel-sql/tests/logs_selective_scan_amplification.rs`'s
+`plan_barrier_peak_bytes_is_corpus_not_concurrency_bounded` pins it.

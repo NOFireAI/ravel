@@ -9,9 +9,12 @@
 //! Without a cache nothing coalesces them, so the scan pays one whole-object GET
 //! per partition per segment. The fix (deliverable of #693) makes the un-cached
 //! path segment-granular: relevant segment `j` (snapshot order) goes to
-//! partition `j % n` and drains all of that segment's surviving blocks, so the
-//! scan issues exactly one plan read plus one scan read per segment. The cached
-//! path keeps the intra-segment block striping unchanged.
+//! partition `j % n` and drains all of that segment's surviving blocks. That
+//! #693 fix left one read per phase per segment (a plan read plus a separate
+//! scan read); #835 removes the second one by carrying the plan phase's
+//! fetched bytes into the scan, so the un-cached cost is one whole-object GET
+//! per segment, not two. The cached path keeps the intra-segment block
+//! striping unchanged.
 //!
 //! Every fixture here carries a pending erasure predicate that matches nothing
 //! ([`non_matching_erasure`]), which changes no row and prunes no block but does
@@ -300,15 +303,23 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
     )))
 }
 
-/// The pinned request-count property (#693, #680). Without a read cache the scan
-/// must open each of the six segments exactly once: one plan read per segment
-/// plus one scan read per segment, `2 * 6 = 12` whole-object GETs total.
+/// The pinned request-count property (#693, #680, amended by #835). Without a
+/// read cache the scan must open each of the six segments exactly once: one
+/// whole-object GET per segment in the plan phase, `SEGMENTS = 6` total.
 ///
-/// Against the pre-fix ADR-0102 code this fails: block striping puts every
-/// segment's four blocks into all four partitions, each partition opens the
-/// segment itself, and nothing coalesces the re-opens, so the scan costs
-/// `6 + 6 * 4 = 30` GETs (one plan read per segment plus one scan read per
-/// partition per segment).
+/// Before #835 the plan phase's fetched bytes were discarded once the
+/// predicate was decided, so the scan (uncached, nothing to coalesce a
+/// re-open onto) issued its own second GET per segment: `2 * 6 = 12`. Since
+/// #835 the plan's fetch is carried forward (`CarriedWholeObject`) and the
+/// scan reuses it instead of reopening, so the un-cached cost drops to the
+/// same `SEGMENTS` a cache previously only approximated when it was large
+/// enough to hold the whole corpus.
+///
+/// Against the pre-#693 ADR-0102 code this fails much worse: block striping
+/// puts every segment's four blocks into all four partitions, each partition
+/// opens the segment itself, and nothing coalesces the re-opens, so the scan
+/// costs `6 + 6 * 4 = 30` GETs (one plan read per segment plus one scan read
+/// per partition per segment).
 #[tokio::test]
 async fn uncached_scan_opens_each_segment_once() {
     let counting = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -329,10 +340,13 @@ async fn uncached_scan_opens_each_segment_once() {
 
     assert_eq!(
         counting.gets(),
-        (2 * SEGMENTS) as u64,
-        "un-cached scan must open each segment once: {SEGMENTS} plan reads + \
-         {SEGMENTS} scan reads. The pre-fix striped path issues \
-         {} (= {SEGMENTS} + {SEGMENTS} * {PARTS}).",
+        SEGMENTS as u64,
+        "un-cached scan must open each segment exactly once, in the plan \
+         phase: {SEGMENTS} GETs total. Since #835 the scan reuses the plan's \
+         carried bytes instead of reopening, so this no longer costs \
+         {} (= 2 * {SEGMENTS}) the way it did before that fix, and the \
+         pre-#693 striped path costs {} (= {SEGMENTS} + {SEGMENTS} * {PARTS}).",
+        2 * SEGMENTS,
         SEGMENTS + SEGMENTS * PARTS,
     );
 }
