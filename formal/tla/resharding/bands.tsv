@@ -1,5 +1,5 @@
 # cfg	min_distinct	max_distinct	min_depth	max_depth
-# smoke.cfg: measured distinct=958804 depth=18 (states=7809360, 26s) on tla2tools 1.7.4.
+# smoke.cfg: measured distinct=958804 depth=18 (states=7809360, 43s) on tla2tools 1.7.4.
 # The band brackets that measurement with margin; a silent state-space collapse
 # (a broken guard, a dropped action) falls outside it and fails the smoke gate.
 # exhaustive.cfg: measured distinct=1179718 depth=20 (states=8503664, under 5min)
