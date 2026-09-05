@@ -2,12 +2,18 @@
 
 ## 1. Scope and commit
 
-This report covers the six specifications under `formal/tla/` (`common`,
-`commit`, `catalog`, `lifecycle`, `resharding`, `maintenance`) as they stand
-at commit `7124a3d3a4e9005cef303341989a40ac3b2bd153`. Every figure below is
-copied from the area's own `results.md` and `bands.tsv`; no model was run to
-produce this report, and no figure here was recomputed, rounded, or recalled
-from anything other than those files.
+This report covers the six areas under `formal/tla/` (`common`, `commit`,
+`catalog`, `lifecycle`, `resharding`, `maintenance`), seven specification
+modules in all, as they stand at commit
+`7124a3d3a4e9005cef303341989a40ac3b2bd153`. Maintenance alone holds two
+modules: `MaintenanceOwnership.tla` (ADR-0065, shipped behaviour) and
+`CompactionClaims.tla` (ADR-1029, a proposed design over a landed
+CreateIfAbsent/CasVersion claim primitive that nothing in the repository
+calls yet; this suite checks that the design is internally consistent, not
+that it is implemented). Every figure below is copied from the area's own
+`results.md` and `bands.tsv`; no model was run to produce this report, and
+no figure here was recomputed, rounded, or recalled from anything other than
+those files.
 
 ## 2. Method
 
@@ -518,12 +524,14 @@ precisely (two) rather than rounding it to the zero the drafting instruction
 expected, because the instruction's premise — that the string would not
 appear at all — does not match what the phrase-level denials actually do.
 
-This suite establishes that six finite models of Ravel's coordination
-protocols hold their stated safety invariants under the checked bounds, that
-the negative controls demonstrate each invariant is non-vacuous (it can be
-made to fail), and that the stated liveness properties hold under the named
-fairness assumptions where checked. It does not establish that the Rust
-implementation conforms to these models beyond what each area's
+This suite establishes that seven finite models, across the six areas, of
+Ravel's coordination protocols hold their stated safety invariants under the
+checked bounds (CompactionClaims as a proposed design, not shipped
+behaviour), that the negative controls demonstrate each invariant is
+non-vacuous (it can be made to fail), and that the stated liveness
+properties hold under the named fairness assumptions where checked. It does
+not establish that the Rust implementation conforms to these models beyond
+what each area's
 traceability table and named tests assert; it does not establish anything
 about configurations, clock bounds, or worker counts wider than the ones
 each `results.md` records having run; and it does not establish, and does
