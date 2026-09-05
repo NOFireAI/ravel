@@ -139,20 +139,42 @@ visible. Four parts; the first two are the substance.
 ### 1. `MemoryBudget`, a process-wide accountant
 
 A new leaf crate, `ravel-memory`, with no store I/O and no dependency beyond
-std: `MemoryBudget { limit, reserved: AtomicU64 }` with fallible `try_reserve(n)
--> Result<Reservation, MemoryExhausted>`, and `Reservation` an RAII guard that
-releases on drop. Ownership follows the guard, which follows the allocation:
-whoever holds the buffer holds the guard. That is constraint 1 by construction.
+std. `MemoryBudget { limit, reserved: AtomicU64 }` exposes two shapes over one
+counter, because its two consumers account differently:
 
-`TenantMemoryAccountant` becomes the adapter its doc already reserves: its
-`try_grow` charges the tenant counter, then `MemoryBudget::try_reserve`; a
-refusal at either level rolls the other back and surfaces as the existing
-`ResourcesExhausted`. The per-tenant ceiling stays as a fairness limit nested
-inside the process limit, so N tenants can no longer reserve N x 50%. The
-infallible `grow` path is unchanged: it records overshoot into the process
-counter and trips `CeilingBreach` exactly as today, so a DataFusion-internal
-overshoot still ends in a typed error one batch later, not in a kernel kill
-nobody can attribute.
+- Counter operations for the SQL adapter: `try_reserve(n) -> Result<(),
+  MemoryExhausted>` (a CAS against `limit`), `reserve_unchecked(n)` (the
+  infallible path, may overshoot), and `release(n)`. `TenantMemoryAccountant`
+  already keeps grow and shrink as separate counter operations
+  (`memory.rs:105-130`) and `TenantDelegatingPool` already forwards every
+  DataFusion `grow`, `try_grow` and `shrink` to it 1:1 with rollback on
+  refusal (`memory.rs:264-348`); the adapter forwards each of those to the
+  process counter with the same delta, in the same order, so process-level
+  bytes track SQL bytes exactly: tenant then process on the way up, process
+  then tenant on the way down, and a refusal at either level rolls the other
+  back before surfacing as `ResourcesExhausted`. No guard is held across a
+  query; the counters are the ledger, as they are today.
+- An RAII `Reservation` guard for the fetch layer, a thin wrapper that calls
+  `try_reserve` on construction and `release` on drop. Ownership follows the
+  guard, which follows the allocation: whoever holds the buffer holds the
+  guard. That is constraint 1 by construction for buffers, and the SQL
+  adapter's explicit shrink is constraint 1 for reservations DataFusion
+  resizes.
+
+The per-tenant ceiling stays as a fairness limit nested inside the process
+limit, so N tenants can no longer reserve N x 50%.
+
+The infallible `grow` path keeps its shape: `reserve_unchecked` records the
+overshoot into the process counter and `CeilingBreach` trips exactly as today,
+so a DataFusion-internal overshoot ends in a typed error on the stream's next
+poll (`executor.rs:1805-1815`). What that path cannot promise is stated, not
+hidden: the bytes are allocated before the breach is visible, and a delta larger
+than the headroom between the budget and the kill boundary kills the process
+before the next poll runs. The overshoot per poll is bounded by what DataFusion
+allocates between two polls of the query stream, one batch per partition, so
+the exposure is `partitions x max batch bytes` per query; the overhead reserve
+in decision 3 must exceed it, and the acceptance in decision 4 says what a kill
+that slips through counts as.
 
 ### 2. A fetch byte reservation at the points where the unit is known
 
@@ -175,6 +197,32 @@ is constraint 2 answered by reserving at fetch time rather than at admission.
 Reservations are released when the buffer is dropped, not when the GET
 completes.
 
+Buffers outlive the fetch layer, so the guard needs a handoff rule, and the
+rule is: **every byte is under exactly one of three ledgers at every instant,
+the cache cap, a fetch guard, or an SQL reservation, and a handoff may
+double-count transiently but may never leave a gap.** Concretely:
+
+- A fetched buffer handed to an SQL scan is charged by that scan's own
+  `try_grow` (the `LogScanStream` reservation over pending and emitted buffers,
+  `crates/ravel-sql/src/logs_scan.rs:2992-3068`, and `scan.rs:598` for RSEG),
+  which now reaches the same process budget through the adapter. The fetch
+  guard is released only after that `try_grow` has succeeded, so the bytes are
+  double-counted for the width of one call and never uncounted. A `try_grow`
+  refusal at handoff drops the buffer and surfaces the SQL error; the fetch
+  guard's release follows the drop.
+- A buffer inserted into a cache is covered by the cache's hard cap from the
+  insert onward; the fetch guard is released after the insert. A `Bytes` that a
+  reader retains after the cache evicts it is covered by that reader's ledger:
+  the SQL reservation for a scan, the fetch guard for a consumer without a
+  pool (PromQL today), which is why the guard rides with the `Bytes` in
+  `FetchedRegions` rather than with the request.
+- A buffer that reaches no consumer (an error between fetch and handoff) is
+  released by the guard's drop, as any RAII value is.
+
+The static cache carve bounds residency, not references; the handoff rule is
+what bounds the references, and it is what a review of a draft without it
+found missing.
+
 Concurrency knobs stop being the only thing bounding fetch memory. Raising
 `--store-get-concurrency` to 256 with a ranged policy becomes a throughput
 choice whose memory cost is charged and refused, instead of the kernel's
@@ -191,11 +239,21 @@ per-tenant ceiling as the fairness bound within it. The sum of hard caps plus
 the shared remainder equals the budget by construction, and startup refuses a
 flag combination whose hard caps alone exceed it.
 
-The overhead reserve is a measured number, not a guess: the gap between
-`ravel_process_allocator_bytes{stat="resident"}` and the sum of tracked
-reservations under the 10-connection window, plus margin. The ADR does not fix
-it; the first measurement under decision 4 does, and the constant's doc comment
-carries the figure the way `CACHE_MEMORY_PERCENT`'s does.
+The overhead reserve is a measured number, not a guess, and it is measured in
+a calibration run that is separate from, and frozen before, the acceptance
+runs, so the acceptance assertion is not circular. Calibration: parts 1, 2 and
+4 landed, the budget set to unlimited so nothing is refused, the same
+10-connection window; the reserve is the maximum over the window of
+`ravel_process_allocator_bytes{stat="resident"}` minus the sum of every tracked
+ledger (`ravel_cache_resident_bytes` for both caches, `ravel_memory_reserved_
+bytes{component="sql"}`, `ravel_memory_reserved_bytes{component="fetch"}`),
+plus a 25% margin, rounded up to the next 256 MiB, and it must exceed the
+`partitions x max batch bytes` exposure in decision 1. That value lands as a
+constant in the derivation with the calibration figures in its doc comment, the
+way `CACHE_MEMORY_PERCENT` carries the sweep, in a commit that precedes the
+first acceptance run. The acceptance runs then use the frozen value and can
+fail against it: resident above `budget + reserve` in acceptance means an
+allocation that calibration did not see, which is a finding, not a recalibration.
 
 ### 4. The aggregate, visible and asserted
 
@@ -204,11 +262,16 @@ carries the figure the way `CACHE_MEMORY_PERCENT`'s does.
 - Gauges: `ravel_memory_budget_bytes`, `ravel_memory_reserved_bytes{component=
   "sql"|"fetch"}`, beside the existing cache residency and allocator gauges.
 - Pre-registered acceptance, same box, same tenant, same 600 s window at 10
-  connections, three consecutive runs: zero kernel kills; every over-budget
-  query ends in `ResourcesExhausted` or `FetchMemoryExhausted`; error ratio at
-  or below the 6 GiB arm's 3.9%; peak `ravel_process_allocator_bytes{resident}`
-  at or below budget plus overhead reserve. A run that survives with resident
-  above that band has an untracked allocation and fails the gate.
+  connections, three consecutive runs after the reserve is frozen: every
+  over-budget query ends in `ResourcesExhausted` or `FetchMemoryExhausted`;
+  error ratio at or below the 6 GiB arm's 3.9%; peak
+  `ravel_process_allocator_bytes{resident}` at or below budget plus the frozen
+  reserve; and zero kernel kills attributable to a tracked ledger. A kill is
+  attributable to the infallible `grow` path only if the server's last breach
+  record names an unchecked delta larger than the reserve, and such a kill is
+  itself a finding against the reserve's sizing, recorded and re-run, not
+  accepted. A run that survives with resident above the band has an untracked
+  allocation and fails the gate.
 
 ```mermaid
 flowchart TD
@@ -295,6 +358,14 @@ issue and drop and on every SQL reservation; refusals on queries that used to
 succeed by overshooting into headroom another component was not using. The
 last is the point, and the acceptance band says how many refusals are
 acceptable.
+
+A residual the design does not remove: DataFusion's infallible `grow` can
+allocate past the budget before the next poll detects it, so process survival
+is guaranteed for tracked allocations and bounded, not guaranteed, for that
+path, by the overhead reserve exceeding `partitions x max batch bytes`. A
+budget that made that path fallible would need a DataFusion change or a
+pool that lies to `resize`, which desynchronises the reservation; neither is
+taken here.
 
 Report only, found while verifying: ADR-0107's 2026-09-05 amendment
 (`docs/adrs/0107-pruning-proportional-logs-fetch.md:322-324`) still says the
