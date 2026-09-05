@@ -29,6 +29,14 @@ maximum flush delay. A clean shutdown drains the window, so the loss is
 specific to a crash. The [consistency model](docs/consistency-model.md) is
 normative for both modes.
 
+The durability protocols above are modeled in TLA+. TLC checked five finite
+models of the commit, catalog, lifecycle, resharding, and maintenance
+protocols, over one shared object-store model, under stated bounds and
+assumptions. Negative controls show that each invariant can fail, and every
+checked property traces to a Rust symbol and a test. The
+[formal verification guide](docs/guides/formal-verification.md) has the
+bounds, the assumptions, and the results.
+
 ## Why it is built this way
 
 Every self-hosted observability stack ends up storing data on object storage.
@@ -331,6 +339,15 @@ Replace `v0.13.0` and `0.13.0` with the release you are verifying. The tag ref i
 Durability claims are cheap to write and hard to keep. These are the checks that
 hold Ravel to them:
 
+- TLA+ models check the commit, catalog, lifecycle, resharding, and
+  maintenance protocols over one shared object-store model, and every checked
+  property observes the store itself rather than the model's own bookkeeping.
+  Each area carries negative controls that show its invariants can fail, and
+  reachability obligations that show a guarded state is still reached.
+  `scripts/check-tla.sh` runs the smoke, negative, and traceability lanes on
+  every pull request, and the exhaustive lane nightly. See the
+  [formal verification guide](docs/guides/formal-verification.md) for the
+  results.
 - A deterministic simulation harness drives the full ingest, fold, compact,
   sweep, and query cycle under injected faults. It checks read-your-write,
   strict-ack durability, compaction equivalence, record-count conservation, and
