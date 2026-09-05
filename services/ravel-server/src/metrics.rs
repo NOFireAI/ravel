@@ -1615,9 +1615,11 @@ fn render_metadata_cache_family(out: &mut String, mode: Mode, counters: &Metadat
 /// The `shard_count` provisioning family (ADR-0050 section 5, EC5; ADR-0082).
 ///
 /// `ravel_provisioning_shard_count_mismatch_total` counts hard provisioning
-/// failures: an unreadable record (corrupt or a future format version), or
-/// pre-ADR data a lower `shard_count` would hide, caught on a dynamic tenant's
-/// first touch or on the maintain per-tenant loop. A nonzero value means at
+/// failures: an unreadable record (corrupt or a future format version), a
+/// decodable record whose generation history fails structural validation
+/// (`CorruptGenerations`: a scalar/generation-0 mismatch or a nonzero first
+/// activation hour), or pre-ADR data a lower `shard_count` would hide, caught
+/// on a dynamic tenant's first touch or on the maintain per-tenant loop. A nonzero value means at
 /// least one tenant's provisioning record could not be validated; the
 /// operations guide pages on any increase.
 ///
