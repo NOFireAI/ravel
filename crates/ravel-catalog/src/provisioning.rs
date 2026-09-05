@@ -2343,6 +2343,7 @@ mod tests {
     /// the `.expect(...)` on the `Ok` value below panicked.
     #[tokio::test]
     async fn create_if_absent_race_loser_accepts_winner_on_drift() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
         let inner = MemoryStore::new();
         let th = tenant();
         seed_record(&inner, &th, Signal::Metrics, 4).await;
