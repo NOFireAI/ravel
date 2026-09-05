@@ -83,9 +83,7 @@ claim primitive that nothing in the repository calls yet. Catalog's
 overlap configuration does not finish inside its time budget. It runs as
 a targeted check, not a gated pass or fail lane. Resharding's skew
 configuration was killed at an internal timeout with ten million states
-still queued, and the suite records no result for it. Five negative
-configurations in commit and catalog still carry no counterexample note,
-a documentation gap the suite reports instead of fixing.
+still queued, and the suite records no result for it.
 
 Two liveness results hold only under stated conditions. When hold state,
 HEAD read state, and refresh outcome all eventually stop changing, the
@@ -103,8 +101,8 @@ Issue 1244 tracks two wording fixes to the suite report.
 
 Install a Java 17 or later runtime before you run any lane. Install GNU
 timeout before you run any lane. On macOS, run `brew install coreutils`
-to get it. If neither Java nor GNU timeout is usable, the harness exits
-with code 2 and prints the reason.
+to get it. If Java or GNU timeout is missing, the harness exits with
+code 2 and prints the reason.
 
 Run `scripts/check-tla.sh smoke` to check safety in every area, at a
 300-second budget per configuration. Run `scripts/check-tla.sh negative`
@@ -156,7 +154,7 @@ the real source tree, and it needs no Java runtime.
 
 Five rows across the suite still have no test. Two are in lifecycle.
 `RequestErasure` has no production code that writes the erasure request
-marker, only a key builder and tests exist. The pair `CompleteErasure`
+marker. Only a key builder and tests exist. The pair `CompleteErasure`
 and `CompletionImpliesNoPreRewriteExposure` names a gate the code
 computes, but no production symbol writes the completion object.
 
