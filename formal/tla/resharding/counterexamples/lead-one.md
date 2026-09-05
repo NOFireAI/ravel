@@ -2,8 +2,8 @@
 
 Config: `negative/lead-one.cfg` (`L = 1` against the shipped `L = 2` that
 `MIN_LEAD_HOURS` demands at `C = 1`, no skew, `MaxHour = 3`). Property violated:
-`LeadCoversRefreshHorizon`. This is the shallowest control: 199 distinct states,
-one second.
+`LeadCoversRefreshHorizon`. This is the shallowest control: 236 distinct states,
+under one second.
 
 A decrease is appended at some router hour with an activation only one hour
 later. A writer that refreshed at that same hour holds a view whose newest known
