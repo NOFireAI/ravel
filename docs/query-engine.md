@@ -1693,14 +1693,14 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   shards' LIST pages ran concurrently with each other or one after another,
   only that they happened (`ravel-catalog` owns that fan-out; out of this
   task's scope to change).
-- `serviceBatches`: batches this query's per-segment fan-out was forced into
-  by the binding concurrency it actually ran under. The metrics fetch is a
-  NESTED fan-out with three levels of admission, all of which bound the
-  batch count: an OUTER `buffer_unordered(promql_fetch_fanout)` over
-  distinct matcher plans (`distinct_plans_by_matcher` in
-  `crates/ravel-query/src/engine.rs`), which admits at most
-  `promql_fetch_fanout` plans at once, however many distinct matcher sets
-  the query has; each admitted plan's own INNER
+- `serviceBatches`: a LOWER bound on the serial service rounds this query's
+  per-segment fan-out needed, under a wave-synchronous model of the nested
+  fan-out. The metrics fetch is a NESTED fan-out with three levels of
+  admission, all of which bound the round count: an OUTER
+  `buffer_unordered(promql_fetch_fanout)` over distinct matcher plans
+  (`distinct_plans_by_matcher` in `crates/ravel-query/src/engine.rs`), which
+  admits at most `promql_fetch_fanout` plans at once, however many distinct
+  matcher sets the query has; each admitted plan's own INNER
   `buffer_unordered(promql_fetch_fanout)` over that plan's segments
   (`prefetch_metric_plans`/`fetch_all_samples_and_histograms`); and the one
   shared `GetLimiter` described under "GET concurrency (ADR-1195)" above,
@@ -1710,29 +1710,44 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   figure models: it says nothing about GETs another engine in the same
   process issues, and nothing about the RLOG whole-object funnel, which
   takes no permit at all.
-  The outer and inner levels do not multiply freely: plan capacity is
-  `promql_fetch_fanout * min(distinctMatcherSets, promql_fetch_fanout)`, not
-  `promql_fetch_fanout * distinctMatcherSets` -- the outer stream can never
-  have more than `promql_fetch_fanout` plans in flight even when there are
-  more distinct matcher sets than that. So the binding concurrency is
-  `min(promql_fetch_fanout * min(distinctMatcherSets, promql_fetch_fanout),
-  sharedGetPermits)`, and the work this fan-out issues is `segment_count *
-  distinctMatcherSets` GETs, uncapped (distinct matcher sets, not the raw
-  plan count `stats.estimate` scales by -- a query naming two `SelectorPlan`s
+  It is a lower bound, never an upper bound or an exact count, because the
+  OUTER `buffer_unordered` is a SLIDING window, not a wave-synchronous one:
+  as soon as one admitted plan finishes, the next plan is admitted
+  immediately, without waiting for its siblings. Modeling it as
+  wave-synchronous anyway -- one binding concurrency
+  (`min(promql_fetch_fanout * min(distinctMatcherSets,
+  promql_fetch_fanout), sharedGetPermits)`) dividing the total work
+  (`segment_count * distinctMatcherSets` GETs) in a single division --
+  undercounts whenever the outer window is not full for the query's whole
+  duration: 3 distinct matcher sets, 1 segment each, `promql_fetch_fanout`
+  2, and 1000 shared permits gives peak capacity `min(2 * 2, 1000) = 4`, so
+  that single division reports `ceil(3 / 4) = 1` round, but plans 1 and 2
+  admit together in the first round and plan 3 only after one of them
+  finishes, in a second round -- the real schedule needs at least 2 rounds,
+  not 1.
+  So this figure is computed per WAVE of the outer fan-out instead: `waves
+  = ceil(distinctMatcherSets / promql_fetch_fanout)`; for 0-based wave `w`,
+  `active_w = min(promql_fetch_fanout, distinctMatcherSets - w *
+  promql_fetch_fanout)` plans are admitted, `capacity_w =
+  min(promql_fetch_fanout * active_w, sharedGetPermits)` is that wave's
+  binding concurrency, and `batches_w = ceil(segment_count * active_w /
+  capacity_w)` is its own serial round count; `serviceBatches` sums
+  `batches_w` over every wave (distinct matcher sets, not the raw plan
+  count `stats.estimate` scales by -- a query naming two `SelectorPlan`s
   that share one matcher set, `up + up offset 5m`, is fetched in one pass,
-  so its `serviceBatches` does not double; every distinct matcher set still
-  issues its own GETs, just not all of them concurrently). 64 segments,
-  `promql_fetch_fanout` 8, two distinct matcher sets, and 16 shared permits
-  gives 128 GETs at binding concurrency `min(8 * min(2, 8), 16) = min(16,
-  16) = 16`, i.e. 8 batches, not `ceil(64 * 2 / 8) = 16`: dividing the
-  plan-multiplied numerator by the un-multiplied fan-out width alone
-  double-counts the plan fan-out. Conversely, `promql_fetch_fanout` 1 with
-  three distinct matcher sets, 20 segments, and 1000 shared permits gives
-  binding concurrency `min(1 * min(3, 1), 1000) = 1`, i.e. 60 batches (60
-  GETs one at a time) -- capping the multiplier by `sharedGetPermits` alone,
-  without also capping it by `promql_fetch_fanout`, would have reported 20,
-  silently assuming all 3 plans ran at once when the outer stream never
-  admits more than 1. A single-plan query reduces to
+  so its `serviceBatches` does not double). This sum is still a lower
+  bound, never exact: the sliding window can only pack work at least as
+  tightly as the wave-synchronous model assumes, never more loosely, so the
+  real scheduler takes at least this many rounds. 64 segments,
+  `promql_fetch_fanout` 8, two distinct matcher sets, and 16 shared permits:
+  one wave, `active_0 = 2`, `capacity_0 = min(16, 16) = 16`, `batches_0 =
+  ceil(128 / 16) = 8`. `promql_fetch_fanout` 1 with three distinct matcher
+  sets, 20 segments, and 1000 shared permits: three waves, each `active_w =
+  1`, `capacity_w = min(1, 1000) = 1`, `batches_w = ceil(20 / 1) = 20`,
+  summing to 60 -- not the 20 a single `min(1 * 3, 1000) = 3`-capacity
+  division would report, which would silently assume all 3 plans ran at
+  once when the outer stream never admits more than 1. A single-plan query
+  always has exactly one wave with `active_0 = 1`, reducing to
   `ceil(segment_count / promql_fetch_fanout)`, since `min(promql_fetch_fanout,
   sharedGetPermits)` is the fan-out width whenever the shared pool is at
   least as large as one plan's own fan-out bound, as it is for any config
