@@ -71,7 +71,8 @@ scripts/check-tla.sh smoke -a common  # scope any subcommand to one area
 
 `ci` and `all` record every model under a single run id, so `last-run.tsv` is
 one coherent run rather than a config's rows overwriting the previous config's.
-Exit codes: `0` pass, `1` a check failed, `2` no usable Java. A subcommand or
+Exit codes: `0` pass, `1` a check failed, `2` no usable Java or GNU
+timeout(1) unavailable. A subcommand or
 `-a` area that does not exist, and `-a` with no value, fail immediately.
 
 ### The TLC jar
