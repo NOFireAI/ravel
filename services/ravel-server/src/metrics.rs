@@ -1672,7 +1672,7 @@ fn render_provisioning_family(
     write_header(
         out,
         "ravel_provisioning_shard_count_mismatch_total",
-        "Provisioning checks that failed hard: an unreadable record, or pre-ADR data a lower shard_count would hide (ADR-0050 section 5). A recorded shard_count that merely differs from the live default is tolerated and counted by ravel_provisioning_shard_count_drift_total instead.",
+        "Provisioning checks that failed hard: an unreadable record, a decodable record with a structurally invalid generation history, or pre-ADR data a lower shard_count would hide (ADR-0050 section 5). A recorded shard_count that merely differs from the live default is tolerated and counted by ravel_provisioning_shard_count_drift_total instead.",
         "counter",
     );
     write_sample(
