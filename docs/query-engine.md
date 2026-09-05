@@ -687,21 +687,30 @@ Prometheus-style error, never a partial silent result.
 
 The "max concurrent GETs (8, ...)" figure above is the ceiling for the
 fetchers one `QueryEngine` owns, not a per-selector one. Inside an engine the
-RSEG `SegmentFetcher`, the RLOG `BlockRangeFetcher` (the block-range protocol
-that `LogSegmentFetcher` delegates to) and the RSPAN `SpanSegmentFetcher`
-draw their GET permits from one shared `ravel_query::GetLimiter`, an
-`Arc`-based wrapper over a `tokio::Semaphore`. `QueryEngine::new` builds this
-limiter once and hands the same `Arc` to the fetchers it owns;
-`QueryEngine::with_get_limiter` replaces it on all of them at once, so a
-process can share one ceiling across several engines.
+RSEG `SegmentFetcher`, RLOG's `LogSegmentFetcher` (both its own whole-object
+funnel and the `BlockRangeFetcher` it delegates to above the block-range
+threshold), and the RSPAN `SpanSegmentFetcher` draw their GET permits from
+one shared `ravel_query::GetLimiter`, an `Arc`-based wrapper over a
+`tokio::Semaphore`. `QueryEngine::new` builds this limiter once and hands
+the same `Arc` to the fetchers it owns; `QueryEngine::with_get_limiter`
+replaces it on all of them at once, so a process can share one ceiling
+across several engines.
 
-Two gaps remain until the server half of ADR-1195 lands. The ceiling is per
-engine, not per process: `ravel-server` and `ravel-sql` still construct
-engines and standalone fetchers with their own limiters. And the RLOG
-whole-object funnel (`LogSegmentFetcher::fetch_accounted` and
+One gap remains until the server half of ADR-1195 lands: the ceiling is per
+engine, not per process. `ravel-server` and `ravel-sql` still construct
+engines and standalone fetchers with their own limiters.
+
+Every RLOG GET is now permitted, both paths. `LogSegmentFetcher` holds its
+own `GetLimiter` for its whole-object funnel (`fetch_accounted` and
 `whole_object_bytes`, taken by every object at or below the block-range
-threshold) issues its GETs without a permit, as it did before ADR-1195; only
-the block-range protocol is bounded today.
+threshold) in addition to the one it hands to its internal
+`BlockRangeFetcher`; `with_get_limiter` sets both to the same `Arc`, and
+`with_block_range` re-applies the fetcher's current limiter to a replacement
+`BlockRangeFetcher` so builder order cannot drop it. `QueryEngine::new`
+builds the RLOG fetcher used by every server query path, so the whole-object
+RLOG reads that the `cost-based` default policy issues -- the stock
+ClickBench path -- are bounded by `store_get_concurrency()` for the first
+time.
 
 Before ADR-1195, each fetcher held its own independent semaphore, so N
 fetchers each configured to "8 concurrent GETs" could together put 8N GETs

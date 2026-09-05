@@ -538,6 +538,16 @@ pub struct LogSegmentFetcher {
     /// The block-range fetcher used for objects above `block_range_threshold`.
     /// Kept in sync with `store`/`cfg`/`cache` by the builders.
     block_range: BlockRangeFetcher,
+    /// Bounds this fetcher's OWN whole-object GETs (`fetch_accounted` and
+    /// `whole_object_bytes`'s two sites), the funnel every object at or below
+    /// `block_range_threshold` routes through. Distinct from
+    /// `block_range`'s limiter, which bounds only the above-threshold
+    /// ranged path; [`Self::with_get_limiter`] sets both to the same `Arc` so
+    /// a caller shares one pool across both funnels, and
+    /// [`Self::with_block_range`] re-applies this field's current limiter to
+    /// the replacement `BlockRangeFetcher` so builder order cannot silently
+    /// drop it (ADR-1195).
+    get_limiter: Arc<crate::GetLimiter>,
     /// Per-phase tail-section probe misses across every read this fetcher has
     /// served (#883). Shared by every clone, like `block_range`'s GET semaphore,
     /// and read through [`probe_miss_counter`](Self::probe_miss_counter).
@@ -559,6 +569,9 @@ impl LogSegmentFetcher {
             cache: None,
             block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             block_range: BlockRangeFetcher::new(store).with_wire_byte_counter(wire_bytes.clone()),
+            get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
+                DEFAULT_LOG_MAX_CONCURRENT_GETS,
+            )),
             probe_misses: ProbeMissCounter::new(),
             wire_bytes,
         }
@@ -658,22 +671,37 @@ impl LogSegmentFetcher {
         self
     }
 
-    /// Wires the block-range path to a caller-owned [`crate::GetLimiter`]
-    /// (ADR-1195), so it draws GET permits from the same pool as every other
-    /// fetcher (and, via [`crate::QueryEngine::with_get_limiter`], every
-    /// other engine) holding the same `Arc`.
+    /// Wires this fetcher's OWN whole-object GETs and the block-range path to
+    /// the same caller-owned [`crate::GetLimiter`] (ADR-1195), so both funnels
+    /// draw permits from the same pool as every other fetcher (and, via
+    /// [`crate::QueryEngine::with_get_limiter`], every other engine) holding
+    /// the same `Arc`.
     #[must_use]
     pub fn with_get_limiter(mut self, limiter: std::sync::Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = Arc::clone(&limiter);
         self.block_range = self.block_range.with_get_limiter(limiter);
         self
     }
 
-    /// The block-range path's current limiter, for a test to `Arc::ptr_eq`
-    /// against another fetcher's or an engine's, proving two fetchers
-    /// actually share one `GetLimiter` rather than each holding an
-    /// equal-but-distinct one.
+    /// This fetcher's own limiter (bounds `fetch_accounted` and
+    /// `whole_object_bytes`), for a test to `Arc::ptr_eq` against another
+    /// fetcher's or an engine's, proving two fetchers actually share one
+    /// `GetLimiter` rather than each holding an equal-but-distinct one. See
+    /// [`Self::block_range_get_limiter_for_test`] for the block-range path's
+    /// limiter.
     #[cfg(test)]
     pub(crate) fn get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
+        &self.get_limiter
+    }
+
+    /// The block-range path's current limiter, for the same `Arc::ptr_eq`
+    /// purpose as [`Self::get_limiter_for_test`]. Kept separate because
+    /// `with_block_range` can, in principle, be handed a `BlockRangeFetcher`
+    /// wired to a different limiter than this instance's own before this
+    /// builder re-applies the shared one; a test asserting both proves that
+    /// re-apply actually happened.
+    #[cfg(test)]
+    pub(crate) fn block_range_get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
         self.block_range.get_limiter_for_test()
     }
 
@@ -722,9 +750,18 @@ impl LogSegmentFetcher {
     /// counter (#913), so a caller that took the handle from
     /// [`phase_wire_byte_counter`](Self::phase_wire_byte_counter) before or
     /// after this call reads the same totals either way.
+    ///
+    /// It is also re-wired to this instance's current `get_limiter` (ADR-1195),
+    /// overriding whatever limiter `block_range` was built with. This makes
+    /// builder order irrelevant: `with_get_limiter().with_block_range(...)`
+    /// and `with_block_range(...).with_get_limiter(...)` both end with the
+    /// block-range path sharing this fetcher's limiter, rather than the first
+    /// order silently dropping it in favor of the replacement's own.
     #[must_use]
     pub fn with_block_range(mut self, block_range: BlockRangeFetcher) -> Self {
-        self.block_range = block_range.with_wire_byte_counter(self.wire_bytes.clone());
+        self.block_range = block_range
+            .with_wire_byte_counter(self.wire_bytes.clone())
+            .with_get_limiter(Arc::clone(&self.get_limiter));
         self
     }
 
@@ -973,6 +1010,18 @@ impl LogSegmentFetcher {
                 s3_bytes = tracing::field::Empty,
             );
             let got = async {
+                // Held across the GET only: dropped when this inner block
+                // returns, before `decode_spanned` below (ADR-1195).
+                let _permit =
+                    self.get_limiter
+                        .acquire()
+                        .await
+                        .map_err(|_| LogFetchError::Store {
+                            key: key.to_string(),
+                            source: StoreError::Transient(
+                                "GetLimiter semaphore closed unexpectedly".to_string(),
+                            ),
+                        })?;
                 self.store
                     .get(key, GetRange::Full)
                     .await
@@ -1975,6 +2024,19 @@ impl LogSegmentFetcher {
 
         let Some(cache) = &self.cache else {
             let got = async {
+                // Held across the GET only: dropped when this inner block
+                // returns, before this function hands the bytes to its
+                // caller's decode (ADR-1195).
+                let _permit =
+                    self.get_limiter
+                        .acquire()
+                        .await
+                        .map_err(|_| LogFetchError::Store {
+                            key: key.to_string(),
+                            source: StoreError::Transient(
+                                "GetLimiter semaphore closed unexpectedly".to_string(),
+                            ),
+                        })?;
                 self.store
                     .get(key, GetRange::Full)
                     .await
@@ -2000,6 +2062,13 @@ impl LogSegmentFetcher {
         let (bytes, source) = async {
             cache
                 .get_or_fetch(cache_key, || async move {
+                    // Held across the GET only: dropped before this closure
+                    // returns the bytes to its caller's decode (ADR-1195).
+                    let _permit = self.get_limiter.acquire().await.map_err(|_| {
+                        StoreError::Transient(
+                            "GetLimiter semaphore closed unexpectedly".to_string(),
+                        )
+                    })?;
                     let got = self.store.get(key, GetRange::Full).await?;
                     accounting.record_s3_request(AccountedOp::Get);
                     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
@@ -3506,7 +3575,16 @@ impl BlockRangeFetcher {
         phase: QueryPhase,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, LogFetchError> {
-        let _permit = self.get_limiter.acquire().await;
+        let _permit = self
+            .get_limiter
+            .acquire()
+            .await
+            .map_err(|_| LogFetchError::Store {
+                key: key.to_string(),
+                source: StoreError::Transient(
+                    "GetLimiter semaphore closed unexpectedly".to_string(),
+                ),
+            })?;
         let got = self
             .store
             .get(key, range)
@@ -6101,6 +6179,244 @@ mod plan_fast_path_tests {
             acc.snapshot().total_s3_bytes() > tail,
             "at-threshold: block-range fetch ran, not the footer-only probe"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod whole_object_get_limiter_tests {
+    //! Pins the ADR-1195 gap the adversarial review of #1195 found: the RLOG
+    //! whole-object funnel (`fetch_accounted`, the path every object at or
+    //! below `block_range_threshold` takes) issued its GET with no permit at
+    //! all, so it could never be bounded no matter how the caller configured
+    //! `get_limiter`. `fetch_accounted` is used here rather than the
+    //! tenant-aware `fetch_accounted_with_tenant` because it takes the
+    //! whole-object path unconditionally (no threshold branch to thread a
+    //! tenant hash and cache through); the default `block_range_threshold`
+    //! (`DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`, far larger than this test's
+    //! object) confirms the same funnel is what production's cost-based
+    //! default policy reaches for small objects.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const CONTENT_HASH: [u8; 32] = [9u8; 32];
+    const KEY: &str = "t/whole.rlog";
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        }
+    }
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("request.id".to_string(), AttrValue::Str(format!("r{ts}")))],
+        }
+    }
+
+    fn build_object() -> Vec<u8> {
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.push(record(0)).expect("push");
+        w.finish().expect("finish")
+    }
+
+    fn seg_ref(size: u64) -> SegmentRef {
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    async fn store_with_object(bytes: Vec<u8>) -> MemoryStore {
+        let store = MemoryStore::new();
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        store
+    }
+
+    /// Object well under `DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD`, so every
+    /// fetcher below takes the unconditional whole-object GET in
+    /// `fetch_accounted`, never `block_range`.
+    async fn small_object_backend() -> (Arc<FaultStore<MemoryStore>>, SegmentRef) {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        assert!(
+            size < DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "fixture object must stay below the whole-object threshold"
+        );
+        let store = store_with_object(bytes).await;
+        let fault = Arc::new(FaultStore::new(store, FaultPlan::default()));
+        (fault, seg_ref(size))
+    }
+
+    /// Two `LogSegmentFetcher`s sharing one `GetLimiter::new(1)` must never
+    /// let both whole-object GETs be in flight at once.
+    ///
+    /// Non-vacuity: before Deliverable 1 wired a private `get_limiter` field
+    /// onto `LogSegmentFetcher` and threaded it through `fetch_accounted`'s
+    /// GET (the `let _permit = self.get_limiter.acquire()...` block added
+    /// ahead of `self.store.get(key, GetRange::Full)` there), that GET took
+    /// no permit at all, so `gate.wait_until_held(2)` below would resolve
+    /// immediately instead of timing out and this test would fail at the
+    /// `is_err()` assertion.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_whole_object_gets_to_one() {
+        let (fault, seg) = small_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(1).expect("1 permit is valid"));
+        let fetcher_a = LogSegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = LogSegmentFetcher::new(backend).with_get_limiter(shared);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let seg_a = seg.clone();
+        let query_a = query.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(&seg_a, &query_a).await });
+        let seg_b = seg.clone();
+        let query_b = query.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30 s");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gate.wait_until_held(2)
+            )
+            .await
+            .is_err(),
+            "one shared permit must cap in-flight whole-object GETs at exactly 1"
+        );
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "peak in-flight whole-object GETs must be exactly 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must now be the only one held"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
+    }
+
+    /// Control for the test above: two `LogSegmentFetcher`s with PRIVATE
+    /// `GetLimiter::new(1)` instances (not shared) must reach 2 in-flight
+    /// whole-object GETs, proving the shared case above bounds because the
+    /// limiter is shared, not because the store or fixture serializes them.
+    #[tokio::test]
+    async fn private_get_limiters_do_not_share_a_bound() {
+        let (fault, seg) = small_object_backend().await;
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher_a = LogSegmentFetcher::new(backend.clone()).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(1).expect("1 permit is valid"),
+        ));
+        let fetcher_b = LogSegmentFetcher::new(backend).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(1).expect("1 permit is valid"),
+        ));
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let seg_a = seg.clone();
+        let query_a = query.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(&seg_a, &query_a).await });
+        let seg_b = seg.clone();
+        let query_b = query.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("both fetches issue their GET within 30 s: private limiters do not share");
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "private limiters must let both whole-object GETs be in flight at once"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
     }
 }
 
