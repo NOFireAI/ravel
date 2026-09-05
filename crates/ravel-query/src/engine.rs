@@ -2427,34 +2427,46 @@ fn combine_phase_accounting(
 /// (`prefetch_metric_plans`'s `attempt` closure, `distinct_plans_by_matcher`
 /// in `engine.rs`), each of which runs its own
 /// `buffer_unordered(promql_fetch_fanout)` over that plan's segments
-/// (`fetch_all_samples_and_histograms`). Neither level's own
-/// `buffer_unordered` bound is the binding concurrency for the whole query,
-/// because those inner streams do not get independent budgets: every GET
-/// from every plan passes through the one `GetLimiter` this engine wired to
+/// (`fetch_all_samples_and_histograms`). The OUTER `buffer_unordered` admits
+/// at most `promql_fetch_fanout` plans at once, however many distinct
+/// matcher sets the query has, so plan capacity is `promql_fetch_fanout *
+/// min(service_fetch_multiplier, promql_fetch_fanout)`, not
+/// `promql_fetch_fanout * service_fetch_multiplier` -- that would assume
+/// every distinct plan runs concurrently, true only when
+/// `service_fetch_multiplier <= promql_fetch_fanout`. Neither this level nor
+/// the inner one gets an independent budget on top of that: every GET from
+/// every plan also passes through the one `GetLimiter` this engine wired to
 /// every fetcher it owns (ADR-1195, `limiter.rs`), whose permit count is
 /// `shared_get_permits` here (`GetLimiter::permits`, resolved from
 /// `EngineConfig::store_get_concurrency`, which falls back to
 /// `fetch_concurrency` when unset). So the real binding concurrency is
-/// `min(service_fetch_multiplier * promql_fetch_fanout,
-/// shared_get_permits)`: the outer `buffer_unordered` can never have more
-/// than `service_fetch_multiplier * promql_fetch_fanout` plan/segment
-/// fetches in flight at once even with an unbounded limiter, and the shared
-/// limiter can never let more than `shared_get_permits` GETs run at once
-/// even with an unbounded outer fan-out -- whichever bound is smaller is the
-/// one the query actually waits on. The work this fan-out issues is
-/// `segments * service_fetch_multiplier` GETs, so the batch count this
-/// query's fetch is actually forced into is `service_batches(segments *
-/// service_fetch_multiplier, min(service_fetch_multiplier *
-/// promql_fetch_fanout, shared_get_permits))`, not
-/// `service_batches(segments * service_fetch_multiplier,
-/// promql_fetch_fanout)`: dividing the
+/// `min(promql_fetch_fanout * min(service_fetch_multiplier,
+/// promql_fetch_fanout), shared_get_permits)`: the outer `buffer_unordered`
+/// can never have more than `promql_fetch_fanout * min(service_fetch_multiplier,
+/// promql_fetch_fanout)` plan/segment fetches in flight at once even with an
+/// unbounded limiter, and the shared limiter can never let more than
+/// `shared_get_permits` GETs run at once even with an unbounded outer
+/// fan-out -- whichever bound is smaller is the one the query actually waits
+/// on. The work this fan-out issues is `segments * service_fetch_multiplier`
+/// GETs (uncapped -- every distinct matcher set still issues its own GETs,
+/// just not all of them concurrently), so the batch count this query's
+/// fetch is actually forced into is `service_batches(segments *
+/// service_fetch_multiplier, min(promql_fetch_fanout *
+/// min(service_fetch_multiplier, promql_fetch_fanout),
+/// shared_get_permits))`, not `service_batches(segments *
+/// service_fetch_multiplier, promql_fetch_fanout)`: dividing the
 /// plan-multiplied numerator by the un-multiplied fan-out width alone
-/// double-counts the plan fan-out, since raising the numerator by
-/// `service_fetch_multiplier` without ever raising the denominator to match
-/// double counts the plans (2 distinct matcher sets, 64 segments,
+/// double-counts the plan fan-out (2 distinct matcher sets, 64 segments,
 /// `promql_fetch_fanout` 8, `shared_get_permits` 16: 128 GETs at binding
-/// concurrency `min(16, 16) = 16` is 8 batches, not the 16 the unscaled
-/// divisor reports).
+/// concurrency `min(8 * min(2, 8), 16) = min(16, 16) = 16` is 8 batches, not
+/// the 16 the unscaled divisor reports); and capping the multiplier by
+/// `shared_get_permits` alone, without also capping it by
+/// `promql_fetch_fanout`, overstates plan capacity when there are more
+/// distinct matcher sets than `promql_fetch_fanout` (`promql_fetch_fanout`
+/// 1, 3 distinct matcher sets, 20 segments, `shared_get_permits` 1000: only
+/// one plan's segments are ever in flight, so binding concurrency is
+/// `min(1 * min(3, 1), 1000) = 1`, i.e. 60 batches, not the 20 an uncapped
+/// `1 * 3` capacity term would report).
 ///
 /// A single-plan query (`service_fetch_multiplier == 1`) reduces to
 /// `service_batches(segments, promql_fetch_fanout)` whenever the limiter's
@@ -2489,7 +2501,7 @@ fn io_shape_for_resolve(
         .unwrap_or(0);
     counts.record_dependency_chain(depth);
     let binding_concurrency = concurrency
-        .saturating_mul(service_fetch_multiplier)
+        .saturating_mul(service_fetch_multiplier.min(concurrency))
         .min(shared_get_permits);
     counts.record_service_batches(crate::io_shape::service_batches(
         (snapshot.segments.len() as u64).saturating_mul(service_fetch_multiplier),
@@ -7445,6 +7457,84 @@ mod prefetch_tests {
              promql_fetch_fanout, 4 shared permits) == 4, so 20 segments * 2 \
              matcher sets = 40 GETs is ceil(40 / 4) == 10, not the 3 a \
              16-permit fetcher default would report"
+        );
+    }
+
+    /// Regression for issue #1214's second review round, Finding 2: the
+    /// OUTER `buffer_unordered(promql_fetch_fanout)` over distinct plans
+    /// admits at most `promql_fetch_fanout` plans at once, so plan capacity
+    /// is `promql_fetch_fanout * min(distinct_plans, promql_fetch_fanout)`,
+    /// not `promql_fetch_fanout * distinct_plans` -- that formula assumes
+    /// every distinct plan runs concurrently, which is only true when
+    /// `distinct_plans <= promql_fetch_fanout`. Here `promql_fetch_fanout`
+    /// is 1 (`fetch_concurrency` lowered to 1) with THREE distinct matcher
+    /// sets, so only one plan's segments are ever in flight: plan capacity
+    /// is `1 * min(3, 1) == 1`. The shared `GetLimiter` is built with a
+    /// large permit count so the semaphore never binds and the plan-capacity
+    /// term is what's under test. 20 segments * 3 distinct matcher sets = 60
+    /// GETs at binding concurrency `min(1, 1000) == 1` is 60 batches. The
+    /// pre-fix formula (`concurrency * distinct_plans`, uncapped by
+    /// `concurrency` itself) would have computed binding concurrency
+    /// `min(1 * 3, 1000) == 3` and reported `ceil(60 / 3) == 20`, the raw
+    /// segment count, silently dropping the fact that only one plan's
+    /// segments ever fetch at a time. Flip `service_fetch_multiplier.min(concurrency)`
+    /// in `io_shape_for_resolve` back to plain `service_fetch_multiplier` to
+    /// watch the assertion below fail: it would then read 20, not 60.
+    #[tokio::test]
+    async fn service_batches_caps_plan_capacity_at_outer_fanout_width() {
+        const WIDE_RANGE_NS: i64 = 25 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=20u64 {
+            let ts = BASE_NS - (21 - seq as i64) * NS_PER_MIN;
+            let metric = match seq % 3 {
+                0 => "capacity_metric_a",
+                1 => "capacity_metric_b",
+                _ => "capacity_metric_c",
+            };
+            publish_metric(&store, tenant_hash, seq, metric, ts, seq as f64).await;
+        }
+
+        let config = EngineConfig {
+            fetch_concurrency: 1,
+            ..EngineConfig::default()
+        };
+        let eng = engine_with_config(store, config).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(1000).expect("1000 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("capacity_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("capacity_metric_b")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("capacity_metric_c")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch three-distinct-matcher-set query");
+
+        assert_eq!(
+            stats.estimate.segments, 20,
+            "expected the padded window to resolve exactly the 20 published \
+             segments (no shared name filter to prune by), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 60,
+            "outer plan admission binds here, not the shared limiter: \
+             min(1 promql_fetch_fanout * min(3 distinct matcher sets, 1 \
+             promql_fetch_fanout), 1000 shared permits) == 1, so 20 \
+             segments * 3 matcher sets = 60 GETs is ceil(60 / 1) == 60, \
+             not the 20 an uncapped plan-capacity term would report"
         );
     }
 
