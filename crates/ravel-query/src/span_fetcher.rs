@@ -312,24 +312,28 @@ impl SpanSegmentFetcher {
         }
 
         let key = &seg_ref.data_object_key;
-        let _permit = self
-            .get_limiter
-            .acquire()
-            .await
-            .map_err(|_| SpanFetchError::Store {
-                key: key.to_string(),
-                source: StoreError::Transient(
-                    "GetLimiter semaphore closed unexpectedly".to_string(),
-                ),
-            })?;
-        let got = self
-            .store
-            .get(key, GetRange::Full)
-            .await
-            .map_err(|source| SpanFetchError::Store {
-                key: key.to_string(),
-                source,
-            })?;
+        // The permit covers the GET only; decode below runs without it, as on
+        // every other funnel.
+        let got = async {
+            let _permit = self
+                .get_limiter
+                .acquire()
+                .await
+                .map_err(|_| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "GetLimiter semaphore closed unexpectedly".to_string(),
+                    ),
+                })?;
+            self.store
+                .get(key, GetRange::Full)
+                .await
+                .map_err(|source| SpanFetchError::Store {
+                    key: key.to_string(),
+                    source,
+                })
+        }
+        .await?;
 
         // Unaccounted entry point: the page-byte fold lands in a throwaway
         // handle, exactly as the logs side routes `fetch` through
