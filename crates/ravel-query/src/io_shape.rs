@@ -55,16 +55,30 @@
 //!   recorded separately from `dependency_depth` because pagination
 //!   (`Catalog::list_shard_hours`) and the GET dependency chain are different
 //!   object-store mechanisms with different causes.
-//! - [`service_batches`](QueryIoShape::service_batches): batches this query's
-//!   per-segment fan-out was forced into by its concurrency permit
-//!   (`ceil(segment_count / fetch_concurrency)`): 64 segments under 8
-//!   concurrent permits (`fetch_concurrency`'s default,
-//!   `DEFAULT_FETCH_CONCURRENCY`) is 8 batches at whatever depth those
-//!   segments' fetches classify at. For the metrics lane this is scaled by
-//!   `service_fetch_multiplier`, the count of distinct matcher sets the
-//!   fetch fan-out issues one pass per (`distinct_plans_by_matcher` in
-//!   `crates/ravel-query/src/engine.rs`): 64 segments under 8 permits with
-//!   two distinct matcher sets reports 16 batches, not 8.
+//! - [`service_batches`](QueryIoShape::service_batches): batches this
+//!   query's per-segment fan-out was forced into by the binding concurrency
+//!   it actually ran under. The metrics fetch is a NESTED fan-out
+//!   (`crates/ravel-query/src/engine.rs`): one
+//!   `buffer_unordered(promql_fetch_fanout)` over distinct matcher plans
+//!   (`distinct_plans_by_matcher`), each running its own
+//!   `buffer_unordered(promql_fetch_fanout)` over that plan's segments.
+//!   Those inner streams do not get independent budgets -- every GET from
+//!   every plan passes through the one [`crate::GetLimiter`] the engine
+//!   shares across the fetchers it owns (ADR-1195), sized by the resolved
+//!   `EngineConfig::store_get_concurrency` (see "GET concurrency" in
+//!   docs/query-engine.md). So the binding concurrency is
+//!   `min(service_fetch_multiplier * promql_fetch_fanout,
+//!   shared_get_permits)`, and the work is `segment_count *
+//!   service_fetch_multiplier` GETs: 64 segments, `promql_fetch_fanout` 8, 2
+//!   distinct matcher sets, and 16 shared permits gives 128 GETs at binding
+//!   concurrency `min(16, 16) = 16`, i.e. 8 batches, not
+//!   `ceil(64 * 2 / 8) = 16` -- dividing the plan-multiplied numerator by
+//!   the un-multiplied fan-out width alone double-counts the plan fan-out. A
+//!   single-plan query (`service_fetch_multiplier == 1`) reduces to
+//!   `ceil(segment_count / promql_fetch_fanout)`, since
+//!   `min(promql_fetch_fanout, shared_get_permits)` is the fan-out width
+//!   whenever the shared pool is at least as large as one plan's own
+//!   fan-out bound, as it is for any config leaving both knobs unset.
 //! - [`unfolded_segments_resolved`](QueryIoShape::unfolded_segments_resolved):
 //!   the EXACT count of segments this query's resolve took from the recent
 //!   (unfolded) listing path (`SegmentOrigin::Recent`) rather than a folded

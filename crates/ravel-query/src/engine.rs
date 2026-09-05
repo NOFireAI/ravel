@@ -1763,8 +1763,15 @@ impl QueryEngine {
         // attempts: `window` and `now_ns` do not change on retry, only the
         // snapshot resolve's outcome does.
         let catalog_requests = self.catalog.estimated_catalog_requests(window, now_ns);
-        let concurrency = self.config.fetch_concurrency.max(1) as u64;
+        // The two bounds `io_shape`'s `service_batches` divides by: the
+        // `buffer_unordered` width the fetch streams below are built with
+        // (`promql_fetch_fanout`, ADR-1195) and the permit count of the one
+        // `GetLimiter` every fetcher this engine owns draws from. Reading the
+        // permits off the engine's own limiter rather than off a fetcher
+        // keeps one source of truth for it under `with_get_limiter`.
+        let concurrency = self.config.promql_fetch_fanout().max(1) as u64;
         let whole_object_threshold = self.fetcher.whole_object_threshold();
+        let shared_get_permits = self.get_limiter.permits() as u64;
         // Fresh handle per attempt, created before `resolve_bounded` runs so
         // the same handle that goes on to fetch segments also receives
         // resolve's own catalog-side counters (ADR-0044 decision 1: "created
@@ -1793,6 +1800,7 @@ impl QueryEngine {
             whole_object_threshold,
             concurrency,
             service_fetch_multiplier,
+            shared_get_permits,
             &first_accounting,
             first_unfolded,
         );
@@ -1822,6 +1830,7 @@ impl QueryEngine {
                     whole_object_threshold,
                     concurrency,
                     service_fetch_multiplier,
+                    shared_get_permits,
                     &second_accounting,
                     second_unfolded,
                 );
@@ -2411,39 +2420,63 @@ fn combine_phase_accounting(
 /// plan count `estimate_cost` scales by: that estimate is a deliberate
 /// upper envelope, but `service_batches` documents itself as the batches the
 /// fan-out was FORCED into, a factual figure that must not carry the
-/// envelope's slop. The fan-out itself is a nested `buffer_unordered`
-/// (`futures::stream`): one `buffer_unordered(fetch_concurrency)` over
-/// distinct plans (`prefetch_metric_plans`'s `attempt` closure), each of
-/// which runs its own `buffer_unordered(fetch_concurrency)` over that plan's
-/// segments (`fetch_all_samples_and_histograms`). Neither level shares a
-/// single semaphore across plans: `fetch_concurrency` (`EngineConfig`,
-/// default 8) only bounds each `buffer_unordered` call's own concurrent
-/// future count. The one pool actually shared by every concurrent segment
-/// fetch in a query is `SegmentFetcher::get_semaphore`
-/// (`fetcher.rs`), sized `DEFAULT_MAX_CONCURRENT_GETS` (16) for the metrics
-/// fetcher -- `QueryEngine::new` calls `with_max_concurrent_gets` on the log
-/// fetcher only, never on `self.fetcher`. So the batch count this query's
-/// fetch is actually forced into (at the `buffer_unordered` level
-/// `service_batches` models) is `service_batches(segments *
-/// service_fetch_multiplier, fetch_concurrency)`, not
-/// `service_batches(segments, fetch_concurrency)`; the 8-vs-16 mismatch
-/// between that `buffer_unordered` bound and the get-semaphore's real
-/// capacity is a separate, pre-existing gap this field does not attempt to
-/// close. Omitting the multiplier here (while `estimate_cost` already
-/// applies its own) made `stats.io` and `stats.estimate` disagree by
-/// construction for any query with more than one distinct selector.
+/// envelope's slop.
+///
+/// The fan-out itself is a NESTED `buffer_unordered` (`futures::stream`):
+/// one `buffer_unordered(promql_fetch_fanout)` over distinct plans
+/// (`prefetch_metric_plans`'s `attempt` closure, `distinct_plans_by_matcher`
+/// in `engine.rs`), each of which runs its own
+/// `buffer_unordered(promql_fetch_fanout)` over that plan's segments
+/// (`fetch_all_samples_and_histograms`). Neither level's own
+/// `buffer_unordered` bound is the binding concurrency for the whole query,
+/// because those inner streams do not get independent budgets: every GET
+/// from every plan passes through the one `GetLimiter` this engine wired to
+/// every fetcher it owns (ADR-1195, `limiter.rs`), whose permit count is
+/// `shared_get_permits` here (`GetLimiter::permits`, resolved from
+/// `EngineConfig::store_get_concurrency`, which falls back to
+/// `fetch_concurrency` when unset). So the real binding concurrency is
+/// `min(service_fetch_multiplier * promql_fetch_fanout,
+/// shared_get_permits)`: the outer `buffer_unordered` can never have more
+/// than `service_fetch_multiplier * promql_fetch_fanout` plan/segment
+/// fetches in flight at once even with an unbounded limiter, and the shared
+/// limiter can never let more than `shared_get_permits` GETs run at once
+/// even with an unbounded outer fan-out -- whichever bound is smaller is the
+/// one the query actually waits on. The work this fan-out issues is
+/// `segments * service_fetch_multiplier` GETs, so the batch count this
+/// query's fetch is actually forced into is `service_batches(segments *
+/// service_fetch_multiplier, min(service_fetch_multiplier *
+/// promql_fetch_fanout, shared_get_permits))`, not
+/// `service_batches(segments * service_fetch_multiplier,
+/// promql_fetch_fanout)`: dividing the
+/// plan-multiplied numerator by the un-multiplied fan-out width alone
+/// double-counts the plan fan-out, since raising the numerator by
+/// `service_fetch_multiplier` without ever raising the denominator to match
+/// double counts the plans (2 distinct matcher sets, 64 segments,
+/// `promql_fetch_fanout` 8, `shared_get_permits` 16: 128 GETs at binding
+/// concurrency `min(16, 16) = 16` is 8 batches, not the 16 the unscaled
+/// divisor reports).
+///
+/// A single-plan query (`service_fetch_multiplier == 1`) reduces to
+/// `service_batches(segments, promql_fetch_fanout)` whenever the limiter's
+/// pool is at least as large as one plan's own `buffer_unordered` bound,
+/// which is every config that leaves ADR-1195's knobs unset (both resolve to
+/// `fetch_concurrency`). An operator who sets `--store-get-concurrency`
+/// below `--promql-fetch-fanout` makes the limiter the binding bound even
+/// for one plan, and this figure follows that.
 ///
 /// Deliberately does NOT thread any new instrumentation into the per-segment
 /// fetch loops (`fetch_all_samples_and_histograms`/`fetch_all_series`):
 /// every figure here is a pure function of the resolved `Snapshot` and the
 /// query's own configuration, computable before a single segment fetch
 /// starts.
+#[allow(clippy::too_many_arguments)]
 fn io_shape_for_resolve(
     snapshot: &Snapshot,
     metadata_only: bool,
     whole_object_threshold: u64,
     concurrency: u64,
     service_fetch_multiplier: u64,
+    shared_get_permits: u64,
     accounting: &PhaseAccounting,
     unfolded_segments_resolved: u64,
 ) -> QueryIoShape {
@@ -2455,9 +2488,12 @@ fn io_shape_for_resolve(
         .max()
         .unwrap_or(0);
     counts.record_dependency_chain(depth);
+    let binding_concurrency = concurrency
+        .saturating_mul(service_fetch_multiplier)
+        .min(shared_get_permits);
     counts.record_service_batches(crate::io_shape::service_batches(
         (snapshot.segments.len() as u64).saturating_mul(service_fetch_multiplier),
-        concurrency,
+        binding_concurrency,
     ));
     let resolve_list_requests = accounting
         .resolve()
@@ -7211,6 +7247,204 @@ mod prefetch_tests {
             "every resolve issues one bounded shard LIST plus one \
              unconditional pending-erasure `del/` LIST (ravel-catalog, \
              ADR-0064 decision 2), regardless of plan count: 2 total"
+        );
+    }
+
+    /// Regression for issue #1214's worked acceptance case: a multi-selector
+    /// metrics query's `service_batches` must divide by the BINDING
+    /// concurrency (`min(distinct_matcher_sets * promql_fetch_fanout,
+    /// shared_get_permits)`), not by the fan-out width alone. Two distinct
+    /// matcher sets (`binding_metric_a`, `binding_metric_b`, no shared
+    /// `__name__` filter so the resolve prunes nothing and the padded window
+    /// resolves all 64 published segments), the default `promql_fetch_fanout`
+    /// (8, resolving to `fetch_concurrency`), and a shared `GetLimiter`
+    /// (ADR-1195) built with exactly 16 permits: 128 GETs (64 segments * 2
+    /// distinct matcher sets) at binding concurrency `min(2 * 8, 16) == 16`
+    /// is 8 batches. The limiter is wired explicitly rather than left at the
+    /// resolved default so the expectation is pinned by the test, not by
+    /// whatever `store_get_concurrency` resolves to on the host. Before the
+    /// fix, `io_shape_for_resolve` divided the plan-multiplied numerator by
+    /// the fan-out width alone -- `ceil(64 * 2 / 8) == 16`, double the real
+    /// figure. Flip `binding_concurrency` in `io_shape_for_resolve` back to
+    /// plain `concurrency` to watch the assertion below fail: it would then
+    /// read 16, not 8.
+    #[tokio::test]
+    async fn service_batches_divides_by_binding_concurrency_not_fetch_concurrency_alone() {
+        const WIDE_RANGE_NS: i64 = 70 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=64u64 {
+            let ts = BASE_NS - (65 - seq as i64) * NS_PER_MIN;
+            let metric = if seq % 2 == 0 {
+                "binding_metric_a"
+            } else {
+                "binding_metric_b"
+            };
+            publish_metric(&store, tenant_hash, seq, metric, ts, seq as f64).await;
+        }
+
+        let eng = engine(store).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(16).expect("16 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("binding_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("binding_metric_b")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch two-distinct-matcher-set query");
+
+        assert_eq!(
+            stats.estimate.segments, 64,
+            "expected the padded window to resolve exactly the 64 published \
+             segments (no shared name filter to prune by), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 8,
+            "64 segments * 2 distinct matcher sets = 128 GETs at binding \
+             concurrency min(2 * 8, 16) == 16 is 8 batches, not \
+             ceil(64 * 2 / 8) == 16"
+        );
+    }
+
+    /// Regression for issue #1214: exercises `min()` in the OTHER direction
+    /// from the worked acceptance case above -- here the outer plan fan-out
+    /// (`distinct_matcher_sets * promql_fetch_fanout`), not the shared
+    /// limiter, is the binding constraint, so the pre-fix and post-fix
+    /// formulas disagree on a case where the limiter was never close to
+    /// full. `fetch_concurrency` is lowered to 4 (`EngineConfig`, and
+    /// `promql_fetch_fanout` resolves to it), so 2 distinct matcher sets give
+    /// a plan fan-out bound of `2 * 4 == 8`, strictly under the 16 permits
+    /// the shared `GetLimiter` is built with here: `min(8, 16) == 8` is bound
+    /// by the plan fan-out, not the limiter. 20 segments * 2 matcher sets =
+    /// 40 GETs at that binding concurrency is `ceil(40 / 8) == 5`. The
+    /// limiter is wired explicitly (rather than left at the resolved
+    /// `store_get_concurrency`, which would follow `fetch_concurrency` down
+    /// to 4 and make the limiter bind after all) so this case keeps testing
+    /// the direction it names. The pre-fix formula (dividing by the fan-out
+    /// width alone, ignoring the multiplier entirely) would have read
+    /// `ceil(20 * 2 / 4) == 10`, twice the correct figure -- a different
+    /// wrong answer than the worked acceptance case's, because here the
+    /// multiplier's own contribution to the divisor was never capped by the
+    /// limiter.
+    #[tokio::test]
+    async fn service_batches_binds_on_plan_fanout_when_semaphore_has_headroom() {
+        const WIDE_RANGE_NS: i64 = 25 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=20u64 {
+            let ts = BASE_NS - (21 - seq as i64) * NS_PER_MIN;
+            let metric = if seq % 2 == 0 {
+                "fanout_metric_a"
+            } else {
+                "fanout_metric_b"
+            };
+            publish_metric(&store, tenant_hash, seq, metric, ts, seq as f64).await;
+        }
+
+        let config = EngineConfig {
+            fetch_concurrency: 4,
+            ..EngineConfig::default()
+        };
+        let eng = engine_with_config(store, config).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(16).expect("16 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("fanout_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("fanout_metric_b")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch plan-fanout-bound query");
+
+        assert_eq!(
+            stats.estimate.segments, 20,
+            "expected the padded window to resolve exactly the 20 published \
+             segments (no shared name filter to prune by), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 5,
+            "plan fan-out binds here, not the shared limiter: min(2 distinct \
+             matcher sets * 4 promql_fetch_fanout, 16 shared permits) == 8, \
+             so 20 segments * 2 matcher sets = 40 GETs is ceil(40 / 8) == 5"
+        );
+    }
+
+    /// Pins WHERE the shared permit count comes from after ADR-1195: the
+    /// `GetLimiter` this engine wired to the fetchers it owns, not a
+    /// fetcher-local default. Same shape as the two cases above (2 distinct
+    /// matcher sets, default `promql_fetch_fanout` of 8), but the engine's
+    /// limiter is replaced with a 4-permit one, well under the plan fan-out
+    /// bound of `2 * 8 == 16`: `min(16, 4) == 4`, so 20 segments * 2 matcher
+    /// sets = 40 GETs is `ceil(40 / 4) == 10`. Reading the permit count from
+    /// the fetcher module's `DEFAULT_MAX_CONCURRENT_GETS` (16) instead --
+    /// which is what the pre-ADR-1195 `SegmentFetcher::max_concurrent_gets`
+    /// accessor reported for a fetcher nobody had overridden -- would give
+    /// `min(16, 16) == 16` and report `ceil(40 / 16) == 3`.
+    #[tokio::test]
+    async fn service_batches_reads_permits_from_the_engines_shared_limiter() {
+        const WIDE_RANGE_NS: i64 = 25 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=20u64 {
+            let ts = BASE_NS - (21 - seq as i64) * NS_PER_MIN;
+            let metric = if seq % 2 == 0 {
+                "limiter_metric_a"
+            } else {
+                "limiter_metric_b"
+            };
+            publish_metric(&store, tenant_hash, seq, metric, ts, seq as f64).await;
+        }
+
+        let eng = engine(store).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(4).expect("4 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("limiter_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("limiter_metric_b")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch limiter-bound query");
+
+        assert_eq!(
+            stats.estimate.segments, 20,
+            "expected the padded window to resolve exactly the 20 published \
+             segments (no shared name filter to prune by), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 10,
+            "the shared limiter binds here: min(2 distinct matcher sets * 8 \
+             promql_fetch_fanout, 4 shared permits) == 4, so 20 segments * 2 \
+             matcher sets = 40 GETs is ceil(40 / 4) == 10, not the 3 a \
+             16-permit fetcher default would report"
         );
     }
 
