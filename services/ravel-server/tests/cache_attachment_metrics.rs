@@ -193,6 +193,7 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache.clone()),
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),

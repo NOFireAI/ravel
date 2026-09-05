@@ -492,6 +492,11 @@ struct FragmentServiceInner {
     cache: Option<ReadCache>,
     clock: Arc<dyn Clock>,
     metrics: Arc<FragmentMetrics>,
+    /// ADR-1195: the process-wide GET concurrency limiter, shared with every
+    /// other fetcher this process builds. The distributed fragment path's
+    /// `SegmentFetcher` (`resolve_and_run`) is wired to this same `Arc`, not a
+    /// private pool sized from `--fetch-concurrency`.
+    get_limiter: Arc<ravel_query::GetLimiter>,
 }
 
 /// The boxed frame stream the generated `SeriesFetch` server trait requires.
@@ -509,6 +514,7 @@ impl FragmentService {
         cache: Option<ReadCache>,
         clock: Arc<dyn Clock>,
         metrics: Arc<FragmentMetrics>,
+        get_limiter: Arc<ravel_query::GetLimiter>,
     ) -> Self {
         FragmentService {
             inner: Arc::new(FragmentServiceInner {
@@ -520,6 +526,7 @@ impl FragmentService {
                 cache,
                 clock,
                 metrics,
+                get_limiter,
             }),
             // Backward-compatible default: a directly-constructed service serves
             // both scopes. `lib.rs` sets an explicit role per listener via
@@ -793,7 +800,8 @@ impl FragmentService {
                 (request, resolver)
             }
         };
-        let mut fetcher = SegmentFetcher::new(self.inner.store.clone());
+        let mut fetcher = SegmentFetcher::new(self.inner.store.clone())
+            .with_get_limiter(self.inner.get_limiter.clone());
         if let Some(cache) = &self.inner.cache {
             fetcher = fetcher.with_cache(cache.clone());
         }
@@ -1696,6 +1704,7 @@ mod tests {
             None,
             clock,
             metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
     }
 
@@ -1794,6 +1803,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
     }
 
@@ -2933,6 +2943,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
     }
 
@@ -3075,6 +3086,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
     }
 

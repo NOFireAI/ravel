@@ -537,7 +537,7 @@ pub fn session_config(
     let repartition_free = repartition_free(spill);
     let mut session = SessionConfig::new()
         .with_information_schema(false)
-        .with_target_partitions(config.engine.fetch_concurrency.max(1))
+        .with_target_partitions(config.engine.sql_partition_count())
         // ADR-0094: the only knob that is ever true, and only for a query whose
         // aggregates and group keys are all exact-typed. See the module docs.
         // ADR-0954 takes it back for a spill-enabled query.
@@ -904,6 +904,23 @@ mod tests {
             Some(ravel_rspan::skip_index::STATUS_BIT_ERROR)
         );
         assert_eq!(pushdown.service_name, Some("checkout".to_string()));
+    }
+
+    /// ADR-1195: `target_partitions` follows the resolved
+    /// `sql_partition_count` knob, not the legacy `fetch_concurrency` field
+    /// directly, once an explicit override is set.
+    #[test]
+    fn target_partitions_follows_the_resolved_sql_partition_count() {
+        let config = SqlConfig {
+            engine: ravel_query::EngineConfig {
+                fetch_concurrency: 9,
+                sql_partition_count: Some(5),
+                ..ravel_query::EngineConfig::default()
+            },
+            ..SqlConfig::default()
+        };
+        let session = session_config(&config, false, SpillDecision::Disabled);
+        assert_eq!(session.options().execution.target_partitions, 5);
     }
 
     #[test]

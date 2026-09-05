@@ -651,17 +651,15 @@ pub struct Cli {
     #[arg(long = "logs-max-fetch-run-bytes", value_name = "BYTES", default_value_t = ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES)]
     pub logs_max_fetch_run_bytes: u64,
 
-    /// Bound on concurrent in-flight segment fetches per query (ADR-0088),
-    /// threaded into `ravel_query::EngineConfig::fetch_concurrency`. This is a
-    /// single knob with three coupled effects, NOT decoupled by this change: it
-    /// governs the PromQL/analytics per-query segment fetch fan-out, the SQL
-    /// scan partition count (`target_partitions` in
-    /// `crates/ravel-sql/src/session.rs`), and S3 GET concurrency (ADR-0087).
-    /// Raising it widens all three together; sizing it is a memory-vs-latency
-    /// trade against the host's cores and the store's request budget. Default
-    /// when unset: derived, max(8, 2 x cores); reference host (16 cores, 30 GiB):
-    /// 32. Floor of 8 (the compiled-in default) on a 1-2 core host; this rule is
-    /// core-derived, so MemTotal being unknown does not change it.
+    /// Legacy combined knob (ADR-0088, unbundled by ADR-1195): sets
+    /// `--store-get-concurrency`, `--sql-partition-count`, and
+    /// `--promql-fetch-fanout` together, at source `legacy-flag`, when none of
+    /// those three is given explicitly. Combining this flag with any of the
+    /// three is a startup error naming both flags: pass either this flag alone,
+    /// or the specific new flags without it. Prefer the specific flags for new
+    /// configuration; this one remains for existing deployments' unit files.
+    /// Sizing any of the four is a memory-vs-latency trade against the host's
+    /// cores and the store's request budget.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
@@ -670,6 +668,44 @@ pub struct Cli {
     /// compiled-in 8 on a small one.
     #[arg(long = "fetch-concurrency", value_name = "N")]
     pub fetch_concurrency: Option<usize>,
+
+    /// Count of permits for concurrent GETs against the object store,
+    /// process-wide (ADR-1195), threaded into
+    /// `ravel_query::EngineConfig::store_get_concurrency` and from there into
+    /// the single process-owned `GetLimiter` every fetcher (RSEG, RLOG, RSPAN)
+    /// shares. Default when unset: derived,
+    /// `max(MIN_DERIVED_FETCH_CONCURRENCY, FETCH_CONCURRENCY_PER_CORE *
+    /// cores)`.
+    ///
+    /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
+    /// flags below) when neither is given explicitly. Setting both
+    /// `--fetch-concurrency` and this flag is a startup error.
+    #[arg(long = "store-get-concurrency", value_name = "COUNT")]
+    pub store_get_concurrency: Option<usize>,
+
+    /// Count of DataFusion scan partitions (`target_partitions`,
+    /// `crates/ravel-sql/src/session.rs`), threaded into
+    /// `ravel_query::EngineConfig::sql_partition_count` (ADR-1195). Default
+    /// when unset: derived, `max(MIN_DERIVED_FETCH_CONCURRENCY,
+    /// FETCH_CONCURRENCY_PER_CORE * cores)`.
+    ///
+    /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
+    /// flags above/below) when neither is given explicitly. Setting both
+    /// `--fetch-concurrency` and this flag is a startup error.
+    #[arg(long = "sql-partition-count", value_name = "COUNT")]
+    pub sql_partition_count: Option<usize>,
+
+    /// Count of in-flight futures in the PromQL/analytics `buffer_unordered`
+    /// segment fetch fan-out (`crates/ravel-query/src/engine.rs`), threaded
+    /// into `ravel_query::EngineConfig::promql_fetch_fanout` (ADR-1195).
+    /// Default when unset: derived, `max(MIN_DERIVED_FETCH_CONCURRENCY,
+    /// FETCH_CONCURRENCY_PER_CORE * cores)`.
+    ///
+    /// Legacy precedence: `--fetch-concurrency` still sets this (and the two
+    /// flags above) when neither is given explicitly. Setting both
+    /// `--fetch-concurrency` and this flag is a startup error.
+    #[arg(long = "promql-fetch-fanout", value_name = "COUNT")]
+    pub promql_fetch_fanout: Option<usize>,
 
     /// Cap on the number of segments a single query may fan out over (ADR-0088),
     /// threaded into `ravel_query::EngineConfig::max_segments`. A wide scan over
@@ -1184,6 +1220,22 @@ pub struct QueryBudgets {
     /// and S3 GET concurrency (ADR-0087; not decoupled). Reaches
     /// `EngineConfig::fetch_concurrency`.
     pub fetch_concurrency: usize,
+    /// The resolved GET concurrency (ADR-1195): the operator's explicit
+    /// `--store-get-concurrency`, else the legacy `--fetch-concurrency`
+    /// value, else the derived default -- already resolved by
+    /// [`resolve_performance_defaults`], never re-derived here. Reaches
+    /// `EngineConfig::store_get_concurrency` as `Some(self.store_get_concurrency)`,
+    /// which is what makes the accessor return exactly this value regardless
+    /// of `fetch_concurrency`.
+    pub store_get_concurrency: usize,
+    /// The resolved SQL scan partition count (ADR-1195), same resolution
+    /// shape as [`Self::store_get_concurrency`]. Reaches
+    /// `EngineConfig::sql_partition_count`.
+    pub sql_partition_count: usize,
+    /// The resolved PromQL fetch fan-out width (ADR-1195), same resolution
+    /// shape as [`Self::store_get_concurrency`]. Reaches
+    /// `EngineConfig::promql_fetch_fanout`.
+    pub promql_fetch_fanout: usize,
     /// Per-query segment fan-out cap. Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
     /// Per-query SQL memory-pool ceiling. Reaches `SqlConfig::max_query_bytes`.
@@ -1228,6 +1280,9 @@ impl Default for QueryBudgets {
     fn default() -> Self {
         QueryBudgets {
             fetch_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            store_get_concurrency: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count: ravel_query::DEFAULT_FETCH_CONCURRENCY,
+            promql_fetch_fanout: ravel_query::DEFAULT_FETCH_CONCURRENCY,
             max_segments: ravel_query::DEFAULT_MAX_SEGMENTS,
             sql_max_query_bytes: DEFAULT_SQL_MAX_QUERY_BYTES,
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
@@ -1312,6 +1367,9 @@ impl QueryBudgets {
         let resolved = self.logs_fetch_resolution();
         let config = ravel_query::EngineConfig {
             fetch_concurrency: self.fetch_concurrency,
+            store_get_concurrency: Some(self.store_get_concurrency),
+            sql_partition_count: Some(self.sql_partition_count),
+            promql_fetch_fanout: Some(self.promql_fetch_fanout),
             max_segments: self.max_segments,
             logs_block_range_threshold: resolved.block_range_threshold,
             logs_request_cost_bytes: resolved.request_cost_bytes,
@@ -1616,10 +1674,14 @@ pub const PERF_SOURCE_DERIVED: &str = "derived";
 /// [`ResolvedPerformanceDefaults`] source: no flag was set and the host's
 /// `MemTotal` was unknown, so the compiled-in constant is used.
 pub const PERF_SOURCE_FALLBACK: &str = "fallback";
+/// [`ResolvedPerformanceDefaults`] source: no explicit flag for this setting
+/// was set, but the legacy `--fetch-concurrency` was, and its value is used
+/// verbatim (ADR-1195 legacy precedence).
+pub const PERF_SOURCE_LEGACY_FLAG: &str = "legacy-flag";
 
 /// The operator's explicit performance flags: `None` per field means "derive".
 ///
-/// A parsed, typed mirror of the six CLI flags rather than the CLI itself, so
+/// A parsed, typed mirror of the CLI flags rather than the CLI itself, so
 /// [`resolve_performance_defaults`] takes no `Cli`, does no string parsing, and
 /// cannot fail. [`Cli::performance_flags`] builds it (and is where the
 /// `--gc-max-query-duration` humantime parse and its error live).
@@ -1627,6 +1689,12 @@ pub const PERF_SOURCE_FALLBACK: &str = "fallback";
 pub struct PerformanceFlags {
     /// `--fetch-concurrency`.
     pub fetch_concurrency: Option<usize>,
+    /// `--store-get-concurrency` (ADR-1195).
+    pub store_get_concurrency: Option<usize>,
+    /// `--sql-partition-count` (ADR-1195).
+    pub sql_partition_count: Option<usize>,
+    /// `--promql-fetch-fanout` (ADR-1195).
+    pub promql_fetch_fanout: Option<usize>,
     /// `--max-segments`.
     pub max_segments: Option<usize>,
     /// `--cache-max-bytes`.
@@ -1651,6 +1719,15 @@ pub struct PerformanceFlags {
 pub struct ResolvedPerformanceDefaults {
     /// Reaches `EngineConfig::fetch_concurrency`.
     pub fetch_concurrency: usize,
+    /// Reaches `EngineConfig::store_get_concurrency` and, from there, the
+    /// single process-owned `GetLimiter` (ADR-1195).
+    pub store_get_concurrency: usize,
+    /// Reaches `EngineConfig::sql_partition_count` and, from there,
+    /// `target_partitions` in `crates/ravel-sql/src/session.rs` (ADR-1195).
+    pub sql_partition_count: usize,
+    /// Reaches `EngineConfig::promql_fetch_fanout` and, from there, the
+    /// PromQL/analytics `buffer_unordered` fan-out width (ADR-1195).
+    pub promql_fetch_fanout: usize,
     /// Reaches `EngineConfig::max_segments`.
     pub max_segments: usize,
     /// Reaches the query fetcher cache's byte ceiling
@@ -1694,6 +1771,9 @@ pub struct ResolvedPerformanceDefaults {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerformanceSources {
     pub fetch_concurrency: &'static str,
+    pub store_get_concurrency: &'static str,
+    pub sql_partition_count: &'static str,
+    pub promql_fetch_fanout: &'static str,
     pub max_segments: &'static str,
     pub cache_max_bytes: &'static str,
     pub catalog_cache_max_bytes: &'static str,
@@ -1720,6 +1800,24 @@ fn percent_of(total: u64, percent: u64) -> u64 {
 /// ceiling, never a wrapped small one.
 fn bytes_as_usize(bytes: u64) -> usize {
     usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
+/// Resolve one of the three ADR-1195 knobs (`store_get_concurrency`,
+/// `sql_partition_count`, `promql_fetch_fanout`): an explicit flag wins, else
+/// the legacy `--fetch-concurrency` value if the operator set it, else the
+/// derived default. `Cli::validate` refuses the combination of an explicit
+/// flag together with `--fetch-concurrency`, so at most one of `explicit` and
+/// `legacy` is ever `Some` here.
+fn resolve_knob(
+    explicit: Option<usize>,
+    legacy: Option<usize>,
+    derived: usize,
+) -> (usize, &'static str) {
+    match (explicit, legacy) {
+        (Some(n), _) => (n, PERF_SOURCE_FLAG),
+        (None, Some(n)) => (n, PERF_SOURCE_LEGACY_FLAG),
+        (None, None) => (derived, PERF_SOURCE_DERIVED),
+    }
 }
 
 /// Resolve the six performance settings from the host and the operator's flags
@@ -1765,13 +1863,29 @@ pub fn resolve_performance_defaults(
 ) -> ResolvedPerformanceDefaults {
     let cores = host.cores.max(1);
 
+    let derived_fetch_concurrency =
+        (FETCH_CONCURRENCY_PER_CORE.saturating_mul(cores)).max(MIN_DERIVED_FETCH_CONCURRENCY);
+
     let (fetch_concurrency, fetch_source) = match flags.fetch_concurrency {
         Some(n) => (n, PERF_SOURCE_FLAG),
-        None => (
-            (FETCH_CONCURRENCY_PER_CORE.saturating_mul(cores)).max(MIN_DERIVED_FETCH_CONCURRENCY),
-            PERF_SOURCE_DERIVED,
-        ),
+        None => (derived_fetch_concurrency, PERF_SOURCE_DERIVED),
     };
+
+    let (store_get_concurrency, store_get_concurrency_source) = resolve_knob(
+        flags.store_get_concurrency,
+        flags.fetch_concurrency,
+        derived_fetch_concurrency,
+    );
+    let (sql_partition_count, sql_partition_count_source) = resolve_knob(
+        flags.sql_partition_count,
+        flags.fetch_concurrency,
+        derived_fetch_concurrency,
+    );
+    let (promql_fetch_fanout, promql_fetch_fanout_source) = resolve_knob(
+        flags.promql_fetch_fanout,
+        flags.fetch_concurrency,
+        derived_fetch_concurrency,
+    );
 
     let (max_segments, segments_source) = match flags.max_segments {
         Some(n) => (n, PERF_SOURCE_FLAG),
@@ -1844,6 +1958,9 @@ pub fn resolve_performance_defaults(
 
     ResolvedPerformanceDefaults {
         fetch_concurrency,
+        store_get_concurrency,
+        sql_partition_count,
+        promql_fetch_fanout,
         max_segments,
         cache_max_bytes,
         catalog_cache_max_bytes,
@@ -1852,6 +1969,9 @@ pub fn resolve_performance_defaults(
         query_deadline,
         sources: PerformanceSources {
             fetch_concurrency: fetch_source,
+            store_get_concurrency: store_get_concurrency_source,
+            sql_partition_count: sql_partition_count_source,
+            promql_fetch_fanout: promql_fetch_fanout_source,
             max_segments: segments_source,
             cache_max_bytes: cache_source,
             catalog_cache_max_bytes: catalog_cache_source,
@@ -1884,6 +2004,24 @@ impl ResolvedPerformanceDefaults {
             setting = "fetch_concurrency",
             value = self.fetch_concurrency,
             source = self.sources.fetch_concurrency,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "store_get_concurrency",
+            value = self.store_get_concurrency,
+            source = self.sources.store_get_concurrency,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "sql_partition_count",
+            value = self.sql_partition_count,
+            source = self.sources.sql_partition_count,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "promql_fetch_fanout",
+            value = self.promql_fetch_fanout,
+            source = self.sources.promql_fetch_fanout,
             "performance default resolved"
         );
         tracing::info!(
@@ -2620,6 +2758,9 @@ impl Cli {
     ) -> anyhow::Result<QueryBudgets> {
         Ok(QueryBudgets {
             fetch_concurrency: resolved.fetch_concurrency,
+            store_get_concurrency: resolved.store_get_concurrency,
+            sql_partition_count: resolved.sql_partition_count,
+            promql_fetch_fanout: resolved.promql_fetch_fanout,
             max_segments: resolved.max_segments,
             sql_max_query_bytes: resolved.sql_max_query_bytes,
             sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
@@ -3266,6 +3407,56 @@ impl Cli {
             );
         }
 
+        // ADR-1195: a zero value in any of the four fetch-concurrency-family
+        // flags is refused here, before configuration resolution builds any
+        // fetcher, engine, or SQL session, with the flag named in the error.
+        if self.fetch_concurrency == Some(0) {
+            anyhow::bail!(
+                "--fetch-concurrency '0' would admit no concurrent segment fetches; omit the \
+                 flag to derive the default from host cores, or set a positive count"
+            );
+        }
+        if self.store_get_concurrency == Some(0) {
+            anyhow::bail!(
+                "--store-get-concurrency '0' would admit no concurrent object-store GETs; omit \
+                 the flag to derive the default from host cores, or set a positive count"
+            );
+        }
+        if self.sql_partition_count == Some(0) {
+            anyhow::bail!(
+                "--sql-partition-count '0' would give DataFusion zero scan partitions; omit the \
+                 flag to derive the default from host cores, or set a positive count"
+            );
+        }
+        if self.promql_fetch_fanout == Some(0) {
+            anyhow::bail!(
+                "--promql-fetch-fanout '0' would admit no concurrent PromQL segment fetches; \
+                 omit the flag to derive the default from host cores, or set a positive count"
+            );
+        }
+
+        // ADR-1195 legacy precedence: `--fetch-concurrency` sets all three new
+        // knobs together when none of them is given explicitly. Combining it
+        // with any of the three is a startup error naming both flags, not a
+        // silent precedence rule.
+        if self.fetch_concurrency.is_some() {
+            let conflicting = [
+                ("--store-get-concurrency", self.store_get_concurrency),
+                ("--sql-partition-count", self.sql_partition_count),
+                ("--promql-fetch-fanout", self.promql_fetch_fanout),
+            ]
+            .into_iter()
+            .find(|(_, value)| value.is_some());
+            if let Some((flag_name, _)) = conflicting {
+                anyhow::bail!(
+                    "--fetch-concurrency cannot be combined with {flag_name}: --fetch-concurrency \
+                     is the legacy flag that sets --store-get-concurrency, \
+                     --sql-partition-count, and --promql-fetch-fanout together (ADR-1195). Pass \
+                     either --fetch-concurrency alone, or the specific new flags without it."
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -3311,6 +3502,9 @@ impl Cli {
         };
         Ok(PerformanceFlags {
             fetch_concurrency: self.fetch_concurrency,
+            store_get_concurrency: self.store_get_concurrency,
+            sql_partition_count: self.sql_partition_count,
+            promql_fetch_fanout: self.promql_fetch_fanout,
             max_segments: self.max_segments,
             cache_max_bytes: self.cache_max_bytes,
             sql_max_query_bytes: self.sql_max_query_bytes,
@@ -4708,6 +4902,158 @@ mod tests {
         );
     }
 
+    /// ADR-1195 reachability: `--store-get-concurrency` must reach the
+    /// `EngineConfig` the running engine enforces, not stop at a parsed field.
+    /// Same wiring trace as [`fetch_concurrency_is_reachable_from_cli`].
+    #[test]
+    fn store_get_concurrency_is_reachable_from_cli() {
+        let cli = Cli::try_parse_from(["ravel-server", "--store-get-concurrency", "7"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.store_get_concurrency(), 7,
+            "the running engine's store_get_concurrency must be the configured flag"
+        );
+        // The other two unbundled knobs and the legacy field must be
+        // unaffected: this flag governs only GET concurrency.
+        assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195 reachability: `--sql-partition-count` must reach the
+    /// `EngineConfig` `crates/ravel-sql/src/session.rs` reads for
+    /// `target_partitions`. Same wiring trace as
+    /// [`fetch_concurrency_is_reachable_from_cli`].
+    #[test]
+    fn sql_partition_count_is_reachable_from_cli() {
+        let cli = Cli::try_parse_from(["ravel-server", "--sql-partition-count", "5"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.sql_partition_count(), 5,
+            "the running engine's sql_partition_count must be the configured flag"
+        );
+        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195 reachability: `--promql-fetch-fanout` must reach the
+    /// `EngineConfig` the running engine enforces. Same wiring trace as
+    /// [`fetch_concurrency_is_reachable_from_cli`].
+    #[test]
+    fn promql_fetch_fanout_is_reachable_from_cli() {
+        let cli = Cli::try_parse_from(["ravel-server", "--promql-fetch-fanout", "3"])
+            .expect("flag parses");
+        let engine = engine_from(&cli);
+        assert_eq!(
+            engine.promql_fetch_fanout(), 3,
+            "the running engine's promql_fetch_fanout must be the configured flag"
+        );
+        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195: with none of the four fetch-concurrency-family flags set, all
+    /// three unbundled knobs derive independently from the host, at the same
+    /// value `fetch_concurrency` itself derives to, each reported at source
+    /// `derived`.
+    #[test]
+    fn reference_host_resolves_the_three_unbundled_knobs() {
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(resolved.store_get_concurrency, 32);
+        assert_eq!(resolved.sql_partition_count, 32);
+        assert_eq!(resolved.promql_fetch_fanout, 32);
+        assert_eq!(resolved.sources.store_get_concurrency, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.sql_partition_count, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.sources.promql_fetch_fanout, PERF_SOURCE_DERIVED);
+    }
+
+    /// ADR-1195: on a tiny host the three unbundled knobs floor at
+    /// `MIN_DERIVED_FETCH_CONCURRENCY`, exactly like `fetch_concurrency` does.
+    #[test]
+    fn small_host_floors_the_three_unbundled_knobs_at_the_minimum() {
+        let tiny = resolve_performance_defaults(
+            HostProfile::new(1, Some(8 * 1024 * 1024 * 1024)),
+            PerformanceFlags::default(),
+        );
+        assert_eq!(tiny.store_get_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
+        assert_eq!(tiny.sql_partition_count, MIN_DERIVED_FETCH_CONCURRENCY);
+        assert_eq!(tiny.promql_fetch_fanout, MIN_DERIVED_FETCH_CONCURRENCY);
+    }
+
+    /// ADR-1195 legacy precedence: `--fetch-concurrency` alone sets all three
+    /// unbundled knobs together, at source `legacy-flag`, exactly like the
+    /// pre-1195 single-knob behaviour.
+    #[test]
+    fn legacy_fetch_concurrency_sets_all_three_unbundled_knobs() {
+        let cli = Cli::try_parse_from(["ravel-server", "--fetch-concurrency", "9"])
+            .expect("flag parses");
+        let resolved = resolved_from(&cli);
+        assert_eq!(resolved.store_get_concurrency, 9);
+        assert_eq!(resolved.sql_partition_count, 9);
+        assert_eq!(resolved.promql_fetch_fanout, 9);
+        assert_eq!(resolved.sources.store_get_concurrency, PERF_SOURCE_LEGACY_FLAG);
+        assert_eq!(resolved.sources.sql_partition_count, PERF_SOURCE_LEGACY_FLAG);
+        assert_eq!(resolved.sources.promql_fetch_fanout, PERF_SOURCE_LEGACY_FLAG);
+
+        let engine = engine_from(&cli);
+        assert_eq!(engine.store_get_concurrency(), 9);
+        assert_eq!(engine.sql_partition_count(), 9);
+        assert_eq!(engine.promql_fetch_fanout(), 9);
+    }
+
+    /// ADR-1195: combining `--fetch-concurrency` with any of the three new
+    /// flags is a startup error naming both flags, not a silent precedence
+    /// rule.
+    #[test]
+    fn fetch_concurrency_conflicts_with_each_new_flag() {
+        for (flag, value) in [
+            ("--store-get-concurrency", "4"),
+            ("--sql-partition-count", "4"),
+            ("--promql-fetch-fanout", "4"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "ravel-server",
+                "--fetch-concurrency",
+                "9",
+                flag,
+                value,
+            ])
+            .expect("flags parse at the CLI layer");
+            let err = cli
+                .validate()
+                .expect_err(&format!("--fetch-concurrency combined with {flag} must fail startup"));
+            let message = err.to_string();
+            assert!(
+                message.contains("--fetch-concurrency") && message.contains(flag),
+                "error must name both conflicting flags: {message}"
+            );
+        }
+    }
+
+    /// ADR-1195: a `0` value in any of the four fetch-concurrency-family
+    /// flags is refused at validation, before configuration resolution builds
+    /// any fetcher, engine, or SQL session, with the flag named in the error.
+    #[test]
+    fn zero_value_in_any_fetch_concurrency_family_flag_is_a_startup_error() {
+        for flag in [
+            "--fetch-concurrency",
+            "--store-get-concurrency",
+            "--sql-partition-count",
+            "--promql-fetch-fanout",
+        ] {
+            let cli = Cli::try_parse_from(["ravel-server", flag, "0"])
+                .expect("0 parses at the CLI layer");
+            let err = cli
+                .validate()
+                .expect_err(&format!("{flag} 0 must fail startup"));
+            assert!(
+                err.to_string().contains(flag),
+                "error must name the offending flag: {err}"
+            );
+        }
+    }
+
     /// ADR-0088 reachability: `--max-segments` must reach the `EngineConfig` the
     /// running engine enforces. Same wiring trace as
     /// [`fetch_concurrency_is_reachable_from_cli`].
@@ -4876,10 +5222,18 @@ mod tests {
                 logs_block_range_threshold: u64::MAX,
                 fetch_concurrency: REFERENCE_FETCH_CONCURRENCY,
                 max_segments: DERIVED_MAX_SEGMENTS,
+                // ADR-1195: `apply_to_engine` always sets the three unbundled
+                // knobs from `QueryBudgets`, which resolved them at the same
+                // derived value as `fetch_concurrency` (none of the four flags
+                // was set).
+                store_get_concurrency: Some(REFERENCE_FETCH_CONCURRENCY),
+                sql_partition_count: Some(REFERENCE_FETCH_CONCURRENCY),
+                promql_fetch_fanout: Some(REFERENCE_FETCH_CONCURRENCY),
                 ..EngineConfig::default()
             },
-            "unset flags must perturb only the derived budgets and the two quantities the \
-             default cost-based policy resolves at the reference profile"
+            "unset flags must perturb only the derived budgets, the ADR-1195 unbundled knobs, \
+             and the two quantities the default cost-based policy resolves at the reference \
+             profile"
         );
     }
 
