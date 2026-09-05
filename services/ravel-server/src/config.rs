@@ -905,7 +905,9 @@ pub struct Cli {
     /// once, via a per-instance semaphore. Unset, it takes
     /// `ravel_catalog::CatalogConfig`'s own default (currently 128). `0` is
     /// rejected by [`Cli::validate`]: a zero-permit semaphore would deadlock
-    /// every resolve, never silently clamped to 1.
+    /// every resolve, never silently clamped to 1. A value above
+    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` is rejected too, rather
+    /// than panicking inside `tokio::sync::Semaphore::new` at startup.
     #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
     pub catalog_resolve_concurrency: Option<usize>,
 
@@ -3157,6 +3159,18 @@ impl Cli {
                 "--catalog-resolve-concurrency '0' would deadlock every catalog resolve: a \
                  zero-permit semaphore can never be acquired. Omit the flag to use the \
                  catalog's own default, or set a positive count."
+            );
+        }
+
+        if let Some(concurrency) = self.catalog_resolve_concurrency
+            && concurrency > ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY
+        {
+            anyhow::bail!(
+                "--catalog-resolve-concurrency '{concurrency}' exceeds the maximum of {}: \
+                 past that ceiling the value is not a sane operator setting and \
+                 tokio::sync::Semaphore::new would panic at startup instead of failing \
+                 cleanly. Set a smaller count.",
+                ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY
             );
         }
 
@@ -6482,6 +6496,42 @@ mod tests {
         .expect("flags parse at the CLI layer");
         cli.validate().expect(
             "--max-flush-delay-idle == --max-flush-delay must be accepted (inclusive boundary)",
+        );
+    }
+
+    /// Issue #1238 review round: `--catalog-resolve-concurrency 0` must be
+    /// rejected here, at `Cli::validate`, not only later inside
+    /// `Catalog::new`. Deleting the bail at the top of `Cli::validate`
+    /// leaves every other test green (startup still fails, just later,
+    /// through `Catalog::new`'s own zero check) -- this test pins the
+    /// flag-level rejection specifically.
+    #[test]
+    fn catalog_resolve_concurrency_zero_is_rejected_at_startup() {
+        let cli = Cli::try_parse_from(["ravel-server", "--catalog-resolve-concurrency", "0"])
+            .expect("flag parses at the CLI layer");
+        let err = cli
+            .validate()
+            .expect_err("startup must reject --catalog-resolve-concurrency 0");
+        assert!(
+            err.to_string().contains("--catalog-resolve-concurrency"),
+            "expected the catalog-resolve-concurrency error, got: {err}"
+        );
+    }
+
+    /// Issue #1238 review round: a `--catalog-resolve-concurrency` above
+    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` must be rejected here,
+    /// not left to panic inside `tokio::sync::Semaphore::new` at startup.
+    #[test]
+    fn catalog_resolve_concurrency_above_max_is_rejected_at_startup() {
+        let over_max = (ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY + 1).to_string();
+        let cli = Cli::try_parse_from(["ravel-server", "--catalog-resolve-concurrency", &over_max])
+            .expect("flag parses at the CLI layer");
+        let err = cli.validate().expect_err(
+            "startup must reject a --catalog-resolve-concurrency above MAX_RESOLVE_GET_CONCURRENCY",
+        );
+        assert!(
+            err.to_string().contains("--catalog-resolve-concurrency"),
+            "expected the catalog-resolve-concurrency error, got: {err}"
         );
     }
 
