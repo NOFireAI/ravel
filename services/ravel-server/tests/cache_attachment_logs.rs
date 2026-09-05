@@ -207,6 +207,7 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
         cli.disable_cache,
         ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
+        cli.catalog_resolve_concurrency,
     )
     .expect("catalog");
     let mut sql_state = build_sql_state(

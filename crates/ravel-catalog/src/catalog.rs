@@ -35,14 +35,6 @@ use crate::provisioning::ShardGeneration;
 use crate::snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
-/// Bound on the object-store requests one resolve keeps in flight at once.
-/// A cold resolve issues one LIST per (shard, hour) plus one
-/// GET per uncached commit/compaction record and per snapshot part; these
-/// used to run strictly one await at a time. They now run concurrently up to
-/// this bound, held by [`Catalog::request_semaphore`] and acquired only
-/// around a single leaf request, so the fan-out collapses from k sequential
-/// round trips toward ceil(k / this) without ever exceeding it.
-pub(crate) const MAX_CONCURRENT_REQUESTS: usize = 16;
 /// One shard's listed commit-bucket entries, keyed by `(shard, ingest_hour)`,
 /// as produced by [`Catalog::list_shard_hours`] and merged in
 /// [`Catalog::list_window_bounded`].
@@ -475,13 +467,20 @@ impl crate::provisioning::AccountedRecordGet for GuardedRecordGet<'_> {
 
 impl Catalog {
     /// Errors if `config.shard_count == 0` (a resolvable catalog needs at
-    /// least one shard).
+    /// least one shard) or `config.resolve_get_concurrency == 0` (a
+    /// zero-permit semaphore would deadlock every resolve, never silently
+    /// clamped to 1).
     pub fn new(
         store: Arc<dyn ObjectStoreBackend>,
         config: CatalogConfig,
     ) -> Result<Self, CatalogError> {
         if config.shard_count == 0 {
-            return Err(CatalogError::InvalidConfig);
+            return Err(CatalogError::InvalidConfig("shard_count must be > 0"));
+        }
+        if config.resolve_get_concurrency == 0 {
+            return Err(CatalogError::InvalidConfig(
+                "resolve_get_concurrency must be > 0",
+            ));
         }
         // `byte_cache_max_bytes == 0` is the disabled sentinel:
         // build no byte cache at all rather than a zero-capacity one, so the
@@ -513,7 +512,9 @@ impl Catalog {
             compaction_input_set_conflicts: AtomicU64::new(0),
             rewrite_sibling_conflicts: AtomicU64::new(0),
             isolation_breaches: AtomicU64::new(0),
-            request_semaphore: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_REQUESTS)),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                config.resolve_get_concurrency,
+            )),
             enforce_provisioning: false,
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
@@ -1928,7 +1929,7 @@ impl Catalog {
                     accounting,
                 )
             })
-            .buffered(MAX_CONCURRENT_REQUESTS)
+            .buffered(self.config.resolve_get_concurrency)
             .collect()
             .await;
         let mut grouped: ShardBuckets = HashMap::new();
@@ -1966,7 +1967,7 @@ impl Catalog {
                     self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
                         .await
                 })
-                .buffered(MAX_CONCURRENT_REQUESTS)
+                .buffered(self.config.resolve_get_concurrency)
                 .collect()
                 .await;
         let mut out: HashMap<String, SegmentRef> = HashMap::new();
@@ -2482,7 +2483,7 @@ impl Catalog {
                     self.process_bucket(tenant, signal, shard, hour, objs, range, accounting)
                         .await
                 })
-                .buffered(MAX_CONCURRENT_REQUESTS)
+                .buffered(self.config.resolve_get_concurrency)
                 .collect()
                 .await;
         let mut out: HashMap<String, SegmentRef> = HashMap::new();
@@ -2517,7 +2518,7 @@ impl Catalog {
                     .await
                     .map(|_| ())
             })
-            .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+            .buffer_unordered(self.config.resolve_get_concurrency)
             .collect()
             .await;
         for load in loads {
@@ -2542,7 +2543,7 @@ impl Catalog {
                     .await
                     .map(|_| ())
             })
-            .buffer_unordered(MAX_CONCURRENT_REQUESTS)
+            .buffer_unordered(self.config.resolve_get_concurrency)
             .collect()
             .await;
         for load in loads {
@@ -4450,8 +4451,8 @@ mod tests {
     /// raw `validate_or_adopt(self.store.as_ref(), .., CheckOnly)` call (and
     /// `read_scan_generations` to `read_generations_from_store`). The held
     /// provisioning GET then holds no resolve permit, so `available_permits()`
-    /// stays at `MAX_CONCURRENT_REQUESTS` and the `== MAX_CONCURRENT_REQUESTS -
-    /// 1` assertion fails.
+    /// stays at `DEFAULT_RESOLVE_GET_CONCURRENCY` and the
+    /// `== DEFAULT_RESOLVE_GET_CONCURRENCY - 1` assertion fails.
     #[tokio::test]
     async fn provisioning_read_holds_a_resolve_semaphore_permit() {
         let mem = MemoryStore::new();
@@ -4478,7 +4479,7 @@ mod tests {
 
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            MAX_CONCURRENT_REQUESTS,
+            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY,
             "no permit is held before the resolve starts"
         );
 
@@ -4499,7 +4500,7 @@ mod tests {
         );
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            MAX_CONCURRENT_REQUESTS - 1,
+            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY - 1,
             "the held provisioning GET holds a resolve semaphore permit: it routed through \
              guarded_get, not a raw store.get"
         );
@@ -4526,6 +4527,155 @@ mod tests {
             1,
             "once unblocked the resolve returns the published segment"
         );
+    }
+
+    /// Issue #1238: the resolve path's per-bucket prewarm fan-out
+    /// (`Catalog::prewarm_commit_records`) issues commit-record GETs
+    /// concurrently up to `CatalogConfig::resolve_get_concurrency`, enforced
+    /// by the resolve-wide semaphore (`Catalog::request_semaphore`), not a
+    /// fixed constant. A `FaultStore` hold on every commit-record GET
+    /// (key suffix `.cmt`) lets the test observe the exact number in flight
+    /// at once; a plain counter over `MemoryStore` alone could never observe
+    /// more than one in flight, since nothing in that path ever yields
+    /// control back before completing.
+    ///
+    /// Checked at two different configured values (8 and 32) so a
+    /// coincidental match against one hardcoded fan-out width cannot pass
+    /// this test.
+    ///
+    /// FLIP (pre-fix demonstration): before this change, every one of these
+    /// sites read the fixed `MAX_CONCURRENT_REQUESTS = 16` constant
+    /// (catalog.rs:45 prior to this change) instead of
+    /// `self.config.resolve_get_concurrency`. Configuring 64 against that
+    /// code holds the fan-out at 16 in flight forever: `gate.wait_until_held(64)`
+    /// never returns and the test hangs instead of asserting `== 64`.
+    #[tokio::test]
+    async fn resolve_fan_out_reaches_the_configured_concurrency() {
+        assert_fan_out_peaks_at(8).await;
+        assert_fan_out_peaks_at(32).await;
+    }
+
+    /// Publishes `concurrency * 4` commit records into one `(shard, hour)`
+    /// bucket -- comfortably more than the configured concurrency, so the
+    /// prewarm fan-out has enough keys to saturate the semaphore twice over
+    /// -- then asserts the observed peak in-flight commit-record GET count
+    /// equals `concurrency` exactly, on two separate waves.
+    async fn assert_fan_out_peaks_at(concurrency: usize) {
+        let mem = MemoryStore::new();
+        let hour = 500_000u32;
+        let now = i64::from(hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        let tail = concurrency * 4;
+        for seq in 1..=tail as u64 {
+            publish_segment(&mem, 0, seq, hour, now, now - 1_000, now).await;
+        }
+        let store = Arc::new(FaultStore::new(mem, FaultPlan::empty()));
+        // Hold every commit-record GET (".cmt"). The provisioning-record GET
+        // (`/prov`) and any HEAD/listing calls this resolve issues use a
+        // different key shape and pass straight through.
+        let gate = store.hold(Op::Get, Some(".cmt".to_string()), Occurrence::Always);
+
+        let catalog = Arc::new(
+            Catalog::new(
+                store.clone(),
+                CatalogConfig {
+                    resolve_get_concurrency: concurrency,
+                    ..config(1)
+                },
+            )
+            .expect("catalog"),
+        );
+        let range = TimeRange {
+            start_ns: now - 1_000,
+            end_ns: now,
+        };
+        let acc = QueryAccounting::new();
+        let cat_task = catalog.clone();
+        let task = tokio::spawn(async move {
+            cat_task
+                .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now, &acc)
+                .await
+        });
+
+        gate.wait_until_held(concurrency).await;
+        assert_eq!(
+            gate.held_count(),
+            concurrency,
+            "exactly the configured number of commit-record GETs are in flight at once \
+             (concurrency = {concurrency})"
+        );
+
+        // Release the first wave and confirm the fan-out refills to exactly
+        // the same bound from the remaining keys, not just once by chance.
+        for id in gate.held() {
+            gate.release(id);
+        }
+        gate.wait_until_held(concurrency).await;
+        assert_eq!(
+            gate.held_count(),
+            concurrency,
+            "the fan-out refills to exactly the configured bound on a second wave \
+             (concurrency = {concurrency})"
+        );
+
+        let mut spins = 0;
+        while !task.is_finished() {
+            for id in gate.held() {
+                gate.release(id);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            spins += 1;
+            assert!(
+                spins < 10_000,
+                "resolve did not finish after releasing every held commit-record GET \
+                 (concurrency = {concurrency})"
+            );
+        }
+        let snapshot = task.await.expect("join resolve task").expect("resolve");
+        assert_eq!(
+            snapshot.segments.len(),
+            tail,
+            "every published segment is present once the fan-out drained \
+             (concurrency = {concurrency})"
+        );
+    }
+
+    /// Issue #1238: `CatalogConfig::resolve_get_concurrency` defaults to 128,
+    /// not the old fixed `MAX_CONCURRENT_REQUESTS = 16`. Measured against
+    /// real S3 on a 10,000-record unsealed tail (one cold resolve each,
+    /// 10,001 GETs and 13 LISTs at every level -- concurrency-bound, not
+    /// request-count-bound): 23.157s at 16, 4.374s at 64, 2.341s at 128. A
+    /// silent revert of the default fails this assertion.
+    #[test]
+    fn resolve_get_concurrency_defaults_to_128() {
+        assert_eq!(CatalogConfig::default().resolve_get_concurrency, 128);
+    }
+
+    /// Issue #1238: a zero `resolve_get_concurrency` is rejected at
+    /// `Catalog::new` with a typed error, never silently clamped to 1 (a
+    /// zero-permit semaphore would deadlock every resolve forever, which is
+    /// far worse than a rejected startup).
+    ///
+    /// FLIP (pre-fix demonstration): before this change `Catalog::new` never
+    /// read `resolve_get_concurrency` at all (the semaphore was sized from
+    /// the fixed `MAX_CONCURRENT_REQUESTS` constant), so this construction
+    /// would return `Ok` instead of `Err(CatalogError::InvalidConfig(_))`.
+    #[test]
+    fn zero_resolve_get_concurrency_is_rejected() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: 0,
+                ..config(1)
+            },
+        );
+        match result {
+            Err(CatalogError::InvalidConfig(msg)) => {
+                assert_eq!(msg, "resolve_get_concurrency must be > 0");
+            }
+            Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
     }
 
     /// End-to-end: an older HEAD (`shard_generation_count` lower
@@ -6053,7 +6203,7 @@ mod tests {
         );
         assert_eq!(
             catalog.request_semaphore.available_permits(),
-            MAX_CONCURRENT_REQUESTS,
+            crate::config::DEFAULT_RESOLVE_GET_CONCURRENCY,
             "every acquired permit was released"
         );
     }

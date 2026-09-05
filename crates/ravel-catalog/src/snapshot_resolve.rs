@@ -748,7 +748,7 @@ impl Catalog {
         // impl at the HTTP router (the "FnOnce is not general enough" wall).
         let loaded: Vec<OnePartOutcome> = stream::iter(part_refs.iter().cloned())
             .map(|part_ref| async move { self.load_one_part(tenant, &part_ref, accounting).await })
-            .buffered(crate::catalog::MAX_CONCURRENT_REQUESTS)
+            .buffered(self.config().resolve_get_concurrency)
             .collect()
             .await;
         let mut parts = Vec::with_capacity(loaded.len());
