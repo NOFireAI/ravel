@@ -238,13 +238,23 @@ listing path) and raises the flush rate for streams that never reach
 whether a tenant's shards are byte-driven or timer-driven, so the experiment
 varies it against both.
 
-Deliverable: a measured table of tail record count and cold resolve cost across
-that knob space on a real corpus, and a defaults recommendation. Raising
-Raising `target_bytes` to 64 MiB is worth roughly 8x on record count **for
-byte-driven shards only**: a shard whose buffer never reaches the target flushes
-on the timer instead, and raising the target changes nothing for it. That is the
-same interaction as above, and it is why the recommendation comes from the
-experiment rather than from the arithmetic.
+This was measured (issue #1215), and the result changes the decision rather than
+informing it. `target_bytes` is not the lever: it fired zero times across two
+runs spanning 47x in ingest rate, because the 2 s age trigger always wins first
+on the acknowledged path. The 8x this ADR originally attributed to it applies to
+nobody on strict ingest.
+
+The lever is `max_flush_delay`, and it is not free the way a default usually is:
+a strict acknowledgement waits for its flush, so raising the delay raises
+acknowledged write latency one for one. That is a change to the acknowledgement
+contract and belongs to whoever owns that contract, not to a tuning pass.
+`min_flush_bytes` and `max_flush_delay_idle` cannot substitute, because the idle
+ceiling is unreachable whenever a waiter exists.
+
+What remains for issue #1217 is therefore documentation rather than a defaults
+change: state the mechanism, the measured rate, and the latency cost of the only
+knob that moves it, so that an operator raising `max_flush_delay` for a tenant
+is making that trade knowingly.
 
 ### 3. The tail checkpoint is specified here and NOT built
 
@@ -342,9 +352,12 @@ own ADR.
 Build the tail checkpoint only if, after decision 2's knob defaults are applied,
 both hold over a 24-hour window on a real workload:
 
-- `unfolded_segments_resolved` at p99 is at least **2,000** per resolve. The
-  threshold is denominated in segments because that is what the read path can
-  count. For an all-L0 tail, which is what the unsealed region is, one segment
+- `unfolded_segments_resolved` at p99 is at least **2,000** per resolve. On the
+  measured figures this is crossed by any strict-ingest tenant with two or more
+  shards, independently of how much data it sends, so this condition is expected
+  to hold rather than to discriminate, and the cold-resolve condition below is
+  the one that decides. The threshold is denominated in segments because that is
+  what the read path can count. For an all-L0 tail, which is what the unsealed region is, one segment
   is one commit record and the measured 1.6 ms per record makes 2,000 about 3.2
   seconds of resolve before a predicate rejects anything: the point where
   resolve stops being a rounding error against a query budget. That time
