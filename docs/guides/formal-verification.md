@@ -41,7 +41,7 @@ the exhaustive configuration's distinct-state count and wall time.
 |---|---|---|---|
 | common | `RavelObjectStore.tla` | 3845952 | 252 seconds |
 | commit | `CommitProtocol.tla` | 5466239 | 131 seconds |
-| catalog | `CatalogMVCC.tla` | 3422524 | not recorded |
+| catalog | `CatalogMVCC.tla` | 3422524 | 510 seconds |
 | lifecycle | `LifecycleGC.tla` | 230815 | 30 seconds |
 | resharding | `OnlineResharding.tla` | 1179718 | under 300 seconds |
 | maintenance | `MaintenanceOwnership.tla` | 13183990 | 1769 seconds |
