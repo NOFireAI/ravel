@@ -143,5 +143,6 @@ the reservation commit that used to work around it.
 | [1101](1101-alerts-and-audit-sql-tables.md) | Register the `alerts` and `audit` SQL tables | Accepted (2026-09-03) |
 | [1103](1103-promql-over-logs.md) | PromQL over logs: `ravel_log_lines` and `ravel_log_bytes` | Accepted |
 | [1113](1113-tla-verification-suite.md) | TLA+ verification suite for the commit, catalog, lifecycle, resharding, and maintenance protocols | Proposed |
+| [1170](1170-process-memory-budget.md) | One process-wide memory budget: a `MemoryBudget` accountant the tenant accountants adapt to, byte reservations at the fetch layer where the unit is known, a static carve under one number, and the aggregate logged and gauged | Proposed |
 | [1195](1195-unbundle-fetch-concurrency.md) | Unbundle `--fetch-concurrency`, and make GET concurrency a process-wide limit | Proposed |
 | [1196](1196-fetch-objective-cost-first-default-latency-first-policy.md) | Keep the cost-first fetch default, add a latency-first policy | Proposed |
