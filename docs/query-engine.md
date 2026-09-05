@@ -1595,7 +1595,7 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `s3HeadRequests`/`s3HeadBytes`, `s3ListBytes`, and
   `peakIntermediateBytes` (SQL executor only).
 
-### I/O dependency shape (issue #1214)
+### I/O dependency shape
 
 `stats.phases` above answers "how many requests and bytes did each phase
 spend." It cannot answer a different question: how many of those requests
