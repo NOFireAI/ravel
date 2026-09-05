@@ -306,6 +306,7 @@ async fn spawn_remote(
         None,
         clock,
         metrics,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
 
     let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));

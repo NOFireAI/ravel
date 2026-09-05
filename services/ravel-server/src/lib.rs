@@ -675,6 +675,21 @@ pub async fn start(
     // first), so the result is discarded.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    // ADR-1195: the ONE process-wide GET limiter every fetcher this process
+    // constructs shares -- the query engine's RSEG and RLOG block-range
+    // fetchers, RSPAN's `SpanSegmentFetcher`, the distributed fragment path's
+    // per-fragment `SegmentFetcher`, and the cache-warm fetchers all draw from
+    // this single permit pool, so a fan-out that used to multiply per-engine
+    // (or per-fetcher) permits now sums to one process-wide total. Built from
+    // `config.query_budgets.store_get_concurrency`, which `main` already
+    // resolved and validated against zero (`Cli::performance_flags`, before
+    // `start` ran), so this never fails in practice; the `?` is defense in
+    // depth, not an expected path.
+    let get_limiter = Arc::new(
+        ravel_query::GetLimiter::new(config.query_budgets.store_get_concurrency)
+            .map_err(|err| anyhow::anyhow!("invalid GET-limiter configuration: {err}"))?,
+    );
+
     // The process-wide ingest buffer byte budget (ADR-0069 decision 1). One
     // gauge shared by `Arc` across the metrics, log, and span routers so a
     // single `--max-ingest-buffer-bytes` ceiling bounds the sum of buffered
@@ -1109,6 +1124,7 @@ pub async fn start(
             cache.clone(),
             Arc::new(SystemClock),
             metrics.clone(),
+            get_limiter.clone(),
         );
         // When this process runs a dedicated TLS fragment listener (ADR-0071
         // amendment decision 1), its coordinator dials remote workers' TLS
@@ -1298,6 +1314,7 @@ pub async fn start(
             distributed.clone(),
             federation,
             metadata_cache.clone(),
+            get_limiter.clone(),
         );
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
@@ -1351,6 +1368,7 @@ pub async fn start(
                 query_accounting.clone(),
                 query_admission.clone(),
                 Some(declared_columns),
+                get_limiter.clone(),
             )?;
             alert_sql_executor = Some(state.executor.clone());
             // The same executor the idle-tenant sweep evicts idle accountants
@@ -1505,8 +1523,14 @@ pub async fn start(
         // attached to the query paths above, cloned before `catalog` is
         // moved into `fold::spawn` below.
         if let Some(cache) = &cache {
-            cache_warm::warm_cache(store.clone(), catalog.clone(), cache.clone(), &SystemClock)
-                .await;
+            cache_warm::warm_cache(
+                store.clone(),
+                catalog.clone(),
+                cache.clone(),
+                &SystemClock,
+                get_limiter.clone(),
+            )
+            .await;
         }
     }
 

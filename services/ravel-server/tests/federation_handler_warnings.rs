@@ -179,6 +179,7 @@ async fn promql_with_federation(store: Arc<dyn ObjectStoreBackend>, tenant: &Ten
         None,
         Some(federation),
         None,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     promql_router(app_state)
 }

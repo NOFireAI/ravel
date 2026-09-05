@@ -30,7 +30,7 @@ use std::time::Duration;
 use ravel_catalog::{Catalog, SegmentRef};
 use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_query::{LogQuery, LogSegmentFetcher, ReadCache, SegmentFetcher};
+use ravel_query::{GetLimiter, LogQuery, LogSegmentFetcher, ReadCache, SegmentFetcher};
 use ravel_types::{Signal, TenantHash, TimeRange};
 
 /// Per (tenant, signal), the number of most-recent parts warmed.
@@ -58,11 +58,12 @@ pub async fn warm_cache(
     catalog: Arc<Catalog>,
     cache: ReadCache,
     clock: &dyn Clock,
+    get_limiter: Arc<GetLimiter>,
 ) {
     let now_ns = clock.now_ns();
     match tokio::time::timeout(
         WARM_DEADLINE,
-        warm_cache_inner(store, catalog, cache, now_ns),
+        warm_cache_inner(store, catalog, cache, now_ns, get_limiter),
     )
     .await
     {
@@ -82,6 +83,7 @@ async fn warm_cache_inner(
     catalog: Arc<Catalog>,
     cache: ReadCache,
     now_ns: i64,
+    get_limiter: Arc<GetLimiter>,
 ) {
     let tenants = match ravel_maintain::discover_tenants(store.as_ref()).await {
         Ok(tenants) => tenants,
@@ -96,8 +98,15 @@ async fn warm_cache_inner(
         end_ns: now_ns,
     };
 
-    let metrics_fetcher = SegmentFetcher::new(store.clone()).with_cache(cache.clone());
-    let logs_fetcher = LogSegmentFetcher::new(store).with_cache(cache);
+    // ADR-1195: share the one process-wide GET limiter rather than each
+    // fetcher's own default private pool, so a cache-warm pass counts against
+    // the same budget the real query paths draw from.
+    let metrics_fetcher = SegmentFetcher::new(store.clone())
+        .with_cache(cache.clone())
+        .with_get_limiter(get_limiter.clone());
+    let logs_fetcher = LogSegmentFetcher::new(store)
+        .with_cache(cache)
+        .with_get_limiter(get_limiter);
 
     for tenant in tenants {
         warm_metrics(&catalog, &metrics_fetcher, tenant, range, now_ns).await;
@@ -323,6 +332,7 @@ mod tests {
             catalog,
             ReadCache::Ram(cache.clone()),
             &FixedClock(now),
+            Arc::new(GetLimiter::new(16).expect("16 permits is valid")),
         )
         .await;
 
@@ -348,6 +358,7 @@ mod tests {
             catalog,
             ReadCache::Ram(cache.clone()),
             &FixedClock(now_ns()),
+            Arc::new(GetLimiter::new(16).expect("16 permits is valid")),
         )
         .await;
 
@@ -377,6 +388,7 @@ mod tests {
             catalog,
             ReadCache::Ram(cache.clone()),
             &FixedClock(now_ns()),
+            Arc::new(GetLimiter::new(16).expect("16 permits is valid")),
         )
         .await;
 
@@ -450,7 +462,14 @@ mod tests {
         )));
 
         let warm = tokio::spawn(async move {
-            warm_cache(store, catalog, ReadCache::Ram(cache), &FixedClock(now_ns())).await;
+            warm_cache(
+                store,
+                catalog,
+                ReadCache::Ram(cache),
+                &FixedClock(now_ns()),
+                Arc::new(GetLimiter::new(16).expect("16 permits is valid")),
+            )
+            .await;
         });
 
         // No manual `advance()`: the child's own `WARM_DEADLINE` sleep is only

@@ -173,6 +173,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         None,
         None,
         None,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     let promql = promql_router(app_state);
 

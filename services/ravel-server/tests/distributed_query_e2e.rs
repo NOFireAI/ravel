@@ -603,6 +603,7 @@ async fn distributed_query_dispatches_a_real_remote_hop() {
         None,
         clock,
         metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     let self_cell = Arc::new(OnceLock::new());
     self_cell
@@ -1254,6 +1255,7 @@ async fn worker_loss_redispatches_once_then_fails_typed() {
         None,
         clock,
         metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     let self_cell = Arc::new(OnceLock::new());
     // A self id absent from the worker set, so every slice maps to a remote.
@@ -1385,6 +1387,7 @@ async fn version_mismatch_falls_back_to_local() {
         None,
         clock,
         metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     let self_cell = Arc::new(OnceLock::new());
     self_cell
@@ -1545,6 +1548,7 @@ async fn slice_atomicity_discards_partial_frames_from_failed_attempt() {
         None,
         clock,
         metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     let self_cell = Arc::new(OnceLock::new());
     self_cell
@@ -1669,6 +1673,7 @@ async fn cancelled_distributed_query_frees_fragment_permits() {
         None,
         clock,
         metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     let self_cell = Arc::new(OnceLock::new());
     self_cell
@@ -1843,6 +1848,7 @@ async fn corrupt_worker_fails_typed_without_retry_or_fallback() {
         None,
         clock,
         metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     let self_cell = Arc::new(OnceLock::new());
     self_cell

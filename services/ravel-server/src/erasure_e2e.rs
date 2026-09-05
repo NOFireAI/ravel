@@ -388,6 +388,7 @@ fn build_metrics_app(
         None,
         None,
         None,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     ravel_query::http::router(state)
 }
@@ -775,6 +776,7 @@ mod logs {
                 ravel_query::QueryConcurrencyLimit::Unlimited,
             ),
             None,
+            Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
         )
         .expect("sql state");
         sql_state.clock = Arc::new(FixedQueryClock);

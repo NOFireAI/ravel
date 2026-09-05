@@ -252,6 +252,7 @@ async fn run(argv: &[&str]) -> Routed {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         None,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     )
     .expect("sql state");
 

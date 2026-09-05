@@ -62,6 +62,7 @@ use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::instrument::{LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT};
 use ravel_proto::queryfrag::v1 as pb;
+use ravel_query::GetLimiter;
 use ravel_query::ReadCache;
 use ravel_query::SegmentFetcher;
 use ravel_query::distrib::client::{
@@ -492,6 +493,10 @@ struct FragmentServiceInner {
     cache: Option<ReadCache>,
     clock: Arc<dyn Clock>,
     metrics: Arc<FragmentMetrics>,
+    /// ADR-1195: the one process-wide GET limiter every fetcher this process
+    /// constructs shares. Applied to the per-fragment `SegmentFetcher`
+    /// `resolve_and_run` builds, via [`SegmentFetcher::with_get_limiter`].
+    get_limiter: Arc<GetLimiter>,
 }
 
 /// The boxed frame stream the generated `SeriesFetch` server trait requires.
@@ -509,6 +514,7 @@ impl FragmentService {
         cache: Option<ReadCache>,
         clock: Arc<dyn Clock>,
         metrics: Arc<FragmentMetrics>,
+        get_limiter: Arc<GetLimiter>,
     ) -> Self {
         FragmentService {
             inner: Arc::new(FragmentServiceInner {
@@ -520,6 +526,7 @@ impl FragmentService {
                 cache,
                 clock,
                 metrics,
+                get_limiter,
             }),
             // Backward-compatible default: a directly-constructed service serves
             // both scopes. `lib.rs` sets an explicit role per listener via
@@ -793,7 +800,8 @@ impl FragmentService {
                 (request, resolver)
             }
         };
-        let mut fetcher = SegmentFetcher::new(self.inner.store.clone());
+        let mut fetcher = SegmentFetcher::new(self.inner.store.clone())
+            .with_get_limiter(self.inner.get_limiter.clone());
         if let Some(cache) = &self.inner.cache {
             fetcher = fetcher.with_cache(cache.clone());
         }
@@ -1696,6 +1704,7 @@ mod tests {
             None,
             clock,
             metrics,
+            Arc::new(GetLimiter::new(16).expect("16 permits is valid")),
         )
     }
 
@@ -1794,6 +1803,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(GetLimiter::new(16).expect("16 permits is valid")),
         )
     }
 
@@ -2933,6 +2943,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(GetLimiter::new(16).expect("16 permits is valid")),
         )
     }
 
@@ -3075,6 +3086,7 @@ mod tests {
             None,
             Arc::new(FixedClock(now_ns)),
             metrics,
+            Arc::new(GetLimiter::new(16).expect("16 permits is valid")),
         )
     }
 

@@ -202,6 +202,7 @@ async fn cache_enabled_config_attaches_cache_to_the_metric_path() {
         None,
         None,
         None,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     let app: Router = router(state);
 

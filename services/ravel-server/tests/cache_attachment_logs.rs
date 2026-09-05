@@ -225,6 +225,7 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         None,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     )
     .expect("sql state");
     // Freeze the clock so the epoch-start window resolves to an ordinary

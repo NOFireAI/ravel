@@ -248,6 +248,7 @@ fn promql_app(
         None,
         None,
         None,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     );
     ravel_query::http::router(state)
 }
@@ -274,6 +275,7 @@ fn sql_app(
         )),
         QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
         None,
+        Arc::new(ravel_query::GetLimiter::new(16).expect("16 permits is valid")),
     )
     .expect("build_sql_state");
     ravel_server::sql::router(state)
