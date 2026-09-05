@@ -46,7 +46,8 @@ config. New areas planned by ADR-1113:
 Requires Java 17 or newer (Temurin 21 is what CI uses). The harness resolves
 Java from `RAVEL_TLA_JAVA` if set, else `java` on `PATH`, and exits 2 if none
 is usable. It needs network access on first run only to fetch the TLC jar,
-unless you supply one with `RAVEL_TLA_TOOLS_JAR` (see below).
+unless you supply one with `RAVEL_TLA_TOOLS_JAR` (see below). The
+traceability lane runs no TLC and needs no Java at all.
 
 The per-model wall-clock ceiling requires GNU `timeout(1)`. Linux ships it as
 `timeout`; on macOS install it with `brew install coreutils`, which provides
