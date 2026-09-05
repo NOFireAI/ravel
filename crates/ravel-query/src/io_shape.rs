@@ -57,9 +57,14 @@
 //!   object-store mechanisms with different causes.
 //! - [`service_batches`](QueryIoShape::service_batches): batches this query's
 //!   per-segment fan-out was forced into by its concurrency permit
-//!   (`ceil(segment_count / fetch_concurrency)`): 64 segments under 16
-//!   concurrent permits is 4 batches at whatever depth those segments'
-//!   fetches classify at.
+//!   (`ceil(segment_count / fetch_concurrency)`): 64 segments under 8
+//!   concurrent permits (`fetch_concurrency`'s default,
+//!   `DEFAULT_FETCH_CONCURRENCY`) is 8 batches at whatever depth those
+//!   segments' fetches classify at. For the metrics lane this is scaled by
+//!   `service_fetch_multiplier`, the count of distinct matcher sets the
+//!   fetch fan-out issues one pass per (`distinct_plans_by_matcher` in
+//!   `crates/ravel-query/src/engine.rs`): 64 segments under 8 permits with
+//!   two distinct matcher sets reports 16 batches, not 8.
 //! - [`unfolded_segments_resolved`](QueryIoShape::unfolded_segments_resolved):
 //!   the EXACT count of segments this query's resolve took from the recent
 //!   (unfolded) listing path (`SegmentOrigin::Recent`) rather than a folded
@@ -395,12 +400,12 @@ mod tests {
     /// the threshold is a whole-object read (depth 1); every other case --
     /// including `object_size == 0`, which `open_segment` sends down the
     /// `GetRange::Suffix` footer-tail path, not the whole-object path --
-    /// reports the upper bound 3, because a `FooterOutcome::NeedRange` chase
-    /// on the tail guess is a real third stage this function cannot rule
-    /// out from `object_size` alone. Flip the `object_size != 0 &&` guard
-    /// off (restoring the old `object_size <= threshold` test alone) to
-    /// watch the `object_size == 0` case fail: it would wrongly report 1
-    /// instead of 3.
+    /// reports the upper bound 4, because a `FooterOutcome::NeedRange` chase
+    /// on the tail guess, plus the catalog and page fetch stages, are real
+    /// further stages this function cannot rule out from `object_size`
+    /// alone. Flip the `object_size != 0 &&` guard off (restoring the old
+    /// `object_size <= threshold` test alone) to watch the `object_size ==
+    /// 0` case fail: it would wrongly report 1 instead of 4.
     #[test]
     fn depth_for_object_matches_whole_object_threshold_branch() {
         assert_eq!(
