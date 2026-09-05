@@ -15,7 +15,10 @@ use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use ravel_catalog::{Catalog, CatalogConfig};
+use ravel_catalog::{
+    Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
+    DEFAULT_MAX_FLUSH_LIFETIME_NS,
+};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{erasure, keys, publish, record, signal};
@@ -219,13 +222,32 @@ async fn publish_metric(
     ts: i64,
     value: f64,
 ) {
+    publish_metric_named(store, tenant_id, tenant_hash, "target_rps", 0, ts, value).await;
+}
+
+/// Same as `publish_metric`, naming the metric explicitly and taking an
+/// explicit `writer_seq`: used to publish a second, unrelated series so a
+/// postings-pruned resolve has something real to prune (issue #1214 finding
+/// 1's plan-class test needs the metrics lane to resolve as
+/// `SelectiveIndexed`, not `ExhaustiveScan`). Distinct `writer_seq` values
+/// keep each call's `SegmentIdentity`/`NewCommitRecord` from colliding when
+/// two segments share the same writer id.
+async fn publish_metric_named(
+    store: &MemoryStore,
+    tenant_id: &TenantId,
+    tenant_hash: TenantHash,
+    metric: &str,
+    writer_seq: u64,
+    ts: i64,
+    value: f64,
+) {
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId};
 
     let labels = LabelSet::new(vec![
         Label {
             name: "__name__".to_string(),
-            value: "target_rps".to_string(),
+            value: metric.to_string(),
         },
         Label {
             name: "job".to_string(),
@@ -233,7 +255,7 @@ async fn publish_metric(
         },
     ])
     .expect("valid labels");
-    let series_id = SeriesId::compute(tenant_id, "target_rps", &labels).expect("series id");
+    let series_id = SeriesId::compute(tenant_id, metric, &labels).expect("series id");
     let input = SeriesInput {
         series_id,
         labels,
@@ -244,7 +266,7 @@ async fn publish_metric(
         shard: 0,
         writer_id: Uuid::from_bytes([4u8; 16]).to_string(),
         writer_epoch: 1,
-        writer_seq: 0,
+        writer_seq,
     };
     let written = SegmentWriter::write(
         vec![input],
@@ -261,7 +283,7 @@ async fn publish_metric(
         shard: 0,
         writer_id: Uuid::from_bytes([4u8; 16]),
         writer_epoch: 1,
-        writer_seq: 0,
+        writer_seq,
         object_size: written.bytes.len() as u64,
         content_hash: written.summary.blake3,
         sample_count: written.summary.sample_count,
@@ -547,6 +569,77 @@ async fn binop_between_aggregated_log_series_and_a_metrics_series() {
     assert!(
         (vector[0].value - 5.0).abs() < 1e-9,
         "8 log lines - 3 rps = 5"
+    );
+}
+
+/// The same log/metrics binop as
+/// `binop_between_aggregated_log_series_and_a_metrics_series`, but with a
+/// second, unrelated metric segment and postings built for `Signal::Metrics`
+/// so the metrics lane resolves with real pruning (`segments_pruned > 0`,
+/// `PlanClass::SelectiveIndexed`). Issue #1214 finding 1's bug was that the
+/// log lane unconditionally reported `PlanClass::ExhaustiveScan` regardless
+/// of what it itself resolved -- the log lane's `resolve_bounded` call
+/// always passes `name_filter: None`, so its own `segments_pruned` is
+/// structurally always 0 and it has no basis to claim any class at all, let
+/// alone the most severe one -- which would have dragged this query's
+/// overall `plan_class` from `SelectiveIndexed` up to `ExhaustiveScan` by
+/// `merge_plan_class`'s most-severe-wins rule, even though the log lane
+/// resolved its own segments outside of any selector-based pruning. The fix
+/// reports the log lane's contribution as `Unclassified`, which ranks below
+/// `SelectiveIndexed`, so the metrics lane's real classification survives
+/// the merge unharmed.
+#[tokio::test]
+async fn log_lane_never_escalates_a_selectively_indexed_metrics_lane_to_exhaustive_scan() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    fixture(&store, th).await;
+    publish_metric(&store, &tid, th, BASE + 2 * NS, 3.0).await;
+    // Unrelated metric segment: pruned for the `target_rps` selector once
+    // postings are built, fetched for a selector that names it instead.
+    publish_metric_named(&store, &tid, th, "other_metric", 1, BASE + 2 * NS, 99.0).await;
+
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let catalog = Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog");
+
+    let hour = u32::try_from(BASE / NS_PER_HOUR).expect("hour fits u32");
+    let fold_now_ns = (i64::from(hour) + 1) * NS_PER_HOUR
+        + DEFAULT_MAX_FLUSH_LIFETIME_NS
+        + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+        + DEFAULT_FOLD_SAFETY_MARGIN_NS;
+    let report = catalog
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), fold_now_ns, &[], None)
+        .await
+        .expect("fold");
+    assert!(
+        report.postings_built,
+        "postings must build for this test to exercise pruning at all"
+    );
+
+    let engine = QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default());
+
+    let (_value, stats) = engine
+        .instant_with_stats(
+            th,
+            r#"sum by (job) (count_over_time(ravel_log_lines{job="api"}[1h])) - target_rps{job="api"}"#,
+            ms(BASE + 20 * NS),
+            &[],
+            fold_now_ns,
+            DEADLINE,
+        )
+        .await
+        .expect("query succeeds");
+
+    assert_eq!(
+        stats.segments_pruned, 1,
+        "the unrelated metric segment must actually be pruned for this test to be meaningful"
+    );
+    assert_eq!(
+        stats.io_shape.plan_class,
+        ravel_query::io_shape::PlanClass::SelectiveIndexed,
+        "the log lane resolved zero segments of its own choosing (name_filter: None never \
+         prunes), and must not escalate the metrics lane's real SelectiveIndexed class to \
+         ExhaustiveScan"
     );
 }
 
