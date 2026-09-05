@@ -259,7 +259,9 @@ connection, a pushed-but-broken main).
   conflict resolution, or manual edit changes the tree and voids the
   receipt: rerun the gates. The script also runs `assert-gh-auth.sh`
   first and `assert-clean-authorship.sh` on the rewritten history before
-  it pushes.
+  it pushes. A receipt written by `verify-dispatch-gates.sh --with-gates`
+  satisfies this same check: the authorship rewrite and wip-fold change
+  commit ids, not the tree, so the tree-hash-keyed receipt still matches.
 - `scripts/pr-review-status.sh <pr-number>`: one-line status for the
   wait-for-CodeRabbit-then-merge-by-hand flow -- `mergeStateStatus`, the
   CI check rollup (pass/pending/fail counts, failing check names), and
@@ -269,13 +271,19 @@ connection, a pushed-but-broken main).
   human/session read of `gh api repos/.../pulls/<n>/comments` to judge
   whether each was already fixed or answered; the script only tells you
   there's something to read.
-- `scripts/verify-dispatch-gates.sh <ref> <scratchpad-dir>`: the tier-1
-  gate check behind the `verify-dispatch` skill: an isolated worktree
-  outside the repo, a cold `CARGO_TARGET_DIR`, and the full workspace
-  gate list, regardless of which crate the branch touched. Run this (via
-  the `verify-dispatch` skill, which adds narrow adversarial checks on
-  top) before merging any fleet result: a crate-scoped or warm-cache
-  gate run can let a broken branch through.
+- `scripts/verify-dispatch-gates.sh [--with-gates] <ref> <scratchpad-dir>`:
+  the tier-1 gate check behind the `verify-dispatch` skill: an isolated
+  worktree outside the repo, a cold `CARGO_TARGET_DIR`, and the full
+  workspace gate list, regardless of which crate the branch touched. Run
+  this (via the `verify-dispatch` skill, which adds narrow adversarial
+  checks on top) before merging any fleet result: a crate-scoped or
+  warm-cache gate run can let a broken branch through. `--with-gates` (or
+  `VERIFY_WITH_GATES=1`) runs `scripts/gates.sh` itself inside that cold
+  worktree instead of five hand-listed cargo commands, which also covers
+  the `sql`/`flight-sql`/`ravel-bench` feature lanes and leaves a
+  gates-pass receipt that `FLEET_MERGE_SKIP_GATES=1
+  scripts/fleet-result-merge.sh` can then reuse to skip its own second
+  full build.
 - `scripts/affected-tests.sh [-n] -p CRATE [-p CRATE ...]`: runs tests
   for the named crates plus every workspace crate that depends on them
   (transitively), with the `ci` cargo profile; `-n` prints the affected
