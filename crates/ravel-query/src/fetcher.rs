@@ -577,6 +577,14 @@ pub struct SegmentFetcher {
     /// `store.get`, never across a scope that acquires another permit, so no
     /// fetch can deadlock waiting on permits it already holds.
     get_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    /// The permit count `get_semaphore` was constructed or last
+    /// `with_max_concurrent_gets`-overridden with. Tracked separately from
+    /// the semaphore itself because `Semaphore::available_permits` reports
+    /// permits currently free, not total capacity: reading it while another
+    /// query holds permits from this same shared (`Arc`) semaphore would
+    /// undercount. `io_shape`'s `service_batches` needs the fixed capacity,
+    /// not a point-in-time snapshot of concurrent load.
+    max_concurrent_gets: usize,
     /// ADR-0046's read cache, consulted by `guarded_get` for every
     /// byte-range (and whole-object) GET. `None` -- the default from
     /// `new` -- reproduces exactly the pre-cache behavior: every GET goes
@@ -623,6 +631,7 @@ impl SegmentFetcher {
             get_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 DEFAULT_MAX_CONCURRENT_GETS,
             )),
+            max_concurrent_gets: DEFAULT_MAX_CONCURRENT_GETS,
             cache: None,
             suffix_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             label_sets_materialized: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -712,8 +721,20 @@ impl SegmentFetcher {
     /// this fetcher's clones.
     #[must_use]
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
-        self.get_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(n.max(1)));
+        self.max_concurrent_gets = n.max(1);
+        self.get_semaphore =
+            std::sync::Arc::new(tokio::sync::Semaphore::new(self.max_concurrent_gets));
         self
+    }
+
+    /// The in-flight GET permit pool's fixed capacity (see
+    /// [`Self::with_max_concurrent_gets`]; `DEFAULT_MAX_CONCURRENT_GETS` if
+    /// never overridden). Read-only counterpart used by `io_shape`'s
+    /// `service_batches`, which needs the real shared-semaphore bound this
+    /// fetcher's GETs are serialized against, not the per-fan-out
+    /// `fetch_concurrency` that only bounds one `buffer_unordered` level.
+    pub fn max_concurrent_gets(&self) -> usize {
+        self.max_concurrent_gets
     }
 
     /// One store GET, bounded by the shared in-flight semaphore. The permit
