@@ -515,7 +515,10 @@ its contract are assumptions, stated as such, not properties this suite
 checks (section 9).
 
 A literal search for the phrase "formally verified" across `formal/` and
-`docs/adrs/1113*` returns **two** matches, not zero:
+`docs/adrs/1113*`, excluding this report itself (`REPORT.md` quotes and
+discusses the phrase several times in this very paragraph and in section 6's
+source material, which would make the count circular), returns **two**
+matches, not zero:
 
 - `docs/adrs/1113-tla-verification-suite.md`, under "D12. What the suite
   claims, in the words it must use": `"Ravel is formally verified" does not
