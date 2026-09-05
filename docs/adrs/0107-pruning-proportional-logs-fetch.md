@@ -306,6 +306,25 @@ Before this amendment nothing set it, so every logs scan ran at most 16
 GETs in flight regardless of the flag, and a 100M-row `count(*)` measured
 the same 160 s at `--fetch-concurrency` 16 and 32.
 
+## Amendment 2026-09-05 (ADR-1195): the RLOG permit pool is the shared GET limiter
+
+ADR-1195 replaces the per-fetcher semaphores with one
+`ravel_query::GetLimiter` shared by every fetcher a `QueryEngine` owns, sized
+by the new `--store-get-concurrency` knob (derived default
+`max(8, 2 x cores)`, the formula `--fetch-concurrency` used). This supersedes
+"sized independently for RLOG's call volume" in decision 1 and "separate from
+RSEG's" in the amendment above: RLOG's `BlockRangeFetcher` now draws from the
+same pool as RSEG and RSPAN, and `LogSegmentFetcher::with_max_concurrent_gets`
+is a convenience that builds a private limiter for callers outside an engine
+(the benches). The knob ADR-1195 left for this ADR to name is
+`--store-get-concurrency`.
+
+Two things this amendment does not change. The RLOG whole-object funnel
+(`fetch_accounted` and `whole_object_bytes`) still issues GETs without a
+permit; the ADR-1195 follow-up closes that. And sharing one limiter across
+`ravel-server`'s engines and standalone fetchers lands with the server half of
+ADR-1195; until then the pool is per engine.
+
 ## Amendment 2026-08-26 (issue #693 part 3): a footer carried from the plan phase establishes the etag pin on the first data GET
 
 Decision 1 establishes the mandatory etag pin on the suffix probe: the probe is
