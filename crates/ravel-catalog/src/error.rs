@@ -10,8 +10,8 @@ use crate::snapshot_format::SnapshotFormatError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CatalogError {
-    #[error("catalog config invalid: shard_count must be > 0")]
-    InvalidConfig,
+    #[error("catalog config invalid: {0}")]
+    InvalidConfig(&'static str),
     #[error("store error: {0}")]
     Store(#[from] StoreError),
     #[error("key error: {0}")]

@@ -153,6 +153,25 @@ pub const DEFAULT_FRONTIER_RECONCILE_MAX_HOURS: u32 = 168;
 /// identical snapshots and both respect [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`],
 /// so any value is correct.
 pub const DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS: u64 = 720;
+/// Default `resolve_get_concurrency`: the number of in-flight object-store
+/// requests (LISTs and record GETs) `Catalog::resolve_impl` and its helpers
+/// keep in flight at once, via a per-`Catalog`-instance semaphore
+/// (`Catalog::request_semaphore`). 128, derived from a measured S3 GET round
+/// trip of about 30ms: 128 requests in flight sustain roughly 128 / 0.030s ~=
+/// 4,300 GET/s, under S3's published guidance of about 5,500 GET/s per
+/// prefix, and every request this bounds lands under one
+/// `m/c/<shard>/<hour>/` prefix per shard-hour. Measured end to end on a
+/// 10,000-record unsealed tail (one cold resolve each, 10,001 GETs and 13
+/// LISTs at every concurrency level -- request count does not move, only the
+/// number of concurrency-bound rounds does): 23.157s at 16 (the prior fixed
+/// constant), 4.374s at 64, 2.341s at 128.
+///
+/// This bounds one `Catalog` instance, not the process: N concurrent cold
+/// queries against the same or different tenants, each building or reusing a
+/// `Catalog` with this default, can have up to N * 128 record GETs in flight
+/// at once. A process-wide cap across instances is not implemented here and
+/// is tracked as a follow-up.
+pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
 
 /// Catalog configuration.
 ///
@@ -330,6 +349,15 @@ pub struct CatalogConfig {
     /// [`crate::FoldReport::frontier_hours_deferred`], never silently skipped.
     /// Default [`DEFAULT_FRONTIER_RECONCILE_MAX_HOURS`].
     pub frontier_reconcile_max_hours: u32,
+    /// Number of in-flight object-store requests (LISTs and record GETs)
+    /// the resolve path keeps in flight at once, via a per-instance
+    /// semaphore (`Catalog::request_semaphore`). Must be greater than zero;
+    /// [`crate::Catalog::new`] rejects `0` with
+    /// [`CatalogError::InvalidConfig`](crate::CatalogError::InvalidConfig)
+    /// rather than silently clamping it to 1. See
+    /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`] for the measured basis. Default
+    /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`].
+    pub resolve_get_concurrency: usize,
 }
 
 impl Default for CatalogConfig {
@@ -358,6 +386,7 @@ impl Default for CatalogConfig {
             fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
             frontier_reconcile_max_hours: DEFAULT_FRONTIER_RECONCILE_MAX_HOURS,
+            resolve_get_concurrency: DEFAULT_RESOLVE_GET_CONCURRENCY,
         }
     }
 }

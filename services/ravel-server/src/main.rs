@@ -485,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
         cache_max_bytes: performance.cache_max_bytes,
         catalog_cache_max_bytes: performance.catalog_cache_max_bytes,
         cache_dir: cli.cache_dir.clone(),
+        catalog_resolve_concurrency: cli.catalog_resolve_concurrency,
         ingest_concurrency_limit: cli
             .parse_ingest_concurrency_limit()
             .context("failed to parse --max-inflight-ingest-requests")?,
