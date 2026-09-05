@@ -240,6 +240,97 @@ async fn pruned_and_bypassed_queries_are_bit_identical_across_formats_and_duplic
     assert_eq!(vector_bits(&bypassed_value), expected);
 }
 
+/// The same equality-vs-regex pair as
+/// `pruned_and_bypassed_queries_are_bit_identical_across_formats_and_duplicates`,
+/// but asserting on `stats.io_shape.plan_class` (issue #1214 finding 1): a
+/// real pruned resolve (seg C excluded, `segments_pruned == 1`) must report
+/// `SelectiveIndexed`, and a real exhaustive resolve of the SAME snapshot
+/// under a regex matcher that bypasses pruning (`segments_pruned == 0`, all
+/// three segments fetched) must report `ExhaustiveScan`. Before this fix
+/// both cases fell through `merge_plan_class`'s old two-way rank unchanged,
+/// so this pair already differed; the regression this pins is that
+/// `plan_class` tracks the metrics lane's OWN resolve outcome, not a
+/// constant for the query class.
+#[tokio::test]
+async fn differently_pruned_queries_report_different_plan_class() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tid = tenant("acme");
+    let th = tid.hash();
+    let hour = 5_010u32;
+    let now = now_at_seal(hour);
+    let ts = i64::from(hour) * NS_PER_HOUR + 30 * 60 * NS_PER_SEC;
+    let t_ms = ts / 1_000_000;
+
+    publish_segment(
+        store.as_ref(),
+        th,
+        Uuid::new_v4(),
+        1,
+        hour,
+        false,
+        vec![series_input(&tid, "target_metric", ts, 1.0)],
+    )
+    .await;
+    // Seg B: unrelated metric only. Pruned for the equality query, fetched
+    // for the regex-bypassed one.
+    publish_segment(
+        store.as_ref(),
+        th,
+        Uuid::new_v4(),
+        1,
+        hour,
+        false,
+        vec![series_input(&tid, "other_metric", ts, 99.0)],
+    )
+    .await;
+
+    let catalog = catalog(store.clone());
+    let report = catalog
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), now, &[], None)
+        .await
+        .expect("fold");
+    assert!(
+        report.postings_built,
+        "postings must build for this test to exercise pruning at all"
+    );
+
+    let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+
+    let (_pruned_value, pruned_stats) = engine
+        .instant_with_stats(th, "target_metric", t_ms, &[], now, Duration::from_secs(5))
+        .await
+        .expect("equality query");
+    assert_eq!(pruned_stats.segments_pruned, 1, "seg B pruned");
+    assert_eq!(
+        pruned_stats.io_shape.plan_class,
+        ravel_query::io_shape::PlanClass::SelectiveIndexed,
+        "a resolve that actually pruned a segment must report SelectiveIndexed"
+    );
+
+    let (_bypassed_value, bypassed_stats) = engine
+        .instant_with_stats(
+            th,
+            "{__name__=~\"target_metric\"}",
+            t_ms,
+            &[],
+            now,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("regex-bypassed query");
+    assert_eq!(bypassed_stats.segments_pruned, 0);
+    assert_eq!(
+        bypassed_stats.io_shape.plan_class,
+        ravel_query::io_shape::PlanClass::ExhaustiveScan,
+        "a resolve that fetched every segment with no pruning must report ExhaustiveScan"
+    );
+
+    assert_ne!(
+        pruned_stats.io_shape.plan_class, bypassed_stats.io_shape.plan_class,
+        "two queries with different real pruning outcomes must report different plan_class"
+    );
+}
+
 /// A negative `__name__` matcher must bypass pruning entirely, even though
 /// a segment lacking the compared-against name legitimately exists (so
 /// pruning-by-absence could otherwise seem to "work" here by accident).

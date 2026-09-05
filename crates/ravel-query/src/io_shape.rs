@@ -16,14 +16,15 @@
 //! / `fetch_histogram_pages`, `crate::fetcher`) is visible here, so
 //! [`dependency_depth`](QueryIoShape::dependency_depth) reflects it: whether a
 //! segment resolves in one whole-object GET (depth 1) or needs a
-//! footer-tail-then-dependent-fetch sequence (depth 2), classified structurally
-//! from `SegmentRef::object_size` against `SegmentFetcher::whole_object_threshold`
-//! (`depth_for_object` below), the same size test `open_segment` itself
-//! branches on. This mirrors `CostEstimate`'s existing convention: an upper
-//! envelope, not a per-request trace, because tracing the real request graph
-//! would require instrumenting every private call inside the fetch pipeline
-//! for a benefit this structural classification already gets from a field
-//! the snapshot already carries.
+//! footer-tail-then-dependent-fetch sequence, reported as an upper bound of
+//! depth 3 to cover a possible footer-range chase (`depth_for_object` below),
+//! classified structurally from `SegmentRef::object_size` against
+//! `SegmentFetcher::whole_object_threshold`, the same size test `open_segment`
+//! itself branches on. This mirrors `CostEstimate`'s existing convention: an
+//! upper envelope, not a per-request trace, because tracing the real request
+//! graph would require instrumenting every private call inside the fetch
+//! pipeline for a benefit this structural classification already gets from a
+//! field the snapshot already carries.
 //!
 //! What is NOT knowable from this crate: the catalog snapshot resolve's own
 //! internal dependency chain (`Catalog::resolve_pruned_with_generations` and
@@ -46,7 +47,9 @@
 //!   stage needs a previous stage's bytes to know its own keys. Four
 //!   independent segment GETs report depth 1 (they run concurrently, none
 //!   depends on another); a segment whose footer read is followed by a
-//!   dependent page fetch reports depth 2.
+//!   dependent page fetch reports depth 3, an upper bound covering a
+//!   possible footer-range chase this crate cannot rule out from
+//!   `object_size` alone (see `depth_for_object`).
 //! - [`list_page_depth`](QueryIoShape::list_page_depth): serial LIST pages,
 //!   recorded separately from `dependency_depth` because pagination
 //!   (`Catalog::list_shard_hours`) and the GET dependency chain are different
@@ -76,7 +79,7 @@
 //! # Tests
 //!
 //! Unit tests live in this module (`tests` submodule below) and exercise
-//! [`IoShapeRecorder`] directly: they construct chained versus parallel
+//! [`IoShapeCounts`] directly: they construct chained versus parallel
 //! recording sequences and assert on the resulting [`IoShapeCounts`], with no
 //! dependency on a live catalog or object store.
 
@@ -97,6 +100,16 @@ pub enum PlanClass {
     /// Every listed segment in the resolved window is opened: no pruning
     /// narrowed the set (or none was possible for this query shape).
     ExhaustiveScan,
+    /// The lane's own resolve carries no signal this crate can use to tell
+    /// a pruned fetch from a full scan (the log lane's `resolve_bounded`
+    /// call always passes `name_filter: None`, so `Snapshot::segments_pruned`
+    /// is structurally always 0 for it, regardless of whether the resolved
+    /// window is actually narrow). Reporting `ExhaustiveScan` here would be
+    /// fabricated: this lane genuinely does not know, and the honest
+    /// classification says so rather than defaulting to the most severe
+    /// value. See [`merge_plan_class`] for how this ranks against a lane
+    /// that DOES know.
+    Unclassified,
 }
 
 impl PlanClass {
@@ -107,6 +120,7 @@ impl PlanClass {
             PlanClass::MetadataOnly => "metadata_only",
             PlanClass::SelectiveIndexed => "selective_indexed",
             PlanClass::ExhaustiveScan => "exhaustive_scan",
+            PlanClass::Unclassified => "unclassified",
         }
     }
 }
@@ -145,18 +159,25 @@ impl Default for QueryIoShape {
 
 /// Combines two lanes' plan classes (a federated query can run a metrics
 /// lane and a log lane, each independently classified) into the single
-/// value `QueryIoShape` reports. Ranked by scan severity, most severe wins:
-/// `ExhaustiveScan` outranks `SelectiveIndexed`, which outranks
-/// `MetadataOnly`. This is the same conservative direction as
-/// `CostEstimate`'s upper-envelope convention -- if either lane touched an
-/// unpruned full window, the combined figure says so rather than averaging
-/// it away against a lane that pruned well.
+/// value `QueryIoShape` reports. Ranked: `MetadataOnly` (0) < `Unclassified`
+/// (1) < `SelectiveIndexed` (2) < `ExhaustiveScan` (3), most severe wins.
+/// `Unclassified` sits strictly between the never-ran identity and either
+/// real scan classification: a lane that genuinely resolved segments but
+/// cannot say whether pruning narrowed them is worse than a lane that never
+/// touched storage, but merging it against a lane that DID classify itself
+/// must never silently promote a real `SelectiveIndexed` result up to
+/// `ExhaustiveScan` -- that would be exactly the fabrication this value
+/// exists to avoid. This is the same conservative direction as
+/// `CostEstimate`'s upper-envelope convention otherwise: if either lane
+/// touched an unpruned full window, the combined figure says so rather than
+/// averaging it away against a lane that pruned well.
 pub fn merge_plan_class(a: PlanClass, b: PlanClass) -> PlanClass {
     fn rank(c: PlanClass) -> u8 {
         match c {
             PlanClass::MetadataOnly => 0,
-            PlanClass::SelectiveIndexed => 1,
-            PlanClass::ExhaustiveScan => 2,
+            PlanClass::Unclassified => 1,
+            PlanClass::SelectiveIndexed => 2,
+            PlanClass::ExhaustiveScan => 3,
         }
     }
     if rank(a) >= rank(b) { a } else { b }
@@ -164,21 +185,42 @@ pub fn merge_plan_class(a: PlanClass, b: PlanClass) -> PlanClass {
 
 /// Structural `dependency_depth` classification for one segment's fetch
 /// pipeline, from the same size test `SegmentFetcher::open_segment` branches
-/// on. A segment at or below the whole-object threshold resolves everything
-/// (footer, catalog, pages) from its first GET: depth 1, no later stage
-/// depends on this one's output to name its own keys. A larger segment reads
-/// only a footer tail first, and a page fetch that needs byte ranges the
-/// footer/catalog decode had to name is a second, dependent stage: depth 2.
+/// on. A segment strictly between 0 and the whole-object threshold resolves
+/// everything (footer, catalog, pages) from its first GET: depth 1, no later
+/// stage depends on this one's output to name its own keys.
 ///
-/// This ignores in-memory region reuse and cache warmth by design (same
-/// upper-envelope convention as `CostEstimate`): a fully-cached large segment
-/// still reports depth 2, because the *plan* has two dependent stages even
-/// when a cache absorbs the second one.
+/// Every other case reports depth 3, as an upper bound rather than a single
+/// true value, because this function only has `(object_size,
+/// whole_object_threshold)` to go on and `open_segment`'s real chain length
+/// past the whole-object branch depends on state this crate cannot see from
+/// those two numbers alone:
+/// - `object_size == 0` (size unknown ahead of the fetch) takes a
+///   `GetRange::Suffix` read (a footer-tail guess, not a whole-object read),
+///   which is then followed by dependent page GETs: at least 2 stages, and a
+///   `FooterOutcome::NeedRange` on that suffix guess (the tail didn't reach
+///   far enough back to cover the real footer) inserts one more dependent
+///   footer-range GET before the page fetch, making 3.
+/// - `object_size > whole_object_threshold` takes the same footer-tail path
+///   and is subject to the same possible `NeedRange` chase, for the same
+///   2-or-3 range.
+///
+/// Neither branch can be resolved to an exact depth here: whether the tail
+/// guess (`SegmentFetcher`'s private `suffix_len`) covers a given segment's
+/// real footer size is not observable from this function's inputs, and no
+/// public accessor exposes it. Reporting the upper bound (3) rather than the
+/// optimistic case (2) matches the module's existing "never underestimate"
+/// convention (see `CostEstimate`'s upper envelope): a chain this function
+/// undercounts would silently understate how serial a query's fetch plan
+/// is, which is the failure mode this field exists to surface.
+///
+/// This also ignores in-memory region reuse and cache warmth by design: a
+/// fully-cached large segment still reports its structural depth, because
+/// the *plan* has that many dependent stages even when a cache absorbs one.
 pub fn depth_for_object(object_size: u64, whole_object_threshold: u64) -> u32 {
-    if object_size <= whole_object_threshold {
+    if object_size != 0 && object_size <= whole_object_threshold {
         1
     } else {
-        2
+        3
     }
 }
 
@@ -272,6 +314,8 @@ impl IoShapeCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ravel_catalog::{DeclaredColumnStats, SegmentLevel, SegmentOrigins, SegmentRef, Snapshot};
+    use uuid::Uuid;
 
     /// A chained stage sequence (a HEAD-shaped stage whose bytes name the
     /// next stage's keys, repeated) must report a strictly greater
@@ -337,15 +381,22 @@ mod tests {
     }
 
     /// `depth_for_object` classifies structurally from the same size test
-    /// `SegmentFetcher::open_segment` branches on: at or below the
-    /// threshold is a whole-object read (depth 1), above it is a
-    /// footer-tail-then-dependent-fetch sequence (depth 2).
+    /// `SegmentFetcher::open_segment` branches on: strictly between 0 and
+    /// the threshold is a whole-object read (depth 1); every other case --
+    /// including `object_size == 0`, which `open_segment` sends down the
+    /// `GetRange::Suffix` footer-tail path, not the whole-object path --
+    /// reports the upper bound 3, because a `FooterOutcome::NeedRange` chase
+    /// on the tail guess is a real third stage this function cannot rule
+    /// out from `object_size` alone. Flip the `object_size != 0 &&` guard
+    /// off (restoring the old `object_size <= threshold` test alone) to
+    /// watch the `object_size == 0` case fail: it would wrongly report 1
+    /// instead of 3.
     #[test]
     fn depth_for_object_matches_whole_object_threshold_branch() {
         assert_eq!(
             depth_for_object(1_000, 2_000),
             1,
-            "at or below: whole object"
+            "strictly between 0 and threshold: whole object"
         );
         assert_eq!(
             depth_for_object(2_000, 2_000),
@@ -354,8 +405,14 @@ mod tests {
         );
         assert_eq!(
             depth_for_object(2_001, 2_000),
-            2,
-            "above threshold: footer tail then dependent fetch"
+            3,
+            "above threshold: footer tail, upper-bounded for a possible NeedRange chase"
+        );
+        assert_eq!(
+            depth_for_object(0, 2_000),
+            3,
+            "unknown size takes the suffix footer-tail path, not whole-object, \
+             even though 0 <= threshold"
         );
     }
 
@@ -390,28 +447,79 @@ mod tests {
     }
 
     /// Pins the segments-versus-records divergence the field name and doc
-    /// comment now spell out explicitly: `origins` is parallel to
-    /// `Snapshot::segments`, one entry per resolved `SegmentRef`, so a single
-    /// L1 compaction record that fans out into several parts contributes one
-    /// `Recent` origin PER PART, not one per underlying record. A fixture
-    /// standing in for one compaction record with 3 parts (all `Recent`)
-    /// plus one L0 record (also `Recent`, one segment) has 2 underlying
-    /// records but must report 4 -- the segment count, never the record
-    /// count `ravel-query` cannot see from `SegmentOrigin` alone.
+    /// comment now spell out explicitly, against REAL `ravel-catalog` types
+    /// rather than a bare `Vec<SegmentOrigin>` with no `Snapshot` behind it:
+    /// a `Snapshot` holding one L0 `SegmentRef` plus a 3-part L1 compaction
+    /// (`SegmentLevel::L1` at `part_index` 0, 1, 2, sharing one
+    /// `input_set_hash` -- the real shape one compaction record fans out
+    /// into) has 4 `segments` entries from only 2 underlying commit/
+    /// compaction records. `SegmentOrigins::origins` is built parallel to
+    /// `snapshot.segments` (same length, same order, all `Recent`, matching
+    /// how a real live-listing resolve populates both), and the assertion
+    /// checks that parallelism explicitly before checking the count, so a
+    /// carriage bug that let the two vectors drift out of sync would fail
+    /// here even before the count assertion. Flip the L1 fixture down to 1
+    /// part (drop two of the three `part_index` entries and their origins)
+    /// to watch the count assertion fail: it would then read 2, not 4.
     #[test]
     fn unfolded_segments_resolved_counts_compaction_parts_not_records() {
-        let origins = vec![
-            // 1 underlying L0 commit record -> 1 segment.
-            SegmentOrigin::Recent,
-            // 1 underlying L1 compaction record, fanned out into 3 parts
-            // (`SegmentLevel::L1`'s `part_index` 0, 1, 2) -> 3 segments.
-            SegmentOrigin::Recent,
-            SegmentOrigin::Recent,
-            SegmentOrigin::Recent,
-        ];
+        fn segment_ref(level: SegmentLevel) -> SegmentRef {
+            SegmentRef {
+                data_object_key: "irrelevant".to_string(),
+                object_size: 4_096,
+                min_event_ts_ns: 0,
+                max_event_ts_ns: 1,
+                ingest_hour_bucket: 0,
+                sample_count: 1,
+                series_count: 1,
+                shard: 0,
+                content_hash: [0u8; 32],
+                writer_id: Uuid::nil(),
+                writer_epoch: 0,
+                writer_seq: 0,
+                created_unix_ns: 0,
+                level,
+                segment_format_version: 1,
+                declared_column_stats: DeclaredColumnStats::default(),
+            }
+        }
+
+        let input_set_hash = [7u8; 32];
+        let snapshot = Snapshot {
+            segments: vec![
+                // 1 underlying L0 commit record -> 1 segment.
+                segment_ref(SegmentLevel::L0),
+                // 1 underlying L1 compaction record, fanned out into 3
+                // parts -> 3 segments.
+                segment_ref(SegmentLevel::L1 {
+                    input_set_hash,
+                    part_index: 0,
+                }),
+                segment_ref(SegmentLevel::L1 {
+                    input_set_hash,
+                    part_index: 1,
+                }),
+                segment_ref(SegmentLevel::L1 {
+                    input_set_hash,
+                    part_index: 2,
+                }),
+            ],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+
+        let mut origins = SegmentOrigins::default();
+        for _ in &snapshot.segments {
+            origins.push(SegmentOrigin::Recent);
+        }
 
         assert_eq!(
-            count_unfolded_segments(&origins),
+            origins.origins.len(),
+            snapshot.segments.len(),
+            "origins must stay parallel to snapshot.segments"
+        );
+        assert_eq!(
+            count_unfolded_segments(&origins.origins),
             4,
             "4 segments (1 L0 + 3 L1 parts) from only 2 underlying commit/compaction records"
         );

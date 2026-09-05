@@ -4496,6 +4496,146 @@ mod tests {
         }
     }
 
+    /// `crate::io_shape::depth_for_object` (issue #1214) mirrors the real
+    /// branches `open_segment` takes, not just two of its three. A small
+    /// object (`object_size` in `(0, threshold]`) resolves footer, catalog,
+    /// and pages from one GET: zero dependent stages, depth 1. Every other
+    /// case takes the footer-tail path, which is always followed by a
+    /// dependent page fetch (`decode_selected`'s own doc comment: "page
+    /// bytes are fetched afterwards by the caller from regions") -- a
+    /// second stage on top of the footer stage(s) -- and the footer stage
+    /// itself is either 1 GET (the tail guess covers the real footer) or 2
+    /// (a `FooterOutcome::NeedRange` chase), so the real chain is 2 or 3
+    /// stages. The pre-fix `depth_for_object` tested only
+    /// `object_size <= whole_object_threshold`, which is vacuously true for
+    /// `object_size == 0` against any non-negative threshold, and so wrongly
+    /// reported depth 1 -- the whole-object depth -- for a segment that
+    /// `open_segment` actually routes down the footer-tail path.
+    ///
+    /// Verified against real `open_segment` GET counts via `QueryAccounting`,
+    /// not hardcoded constants: `real_footer_gets + 1` (the dependent page
+    /// stage) must never exceed the predicted upper bound of 3, and must
+    /// equal it exactly in the forced-`NeedRange` case. Flip the
+    /// `object_size != 0 &&` guard back off in `depth_for_object` to watch
+    /// the `object_size == 0` assertion below fail: it would then predict 1,
+    /// not 3.
+    #[tokio::test]
+    async fn depth_for_object_upper_bounds_the_real_footer_and_page_chain() {
+        use crate::io_shape::depth_for_object;
+
+        // (a) Whole-object path: resolves everything from the single first
+        // GET, zero dependent stages.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let size = seg_ref.object_size;
+            let store = counting_store(bytes, &seg_ref.data_object_key).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+            SegmentFetcher::new(backend)
+                .with_whole_object_threshold(size + 1)
+                .fetch(tenant_hash, &seg_ref, &[])
+                .await
+                .expect("whole-object fetch");
+            let real_chain = store.sequence_progress(0);
+            assert_eq!(
+                real_chain, 1,
+                "whole-object path resolves footer, catalog, and pages from one GET"
+            );
+            assert_eq!(
+                depth_for_object(size, size + 1),
+                1,
+                "predicted depth must match the real single-GET chain exactly"
+            );
+        }
+
+        // (b) Forced footer-tail path with a `NeedRange` chase (`suffix_len`
+        // too small to cover the footer): 2 footer-stage GETs plus the
+        // dependent page stage is 3, matching the upper bound exactly.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let store = store_from_bytes(&seg_ref.data_object_key, bytes).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let fetcher = SegmentFetcher::new(backend)
+                .with_whole_object_threshold(0)
+                .with_suffix_len(16);
+            let acct = QueryAccounting::new();
+            fetcher
+                .open_segment(tenant_hash, &seg_ref, &acct)
+                .await
+                .expect("forced NeedRange chase open");
+            let footer_gets = acct.snapshot().s3_requests(AccountedOp::Get);
+            assert_eq!(
+                footer_gets, 2,
+                "a 16-byte suffix_len is too small to cover the footer, forcing a \
+                 NeedRange chase: exactly 2 footer-stage GETs"
+            );
+            let real_chain = footer_gets + 1; // + the dependent page fetch stage
+            assert_eq!(
+                real_chain, 3,
+                "2 footer GETs plus the dependent page fetch is a 3-stage chain"
+            );
+            assert_eq!(
+                depth_for_object(seg_ref.object_size, 0),
+                3,
+                "predicted upper bound must equal the real chain exactly in the \
+                 worst case"
+            );
+        }
+
+        // (c) `object_size == 0` (unknown size): takes the SAME footer-tail
+        // path as (b), not the whole-object path, even though the pre-fix
+        // code's `object_size <= whole_object_threshold` test was vacuously
+        // true for 0 against any non-negative threshold. The generous
+        // default `suffix_len` covers this small segment's footer in one
+        // GET, so the real chain is 2 (1 footer GET + 1 page stage) -- more
+        // than the pre-fix code's wrongly-predicted 1, and safely within the
+        // fixed code's upper bound of 3.
+        {
+            let (mem, tenant_hash, seg_ref) = write_test_segment().await;
+            let bytes = mem
+                .get(&seg_ref.data_object_key, GetRange::Full)
+                .await
+                .expect("get bytes")
+                .data;
+            let mut sizeless = seg_ref.clone();
+            sizeless.object_size = 0;
+            let store = store_from_bytes(&seg_ref.data_object_key, bytes).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let fetcher = SegmentFetcher::new(backend).with_whole_object_threshold(1_000_000);
+            let acct = QueryAccounting::new();
+            fetcher
+                .open_segment(tenant_hash, &sizeless, &acct)
+                .await
+                .expect("sizeless open");
+            let footer_gets = acct.snapshot().s3_requests(AccountedOp::Get);
+            assert_eq!(
+                footer_gets, 1,
+                "the default suffix_len covers this small segment's footer in one GET"
+            );
+            let real_chain = footer_gets + 1;
+            assert!(
+                real_chain <= 3,
+                "real chain ({real_chain}) must not exceed the predicted upper bound"
+            );
+            assert_eq!(
+                depth_for_object(0, 1_000_000),
+                3,
+                "object_size == 0 must take the footer-tail upper bound, not the \
+                 whole-object depth of 1, even though 0 <= any non-negative \
+                 threshold"
+            );
+        }
+    }
+
     /// End-to-end guard for issue #811 over a full `fetch_soa` (footer +
     /// catalog + pages), not just `open_segment`: a cold query with a cache
     /// attached must succeed, and a second identical query must issue zero

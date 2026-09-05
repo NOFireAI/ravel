@@ -1685,14 +1685,20 @@ and rendered as `stats.io`, additive beside `stats.phases`:
 - `dependencyDepth`: the longest chain of object-store stages, across every
   segment the query opened, where a stage needed a previous stage's bytes to
   know its own keys. Four independent segment GETs report depth 1; a
-  footer-tail read whose bytes name a page's byte range, followed by that
-  page's dependent GET, reports depth 2. Classified structurally from each
+  footer-tail read that may need a dependent page fetch reports depth 3, an
+  upper bound, not a single true value: this crate cannot tell from
+  `object_size` alone whether the footer-tail guess covered the real footer
+  in one GET or needed a `FooterOutcome::NeedRange` chase for another GET
+  before the dependent page fetch, so it reports the worse of the two rather
+  than risk understating the chain. Classified structurally from each
   segment's `object_size` against the fetcher's whole-object threshold (the
   same size test `SegmentFetcher::open_segment` itself branches on), not
   from a live per-request trace, matching `CostEstimate`'s existing
-  upper-envelope convention: a fully-cached large segment still reports
-  depth 2, because the plan has two dependent stages even when a cache
-  absorbs the second one.
+  upper-envelope convention: a fully-cached large segment still reports its
+  structural depth, because the plan has that many dependent stages even
+  when a cache absorbs one. A segment with unknown size (`object_size == 0`)
+  also takes the footer-tail path, not the whole-object path, and reports
+  the same upper bound.
 - `listPageDepth`: serial LIST pages, recorded independently of
   `dependencyDepth` because pagination (`Catalog::list_shard_hours`) and the
   GET dependency chain are different object-store mechanisms with different
@@ -1704,7 +1710,13 @@ and rendered as `stats.io`, additive beside `stats.phases`:
 - `serviceBatches`: batches this query's per-segment fan-out was forced into
   by its concurrency permit: `ceil(segment_count / fetch_concurrency)`. 64
   segments under 16 concurrent permits is 4 batches at whatever depth those
-  segments' fetches classify at.
+  segments' fetches classify at. For the metrics lane this is scaled by the
+  same per-distinct-selector fan-out multiplier `stats.estimate` already
+  applies (`fetch_multiplier`, one resolve reopened once per distinct plan,
+  all contending for the same concurrency permit): a query naming two
+  distinct metrics selectors over 64 segments under 16 permits reports 8
+  batches, not 4, matching the cost estimate's own scaling instead of
+  disagreeing with it.
 - `unfoldedSegmentsResolved`: the EXACT (never estimated) count of segments
   this query's resolve took from the recent (unfolded) listing path rather
   than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073 decision 1).
@@ -1721,10 +1733,18 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   counting it here would overstate the fold benefit.
 - `planClass`: `metadata_only` (a labels/label-values/series discovery query
   that never reaches a page fetch), `selective_indexed` (the resolve's
-  postings-based pruning excluded at least one snapshot-sourced segment), or
+  postings-based pruning excluded at least one snapshot-sourced segment),
   `exhaustive_scan` (every listed segment in the resolved window was
-  opened). Decided before any segment is opened, from the query's shape and
-  the resolve's own pruning outcome, not from the fetch's actual cost.
+  opened), or `unclassified` (the lane's own resolve carries no signal this
+  crate can use to tell a pruned fetch from a full scan). The log lane
+  always reports `unclassified`: `resolve_bounded` always resolves
+  `Signal::Logs` with `name_filter: None` (ADR-1103's log discovery has no
+  name-postings filter to prune against), so `Snapshot::segments_pruned` is
+  structurally always 0 for that lane no matter how narrow the resolved
+  window actually is, and reporting `exhaustive_scan` on that basis alone
+  would be a fabricated severity this crate cannot back up. Decided before
+  any segment is opened, from the query's shape and the resolve's own
+  pruning outcome, not from the fetch's actual cost.
 
 What is knowable from `ravel-query`, and what is not: the per-segment fetch
 pipeline this crate owns is visible here, so `dependencyDepth` reflects it
@@ -1735,14 +1755,27 @@ sequence it takes) lives entirely inside `ravel-catalog`; `dependencyDepth`
 therefore reports only the segment-fetch chain's depth, and the true
 end-to-end depth (resolve's own chain, however deep, prefixed to the
 segment-fetch chain) can only be equal to or greater than what is reported.
-A federated query (a metrics lane and a log lane, prefetched independently)
-folds both lanes' contributions together: `dependencyDepth`/
-`listPageDepth`/`serviceBatches` take the max across lanes (the longer
-chain wins, since the two lanes' chains ran alongside each other, not one
-after the other), `unfoldedSegmentsResolved` sums across lanes (an exact
-total count), and `planClass` takes the more severe of the two
-(`exhaustive_scan` outranks `selective_indexed` outranks `metadata_only`),
-so a lane that never ran cannot understate a lane that did.
+A federated query (a metrics lane and a log lane) folds both lanes'
+contributions together. The two lanes run STRICTLY SERIALLY -- the log
+lane's resolve is only reached after the metrics lane has already been
+awaited to completion, never alongside it -- and that seriality is why the
+fields below do not all combine the same way:
+`listPageDepth` ADDS across lanes (two serial phases' page counts sum: a
+query whose metrics lane paginated 4 LIST pages and whose log lane
+paginated 2 more waited through 6 serial pages, not 4).
+`dependencyDepth`/`serviceBatches` still take the max across lanes, but not
+because the lanes run concurrently (they do not): the log lane's fetch
+chain has no DATA dependency on the metrics lane's bytes, so the two chains
+are independent chains that happen to run one after the other, and the
+reported figure is the longest (or most-batched) independent chain, not
+their sum.
+`unfoldedSegmentsResolved` sums across lanes (an exact total count, with no
+ambiguity about how the two lanes' costs compose), and `planClass` takes
+the more severe of the two (`exhaustive_scan` outranks `selective_indexed`
+outranks `unclassified` outranks `metadata_only`), so a lane that never ran
+cannot understate a lane that did, and the log lane's `unclassified` result
+cannot fabricate a worse classification than a metrics lane that pruned
+correctly.
 
 `stats.io` carries no object keys, field values, predicates, or index
 terms: every figure is a structural count.

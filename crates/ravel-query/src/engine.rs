@@ -1225,12 +1225,36 @@ impl QueryEngine {
         stats.accounting = stats.phase_accounting.pooled();
 
         // Fold the log lane's own io_shape contribution into the metrics
-        // lane's, mirroring the `combine_phase_accounting` fold above.
-        // Unlike that fold, `dependency_depth`/`list_page_depth`/
-        // `service_batches` are "longest chain wins" (`IoShapeCounts`'s own
-        // max-based semantics), not sums: two lanes' chains ran alongside
-        // each other, not one after the other. `unfolded_segments_resolved`
-        // IS additive (an exact total count across both lanes' resolves).
+        // lane's, mirroring the `combine_phase_accounting` fold above. The
+        // two lanes run STRICTLY SERIALLY, never alongside each other (see
+        // the comment above `resolve_bounded` at the top of this function:
+        // the log lane's resolve is only reached after the metrics lane's
+        // `prefetch_metric_plans` call has already been awaited to
+        // completion). That seriality is exactly why the fields below
+        // combine differently from each other, not the same way:
+        // - `list_page_depth` counts serial LIST pages. Because the two
+        //   lanes' resolves run one after another in wall-clock time, their
+        //   page counts ADD: a query whose metrics lane paginated 4 LIST
+        //   pages and whose log lane paginated 2 more genuinely waited
+        //   through 6 serial pages, not 4.
+        // - `dependency_depth` stays max-based, but not because of
+        //   concurrency (there is none here): the log lane's fetch chain
+        //   has no DATA dependency on the metrics lane's bytes -- it does
+        //   not need any byte the metrics lane fetched to know its own
+        //   segment keys, so the two chains are independent chains that
+        //   happen to run one after the other. The reported figure is the
+        //   longest independent chain, matching `dependency_depth`'s own
+        //   definition ("the longest chain... where a stage needs a
+        //   previous stage's bytes to know its own keys"), which a serial
+        //   but data-independent pair of chains does not satisfy across
+        //   lanes.
+        // - `service_batches` stays max-based for the same data-independence
+        //   reason: each lane's fan-out is bounded by its own concurrency
+        //   permit independently of the other lane's batch count.
+        // `unfolded_segments_resolved` IS additive (an exact total count
+        // across both lanes' resolves, with no ambiguity about how the two
+        // lanes' costs compose).
+        //
         // The log lane's `whole_object_threshold` is not reachable from
         // here (`BlockRangeFetcher::effective_whole_object_threshold` is
         // private and, unlike `SegmentFetcher`'s fixed field, scales
@@ -1240,7 +1264,7 @@ impl QueryEngine {
         // dependency_depth here.
         let mut log_counts = IoShapeCounts {
             dependency_depth: stats.io_shape.dependency_depth,
-            list_page_depth: stats.io_shape.list_page_depth,
+            list_page_depth: 0,
             service_batches: stats.io_shape.service_batches,
         };
         let log_depth = log_snapshot
@@ -1264,11 +1288,25 @@ impl QueryEngine {
             .snapshot()
             .s3_requests(AccountedOp::List);
         log_counts.record_list_pages(log_list_requests.min(u64::from(u32::MAX)) as u32);
-        let log_plan_class = if log_snapshot.segments_pruned > 0 {
-            PlanClass::SelectiveIndexed
-        } else {
-            PlanClass::ExhaustiveScan
-        };
+        log_counts.list_page_depth = stats
+            .io_shape
+            .list_page_depth
+            .saturating_add(log_counts.list_page_depth);
+        // The log lane's `resolve_bounded` call above always passes
+        // `name_filter: None` (ADR-1103's log discovery has no name-postings
+        // filter to prune against), so `Snapshot::segments_pruned` is
+        // structurally always 0 for this lane regardless of how narrow the
+        // resolved window actually is: `postings_ordinals_for_filter`'s
+        // first line returns `None` immediately when there is no name
+        // filter, so the pruning-count increment in
+        // `SnapshotWindow::extract_into` is unreachable here. Reporting
+        // `ExhaustiveScan` on that basis would be fabricated severity this
+        // lane cannot actually back up, and letting it through
+        // `merge_plan_class` would wrongly outrank a metrics lane that DID
+        // classify itself correctly. `Unclassified` says plainly that this
+        // crate cannot tell, for this lane, whether the fetch was pruned or
+        // exhaustive.
+        let log_plan_class = PlanClass::Unclassified;
         stats.io_shape = log_counts.into_shape(
             stats.io_shape.unfolded_segments_resolved + log_unfolded,
             crate::io_shape::merge_plan_class(stats.io_shape.plan_class, log_plan_class),
@@ -1720,6 +1758,7 @@ impl QueryEngine {
             metadata_only,
             whole_object_threshold,
             concurrency,
+            fetch_multiplier,
             &first_accounting,
             first_unfolded,
         );
@@ -1748,6 +1787,7 @@ impl QueryEngine {
                     metadata_only,
                     whole_object_threshold,
                     concurrency,
+                    fetch_multiplier,
                     &second_accounting,
                     second_unfolded,
                 );
@@ -2330,6 +2370,17 @@ fn combine_phase_accounting(
 /// two shards' LIST pages ran concurrently with each other), and the
 /// already-computed exact unfolded-segment count and plan-class decision.
 ///
+/// `fetch_multiplier` is the same per-distinct-selector fan-out factor
+/// `estimate_cost` scales its own request estimate by (`plans.len()` in
+/// `prefetch_metric_plans`): the metrics fetch reopens this resolve's
+/// segment set once per distinct plan, all contending for one shared
+/// `fetch_concurrency` semaphore, so the batch count this query's fetch is
+/// actually forced into is `service_batches(segments * fetch_multiplier,
+/// concurrency)`, not `service_batches(segments, concurrency)`. Omitting the
+/// multiplier here (while `estimate_cost` already applies it) made
+/// `stats.io` and `stats.estimate` disagree by construction for any query
+/// with more than one distinct selector.
+///
 /// Deliberately does NOT thread any new instrumentation into the per-segment
 /// fetch loops (`fetch_all_samples_and_histograms`/`fetch_all_series`):
 /// every figure here is a pure function of the resolved `Snapshot` and the
@@ -2340,6 +2391,7 @@ fn io_shape_for_resolve(
     metadata_only: bool,
     whole_object_threshold: u64,
     concurrency: u64,
+    fetch_multiplier: u64,
     accounting: &PhaseAccounting,
     unfolded_segments_resolved: u64,
 ) -> QueryIoShape {
@@ -2352,7 +2404,7 @@ fn io_shape_for_resolve(
         .unwrap_or(0);
     counts.record_dependency_chain(depth);
     counts.record_service_batches(crate::io_shape::service_batches(
-        snapshot.segments.len() as u64,
+        snapshot.segments.len() as u64 * fetch_multiplier,
         concurrency,
     ));
     let resolve_list_requests = accounting
