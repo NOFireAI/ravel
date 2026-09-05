@@ -353,8 +353,11 @@ fn phase_costs(snapshot: &PhaseAccountingSnapshot) -> Vec<PhaseCostJson> {
 pub struct IoShapeJson {
     /// The longest chain of object-store stages, across every segment this
     /// query opened, where a stage needed a previous stage's bytes to know
-    /// its own keys. Four independent segment GETs report depth 1; a footer
-    /// read followed by a dependent page fetch reports depth 2.
+    /// its own keys. Four independent segment GETs report depth 1; a
+    /// segment whose footer read is followed by a dependent catalog fetch
+    /// and a dependent page fetch reports depth 4, an upper bound covering
+    /// a possible footer-range chase this crate cannot rule out from
+    /// `object_size` alone.
     #[serde(rename = "dependencyDepth")]
     pub dependency_depth: u32,
     /// Serial LIST pages, recorded independently of `dependencyDepth`
