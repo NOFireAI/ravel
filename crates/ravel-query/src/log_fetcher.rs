@@ -1069,11 +1069,12 @@ impl LogSegmentFetcher {
     /// `LogSegmentFetcher`, because the one production instance
     /// (`services/ravel-server/src/query.rs`) is shared across every tenant;
     /// a per-instance tenant would make that instance usable by exactly one
-    /// tenant. Wiring production callers (`ravel-sql`'s `logs_provider`,
-    /// `alerts_scan`, `audit_scan`, `audit_provider`) onto this method
-    /// instead of [`fetch_accounted`](Self::fetch_accounted) is out of
-    /// scope here: it is a `ravel-sql` change, and moving those callers onto
-    /// the accounted funnel is separately tracked future work.
+    /// tenant. Production callers in `ravel-sql` all reach a tenant-aware
+    /// funnel: the logs scan through
+    /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant) and
+    /// its `_subset` form, the alerts and audit scans through this method.
+    /// The untenanted [`fetch_accounted`](Self::fetch_accounted) remains for
+    /// tests and for the unaccounted `fetch`.
     ///
     /// With no cache configured (`with_cache` never called), this fetches
     /// exactly like [`fetch_accounted`](Self::fetch_accounted): every GET

@@ -707,7 +707,7 @@ below the block-range threshold) in addition to the one it hands to its
 internal `BlockRangeFetcher`; `with_get_limiter` sets both to the same
 `Arc`, and `with_block_range` re-applies the fetcher's current limiter to a
 replacement `BlockRangeFetcher` so builder order cannot drop it. For a
-standalone fetcher (one no `QueryEngine` owns), `with_max_concurrent_gets(n)`
+standalone fetcher (one that no `QueryEngine` owns), `with_max_concurrent_gets(n)`
 builds exactly this dual-path arrangement itself: one private `GetLimiter` of
 `n` permits, shared by the whole-object and block-range paths, bounding both
 until a later `with_get_limiter` call replaces it. Which limiter that is
