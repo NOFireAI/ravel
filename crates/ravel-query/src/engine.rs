@@ -1401,15 +1401,15 @@ impl QueryEngine {
         // share a matcher set is a legitimate conservative slop, not a bug.
         let fetch_multiplier = plans.len() as u64;
         // The fan-out `service_batches` actually measures (`io_shape.rs`'s
-        // doc comment: "batches this query's per-segment fan-out was forced
-        // into") is real, not an envelope: the `attempt` closure below fetches
-        // exactly one distinct matcher set's segments per pass
-        // (`distinct_plans_by_matcher`, same dedup the closure's own
-        // `distinct_plans` uses), so `up + up offset 5m` -- two plans, one
-        // distinct matcher set -- is forced into ONE fetch pass over the
-        // snapshot, not two. Using `fetch_multiplier` here as well (the
-        // upper-envelope, undeduplicated count) would report a batch count
-        // the fan-out was never actually forced into.
+        // doc comment: "a LOWER bound on the serial service rounds this
+        // query's per-segment fan-out needed") is real, not an envelope: the
+        // `attempt` closure below fetches exactly one distinct matcher set's
+        // segments per pass (`distinct_plans_by_matcher`, same dedup the
+        // closure's own `distinct_plans` uses), so `up + up offset 5m` --
+        // two plans, one distinct matcher set -- runs as ONE fetch pass over
+        // the snapshot, not two. Using `fetch_multiplier` here as well (the
+        // upper-envelope, undeduplicated count) would report a round count
+        // the fan-out never actually needed.
         let service_fetch_multiplier = distinct_plans_by_matcher(plans).len() as u64;
         // Captured by reference (like `plans`), so the `FnMut` attempt copies
         // the reference on each retry rather than moving the owned `Vec` out of
@@ -1742,9 +1742,9 @@ impl QueryEngine {
         // the fetch fan-out actually issues one pass per
         // (`distinct_plans_by_matcher`), never larger than `fetch_multiplier`
         // and strictly smaller whenever two plans share a matcher set (`up +
-        // up offset 5m`). `service_batches` documents itself as the batches
-        // the fan-out was FORCED into, a factual figure, so it must use this
-        // deduplicated count rather than the upper-envelope one.
+        // up offset 5m`). `service_batches` documents itself as a lower
+        // bound on the serial rounds the fan-out actually needed, so it must
+        // use this deduplicated count rather than the upper-envelope one.
         service_fetch_multiplier: u64,
         // `QueryIoShape::plan_class` is decided before any segment is opened
         // (issue #1214): `true` for a discovery-only caller
@@ -2418,9 +2418,11 @@ fn combine_phase_accounting(
 /// (`distinct_plans_by_matcher` in `prefetch_metric_plans`, e.g. `up + up
 /// offset 5m` -- two plans, one distinct matcher set, one pass), not the raw
 /// plan count `estimate_cost` scales by: that estimate is a deliberate
-/// upper envelope, but `service_batches` documents itself as the batches the
-/// fan-out was FORCED into, a factual figure that must not carry the
-/// envelope's slop.
+/// upper envelope, but `service_batches` is a LOWER bound on serial rounds
+/// under a wave-synchronous model of the fan-out (see
+/// `crate::io_shape::service_batches_over_plan_waves` and the module docs'
+/// `service_batches` entry for why this is a lower, not an upper or exact,
+/// bound), and must not carry the envelope's slop either.
 ///
 /// The fan-out itself is a NESTED `buffer_unordered` (`futures::stream`):
 /// one `buffer_unordered(promql_fetch_fanout)` over distinct plans
@@ -2429,52 +2431,52 @@ fn combine_phase_accounting(
 /// `buffer_unordered(promql_fetch_fanout)` over that plan's segments
 /// (`fetch_all_samples_and_histograms`). The OUTER `buffer_unordered` admits
 /// at most `promql_fetch_fanout` plans at once, however many distinct
-/// matcher sets the query has, so plan capacity is `promql_fetch_fanout *
-/// min(service_fetch_multiplier, promql_fetch_fanout)`, not
-/// `promql_fetch_fanout * service_fetch_multiplier` -- that would assume
-/// every distinct plan runs concurrently, true only when
-/// `service_fetch_multiplier <= promql_fetch_fanout`. Neither this level nor
-/// the inner one gets an independent budget on top of that: every GET from
-/// every plan also passes through the one `GetLimiter` this engine wired to
-/// every fetcher it owns (ADR-1195, `limiter.rs`), whose permit count is
+/// matcher sets the query has, and it is a SLIDING window, not a
+/// wave-synchronous one: as soon as one admitted plan finishes, the next
+/// plan is admitted, without waiting for its siblings. Modeling it as
+/// wave-synchronous anyway -- computing one binding concurrency
+/// (`min(promql_fetch_fanout * min(service_fetch_multiplier,
+/// promql_fetch_fanout), shared_get_permits)`) and dividing the total work
+/// (`segments * service_fetch_multiplier` GETs) by it in one division --
+/// UNDERCOUNTS whenever the outer window is not full for the query's whole
+/// duration: 3 distinct plans, 1 segment each, `promql_fetch_fanout` 2, and
+/// `shared_get_permits` 1000 gives peak capacity `min(2 * 2, 1000) = 4`, so
+/// that single division reports `ceil(3 / 4) = 1` round, but plans 1 and 2
+/// admit together in the first round and plan 3 only after one of them
+/// finishes, in a second round -- 2 rounds, not 1. Every GET from every
+/// plan also passes through the one `GetLimiter` this engine wired to every
+/// fetcher it owns (ADR-1195, `limiter.rs`), whose permit count is
 /// `shared_get_permits` here (`GetLimiter::permits`, resolved from
 /// `EngineConfig::store_get_concurrency`, which falls back to
-/// `fetch_concurrency` when unset). So the real binding concurrency is
-/// `min(promql_fetch_fanout * min(service_fetch_multiplier,
-/// promql_fetch_fanout), shared_get_permits)`: the outer `buffer_unordered`
-/// can never have more than `promql_fetch_fanout * min(service_fetch_multiplier,
-/// promql_fetch_fanout)` plan/segment fetches in flight at once even with an
-/// unbounded limiter, and the shared limiter can never let more than
-/// `shared_get_permits` GETs run at once even with an unbounded outer
-/// fan-out -- whichever bound is smaller is the one the query actually waits
-/// on. The work this fan-out issues is `segments * service_fetch_multiplier`
-/// GETs (uncapped -- every distinct matcher set still issues its own GETs,
-/// just not all of them concurrently), so the batch count this query's
-/// fetch is actually forced into is `service_batches(segments *
-/// service_fetch_multiplier, min(promql_fetch_fanout *
-/// min(service_fetch_multiplier, promql_fetch_fanout),
-/// shared_get_permits))`, not `service_batches(segments *
-/// service_fetch_multiplier, promql_fetch_fanout)`: dividing the
-/// plan-multiplied numerator by the un-multiplied fan-out width alone
-/// double-counts the plan fan-out (2 distinct matcher sets, 64 segments,
-/// `promql_fetch_fanout` 8, `shared_get_permits` 16: 128 GETs at binding
-/// concurrency `min(8 * min(2, 8), 16) = min(16, 16) = 16` is 8 batches, not
-/// the 16 the unscaled divisor reports); and capping the multiplier by
-/// `shared_get_permits` alone, without also capping it by
-/// `promql_fetch_fanout`, overstates plan capacity when there are more
-/// distinct matcher sets than `promql_fetch_fanout` (`promql_fetch_fanout`
-/// 1, 3 distinct matcher sets, 20 segments, `shared_get_permits` 1000: only
-/// one plan's segments are ever in flight, so binding concurrency is
-/// `min(1 * min(3, 1), 1000) = 1`, i.e. 60 batches, not the 20 an uncapped
-/// `1 * 3` capacity term would report).
+/// `fetch_concurrency` when unset).
 ///
-/// A single-plan query (`service_fetch_multiplier == 1`) reduces to
-/// `service_batches(segments, promql_fetch_fanout)` whenever the limiter's
-/// pool is at least as large as one plan's own `buffer_unordered` bound,
-/// which is every config that leaves ADR-1195's knobs unset (both resolve to
-/// `fetch_concurrency`). An operator who sets `--store-get-concurrency`
-/// below `--promql-fetch-fanout` makes the limiter the binding bound even
-/// for one plan, and this figure follows that.
+/// So this figure is computed per WAVE of the outer fan-out
+/// (`crate::io_shape::service_batches_over_plan_waves`): `waves =
+/// ceil(service_fetch_multiplier / promql_fetch_fanout)`; for 0-based wave
+/// `w`, `active_w = min(promql_fetch_fanout, service_fetch_multiplier - w *
+/// promql_fetch_fanout)` plans are admitted, `capacity_w =
+/// min(promql_fetch_fanout * active_w, shared_get_permits)` is that wave's
+/// binding concurrency, and `batches_w = service_batches(segments *
+/// active_w, capacity_w)` is its own serial round count; `service_batches`
+/// is the sum of `batches_w` over every wave. This is still a lower bound,
+/// not an exact count: the sliding window can only pack work at least as
+/// tightly as the wave-synchronous model assumes, never more loosely, so
+/// the real scheduler takes at least this many rounds. 2 distinct matcher
+/// sets, 64 segments, `promql_fetch_fanout` 8, `shared_get_permits` 16: one
+/// wave, `active_0 = 2`, `capacity_0 = min(16, 16) = 16`, `batches_0 =
+/// ceil(128 / 16) = 8`. `promql_fetch_fanout` 1, 3 distinct matcher sets, 20
+/// segments, `shared_get_permits` 1000: three waves, each `active_w = 1`,
+/// `capacity_w = min(1, 1000) = 1`, `batches_w = ceil(20 / 1) = 20`, summing
+/// to 60 -- not the 20 a single `min(1 * 3, 1000) = 3`-capacity division
+/// would report, which would silently assume all 3 plans ran at once when
+/// the outer stream never admits more than 1.
+///
+/// A single-plan query (`service_fetch_multiplier == 1`) always has exactly
+/// one wave with `active_0 = 1`, reducing to `service_batches(segments,
+/// min(promql_fetch_fanout, shared_get_permits))`. An operator who sets
+/// `--store-get-concurrency` below `--promql-fetch-fanout` makes the
+/// limiter the binding bound even for one plan, and this figure follows
+/// that.
 ///
 /// Deliberately does NOT thread any new instrumentation into the per-segment
 /// fetch loops (`fetch_all_samples_and_histograms`/`fetch_all_series`):
@@ -2500,12 +2502,11 @@ fn io_shape_for_resolve(
         .max()
         .unwrap_or(0);
     counts.record_dependency_chain(depth);
-    let binding_concurrency = concurrency
-        .saturating_mul(service_fetch_multiplier.min(concurrency))
-        .min(shared_get_permits);
-    counts.record_service_batches(crate::io_shape::service_batches(
-        (snapshot.segments.len() as u64).saturating_mul(service_fetch_multiplier),
-        binding_concurrency,
+    counts.record_service_batches(crate::io_shape::service_batches_over_plan_waves(
+        snapshot.segments.len() as u64,
+        service_fetch_multiplier,
+        concurrency,
+        shared_get_permits,
     ));
     let resolve_list_requests = accounting
         .resolve()
@@ -7535,6 +7536,88 @@ mod prefetch_tests {
              promql_fetch_fanout), 1000 shared permits) == 1, so 20 \
              segments * 3 matcher sets = 60 GETs is ceil(60 / 1) == 60, \
              not the 20 an uncapped plan-capacity term would report"
+        );
+    }
+
+    /// Regression for issue #1214 (defect found in review of this PR):
+    /// dividing TOTAL work by PEAK capacity in one division undercounts
+    /// whenever the outer plan fan-out window is not full for the query's
+    /// whole duration. Reviewer's case: 3 distinct matcher plans, 1
+    /// resolved segment, `promql_fetch_fanout` 2, and a 1000-permit shared
+    /// limiter (`GetLimiter::new(1000)`, wired explicitly so the expectation
+    /// does not depend on whatever `store_get_concurrency` resolves to on
+    /// the host). The pre-fix formula computed one binding concurrency
+    /// `min(2 * min(3, 2), 1000) = min(4, 1000) = 4` and divided the total
+    /// work (`1 segment * 3 distinct matcher sets = 3` GETs) by it in one
+    /// shot: `ceil(3 / 4) == 1`. The real outer `buffer_unordered(2)` admits
+    /// only 2 of the 3 plans in its first wave; the third plan is admitted
+    /// only after one of the first two finishes, in a second wave -- 2
+    /// serial rounds, not 1. The wave-accounted fix computes 2 waves: wave 0
+    /// (`active_0 = min(2, 3) = 2`, `capacity_0 = min(2 * 2, 1000) = 4`,
+    /// `batches_0 = ceil(1 * 2 / 4) = 1`) and wave 1 (`active_1 = min(2, 1)
+    /// = 1`, `capacity_1 = min(2 * 1, 1000) = 2`, `batches_1 = ceil(1 * 1 /
+    /// 2) = 1`), summing to 2. Flip `io_shape_for_resolve`'s call site back
+    /// to a single `service_batches(segments * service_fetch_multiplier,
+    /// min(concurrency * service_fetch_multiplier.min(concurrency),
+    /// shared_get_permits))` division to watch the assertion below fail: it
+    /// would then read 1, not 2.
+    #[tokio::test]
+    async fn service_batches_accounts_for_outer_fanout_waves_not_peak_capacity() {
+        const WIDE_RANGE_NS: i64 = 25 * NS_PER_MIN;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        publish_metric(
+            &store,
+            tenant_hash,
+            1,
+            "wave_metric_a",
+            BASE_NS - NS_PER_MIN,
+            1.0,
+        )
+        .await;
+
+        let config = EngineConfig {
+            promql_fetch_fanout: Some(2),
+            ..EngineConfig::default()
+        };
+        let eng = engine_with_config(store, config).with_get_limiter(Arc::new(
+            crate::GetLimiter::new(1000).expect("1000 permits is valid"),
+        ));
+        let plans = vec![
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("wave_metric_a")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("wave_metric_b")
+            },
+            SelectorPlan {
+                range_ns: WIDE_RANGE_NS,
+                ..window_plan("wave_metric_c")
+            },
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch three-distinct-matcher-set single-segment query");
+
+        assert_eq!(
+            stats.estimate.segments, 1,
+            "expected the padded window to resolve exactly the 1 published \
+             segment (no shared name filter to prune by, since the 3 plans \
+             name 3 different metrics), got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 2,
+            "3 distinct matcher plans over a promql_fetch_fanout of 2 admit \
+             in 2 waves (2 plans, then 1); wave 0 is ceil(1 * 2 / min(4, \
+             1000)) == 1 batch and wave 1 is ceil(1 * 1 / min(2, 1000)) == \
+             1 batch, summing to 2 -- not the 1 a single peak-capacity \
+             division (ceil(3 / min(4, 1000)) == ceil(3 / 4) == 1) would \
+             report"
         );
     }
 

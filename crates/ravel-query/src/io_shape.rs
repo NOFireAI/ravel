@@ -55,11 +55,11 @@
 //!   recorded separately from `dependency_depth` because pagination
 //!   (`Catalog::list_shard_hours`) and the GET dependency chain are different
 //!   object-store mechanisms with different causes.
-//! - [`service_batches`](QueryIoShape::service_batches): batches this
-//!   query's per-segment fan-out was forced into by the binding concurrency
-//!   it actually ran under. The metrics fetch is a NESTED fan-out
+//! - [`service_batches`](QueryIoShape::service_batches): a LOWER bound on
+//!   the serial service rounds this query's per-segment fan-out needed,
+//!   under a wave-synchronous model of the nested fan-out
 //!   (`crates/ravel-query/src/engine.rs`) with three levels of admission,
-//!   all of which bound the batch count:
+//!   all of which bound the round count:
 //!   1. the OUTER `buffer_unordered(promql_fetch_fanout)` over distinct
 //!      matcher plans (`distinct_plans_by_matcher`), which admits at most
 //!      `promql_fetch_fanout` plans at once -- never
@@ -73,33 +73,53 @@
 //!      docs/query-engine.md), which every GET from every plan passes
 //!      through regardless of which plan or segment issued it.
 //!
-//!   Levels 1 and 2 do not multiply freely: plan capacity is
-//!   `promql_fetch_fanout * min(service_fetch_multiplier,
-//!   promql_fetch_fanout)`, not `promql_fetch_fanout *
-//!   service_fetch_multiplier` -- the outer stream can never have more than
-//!   `promql_fetch_fanout` plans in flight even when there are more distinct
-//!   matcher sets than that. The binding concurrency is that plan capacity
-//!   capped by the shared limiter:
-//!   `min(promql_fetch_fanout * min(service_fetch_multiplier,
-//!   promql_fetch_fanout), shared_get_permits)`, and the work is
-//!   `segment_count * service_fetch_multiplier` GETs (the multiplier is not
-//!   capped there -- every distinct matcher set still issues its own GETs,
-//!   just not all at once): 64 segments, `promql_fetch_fanout` 8, 2 distinct
-//!   matcher sets, and 16 shared permits gives 128 GETs at binding
-//!   concurrency `min(8 * min(2, 8), 16) = min(16, 16) = 16`, i.e. 8
-//!   batches, not `ceil(64 * 2 / 8) = 16` -- dividing the plan-multiplied
-//!   numerator by the un-multiplied fan-out width alone double-counts the
-//!   plan fan-out. Conversely, `promql_fetch_fanout` 1 with 3 distinct
-//!   matcher sets and 20 segments gives binding concurrency
-//!   `min(1 * min(3, 1), 1000) = 1`, i.e. 60 batches (60 GETs, one at a
-//!   time) -- capping the multiplier by `shared_get_permits` alone, without
-//!   also capping it by `promql_fetch_fanout`, would have reported 20,
-//!   silently assuming all 3 plans ran at once when the outer stream never
-//!   admits more than 1. A single-plan query (`service_fetch_multiplier ==
-//!   1`) reduces to `ceil(segment_count / promql_fetch_fanout)`, since
-//!   `min(promql_fetch_fanout, shared_get_permits)` is the fan-out width
-//!   whenever the shared pool is at least as large as one plan's own
-//!   fan-out bound, as it is for any config leaving both knobs unset.
+//!   It is a lower bound, never an upper bound or an exact count, because
+//!   the OUTER `buffer_unordered` is a SLIDING window, not a wave-synchronous
+//!   one: as soon as one admitted plan finishes, the next plan is admitted
+//!   immediately, without waiting for its siblings. A model that assumed the
+//!   whole outer window empties and refills together (`ceil(segment_count *
+//!   service_fetch_multiplier / min(promql_fetch_fanout *
+//!   min(service_fetch_multiplier, promql_fetch_fanout),
+//!   shared_get_permits))`, dividing TOTAL work by PEAK capacity) undercounts
+//!   whenever the outer window is not full for the query's entire duration:
+//!   3 distinct plans, 1 segment each, `promql_fetch_fanout` 2, and a
+//!   1000-permit limiter gives peak capacity `min(2 * 2, 1000) = 4`, so that
+//!   model reports `ceil(3 / 4) = 1` round -- but plans 1 and 2 admit
+//!   together in the first round, and plan 3 is only admitted after one of
+//!   them finishes, in a second round: the real scheduler takes at least 2
+//!   rounds, never fewer than the wave-synchronous model computes, because a
+//!   sliding window can only pack work as tightly as a synchronized one, not
+//!   more loosely.
+//!
+//!   So this figure is computed per WAVE of the outer fan-out instead of
+//!   once over the total: `waves = ceil(service_fetch_multiplier /
+//!   promql_fetch_fanout)`. For 0-based wave `w`, `active_w =
+//!   min(promql_fetch_fanout, service_fetch_multiplier - w *
+//!   promql_fetch_fanout)` is the count of distinct plans admitted in that
+//!   wave, `capacity_w = min(promql_fetch_fanout * active_w,
+//!   shared_get_permits)` is that wave's binding concurrency, and `batches_w
+//!   = ceil(segment_count * active_w / capacity_w)` is the serial rounds
+//!   that wave alone needs. `service_batches` sums `batches_w` over every
+//!   wave: because the outer stream never admits a plan from wave `w + 1`
+//!   until wave `w`'s plans have all been admitted (though not necessarily
+//!   finished -- see the sliding-window caveat above, which is exactly why
+//!   this sum is a lower rather than an exact bound), the waves are at least
+//!   this serial, and their round counts add.
+//!
+//!   Reviewer's case above: 2 waves. Wave 0: `active_0 = min(2, 3) = 2`,
+//!   `capacity_0 = min(2 * 2, 1000) = 4`, `batches_0 = ceil(1 * 2 / 4) = 1`.
+//!   Wave 1: `active_1 = min(2, 1) = 1`, `capacity_1 = min(2 * 1, 1000) =
+//!   2`, `batches_1 = ceil(1 * 1 / 2) = 1`. Sum: 2, matching the real
+//!   schedule. 64 segments, `promql_fetch_fanout` 8, 2 distinct matcher
+//!   sets, and 16 shared permits: one wave (`ceil(2 / 8) = 1`), `active_0 =
+//!   2`, `capacity_0 = min(16, 16) = 16`, `batches_0 = ceil(128 / 16) = 8`.
+//!   `promql_fetch_fanout` 1 with 3 distinct matcher sets, 20 segments, and
+//!   1000 permits: three waves (`ceil(3 / 1) = 3`), each `active_w = 1`,
+//!   `capacity_w = min(1, 1000) = 1`, `batches_w = ceil(20 / 1) = 20`, sum
+//!   60. A single-plan query (`service_fetch_multiplier == 1`) always has
+//!   exactly one wave with `active_0 = 1`, so it reduces to
+//!   `ceil(segment_count / min(promql_fetch_fanout, shared_get_permits))`,
+//!   the same figure the un-waved formula already gave for that case.
 //! - [`unfolded_segments_resolved`](QueryIoShape::unfolded_segments_resolved):
 //!   the EXACT count of segments this query's resolve took from the recent
 //!   (unfolded) listing path (`SegmentOrigin::Recent`) rather than a folded
@@ -309,6 +329,43 @@ pub fn count_unfolded_segments(origins: &[SegmentOrigin]) -> u64 {
 pub fn service_batches(item_count: u64, concurrency: u64) -> u32 {
     let concurrency = concurrency.max(1);
     item_count.div_ceil(concurrency).min(u64::from(u32::MAX)) as u32
+}
+
+/// A LOWER bound on the serial service rounds a nested plan/segment fan-out
+/// needs, computed per wave of the OUTER `buffer_unordered(fanout)` over
+/// `distinct_plans` distinct matcher plans rather than once over the total
+/// work -- see the module docs' `service_batches` entry for why a single
+/// total-work-over-peak-capacity division undercounts, and for the worked
+/// examples this function's wave loop reproduces exactly.
+///
+/// `waves = ceil(distinct_plans / fanout)`. For 0-based wave `w`, `active_w
+/// = min(fanout, distinct_plans - w * fanout)` distinct plans are admitted,
+/// `capacity_w = min(fanout * active_w, shared_permits)` is that wave's
+/// binding concurrency, and `batches_w = service_batches(segments *
+/// active_w, capacity_w)` is the wave's own serial round count. The result
+/// is the sum of `batches_w` across every wave, saturating throughout and
+/// clamped to `u32::MAX` like [`service_batches`]. `fanout` and
+/// `distinct_plans` are each clamped to at least 1, matching
+/// [`service_batches`]'s own concurrency clamp, so this never divides by
+/// zero and never iterates zero waves.
+pub fn service_batches_over_plan_waves(
+    segments: u64,
+    distinct_plans: u64,
+    fanout: u64,
+    shared_permits: u64,
+) -> u32 {
+    let fanout = fanout.max(1);
+    let distinct_plans = distinct_plans.max(1);
+    let waves = distinct_plans.div_ceil(fanout);
+    let mut total: u64 = 0;
+    for w in 0..waves {
+        let admitted_before = w.saturating_mul(fanout);
+        let active = fanout.min(distinct_plans.saturating_sub(admitted_before));
+        let capacity = fanout.saturating_mul(active).min(shared_permits);
+        let batches = service_batches(segments.saturating_mul(active), capacity);
+        total = total.saturating_add(u64::from(batches));
+    }
+    total.min(u64::from(u32::MAX)) as u32
 }
 
 /// Accumulates the three fan-out-shaped `QueryIoShape` fields
