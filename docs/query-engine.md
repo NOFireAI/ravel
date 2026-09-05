@@ -1709,26 +1709,36 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   only that they happened (`ravel-catalog` owns that fan-out; out of this
   task's scope to change).
 - `serviceBatches`: batches this query's per-segment fan-out was forced into
-  by its concurrency permit: `ceil(segment_count / fetch_concurrency)`. 64
-  segments under 8 concurrent permits (`fetch_concurrency`'s default) is 8
-  batches at whatever depth those segments' fetches classify at. For the
-  metrics lane this is scaled by the count of DISTINCT matcher sets the
-  fetch fan-out actually issues one pass per (`distinct_plans_by_matcher` in
-  `crates/ravel-query/src/engine.rs`), not the raw plan count
-  `stats.estimate` scales by: a query naming two `SelectorPlan`s that share
-  one matcher set (`up + up offset 5m`) is fetched in one pass, so its
-  `serviceBatches` does not double, while a query naming two plans with two
-  distinct matcher sets over 64 segments under 8 permits reports 16
-  batches, not 8. This deliberately does NOT claim every plan's segment
-  fetches contend for one shared semaphore: the fan-out is a nested
-  `buffer_unordered(fetch_concurrency)` over distinct plans, each running
-  its own `buffer_unordered(fetch_concurrency)` over that plan's segments
-  (`prefetch_metric_plans`/`fetch_all_samples_and_histograms`), and the one
-  pool genuinely shared across every concurrent segment fetch in a query is
-  `SegmentFetcher::get_semaphore`, sized `DEFAULT_MAX_CONCURRENT_GETS` (16)
-  for the metrics fetcher -- a different, larger number than
-  `fetch_concurrency` (8), and a pre-existing mismatch this field does not
-  attempt to close.
+  by the binding concurrency it actually ran under. The metrics fetch is a
+  NESTED fan-out: one `buffer_unordered(promql_fetch_fanout)` over distinct
+  matcher plans (`distinct_plans_by_matcher` in
+  `crates/ravel-query/src/engine.rs`), each running its own
+  `buffer_unordered(promql_fetch_fanout)` over that plan's segments
+  (`prefetch_metric_plans`/`fetch_all_samples_and_histograms`). Those inner
+  streams do not get independent budgets: every GET from every plan passes
+  through the one shared `GetLimiter` described under "GET concurrency
+  (ADR-1195)" above, whose permit count is the resolved
+  `store_get_concurrency`. That limiter is shared inside one `QueryEngine`,
+  which is the scope this figure models: it says nothing about GETs another
+  engine in the same process issues, and nothing about the RLOG
+  whole-object funnel, which takes no permit at all. So the binding
+  concurrency is `min(distinctMatcherSets * promql_fetch_fanout,
+  sharedGetPermits)`, and the work this fan-out issues is
+  `segment_count * distinctMatcherSets` GETs (distinct matcher sets, not the
+  raw plan count `stats.estimate` scales by -- a query naming two
+  `SelectorPlan`s that share one matcher set, `up + up offset 5m`, is
+  fetched in one pass, so its `serviceBatches` does not double). 64 segments,
+  `promql_fetch_fanout` 8, two distinct matcher sets, and 16 shared permits
+  gives 128 GETs at binding concurrency `min(16, 16) = 16`, i.e. 8 batches,
+  not `ceil(64 * 2 / 8) = 16`: dividing the plan-multiplied numerator by the
+  un-multiplied fan-out width alone double-counts the plan fan-out. A
+  single-plan query reduces to `ceil(segment_count / promql_fetch_fanout)`,
+  since `min(promql_fetch_fanout, sharedGetPermits)` is the fan-out width
+  whenever the shared pool is at least as large as one plan's own fan-out
+  bound, as it is for any config that leaves both ADR-1195 knobs unset (both
+  then resolve to `fetch_concurrency`). Lower `--store-get-concurrency`
+  below `--promql-fetch-fanout` and the limiter binds instead, for a
+  single-plan query too; this figure follows whichever bound is smaller.
 - `unfoldedSegmentsResolved`: the EXACT (never estimated) count of segments
   this query's resolve took from the recent (unfolded) listing path rather
   than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073 decision 1).
