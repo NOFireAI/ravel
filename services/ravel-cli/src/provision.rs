@@ -13,7 +13,9 @@
 
 use std::sync::Arc;
 
-use ravel_catalog::{AbsentPolicy, ProvisioningCheck, append_generation, validate_or_adopt};
+use ravel_catalog::{
+    AbsentPolicy, ProvisioningCheck, ProvisioningError, append_generation, validate_or_adopt,
+};
 use ravel_maintain::write_reshard_audit;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantId};
@@ -52,7 +54,7 @@ pub async fn adopt(
         None => vec![Signal::Metrics, Signal::Logs, Signal::Spans],
     };
 
-    let mut refused = false;
+    let mut last_refusal: Option<ProvisioningError> = None;
     for signal in signals {
         let sig = signal.key_prefix();
         match validate_or_adopt(
@@ -84,17 +86,45 @@ pub async fn adopt(
                 );
             }
             Err(err) => {
-                refused = true;
                 println!("{sig}: REFUSED: {err}");
+                last_refusal = Some(err);
             }
         }
     }
 
-    if refused {
+    if let Some(err) = last_refusal {
+        let (cause, remedy): (&str, &str) = match err {
+            ProvisioningError::AdoptionWouldHideData { .. } => (
+                "the configured --shards would hide existing data (one possible refusal cause)",
+                "Re-run with a shard count that covers every observed shard index.",
+            ),
+            ProvisioningError::Decode { .. } => (
+                "the provisioning record could not be decoded",
+                "The record above must be repaired or removed before adopting.",
+            ),
+            ProvisioningError::CorruptRecord { .. } => (
+                "the provisioning record is misfiled (its contents don't match the key it was \
+                 read under)",
+                "The record above must be repaired or removed before adopting.",
+            ),
+            ProvisioningError::CorruptGenerations { .. } => (
+                "the provisioning record's shard-generation history is structurally invalid",
+                "The record above must be repaired or removed before adopting.",
+            ),
+            ProvisioningError::UnsupportedVersion { .. } => (
+                "the provisioning record declares a format_version this build does not \
+                 understand",
+                "Upgrade the binary reading this record, or repair the record's version.",
+            ),
+            _ => (
+                "the refusal above",
+                "See the specific error above for the required remediation.",
+            ),
+        };
         anyhow::bail!(
-            "provision adopt refused for at least one signal: the configured --shards would hide \
-             existing data. Nothing was written for a refused signal. Re-run with a shard count \
-             that covers every observed shard index."
+            "provision adopt refused for at least one signal: {cause}. Nothing was written for a \
+             refused signal. {remedy} See the specific error above for the exact cause per \
+             signal."
         );
     }
     Ok(())
