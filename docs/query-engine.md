@@ -1633,11 +1633,20 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   by its concurrency permit: `ceil(segment_count / fetch_concurrency)`. 64
   segments under 16 concurrent permits is 4 batches at whatever depth those
   segments' fetches classify at.
-- `unfoldedRecordsResolved`: the EXACT (never estimated) count of commit
-  records this query's resolve took from the recent (unfolded) listing path
-  rather than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073
-  decision 1). Exact because it gates a downstream fold-benefit decision an
-  approximation would silently corrupt.
+- `unfoldedSegmentsResolved`: the EXACT (never estimated) count of segments
+  this query's resolve took from the recent (unfolded) listing path rather
+  than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073 decision 1).
+  Exact because it gates a downstream fold-benefit decision an approximation
+  would silently corrupt. A SEGMENT count, not a commit-record count:
+  `SegmentOrigin` is parallel to `Snapshot::segments` (one entry per resolved
+  `SegmentRef`), and a multi-part L1 compaction record contributes one
+  `Recent` entry per part, so this figure counts every part, not the single
+  underlying compaction record. `ravel-query` cannot recover the record
+  count from `SegmentOrigin` alone, so the field is named for the quantity
+  it actually counts. Excludes `SegmentOrigin::TokenResolved`: a
+  read-your-write token match always costs its own GET by explicit key,
+  whether or not a fold has run, so folding can never remove that cost and
+  counting it here would overstate the fold benefit.
 - `planClass`: `metadata_only` (a labels/label-values/series discovery query
   that never reaches a page fetch), `selective_indexed` (the resolve's
   postings-based pruning excluded at least one snapshot-sourced segment), or
@@ -1658,7 +1667,7 @@ A federated query (a metrics lane and a log lane, prefetched independently)
 folds both lanes' contributions together: `dependencyDepth`/
 `listPageDepth`/`serviceBatches` take the max across lanes (the longer
 chain wins, since the two lanes' chains ran alongside each other, not one
-after the other), `unfoldedRecordsResolved` sums across lanes (an exact
+after the other), `unfoldedSegmentsResolved` sums across lanes (an exact
 total count), and `planClass` takes the more severe of the two
 (`exhaustive_scan` outranks `selective_indexed` outranks `metadata_only`),
 so a lane that never ran cannot understate a lane that did.
