@@ -727,6 +727,15 @@ over it when set, each resolved through a same-named accessor method:
 - `promql_fetch_fanout` / `promql_fetch_fanout()` -- the `buffer_unordered`
   fan-out width PromQL's per-selector fetch streams use.
 
+The permit bounds GETs in flight, not fetch tasks in flight. An RLOG
+block-range read builds its object assembler (charged to the assembly pool)
+before its first extent asks the limiter for a permit, so when
+`promql_fetch_fanout` or `sql_partition_count` exceeds `store_get_concurrency`,
+up to that many object-sized assemblies can wait behind the limiter at once.
+Peak assembly memory therefore follows the fan-out setting, and an operator
+who raises fan-out without raising GET concurrency trades store pressure for
+memory, not for nothing.
+
 `EngineConfig::validate` rejects zero on `fetch_concurrency` and on each
 knob's resolved value (an explicit override of `0`, not just an unset one),
 naming the specific knob in the returned `EngineConfigError`.

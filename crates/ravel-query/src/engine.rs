@@ -366,6 +366,14 @@ impl QueryEngine {
         // below used before this change -- `store_get_concurrency()` resolves
         // to `fetch_concurrency` itself when unset, so an untouched
         // deployment is unaffected.
+        //
+        // The permit bounds GETs in flight, not tasks in flight: an RLOG
+        // block-range read builds its `ObjectAssembler` (charged to the
+        // assembly pool) before its first extent reaches `store_get_pinned`
+        // and waits for a permit, so with `promql_fetch_fanout` (or the SQL
+        // partition count) above `store_get_concurrency` up to that many
+        // object-sized assemblies can sit queued behind the limiter at once.
+        // Peak assembly memory scales with the fan-out, not with this count.
         let get_limiter = Arc::new(GetLimiter::new_unchecked(
             config.store_get_concurrency().max(1),
         ));
