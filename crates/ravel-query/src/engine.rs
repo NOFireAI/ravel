@@ -19,7 +19,9 @@ use ravel_promql::{
 };
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::ReaderLimits;
-use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::{
+    AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
+};
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
 };
@@ -1227,7 +1229,7 @@ impl QueryEngine {
         // Unlike that fold, `dependency_depth`/`list_page_depth`/
         // `service_batches` are "longest chain wins" (`IoShapeCounts`'s own
         // max-based semantics), not sums: two lanes' chains ran alongside
-        // each other, not one after the other. `unfolded_records_resolved`
+        // each other, not one after the other. `unfolded_segments_resolved`
         // IS additive (an exact total count across both lanes' resolves).
         // The log lane's `whole_object_threshold` is not reachable from
         // here (`BlockRangeFetcher::effective_whole_object_threshold` is
@@ -1244,7 +1246,12 @@ impl QueryEngine {
         let log_depth = log_snapshot
             .segments
             .iter()
-            .map(|seg| crate::io_shape::depth_for_object(seg.object_size, DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD))
+            .map(|seg| {
+                crate::io_shape::depth_for_object(
+                    seg.object_size,
+                    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+                )
+            })
             .max()
             .unwrap_or(0);
         log_counts.record_dependency_chain(log_depth);
@@ -1252,7 +1259,10 @@ impl QueryEngine {
             log_snapshot.segments.len() as u64,
             self.config.fetch_concurrency.max(1) as u64,
         ));
-        let log_list_requests = log_accounting.resolve().snapshot().s3_requests(AccountedOp::List);
+        let log_list_requests = log_accounting
+            .resolve()
+            .snapshot()
+            .s3_requests(AccountedOp::List);
         log_counts.record_list_pages(log_list_requests.min(u64::from(u32::MAX)) as u32);
         let log_plan_class = if log_snapshot.segments_pruned > 0 {
             PlanClass::SelectiveIndexed
@@ -1260,7 +1270,7 @@ impl QueryEngine {
             PlanClass::ExhaustiveScan
         };
         stats.io_shape = log_counts.into_shape(
-            stats.io_shape.unfolded_records_resolved + log_unfolded,
+            stats.io_shape.unfolded_segments_resolved + log_unfolded,
             crate::io_shape::merge_plan_class(stats.io_shape.plan_class, log_plan_class),
         );
 
@@ -1816,11 +1826,11 @@ impl QueryEngine {
         segment_admission::admit(&snapshot, &origins, &self.config)?;
         // Exact count of segments this resolve took from the recent
         // (unfolded) listing path rather than a folded snapshot part
-        // (`QueryIoShape::unfolded_records_resolved`, issue #1214): gates a
+        // (`QueryIoShape::unfolded_segments_resolved`, issue #1214): gates a
         // downstream fold-benefit decision, so this must be the real count,
         // never an estimate.
-        let unfolded_records_resolved = crate::io_shape::count_unfolded_records(&origins.origins);
-        Ok((snapshot, generations, unfolded_records_resolved))
+        let unfolded_segments_resolved = crate::io_shape::count_unfolded_segments(&origins.origins);
+        Ok((snapshot, generations, unfolded_segments_resolved))
     }
 
     /// Maps a log lane failure onto the same [`QueryError`] variants the
@@ -2318,7 +2328,7 @@ fn combine_phase_accounting(
 /// LIST request count (`list_page_depth`, an upper-bound serial depth --
 /// see `crate::io_shape` module docs for why this crate cannot see whether
 /// two shards' LIST pages ran concurrently with each other), and the
-/// already-computed exact unfolded-record count and plan-class decision.
+/// already-computed exact unfolded-segment count and plan-class decision.
 ///
 /// Deliberately does NOT thread any new instrumentation into the per-segment
 /// fetch loops (`fetch_all_samples_and_histograms`/`fetch_all_series`):
@@ -2331,7 +2341,7 @@ fn io_shape_for_resolve(
     whole_object_threshold: u64,
     concurrency: u64,
     accounting: &PhaseAccounting,
-    unfolded_records_resolved: u64,
+    unfolded_segments_resolved: u64,
 ) -> QueryIoShape {
     let mut counts = IoShapeCounts::default();
     let depth = snapshot
@@ -2357,7 +2367,7 @@ fn io_shape_for_resolve(
     } else {
         PlanClass::ExhaustiveScan
     };
-    counts.into_shape(unfolded_records_resolved, plan_class)
+    counts.into_shape(unfolded_segments_resolved, plan_class)
 }
 
 /// A locally-scoped series identity for a log-derived series returned from
