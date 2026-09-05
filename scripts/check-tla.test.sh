@@ -114,10 +114,10 @@ done
 javashim="$bdir/java"
 cat > "$javashim" <<EOF
 #!/usr/bin/env bash
+touch "$marker"
 case "\$1" in
     -version) echo 'openjdk version "21.0.4" 2024-07-16' >&2; exit 0 ;;
 esac
-touch "$marker"
 exit 0
 EOF
 chmod +x "$javashim"

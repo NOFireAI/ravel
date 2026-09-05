@@ -563,15 +563,18 @@ main() {
         *) die "unknown subcommand: $cmd" ;;
     esac
 
-    resolve_java
-    # Resolved once, before any lane launches anything, and even for a lane
-    # that discovers zero configs to run: a developer without GNU coreutils
-    # must hear about it on the first invocation, not on the first slow run.
-    # traceability enforces no budget and needs no timeout binary at all.
+    # resolve_timeout runs before resolve_java: resolve_java's -version probe
+    # spawns java, so on a host without GNU timeout(1) that probe must never
+    # happen. Resolved once, before any lane launches anything, and even for
+    # a lane that discovers zero configs to run: a developer without GNU
+    # coreutils must hear about it on the first invocation, not on the first
+    # slow run. traceability enforces no budget and needs no timeout binary
+    # at all.
     case "$cmd" in
         traceability) : ;;
         *) resolve_timeout ;;
     esac
+    resolve_java
 
     local areas
     if [ -n "$only_area" ]; then
