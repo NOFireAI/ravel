@@ -2141,6 +2141,211 @@ async fn a_part_reference_that_excludes_its_own_entries_blocks_fail_closed() {
     }
 }
 
+// --- (k2) a covering part that cannot be read back intact --------------------
+
+/// DoSweepSuperseded covering-part guard (catalog traceability row 29): a
+/// snapshot part HEAD names by an intact reference (matching hash, matching
+/// bounds) but whose bytes come back corrupted blocks the sweep fail-closed,
+/// distinct from both an unreadable HEAD and the bounds-mismatch reference
+/// case above. There the HEAD-level reference itself was edited; here the
+/// reference is untouched and only the part object's own bytes are corrupted
+/// at read time, so this exercises `ensure_part`'s own decode/hash-mismatch
+/// arm rather than its bounds-mismatch arm or `ensure_head`.
+///
+/// Flip-line proof: in `ensure_part`, change the blake3-mismatch and
+/// decode-failure arms to fall through to `Ok(part)` as if the corrupted
+/// bytes had decoded cleanly: the gate then clears on unproven data, all four
+/// objects are deleted, the `Op::Delete` fault fires, and the sweep's
+/// `.expect` panics.
+#[tokio::test]
+async fn an_unreadable_covering_part_blocks_the_superseded_sweep_fail_closed() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let commit_keys = seed_two_hours(mem.as_ref()).await;
+    let input_data_keys = seeded_input_data_keys(mem.as_ref(), &commit_keys).await;
+
+    fold_head(&mem, created, 1, None).await;
+    run_rewrite(mem.as_ref(), &clock).await;
+    fold_head(&mem, created + 3 * NS_PER_HOUR, 2, None).await;
+    assert_eq!(
+        head_named_data_keys(mem.as_ref(), OLD_HOUR).await,
+        input_data_keys,
+        "the part names exactly the two pre-rewrite inputs"
+    );
+
+    let head_bytes = get_full(mem.as_ref(), &head_key()).await;
+    let head = ravel_catalog::decode_head(head_bytes.as_ref()).expect("HEAD decodes");
+    assert_eq!(head.parts.len(), 1, "single-part HEAD on this fixture");
+    let part_key = head.parts[0].key.clone();
+
+    // The HEAD-level reference is never touched: its hash and bounds still
+    // match what is on disk. Only the GET of the part's own bytes is
+    // corrupted, so `ensure_part` reads something present but unreadable.
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout))
+        .with_rule(Rule::new(Op::Get, ScriptedFault::CorruptRange).with_key_contains(part_key));
+    let store = FaultStore::new(mem.clone(), plan);
+
+    clock.set(past_horizon(created));
+    let out = sweep(&store, &clock)
+        .await
+        .expect("an unreadable covering part holds, it does not error the pass");
+    assert_eq!((out.records_deleted, out.data_deleted), (0, 0));
+    assert_eq!(
+        out.held_by_unreadable_head, 4,
+        "all four objects held under the Unreadable reason"
+    );
+    assert_eq!(
+        out.held_by_snapshot, 0,
+        "not the Named reason: the part could not be decoded to check names"
+    );
+    assert_eq!(
+        store.fault_count(Op::Get, FaultKind::CorruptRange),
+        1,
+        "exactly one GET of the covering part, and it was corrupted"
+    );
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Timeout),
+        0,
+        "the sweep issued exactly zero deletes"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &input_data_keys).await,
+        input_data_keys,
+        "both inputs the unreadable part would have named survive"
+    );
+    for key in &commit_keys {
+        assert!(mem.head(key).await.is_ok(), "and both their commit records");
+    }
+}
+
+// --- (k3) a covering entry whose identity does not fit the shape a fold writes
+
+/// DoSweepSuperseded entry-identity guard (catalog traceability row 30): a
+/// covering part that decodes cleanly (right hash, right bounds) can still
+/// carry one entry whose identity fields do not fit the shape a fold writes.
+/// Here the reconciled hour's snapshot names only the rewrite's single level-1
+/// output entry; that entry's `writer_epoch` slot (which the frozen
+/// `SnapshotEntry` overloads for the level-1 `part_index`) is set past
+/// `u32::MAX`, which `snapshot_object` cannot read back into a `part_index`.
+/// The part and the HEAD-level reference around it are otherwise untouched
+/// and mutually consistent, so this exercises `snapshot_object`'s own
+/// fail-closed `None`, distinct from `ensure_part` finding the part itself
+/// unreadable.
+///
+/// Flip-line proof: in `snapshot_object`, change the level-1 arm's
+/// `u32::try_from(entry.writer_epoch).ok()?` to `entry.writer_epoch as u32`
+/// (a silent truncating cast instead of a fail-closed `None`): the corrupted
+/// entry then decodes to some arbitrary `part_index` instead of blocking, the
+/// gate does not recognize it as unreadable, the two superseded inputs are
+/// deleted, the `Op::Delete` fault fires, and the sweep's `.expect` panics.
+#[tokio::test]
+async fn an_undecodable_covering_entry_blocks_the_superseded_sweep_fail_closed() {
+    let mem = Arc::new(MemoryStore::new());
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let commit_keys = seed_two_hours(mem.as_ref()).await;
+    let input_data_keys = seeded_input_data_keys(mem.as_ref(), &commit_keys).await;
+
+    fold_head(&mem, created, 1, None).await;
+    run_rewrite(mem.as_ref(), &clock).await;
+    // A reconcile window wide enough to reach 100 hours back: the fold now
+    // observes the rewrite and republishes the hour naming only its output.
+    fold_head(&mem, created + 3 * NS_PER_HOUR, 2, Some(200)).await;
+
+    let named = head_named_data_keys(mem.as_ref(), OLD_HOUR).await;
+    assert!(
+        named.is_disjoint(&input_data_keys),
+        "the reconciled snapshot names none of the pre-rewrite inputs"
+    );
+
+    let head_bytes = get_full(mem.as_ref(), &head_key()).await;
+    let mut head = ravel_catalog::decode_head(head_bytes.as_ref()).expect("HEAD decodes");
+    assert_eq!(head.parts.len(), 1, "single-part HEAD on this fixture");
+    let part_key = head.parts[0].key.clone();
+    let part_bytes = get_full(mem.as_ref(), &part_key).await;
+    let limits = ravel_catalog::PartLimits {
+        max_snapshot_part_bytes: ravel_catalog::DEFAULT_MAX_SNAPSHOT_PART_BYTES,
+    };
+    let part = ravel_catalog::decode_part(part_bytes.as_ref(), &limits).expect("part decodes");
+    let mut entries = part.entries.clone();
+    let old_hour_entry_idx = entries
+        .iter()
+        .position(|e| e.level == 1 && e.ingest_hour_bucket == OLD_HOUR)
+        .expect("the rewrite's level-1 output entry covers the old hour");
+    // Past u32::MAX: snapshot_object's `u32::try_from(entry.writer_epoch)`
+    // on the level-1 arm cannot read this back as a part_index.
+    entries[old_hour_entry_idx].writer_epoch = u64::from(u32::MAX) + 1;
+
+    let tenant_hash_bytes: [u8; 16] = part
+        .header
+        .tenant_hash
+        .as_slice()
+        .try_into()
+        .expect("16-byte tenant hash");
+    let corrupted_part = ravel_catalog::encode_part(
+        tenant_hash_bytes,
+        part.header.signal,
+        part.header.shard_count,
+        part.header.watermark_hour,
+        &entries,
+    )
+    .expect("validate_entries does not range-check writer_epoch, so this still encodes");
+    // Re-decodes cleanly too: the corruption is in the identity's meaning,
+    // not in the envelope, which is exactly why `ensure_part` alone cannot
+    // catch it.
+    ravel_catalog::decode_part(&corrupted_part, &limits).expect("the corrupted part still decodes");
+
+    mem.put(
+        &part_key,
+        bytes::Bytes::from(corrupted_part.clone()),
+        PutOptions::default(),
+    )
+    .await
+    .expect("republish the part");
+    head.parts[0].blake3 = blake3::hash(&corrupted_part).as_bytes().to_vec();
+    head.parts[0].size = corrupted_part.len() as u64;
+    let encoded_head = ravel_catalog::encode_head(&head).expect("HEAD still encodes");
+    mem.put(
+        &head_key(),
+        bytes::Bytes::from(encoded_head),
+        PutOptions::default(),
+    )
+    .await
+    .expect("republish HEAD");
+
+    let plan = FaultPlan::empty().with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout));
+    let store = FaultStore::new(mem.clone(), plan);
+
+    clock.set(past_horizon(created));
+    let out = sweep(&store, &clock)
+        .await
+        .expect("an undecodable covering entry holds, it does not error the pass");
+    assert_eq!((out.records_deleted, out.data_deleted), (0, 0));
+    assert_eq!(
+        out.held_by_unreadable_head, 4,
+        "all four objects held under the Unreadable reason"
+    );
+    assert_eq!(
+        out.held_by_snapshot, 0,
+        "not the Named reason: the entry's identity could not be read to compare"
+    );
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Timeout),
+        0,
+        "the sweep issued exactly zero deletes"
+    );
+    assert_eq!(
+        present_keys(mem.as_ref(), &input_data_keys).await,
+        input_data_keys,
+        "both inputs the undecodable entry would have named survive"
+    );
+    for key in &commit_keys {
+        assert!(mem.head(key).await.is_ok(), "and both their commit records");
+    }
+}
+
 // --- (l) observing the holds is never gated on age --------------------------
 //
 // Two filters decide whether a chain is collectable YET: the protection
