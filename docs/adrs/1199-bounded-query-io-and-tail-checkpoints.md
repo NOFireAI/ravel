@@ -56,10 +56,20 @@ wall time is rounds times round-trip:
 
 That is S3 GET round-trip time, flat across 10x. **Cold resolve is
 concurrency-bound, not request-bound**: 1.6 ms per record is 26 ms per round
-divided by 16, and the same 10,001 GETs at 128 permits would take about 2 s if
-nothing else binds. Whether it does is measured under issue #1215 before this
-ADR's checkpoint decision is taken; the 25,000-record point (34 ms per round)
-is an open residual that model does not explain.
+divided by 16. Measured directly (issue #1215), with the constant patched in a
+measurement clone and the same 10,000-record tail resolved cold at each level:
+
+| permits | rounds | resolve wall | ms per round | GETs | LISTs |
+| --- | --- | --- | --- | --- | --- |
+| 16 | 625 | 23.157 s | 37.0 | 10,001 | 13 |
+| 64 | 157 | 4.374 s | 27.9 | 10,001 | 13 |
+| 128 | 79 | 2.341 s | 29.6 | 10,001 | 13 |
+
+Requests did not move; rounds did. 9.9x from 16 to 128, no flattening. The
+16-permit baseline ran in a slow S3 window (37 ms against 28-30 ms for the
+other two), which is why it was re-measured in-session rather than reused from
+the first run. The 25,000-record point (34 ms per round) remains an open
+residual.
 
 Three things about these numbers need stating precisely.
 
@@ -164,11 +174,11 @@ serves buffered writes nobody is waiting on.
 The tail is therefore `shards x flush cadence x residence window`, with volume
 absent from it:
 
-| shards | records/hour | tail records | cold resolve at 16 permits | at 128, if it scales |
+| shards | records/hour | tail records | cold resolve at 16 permits | at 128 (measured 30 ms/round) |
 | --- | --- | --- | --- | --- |
-| 4 | 5,655 | 8,010 - 13,670 | 13 - 22 s | 1.6 - 2.7 s |
-| 16 | 22,620 | 32,040 - 54,670 | 51 - 88 s | 6.4 - 11 s |
-| 64 | 90,480 | 128,180 - 218,660 | 3.4 - 5.8 min | 26 - 44 s |
+| 4 | 5,655 | 8,010 - 13,670 | 13 - 22 s | 1.9 - 3.2 s |
+| 16 | 22,620 | 32,040 - 54,670 | 51 - 88 s | 7.5 - 13 s |
+| 64 | 90,480 | 128,180 - 218,660 | 3.4 - 5.8 min | 30 - 51 s |
 
 A tenant sending 200 points per second carries the same catalog tail as one
 sending 8,500.
@@ -259,6 +269,20 @@ The instrumented resolve must also answer the 13-LIST question above: which
 listing path ran, and how the page count arises.
 
 ### 2. Exhaust the configuration knobs before building anything durable
+
+The knob that moves cold resolve is not on the ingest side at all. It is
+`MAX_CONCURRENT_REQUESTS` (`crates/ravel-catalog/src/catalog.rs:45`), the
+hardcoded bound on record GETs in flight during a resolve, and the measurement
+above shows it is worth 9.9x at 128. This ADR therefore decides, first: make it
+a `CatalogConfig` knob plumbed from the server, default 128, with the
+per-prefix arithmetic in its doc (128 in flight at 30 ms is about 4,300 GET/s
+against S3's ~5,500 per-prefix guidance, spread over one `m/c/<shard>/<hour>/`
+prefix per shard-hour). The semaphore is per `Catalog` instance, so concurrent
+cold queries multiply it; folding it into a process-wide limiter in the spirit
+of ADR-1195 is a named follow-up, not this decision. Issue #1238.
+
+The ingest-side knobs below were measured next, and the result is recorded
+because it closes off the path the source plan recommended.
 
 The knobs that set tail size already exist and cost nothing to turn:
 
@@ -401,8 +425,10 @@ own ADR.
 
 ### 4. The gate that decides whether decision 3 gets built
 
-Build the tail checkpoint only if, after decision 2's knob defaults are applied,
-both hold over a 24-hour window on a real workload:
+Build the tail checkpoint only if, after decision 2's resolve concurrency
+default is applied, both hold over a 24-hour window on a real workload. The
+baseline the checkpoint has to beat is the 128-permit column above, about 2.3 s
+for a 10,000-record tail, not the 16 s the first measurement showed:
 
 - `unfolded_segments_resolved` at p99 is at least **2,000** per resolve. On the
   measured figures this is crossed by any strict-ingest tenant with two or more
