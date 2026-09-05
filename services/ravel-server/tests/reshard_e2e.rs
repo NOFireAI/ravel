@@ -261,6 +261,7 @@ fn engine(store: Arc<dyn ObjectStoreBackend>, catalog_count: u32) -> (Arc<Catalo
         false,
         ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
         None,
+        None,
     )
     .expect("catalog builds");
     let engine = QueryEngine::new(catalog.clone(), store, EngineConfig::default());
