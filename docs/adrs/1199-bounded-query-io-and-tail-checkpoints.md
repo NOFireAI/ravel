@@ -362,10 +362,34 @@ than a second semantic representation means the query runs the same decoders and
 the same tenant, signal, shard, key-shape and reconstructed-data-key checks it
 runs after a direct GET, so a checkpoint can never become a validation bypass.
 
-Per `(tenant, signal, shard, ingest_hour)` the head advertises a base pack and
-bounded delta packs, deduplicated by exact record key and consolidated by a
-maintenance pass, because rewriting the whole open hour on every publication
-costs `tail_size x frequency` in write amplification.
+Per `(tenant, signal, shard, ingest_hour)` the head advertises one base pack
+and at most `K` delta packs, deduplicated by exact record key, because
+rewriting the whole open hour on every publication costs `tail_size x
+frequency` in write amplification. The bound is a number, not an adjective:
+
+- `K = 4` by default, with a codec hard maximum of 8 that a head cannot
+  exceed and remain decodable. A head naming more than 8 packs for one
+  shard-hour is unusable, and the resolver takes the direct-GET path for that
+  shard-hour, exactly as for a corrupt head.
+- A query loads at most `tail_checkpoint_max_packs_per_query` packs in total
+  across every shard-hour in its window (default 16), chosen
+  deterministically: for each shard-hour, the base first, then deltas newest
+  first, until the budget is spent. Records in packs the budget did not reach
+  resolve through direct GETs; the count of such records is what
+  `unfolded_segments_resolved` minus the served-from-pack figure reports.
+- Publication never waits and never adds a `K+1`th delta. A builder that finds
+  the head at `K` deltas for its target consolidates instead: it merges the
+  base and all deltas by exact record key, re-LISTs so the new base is not
+  knowingly older than the namespace, publishes the new base with zero deltas
+  through the same CAS, and leaves the old packs for the sweeper after the
+  protection horizon. Consolidation also triggers when delta bytes exceed base
+  bytes, whichever comes first.
+- When maintenance lags, nothing grows on the read side: the head stays at its
+  last published pack set within the bound, and every record published since
+  then is simply uncheckpointed and resolves through direct GETs. The cost of
+  lag is the per-record GET term this ADR measured, on exactly the records the
+  lag covers, and the `io` block makes it visible per query. Correctness does
+  not depend on the builder running at all (invariant 1).
 
 ```mermaid
 flowchart TD
