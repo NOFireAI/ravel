@@ -708,22 +708,28 @@ schemes starts a new bucket and drains into it.
 ## Durable shard count
 
 `--shards` is a default for tenants that have not yet been provisioned. It is
-not a per-tenant setting you can change after the fact: once a tenant's data for
-a signal is written across N shards, that count is fixed for that tenant and
-signal, and routing serves it over its own recorded shard range regardless of
-the live `--shards` value. The flag sets both the ingest router's shard count
-and the query-side catalog's shard count for new tenants, which is why there is
-no separate query-side flag.
+not a per-tenant setting you can change after the fact for existing data:
+generation 0's shard count is fixed forever once a tenant's data for a signal
+is written across it. The flag sets both the ingest router's shard count and
+the query-side catalog's shard count for new tenants, which is why there is no
+separate query-side flag.
 
-The first write for a tenant and signal records its shard count in a durable
-provisioning record at `t/<tenant_hash>/<signal>/prov`. Every later ingest,
-query, and maintenance touch reads that record and routes over the recorded
-count. An already-provisioned tenant keeps its recorded count: changing the
+The first write for a tenant and signal records its shard count as generation 0
+of a durable, append-only shard-generation history in a provisioning record at
+`t/<tenant_hash>/<signal>/prov`. Every later ingest, query, and maintenance
+touch reads that history and routes each hour over the shard count active for
+that hour, not over a single fixed count: `ravel-cli provision reshard` appends
+a new generation with a different shard count, taking effect at a future
+activation hour, without moving or re-keying existing data. Relying on
+generation 0's count alone misses any later reshard; always route from the
+persisted generation history.
+
+An already-provisioned tenant keeps its own generation history: changing the
 global `--shards` default (for example, lowering it for new tenants) does not
 affect a tenant that already has a record, and does not refuse startup, fail its
-queries, or skip its maintenance. This drift between a tenant's recorded count
-and the live default is expected and is surfaced as an informational metric, not
-an error.
+queries, or skip its maintenance. This drift between a tenant's generation-0
+recorded count and the live default is expected and is surfaced as an
+informational metric, not an error.
 
 The one case still refused is a record whose shard count would hide existing
 data if adopted, and an unreadable (corrupt or future-format) record whose true
