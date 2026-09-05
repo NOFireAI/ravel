@@ -43,6 +43,7 @@ pub use config::{
     DEFAULT_MAX_CATALOG_LIST_REQUESTS, DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_INGEST_LAG_NS,
     DEFAULT_POSTINGS_CACHE_ENTRIES, DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
     DEFAULT_PROTECTION_HORIZON_NS, DEFAULT_RESOLVE_GET_CONCURRENCY, DEFAULT_SNAPSHOT_CACHE_PARTS,
+    MAX_RESOLVE_GET_CONCURRENCY,
 };
 pub use covering_postings::{LoadPostingsError, LoadedCoveringPostings, load_covering_postings};
 pub use declared_stats::{DeclaredColumnStats, read_snapshot_entry};
