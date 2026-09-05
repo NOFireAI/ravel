@@ -12,21 +12,21 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestClock, tenant};
-use ravel_commit::keys;
-use ravel_commit::record;
+use common::{TestClock, catalog, tenant};
 use ravel_ingest::{IngestConfig, LogIngestRouter, SpanIngestRouter, WriteMode};
-use ravel_logseg::{LogRecord, Predicate, RlogConfig, RlogReader};
+use ravel_logseg::LogRecord;
+use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_otlp::traces_normalize::NormalizedSpan;
-use ravel_rspan::record::StatusCode;
-use ravel_rspan::{RspanConfig, RspanReader, SpanQuery};
+use ravel_query::{LogQuery, LogSegmentFetcher, SpanSegmentFetcher};
+use ravel_rspan::SpanQuery;
+use ravel_rspan::record::{SpanRecord, StatusCode};
 use ravel_types::logstream::{AttrValue, log_stream_id};
-use ravel_types::{CommitToken, Signal, TenantHash};
+use ravel_types::{Signal, TenantHash, TimeRange};
 
 const BASE_NS: i64 = 1_700_000_000_000_000_000;
+const NS_PER_SEC: i64 = 1_000_000_000;
 
 fn config(shard_count: u32) -> IngestConfig {
     IngestConfig {
@@ -74,58 +74,68 @@ fn span(trace_id: [u8; 16], start_ns: i64) -> NormalizedSpan {
     }
 }
 
-/// Follows a commit token to its RLOG object and returns every record an
-/// unfiltered scan yields.
-async fn read_back_logs(
-    store: &dyn ObjectStoreBackend,
-    tenant_hash: &TenantHash,
-    token: &CommitToken,
+/// Discovers every commit for (tenant, `Signal::Logs`) in `range` through the
+/// catalog -- the same resolution `ravel-sql`'s logs table provider drives
+/// (`Catalog::resolve` -> per-segment `LogSegmentFetcher::fetch`) -- and
+/// merges every resolved segment's records into one list. This is the
+/// supported log query path: a client retry after a lost ack has no commit
+/// token to follow, so a real query discovers both commits by time range,
+/// not by token. Two identical commits therefore serve two records unless
+/// something on this path dedups across them, which nothing here does
+/// (docs/consistency-model.md).
+async fn discover_and_read_logs(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant_hash: TenantHash,
+    range: TimeRange,
+    now_ns: i64,
 ) -> Vec<LogRecord> {
-    let commit_key =
-        keys::commit_key_for_token(tenant_hash, Signal::Logs, token).expect("commit key");
-    let commit_bytes = store
-        .get(&commit_key, GetRange::Full)
+    let cat = catalog(Arc::clone(&store), 1);
+    let snapshot = cat
+        .resolve(&tenant_hash, Signal::Logs, range, &[], now_ns)
         .await
-        .expect("get commit record")
-        .data;
-    let rec = record::decode(&commit_bytes).expect("decode commit record");
-    let data_bytes = store
-        .get(&rec.object_key, GetRange::Full)
-        .await
-        .expect("get data object")
-        .data;
-    let reader = RlogReader::new(&data_bytes, &RlogConfig::default()).expect("open rlog");
-    let (records, _stats) = reader
-        .scan(&Predicate::And(Vec::new()))
-        .expect("unfiltered scan");
+        .expect("resolve logs snapshot");
+    let fetcher = LogSegmentFetcher::new(store);
+    let query = LogQuery::new(range.start_ns, range.end_ns);
+    let mut records = Vec::new();
+    for seg_ref in &snapshot.segments {
+        if let Some(output) = fetcher
+            .fetch(seg_ref, &query)
+            .await
+            .expect("fetch log segment")
+        {
+            records.extend(output.records);
+        }
+    }
     records
 }
 
-/// Follows a commit token to its RSPAN object and returns every span for
-/// `trace_id` an unfiltered-by-time scan yields.
-async fn read_back_spans(
-    store: &dyn ObjectStoreBackend,
-    tenant_hash: &TenantHash,
-    token: &CommitToken,
+/// Spans counterpart of [`discover_and_read_logs`]: `Catalog::resolve` ->
+/// per-segment `SpanSegmentFetcher::fetch`, merged across every resolved
+/// commit, matching how a real spans query discovers and reads them.
+async fn discover_and_read_spans(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant_hash: TenantHash,
+    range: TimeRange,
+    now_ns: i64,
     trace_id: [u8; 16],
-) -> Vec<ravel_rspan::record::SpanRecord> {
-    let commit_key =
-        keys::commit_key_for_token(tenant_hash, Signal::Spans, token).expect("commit key");
-    let commit_bytes = store
-        .get(&commit_key, GetRange::Full)
+) -> Vec<SpanRecord> {
+    let cat = catalog(Arc::clone(&store), 1);
+    let snapshot = cat
+        .resolve(&tenant_hash, Signal::Spans, range, &[], now_ns)
         .await
-        .expect("get commit record")
-        .data;
-    let rec = record::decode(&commit_bytes).expect("decode commit record");
-    let data_bytes = store
-        .get(&rec.object_key, GetRange::Full)
-        .await
-        .expect("get data object")
-        .data;
-    let reader = RspanReader::new(&data_bytes, &RspanConfig::default()).expect("open rspan");
-    let (records, _stats) = reader
-        .scan(&SpanQuery::trace(trace_id, i64::MIN, i64::MAX))
-        .expect("trace scan");
+        .expect("resolve spans snapshot");
+    let fetcher = SpanSegmentFetcher::new(store);
+    let query = SpanQuery::trace(trace_id, range.start_ns, range.end_ns);
+    let mut records = Vec::new();
+    for seg_ref in &snapshot.segments {
+        if let Some(output) = fetcher
+            .fetch(seg_ref, &query, None, None, &[])
+            .await
+            .expect("fetch span segment")
+        {
+            records.extend(output.records.into_iter().map(|row| row.record));
+        }
+    }
     records
 }
 
@@ -166,12 +176,17 @@ async fn logs_and_spans_lost_ack_retry_serves_the_record_twice_logs() {
     );
     router.shutdown().await;
 
-    let mut bodies: Vec<String> = Vec::new();
-    for token in first.tokens.iter().chain(retry.tokens.iter()) {
-        for rec in read_back_logs(store.as_ref(), &tid.hash(), token).await {
-            bodies.push(rec.body);
-        }
-    }
+    let event_ts = BASE_NS - 60_000_000_000;
+    let range = TimeRange {
+        start_ns: event_ts - NS_PER_SEC,
+        end_ns: event_ts + NS_PER_SEC,
+    };
+    let bodies: Vec<String> =
+        discover_and_read_logs(Arc::clone(&store), tid.hash(), range, clock.now())
+            .await
+            .into_iter()
+            .map(|rec| rec.body)
+            .collect();
     assert_eq!(
         bodies,
         vec!["checkout failed".to_string(), "checkout failed".to_string()],
@@ -215,12 +230,17 @@ async fn logs_and_spans_lost_ack_retry_serves_the_record_twice_spans() {
     );
     router.shutdown().await;
 
-    let mut names: Vec<String> = Vec::new();
-    for token in first.tokens.iter().chain(retry.tokens.iter()) {
-        for rec in read_back_spans(store.as_ref(), &tid.hash(), token, trace_id).await {
-            names.push(rec.name);
-        }
-    }
+    let event_ts = BASE_NS - 60_000_000_000;
+    let range = TimeRange {
+        start_ns: event_ts - NS_PER_SEC,
+        end_ns: event_ts + NS_PER_SEC,
+    };
+    let names: Vec<String> =
+        discover_and_read_spans(Arc::clone(&store), tid.hash(), range, clock.now(), trace_id)
+            .await
+            .into_iter()
+            .map(|rec| rec.name)
+            .collect();
     assert_eq!(
         names,
         vec!["handle".to_string(), "handle".to_string()],
