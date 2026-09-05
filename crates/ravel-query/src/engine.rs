@@ -1258,7 +1258,12 @@ impl QueryEngine {
         //   data-independent pair of chains does not satisfy.
         // `unfolded_segments_resolved` IS additive (an exact total count
         // across both lanes' resolves, with no ambiguity about how the two
-        // lanes' costs compose).
+        // lanes' costs compose). `unfolded_segments_served_from_cache`
+        // follows the same rule for the same reason: each lane's figure is
+        // derived from that lane's OWN `QueryAccounting` handle's cache
+        // hit/miss delta (`crate::io_shape::unfolded_segments_served_from_cache`),
+        // so the two lanes' counts are over disjoint resolves and sum
+        // cleanly into one query-wide total.
         //
         // The log lane's `whole_object_threshold` is not reachable from
         // here (`BlockRangeFetcher::effective_whole_object_threshold` is
@@ -1292,11 +1297,13 @@ impl QueryEngine {
             .io_shape
             .service_batches
             .saturating_add(log_counts.service_batches);
-        let log_list_requests = log_accounting
-            .resolve()
-            .snapshot()
-            .s3_requests(AccountedOp::List);
+        let log_resolve_snapshot = log_accounting.resolve().snapshot();
+        let log_list_requests = log_resolve_snapshot.s3_requests(AccountedOp::List);
         log_counts.record_list_pages(log_list_requests.min(u64::from(u32::MAX)) as u32);
+        let log_served_from_cache = crate::io_shape::unfolded_segments_served_from_cache(
+            log_resolve_snapshot.cache_hits,
+            log_resolve_snapshot.cache_misses,
+        );
         log_counts.list_page_depth = stats
             .io_shape
             .list_page_depth
@@ -1318,6 +1325,7 @@ impl QueryEngine {
         let log_plan_class = PlanClass::Unclassified;
         stats.io_shape = log_counts.into_shape(
             stats.io_shape.unfolded_segments_resolved + log_unfolded,
+            stats.io_shape.unfolded_segments_served_from_cache + log_served_from_cache,
             crate::io_shape::merge_plan_class(stats.io_shape.plan_class, log_plan_class),
         );
 
@@ -2508,11 +2516,13 @@ fn io_shape_for_resolve(
         concurrency,
         shared_get_permits,
     ));
-    let resolve_list_requests = accounting
-        .resolve()
-        .snapshot()
-        .s3_requests(AccountedOp::List);
+    let resolve_snapshot = accounting.resolve().snapshot();
+    let resolve_list_requests = resolve_snapshot.s3_requests(AccountedOp::List);
     counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
+    let unfolded_segments_served_from_cache = crate::io_shape::unfolded_segments_served_from_cache(
+        resolve_snapshot.cache_hits,
+        resolve_snapshot.cache_misses,
+    );
     let plan_class = if metadata_only {
         PlanClass::MetadataOnly
     } else if snapshot.segments_pruned > 0 {
@@ -2520,7 +2530,11 @@ fn io_shape_for_resolve(
     } else {
         PlanClass::ExhaustiveScan
     };
-    counts.into_shape(unfolded_segments_resolved, plan_class)
+    counts.into_shape(
+        unfolded_segments_resolved,
+        unfolded_segments_served_from_cache,
+        plan_class,
+    )
 }
 
 /// A locally-scoped series identity for a log-derived series returned from
@@ -7210,6 +7224,108 @@ mod prefetch_tests {
             stats.estimate.segments
         );
         assert_estimate_covers_actual("multi-segment query", &stats);
+    }
+
+    /// Regression for issue #1219: `unfolded_segments_served_from_cache` must
+    /// report the EXACT number of a resolve's segments whose commit record
+    /// was already in the local record cache before the resolve started, not
+    /// merely `> 0`. Publishes 3 records and resolves once to warm their
+    /// commit records into the cache (an untested setup step), publishes 5
+    /// MORE records (a known LARGER number not yet cached), then resolves
+    /// the same metric again: 8 segments total, 3 already warm, 5 cold.
+    ///
+    /// Flip-line proof: in `unfolded_segments_served_from_cache`
+    /// (`crates/ravel-query/src/io_shape.rs`), change
+    /// `cache_misses.saturating_sub(1)` back to plain `cache_misses` (as if
+    /// `ravel-catalog`'s constant per-resolve decoded-HEAD probe miss did
+    /// not exist) and this assertion reads 2, not 3.
+    #[tokio::test]
+    async fn resolve_reports_exact_segments_served_from_cache_when_partially_warm() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+
+        for seq in 1..=3u64 {
+            let ts = BASE_NS - (9 - seq as i64) * 20 * NS_PER_SEC;
+            publish_metric(&store, tenant_hash, seq, "cache_metric", ts, seq as f64).await;
+        }
+        let eng = engine(Arc::clone(&store));
+        let plans = vec![window_plan("cache_metric")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        // Warms the record cache for the first 3 records only. Not itself
+        // asserted on: it is the fixture's "already in the cache" half.
+        eng.prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("warm-up prefetch");
+
+        for seq in 4..=8u64 {
+            let ts = BASE_NS - (9 - seq as i64) * 20 * NS_PER_SEC;
+            publish_metric(&store, tenant_hash, seq, "cache_metric", ts, seq as f64).await;
+        }
+
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch partially warm");
+
+        assert_eq!(
+            stats.io_shape.unfolded_segments_resolved, 8,
+            "8 published records must all resolve as unfolded segments"
+        );
+        assert_eq!(
+            stats.io_shape.unfolded_segments_served_from_cache, 3,
+            "only the 3 records warmed by the earlier prefetch came from cache"
+        );
+    }
+
+    /// Regression for issue #1219: a second resolve of the SAME window on
+    /// the SAME engine must report `unfolded_segments_served_from_cache`
+    /// EQUAL to `unfolded_segments_resolved` (fully warm), pinned exactly --
+    /// every commit record the first resolve read is still in the cache by
+    /// the time the second resolve runs.
+    ///
+    /// Flip-line proof: same production line as the partially-warm test
+    /// above -- reverting `unfolded_segments_served_from_cache`'s
+    /// `cache_misses.saturating_sub(1)` to plain `cache_misses` makes the
+    /// final assertion here read 5, not 6.
+    #[tokio::test]
+    async fn second_resolve_of_same_window_is_fully_warm() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=6u64 {
+            let ts = BASE_NS - (7 - seq as i64) * 20 * NS_PER_SEC;
+            publish_metric(
+                &store,
+                tenant_hash,
+                seq,
+                "fully_warm_metric",
+                ts,
+                seq as f64,
+            )
+            .await;
+        }
+
+        let eng = engine(store);
+        let plans = vec![window_plan("fully_warm_metric")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+
+        let (_source, first) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("first prefetch");
+        assert_eq!(first.io_shape.unfolded_segments_resolved, 6);
+
+        let (_source, second) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("second prefetch");
+        assert_eq!(
+            second.io_shape.unfolded_segments_resolved, 6,
+            "the same window resolves the same 6 segments again"
+        );
+        assert_eq!(
+            second.io_shape.unfolded_segments_served_from_cache, 6,
+            "every one of the 6 records is already cached from the first resolve"
+        );
     }
 
     /// Regression for issue #1214's second review round, Finding 1: a real

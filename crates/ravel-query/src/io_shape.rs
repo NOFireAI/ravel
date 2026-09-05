@@ -134,6 +134,26 @@
 //!   figure counts every part. `ravel-query` cannot recover the underlying
 //!   record count from `SegmentOrigin` alone -- the field is named, and
 //!   documented, for the quantity it actually counts.
+//! - [`unfolded_segments_served_from_cache`](QueryIoShape::unfolded_segments_served_from_cache):
+//!   of the segments `unfolded_segments_resolved` counts, how many came from
+//!   a commit record already sitting in `ravel-catalog`'s local record cache
+//!   rather than fetched fresh. Derived from this resolve's OWN
+//!   `QueryAccounting` handle's cache hit/miss delta, never a pooled process
+//!   counter: a `PhaseAccounting::resolve()` handle is built fresh per query
+//!   attempt, so its counters ARE that attempt's resolve-phase delta, with
+//!   nothing to subtract. See [`unfolded_segments_served_from_cache`] (the
+//!   function) for the exact derivation and the shape it is proven for. Like
+//!   `unfolded_segments_resolved`, this is a SEGMENT figure gated by a
+//!   commit-RECORD-level cache counter -- the two coincide for the all-L0
+//!   unsealed tail this derivation covers, and diverge exactly where
+//!   `unfolded_segments_resolved` already says a segment and its record
+//!   diverge (a multi-part L1 compaction). The derivation additionally
+//!   assumes this tenant/signal has no snapshot HEAD from an earlier fold
+//!   (see the function's own doc comment, "The constant decoded-HEAD
+//!   probe"); when one exists, the figure can read up to 1 away from the
+//!   true count. This field does not decide cold/warm; see
+//!   docs/query-engine.md for that classification rule and why it lives
+//!   with the reader of both figures, not here.
 //! - [`plan_class`](QueryIoShape::plan_class): decided before any segment is
 //!   opened, from the query's shape and the resolve's own pruning outcome.
 //!
@@ -196,6 +216,7 @@ pub struct QueryIoShape {
     pub list_page_depth: u32,
     pub service_batches: u32,
     pub unfolded_segments_resolved: u64,
+    pub unfolded_segments_served_from_cache: u64,
     pub plan_class: PlanClass,
 }
 
@@ -213,6 +234,7 @@ impl Default for QueryIoShape {
             list_page_depth: 0,
             service_batches: 0,
             unfolded_segments_resolved: 0,
+            unfolded_segments_served_from_cache: 0,
             plan_class: PlanClass::MetadataOnly,
         }
     }
@@ -321,6 +343,107 @@ pub fn count_unfolded_segments(origins: &[SegmentOrigin]) -> u64 {
         .count() as u64
 }
 
+/// Derives, from one resolve's OWN `QueryAccounting` cache hit/miss delta
+/// (never a pooled process counter -- a `PhaseAccounting::resolve()` handle
+/// is built fresh per query attempt, so its counters ARE that attempt's
+/// resolve-phase delta, with nothing to subtract), how many of that
+/// resolve's `Recent`-origin segments were served from `ravel-catalog`'s
+/// local commit record cache rather than fetched fresh.
+///
+/// # Why this is derived, not read directly
+///
+/// `ravel-catalog`'s plain L0 fast path (`Catalog::process_bucket`, out of
+/// this crate's scope to read or edit) touches every commit record key
+/// TWICE per resolve: once in `prewarm_commit_records` (a concurrent
+/// warm-up pass, a REAL hit or miss against whatever the cache held before
+/// this resolve started) and once in `include_l0_if_overlaps` (a sequential
+/// include pass, which always hits because the prewarm pass just populated
+/// the cache for that key, barring an eviction race in between). So for
+/// `n_warm` keys already cached before this resolve started and `n_cold`
+/// keys that were not:
+///
+/// - each `n_warm` key contributes 2 hits, 0 misses (prewarm hit, include
+///   hit);
+/// - each `n_cold` key contributes 1 hit, 1 miss (prewarm miss populates
+///   the cache, include then hits).
+///
+/// So `cache_hits == 2 * n_warm + n_cold` and `cache_misses == n_cold`,
+/// which solves to `n_warm == (cache_hits - cache_misses) / 2`: exactly the
+/// count of records served from cache, under this shape.
+///
+/// # Segments, not records
+///
+/// `ravel-catalog`'s cache counters are per commit RECORD, while
+/// `unfolded_segments_resolved` is a per-SEGMENT count (see that field's own
+/// doc comment for when a segment and its underlying record diverge: a
+/// multi-part L1 compaction). The two coincide for the all-L0 case this
+/// derivation covers, one commit record naming one segment.
+///
+/// # Scope this is exact for
+///
+/// `cache_hits`/`cache_misses` on `QueryAccounting` are POOLED across every
+/// cache a resolve's catalog call can touch: the L0 commit-record cache
+/// this derivation models, the compaction-record cache, the rewrite-record
+/// cache, the decoded-HEAD cache, the postings cache, and the
+/// folded-snapshot-part byte cache (`Catalog::fetch_content_addressed`).
+/// This function's arithmetic is only proven for a resolve whose window
+/// contains ONLY plain L0 records, with no compaction, no rewrite, and no
+/// sealed-below-watermark folded segment in the same resolve: any of those
+/// add hits or misses this formula does not model, silently widening the
+/// gap between this figure and the true served-from-cache count with no
+/// signal that it happened.
+///
+/// # The constant decoded-HEAD probe
+///
+/// Even in that narrowed scope, `ravel-catalog`'s `resolve_snapshot_window`
+/// (`crates/ravel-catalog/src/snapshot_resolve.rs`, out of this crate's
+/// scope to edit) unconditionally calls `read_head` once per resolve,
+/// whenever the window has any hour bounds at all, regardless of whether
+/// the window's segments turn out to be all-L0. `read_head` checks the
+/// decoded-HEAD cache first and records exactly one hit or miss into the
+/// SAME pooled `QueryAccounting` counters this function reads, before
+/// falling back to a store GET that itself returns `Ok(None)` (never
+/// populating the cache) when no fold has ever produced a HEAD object for
+/// this tenant and signal. A tenant/signal with no snapshot HEAD at all
+/// (the common case for data recent enough that ADR-1199's cold/warm gate
+/// even applies -- a fold has to run before a HEAD exists) therefore
+/// contributes exactly one constant, never-converting miss on every
+/// resolve, independent of segment count or warm/cold shape: `cache_hits ==
+/// 2 * n_warm + n_cold` still holds, but `cache_misses == n_cold + 1`, one
+/// more than the double-touch model alone predicts. This function corrects
+/// for exactly that known, constant offset:
+/// `n_warm == (cache_hits - (cache_misses - 1)) / 2`.
+///
+/// This correction is itself a narrowing, not a generalization: it assumes
+/// the decoded-HEAD probe ran exactly once and missed. If this tenant and
+/// signal DOES have a snapshot HEAD from an earlier fold (even one that
+/// covers none of this resolve's own all-L0 window), `read_head` can hit
+/// instead, which both drops the `+ 1` this correction subtracts from
+/// `cache_misses` AND adds an uncounted `+ 1` to `cache_hits` -- moving the
+/// result up to 1 too high rather than removing the offset this comment
+/// documents. `ravel-catalog` exposes no counter that separates the
+/// decoded-HEAD probe from the record-cache double-touch this derivation
+/// otherwise models, and adding one is out of this task's scope
+/// (`ravel-types`, `ravel-catalog`). See docs/query-engine.md for this
+/// caveat restated for an operator reading the figure, and the final
+/// report for how it was found (issue #1219): a live debug trace against
+/// this crate's own test engine showed `cache_hits` matching the
+/// double-touch model exactly while `cache_misses` was consistently one
+/// higher, in both a fully-cold and an immediately-following fully-warm
+/// resolve, which rules out an ordinary TTL hit/miss cycle (that would
+/// convert to a hit on the second resolve) and points at a probe that
+/// never gets a chance to populate its own cache in a never-folded
+/// fixture.
+///
+/// Saturates to 0 rather than underflowing if `cache_misses` is 0 (no
+/// decoded-HEAD probe ran at all -- a degenerate window with no hour
+/// bounds) or if it otherwise exceeds `cache_hits` (not expected under the
+/// modeled shape, but these are live counters, not a closed system, so
+/// this function does not assume they stay consistent with each other).
+pub fn unfolded_segments_served_from_cache(cache_hits: u64, cache_misses: u64) -> u64 {
+    cache_hits.saturating_sub(cache_misses.saturating_sub(1)) / 2
+}
+
 /// Batches one concurrency-bounded fan-out over `item_count` items is forced
 /// into under `concurrency` simultaneous permits: `ceil(item_count /
 /// concurrency)`. `concurrency` is clamped to at least 1 (mirrors every fetch
@@ -406,6 +529,7 @@ impl IoShapeCounts {
     pub fn into_shape(
         self,
         unfolded_segments_resolved: u64,
+        unfolded_segments_served_from_cache: u64,
         plan_class: PlanClass,
     ) -> QueryIoShape {
         QueryIoShape {
@@ -413,6 +537,7 @@ impl IoShapeCounts {
             list_page_depth: self.list_page_depth,
             service_batches: self.service_batches,
             unfolded_segments_resolved,
+            unfolded_segments_served_from_cache,
             plan_class,
         }
     }
@@ -639,6 +764,46 @@ mod tests {
             4,
             "4 segments (1 L0 + 3 L1 parts) from only 2 underlying commit/compaction records"
         );
+    }
+
+    /// The double-touch derivation, plus the constant decoded-HEAD probe
+    /// miss (see the function's own doc comment): a resolve with 3 keys
+    /// already warm before it started and 5 cold contributes `2*3 + 5 =
+    /// 11` hits and `5 + 1 = 6` misses (one extra miss from `read_head`
+    /// finding no snapshot HEAD), so `(11 - (6 - 1)) / 2 == 3` recovers
+    /// `n_warm` exactly. Flip the trailing `- 1` to nothing (as if the
+    /// decoded-HEAD probe never contributed a miss) to watch this fail: it
+    /// would then read 2, not 3.
+    #[test]
+    fn unfolded_segments_served_from_cache_recovers_warm_count_from_double_touch() {
+        assert_eq!(unfolded_segments_served_from_cache(11, 6), 3);
+    }
+
+    /// A fully cold resolve (nothing warm beforehand): every key is a
+    /// prewarm miss plus an include hit, so `cache_hits == n_cold` and
+    /// `cache_misses == n_cold + 1` once the constant decoded-HEAD probe
+    /// miss is folded in; no key was served from cache.
+    #[test]
+    fn unfolded_segments_served_from_cache_is_zero_when_fully_cold() {
+        assert_eq!(unfolded_segments_served_from_cache(5, 6), 0);
+    }
+
+    /// A fully warm resolve (every key already cached beforehand): every
+    /// key is a prewarm hit plus an include hit, so `cache_misses == 1`
+    /// (only the constant decoded-HEAD probe miss) and `n_warm` equals half
+    /// the hit count once that 1 is corrected for.
+    #[test]
+    fn unfolded_segments_served_from_cache_equals_resolved_when_fully_warm() {
+        assert_eq!(unfolded_segments_served_from_cache(10, 1), 5);
+    }
+
+    /// Live counters are not a closed system: this function must not panic
+    /// or underflow when `cache_misses` exceeds `cache_hits`, nor when
+    /// `cache_misses` is 0 (the `- 1` correction must not underflow either).
+    #[test]
+    fn unfolded_segments_served_from_cache_saturates_instead_of_underflowing() {
+        assert_eq!(unfolded_segments_served_from_cache(0, 5), 0);
+        assert_eq!(unfolded_segments_served_from_cache(0, 0), 0);
     }
 
     #[test]

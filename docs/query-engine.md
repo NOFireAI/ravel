@@ -1789,6 +1789,26 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   read-your-write token match always costs its own GET by explicit key,
   whether or not a fold has run, so folding can never remove that cost and
   counting it here would overstate the fold benefit.
+- `unfoldedSegmentsServedFromCache`: of the segments `unfoldedSegmentsResolved`
+  counts, the EXACT number whose commit record was already sitting in
+  `ravel-catalog`'s local record cache before this resolve started, rather
+  than fetched fresh. Derived from this resolve's own cache hit/miss delta,
+  never a pooled process counter, so it is exact per resolve, not per
+  process. Like `unfoldedSegmentsResolved`, this is a SEGMENT figure gated
+  by a commit-RECORD-level cache counter: the two coincide for the all-L0
+  unsealed tail this figure targets, and diverge exactly where
+  `unfoldedSegmentsResolved` already diverges from its underlying record
+  count (a multi-part L1 compaction). This derivation additionally assumes
+  the resolve's tenant and signal has no snapshot HEAD from an earlier
+  fold: `ravel-catalog` checks a decoded-HEAD cache once per resolve
+  regardless of segment shape, and that check shares the same pooled
+  hit/miss counters this figure reads. When no snapshot HEAD exists yet
+  (the common case for data recent enough that a fold has not reached it),
+  that check contributes one constant, known miss that this figure corrects
+  for; if a snapshot HEAD does exist, the check's outcome cannot be told
+  apart from record-cache activity, and the figure can read up to 1 away
+  from the true served-from-cache count. This field does not decide whether
+  the resolve counts as cold or warm; see "Cold and warm resolves" below.
 - `planClass`: `metadata_only` (a labels/label-values/series discovery query
   that never reaches a page fetch), `selective_indexed` (the resolve's
   postings-based pruning excluded at least one snapshot-sourced segment),
@@ -1834,7 +1854,10 @@ fetch chain has no DATA dependency on the metrics lane's bytes, so the two
 chains are independent chains that happen to run one after the other, and
 the reported figure is the longest independent chain, not their sum.
 `unfoldedSegmentsResolved` sums across lanes (an exact total count, with no
-ambiguity about how the two lanes' costs compose), and `planClass` takes
+ambiguity about how the two lanes' costs compose), `unfoldedSegmentsServedFromCache`
+follows the same additive rule for the same reason (each lane's figure comes
+from that lane's own cache hit/miss delta, over disjoint resolves), and
+`planClass` takes
 the more severe of the two (`exhaustive_scan` outranks `selective_indexed`
 outranks `unclassified` outranks `metadata_only`), so a lane that never ran
 cannot understate a lane that did, and the log lane's `unclassified` result
@@ -1843,6 +1866,27 @@ correctly.
 
 `stats.io` carries no object keys, field values, predicates, or index
 terms: every figure is a structural count.
+
+### Cold and warm resolves
+
+A resolve is classified cold when fewer than half its unfolded segments came
+from the cache (`unfoldedSegmentsServedFromCache < unfoldedSegmentsResolved /
+2`), and warm otherwise. `stats.io` does not carry this classification as its
+own field: `unfoldedSegmentsResolved` and `unfoldedSegmentsServedFromCache`
+are both exact counts a caller can already combine, and a caller with a
+different cold/warm threshold (or one that wants the raw ratio rather than a
+boolean) would have to reconstruct it from the two counts anyway. Deciding it
+here would also force the query path itself to know about a threshold whose
+only consumer is a build-time gate over aggregated resolves, not any
+per-query behavior: nothing the query path does changes based on whether a
+resolve counts as cold or warm, so the query path is not where that decision
+belongs. The classification lives with whatever reads both figures across
+many resolves.
+
+The cold/warm rule is the basis for a build gate over aggregated resolves:
+at least 10% of resolves over recent data must be cold, so that a fold-
+benefit decision is validated against real cold traffic rather than a corpus
+that only ever exercises an already-warm cache.
 
 ## PromQL conformance (ADR-0035)
 
