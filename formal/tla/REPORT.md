@@ -140,9 +140,10 @@ clause is load-bearing" — the shipped model keeps
 successor.
 
 **Disagreement 1 (invariant count, lifecycle).** `lifecycle/README.md` states
-twice (lines 143 and 170) that the seven negative controls run "the full
-fourteen-invariant list from `smoke.cfg`." `lifecycle/results.md` itself says
-"thirteen-invariant list" (line 28) elsewhere. Neither figure is what the
+twice, under "Switches and negative controls," that the seven negative
+controls run "the full fourteen-invariant list from `smoke.cfg`."
+`lifecycle/results.md` itself says "thirteen-invariant list," under
+"Negative controls," elsewhere. Neither figure is what the
 shipped `.cfg` files carry: `smoke.cfg` declares 15 `INVARIANT` lines
 (`TypeOK` plus 14 named invariants); every `negative/*.cfg` declares 13
 `INVARIANT` lines (`TypeOK` plus 12 named invariants), omitting
@@ -456,37 +457,12 @@ inferred by this report.
   is fixed to `RawInputs`, and no action produces a second rewrite object a
   further rewrite could take as input — so rewrite-of-rewrite is
   unreachable in `smoke.cfg`, `exhaustive.cfg`, or any other configuration in
-  this area. **This report was drafted from instructions asserting this gap
-  is "tracked as issue 1221." That citation does not match the repository:**
-  no reference to issue 1221 exists anywhere in `formal/` or
-  `docs/adrs/1113*`, in `lifecycle/README.md`, or in `lifecycle/results.md`,
-  and a repository-wide search for "1221" in Markdown files finds it only in
-  an unrelated ADR (`docs/adrs/0061-query-cost-governance.md`). The gap
-  itself is real and is stated above in the area's own words; the issue
-  number is not corroborated and is omitted here rather than fabricated.
-- **Maintenance two-worker lane.** This report was drafted from instructions
-  asserting "the maintenance two-worker lane is bounded-depth simulation, not
-  exhaustive." **That also does not match the repository.** The actual
-  documented state (`maintenance/README.md` lines 89-108,
-  `maintenance/results.md` lines 71-129): the two-worker duplicate-ownership
-  race is covered **exhaustively for safety only**, up to the sound `MCView`
-  state abstraction, by `MCMaintenanceOwnership.smoke.cfg`
-  (`Workers = {1, 2}`, the same six safety invariants, `MCSpec` with no
-  fairness) — this is exhaustive-with-abstraction, not bounded-depth
-  simulation. What is genuinely not covered at two workers is liveness: no
-  lane in this suite exhaustively checks either liveness property
-  (`NoWorkerEverStale`, `OwnershipIsNotPublicationAuthority`) at
-  `Workers = {1, 2}`, and the no-`VIEW` exhaustive attempt at two workers was
-  abandoned mid-run (still climbing past 4,600,000 distinct states at depth
-  13 of an eventual 20). The one place in the suite that genuinely is
-  budget-bounded simulation rather than exhaustive search is
-  **resharding**'s `writer-fence-comparison.cfg` fallback run: a TLC random
-  simulation checking 63,203,643 states in a fixed 300-second budget, which
-  `resharding/results.md` itself describes as "budget-bounded, not
-  traversal-bounded" (section 5, section 9). The instruction appears to have
-  conflated the resharding finding with the maintenance area; this report
-  states each area's actual, independently-verified position instead of the
-  instructed wording.
+  this area. Tracked as issue #1221.
+- **Maintenance two-worker lane.** Covered in section 8: the two-worker
+  duplicate-ownership race is exhaustive for safety only, under the sound
+  `MCView` state abstraction, with no fairness and no liveness checked at
+  two workers. The suite's one genuinely budget-bounded, non-exhaustive lane
+  is resharding's `writer-fence-comparison.cfg` (section 9).
 - **ADR-0064's out-of-window case** is recorded as open for lifecycle (D1
   table, section 4): the model covers the shipped retention path, not the
   out-of-window legal-hold interaction ADR-0064 leaves as a follow-up.
@@ -528,10 +504,11 @@ checks (section 9).
 A literal search for the phrase "formally verified" across `formal/` and
 `docs/adrs/1113*` returns **two** matches, not zero:
 
-- `docs/adrs/1113-tla-verification-suite.md:506`: `"Ravel is formally
-  verified" does not appear anywhere.`
-- `formal/tla/maintenance/README.md:20`: `..."Ravel is formally verified" is
-  not a claim this suite makes.`
+- `docs/adrs/1113-tla-verification-suite.md`, under "D12. What the suite
+  claims, in the words it must use": `"Ravel is formally verified" does not
+  appear anywhere.`
+- `formal/tla/maintenance/README.md`, in its opening summary: `..."Ravel is
+  formally verified" is not a claim this suite makes.`
 
 Both matches are the literal string appearing inside an explicit denial, not
 a claim. There is no sentence anywhere in the suite that asserts Ravel, or
