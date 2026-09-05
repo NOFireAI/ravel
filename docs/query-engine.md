@@ -700,17 +700,22 @@ One gap remains until the server half of ADR-1195 lands: the ceiling is per
 engine, not per process. `ravel-server` and `ravel-sql` still construct
 engines and standalone fetchers with their own limiters.
 
-Every RLOG GET is now permitted, both paths. `LogSegmentFetcher` holds its
-own `GetLimiter` for its whole-object funnel (`fetch_accounted` and
-`whole_object_bytes`, taken by every object at or below the block-range
-threshold) in addition to the one it hands to its internal
-`BlockRangeFetcher`; `with_get_limiter` sets both to the same `Arc`, and
-`with_block_range` re-applies the fetcher's current limiter to a replacement
-`BlockRangeFetcher` so builder order cannot drop it. `QueryEngine::new`
-builds the RLOG fetcher used by every server query path, so the whole-object
-RLOG reads that the `cost-based` default policy issues -- the stock
-ClickBench path -- are bounded by `store_get_concurrency()` for the first
-time.
+Every RLOG GET a `LogSegmentFetcher` issues now takes a permit, on both
+paths. The fetcher holds its own `GetLimiter` for its whole-object funnel
+(`fetch_accounted` and `whole_object_bytes`, taken by every object at or
+below the block-range threshold) in addition to the one it hands to its
+internal `BlockRangeFetcher`; `with_get_limiter` sets both to the same
+`Arc`, and `with_block_range` re-applies the fetcher's current limiter to a
+replacement `BlockRangeFetcher` so builder order cannot drop it. Which
+limiter that is depends on who built the fetcher: the RLOG fetcher a
+`QueryEngine` owns draws from the engine's shared limiter, sized by
+`store_get_concurrency()`. The standalone RLOG fetcher that `ravel-server`'s
+SQL path builds (`build_sql_state`) still uses `with_max_concurrent_gets`,
+which reaches only the block-range protocol, so its whole-object funnel is
+bounded by the fetcher's private default until the server half wires it to
+the process limiter with `with_get_limiter`. The stock ClickBench path runs
+through that SQL fetcher, so it is not yet governed by
+`store_get_concurrency()`.
 
 Before ADR-1195, each fetcher held its own independent semaphore, so N
 fetchers each configured to "8 concurrent GETs" could together put 8N GETs
