@@ -375,7 +375,10 @@ pub struct IoShapeJson {
     #[serde(rename = "unfoldedSegmentsResolved")]
     pub unfolded_segments_resolved: u64,
     /// Pre-execution access-pattern classification: `metadata_only`,
-    /// `selective_indexed`, or `exhaustive_scan` (`crate::io_shape::PlanClass::name`).
+    /// `selective_indexed`, `exhaustive_scan`, or `unclassified` (a lane,
+    /// such as the log lane, whose own resolve carries no signal this crate
+    /// can use to tell a pruned fetch from a full scan --
+    /// `crate::io_shape::PlanClass::name`).
     #[serde(rename = "planClass")]
     pub plan_class: &'static str,
 }
