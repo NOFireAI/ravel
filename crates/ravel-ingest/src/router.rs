@@ -656,6 +656,17 @@ mod tests {
 
         let point = test_point(&tenant, "cpu_usage", t0, 1.0);
         let expected_shard = shard_for(&point.series_id, 8);
+        // The process default (4 shards) must route this point to a
+        // different shard than the routed (post-reshard, 8-shard) count, or a
+        // write that used the wrong count would land on `expected_shard` by
+        // coincidence and both assertions below would still pass.
+        assert_ne!(
+            shard_for(&point.series_id, 4),
+            expected_shard,
+            "this series id must not land on the same shard under the process \
+             default count (4) and the routed count (8), or routing with the \
+             wrong count would go undetected"
+        );
 
         // The frozen clock never ages past `max_flush_delay` on its own, so
         // `flush_all` must run concurrently with (not after) the write, and
