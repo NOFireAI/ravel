@@ -26,7 +26,9 @@
 //! EK); nothing here changes a recorded value, only refuses when config and
 //! record disagree.
 
+use std::collections::HashSet;
 use std::future::Future;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
@@ -900,6 +902,13 @@ impl ProvisioningError {
 /// Process-global, single source, no labels.
 static SHARD_COUNT_DRIFTS: AtomicU64 = AtomicU64::new(0);
 
+/// `(tenant, signal)` pairs whose drift has already been logged once. The
+/// maintenance tick re-validates every signal on every tick (ADR-0050 section
+/// 5), so an unguarded log line would repeat forever for a tenant that is
+/// simply running below or above the live default. [`SHARD_COUNT_DRIFTS`]
+/// still increments on every validation; only the log line is deduplicated.
+static SHARD_COUNT_DRIFT_LOGGED: Mutex<Option<HashSet<(TenantHash, Signal)>>> = Mutex::new(None);
+
 /// The process-global shard-count drift count for the `/metrics` renderer
 /// (ADR-0082). See [`SHARD_COUNT_DRIFTS`].
 pub fn shard_count_drift_count() -> u64 {
@@ -1118,14 +1127,24 @@ fn validate_record(
         // config. Keep the drift observable so an operator can still see which
         // tenants run below or above today's default.
         SHARD_COUNT_DRIFTS.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(
-            tenant_hash = %tenant_hash.to_hex(),
-            signal = signal.key_prefix(),
-            recorded_shard_count = record.shard_count,
-            live_shards_default = shard_count,
-            "provisioning record shard_count differs from the live --shards default; \
-             tolerated, routing uses the record's own generation history (ADR-0082)"
-        );
+        let first_time_seeing_this_drift = {
+            let mut logged = SHARD_COUNT_DRIFT_LOGGED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            logged
+                .get_or_insert_with(HashSet::new)
+                .insert((*tenant_hash, signal))
+        };
+        if first_time_seeing_this_drift {
+            tracing::info!(
+                tenant_hash = %tenant_hash.to_hex(),
+                signal = signal.key_prefix(),
+                recorded_shard_count = record.shard_count,
+                live_shards_default = shard_count,
+                "provisioning record shard_count differs from the live --shards default; \
+                 tolerated, routing uses the record's own generation history (ADR-0082)"
+            );
+        }
     }
     Ok(())
 }
