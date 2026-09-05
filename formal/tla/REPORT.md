@@ -160,7 +160,7 @@ configs; no wording change was needed there.
 
 | Config | States generated | Distinct | Depth | Wall (results.md) | Wall (bands.tsv comment) | Result | Band (distinct / depth) |
 |---|---|---|---|---|---|---|---|
-| smoke.cfg | 7809360 | 958804 | 18 | 37s | 26s | PASS | 900000-1000000 / 17-19 |
+| smoke.cfg | 7809360 | 958804 | 18 | 43s | 43s | PASS | 900000-1000000 / 17-19 |
 | exhaustive.cfg | 8503664 | 1179718 | 20 | under 300s | under 300s ("under 5 min") | PASS | 1000000-1500000 / 18-23 |
 
 Both configurations land inside their distinct/depth bands.
@@ -180,7 +180,7 @@ counts vary run to run):
 |---|---|---|---|---|
 | scan-slack-zero | `S = 0` (shipped 3) | EveryAdmittedWriteInScanSet | 3512 | 2 |
 | appender-skew-unbounded | `AppenderSkew = 5` (tolerated 1) | EveryAdmittedWriteInScanSet | 124721 | 4 |
-| lead-one | `L = 1` (shipped 2) | LeadCoversRefreshHorizon | 174 | 2 |
+| lead-one | `L = 1` (shipped 2) | LeadCoversRefreshHorizon | 236 | under 1 |
 | no-writer-fence | `WriterFenceEnabled = FALSE` | StaleWriterFailsClosed | 48018 | 2 |
 | token-validated-against-count | `TokenValidatedAgainstCount = TRUE` | TokenResolvesAcrossReshards | 12709 | 3 |
 
