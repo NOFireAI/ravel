@@ -864,6 +864,15 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub cache_dir: Option<PathBuf>,
 
+    /// Number of in-flight object-store requests (LISTs and record GETs) the
+    /// catalog resolve path (`Catalog::resolve_impl`) keeps in flight at
+    /// once, via a per-instance semaphore. Unset, it takes
+    /// `ravel_catalog::CatalogConfig`'s own default (currently 128). `0` is
+    /// rejected by [`Cli::validate`]: a zero-permit semaphore would deadlock
+    /// every resolve, never silently clamped to 1.
+    #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
+    pub catalog_resolve_concurrency: Option<usize>,
+
     /// Disables every ADR-0046 read cache in the process entirely: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
     /// (`query::build_catalog`) both, not just the fetcher cache.
@@ -2996,6 +3005,14 @@ impl Cli {
             anyhow::bail!(
                 "--max-s3-requests '0' would reject every query; omit the flag to derive the \
                  budget from --shards and the flush cadence, or set a positive count"
+            );
+        }
+
+        if self.catalog_resolve_concurrency == Some(0) {
+            anyhow::bail!(
+                "--catalog-resolve-concurrency '0' would deadlock every catalog resolve: a \
+                 zero-permit semaphore can never be acquired. Omit the flag to use the \
+                 catalog's own default, or set a positive count."
             );
         }
 
