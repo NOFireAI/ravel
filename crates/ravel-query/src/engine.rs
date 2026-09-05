@@ -31,6 +31,7 @@ use crate::fetcher::{
     FetchError, FetchStats, FetchedHistogramSeries, FetchedSeriesSoa, ReadCache, SamplePriority,
     SegmentFetcher,
 };
+use crate::limiter::GetLimiter;
 use crate::log_fetcher::{LogFetchError, LogSegmentFetcher};
 use crate::log_series;
 use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
@@ -324,6 +325,12 @@ pub struct QueryEngine {
     /// selectors (ADR-1103). Built from the same store as `fetcher`,
     /// with the logs-specific fetch bounds from `config`.
     log_fetcher: LogSegmentFetcher,
+    /// The one process-shareable GET limiter (ADR-1195) this engine's
+    /// `fetcher` and `log_fetcher` were built to share. Kept so
+    /// [`Self::with_get_limiter`] can hand out the SAME `Arc` a caller
+    /// later wants a second engine (or a directly-constructed fetcher) to
+    /// also draw permits from.
+    get_limiter: Arc<GetLimiter>,
     config: EngineConfig,
     /// ADR-0071 distributed read fan-out. `None` is the default:
     /// the engine runs the local fetch path untouched. `Some` opts this engine
@@ -353,9 +360,18 @@ impl QueryEngine {
         } else {
             config.logs_max_fetch_run_bytes
         };
+        // One process-owned limiter shared by every fetcher this engine owns
+        // (ADR-1195), built from `store_get_concurrency` rather than the
+        // legacy `fetch_concurrency` the two `with_max_concurrent_gets` calls
+        // below used before this change -- `store_get_concurrency()` resolves
+        // to `fetch_concurrency` itself when unset, so an untouched
+        // deployment is unaffected.
+        let get_limiter = Arc::new(GetLimiter::new_unchecked(
+            config.store_get_concurrency().max(1),
+        ));
         let log_fetcher = LogSegmentFetcher::new(store.clone())
             .with_block_range_threshold(config.logs_block_range_threshold)
-            .with_max_concurrent_gets(config.fetch_concurrency)
+            .with_get_limiter(get_limiter.clone())
             .with_request_cost_bytes(config.logs_request_cost_bytes)
             .with_max_fetch_run_bytes(fetch_run_bytes)
             .unwrap_or_else(|err| {
@@ -366,13 +382,14 @@ impl QueryEngine {
                 );
                 LogSegmentFetcher::new(store.clone())
                     .with_block_range_threshold(config.logs_block_range_threshold)
-                    .with_max_concurrent_gets(config.fetch_concurrency)
+                    .with_get_limiter(get_limiter.clone())
                     .with_request_cost_bytes(config.logs_request_cost_bytes)
             });
         QueryEngine {
             catalog,
-            fetcher: SegmentFetcher::new(store),
+            fetcher: SegmentFetcher::new(store).with_get_limiter(get_limiter.clone()),
             log_fetcher,
+            get_limiter,
             config,
             distributed: None,
             federation: None,
@@ -419,8 +436,32 @@ impl QueryEngine {
         self
     }
 
+    /// Replaces the limiter on every fetcher this engine owns (`fetcher` and
+    /// `log_fetcher`) with `limiter`, so a process can share one
+    /// [`GetLimiter`] -- and so one process-wide GET ceiling -- across several
+    /// `QueryEngine`s (ADR-1195). `QueryEngine::new` already builds one
+    /// private limiter from `store_get_concurrency` and wires both fetchers to
+    /// it; this is the seam a caller uses to replace that private limiter with
+    /// a shared one after construction, mirroring [`Self::with_cache`].
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: Arc<GetLimiter>) -> Self {
+        self.fetcher = self.fetcher.with_get_limiter(limiter.clone());
+        self.log_fetcher = self.log_fetcher.with_get_limiter(limiter.clone());
+        self.get_limiter = limiter;
+        self
+    }
+
     pub fn config(&self) -> &EngineConfig {
         &self.config
+    }
+
+    /// The [`GetLimiter`] this engine's `fetcher` and `log_fetcher` currently
+    /// share. Test-only: production code has no reason to reach behind the
+    /// engine at its fetchers' shared limiter, only to replace it wholesale
+    /// via [`Self::with_get_limiter`].
+    #[cfg(test)]
+    fn get_limiter_for_test(&self) -> &Arc<GetLimiter> {
+        &self.get_limiter
     }
 
     /// Evaluates `query` as an instant query, returning its value paired with
@@ -1221,7 +1262,7 @@ impl QueryEngine {
         let max_samples = self.config.max_samples;
         let max_bytes_scanned = self.config.max_bytes_scanned;
         let max_s3_requests = self.config.max_s3_requests;
-        let concurrency = self.config.fetch_concurrency.max(1);
+        let concurrency = self.config.promql_fetch_fanout().max(1);
         // The query's absolute deadline in unix nanoseconds, from the injected
         // `now_ns` and the configured engine deadline. Threaded into the
         // distributed fan-out (ADR-0071 amendment, decision 2) so the coordinator
@@ -1763,7 +1804,7 @@ impl QueryEngine {
         ),
         QueryError,
     > {
-        let concurrency = self.config.fetch_concurrency.max(1);
+        let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
         let mut stream = stream::iter(snapshot.segments.iter().cloned())
             .map(|seg_ref| {
@@ -2071,7 +2112,7 @@ impl QueryEngine {
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestLimit,
     ) -> Result<Vec<Vec<ravel_segment::SeriesEntry>>, QueryError> {
-        let concurrency = self.config.fetch_concurrency.max(1);
+        let concurrency = self.config.promql_fetch_fanout().max(1);
         let matchers: Arc<Vec<LabelMatcher>> = Arc::new(matchers.to_vec());
         let mut stream = stream::iter(snapshot.segments.iter().cloned())
             .map(|seg_ref| {
@@ -7462,5 +7503,67 @@ mod coverage_wrapper_tests {
     #[tokio::test]
     async fn resolve_series_reports_partial_coverage_matching_its_stats() {
         assert_resolve_series_parity(false).await;
+    }
+}
+
+/// ADR-1195: `QueryEngine::new` builds one process-shareable `GetLimiter` and
+/// wires it to every fetcher it owns; `with_get_limiter` replaces it on all of
+/// them at once, for a process sharing one limiter across engines.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod get_limiter_tests {
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    fn engine(store: Arc<MemoryStore>) -> QueryEngine {
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default())
+    }
+
+    /// `QueryEngine::new` must wire the SAME limiter `Arc` to both fetchers it
+    /// owns, not two equal-but-distinct ones: two independent limiters would
+    /// let each fetcher exhaust its own pool while the other sits idle, which
+    /// is exactly the multiplication ADR-1195 exists to close.
+    #[test]
+    fn new_wires_one_shared_limiter_to_both_owned_fetchers() {
+        let engine = engine(Arc::new(MemoryStore::new()));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.get_limiter_for_test(),
+            engine.log_fetcher.get_limiter_for_test()
+        ));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.get_limiter_for_test(),
+            engine.get_limiter_for_test()
+        ));
+    }
+
+    /// `with_get_limiter` must replace the limiter on every fetcher the engine
+    /// owns, and record the new `Arc` as the engine's own, so a later
+    /// `with_get_limiter` call (or another engine sharing this one) still sees
+    /// the current limiter rather than the one `new` built privately.
+    #[test]
+    fn with_get_limiter_replaces_every_owned_fetcher() {
+        let engine = engine(Arc::new(MemoryStore::new()));
+        let original = engine.get_limiter_for_test().clone();
+        let replacement = Arc::new(GetLimiter::new(4).expect("4 permits is valid"));
+        let engine = engine.with_get_limiter(replacement.clone());
+
+        assert!(Arc::ptr_eq(engine.get_limiter_for_test(), &replacement));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.get_limiter_for_test(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            engine.log_fetcher.get_limiter_for_test(),
+            &replacement
+        ));
+        assert!(!Arc::ptr_eq(
+            engine.fetcher.get_limiter_for_test(),
+            &original
+        ));
     }
 }

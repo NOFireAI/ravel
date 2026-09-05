@@ -570,13 +570,14 @@ pub struct SegmentFetcher {
     /// instead of a footer suffix.
     whole_object_threshold: u64,
     limits: ReaderLimits,
-    /// Bounds the byte-range GETs kept in flight. Shared across `clone`s (it
-    /// is an `Arc`), so every concurrent segment fetch in one query draws
-    /// from the same permit pool rather than each opening its own unbounded
-    /// fan-out. It is only ever held around a single leaf
-    /// `store.get`, never across a scope that acquires another permit, so no
-    /// fetch can deadlock waiting on permits it already holds.
-    get_semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Bounds the byte-range GETs kept in flight. Shared across `clone`s and,
+    /// via [`Self::with_get_limiter`], across every other fetcher and engine
+    /// holding the same `Arc` (ADR-1195): every concurrent segment fetch in
+    /// the process draws from the same permit pool rather than each fetcher
+    /// opening its own unbounded fan-out. It is only ever held around a
+    /// single leaf `store.get`, never across a scope that acquires another
+    /// permit, so no fetch can deadlock waiting on permits it already holds.
+    get_limiter: std::sync::Arc<crate::GetLimiter>,
     /// ADR-0046's read cache, consulted by `guarded_get` for every
     /// byte-range (and whole-object) GET. `None` -- the default from
     /// `new` -- reproduces exactly the pre-cache behavior: every GET goes
@@ -620,7 +621,7 @@ impl SegmentFetcher {
             coalesce_gap: DEFAULT_COALESCE_GAP,
             whole_object_threshold: DEFAULT_WHOLE_OBJECT_THRESHOLD,
             limits: ReaderLimits::default(),
-            get_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            get_limiter: std::sync::Arc::new(crate::GetLimiter::new_unchecked(
                 DEFAULT_MAX_CONCURRENT_GETS,
             )),
             cache: None,
@@ -699,15 +700,34 @@ impl SegmentFetcher {
         self
     }
 
-    /// Sets the in-flight byte-range GET bound. Shared across
-    /// this fetcher's clones.
+    /// Sets the in-flight byte-range GET bound by building a new private
+    /// limiter. Shared across this fetcher's clones; not shared with any
+    /// other fetcher unless [`Self::with_get_limiter`] is used instead.
     #[must_use]
     pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
-        self.get_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(n.max(1)));
+        self.get_limiter = std::sync::Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
         self
     }
 
-    /// One store GET, bounded by the shared in-flight semaphore. The permit
+    /// Wires this fetcher to a caller-owned [`crate::GetLimiter`] (ADR-1195),
+    /// so it draws GET permits from the same pool as every other fetcher (and,
+    /// via [`crate::QueryEngine::with_get_limiter`], every other engine)
+    /// holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: std::sync::Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = limiter;
+        self
+    }
+
+    /// This fetcher's current limiter, for a test to `Arc::ptr_eq` against
+    /// another fetcher's or an engine's, proving two fetchers actually share
+    /// one `GetLimiter` rather than each holding an equal-but-distinct one.
+    #[cfg(test)]
+    pub(crate) fn get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
+        &self.get_limiter
+    }
+
+    /// One store GET, bounded by the shared in-flight limiter. The permit
     /// is released the moment the GET resolves; callers must
     /// never hold the returned future's permit across another
     /// `guarded_get`/`ensure_ranges` call, or a query whose in-flight GETs
@@ -726,10 +746,7 @@ impl SegmentFetcher {
         range: GetRange,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, StoreError> {
-        let _permit =
-            self.get_semaphore.acquire().await.map_err(|_| {
-                StoreError::Transient("fetch concurrency semaphore closed".to_string())
-            })?;
+        let _permit = self.get_limiter.acquire().await;
         accounting.record_s3_request(AccountedOp::Get);
         let got = self.store.get(key, range).await?;
         accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
@@ -3388,6 +3405,151 @@ mod tests {
             object_bytes.len() as u64,
             "the whole-object GET charges exactly the object's byte length at completion"
         );
+    }
+
+    /// ADR-1195: two `SegmentFetcher`s sharing one `GetLimiter::new(1)` must
+    /// never let both their GETs reach the store concurrently. The gate
+    /// observes the store's own in-flight GET count directly, so this pins
+    /// the process-wide bound rather than trusting the fetchers' bookkeeping.
+    #[tokio::test]
+    async fn shared_get_limiter_bounds_peak_concurrent_gets_to_one() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let shared = Arc::new(crate::GetLimiter::new(1).expect("1 permit is valid"));
+        let fetcher_a = SegmentFetcher::new(backend.clone()).with_get_limiter(shared.clone());
+        let fetcher_b = SegmentFetcher::new(backend).with_get_limiter(shared);
+
+        let seg_a = seg_ref.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(tenant_hash, &seg_a, &[]).await });
+        let seg_b = seg_ref.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(tenant_hash, &seg_b, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30 s");
+
+        // Give the other fetch's task every chance to also reach the store: if
+        // the shared limiter did not actually bound concurrency, its GET would
+        // land here too and `held_count` would climb to 2 well within this
+        // window.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "one shared permit must cap in-flight GETs at exactly 1, \
+             not merely at more than 0"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must be the only one held once the first releases"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b");
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
+    }
+
+    /// Control for [`shared_get_limiter_bounds_peak_concurrent_gets_to_one`]:
+    /// the same two fetchers, but each with its OWN private limiter of 1
+    /// permit rather than a shared one. Private pools do not add, so both
+    /// GETs reach the store at once and peak in-flight is exactly 2 --
+    /// proving the shared test's bound of 1 comes from sharing, not from some
+    /// other serialization (object identity, a single-flight cache, tokio
+    /// scheduling).
+    #[tokio::test]
+    async fn private_get_limiters_do_not_share_a_bound() {
+        use ravel_object_store::fault::{GateHandle, Occurrence};
+
+        let (source, tenant_hash, seg_ref) = write_test_segment().await;
+        let object_bytes = source
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("read back test segment")
+            .data;
+        let memory = MemoryStore::new();
+        memory
+            .put(
+                &seg_ref.data_object_key,
+                object_bytes.clone(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put segment object");
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle = fault.hold(Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher_a = SegmentFetcher::new(backend.clone()).with_max_concurrent_gets(1);
+        let fetcher_b = SegmentFetcher::new(backend).with_max_concurrent_gets(1);
+
+        let seg_a = seg_ref.clone();
+        let handle_a = tokio::spawn(async move { fetcher_a.fetch(tenant_hash, &seg_a, &[]).await });
+        let seg_b = seg_ref.clone();
+        let handle_b = tokio::spawn(async move { fetcher_b.fetch(tenant_hash, &seg_b, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(2))
+            .await
+            .expect("two independently-limited fetchers both reach the store within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            2,
+            "two private 1-permit limiters admit exactly 2 concurrent GETs, not 1"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b");
+        assert_eq!(a.len(), 2);
+        assert_eq!(b.len(), 2);
     }
 
     /// ADR-0044: accounting must be pure observation. The accounted and

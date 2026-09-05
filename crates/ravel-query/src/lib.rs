@@ -10,6 +10,7 @@ pub mod erasure;
 mod error;
 mod fetcher;
 pub mod http;
+mod limiter;
 mod log_fetcher;
 pub mod log_series;
 mod phase_accounting;
@@ -31,6 +32,7 @@ pub use fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, ReadCache,
     SamplePriority, SegmentFetcher,
 };
+pub use limiter::GetLimiter;
 pub use log_fetcher::{
     AssemblyBufferStats, BlockRangeFetcher, BlockRangeStats, BlockStatsReport, CarriedFooter,
     ColumnarBlockOutcome, DEFAULT_LOG_COALESCE_GAP, DEFAULT_LOG_COVERAGE_THRESHOLD,

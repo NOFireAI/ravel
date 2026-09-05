@@ -181,6 +181,14 @@ pub struct SpanSegmentFetcher {
     /// builds the RAM or RAM-over-disk variant the same way the metric and log
     /// fetchers do.
     cache: Option<ReadCache>,
+    /// Bounds in-flight object-store GETs (ADR-1195). This is this fetcher's
+    /// FIRST-EVER concurrency bound: before ADR-1195, `SpanSegmentFetcher` held
+    /// no semaphore at all and its GET concurrency was limited only by its
+    /// caller. `new` gives it a private limiter at
+    /// [`crate::fetcher::DEFAULT_MAX_CONCURRENT_GETS`]; [`Self::with_get_limiter`]
+    /// wires it to the one process-shared limiter every query-side fetcher can
+    /// hold instead.
+    get_limiter: Arc<crate::GetLimiter>,
 }
 
 impl SpanSegmentFetcher {
@@ -189,7 +197,29 @@ impl SpanSegmentFetcher {
             store,
             cfg: RspanConfig::default(),
             cache: None,
+            get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
+                crate::fetcher::DEFAULT_MAX_CONCURRENT_GETS,
+            )),
         }
+    }
+
+    /// Sets the in-flight GET bound by building a new private limiter. Shared
+    /// across this fetcher's clones; not shared with any other fetcher unless
+    /// [`Self::with_get_limiter`] is used instead.
+    #[must_use]
+    pub fn with_max_concurrent_gets(mut self, n: usize) -> Self {
+        self.get_limiter = Arc::new(crate::GetLimiter::new_unchecked(n.max(1)));
+        self
+    }
+
+    /// Wires this fetcher to a caller-owned [`crate::GetLimiter`] (ADR-1195),
+    /// so it draws GET permits from the same pool as every other fetcher (and,
+    /// via [`crate::QueryEngine::with_get_limiter`], every other engine)
+    /// holding the same `Arc`.
+    #[must_use]
+    pub fn with_get_limiter(mut self, limiter: Arc<crate::GetLimiter>) -> Self {
+        self.get_limiter = limiter;
+        self
     }
 
     /// Overrides the [`RspanConfig`] used for section-size caps when decoding.
@@ -282,6 +312,7 @@ impl SpanSegmentFetcher {
         }
 
         let key = &seg_ref.data_object_key;
+        let _permit = self.get_limiter.acquire().await;
         let got = self
             .store
             .get(key, GetRange::Full)
@@ -510,6 +541,7 @@ impl SpanSegmentFetcher {
         let key = &seg_ref.data_object_key;
 
         let Some(cache) = &self.cache else {
+            let _permit = self.get_limiter.acquire().await;
             let got = self
                 .store
                 .get(key, GetRange::Full)
@@ -529,6 +561,7 @@ impl SpanSegmentFetcher {
         // tiered tier (see `ReadCache::get_or_fetch`).
         let (bytes, source) = cache
             .get_or_fetch(cache_key, || async move {
+                let _permit = self.get_limiter.acquire().await;
                 let got = self.store.get(key, GetRange::Full).await?;
                 accounting.record_s3_request(AccountedOp::Get);
                 accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
@@ -1586,5 +1619,79 @@ mod tests {
             row_out.records.len(),
             "both exits select the identical surviving-row multiset under a trace filter"
         );
+    }
+
+    /// ADR-1195: `SpanSegmentFetcher` had no GET concurrency bound at all
+    /// before this change. `with_max_concurrent_gets(1)` must cap in-flight
+    /// GETs at exactly 1 -- proven the same way as the RSEG/RLOG shared-bound
+    /// tests (`crate::fetcher`'s `shared_get_limiter_bounds_peak_concurrent_gets_to_one`):
+    /// a `FaultStore` hold gate observes the store's own in-flight GET count
+    /// directly, so this pins the fetcher's own bookkeeping against the
+    /// store's view, not just against itself.
+    #[tokio::test]
+    async fn get_limiter_bounds_peak_concurrent_gets_to_permit_count() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence};
+
+        let memory = MemoryStore::new();
+        let records = vec![span_with_attrs_and_events(trace(1), span(1), 100, 200)];
+        let seg = write_object(&memory, 0, &records).await;
+        let fault = Arc::new(FaultStore::new(memory, FaultPlan::default()));
+        let gate: GateHandle =
+            fault.hold(ravel_object_store::fault::Op::Get, None, Occurrence::Always);
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+
+        let fetcher = SpanSegmentFetcher::new(backend).with_max_concurrent_gets(1);
+        let query = all_query();
+
+        let fetcher_a = fetcher.clone();
+        let seg_a = seg.clone();
+        let query_a = query;
+        let handle_a =
+            tokio::spawn(async move { fetcher_a.fetch(&seg_a, &query_a, None, None, &[]).await });
+        let fetcher_b = fetcher.clone();
+        let seg_b = seg.clone();
+        let query_b = query;
+        let handle_b =
+            tokio::spawn(async move { fetcher_b.fetch(&seg_b, &query_b, None, None, &[]).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("one of the two fetches issues its GET within 30 s");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "one permit must cap in-flight GETs at exactly 1, not merely more than 0"
+        );
+
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("releasing the first permit lets the second GET proceed within 30 s");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must be the only one held once the first releases"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let a = tokio::time::timeout(std::time::Duration::from_secs(30), handle_a)
+            .await
+            .expect("fetch a completes within 30 s")
+            .expect("join fetch a")
+            .expect("fetch a")
+            .expect("fetch a found the segment relevant");
+        let b = tokio::time::timeout(std::time::Duration::from_secs(30), handle_b)
+            .await
+            .expect("fetch b completes within 30 s")
+            .expect("join fetch b")
+            .expect("fetch b")
+            .expect("fetch b found the segment relevant");
+        assert_eq!(a.records.len(), 1);
+        assert_eq!(b.records.len(), 1);
     }
 }
