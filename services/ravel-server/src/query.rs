@@ -103,22 +103,32 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// disk tier shares the one `--cache-max-bytes` number the fetcher cache and the
 /// catalog RAM tier already share. `--disable-cache` (the `0` sentinel) wins
 /// over a configured `cache_dir`: no cache of either tier is built.
+///
+/// `resolve_get_concurrency` is the CLI's `--catalog-resolve-concurrency`.
+/// `None` leaves `ravel_catalog::CatalogConfig`'s own default in place;
+/// `Some(n)` overrides it for this catalog instance.
 pub fn build_catalog(
     store: Arc<dyn ObjectStoreBackend>,
     shard_count: u32,
     disable_cache: bool,
     cache_max_bytes: u64,
     cache_dir: Option<PathBuf>,
+    resolve_get_concurrency: Option<usize>,
 ) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
     // --disable-cache into a `None` fetcher cache.
     let byte_cache_max_bytes = if disable_cache { 0 } else { cache_max_bytes };
-    let catalog_config = CatalogConfig {
+    let mut catalog_config = CatalogConfig {
         shard_count,
         byte_cache_max_bytes,
         ..CatalogConfig::default()
     };
+    // `None` leaves ravel-catalog's own default (currently 128) as the sole
+    // source of truth; only override when the CLI passed an explicit value.
+    if let Some(concurrency) = resolve_get_concurrency {
+        catalog_config.resolve_get_concurrency = concurrency;
+    }
     // Durable shard_count enforcement on the read path (ADR-0050 section 5,
     // EC5): the first resolve for each (tenant, signal) validates this
     // catalog's configured shard_count against the tenant's provisioning
@@ -409,6 +419,7 @@ mod catalog_cache_tests {
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
+            None,
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -448,6 +459,7 @@ mod catalog_cache_tests {
             1,
             true,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
             None,
         )
         .expect("catalog builds");
@@ -507,7 +519,7 @@ mod catalog_cache_tests {
     fn build_catalog_wires_cache_max_bytes_through_to_the_byte_cache() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let budget = 7 * 1024 * 1024;
-        let catalog = build_catalog(store, 1, false, budget, None).expect("catalog builds");
+        let catalog = build_catalog(store, 1, false, budget, None, None).expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
             budget,
@@ -555,6 +567,7 @@ mod catalog_cache_tests {
             cli.disable_cache,
             resolved.catalog_cache_max_bytes,
             cli.cache_dir.clone(),
+            None,
         )
         .expect("catalog builds");
         assert_eq!(
@@ -579,6 +592,7 @@ mod catalog_cache_tests {
             flagged.disable_cache,
             resolved.catalog_cache_max_bytes,
             flagged.cache_dir.clone(),
+            None,
         )
         .expect("catalog builds");
         assert_eq!(
@@ -610,6 +624,7 @@ mod tests {
             1,
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
             None,
         )
         .expect("catalog");
@@ -665,6 +680,7 @@ mod tests {
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
             None,
+            None,
         )
         .expect("catalog");
         let engine_config = EngineConfig {
@@ -707,6 +723,7 @@ mod tests {
             1,
             false,
             ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
             None,
         )
         .expect("catalog");
