@@ -1619,13 +1619,17 @@ fn render_metadata_cache_family(out: &mut String, mode: Mode, counters: &Metadat
 /// decodable record whose generation history fails structural validation
 /// (`CorruptGenerations`: a scalar/generation-0 mismatch or a nonzero first
 /// activation hour), or pre-ADR data a lower `shard_count` would hide, caught
-/// on a dynamic tenant's first touch or on the maintain per-tenant loop. A nonzero value means at
-/// least one tenant's provisioning record could not be validated; the
-/// operations guide pages on any increase.
+/// on a dynamic tenant's first touch or on the maintain per-tenant loop. A
+/// nonzero value means at least one tenant failed a hard provisioning check:
+/// either an existing record could not be validated, or an adoption was
+/// refused before any record was written; the operations guide pages on any
+/// increase.
 ///
 /// `ravel_provisioning_shard_count_drift_total` counts the ADR-0082 case: a
-/// decodable record whose recorded generation-0 `shard_count` differs from this
-/// process's live `--shards` default. That drift is tolerated (routing uses the
+/// decodable record with a structurally valid generation history whose
+/// recorded generation-0 `shard_count` differs from this process's live
+/// `--shards` default (a `CorruptGenerations` record fails hard above and is
+/// never counted here). That drift is tolerated (routing uses the
 /// record's own generation history), so it is an informational signal, not a
 /// failure. Both are process-global atomic reads with no labels beyond mode.
 fn render_provisioning_family(
@@ -1649,7 +1653,7 @@ fn render_provisioning_family(
     write_header(
         out,
         "ravel_provisioning_shard_count_drift_total",
-        "Provisioning validations where a decodable record's recorded shard_count differed from the live --shards default; the drift is tolerated and routing uses the record's own generation history (ADR-0082).",
+        "Provisioning validations where a decodable record with a structurally valid generation history had a recorded shard_count that differed from the live --shards default; the drift is tolerated and routing uses the record's own generation history (ADR-0082).",
         "counter",
     );
     write_sample(
