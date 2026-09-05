@@ -20,6 +20,10 @@ if [[ ! -d "${tmproot}" ]]; then
   echo "FAIL  could not create a temp dir for the scratch repos" >&2
   exit 1
 fi
+# Physical path, so the paths this test derives compare equal to the ones the
+# scripts print via `pwd` and `git rev-parse --git-common-dir`. On macOS
+# `$TMPDIR` is a symlink under /var and may carry a trailing slash.
+tmproot="$(cd "${tmproot}" && pwd -P)"
 trap 'rm -rf "${tmproot}"' EXIT
 
 pass=0
