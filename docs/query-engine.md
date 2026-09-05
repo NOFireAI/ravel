@@ -1710,35 +1710,51 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   task's scope to change).
 - `serviceBatches`: batches this query's per-segment fan-out was forced into
   by the binding concurrency it actually ran under. The metrics fetch is a
-  NESTED fan-out: one `buffer_unordered(promql_fetch_fanout)` over distinct
-  matcher plans (`distinct_plans_by_matcher` in
-  `crates/ravel-query/src/engine.rs`), each running its own
+  NESTED fan-out with three levels of admission, all of which bound the
+  batch count: an OUTER `buffer_unordered(promql_fetch_fanout)` over
+  distinct matcher plans (`distinct_plans_by_matcher` in
+  `crates/ravel-query/src/engine.rs`), which admits at most
+  `promql_fetch_fanout` plans at once, however many distinct matcher sets
+  the query has; each admitted plan's own INNER
   `buffer_unordered(promql_fetch_fanout)` over that plan's segments
-  (`prefetch_metric_plans`/`fetch_all_samples_and_histograms`). Those inner
-  streams do not get independent budgets: every GET from every plan passes
-  through the one shared `GetLimiter` described under "GET concurrency
-  (ADR-1195)" above, whose permit count is the resolved
-  `store_get_concurrency`. That limiter is shared inside one `QueryEngine`,
-  which is the scope this figure models: it says nothing about GETs another
-  engine in the same process issues, and nothing about the RLOG
-  whole-object funnel, which takes no permit at all. So the binding
-  concurrency is `min(distinctMatcherSets * promql_fetch_fanout,
-  sharedGetPermits)`, and the work this fan-out issues is
-  `segment_count * distinctMatcherSets` GETs (distinct matcher sets, not the
-  raw plan count `stats.estimate` scales by -- a query naming two
-  `SelectorPlan`s that share one matcher set, `up + up offset 5m`, is
-  fetched in one pass, so its `serviceBatches` does not double). 64 segments,
+  (`prefetch_metric_plans`/`fetch_all_samples_and_histograms`); and the one
+  shared `GetLimiter` described under "GET concurrency (ADR-1195)" above,
+  whose permit count is the resolved `store_get_concurrency` and which every
+  GET from every plan passes through regardless of which level admitted it.
+  That limiter is shared inside one `QueryEngine`, which is the scope this
+  figure models: it says nothing about GETs another engine in the same
+  process issues, and nothing about the RLOG whole-object funnel, which
+  takes no permit at all.
+  The outer and inner levels do not multiply freely: plan capacity is
+  `promql_fetch_fanout * min(distinctMatcherSets, promql_fetch_fanout)`, not
+  `promql_fetch_fanout * distinctMatcherSets` -- the outer stream can never
+  have more than `promql_fetch_fanout` plans in flight even when there are
+  more distinct matcher sets than that. So the binding concurrency is
+  `min(promql_fetch_fanout * min(distinctMatcherSets, promql_fetch_fanout),
+  sharedGetPermits)`, and the work this fan-out issues is `segment_count *
+  distinctMatcherSets` GETs, uncapped (distinct matcher sets, not the raw
+  plan count `stats.estimate` scales by -- a query naming two `SelectorPlan`s
+  that share one matcher set, `up + up offset 5m`, is fetched in one pass,
+  so its `serviceBatches` does not double; every distinct matcher set still
+  issues its own GETs, just not all of them concurrently). 64 segments,
   `promql_fetch_fanout` 8, two distinct matcher sets, and 16 shared permits
-  gives 128 GETs at binding concurrency `min(16, 16) = 16`, i.e. 8 batches,
-  not `ceil(64 * 2 / 8) = 16`: dividing the plan-multiplied numerator by the
-  un-multiplied fan-out width alone double-counts the plan fan-out. A
-  single-plan query reduces to `ceil(segment_count / promql_fetch_fanout)`,
-  since `min(promql_fetch_fanout, sharedGetPermits)` is the fan-out width
-  whenever the shared pool is at least as large as one plan's own fan-out
-  bound, as it is for any config that leaves both ADR-1195 knobs unset (both
-  then resolve to `fetch_concurrency`). Lower `--store-get-concurrency`
-  below `--promql-fetch-fanout` and the limiter binds instead, for a
-  single-plan query too; this figure follows whichever bound is smaller.
+  gives 128 GETs at binding concurrency `min(8 * min(2, 8), 16) = min(16,
+  16) = 16`, i.e. 8 batches, not `ceil(64 * 2 / 8) = 16`: dividing the
+  plan-multiplied numerator by the un-multiplied fan-out width alone
+  double-counts the plan fan-out. Conversely, `promql_fetch_fanout` 1 with
+  three distinct matcher sets, 20 segments, and 1000 shared permits gives
+  binding concurrency `min(1 * min(3, 1), 1000) = 1`, i.e. 60 batches (60
+  GETs one at a time) -- capping the multiplier by `sharedGetPermits` alone,
+  without also capping it by `promql_fetch_fanout`, would have reported 20,
+  silently assuming all 3 plans ran at once when the outer stream never
+  admits more than 1. A single-plan query reduces to
+  `ceil(segment_count / promql_fetch_fanout)`, since `min(promql_fetch_fanout,
+  sharedGetPermits)` is the fan-out width whenever the shared pool is at
+  least as large as one plan's own fan-out bound, as it is for any config
+  that leaves both ADR-1195 knobs unset (both then resolve to
+  `fetch_concurrency`). Lower `--store-get-concurrency` below
+  `--promql-fetch-fanout` and the limiter binds instead, for a single-plan
+  query too; this figure follows whichever bound is smaller.
 - `unfoldedSegmentsResolved`: the EXACT (never estimated) count of segments
   this query's resolve took from the recent (unfolded) listing path rather
   than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073 decision 1).
