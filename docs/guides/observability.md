@@ -247,7 +247,7 @@ Labels: `mode`.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_provisioning_shard_count_mismatch_total` | Provisioning checks that failed hard: an unreadable record, or pre-ADR data a lower `shard_count` would hide. Alert on any increase; [Troubleshooting](operations/troubleshooting.md) gives its rule. |
+| `ravel_provisioning_shard_count_mismatch_total` | Provisioning checks that failed hard: an unreadable record, a decodable record whose generation history fails structural validation, or pre-ADR data a lower `shard_count` would hide. Alert on any increase; [Troubleshooting](operations/troubleshooting.md) gives its rule. |
 | `ravel_provisioning_shard_count_drift_total` | Validations where a decodable record's recorded `shard_count` differed from the live `--shards` default. The drift is tolerated and routing uses the record's own generation history, so this is informational: a nonzero value is expected after lowering the global default, not a fault. |
 
 ### Store reachability (`ravel_store_reachable`, `ravel_store_probe_failures_total`)
