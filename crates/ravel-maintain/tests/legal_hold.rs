@@ -10,11 +10,14 @@ mod common;
 use common::*;
 use ravel_commit::keys;
 use ravel_maintain::{
-    Bucket, CompactionOutcome, CompactorConfig, FixedClock, LeaseCheck, LegalHoldCheck, NoLeases,
-    SweepReport, compact_bucket, shard_hold_scopes, sweep_shard, write_hold_clear, write_hold_set,
+    AUDIT_HOLD_SHARD, Bucket, CompactionOutcome, CompactorConfig, FixedClock, LeaseCheck,
+    LegalHoldCheck, NoLeases, SweepReport, compact_bucket, shard_hold_scopes, sweep_shard,
+    write_hold_clear, write_hold_set,
 };
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
+use ravel_types::Signal;
 use uuid::Uuid;
 
 fn cfg() -> CompactorConfig {
@@ -345,6 +348,91 @@ async fn empty_scope_is_rejected_before_any_write() {
         before,
         "no object written for a rejected clear"
     );
+}
+
+/// The tick a real caller composes: refresh the hold snapshot, then sweep
+/// under it. Plain `?` propagation means a failed refresh never reaches the
+/// sweep call at all. No production symbol performs this composition yet
+/// (lifecycle traceability row 22 names the fallible `refresh` alone, not a
+/// tick that wraps it), so the tick is local to this test.
+async fn tick(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    bucket: &Bucket,
+) -> ravel_maintain::Result<SweepReport> {
+    let lease = LegalHoldCheck::refresh(store, &bucket.tenant_hash).await?;
+    sweep_shard(
+        store,
+        clock,
+        &cfg(),
+        &lease,
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+    )
+    .await
+}
+
+/// SetRefresh / RefreshFailureNeverSweeps (lifecycle traceability row 22): a
+/// legal-hold refresh that fails must fail closed for a tick composing it with
+/// a sweep - the error stops the tick before the sweep call, deleting nothing,
+/// rather than the tick treating a failed refresh as "no holds" and sweeping
+/// anyway.
+///
+/// To watch this FAIL, change `tick` above to swallow a refresh error and
+/// fall back to `NoLeases` (the shape a careless tick could take) instead of
+/// propagating it with `?`: the sweep then runs unheld, the superseded L0
+/// inputs and their commit records are deleted, and the post-tick
+/// `l0_data_count`/`commit_record_count` assertions below fail.
+#[tokio::test]
+async fn refresh_failure_skips_the_sweep_tick_and_deletes_nothing() {
+    let mem = MemoryStore::new();
+    let created = sealed_now_ns();
+    let clock = FixedClock::new(created);
+    let bucket = seed_and_compact(&mem, &clock).await;
+    let data_before = l0_data_count(&mem, &bucket).await;
+    let records_before = commit_record_count(&mem, &bucket).await;
+    assert!(data_before > 0, "fixture seeds superseded L0 data");
+    assert!(records_before > 0, "fixture seeds commit records");
+
+    let hold_shard_prefix =
+        keys::commit_shard_prefix(&bucket.tenant_hash, Signal::Audit, AUDIT_HOLD_SHARD)
+            .expect("hold shard prefix");
+    let plan = FaultPlan::empty()
+        .with_rule(Rule::new(Op::List, ScriptedFault::Timeout).with_key_contains(hold_shard_prefix))
+        .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout));
+    let store = FaultStore::new(mem, plan);
+
+    clock.set(past_horizon(created));
+    let err = tick(&store, &clock, &bucket)
+        .await
+        .expect_err("a failed refresh must fail the tick, not sweep unheld");
+    assert!(
+        matches!(err, ravel_maintain::MaintainError::Store(_)),
+        "the refresh's own LIST failure surfaces as a store error: {err:?}"
+    );
+
+    assert_eq!(
+        store.fault_count(Op::List, FaultKind::Timeout),
+        1,
+        "exactly one LIST of the hold shard, and it was the one that failed"
+    );
+    assert_eq!(
+        store.fault_count(Op::Delete, FaultKind::Timeout),
+        0,
+        "the tick never reached the sweep, so it issued zero deletes"
+    );
+    assert_eq!(
+        l0_data_count(&store, &bucket).await,
+        data_before,
+        "superseded data survives a tick whose refresh failed"
+    );
+    assert_eq!(
+        commit_record_count(&store, &bucket).await,
+        records_before,
+        "and so do the commit records"
+    );
+    assert_l1_intact(&store, &bucket).await;
 }
 
 /// Every object key under the tenant prefix, sorted.
