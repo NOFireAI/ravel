@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Proofs for issue #1192: check-tla.sh must enforce its TLC wall-clock
-# budget via GNU timeout(1), never report a timed-out run as a pass, and
-# refuse outright when no GNU timeout is available. Run:
+# budget via GNU timeout(1), never report a timed-out run as a pass, refuse
+# outright when no GNU timeout is available or when one accepts the banner
+# check but rejects --kill-after, and never require Java for the
+# traceability lane. Run:
 #   bash scripts/check-tla.test.sh
 set -uo pipefail
 
@@ -142,6 +144,79 @@ else
     ok
 fi
 rm -rf "$bdir"
+
+# --- (d) refusal when timeout's banner lies about --kill-after -------------
+# A candidate that prints the GNU coreutils --version banner but rejects
+# --kill-after must be refused at startup, before java ever runs: accepting
+# it on the banner alone would only fail once a lane is already mid-run.
+echo "--- (d) timeout shim: real banner, --kill-after rejected: expect exit 2, refusal, java never launched"
+ddir="$(mktemp -d)"
+dmarker="$ddir/java-was-invoked"
+for tool in bash git basename dirname date mktemp grep sed awk cat tr sha256sum mkdir rm cut wc head tail printf env sh; do
+    real="$(command -v "$tool" 2>/dev/null)" || continue
+    ln -sf "$real" "$ddir/$tool"
+done
+timeoutshim="$ddir/timeout"
+cat > "$timeoutshim" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    --version) echo 'timeout (GNU coreutils) 9.4'; exit 0 ;;
+esac
+for a in "$@"; do
+    case "$a" in
+        --kill-after*) exit 125 ;;
+    esac
+done
+exit 0
+EOF
+chmod +x "$timeoutshim"
+javashim_d="$ddir/java"
+cat > "$javashim_d" <<EOF
+#!/usr/bin/env bash
+: > "$dmarker"
+case "\$1" in
+    -version) echo 'openjdk version "21.0.4" 2024-07-16' >&2; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$javashim_d"
+
+out=""
+out="$(env -i PATH="$ddir" HOME="$HOME" RAVEL_TLA_JAVA="$javashim_d" "$SCRIPT" smoke 2>&1)"
+code=$?
+
+if [ "$code" -eq 2 ]; then ok; else bad "d: expected exit 2, got $code"; fi
+if printf '%s' "$out" | grep -qF 'GNU timeout(1) not found'; then
+    ok
+else
+    bad "d: refusal line not printed; got: $out"
+fi
+if [ -e "$dmarker" ]; then
+    bad "d: java shim was invoked despite the --kill-after refusal"
+else
+    ok
+fi
+rm -rf "$ddir"
+
+# --- (e) traceability needs no Java -----------------------------------------
+# main used to call resolve_java before dispatching on the subcommand, so
+# traceability (pure filesystem, no TLC) refused with "no Java found" on a
+# host with no JDK. Restrict PATH to what traceability actually needs (git,
+# basename, dirname, date, mktemp, grep, sed, awk, cat, tr, mkdir, rm, cut,
+# wc, head, tail, printf, env, sh) and give it no java and no shim.
+echo "--- (e) no java, no shim on PATH: traceability must exit 0"
+edir="$(mktemp -d)"
+for tool in bash git basename dirname date mktemp grep sed awk cat tr mkdir rm cut wc head tail printf env sh; do
+    real="$(command -v "$tool" 2>/dev/null)" || continue
+    ln -sf "$real" "$edir/$tool"
+done
+
+out=""
+out="$(env -i PATH="$edir" HOME="$HOME" "$SCRIPT" traceability 2>&1)"
+code=$?
+
+if [ "$code" -eq 0 ]; then ok; else bad "e: expected exit 0, got $code; output: $out"; fi
+rm -rf "$edir"
 
 # --- (c) normal operation is unchanged (see report; needs the real TLC jar
 # and a JDK, so it is not run unpiped here) ----------------------------------
