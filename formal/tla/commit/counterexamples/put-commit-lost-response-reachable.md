@@ -1,8 +1,8 @@
 # put-commit-lost-response-reachable
 
 Obligation, not a bug. `PutCommitLostResponseUnreachable` is a predicate
-that must fail once `MaxRetries > 0`, or the retry coverage `smoke.cfg`
-exists to add is vacuous: nothing would ever exercise a writer retrying
+that must fail once `MaxRetries > 0`, or the retry coverage that
+`smoke.cfg` adds is vacuous: nothing would ever exercise a writer retrying
 after losing the commit PUT's response.
 
 Violated invariant: `PutCommitLostResponseUnreachable` (safety, TLC exit
