@@ -65,10 +65,19 @@ LISTs = sum over shards of ceil(records_in_shard / 1000) + 1
 paginates its own records, and the `+ 1` is the pending-erasure LIST that runs
 alongside. The benchmark spreads records evenly, so at 4 shards this collapses
 to `4 * ceil(records / 4 / 1000) + 1`: 5, 9, 13, 29. Production distribution is
-not even, and the sum is the form that holds either way. This is the per-shard
-recursive prefix scan, not the per-(shard, hour) loop: that loop would have
-issued a bucket-driven figure near 120 at every point, flat in record count,
-which none of the four show.
+not even, and the sum is the form that holds either way.
+
+Which path produces it was investigated under #1214 and is not the one the shape
+suggests. `use_prefix` (`crates/ravel-catalog/src/catalog.rs:1631-1636`) requires
+`listing_suffix_buckets` to reach `prefix_list_crossover_requests` (720,
+`config.rs:155`), and this window is roughly 120 buckets, so the crossover never
+fires and the DEFAULT bounded path runs (`list_window_bounded` ->
+`list_shard_hours`, `catalog.rs:1897,1995`). Since issue #730 that path also
+issues one recursive paginated LIST per shard rather than one per (shard, hour),
+so both paths yield the same per-shard page count and the measurement cannot
+distinguish them. They differ only in an early break once a key's hour passes
+the window end (`catalog.rs:2050-2051`), which never triggers here because the
+benchmark resolves before any fold and writes nothing past that hour.
 
 The per-shard denominator matters for more than arithmetic, and it runs the
 opposite way to intuition. Every shard rounds its own partial page up, so page
@@ -166,9 +175,15 @@ records, per query:
   observation-based figure varies run to run for identical work, and a figure
   the same execution reports differently twice cannot gate anything. It is an
   upper bound on waves, and the docs must say so.
-- `unfolded_records_resolved`: how many records this resolve took from the
-  listing path rather than from a snapshot part. This is the multiplier above,
-  measured per query instead of estimated.
+- `unfolded_segments_resolved`: how many SEGMENTS this resolve took from the
+  listing path rather than from a snapshot part. Segments, not records:
+  `SegmentOrigins.origins` is parallel to `Snapshot::segments`, so an L1
+  compaction record naming several parts contributes several entries, and
+  ravel-query cannot recover a record count from an origin tag alone. For the
+  L0 commit records that make up the unsealed tail the two coincide one to one,
+  which is why this is the figure the gate in section 4 reads; a tail carrying
+  resolved compaction records reads high against a record-denominated
+  threshold, and the gate states its own denominator accordingly.
 - `plan_class`: one of `metadata_only`, `selective_indexed`, `exhaustive_scan`,
   decided before execution.
 
@@ -315,16 +330,19 @@ own ADR.
 Build the tail checkpoint only if, after decision 2's knob defaults are applied,
 both hold over a 24-hour window on a real workload:
 
-- `unfolded_records_resolved` at p99 is at least **2,000** per resolve. At the
+- `unfolded_segments_resolved` at p99 is at least **2,000** per resolve. At the
   measured 1.6 ms per record that is about 3.2 seconds of resolve before a
   predicate rejects anything, which is the point where resolve stops being a
-  rounding error against a query budget.
+  rounding error against a query budget. The threshold is denominated in
+  segments because that is what the read path can count; it equals a record
+  count exactly for an all-L0 tail, and over-reads for a tail whose resolved
+  records include compaction records.
 - At least **10%** of resolves over recent data are cold. This needs a
   per-resolve indicator that does not exist yet: the record-cache counters are
   record-level, and a single resolve mixes hits and misses, so a pooled hit
   ratio cannot say how many resolves were cold. Issue #1219 adds
-  `unfolded_records_served_from_cache` per resolve, and a resolve counts as cold
-  when fewer than half its unfolded records came from the cache. Until that
+  `unfolded_segments_served_from_cache` per resolve, and a resolve counts as cold
+  when fewer than half its unfolded segments came from the cache. Until that
   figure exists the gate cannot be evaluated, and no substitute inference about
   pod lifetimes is admissible.
 
@@ -363,7 +381,7 @@ inventory entry and a degraded read mode before turning `target_bytes` is
 expensive in exactly the way that is hard to reverse.
 
 **Turn the knobs and skip the instrumentation.** The knob experiment needs a
-number the tree does not currently produce (`unfolded_records_resolved`), and
+number the tree does not currently produce (`unfolded_segments_resolved`), and
 the 13-LIST anomaly shows that reasoning about this path from the code alone
 already produced one wrong prediction in this ADR.
 
