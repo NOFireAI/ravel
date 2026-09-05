@@ -6644,13 +6644,13 @@ mod whole_object_get_limiter_tests {
         }
     }
 
-    /// `whole_object_bytes`'s NO-cache GET (log_fetcher.rs:2034) must be
+    /// `whole_object_bytes`'s NO-cache GET (log_fetcher.rs:2038) must be
     /// bounded by the shared limiter, reached here through the production
     /// tenant-aware funnel (`fetch_accounted_with_tenant`), not the
     /// untenanted `fetch_accounted` the tests above use.
     ///
     /// Non-vacuity: removing the `let _permit =
-    /// self.get_limiter.acquire()...` at log_fetcher.rs:2034 lets both GETs
+    /// self.get_limiter.acquire()...` at log_fetcher.rs:2038 lets both GETs
     /// proceed immediately, so `wait_until_held(2)` below resolves instead of
     /// timing out.
     #[tokio::test]
@@ -6689,14 +6689,22 @@ mod whole_object_get_limiter_tests {
             "one shared permit must cap in-flight no-cache whole_object_bytes \
              GETs at exactly 1"
         );
-        assert_eq!(gate.held_count(), 1, "peak in-flight GETs must be exactly 1");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "peak in-flight GETs must be exactly 1"
+        );
         for id in gate.held() {
             assert!(gate.release(id), "held id must release");
         }
         tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
             .await
             .expect("releasing the first permit lets the second GET proceed within 30s");
-        assert_eq!(gate.held_count(), 1, "the second GET must now be the only one held");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must now be the only one held"
+        );
         for id in gate.held() {
             assert!(gate.release(id), "held id must release");
         }
@@ -6718,7 +6726,7 @@ mod whole_object_get_limiter_tests {
     }
 
     /// `whole_object_bytes`'s cache-attached GET closure
-    /// (log_fetcher.rs:2071, inside `cache.get_or_fetch`) must be bounded by
+    /// (log_fetcher.rs:2075, inside `cache.get_or_fetch`) must be bounded by
     /// the shared limiter too. Two DISTINCT objects (content hashes) keep
     /// this from being a single-flight no-op: same-key concurrent
     /// `get_or_fetch` calls would collapse into one physical fetch
@@ -6726,7 +6734,7 @@ mod whole_object_get_limiter_tests {
     ///
     /// Non-vacuity: removing the `let _permit =
     /// self.get_limiter.acquire()...` inside the `cache.get_or_fetch`
-    /// closure at log_fetcher.rs:2071 lets both GETs proceed immediately, so
+    /// closure at log_fetcher.rs:2075 lets both GETs proceed immediately, so
     /// `wait_until_held(2)` below resolves instead of timing out.
     #[tokio::test]
     async fn whole_object_bytes_cache_permit_bounds_tenant_funnel() {
@@ -6773,14 +6781,22 @@ mod whole_object_get_limiter_tests {
             "one shared permit must cap in-flight cached whole_object_bytes \
              GETs at exactly 1"
         );
-        assert_eq!(gate.held_count(), 1, "peak in-flight GETs must be exactly 1");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "peak in-flight GETs must be exactly 1"
+        );
         for id in gate.held() {
             assert!(gate.release(id), "held id must release");
         }
         tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
             .await
             .expect("releasing the first permit lets the second GET proceed within 30s");
-        assert_eq!(gate.held_count(), 1, "the second GET must now be the only one held");
+        assert_eq!(
+            gate.held_count(),
+            1,
+            "the second GET must now be the only one held"
+        );
         for id in gate.held() {
             assert!(gate.release(id), "held id must release");
         }

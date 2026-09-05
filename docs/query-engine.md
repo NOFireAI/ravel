@@ -706,8 +706,12 @@ paths. The fetcher holds its own `GetLimiter` for its whole-object funnel
 below the block-range threshold) in addition to the one it hands to its
 internal `BlockRangeFetcher`; `with_get_limiter` sets both to the same
 `Arc`, and `with_block_range` re-applies the fetcher's current limiter to a
-replacement `BlockRangeFetcher` so builder order cannot drop it. Which
-limiter that is depends on who built the fetcher: the RLOG fetcher a
+replacement `BlockRangeFetcher` so builder order cannot drop it. For a
+standalone fetcher (one no `QueryEngine` owns), `with_max_concurrent_gets(n)`
+builds exactly this dual-path arrangement itself: one private `GetLimiter` of
+`n` permits, shared by the whole-object and block-range paths, bounding both
+until a later `with_get_limiter` call replaces it. Which limiter that is
+depends on who built the fetcher: the RLOG fetcher a
 `QueryEngine` owns draws from the engine's shared limiter, sized by
 `store_get_concurrency()`. The standalone RLOG fetcher that `ravel-server`'s
 SQL path builds (`build_sql_state`) uses `with_max_concurrent_gets`, which
