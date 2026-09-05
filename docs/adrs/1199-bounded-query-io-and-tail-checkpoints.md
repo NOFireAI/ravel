@@ -236,8 +236,13 @@ records, per query:
   than as depth 1. Defined as a quotient, deliberately, not as observed
   overlapping waves: a permit frees as each request completes, so an
   observation-based figure varies run to run for identical work, and a figure
-  the same execution reports differently twice cannot gate anything. It is an
-  upper bound on waves, and the docs must say so.
+  the same execution reports differently twice cannot gate anything. It is a
+  LOWER bound on serial service rounds under a wave-synchronous model of the
+  nested fan-out (outer plan admission, inner segment admission, shared
+  permits): a sliding-window scheduler can never beat peak capacity and does
+  worse whenever the outer window is not full, so the real figure can only
+  exceed it. The docs must say "lower bound", and this ADR's first draft
+  called it an upper bound, which was backwards.
 - `unfolded_segments_resolved`: how many SEGMENTS this resolve took from the
   listing path rather than from a snapshot part. Segments, not records:
   `SegmentOrigins.origins` is parallel to `Snapshot::segments`, so an L1
