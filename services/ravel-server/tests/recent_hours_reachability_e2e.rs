@@ -241,6 +241,7 @@ fn promql_app(
         build_resolver(tokens, false),
         None,
         engine_config,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
@@ -266,6 +267,7 @@ fn sql_app(
         build_resolver(tokens, false),
         None,
         engine_config,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
         ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
         false,

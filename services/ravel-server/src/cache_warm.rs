@@ -58,11 +58,12 @@ pub async fn warm_cache(
     catalog: Arc<Catalog>,
     cache: ReadCache,
     clock: &dyn Clock,
+    get_limiter: Arc<ravel_query::GetLimiter>,
 ) {
     let now_ns = clock.now_ns();
     match tokio::time::timeout(
         WARM_DEADLINE,
-        warm_cache_inner(store, catalog, cache, now_ns),
+        warm_cache_inner(store, catalog, cache, now_ns, get_limiter),
     )
     .await
     {
@@ -82,6 +83,7 @@ async fn warm_cache_inner(
     catalog: Arc<Catalog>,
     cache: ReadCache,
     now_ns: i64,
+    get_limiter: Arc<ravel_query::GetLimiter>,
 ) {
     let tenants = match ravel_maintain::discover_tenants(store.as_ref()).await {
         Ok(tenants) => tenants,
@@ -96,8 +98,14 @@ async fn warm_cache_inner(
         end_ns: now_ns,
     };
 
-    let metrics_fetcher = SegmentFetcher::new(store.clone()).with_cache(cache.clone());
-    let logs_fetcher = LogSegmentFetcher::new(store).with_cache(cache);
+    // ADR-1195: shares the process-wide `GetLimiter` rather than a private
+    // pool, same as every other fetcher this process constructs.
+    let metrics_fetcher = SegmentFetcher::new(store.clone())
+        .with_cache(cache.clone())
+        .with_get_limiter(get_limiter.clone());
+    let logs_fetcher = LogSegmentFetcher::new(store)
+        .with_cache(cache)
+        .with_get_limiter(get_limiter);
 
     for tenant in tenants {
         warm_metrics(&catalog, &metrics_fetcher, tenant, range, now_ns).await;
@@ -323,6 +331,7 @@ mod tests {
             catalog,
             ReadCache::Ram(cache.clone()),
             &FixedClock(now),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
         .await;
 
@@ -348,6 +357,7 @@ mod tests {
             catalog,
             ReadCache::Ram(cache.clone()),
             &FixedClock(now_ns()),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
         .await;
 
@@ -377,6 +387,7 @@ mod tests {
             catalog,
             ReadCache::Ram(cache.clone()),
             &FixedClock(now_ns()),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         )
         .await;
 
@@ -450,7 +461,14 @@ mod tests {
         )));
 
         let warm = tokio::spawn(async move {
-            warm_cache(store, catalog, ReadCache::Ram(cache), &FixedClock(now_ns())).await;
+            warm_cache(
+                store,
+                catalog,
+                ReadCache::Ram(cache),
+                &FixedClock(now_ns()),
+                Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            )
+            .await;
         });
 
         // No manual `advance()`: the child's own `WARM_DEADLINE` sleep is only

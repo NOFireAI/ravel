@@ -242,6 +242,7 @@ async fn run(argv: &[&str]) -> Routed {
         )]))),
         None,
         engine,
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         ravel_server::query::DEFAULT_MAX_QUERY_BYTES,
         ravel_server::query::DEFAULT_MAX_TENANT_BYTES,
         budgets.sql_parallel_final_aggregation,

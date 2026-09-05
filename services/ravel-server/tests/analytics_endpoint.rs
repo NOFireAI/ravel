@@ -189,6 +189,7 @@ fn build_router_distributed(
         None,
         clock.clone(),
         metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
     );
     let fetcher = Arc::new(RoutingSliceFetcher::new(
         Arc::new(OnceLock::new()),

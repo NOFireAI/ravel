@@ -696,12 +696,8 @@ the same `Arc` to the fetchers it owns; `QueryEngine::with_get_limiter`
 replaces it on all of them at once, so a process can share one ceiling
 across several engines.
 
-One gap remains until the server half of ADR-1195 lands: the ceiling is per
-engine, not per process. `ravel-server` and `ravel-sql` still construct
-engines and standalone fetchers with their own limiters.
-
-Every RLOG GET a `LogSegmentFetcher` issues now takes a permit, on both
-paths. The fetcher holds its own `GetLimiter` for its whole-object funnel
+Every RLOG GET a `LogSegmentFetcher` issues takes a permit, on both paths.
+The fetcher holds its own `GetLimiter` for its whole-object funnel
 (`fetch_accounted` and `whole_object_bytes`, taken by every object at or
 below the block-range threshold) in addition to the one it hands to its
 internal `BlockRangeFetcher`; `with_get_limiter` sets both to the same
@@ -711,16 +707,15 @@ standalone fetcher (one that no `QueryEngine` owns), `with_max_concurrent_gets(n
 builds exactly this dual-path arrangement itself: one private `GetLimiter` of
 `n` permits, shared by the whole-object and block-range paths, bounding both
 until a later `with_get_limiter` call replaces it. Which limiter that is
-depends on who built the fetcher: the RLOG fetcher a
-`QueryEngine` owns draws from the engine's shared limiter, sized by
-`store_get_concurrency()`. The standalone RLOG fetcher that `ravel-server`'s
-SQL path builds (`build_sql_state`) uses `with_max_concurrent_gets`, which
-gives it a private limiter of `fetch_concurrency` permits shared by its
-whole-object and block-range paths; that limiter is separate from the
-process-wide one until the server half wires the fetcher to it with
-`with_get_limiter`. The stock ClickBench path runs through that SQL fetcher,
-so it is bounded by `fetch_concurrency` and not yet by
-`store_get_concurrency()`.
+depends on who built the fetcher: the RLOG fetcher a `QueryEngine` owns
+draws from the engine's shared limiter, sized by `store_get_concurrency()`;
+a standalone one keeps its private limiter until `with_get_limiter` replaces
+it. `ravel-server` makes that replacement on every fetcher it builds,
+including the standalone RLOG fetcher of its SQL path (`build_sql_state`),
+so inside the server process every RLOG GET, whole-object or ranged, draws
+from the one process-wide limiter described next. The stock ClickBench path
+runs through that SQL fetcher and is therefore bounded by
+`--store-get-concurrency`.
 
 Before ADR-1195, each fetcher held its own independent semaphore, so N
 fetchers each configured to "8 concurrent GETs" could together put 8N GETs
@@ -730,6 +725,13 @@ for the fetchers it reaches.
 directly now gives it a private limiter sized to the fetcher module's
 default concurrent-GET constant, its first-ever concurrency bound, unless
 `with_get_limiter` wires it to the shared one instead.
+
+The ceiling is process-wide, not per engine: `ravel-server` builds exactly
+one `Arc<GetLimiter>` where it assembles its shared state and hands that same
+`Arc` to every fetcher- and engine-construction site in the process (the
+PromQL query path, the SQL executor's three fetchers, the distributed
+fragment path, cache warming, exemplars, and alerting), via `with_get_limiter`
+on each. No fetcher in the server process owns a private limiter.
 
 `EngineConfig::fetch_concurrency` remains the legacy uniform knob: a bare
 `EngineConfig::default()` (or any config that leaves the three knobs below
@@ -741,10 +743,19 @@ over it when set, each resolved through a same-named accessor method:
 - `store_get_concurrency` / `store_get_concurrency()` -- the resolved
   permit count for the one shared `GetLimiter` described above.
 - `sql_partition_count` / `sql_partition_count()` -- DataFusion
-  `target_partitions`; exposed here, wired into
-  `crates/ravel-sql/src/session.rs` by a follow-up task.
+  `target_partitions`, read at `crates/ravel-sql/src/session.rs`.
 - `promql_fetch_fanout` / `promql_fetch_fanout()` -- the `buffer_unordered`
   fan-out width PromQL's per-selector fetch streams use.
+
+`ravel-server` exposes these as `--store-get-concurrency`,
+`--sql-partition-count`, and `--promql-fetch-fanout` (each unset derives from
+host cores like `--fetch-concurrency` always has). `--fetch-concurrency`
+still sets all three together (source `legacy-flag` in the startup log);
+combining it with any of the three, or passing `0` to any of the four, is a
+startup error naming the offending flag(s), raised before any fetcher,
+engine, or SQL session is constructed. See
+`docs/guides/operations/configuration.md` for the operator-facing flag
+reference.
 
 The permit bounds GETs in flight, not fetch tasks in flight. An RLOG
 block-range read builds its object assembler (charged to the assembly pool)

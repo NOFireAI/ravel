@@ -26,6 +26,33 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a `--shards 1` deployment reads the query-audit shard instead of silently
   omitting it, and a wider deployment scans exactly as before.
 
+### Changed
+
+- **`--fetch-concurrency` unbundled into three flags** (ADR-1195): the SQL
+  scan partition count, the PromQL/analytics per-query fetch fan-out, and the
+  object-store GET concurrency were one knob with three coupled effects; they
+  are now `--sql-partition-count`, `--promql-fetch-fanout`, and
+  `--store-get-concurrency`, each independently sizeable. `--fetch-concurrency`
+  still sets all three together for a config that predates the split (source
+  `legacy-flag` in the startup log). Combining it with any of the three new
+  flags is a startup error naming both flags, and a value of `0` in any of the
+  four is a startup error naming that flag, raised before any fetcher, engine,
+  or SQL session exists.
+- **GET concurrency is process-wide, not per engine** (ADR-1195): `ravel-server`
+  now builds exactly one `Arc<GetLimiter>` where it assembles its shared state
+  and hands that same `Arc` to every fetcher- and engine-construction site in
+  the process (the PromQL query path, the SQL executor's RSEG/RLOG/RSPAN
+  fetchers, the distributed fragment path, cache warming, exemplars, and
+  alerting). Before this, each RSEG and RLOG fetcher held its own semaphore, so
+  N fetchers each configured to "8 concurrent GETs" could together put 8N GETs
+  in flight against the store. Two behaviour changes follow. RSEG fetchers now
+  honour the configured limit instead of the compiled default of 16, so a host
+  whose derived value is below 16 issues fewer concurrent GETs than before.
+  RSPAN fetchers are bounded for the first time: span reads previously ran with
+  no GET limit at all, so a span-heavy deployment can see lower read
+  concurrency and should size `--store-get-concurrency` for it. No fetcher in
+  the server process owns a private limiter anymore.
+
 ## [0.13.0]
 
 A stock `ravel-server` now sizes its query budgets from the host it runs on, so

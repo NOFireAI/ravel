@@ -379,6 +379,7 @@ fn build_metrics_app(
         Arc::new(StaticBearerTokenResolver::new(tokens)),
         Some(cache),
         ravel_query::EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
         Arc::new(crate::metrics::QueryAccountingMetrics::new(
             std::collections::HashSet::new(),
         )),
@@ -765,6 +766,7 @@ mod logs {
             Arc::new(StaticBearerTokenResolver::new(tokens)),
             Some(cache),
             ravel_query::EngineConfig::default(),
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             ravel_sql::DEFAULT_MAX_QUERY_BYTES,
             crate::query::DEFAULT_MAX_TENANT_BYTES,
             false,
