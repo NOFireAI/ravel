@@ -58,24 +58,45 @@
 //! - [`service_batches`](QueryIoShape::service_batches): batches this
 //!   query's per-segment fan-out was forced into by the binding concurrency
 //!   it actually ran under. The metrics fetch is a NESTED fan-out
-//!   (`crates/ravel-query/src/engine.rs`): one
-//!   `buffer_unordered(promql_fetch_fanout)` over distinct matcher plans
-//!   (`distinct_plans_by_matcher`), each running its own
-//!   `buffer_unordered(promql_fetch_fanout)` over that plan's segments.
-//!   Those inner streams do not get independent budgets -- every GET from
-//!   every plan passes through the one [`crate::GetLimiter`] the engine
-//!   shares across the fetchers it owns (ADR-1195), sized by the resolved
-//!   `EngineConfig::store_get_concurrency` (see "GET concurrency" in
-//!   docs/query-engine.md). So the binding concurrency is
-//!   `min(service_fetch_multiplier * promql_fetch_fanout,
-//!   shared_get_permits)`, and the work is `segment_count *
-//!   service_fetch_multiplier` GETs: 64 segments, `promql_fetch_fanout` 8, 2
-//!   distinct matcher sets, and 16 shared permits gives 128 GETs at binding
-//!   concurrency `min(16, 16) = 16`, i.e. 8 batches, not
-//!   `ceil(64 * 2 / 8) = 16` -- dividing the plan-multiplied numerator by
-//!   the un-multiplied fan-out width alone double-counts the plan fan-out. A
-//!   single-plan query (`service_fetch_multiplier == 1`) reduces to
-//!   `ceil(segment_count / promql_fetch_fanout)`, since
+//!   (`crates/ravel-query/src/engine.rs`) with three levels of admission,
+//!   all of which bound the batch count:
+//!   1. the OUTER `buffer_unordered(promql_fetch_fanout)` over distinct
+//!      matcher plans (`distinct_plans_by_matcher`), which admits at most
+//!      `promql_fetch_fanout` plans at once -- never
+//!      `service_fetch_multiplier` plans, however many distinct matcher sets
+//!      the query has;
+//!   2. each admitted plan's own INNER
+//!      `buffer_unordered(promql_fetch_fanout)` over that plan's segments;
+//!   3. the one [`crate::GetLimiter`] the engine shares across every fetcher
+//!      it owns (ADR-1195), sized by the resolved
+//!      `EngineConfig::store_get_concurrency` (see "GET concurrency" in
+//!      docs/query-engine.md), which every GET from every plan passes
+//!      through regardless of which plan or segment issued it.
+//!
+//!   Levels 1 and 2 do not multiply freely: plan capacity is
+//!   `promql_fetch_fanout * min(service_fetch_multiplier,
+//!   promql_fetch_fanout)`, not `promql_fetch_fanout *
+//!   service_fetch_multiplier` -- the outer stream can never have more than
+//!   `promql_fetch_fanout` plans in flight even when there are more distinct
+//!   matcher sets than that. The binding concurrency is that plan capacity
+//!   capped by the shared limiter:
+//!   `min(promql_fetch_fanout * min(service_fetch_multiplier,
+//!   promql_fetch_fanout), shared_get_permits)`, and the work is
+//!   `segment_count * service_fetch_multiplier` GETs (the multiplier is not
+//!   capped there -- every distinct matcher set still issues its own GETs,
+//!   just not all at once): 64 segments, `promql_fetch_fanout` 8, 2 distinct
+//!   matcher sets, and 16 shared permits gives 128 GETs at binding
+//!   concurrency `min(8 * min(2, 8), 16) = min(16, 16) = 16`, i.e. 8
+//!   batches, not `ceil(64 * 2 / 8) = 16` -- dividing the plan-multiplied
+//!   numerator by the un-multiplied fan-out width alone double-counts the
+//!   plan fan-out. Conversely, `promql_fetch_fanout` 1 with 3 distinct
+//!   matcher sets and 20 segments gives binding concurrency
+//!   `min(1 * min(3, 1), 1000) = 1`, i.e. 60 batches (60 GETs, one at a
+//!   time) -- capping the multiplier by `shared_get_permits` alone, without
+//!   also capping it by `promql_fetch_fanout`, would have reported 20,
+//!   silently assuming all 3 plans ran at once when the outer stream never
+//!   admits more than 1. A single-plan query (`service_fetch_multiplier ==
+//!   1`) reduces to `ceil(segment_count / promql_fetch_fanout)`, since
 //!   `min(promql_fetch_fanout, shared_get_permits)` is the fan-out width
 //!   whenever the shared pool is at least as large as one plan's own
 //!   fan-out bound, as it is for any config leaving both knobs unset.
