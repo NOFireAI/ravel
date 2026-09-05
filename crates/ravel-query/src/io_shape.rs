@@ -17,7 +17,8 @@
 //! [`dependency_depth`](QueryIoShape::dependency_depth) reflects it: whether a
 //! segment resolves in one whole-object GET (depth 1) or needs a
 //! footer-tail-then-dependent-fetch sequence, reported as an upper bound of
-//! depth 3 to cover a possible footer-range chase (`depth_for_object` below),
+//! depth 4 to cover a possible footer-range chase plus the catalog and page
+//! fetch stages (`depth_for_object` below),
 //! classified structurally from `SegmentRef::object_size` against
 //! `SegmentFetcher::whole_object_threshold`, the same size test `open_segment`
 //! itself branches on. This mirrors `CostEstimate`'s existing convention: an
@@ -47,9 +48,9 @@
 //!   stage needs a previous stage's bytes to know its own keys. Four
 //!   independent segment GETs report depth 1 (they run concurrently, none
 //!   depends on another); a segment whose footer read is followed by a
-//!   dependent page fetch reports depth 3, an upper bound covering a
-//!   possible footer-range chase this crate cannot rule out from
-//!   `object_size` alone (see `depth_for_object`).
+//!   dependent catalog fetch and a dependent page fetch reports depth 4, an
+//!   upper bound covering a possible footer-range chase this crate cannot
+//!   rule out from `object_size` alone (see `depth_for_object`).
 //! - [`list_page_depth`](QueryIoShape::list_page_depth): serial LIST pages,
 //!   recorded separately from `dependency_depth` because pagination
 //!   (`Catalog::list_shard_hours`) and the GET dependency chain are different
@@ -189,26 +190,35 @@ pub fn merge_plan_class(a: PlanClass, b: PlanClass) -> PlanClass {
 /// everything (footer, catalog, pages) from its first GET: depth 1, no later
 /// stage depends on this one's output to name its own keys.
 ///
-/// Every other case reports depth 3, as an upper bound rather than a single
+/// Every other case reports depth 4, as an upper bound rather than a single
 /// true value, because this function only has `(object_size,
-/// whole_object_threshold)` to go on and `open_segment`'s real chain length
-/// past the whole-object branch depends on state this crate cannot see from
-/// those two numbers alone:
-/// - `object_size == 0` (size unknown ahead of the fetch) takes a
-///   `GetRange::Suffix` read (a footer-tail guess, not a whole-object read),
-///   which is then followed by dependent page GETs: at least 2 stages, and a
-///   `FooterOutcome::NeedRange` on that suffix guess (the tail didn't reach
-///   far enough back to cover the real footer) inserts one more dependent
-///   footer-range GET before the page fetch, making 3.
-/// - `object_size > whole_object_threshold` takes the same footer-tail path
-///   and is subject to the same possible `NeedRange` chase, for the same
-///   2-or-3 range.
+/// whole_object_threshold)` to go on and `open_segment`'s real chain past
+/// the whole-object branch can stack up to four dependent stages, each
+/// needing the previous stage's bytes to know its own keys
+/// (`crate::fetcher`):
+/// 1. **Footer tail**: a `GetRange::Suffix` (size unknown) or a tail
+///    `GetRange::Range` (size known but over threshold) guess at the
+///    footer (`SegmentFetcher::open_segment`).
+/// 2. **`FooterOutcome::NeedRange` chase**: only when the tail guess didn't
+///    reach far enough back to cover the real footer, a second dependent
+///    GET at the exact offset the first GET's bytes revealed
+///    (`open_segment`).
+/// 3. **Catalog `ensure_ranges`**: `decode_selected` fetches LABEL_DICT /
+///    SERIES_IDS / SERIES_META (or the sparse SERIES_IDX / chunked variant)
+///    from the offsets the footer named; these sections sit at the object
+///    front, never inside the footer-tail bytes already in hand, so this is
+///    a separate dependent GET whenever the footer stage's regions don't
+///    already cover them.
+/// 4. **Page `ensure_ranges`**: `fetch_scalar_pages` /
+///    `fetch_histogram_pages` fetch the run page ranges the catalog decode
+///    just named; same reasoning, a separate dependent GET unless already
+///    covered.
 ///
-/// Neither branch can be resolved to an exact depth here: whether the tail
-/// guess (`SegmentFetcher`'s private `suffix_len`) covers a given segment's
-/// real footer size is not observable from this function's inputs, and no
-/// public accessor exposes it. Reporting the upper bound (3) rather than the
-/// optimistic case (2) matches the module's existing "never underestimate"
+/// Stage 1 always runs; stages 2-4 are each conditional on whether an
+/// earlier GET's bytes happen to already cover the next stage's ranges
+/// (`FetchedRegions::covers`), which this function cannot observe from
+/// `object_size` alone. Reporting the upper bound (4) rather than an
+/// optimistic count matches the module's existing "never underestimate"
 /// convention (see `CostEstimate`'s upper envelope): a chain this function
 /// undercounts would silently understate how serial a query's fetch plan
 /// is, which is the failure mode this field exists to surface.
@@ -220,7 +230,7 @@ pub fn depth_for_object(object_size: u64, whole_object_threshold: u64) -> u32 {
     if object_size != 0 && object_size <= whole_object_threshold {
         1
     } else {
-        3
+        4
     }
 }
 
@@ -405,12 +415,13 @@ mod tests {
         );
         assert_eq!(
             depth_for_object(2_001, 2_000),
-            3,
-            "above threshold: footer tail, upper-bounded for a possible NeedRange chase"
+            4,
+            "above threshold: footer tail, upper-bounded for a possible NeedRange \
+             chase plus the catalog and page fetch stages"
         );
         assert_eq!(
             depth_for_object(0, 2_000),
-            3,
+            4,
             "unknown size takes the suffix footer-tail path, not whole-object, \
              even though 0 <= threshold"
         );
@@ -446,23 +457,31 @@ mod tests {
         assert_eq!(count_unfolded_segments(&origins), 1);
     }
 
-    /// Pins the segments-versus-records divergence the field name and doc
-    /// comment now spell out explicitly, against REAL `ravel-catalog` types
-    /// rather than a bare `Vec<SegmentOrigin>` with no `Snapshot` behind it:
-    /// a `Snapshot` holding one L0 `SegmentRef` plus a 3-part L1 compaction
-    /// (`SegmentLevel::L1` at `part_index` 0, 1, 2, sharing one
+    /// Pins `count_unfolded_segments`'s arithmetic against a realistic
+    /// segment shape: a `Snapshot` holding one L0 `SegmentRef` plus a 3-part
+    /// L1 compaction (`SegmentLevel::L1` at `part_index` 0, 1, 2, sharing one
     /// `input_set_hash` -- the real shape one compaction record fans out
-    /// into) has 4 `segments` entries from only 2 underlying commit/
-    /// compaction records. `SegmentOrigins::origins` is built parallel to
-    /// `snapshot.segments` (same length, same order, all `Recent`, matching
-    /// how a real live-listing resolve populates both), and the assertion
-    /// checks that parallelism explicitly before checking the count, so a
-    /// carriage bug that let the two vectors drift out of sync would fail
-    /// here even before the count assertion. Flip the L1 fixture down to 1
-    /// part (drop two of the three `part_index` entries and their origins)
-    /// to watch the count assertion fail: it would then read 2, not 4.
+    /// into) has 4 `segments` entries. This test builds `origins` itself
+    /// (one `SegmentOrigin::Recent` per `snapshot.segments` entry, by
+    /// construction), so it does NOT demonstrate that a real resolve
+    /// actually produces one `Recent` origin per L1 part rather than one per
+    /// compaction record -- that invariant is `ravel-catalog`'s own, made in
+    /// its per-listed-key insert (`origin_by_key.insert(key.clone(),
+    /// SegmentOrigin::Recent)` inside the listing loop,
+    /// `crates/ravel-catalog/src/catalog.rs:1687`, where `key` is one listed
+    /// segment object -- one entry per L1 part, not per compaction record),
+    /// which is out of this crate's scope to prove. What this test DOES pin
+    /// is that `count_unfolded_segments` counts every `Recent` entry in a
+    /// same-length `origins` slice exactly, including when that slice came
+    /// from a 4-segment/2-record snapshot shape rather than a flatter one.
+    /// The parallelism assertion below (`origins.origins.len() ==
+    /// snapshot.segments.len()`) checks the fixture is well-formed before
+    /// the count assertion runs, so a fixture bug would fail there first.
+    /// Flip the L1 fixture down to 1 part (drop two of the three
+    /// `part_index` entries and their origins) to watch the count assertion
+    /// fail: it would then read 2, not 4.
     #[test]
-    fn unfolded_segments_resolved_counts_compaction_parts_not_records() {
+    fn count_unfolded_segments_counts_recent_origins_over_an_l0_plus_l1_parts_snapshot() {
         fn segment_ref(level: SegmentLevel) -> SegmentRef {
             SegmentRef {
                 data_object_key: "irrelevant".to_string(),

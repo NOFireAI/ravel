@@ -240,13 +240,13 @@ async fn pruned_and_bypassed_queries_are_bit_identical_across_formats_and_duplic
     assert_eq!(vector_bits(&bypassed_value), expected);
 }
 
-/// The same equality-vs-regex pair as
+/// The same equality-vs-regex shape as
 /// `pruned_and_bypassed_queries_are_bit_identical_across_formats_and_duplicates`,
 /// but asserting on `stats.io_shape.plan_class` (issue #1214 finding 1): a
-/// real pruned resolve (seg C excluded, `segments_pruned == 1`) must report
+/// real pruned resolve (seg B excluded, `segments_pruned == 1`) must report
 /// `SelectiveIndexed`, and a real exhaustive resolve of the SAME snapshot
-/// under a regex matcher that bypasses pruning (`segments_pruned == 0`, all
-/// three segments fetched) must report `ExhaustiveScan`. Before this fix
+/// under a regex matcher that bypasses pruning (`segments_pruned == 0`, both
+/// segments fetched) must report `ExhaustiveScan`. Before this fix
 /// both cases fell through `merge_plan_class`'s old two-way rank unchanged,
 /// so this pair already differed; the regression this pins is that
 /// `plan_class` tracks the metrics lane's OWN resolve outcome, not a
