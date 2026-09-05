@@ -32,7 +32,7 @@ pub use fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, ReadCache,
     SamplePriority, SegmentFetcher,
 };
-pub use limiter::GetLimiter;
+pub use limiter::{GetLimiter, GetLimiterClosed};
 pub use log_fetcher::{
     AssemblyBufferStats, BlockRangeFetcher, BlockRangeStats, BlockStatsReport, CarriedFooter,
     ColumnarBlockOutcome, DEFAULT_LOG_COALESCE_GAP, DEFAULT_LOG_COVERAGE_THRESHOLD,
