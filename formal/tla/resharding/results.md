@@ -30,7 +30,7 @@ the harness fails unless TLC reports that one.
 |---|---|---|---|---|
 | scan-slack-zero | `S = 0` (shipped 3) | EveryAdmittedWriteInScanSet | 3512 | 2 |
 | appender-skew-unbounded | `AppenderSkew = 5` (tolerated 1) | EveryAdmittedWriteInScanSet | 124721 | 4 |
-| lead-one | `L = 1` (shipped 2) | LeadCoversRefreshHorizon | 174 | 2 |
+| lead-one | `L = 1` (shipped 2) | LeadCoversRefreshHorizon | 236 | 0 |
 | no-writer-fence | `WriterFenceEnabled = FALSE` | StaleWriterFailsClosed | 48018 | 2 |
 | token-validated-against-count | `TokenValidatedAgainstCount = TRUE` | TokenResolvesAcrossReshards | 12709 | 3 |
 
