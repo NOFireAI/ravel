@@ -190,6 +190,8 @@ else, and indexed here so nothing is reachable from nowhere.
   they share.
 - [../formal/tla/README.md](../formal/tla/README.md): machine-checked models
   of the commit, catalog, lifecycle, resharding, and maintenance protocols,
-  and the harness that runs them. See formal/tla/REPORT.md there for the
-  suite-wide report and formal/tla/TRACEABILITY.md for the index into each
-  area's Rust traceability table.
+  and the harness that runs them. See
+  [../formal/tla/REPORT.md](../formal/tla/REPORT.md) there for the
+  suite-wide report and
+  [../formal/tla/TRACEABILITY.md](../formal/tla/TRACEABILITY.md) for the
+  index into each area's Rust traceability table.
