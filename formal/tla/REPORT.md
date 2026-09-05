@@ -145,20 +145,16 @@ clause is load-bearing" — the shipped model keeps
 `HorizonGuardsPinnedQueries = TRUE`, under which this trace has no
 successor.
 
-**Disagreement 1 (invariant count, lifecycle).** `lifecycle/README.md` states
-twice, under "Switches and negative controls," that the seven negative
-controls run "the full fourteen-invariant list from `smoke.cfg`."
-`lifecycle/results.md` itself says "thirteen-invariant list," under
-"Negative controls," elsewhere. Neither figure is what the
-shipped `.cfg` files carry: `smoke.cfg` declares 15 `INVARIANT` lines
-(`TypeOK` plus 14 named invariants); every `negative/*.cfg` declares 13
-`INVARIANT` lines (`TypeOK` plus 12 named invariants), omitting
-`TombstoneNotDeletedBeforeBucketEmpty` and `RawInputContentAssumedImmutable`
-relative to `smoke.cfg`. So `results.md`'s "thirteen" is the correct total
-line count for the negative configs, but the README's claim that negative
-controls run the "full" list from `smoke.cfg` overstates what those
-configurations actually check by two invariants. This is reported here, not
-corrected in `lifecycle/README.md`, which is out of this task's file scope.
+**Disagreement 1 (invariant count, lifecycle) — resolved 2026-09-05.**
+`lifecycle/README.md`'s claim that the seven negative controls run "the full
+fourteen-invariant list from `smoke.cfg`" did not match the shipped
+`negative/*.cfg` files, which declared only 13 `INVARIANT` lines (`TypeOK`
+plus 12 named), omitting `TombstoneNotDeletedBeforeBucketEmpty` and
+`RawInputContentAssumedImmutable`. Both invariants were added to all seven
+`negative/*.cfg` files and the negative lane was re-run: every control still
+violates only its declared target invariant (exit 0 for the lane), so the
+addition is correct. The README's fourteen-invariant claim now matches the
+configs; no wording change was needed there.
 
 ### resharding
 
@@ -169,13 +165,13 @@ corrected in `lifecycle/README.md`, which is out of this task's file scope.
 
 Both configurations land inside their distinct/depth bands.
 
-**Disagreement 2 (wall time, resharding smoke).** `results.md`'s
-configuration table records `smoke.cfg`'s wall time as 37 seconds;
-`bands.tsv`'s header comment, describing the same run (identical
-states/distinct/depth: 7809360/958804/18), records it as 26 seconds. Wall
-time is not banded and this does not affect PASS/FAIL, but it is a real
-disagreement between the two files and is reported rather than silently
-picking one number.
+**Disagreement 2 (wall time, resharding smoke) — resolved 2026-09-05.**
+`results.md`'s configuration table recorded `smoke.cfg`'s wall time as 37
+seconds; `bands.tsv`'s header comment, describing the same run (identical
+states/distinct/depth: 7809360/958804/18), recorded it as 26 seconds. The
+smoke lane was re-run once (same states/distinct/depth) and measured 43
+seconds; both `results.md` and the `bands.tsv` header comment now record
+43 seconds. The state and depth bands are unchanged.
 
 Five negative controls (no bands; error-search stops at first violation, so
 counts vary run to run):
@@ -188,12 +184,14 @@ counts vary run to run):
 | no-writer-fence | `WriterFenceEnabled = FALSE` | StaleWriterFailsClosed | 48018 | 2 |
 | token-validated-against-count | `TokenValidatedAgainstCount = TRUE` | TokenResolvesAcrossReshards | 12709 | 3 |
 
-**Disagreement 3 (lead-one figures, resharding's own docs).**
-`results.md`'s negative-control table records `lead-one` as 174 distinct
-states in 2 seconds. `counterexamples/lead-one.md`, describing the same
-control, states "199 distinct states, one second." These are two different
-figures for the same run in the same area's own documentation; neither
-matches the other, and this report does not pick one.
+**Disagreement 3 (lead-one figures, resharding's own docs) — resolved
+2026-09-05.** `results.md`'s negative-control table recorded `lead-one` as
+174 distinct states in 2 seconds; `counterexamples/lead-one.md`, describing
+the same control, recorded "199 distinct states, one second." TLC's
+error-search stops at the first violation a worker finds, so the exact
+count varies run to run. The `lead-one` control was re-run once and that
+run's figures, 236 distinct states in under one second, are now recorded in
+both `results.md` and `counterexamples/lead-one.md`.
 
 Configurations outside any harness lane, no bands:
 
@@ -278,23 +276,23 @@ absent key that stamps a version, a delete that resets the version counter, a
 counting listing consumer that deduplicates). None is an open defect; each
 confirms detection. No tracking issue applies.
 
-**commit** — six files under `counterexamples/`, one per negative control
-except that five of the eleven `negative/*.cfg` configurations
+**commit** — eleven files under `counterexamples/`, one per negative
+control (resolved 2026-09-05: the five configurations
 (`no-cross-shard-atomicity`, `put-commit-lost-response-reachable`,
 `put-data-lost-response-reachable`, `query-reads-uncommitted-data`,
-`transient-failure-reachable`) have no corresponding note under
-`counterexamples/`. All eleven are broken-behavior negative controls (D6);
-none is classified in `results.md` as a model bug, design flaw, or
-implementation defect, and none carries a tracking issue.
+`transient-failure-reachable`) that previously had no corresponding note
+under `counterexamples/` now each have one). All eleven are broken-behavior
+negative controls (D6); none is classified in `results.md` as a model bug,
+design flaw, or implementation defect, and none carries a tracking issue.
 
-**catalog** — twenty files under `counterexamples/` (plus
+**catalog** — twenty-three files under `counterexamples/` (plus
 `late-supersession-shrink.cfg`, a config with no matching negative lane).
 Of the 21 `negative/*.cfg` configurations, `results.md` itself marks seven as
 "(probe)" — reachability/non-vacuity checks, not broken-behavior controls —
-and the other fourteen as ordinary broken-behavior controls. Three of the
-seven probe configurations (`entry-undecodable-nonvacuity`,
-`head-corruption-nonvacuity`, `part-unreadable-nonvacuity`) have no
-corresponding note under `counterexamples/`, the same gap pattern as commit.
+and the other fourteen as ordinary broken-behavior controls. Resolved
+2026-09-05: the three probe configurations (`entry-undecodable-nonvacuity`,
+`head-corruption-nonvacuity`, `part-unreadable-nonvacuity`) that previously
+had no corresponding note under `counterexamples/` now each have one.
 `dedup-starvation-fixed.md` is a distinct, already-fixed implementation
 defect: "Issue #1121 finding 1," a bug in `Dedup(P)` that let two identities
 sharing one L1 source each independently choose a different survivor and
