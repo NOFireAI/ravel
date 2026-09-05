@@ -188,6 +188,9 @@ else, and indexed here so nothing is reachable from nowhere.
 - [internal/diagrams.md](internal/diagrams.md): what each diagram under
   `diagrams/` shows, which page it illustrates, and the visual language
   they share.
+- [guides/formal-verification.md](guides/formal-verification.md): what the
+  TLA+ suite under `formal/tla/` checks, what it does not establish, and
+  how to run it, read its results, and add a model.
 - [../formal/tla/README.md](../formal/tla/README.md): machine-checked models
   of the commit, catalog, lifecycle, resharding, and maintenance protocols,
   and the harness that runs them. See
