@@ -1,8 +1,10 @@
 # Ravel TLA+ verification
 
 Machine-checked models of Ravel's concurrency and durability contracts, and
-the harness that runs them. Decided by ADR-1113; this directory is task T1
-(wave 1): the harness, the shared object-store module, and the CI lane.
+the harness that runs them. Decided by ADR-1113. All six areas below are
+shipped: the harness, the shared object-store module, the CI lane, and one
+specification per protocol area. `REPORT.md` is the suite-wide report;
+`TRACEABILITY.md` indexes every area's Rust traceability table.
 
 ## Layout
 
@@ -30,16 +32,20 @@ in the directory is a model-check entry module, and an area may hold more than
 one. For each module and kind (smoke, exhaustive) the harness prefers the
 per-module `MC<Spec>.<kind>.cfg` and falls back to the bare `<kind>.cfg` (valid
 only where the area has a single spec); it fails when a smoke module has no
-config. New areas planned by ADR-1113:
+config. All areas planned by ADR-1113 are shipped:
 
-| Area | Contract modeled | Status |
-|---|---|---|
-| common | object-store put/get/delete/list/multipart | this task (T1) |
-| commit | commit publication, acknowledgement, retry, read-your-write | planned (T2) |
-| catalog | catalog fold, snapshots, compaction, MVCC | planned (T3) |
-| lifecycle | retention, erasure, legal holds, physical GC | planned (T4) |
-| resharding | generation-versioned online resharding | planned (T5) |
-| maintenance | maintenance ownership (shipped) and advisory claims (proposed) | planned (T6) |
+| Area | Contract modeled | Specification(s) | Config lanes | Status |
+|---|---|---|---|---|
+| [common](common/) | object-store put/get/delete/list/multipart | `RavelObjectStore.tla` | smoke, exhaustive, 3 negative | shipped |
+| [commit](commit/) | commit publication, acknowledgement, retry, read-your-write | `CommitProtocol.tla` | smoke, exhaustive, 11 negative, plus ungated dedup and liveness configs | shipped |
+| [catalog](catalog/) | catalog fold, snapshots, compaction, MVCC | `CatalogMVCC.tla` | smoke, exhaustive, carryforward, overlap, 21 negative (14 broken-behavior, 7 reachability probes) | shipped |
+| [lifecycle](lifecycle/) | retention, erasure, legal holds, physical GC | `LifecycleGC.tla` | smoke, exhaustive, 7 negative, plus an ungated rejected-design candidate | shipped, with ADR-0064's out-of-window case open |
+| [resharding](resharding/) | generation-versioned online resharding | `OnlineResharding.tla` | smoke, exhaustive, 5 negative, plus several ungated liveness and simulation configs | shipped |
+| [maintenance](maintenance/) | maintenance ownership (shipped) and advisory claims (proposed) | `MaintenanceOwnership.tla`, `CompactionClaims.tla` | smoke, exhaustive (per spec), 12 negative | ownership: shipped; claims: proposed design over a landed primitive |
+
+Each area's own `README.md` explains its abstraction boundary and what it
+does and does not model; `results.md` carries its recorded figures;
+`REPORT.md` (this directory) is the suite-wide report across all six.
 
 ## Running
 
