@@ -26,7 +26,8 @@ from `0f2f875c`, run on a 16 vCPU box against real S3 in the same region.
 | Resolve, after fold | 2 GET, 13 LIST | 0.377 s | 10,000 |
 
 Same answer, 667x the requests and 43x the wall time. The unit cost is one GET
-and about 1.6 ms per unfolded record, paid by every cold process.
+per unfolded record, paid by every cold process; what that GET costs in time is
+set by concurrency, not by the record, as the sweep below shows.
 
 A sweep over record count (issue #1215, same box, bucket and binary, tenant
 prefix wiped before each point) makes the shape exact:
@@ -41,6 +42,24 @@ prefix wiped before each point) makes the shape exact:
 GETs are exactly `records + 1` at every point. Resolve after a fold is flat at
 2 GETs across a 25x range: the fold collapses this problem completely, which is
 why decision 2 comes before decision 3.
+
+The "per record" column is not a per-record cost. Every resolve GET passes
+through `MAX_CONCURRENT_REQUESTS = 16` (`crates/ravel-catalog/src/catalog.rs:45`,
+hardcoded, and not reached by ADR-1195's process-wide `GetLimiter`), so the
+wall time is rounds times round-trip:
+
+| records | rounds at 16 permits | wall | ms per round |
+| --- | --- | --- | --- |
+| 1,000 | 63 | 1.689 s | 27.0 |
+| 5,000 | 313 | 8.331 s | 26.7 |
+| 10,000 | 625 | 16.157 s | 25.9 |
+
+That is S3 GET round-trip time, flat across 10x. **Cold resolve is
+concurrency-bound, not request-bound**: 1.6 ms per record is 26 ms per round
+divided by 16, and the same 10,001 GETs at 128 permits would take about 2 s if
+nothing else binds. Whether it does is measured under issue #1215 before this
+ADR's checkpoint decision is taken; the 25,000-record point (34 ms per round)
+is an open residual that model does not explain.
 
 Three things about these numbers need stating precisely.
 
@@ -113,10 +132,10 @@ per-record GET is still what is worth attacking, and the shard-count sensitivity
 of the LIST term is a figure decision 1 must report rather than an assumption
 this ADR carries.
 
-### The multiplier nobody has measured
+### The multiplier, now measured
 
-Unit cost times tail size is what a user feels, and only the unit cost is in
-evidence. Tail size is set by configuration, not by physics:
+Unit cost times tail size is what a user feels. Both are now in evidence.
+Tail size is set by configuration, not by data volume:
 
 - A record leaves the listing path when its hour seals and folds:
   `max_flush_lifetime` (1h) + `clock_skew_allowance` (5m) +
@@ -127,10 +146,32 @@ evidence. Tail size is set by configuration, not by physics:
 - Records per hour is ingest bytes divided by `target_bytes`, 8 MiB by default,
   times the number of independently flushing shards.
 
-At defaults that puts a 1 GB/h tenant at a few hundred tail records (half a
-second of resolve, invisible) and a 100 GB/h tenant at tens of thousands (tens
-of seconds, dominant). Both are plausible. Which one Ravel's real tenants are is
-not recorded anywhere, and this ADR will not pretend otherwise.
+Measured on the same box against real S3 (issue #1215): a tenant ingesting
+8,474 points per second and one ingesting 178 points per second produce
+**1,413.6 and 1,435.7 commit records per hour per shard** respectively. A 47x
+difference in ingest rate makes a 1.6% difference in record rate, the router's
+flush counters and the store's object counts agree exactly in both runs, and the
+`target_bytes` size trigger fired **zero** times in either.
+
+Record count is set by the flush clock, not by volume, because a strict write's
+buffer always has a waiter. `ShardActor::age_threshold_ns`
+(`crates/ravel-ingest/src/shard.rs:1114`) selects the slow
+`max_flush_delay_idle` ceiling only for a buffer with no strict-mode waiter and
+less than `min_flush_bytes`; on the acknowledged path the first disjunct is
+always true, so every buffer takes the 2 s `max_flush_delay`. The idle ceiling
+serves buffered writes nobody is waiting on.
+
+The tail is therefore `shards x flush cadence x residence window`, with volume
+absent from it:
+
+| shards | records/hour | tail records | cold resolve at 16 permits | at 128, if it scales |
+| --- | --- | --- | --- | --- |
+| 4 | 5,655 | 8,010 - 13,670 | 13 - 22 s | 1.6 - 2.7 s |
+| 16 | 22,620 | 32,040 - 54,670 | 51 - 88 s | 6.4 - 11 s |
+| 64 | 90,480 | 128,180 - 218,660 | 3.4 - 5.8 min | 26 - 44 s |
+
+A tenant sending 200 points per second carries the same catalog tail as one
+sending 8,500.
 
 ### What already exists, and what does not
 
@@ -358,9 +399,11 @@ both hold over a 24-hour window on a real workload:
   to hold rather than to discriminate, and the cold-resolve condition below is
   the one that decides. The threshold is denominated in segments because that is
   what the read path can count. For an all-L0 tail, which is what the unsealed region is, one segment
-  is one commit record and the measured 1.6 ms per record makes 2,000 about 3.2
-  seconds of resolve before a predicate rejects anything: the point where
-  resolve stops being a rounding error against a query budget. That time
+  is one commit record and 2,000 of them is 125 rounds at 16 permits, about
+  3.2 seconds of resolve before a predicate rejects anything: the point where
+  resolve stops being a rounding error against a query budget. That time figure
+  moves with the permit count; the threshold is stated in segments so that it
+  does not. That time
   conversion holds ONLY for an all-L0 tail. A resolved compaction record
   contributes several segments against one GET, so a tail carrying them reads
   high against this threshold and its 2,000 segments cost less than 3.2
