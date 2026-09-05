@@ -1,10 +1,14 @@
 # Ravel TLA+ verification
 
 Machine-checked models of Ravel's concurrency and durability contracts, and
-the harness that runs them. Decided by ADR-1113. All six areas below are
-shipped: the harness, the shared object-store module, the CI lane, and one
-specification per protocol area. `REPORT.md` is the suite-wide report;
-`TRACEABILITY.md` indexes every area's Rust traceability table.
+the harness that runs them. Decided by ADR-1113. The harness, the shared
+object-store module, and the CI lane are shipped, covering the six areas
+below with seven specification modules in all: one per protocol area except
+maintenance, which holds two, `MaintenanceOwnership.tla` (ADR-0065, shipped
+behaviour) and `CompactionClaims.tla` (ADR-1029, a proposed design over a
+landed claim primitive nothing calls yet, checked as a design, not as
+shipped behaviour). `REPORT.md` is the suite-wide report; `TRACEABILITY.md`
+indexes every area's Rust traceability table.
 
 ## Layout
 
