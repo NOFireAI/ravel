@@ -340,6 +340,48 @@ mod tests {
         );
     }
 
+    /// Direct pin on the [`MIN_LEAD_HOURS`] boundary: a lead of exactly the
+    /// minimum is accepted, one hour below it is refused with the exact
+    /// message the check returns.
+    #[tokio::test]
+    async fn reshard_refuses_an_activation_lead_below_min_lead_hours() {
+        let accepted_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        seed_record(accepted_store.as_ref(), Signal::Metrics, 4).await;
+        reshard(
+            accepted_store.clone(),
+            TENANT,
+            SignalArg::Metrics,
+            8,
+            MIN_LEAD_HOURS,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect("a lead of exactly MIN_LEAD_HOURS is accepted");
+
+        let refused_store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        seed_record(refused_store.as_ref(), Signal::Metrics, 4).await;
+        let below_min = MIN_LEAD_HOURS - 1;
+        let err = reshard(
+            refused_store.clone(),
+            TENANT,
+            SignalArg::Metrics,
+            8,
+            below_min,
+            10 * NS_PER_HOUR,
+        )
+        .await
+        .expect_err("a lead one hour below MIN_LEAD_HOURS must be refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "--lead-hours {below_min} is below the minimum {MIN_LEAD_HOURS} (ceil(C) + 1 with \
+                 the router's default 60s refresh interval): a shorter lead could let a live \
+                 writer route past the activation on a view it had not yet refreshed. Nothing was \
+                 written."
+            )
+        );
+    }
+
     /// A reshard to the same count is refused by the append (adjacent counts
     /// must differ), surfaced as a CLI error.
     #[tokio::test]
