@@ -394,16 +394,23 @@ the implementation justifies as eventually-fair.
   cannot supply the unbounded sequence of watermark-advancing folds the
   property depends on. This is reported as a finite-model limitation to
   document, per the area's own classification, not as a liveness defect.
-- **lifecycle**: `exhaustive.cfg` runs `FairSpec` and reports both
-  `EventuallySwept` and `EventuallyCompleted` as violated at `MaxClock = 2`
-  and (per `results.md`'s finding on issue #1131) as conditional properties,
-  not unconditional guarantees: they hold only when the environment
-  eventually goes quiet on hold state, HEAD read state, and refresh outcome,
-  and when the fold's and the sweep's retention windows agree. A permanently
-  wedged hold, an indefinitely refreshing legal hold, or disagreeing windows
-  make them intentionally false, per the area's own documentation, and
-  `results.md` reports this as a liveness limitation rather than a defect
-  (issue #1131).
+- **lifecycle**: the final lane, `exhaustive.cfg` (`FairSpec`, `MaxClock = 3`),
+  reports PASS on the full invariant list together with both
+  `EventuallySwept` and `EventuallyCompleted` (section 5: 1340669 states
+  generated, 230815 distinct, depth 22, inside band). Both are conditional
+  properties, not unconditional guarantees (per `results.md`'s finding on
+  issue #1131): they hold only when the environment eventually goes quiet on
+  hold state, HEAD read state, and refresh outcome, and when the fold's and
+  the sweep's retention windows agree. A permanently wedged hold, an
+  indefinitely refreshing legal hold, or disagreeing windows make them
+  intentionally false, per the area's own documentation; `results.md`
+  reports this as a liveness limitation rather than a defect (issue #1131).
+  A historical result, from round two's reduced diagnosis
+  (`results.md`, "Liveness, reduced diagnosis"), found both properties
+  violated (TLC exit 13) when each was checked alone in a scratch
+  `MaxClock = 2` configuration under `FairSpec`; that result predates the
+  fairness additions of checkpoint finding 1 and the self-negating-antecedent
+  fix of round three, and is not the lane's current outcome.
 - **resharding**: `live.cfg` initially fails
   `EventuallyRoutedOnNewGeneration` under weak fairness alone, and passes
   once fairness is widened to strong fairness on `AdmitAfterRefresh`
