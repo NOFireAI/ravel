@@ -282,9 +282,11 @@ above shows it is worth 9.9x at 128. This ADR therefore decides, first: make it
 a `CatalogConfig` knob plumbed from the server, default 128, with the
 per-prefix arithmetic in its doc (128 in flight at 30 ms is about 4,300 GET/s
 against S3's ~5,500 per-prefix guidance, spread over one `m/c/<shard>/<hour>/`
-prefix per shard-hour). The semaphore is per `Catalog` instance, so concurrent
-cold queries multiply it; folding it into a process-wide limiter in the spirit
-of ADR-1195 is a named follow-up, not this decision. Issue #1238.
+prefix per shard-hour). The semaphore is per `Catalog` instance, and
+`ravel-server` builds exactly one and clones its `Arc` into every consumer, so
+for the server this bound is already process-wide: 128 record GETs in flight
+in total, however many cold queries run. It multiplies only where several
+`Catalog` instances are constructed, which is the CLI and tests. Issue #1238.
 
 The ingest-side knobs below were measured next, and the result is recorded
 because it closes off the path the source plan recommended.
