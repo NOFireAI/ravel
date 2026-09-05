@@ -56,11 +56,20 @@
 //!   (`ceil(segment_count / fetch_concurrency)`): 64 segments under 16
 //!   concurrent permits is 4 batches at whatever depth those segments'
 //!   fetches classify at.
-//! - [`unfolded_records_resolved`](QueryIoShape::unfolded_records_resolved):
+//! - [`unfolded_segments_resolved`](QueryIoShape::unfolded_segments_resolved):
 //!   the EXACT count of segments this query's resolve took from the recent
 //!   (unfolded) listing path (`SegmentOrigin::Recent`) rather than a folded
 //!   snapshot part. Exact, not estimated, because it gates a downstream
-//!   fold-benefit decision that an approximation would silently corrupt.
+//!   fold-benefit decision that an approximation would silently corrupt. A
+//!   SEGMENT count, not a commit-record count: `SegmentOrigin` is parallel to
+//!   `Snapshot::segments` (one entry per resolved `SegmentRef`), and one L1
+//!   compaction record can produce several `SegmentRef` parts
+//!   (`SegmentLevel::L1`'s `part_index`s) that all inherit that record's
+//!   `Recent` origin. The two counts coincide for L0 (one commit record names
+//!   one segment) and diverge for a multi-part L1 compaction, where this
+//!   figure counts every part. `ravel-query` cannot recover the underlying
+//!   record count from `SegmentOrigin` alone -- the field is named, and
+//!   documented, for the quantity it actually counts.
 //! - [`plan_class`](QueryIoShape::plan_class): decided before any segment is
 //!   opened, from the query's shape and the resolve's own pruning outcome.
 //!
@@ -111,7 +120,7 @@ pub struct QueryIoShape {
     pub dependency_depth: u32,
     pub list_page_depth: u32,
     pub service_batches: u32,
-    pub unfolded_records_resolved: u64,
+    pub unfolded_segments_resolved: u64,
     pub plan_class: PlanClass,
 }
 
@@ -128,7 +137,7 @@ impl Default for QueryIoShape {
             dependency_depth: 0,
             list_page_depth: 0,
             service_batches: 0,
-            unfolded_records_resolved: 0,
+            unfolded_segments_resolved: 0,
             plan_class: PlanClass::MetadataOnly,
         }
     }
@@ -175,11 +184,25 @@ pub fn depth_for_object(object_size: u64, whole_object_threshold: u64) -> u32 {
 
 /// Counts `SegmentOrigin::Recent` entries: segments this resolve took from
 /// the recent (unfolded) listing path rather than a folded snapshot part.
-/// Deliberately excludes `SegmentOrigin::TokenResolved` (an explicit
-/// read-your-write token match, not a listing outcome) and
-/// `SegmentOrigin::SealedBelowWatermark` (already folded). An exact count
-/// over the full `origins` slice, never an estimate.
-pub fn count_unfolded_records(origins: &[SegmentOrigin]) -> u64 {
+/// `origins` is parallel to `Snapshot::segments` (one entry per resolved
+/// `SegmentRef`), so this counts SEGMENTS, not commit records -- see the
+/// module docs' `unfolded_segments_resolved` entry for when a segment and its
+/// underlying record diverge (a multi-part L1 compaction).
+///
+/// Deliberately excludes `SegmentOrigin::SealedBelowWatermark` (already
+/// folded: the quantity this figure gates is unfolded exposure, and a sealed
+/// segment carries none) and `SegmentOrigin::TokenResolved`. The
+/// `TokenResolved` exclusion is a deliberate cost-shape decision, not merely
+/// "not a listing outcome": a token-resolved segment costs exactly one GET by
+/// its explicit `min_commit_token` key (`Catalog::resolve_min_token`)
+/// regardless of whether a fold has run, so folding can never remove that
+/// GET. Counting it here would overstate the fold-benefit figure with a cost
+/// no fold could ever recover. A `Recent` segment's cost is different: it is
+/// discovered by the listing path specifically because no fold covers it
+/// yet, so folding it into a snapshot part is exactly the benefit this
+/// figure gates. An exact count over the full `origins` slice, never an
+/// estimate.
+pub fn count_unfolded_segments(origins: &[SegmentOrigin]) -> u64 {
     origins
         .iter()
         .filter(|o| matches!(o, SegmentOrigin::Recent))
@@ -233,14 +256,14 @@ impl IoShapeCounts {
     /// [`QueryIoShape`].
     pub fn into_shape(
         self,
-        unfolded_records_resolved: u64,
+        unfolded_segments_resolved: u64,
         plan_class: PlanClass,
     ) -> QueryIoShape {
         QueryIoShape {
             dependency_depth: self.dependency_depth,
             list_page_depth: self.list_page_depth,
             service_batches: self.service_batches,
-            unfolded_records_resolved,
+            unfolded_segments_resolved,
             plan_class,
         }
     }
@@ -319,19 +342,31 @@ mod tests {
     /// footer-tail-then-dependent-fetch sequence (depth 2).
     #[test]
     fn depth_for_object_matches_whole_object_threshold_branch() {
-        assert_eq!(depth_for_object(1_000, 2_000), 1, "at or below: whole object");
-        assert_eq!(depth_for_object(2_000, 2_000), 1, "exactly at threshold: whole object");
-        assert_eq!(depth_for_object(2_001, 2_000), 2, "above threshold: footer tail then dependent fetch");
+        assert_eq!(
+            depth_for_object(1_000, 2_000),
+            1,
+            "at or below: whole object"
+        );
+        assert_eq!(
+            depth_for_object(2_000, 2_000),
+            1,
+            "exactly at threshold: whole object"
+        );
+        assert_eq!(
+            depth_for_object(2_001, 2_000),
+            2,
+            "above threshold: footer tail then dependent fetch"
+        );
     }
 
-    /// `count_unfolded_records` counts `Recent` origins EXACTLY, excluding
-    /// both `SealedBelowWatermark` (already folded) and `TokenResolved`
-    /// (an explicit read-your-write match, not a listing outcome). Pinned to
-    /// an exact figure, not `> 0`: this count gates a downstream fold-benefit
-    /// decision that a merely-nonzero check would not catch an
+    /// `count_unfolded_segments` counts `Recent` origins EXACTLY, excluding
+    /// both `SealedBelowWatermark` (already folded) and `TokenResolved` (its
+    /// GET cost survives a fold, so it is not fold-benefit exposure). Pinned
+    /// to an exact figure, not `> 0`: this count gates a downstream
+    /// fold-benefit decision that a merely-nonzero check would not catch an
     /// under-count on.
     #[test]
-    fn unfolded_records_resolved_counts_recent_origins_exactly() {
+    fn unfolded_segments_resolved_counts_recent_origins_exactly() {
         let origins = vec![
             SegmentOrigin::SealedBelowWatermark,
             SegmentOrigin::Recent,
@@ -340,7 +375,7 @@ mod tests {
             SegmentOrigin::Recent,
             SegmentOrigin::SealedBelowWatermark,
         ];
-        assert_eq!(count_unfolded_records(&origins), 3);
+        assert_eq!(count_unfolded_segments(&origins), 3);
     }
 
     /// A deliberate under-count: folding `TokenResolved` into the `Recent`
@@ -349,16 +384,52 @@ mod tests {
     /// pins the exact figure so that regression is visible, not just "some
     /// segments counted."
     #[test]
-    fn unfolded_records_resolved_excludes_token_resolved() {
+    fn unfolded_segments_resolved_excludes_token_resolved() {
         let origins = vec![SegmentOrigin::TokenResolved, SegmentOrigin::Recent];
-        assert_eq!(count_unfolded_records(&origins), 1);
+        assert_eq!(count_unfolded_segments(&origins), 1);
+    }
+
+    /// Pins the segments-versus-records divergence the field name and doc
+    /// comment now spell out explicitly: `origins` is parallel to
+    /// `Snapshot::segments`, one entry per resolved `SegmentRef`, so a single
+    /// L1 compaction record that fans out into several parts contributes one
+    /// `Recent` origin PER PART, not one per underlying record. A fixture
+    /// standing in for one compaction record with 3 parts (all `Recent`)
+    /// plus one L0 record (also `Recent`, one segment) has 2 underlying
+    /// records but must report 4 -- the segment count, never the record
+    /// count `ravel-query` cannot see from `SegmentOrigin` alone.
+    #[test]
+    fn unfolded_segments_resolved_counts_compaction_parts_not_records() {
+        let origins = vec![
+            // 1 underlying L0 commit record -> 1 segment.
+            SegmentOrigin::Recent,
+            // 1 underlying L1 compaction record, fanned out into 3 parts
+            // (`SegmentLevel::L1`'s `part_index` 0, 1, 2) -> 3 segments.
+            SegmentOrigin::Recent,
+            SegmentOrigin::Recent,
+            SegmentOrigin::Recent,
+        ];
+
+        assert_eq!(
+            count_unfolded_segments(&origins),
+            4,
+            "4 segments (1 L0 + 3 L1 parts) from only 2 underlying commit/compaction records"
+        );
     }
 
     #[test]
     fn service_batches_rounds_up_and_clamps_concurrency() {
         assert_eq!(service_batches(64, 16), 4);
-        assert_eq!(service_batches(65, 16), 5, "one leftover item forces another batch");
-        assert_eq!(service_batches(4, 0), 4, "zero concurrency clamps to 1 permit");
+        assert_eq!(
+            service_batches(65, 16),
+            5,
+            "one leftover item forces another batch"
+        );
+        assert_eq!(
+            service_batches(4, 0),
+            4,
+            "zero concurrency clamps to 1 permit"
+        );
     }
 
     /// `merge_plan_class` picks the more severe scan class, in either
