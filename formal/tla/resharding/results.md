@@ -10,7 +10,7 @@ third-round review below).
 
 | cfg | result | states | distinct | depth | seconds |
 |---|---|---|---|---|---|
-| smoke.cfg | PASS | 7809360 | 958804 | 18 | 37 |
+| smoke.cfg | PASS | 7809360 | 958804 | 18 | 43 |
 
 Two writers and two requesters race an increase (3) and a decrease (1) from
 generation 0's count of 2, symmetry-reduced over both permutation groups, with
