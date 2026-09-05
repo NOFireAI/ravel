@@ -879,6 +879,7 @@ impl QueryEngine {
                 now_ns,
                 name_filter.as_deref(),
                 1,
+                1,
                 true, // metadata_only: discovery never fetches pages.
                 attempt,
             )
@@ -955,6 +956,7 @@ impl QueryEngine {
                 min_tokens,
                 now_ns,
                 None,
+                1,
                 1,
                 true, // metadata_only: log discovery never fetches pages.
                 attempt,
@@ -1230,27 +1232,30 @@ impl QueryEngine {
         // the comment above `resolve_bounded` at the top of this function:
         // the log lane's resolve is only reached after the metrics lane's
         // `prefetch_metric_plans` call has already been awaited to
-        // completion). That seriality is exactly why the fields below
-        // combine differently from each other, not the same way:
-        // - `list_page_depth` counts serial LIST pages. Because the two
-        //   lanes' resolves run one after another in wall-clock time, their
-        //   page counts ADD: a query whose metrics lane paginated 4 LIST
-        //   pages and whose log lane paginated 2 more genuinely waited
-        //   through 6 serial pages, not 4.
-        // - `dependency_depth` stays max-based, but not because of
-        //   concurrency (there is none here): the log lane's fetch chain
-        //   has no DATA dependency on the metrics lane's bytes -- it does
-        //   not need any byte the metrics lane fetched to know its own
-        //   segment keys, so the two chains are independent chains that
-        //   happen to run one after the other. The reported figure is the
-        //   longest independent chain, matching `dependency_depth`'s own
-        //   definition ("the longest chain... where a stage needs a
-        //   previous stage's bytes to know its own keys"), which a serial
-        //   but data-independent pair of chains does not satisfy across
-        //   lanes.
-        // - `service_batches` stays max-based for the same data-independence
-        //   reason: each lane's fan-out is bounded by its own concurrency
-        //   permit independently of the other lane's batch count.
+        // completion). Each field's combining rule follows from ONE
+        // criterion, stated once so the three do not silently drift onto
+        // three different unstated rules:
+        // - `list_page_depth` and `service_batches` are both
+        //   SERIALIZATION-ROUND counts: the number of sequential rounds a
+        //   lane's own fan-out actually waited through (LIST pages one
+        //   lane's resolve issued; concurrency-permit batches one lane's
+        //   fetch was forced into). Because the two lanes run one after the
+        //   other in wall-clock time with no overlap, the rounds a query
+        //   waits through end-to-end are the metrics lane's rounds followed
+        //   by the log lane's rounds -- genuinely additive, not a max: a
+        //   query whose metrics lane paginated 4 LIST pages and whose log
+        //   lane paginated 2 more waited through 6 serial pages, not 4, and
+        //   the same reasoning applies unchanged to `service_batches`'s
+        //   fetch-concurrency rounds.
+        // - `dependency_depth` uses a DIFFERENT criterion: DATA
+        //   independence, not serialization order. It measures the longest
+        //   chain of stages where a later stage needs an earlier stage's
+        //   bytes to know its own keys. The log lane's fetch chain needs no
+        //   byte the metrics lane fetched to know its own segment keys, so
+        //   the two chains are independent chains that merely happen to run
+        //   one after the other -- across lanes this stays max-based,
+        //   matching `dependency_depth`'s own definition, which a serial but
+        //   data-independent pair of chains does not satisfy.
         // `unfolded_segments_resolved` IS additive (an exact total count
         // across both lanes' resolves, with no ambiguity about how the two
         // lanes' costs compose).
@@ -1265,7 +1270,7 @@ impl QueryEngine {
         let mut log_counts = IoShapeCounts {
             dependency_depth: stats.io_shape.dependency_depth,
             list_page_depth: 0,
-            service_batches: stats.io_shape.service_batches,
+            service_batches: 0,
         };
         let log_depth = log_snapshot
             .segments
@@ -1283,6 +1288,10 @@ impl QueryEngine {
             log_snapshot.segments.len() as u64,
             self.config.fetch_concurrency.max(1) as u64,
         ));
+        log_counts.service_batches = stats
+            .io_shape
+            .service_batches
+            .saturating_add(log_counts.service_batches);
         let log_list_requests = log_accounting
             .resolve()
             .snapshot()
@@ -1384,9 +1393,24 @@ impl QueryEngine {
             .saturating_add(i64::try_from(self.config.deadline.as_nanos()).unwrap_or(i64::MAX));
         // One independent fetch per selector against the same snapshot
         // (below): an N-selector query re-opens every snapshot segment up to
-        // N times, so the pre-fetch cost estimate must scale by this same
-        // factor to stay a genuine upper bound.
+        // N times in the worst case (no shared matcher set), so the
+        // pre-fetch cost estimate must scale by this same factor to stay a
+        // genuine upper bound. Deliberately NOT deduplicated by matcher
+        // equality: `estimate_cost` is an upper envelope (like every other
+        // term it computes), so over-counting a query whose plans happen to
+        // share a matcher set is a legitimate conservative slop, not a bug.
         let fetch_multiplier = plans.len() as u64;
+        // The fan-out `service_batches` actually measures (`io_shape.rs`'s
+        // doc comment: "batches this query's per-segment fan-out was forced
+        // into") is real, not an envelope: the `attempt` closure below fetches
+        // exactly one distinct matcher set's segments per pass
+        // (`distinct_plans_by_matcher`, same dedup the closure's own
+        // `distinct_plans` uses), so `up + up offset 5m` -- two plans, one
+        // distinct matcher set -- is forced into ONE fetch pass over the
+        // snapshot, not two. Using `fetch_multiplier` here as well (the
+        // upper-envelope, undeduplicated count) would report a batch count
+        // the fan-out was never actually forced into.
+        let service_fetch_multiplier = distinct_plans_by_matcher(plans).len() as u64;
         // Captured by reference (like `plans`), so the `FnMut` attempt copies
         // the reference on each retry rather than moving the owned `Vec` out of
         // its environment. The per-plan futures below build owned pairs from it.
@@ -1422,17 +1446,12 @@ impl QueryEngine {
             // would otherwise pay for -- and account -- the same segment
             // fetch once per plan even though a cache/single-flight layer
             // underneath never re-hits the store for the repeat. Dedup by
-            // matcher equality (`LabelMatcher` has no `Hash`, only a
-            // structural `Eq`, hence a linear scan rather than a set; a
-            // query's selector count is small enough that this stays cheap)
-            // so each distinct matcher set is fetched, decoded, and counted
-            // exactly once, however many plans reference it.
-            let mut distinct_plans: Vec<SelectorPlan> = Vec::with_capacity(plans.len());
-            for plan in plans {
-                if !distinct_plans.iter().any(|p| p.matchers == plan.matchers) {
-                    distinct_plans.push(plan.clone());
-                }
-            }
+            // matcher equality so each distinct matcher set is fetched,
+            // decoded, and counted exactly once, however many plans
+            // reference it -- `distinct_plans_by_matcher` is the same
+            // dedup `service_fetch_multiplier` below was sized from, so the
+            // two never drift onto two different notions of "distinct".
+            let distinct_plans = distinct_plans_by_matcher(plans);
             // ADR-0103 eligibility gate, evaluated ONCE per query over the whole
             // resolved snapshot's segment set and the generation history THIS
             // resolve produced (never a per-matcher-set subset, never a
@@ -1688,6 +1707,7 @@ impl QueryEngine {
                 now_ns,
                 name_filter.as_deref(),
                 fetch_multiplier,
+                service_fetch_multiplier,
                 false, // metadata_only: this path fetches scalar/histogram pages.
                 attempt,
             )
@@ -1711,7 +1731,21 @@ impl QueryEngine {
         min_tokens: &[CommitToken],
         now_ns: i64,
         name_filter: Option<&str>,
+        // Upper-envelope selector fan-out factor for `estimate_cost`
+        // (`plans.len()`, undeduplicated -- see the comment above its
+        // assignment in `prefetch_metric_plans`): legitimately over-counts
+        // a query whose plans share a matcher set, since `estimate_cost` is
+        // an upper bound by design.
         fetch_multiplier: u64,
+        // The real per-distinct-matcher-set fan-out factor `io_shape`'s
+        // `service_batches` scales by: the count of distinct matcher sets
+        // the fetch fan-out actually issues one pass per
+        // (`distinct_plans_by_matcher`), never larger than `fetch_multiplier`
+        // and strictly smaller whenever two plans share a matcher set (`up +
+        // up offset 5m`). `service_batches` documents itself as the batches
+        // the fan-out was FORCED into, a factual figure, so it must use this
+        // deduplicated count rather than the upper-envelope one.
+        service_fetch_multiplier: u64,
         // `QueryIoShape::plan_class` is decided before any segment is opened
         // (issue #1214): `true` for a discovery-only caller
         // (`resolve_series_inner`/`resolve_log_series_inner`, neither of
@@ -1758,7 +1792,7 @@ impl QueryEngine {
             metadata_only,
             whole_object_threshold,
             concurrency,
-            fetch_multiplier,
+            service_fetch_multiplier,
             &first_accounting,
             first_unfolded,
         );
@@ -1787,7 +1821,7 @@ impl QueryEngine {
                     metadata_only,
                     whole_object_threshold,
                     concurrency,
-                    fetch_multiplier,
+                    service_fetch_multiplier,
                     &second_accounting,
                     second_unfolded,
                 );
@@ -2370,16 +2404,34 @@ fn combine_phase_accounting(
 /// two shards' LIST pages ran concurrently with each other), and the
 /// already-computed exact unfolded-segment count and plan-class decision.
 ///
-/// `fetch_multiplier` is the same per-distinct-selector fan-out factor
-/// `estimate_cost` scales its own request estimate by (`plans.len()` in
-/// `prefetch_metric_plans`): the metrics fetch reopens this resolve's
-/// segment set once per distinct plan, all contending for one shared
-/// `fetch_concurrency` semaphore, so the batch count this query's fetch is
-/// actually forced into is `service_batches(segments * fetch_multiplier,
-/// concurrency)`, not `service_batches(segments, concurrency)`. Omitting the
-/// multiplier here (while `estimate_cost` already applies it) made
-/// `stats.io` and `stats.estimate` disagree by construction for any query
-/// with more than one distinct selector.
+/// `service_fetch_multiplier` is the count of DISTINCT matcher sets the
+/// metrics fetch fan-out actually issues one pass per
+/// (`distinct_plans_by_matcher` in `prefetch_metric_plans`, e.g. `up + up
+/// offset 5m` -- two plans, one distinct matcher set, one pass), not the raw
+/// plan count `estimate_cost` scales by: that estimate is a deliberate
+/// upper envelope, but `service_batches` documents itself as the batches the
+/// fan-out was FORCED into, a factual figure that must not carry the
+/// envelope's slop. The fan-out itself is a nested `buffer_unordered`
+/// (`futures::stream`): one `buffer_unordered(fetch_concurrency)` over
+/// distinct plans (`prefetch_metric_plans`'s `attempt` closure), each of
+/// which runs its own `buffer_unordered(fetch_concurrency)` over that plan's
+/// segments (`fetch_all_samples_and_histograms`). Neither level shares a
+/// single semaphore across plans: `fetch_concurrency` (`EngineConfig`,
+/// default 8) only bounds each `buffer_unordered` call's own concurrent
+/// future count. The one pool actually shared by every concurrent segment
+/// fetch in a query is `SegmentFetcher::get_semaphore`
+/// (`fetcher.rs`), sized `DEFAULT_MAX_CONCURRENT_GETS` (16) for the metrics
+/// fetcher -- `QueryEngine::new` calls `with_max_concurrent_gets` on the log
+/// fetcher only, never on `self.fetcher`. So the batch count this query's
+/// fetch is actually forced into (at the `buffer_unordered` level
+/// `service_batches` models) is `service_batches(segments *
+/// service_fetch_multiplier, fetch_concurrency)`, not
+/// `service_batches(segments, fetch_concurrency)`; the 8-vs-16 mismatch
+/// between that `buffer_unordered` bound and the get-semaphore's real
+/// capacity is a separate, pre-existing gap this field does not attempt to
+/// close. Omitting the multiplier here (while `estimate_cost` already
+/// applies its own) made `stats.io` and `stats.estimate` disagree by
+/// construction for any query with more than one distinct selector.
 ///
 /// Deliberately does NOT thread any new instrumentation into the per-segment
 /// fetch loops (`fetch_all_samples_and_histograms`/`fetch_all_series`):
@@ -2391,7 +2443,7 @@ fn io_shape_for_resolve(
     metadata_only: bool,
     whole_object_threshold: u64,
     concurrency: u64,
-    fetch_multiplier: u64,
+    service_fetch_multiplier: u64,
     accounting: &PhaseAccounting,
     unfolded_segments_resolved: u64,
 ) -> QueryIoShape {
@@ -2404,7 +2456,7 @@ fn io_shape_for_resolve(
         .unwrap_or(0);
     counts.record_dependency_chain(depth);
     counts.record_service_batches(crate::io_shape::service_batches(
-        snapshot.segments.len() as u64 * fetch_multiplier,
+        (snapshot.segments.len() as u64).saturating_mul(service_fetch_multiplier),
         concurrency,
     ));
     let resolve_list_requests = accounting
@@ -2847,6 +2899,28 @@ fn shared_equality_name_filter<'a>(plans: &'a [SelectorPlan]) -> Option<Cow<'a, 
         }
     }
     shared
+}
+
+/// Deduplicates `plans` by matcher equality, keeping the first plan seen for
+/// each distinct matcher set. The single source of truth for what
+/// `prefetch_metric_plans`'s per-attempt fetch fan-out (`engine.rs`, the
+/// `distinct_plans` loop inside its `attempt` closure) actually fetches:
+/// `LabelMatcher` has no `Hash`, only a structural `Eq`, hence a linear scan
+/// rather than a set, which stays cheap for the small selector counts a
+/// query carries. Called twice per query attempt against the same `plans`
+/// slice (once here to size the metrics fetch fan-out's `service_batches`
+/// contribution before any segment is opened, once inside the fetch closure
+/// to build the actual per-matcher-set future list) rather than threaded
+/// through as a value, so the two call sites can never drift onto two
+/// different notions of "distinct".
+fn distinct_plans_by_matcher(plans: &[SelectorPlan]) -> Vec<SelectorPlan> {
+    let mut distinct: Vec<SelectorPlan> = Vec::with_capacity(plans.len());
+    for plan in plans {
+        if !distinct.iter().any(|p| p.matchers == plan.matchers) {
+            distinct.push(plan.clone());
+        }
+    }
+    distinct
 }
 
 #[cfg(test)]
@@ -5817,6 +5891,18 @@ mod prefetch_tests {
         }
     }
 
+    /// Same matcher set as `window_plan`, a different `offset_ns`: two plans
+    /// built this way carry identical `matchers` (a query like `up + up
+    /// offset 5m`) and so collapse to one distinct matcher set under
+    /// `distinct_plans_by_matcher`, despite being two separate `SelectorPlan`
+    /// entries.
+    fn window_plan_with_offset(metric: &str, offset_ns: i64) -> SelectorPlan {
+        SelectorPlan {
+            offset_ns,
+            ..window_plan(metric)
+        }
+    }
+
     /// Writes one real RSEG segment (one series per metric) and publishes
     /// its commit record, mirroring `tests/e2e.rs`'s own helper.
     async fn publish_metric(
@@ -7075,6 +7161,57 @@ mod prefetch_tests {
             stats.estimate.segments
         );
         assert_estimate_covers_actual("multi-segment query", &stats);
+    }
+
+    /// Regression for issue #1214's second review round, Finding 1: a real
+    /// `up + up offset 5m`-shaped query (two `SelectorPlan`s sharing one
+    /// matcher set, `window_plan` plus `window_plan_with_offset`) run through
+    /// a real `QueryEngine` must report `service_batches` from the
+    /// DEDUPLICATED matcher-set count, not the raw plan count. 5 segments
+    /// under the default `fetch_concurrency` of 8: the fixed
+    /// `service_fetch_multiplier` (1 distinct matcher set) gives
+    /// `ceil(5 * 1 / 8) == 1`; the pre-fix `fetch_multiplier` (2, the raw
+    /// plan count) would have given `ceil(5 * 2 / 8) == 2`. Flip
+    /// `service_fetch_multiplier` back to `fetch_multiplier` at its
+    /// `resolve_snapshot_with_retry` call site (`prefetch_metric_plans`) to
+    /// watch the `service_batches` assertion below fail: it would then read
+    /// 2, not 1.
+    #[tokio::test]
+    async fn real_query_with_shared_matcher_plans_reports_deduplicated_service_batches() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        for seq in 1..=5u64 {
+            let ts = BASE_NS - (6 - seq as i64) * NS_PER_MIN;
+            publish_metric(&store, tenant_hash, seq, "dedup_metric", ts, seq as f64).await;
+        }
+
+        let eng = engine(store);
+        let plans = vec![
+            window_plan("dedup_metric"),
+            window_plan_with_offset("dedup_metric", 5 * 60 * NS_PER_SEC),
+        ];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+        let (_source, stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("prefetch shared-matcher query");
+
+        assert!(
+            stats.estimate.segments >= 5,
+            "expected the snapshot to span at least the 5 published segments, got {}",
+            stats.estimate.segments
+        );
+        assert_eq!(
+            stats.io_shape.service_batches, 1,
+            "two plans sharing one matcher set must fetch as one distinct pass: \
+             ceil(5 segments * 1 distinct matcher set / 8 concurrency) == 1"
+        );
+        assert_eq!(
+            stats.io_shape.list_page_depth, 2,
+            "every resolve issues one bounded shard LIST plus one \
+             unconditional pending-erasure `del/` LIST (ravel-catalog, \
+             ADR-0064 decision 2), regardless of plan count: 2 total"
+        );
     }
 
     /// Native-histogram fixture (ADR-0044 finding 2): a 200-bucket sample's

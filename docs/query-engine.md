@@ -1670,12 +1670,13 @@ and rendered as `stats.io`, additive beside `stats.phases`:
 - `dependencyDepth`: the longest chain of object-store stages, across every
   segment the query opened, where a stage needed a previous stage's bytes to
   know its own keys. Four independent segment GETs report depth 1; a
-  footer-tail read that may need a dependent page fetch reports depth 3, an
-  upper bound, not a single true value: this crate cannot tell from
-  `object_size` alone whether the footer-tail guess covered the real footer
-  in one GET or needed a `FooterOutcome::NeedRange` chase for another GET
-  before the dependent page fetch, so it reports the worse of the two rather
-  than risk understating the chain. Classified structurally from each
+  footer-tail read that may need a dependent catalog fetch and a dependent
+  page fetch reports depth 4, an upper bound, not a single true value: this
+  crate cannot tell from `object_size` alone whether the footer-tail guess
+  covered the real footer in one GET or needed a `FooterOutcome::NeedRange`
+  chase for another GET before the dependent catalog and page fetches, so it
+  reports the worst case rather than risk understating the chain. Classified
+  structurally from each
   segment's `object_size` against the fetcher's whole-object threshold (the
   same size test `SegmentFetcher::open_segment` itself branches on), not
   from a live per-request trace, matching `CostEstimate`'s existing
@@ -1694,14 +1695,25 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   task's scope to change).
 - `serviceBatches`: batches this query's per-segment fan-out was forced into
   by its concurrency permit: `ceil(segment_count / fetch_concurrency)`. 64
-  segments under 16 concurrent permits is 4 batches at whatever depth those
-  segments' fetches classify at. For the metrics lane this is scaled by the
-  same per-distinct-selector fan-out multiplier `stats.estimate` already
-  applies (`fetch_multiplier`, one resolve reopened once per distinct plan,
-  all contending for the same concurrency permit): a query naming two
-  distinct metrics selectors over 64 segments under 16 permits reports 8
-  batches, not 4, matching the cost estimate's own scaling instead of
-  disagreeing with it.
+  segments under 8 concurrent permits (`fetch_concurrency`'s default) is 8
+  batches at whatever depth those segments' fetches classify at. For the
+  metrics lane this is scaled by the count of DISTINCT matcher sets the
+  fetch fan-out actually issues one pass per (`distinct_plans_by_matcher` in
+  `crates/ravel-query/src/engine.rs`), not the raw plan count
+  `stats.estimate` scales by: a query naming two `SelectorPlan`s that share
+  one matcher set (`up + up offset 5m`) is fetched in one pass, so its
+  `serviceBatches` does not double, while a query naming two plans with two
+  distinct matcher sets over 64 segments under 8 permits reports 16
+  batches, not 8. This deliberately does NOT claim every plan's segment
+  fetches contend for one shared semaphore: the fan-out is a nested
+  `buffer_unordered(fetch_concurrency)` over distinct plans, each running
+  its own `buffer_unordered(fetch_concurrency)` over that plan's segments
+  (`prefetch_metric_plans`/`fetch_all_samples_and_histograms`), and the one
+  pool genuinely shared across every concurrent segment fetch in a query is
+  `SegmentFetcher::get_semaphore`, sized `DEFAULT_MAX_CONCURRENT_GETS` (16)
+  for the metrics fetcher -- a different, larger number than
+  `fetch_concurrency` (8), and a pre-existing mismatch this field does not
+  attempt to close.
 - `unfoldedSegmentsResolved`: the EXACT (never estimated) count of segments
   this query's resolve took from the recent (unfolded) listing path rather
   than a folded snapshot part (`SegmentOrigin::Recent`, ADR-0073 decision 1).
@@ -1743,17 +1755,23 @@ segment-fetch chain) can only be equal to or greater than what is reported.
 A federated query (a metrics lane and a log lane) folds both lanes'
 contributions together. The two lanes run STRICTLY SERIALLY -- the log
 lane's resolve is only reached after the metrics lane has already been
-awaited to completion, never alongside it -- and that seriality is why the
-fields below do not all combine the same way:
-`listPageDepth` ADDS across lanes (two serial phases' page counts sum: a
-query whose metrics lane paginated 4 LIST pages and whose log lane
-paginated 2 more waited through 6 serial pages, not 4).
-`dependencyDepth`/`serviceBatches` still take the max across lanes, but not
-because the lanes run concurrently (they do not): the log lane's fetch
-chain has no DATA dependency on the metrics lane's bytes, so the two chains
-are independent chains that happen to run one after the other, and the
-reported figure is the longest (or most-batched) independent chain, not
-their sum.
+awaited to completion, never alongside it -- and each field's combining
+rule follows from one criterion, not from the same criterion applied
+loosely three times:
+`listPageDepth` and `serviceBatches` are both SERIALIZATION-ROUND counts
+(the number of sequential rounds a lane's own fan-out actually waited
+through), and ADD across lanes for that reason: because the lanes never
+overlap, the rounds a query waits through end-to-end are one lane's rounds
+followed by the other's. A query whose metrics lane paginated 4 LIST pages
+and whose log lane paginated 2 more waited through 6 serial pages, not 4,
+and a query whose metrics fetch was forced into 3 concurrency-permit
+batches and whose log fetch needed 2 more waited through 5 serial batches,
+not `max(3, 2)`.
+`dependencyDepth` uses a DIFFERENT criterion -- DATA independence, not
+serialization order -- and stays max-based across lanes: the log lane's
+fetch chain has no DATA dependency on the metrics lane's bytes, so the two
+chains are independent chains that happen to run one after the other, and
+the reported figure is the longest independent chain, not their sum.
 `unfoldedSegmentsResolved` sums across lanes (an exact total count, with no
 ambiguity about how the two lanes' costs compose), and `planClass` takes
 the more severe of the two (`exhaustive_scan` outranks `selective_indexed`
