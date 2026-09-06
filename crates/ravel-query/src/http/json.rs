@@ -367,10 +367,14 @@ pub struct IoShapeJson {
     pub list_page_depth: u32,
     /// A deterministic model figure for the serial service rounds this
     /// query's metrics fan-out needs: the sum over outer plan waves of
-    /// `ceil(segments * active_plans / min(fanout * active_plans,
-    /// shared_permits))`, with plans counted as distinct matcher sets. Exact
-    /// for identical work and comparable across queries; a lower bound only
-    /// within a single wave, not across the sum. See
+    /// `ceil(segments * active_plans / max(1, min(fanout * active_plans,
+    /// shared_permits)))`, with plans counted as distinct matcher sets (the
+    /// `max(1, ..)` is the helper's own clamp, so a zero permit count divides
+    /// by one, not zero). Identical for identical work and comparable across
+    /// queries; a lower bound within a single wave only. The cross-wave sum
+    /// is neither a lower nor an upper bound on the real sliding-window
+    /// scheduler, which can take fewer rounds (a child admitted into a
+    /// parent wave's leftover capacity) or more (a partial outer window). See
     /// [`crate::io_shape::service_batches_over_plan_waves`] for the model and
     /// its counterexample.
     #[serde(rename = "serviceBatches")]
