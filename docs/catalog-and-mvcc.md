@@ -783,10 +783,19 @@ shard, writer_id, epoch, seq, ingest_hour_bucket, object_key, object_size,
 content_hash (32B), sample_count, series_count, min/max event ts, min/max
 ingest ts, format_version, created_unix_ns, declared_column_stats.
 
-`declared_column_stats` (field 20, ADR-0873) carries the writer-computed
-exact whole-object min, max, and null count for each stamp-eligible declared
-typed attribute column (I64 and BOOL only; STR, BYTES, and ADR-0101's `f64`
-are refused by the allowlist in `ravel-types::declared_stats`). It is
+`declared_column_stats` (field 20, ADR-0873) carries the exact whole-object
+min, max, and null count for each stamp-eligible declared typed attribute
+column (I64 and BOOL only; STR, BYTES, and ADR-0101's `f64` are refused by
+the allowlist in `ravel-types::declared_stats`). The stamp is
+folded over the merged attribute view rather than over the record's own
+attribute set (ADR-0873's 2026-09-03 amendment; docs/log-segment-format.md,
+"What a numeric stat bounds"): a row's value for a column is the record's
+own attribute when the record sets that key at any value kind, and otherwise
+the row's stream-level resource or scope attribute of the same name, so a
+row counts NULL when that merged view resolves the name at another type or
+does not resolve it at all, never merely because the record itself omits it.
+The producer is the ingest fold
+(`crates/ravel-ingest/src/log_declared_stats.rs`), not the segment writer. It is
 additive and permanently optional, and `format_version` stays 1: an empty
 list means the object is uncovered for every typed attribute column, which is the
 normal state of every record written before ADR-0873, of every
@@ -796,9 +805,11 @@ answer, so it is never an error. A decoder validates each entry against the
 allowlist and drops (and counts) an entry whose declared type is ineligible
 or whose min/max kinds disagree with it; a defective statistic leaves that
 column uncovered and never makes the record unreadable.
-`CompactionPart.declared_column_stats` (field 12) is the same statement per
-compaction or erasure-rewrite output part, recomputed over the rows that
-part holds and never copied from an input's stamp.
+`CompactionPart.declared_column_stats` (field 12) is the same statement over
+the same merged view, per compaction or erasure-rewrite output part. The
+producer is the compaction recompute (`crates/ravel-maintain/src/rlog.rs`),
+again not the segment writer: it recomputes over the rows that part holds and
+never copies an input's stamp.
 
 `object_key` is informational. Readers MUST reconstruct the data key from
 (tenant_hash, signal, shard, writer_id, epoch, seq, content_hash) and treat
