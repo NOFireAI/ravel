@@ -33,7 +33,7 @@ The durability protocols above are modeled in TLA+. TLC checked five finite
 models of the commit, catalog, lifecycle, resharding, and maintenance
 protocols, over one shared object-store model, under stated bounds and
 assumptions. Negative controls show that each invariant can fail. Every checked
-property traces to a Rust symbol and, for all but five recorded rows, a
+property traces to a Rust symbol and, for all but five recorded rows, a named
 test. The
 [formal verification guide](docs/guides/formal-verification.md) has the
 bounds, the assumptions, and the results.
