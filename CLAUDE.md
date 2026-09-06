@@ -390,19 +390,23 @@ there before changing a rule.
   Run it after touching that helper region: a wall-clock wait smuggled back
   into a clock-driven test reads as a real defect on a loaded machine, then
   as flakiness on a quiet one, and both readings cost a full gate rerun
-  before anyone thinks to look at the test's own timing model. A scan that
-  finds zero helpers is itself a failure (a clock-type rename would
-  otherwise empty the scan silently).
+  before anyone thinks to look at the test's own timing model. An injected
+  clock's own `sleep`/`elapsed` is exempt (a receiver chain naming a clock
+  type, or an identifier containing "clock"); any other receiver still
+  reports. A scan that finds zero helpers is itself a failure, and so is a
+  scan of the default target that finds fewer than 20 (a clock-type rename
+  would otherwise empty the scan silently, and dropping one clock type from
+  the predicate would silently narrow it from 26 helpers to 5).
   Scope: the default target is the single file
   `services/ravel-cli/src/load.rs`; the rule is NOT yet enforced
   workspace-wide. Pointing it at every other `.rs` that mentions an
   injected-clock type surfaces 9 findings across 5 files (in ravel-cache,
   ravel-maintain, and ravel-server; a mix of idle-eviction sleeps that poll
   a clock-controlled state and `tokio::time::timeout` deadlock guards that
-  would each need a real allow-wall-clock reason), and it cannot anchor at
-  all in 78 more clock-mentioning files (70 of them integration tests under
-  `crates/*/tests/`) that carry no `#[cfg(test)]` module. A follow-up ticket
-  should widen the scan and resolve those.
+  would each need a real allow-wall-clock reason), and it finds no helper at
+  all in 78 more clock-mentioning files, 70 of them integration tests: 60
+  under `crates/*/tests/` and 10 under `services/*/tests/`. Issue #1278 is
+  the follow-up that widens the scan and resolves those.
 
 ### Writing gate and poll shell
 

@@ -6053,25 +6053,53 @@ type = "i64"
     /// triggered by a LATER batch (or by the age trigger), not by the write
     /// itself, so the ack now waits for one.
     ///
-    /// Pinned without a timing band: under a `FixedClock` the age trigger can
-    /// never fire, and at an 8 MiB target no write in this 16-row fixture can
-    /// reach the size trigger either. With no trigger reachable, the load
-    /// cannot finish and -- the part that would be false under the old
-    /// semantics -- the store holds zero data objects while it is suspended.
-    /// The store is read with the load future still alive and pinned, so no
-    /// shutdown flush from dropping the router can race the observation.
+    /// Pinned without a timing band: under a [`TestClock`] this test never
+    /// advances, the age trigger can never fire (the shard actor's flush tick
+    /// waits on that clock's own `sleep`, which only returns on an advance),
+    /// and at an 8 MiB target no write in this 16-row fixture can reach the
+    /// size trigger either. With no trigger reachable, the load cannot finish
+    /// and -- the part that would be false under the old semantics -- the
+    /// store holds zero data objects while it is suspended. The store is read
+    /// with the load future still alive and pinned, so no shutdown flush from
+    /// dropping the router can race the observation.
+    ///
+    /// The suspension is observed off the pipeline's own progress, not off a
+    /// wall-clock window and not off a yield count: the decoder's
+    /// `on_batch_queued` hook gates on every batch having been queued (that
+    /// hook runs on the `spawn_blocking` decode thread, so no filesystem read
+    /// of the fixture can still be outstanding), and
+    /// [`yield_until_router_is_quiet`] then waits for `clock.reads()` to
+    /// settle (so no routed write can still be moving toward its shard
+    /// buffer). A yield count would bound neither, since yields on this task
+    /// do not wait on the blocking decode thread.
     ///
     /// Prove-the-test: hardcode `target_bytes: 1` back into the `IngestConfig`
-    /// in `load_instrumented` and the load completes inside the window, hitting
+    /// in `load_instrumented` and every write triggers its own flush, so the
+    /// acks are answered, the load runs to completion while the driver is
+    /// still waiting for the router to go quiet, and the `biased` select hits
     /// the `panic!` arm ("the load must not complete...").
     #[tokio::test]
     async fn a_strict_ack_above_target_one_waits_for_a_later_batchs_flush() {
         use ravel_object_store::memory::MemoryStore;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let shards = 4u32;
         let rows_per_group = 4usize;
+        // The fixture holds one row group of `rows_per_group` rows per shard and
+        // `--batch-rows` is `rows_per_group`, so the decoder queues exactly
+        // `shards` batches of `rows_per_group` rows each.
+        let batches = shards as usize;
         let (_dir, pq, m) = sorted_by_shard_fixture(shards, rows_per_group);
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let clock = TestClock::new(NOW_NS);
+
+        let queued = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let on_batch_queued: BuildStartHook = Arc::new(move || {
+            if queued.fetch_add(1, Ordering::SeqCst) + 1 == batches {
+                let _ = gate_tx.send(());
+            }
+        });
 
         let load_fut = load_instrumented(
             Arc::clone(&store),
@@ -6087,32 +6115,27 @@ type = "i64"
             8 * 1024 * 1024,
             None,
             NOW_NS,
-            Arc::new(FixedClock(NOW_NS)),
+            Arc::clone(&clock) as Arc<dyn Clock>,
             LoadPath::Columnar,
             None,
-            None,
+            Some(on_batch_queued),
         );
         tokio::pin!(load_fut);
 
-        // Give the load every scheduler turn it can take, then confirm it is
-        // still parked and nothing was made durable. There is no wall-clock
-        // wait: the FixedClock never fires the age trigger and no write
-        // reaches the 8 MiB size trigger, so the load can never answer an ack
-        // however many turns it gets. 256 yields is far more than this tiny
-        // fixture needs to reach that parked state, and a `biased` select
-        // polls the load first on every turn, so a spurious completion still
-        // trips the panic.
+        // Wait for the pipeline to run out of work, then confirm the load is
+        // still parked and nothing was made durable. `biased` polls the load
+        // first on every round, so a load that does complete trips the panic
+        // rather than losing the race to the driver.
         let stored = tokio::select! {
             biased;
             _ = &mut load_fut => panic!(
                 "the load must not complete: at an 8 MiB target no write reaches the size \
-                 trigger, and a FixedClock never fires the age trigger, so no ack can be \
-                 answered"
+                 trigger, and a TestClock this test never advances cannot fire the age \
+                 trigger, so no ack can be answered"
             ),
             () = async {
-                for _ in 0..256 {
-                    tokio::task::yield_now().await;
-                }
+                let () = gate_rx.recv().await.expect("every batch is queued");
+                yield_until_router_is_quiet(&clock).await;
             } => {
                 list_data_objects(store.as_ref()).await
             }

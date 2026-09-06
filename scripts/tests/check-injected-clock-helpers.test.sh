@@ -3,11 +3,18 @@
 # find the injected-clock test helpers by structure (any fn item in the
 # #[cfg(test)] module whose body or signature mentions an injected-clock type
 # -- TestClock or FixedClock -- plus the two named helpers) rather than by a
-# hand-maintained line list, flag the wall-clock constructs (including a bare/
-# aliased sleep() call and .elapsed()) only inside that scanned region, honor
-# the single-line allow-wall-clock marker only when it carries a non-empty
-# reason and is not merely inside a string literal, and fail outright -- not
-# pass silently -- when the scan finds no helpers at all.
+# hand-maintained line list, flag the wall-clock constructs only inside that
+# scanned region, honor the single-line allow-wall-clock marker only when it
+# carries a non-empty reason and is not merely inside a string literal, and
+# fail outright -- not pass silently -- when the scan finds no helpers at all
+# or fewer of them than the real default target holds.
+#
+# Every one of the gate's seven wall-clock patterns has at least one case
+# here, so deleting any single pattern line from the gate fails this suite:
+# thread::sleep, tokio::time::sleep, tokio::time::timeout, Instant::,
+# SystemTime, .elapsed() and a bare/aliased sleep() call. The two
+# receiver-form patterns also have to exempt an injected clock's own
+# sleep/elapsed while still flagging any other receiver.
 #
 # Portability: fixtures are written whole with heredocs, never mutated with
 # `sed -i` (whose backup-extension argument differs between GNU and BSD sed),
@@ -75,9 +82,28 @@ check_absent() {
   fi
 }
 
+# Assert that ${got} is an integer at or above ${floor}.
+check_ge() {
+  local label="$1" floor="$2" got="$3"
+  if [[ "${got}" =~ ^[0-9]+$ ]] && ((got >= floor)); then
+    pass=$((pass + 1))
+    printf 'ok    %s (%s >= %s)\n' "${label}" "${got}" "${floor}"
+  else
+    fail=$((fail + 1))
+    printf 'FAIL  %s\n  want: an integer >= %s\n  got:  %s\n' "${label}" "${floor}" "${got}"
+  fi
+}
+
 # The 1-indexed line number of the first line matching a fixed pattern.
 line_of() {
   grep -nF -- "$2" "$1" | head -1 | cut -d: -f1
+}
+
+# The scanned-helper count out of a clean run's report line, or "" if the run
+# did not print one. Parsed from an already-captured string, so no pipeline
+# ever masks the gate's own exit code.
+helper_count_of() {
+  printf '%s\n' "$1" | sed -n 's/^.*clean (\([0-9]\{1,\}\) helper(s) scanned)$/\1/p'
 }
 
 # === (a) a clean fixture passes with the exact helper count ================
@@ -337,6 +363,151 @@ rc=$?
 check_eq "the known-set fixture exits 0" "0" "${rc}"
 check_eq "the known-set fixture reports exactly 4 scanned helpers" \
   "check-injected-clock-helpers.sh: clean (4 helper(s) scanned)" "${out}"
+
+# === (l) thread::sleep is flagged =========================================
+# One case per remaining wall-clock pattern, so deleting any single pattern
+# line from the gate fails at least one case here. Before these, only
+# tokio::time::sleep and the two receiver-form patterns were covered, and four
+# of the five symbols issue #1260 names by name could be deleted outright with
+# the suite still green.
+threadsleep="${tmproot}/threadsleep.rs"
+cat >"${threadsleep}" <<'RS'
+#[cfg(test)]
+mod tests {
+    struct TestClock;
+
+    fn helper_on_testclock(clock: &TestClock) {
+        let _ = clock;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+RS
+ln="$(line_of "${threadsleep}" 'std::thread::sleep(std::time::Duration')"
+out="$(bash "${CHECK}" "${threadsleep}" 2>&1)"
+rc=$?
+check_eq "a thread::sleep in a clock helper exits 1" "1" "${rc}"
+check_contains "the thread::sleep finding names file:line: symbol in helper" "${out}" \
+  "${threadsleep}:${ln}: thread::sleep in helper_on_testclock"
+
+# === (m) tokio::time::timeout is flagged ==================================
+timeout_fx="${tmproot}/timeout.rs"
+cat >"${timeout_fx}" <<'RS'
+#[cfg(test)]
+mod tests {
+    struct TestClock;
+
+    async fn helper_on_testclock(clock: &TestClock) {
+        let _ = clock;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), work()).await;
+    }
+}
+RS
+ln="$(line_of "${timeout_fx}" 'tokio::time::timeout(std::time::Duration')"
+out="$(bash "${CHECK}" "${timeout_fx}" 2>&1)"
+rc=$?
+check_eq "a tokio::time::timeout in a clock helper exits 1" "1" "${rc}"
+check_contains "the timeout finding names file:line: symbol in helper" "${out}" \
+  "${timeout_fx}:${ln}: tokio::time::timeout in helper_on_testclock"
+
+# === (n) Instant:: is flagged =============================================
+instant="${tmproot}/instant.rs"
+cat >"${instant}" <<'RS'
+#[cfg(test)]
+mod tests {
+    struct FixedClock(i64);
+
+    fn helper_on_fixedclock() {
+        let _c = FixedClock(0);
+        let _started = std::time::Instant::now();
+    }
+}
+RS
+ln="$(line_of "${instant}" 'std::time::Instant::now();')"
+out="$(bash "${CHECK}" "${instant}" 2>&1)"
+rc=$?
+check_eq "an Instant:: in a clock helper exits 1" "1" "${rc}"
+check_contains "the Instant:: finding names file:line: symbol in helper" "${out}" \
+  "${instant}:${ln}: Instant:: in helper_on_fixedclock"
+
+# === (o) SystemTime is flagged ============================================
+systemtime="${tmproot}/systemtime.rs"
+cat >"${systemtime}" <<'RS'
+#[cfg(test)]
+mod tests {
+    struct TestClock;
+
+    fn helper_on_testclock(clock: &TestClock) {
+        let _ = clock;
+        let _wall = std::time::SystemTime::now();
+    }
+}
+RS
+ln="$(line_of "${systemtime}" 'std::time::SystemTime::now();')"
+out="$(bash "${CHECK}" "${systemtime}" 2>&1)"
+rc=$?
+check_eq "a SystemTime in a clock helper exits 1" "1" "${rc}"
+check_contains "the SystemTime finding names file:line: symbol in helper" "${out}" \
+  "${systemtime}:${ln}: SystemTime in helper_on_testclock"
+
+# === (p) an injected clock's OWN sleep/elapsed is not a wall-clock wait ====
+# The idiom the guard exists to encourage: a helper that awaits the injected
+# clock, in three receiver shapes. Reporting these would leave writing an
+# allow-wall-clock reason for code that is not a wall-clock wait as the only
+# escape.
+clockrecv="${tmproot}/clockrecv.rs"
+cat >"${clockrecv}" <<'RS'
+#[cfg(test)]
+mod tests {
+    struct TestClock;
+
+    async fn helper_awaiting_the_injected_clock(clock: &TestClock, holder: &Holder) {
+        clock.sleep(std::time::Duration::from_millis(1)).await;
+        let _d = clock.elapsed();
+        holder.test_clock.as_ref().sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+RS
+out="$(bash "${CHECK}" "${clockrecv}" 2>&1)"
+rc=$?
+check_eq "awaiting the injected clock's own sleep/elapsed exits 0" "0" "${rc}"
+check_eq "the clock-receiver fixture still reports 1 scanned helper" \
+  "check-injected-clock-helpers.sh: clean (1 helper(s) scanned)" "${out}"
+
+# === (q) the receiver exemption is scoped to clocks, not blanket ===========
+otherrecv="${tmproot}/otherrecv.rs"
+cat >"${otherrecv}" <<'RS'
+#[cfg(test)]
+mod tests {
+    struct TestClock;
+
+    fn helper_on_testclock(clock: &TestClock, timer: &Timer) {
+        let _ = clock;
+        timer.sleep(std::time::Duration::from_millis(1));
+    }
+}
+RS
+ln="$(line_of "${otherrecv}" 'timer.sleep(std::time::Duration')"
+out="$(bash "${CHECK}" "${otherrecv}" 2>&1)"
+rc=$?
+check_eq "a non-clock receiver's sleep is still flagged" "1" "${rc}"
+check_contains "the non-clock receiver finding is reported as sleep()" "${out}" \
+  "${otherrecv}:${ln}: sleep() in helper_on_testclock"
+
+# === (r) the real default target stays above the helper-count floor ========
+# The zero-helpers guard only catches a predicate that finds NOTHING. This
+# catches one that narrows: dropping FixedClock from the gate's CLOCK_TYPES
+# takes the real file from 26 scanned helpers to 5, and dropping both clock
+# types to 2, each of which passed every other case in this suite. A floor,
+# not an exact count, so a new helper in load.rs never fails the gate.
+REAL_TARGET_HELPER_FLOOR=20
+check_eq "the gate declares the expected default-target helper floor" \
+  "DEFAULT_TARGET_MIN_HELPERS=${REAL_TARGET_HELPER_FLOOR}" \
+  "$(grep -m1 '^DEFAULT_TARGET_MIN_HELPERS=' "${CHECK}")"
+out="$(bash "${CHECK}" 2>&1)"
+rc=$?
+check_eq "the real default target scans clean" "0" "${rc}"
+check_ge "the real default target's scanned-helper count clears the floor" \
+  "${REAL_TARGET_HELPER_FLOOR}" "$(helper_count_of "${out}")"
 
 echo
 echo "passed: ${pass}  failed: ${fail}"

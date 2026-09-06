@@ -23,11 +23,28 @@
 # hidden one call deep in a clock-free helper is out of scope. Widening to it
 # would need a call graph, which this source-only scan does not build.
 #
+# Injected-clock receivers are not wall-clock waits. `clock.sleep(..).await`
+# and `clock.elapsed()` are the idiom this guard exists to encourage, so a
+# `.sleep(` / `.elapsed(` call is masked when its receiver chain names an
+# injected clock. The test is name-based, since a source-only scan has no
+# types: the chain has to mention one of CLOCK_TYPES or an identifier
+# containing "clock" in either case. Any other receiver (`start.elapsed()`,
+# `timer.sleep(..)`) still reports.
+#
 # Allowlist: a single trailing comment marker on the offending line,
 # `// allow-wall-clock: <reason>`, with a non-empty reason and nothing else
 # (no env var, no exempt file). The marker is matched on the string-stripped
 # line, so a string literal that merely contains the marker text cannot
 # suppress a real finding.
+#
+# Helper-count floor on the default target. The zero-helpers guard below
+# catches a predicate that finds nothing at all, but not one that narrows: as
+# shipped the real file scans 26 helpers, and dropping FixedClock from
+# CLOCK_TYPES takes that to 4 (dropping both clock types, to 2) while still
+# exiting 0. So a scan of the default target that finds fewer than
+# DEFAULT_TARGET_MIN_HELPERS helpers fails. It is a floor rather than an exact
+# count on purpose: a new injected-clock helper in load.rs must never fail the
+# gate, only a predicate that stops seeing the ones already there.
 #
 # Scope note. This guard scans one file, services/ravel-cli/src/load.rs. It is
 # not yet enforced workspace-wide: other crates hold injected-clock tests it
@@ -38,15 +55,16 @@
 #     file defaults to services/ravel-cli/src/load.rs (relative to the repo
 #     root). Tests pass a throwaway fixture path here instead.
 #
-# Exit 0 clean, 1 on a wall-clock hit or on a zero-helpers scan, 64 on bad
-# usage, 70 if the scan itself could not run (unreadable file).
+# Exit 0 clean, 1 on a wall-clock hit, on a zero-helpers scan, or on a
+# default-target scan under the helper-count floor, 64 on bad usage, 70 if the
+# scan itself could not run (unreadable file).
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
 case "${1:-}" in
   -h | --help)
-    sed -n '2,42p' "$0"
+    sed -n '2,60p' "$0"
     exit 0
     ;;
 esac
@@ -56,12 +74,23 @@ if [[ $# -gt 1 ]]; then
   exit 64
 fi
 
-target="${1:-${repo_root}/services/ravel-cli/src/load.rs}"
+default_target="${repo_root}/services/ravel-cli/src/load.rs"
+target="${1:-${default_target}}"
 
 if [[ ! -f "${target}" ]]; then
   echo "check-injected-clock-helpers.sh: no such file: ${target}" >&2
   exit 64
 fi
+
+# The helper-count floor applies to the default target only (see the header):
+# a fixture legitimately holds a handful of helpers. `-ef` compares the files
+# themselves, so a relative path or a symlink to load.rs is still the default
+# target.
+is_default=0
+if [[ "${target}" -ef "${default_target}" ]]; then
+  is_default=1
+fi
+DEFAULT_TARGET_MIN_HELPERS=20
 
 # --- the scan ---------------------------------------------------------------
 #
@@ -182,6 +211,38 @@ function fn_candidate(line,   t, i, n, c) {
   }
   return substr(t, 1, i - 1)
 }
+# True when a receiver chain names an injected clock: it mentions one of
+# CLOCK_TYPES, or an identifier containing "clock" in either case. Name-based
+# because this scan has no types; see the header.
+function is_clock_receiver(chain,   ci) {
+  if (tolower(chain) ~ /clock/) return 1
+  for (ci = 1; ci <= nct; ci++) {
+    if (index(chain, clock_types[ci]) > 0) return 1
+  }
+  return 0
+}
+# Rewrite `<recv>.sleep(` / `<recv>.elapsed(` to an inert method name when
+# <recv> is an injected clock, so awaiting the clock this guard exists to
+# encourage is not itself reported as a wall-clock wait. Only the two
+# receiver-form patterns can be masked: `thread::sleep`, `tokio::time::sleep`,
+# `tokio::time::timeout`, `Instant::` and `SystemTime` carry no leading dot,
+# and masking is per call, so a real finding elsewhere on the line still
+# reports.
+function mask_clock_calls(s,   out, rest, pos, len, base, chain) {
+  out = ""
+  rest = s
+  while (1) {
+    pos = match(rest, /\.(sleep|elapsed)[ \t]*\(/)
+    if (pos == 0) return out rest
+    len = RLENGTH
+    base = substr(rest, 1, pos - 1)
+    chain = base
+    sub(/^.*[^A-Za-z0-9_:.()&*]/, "", chain)
+    if (is_clock_receiver(chain)) out = out base ".injected_clock_call("
+    else out = out base substr(rest, pos, len)
+    rest = substr(rest, pos + len)
+  }
+}
 BEGIN { SQ = sprintf("%c", 39) }
 {
   nlines++
@@ -272,9 +333,10 @@ END {
     if (mentions || is_named) {
       helper_count++
       for (k = i; k <= end_line; k++) {
+        masked = mask_clock_calls(clean[k])
         sym = ""
         for (pi = 1; pi <= np; pi++) {
-          if (clean[k] ~ pre[pi]) { sym = pname[pi]; break }
+          if (masked ~ pre[pi]) { sym = pname[pi]; break }
         }
         if (sym == "") continue
         # allow-wall-clock marker, matched on the string-stripped line and
@@ -299,13 +361,20 @@ END {
       FILENAME, NAMED_1, NAMED_2 > "/dev/stderr"
     exit 1
   }
+  if (is_default && helper_count < min_helpers) {
+    printf "check-injected-clock-helpers.sh: only %d injected-clock helper(s) scanned in %s, " \
+      "under the floor of %d -- did the helper predicate narrow (a clock type dropped from " \
+      "CLOCK_TYPES)?\n", helper_count, FILENAME, min_helpers > "/dev/stderr"
+    exit 1
+  }
   printf "check-injected-clock-helpers.sh: clean (%d helper(s) scanned)\n", helper_count
   exit 0
 }
 '
 
 scan_status=0
-awk "${awk_prog}" "${target}" || scan_status=$?
+awk -v is_default="${is_default}" -v min_helpers="${DEFAULT_TARGET_MIN_HELPERS}" \
+  "${awk_prog}" "${target}" || scan_status=$?
 if [[ ${scan_status} -gt 1 ]]; then
   echo "check-injected-clock-helpers.sh: the scan failed (awk exit ${scan_status})" >&2
   exit 70
