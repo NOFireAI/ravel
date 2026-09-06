@@ -38,20 +38,28 @@ case "$pr" in
     ;;
 esac
 
-git fetch "$remote" "$branch" >/dev/null 2>&1 || {
+# Both fetches name their destination, per the note above: relying on the
+# opportunistic remote-tracking update would make this depend on the clone's
+# `remote.<name>.fetch` refspec being the standard one.
+tip_ref="refs/remotes/${remote}/${branch}"
+git fetch "$remote" "+${branch}:${tip_ref}" >/dev/null 2>&1 || {
   echo "guard: git fetch $remote $branch failed" >&2
   exit 1
 }
 
 # refs/pull/<n>/head needs no branch name, so this works for a PR from any
-# branch and cannot be aimed at the wrong ref by a stale local copy.
-local_ref="refs/remotes/${remote}/pr-${pr}-freshness-check"
-git fetch "$remote" "refs/pull/${pr}/head:${local_ref}" -f >/dev/null 2>&1 || {
+# branch and cannot be aimed at the wrong ref by a stale local copy. The
+# destination carries the pid and is deleted on exit: a name per PR would leave
+# one ref behind for every PR ever checked, and a single fixed name would race
+# two concurrent runs against each other.
+local_ref="refs/remotes/${remote}/freshness-check-$$"
+trap 'git update-ref -d "$local_ref" 2>/dev/null || true' EXIT HUP INT TERM
+git fetch "$remote" "+refs/pull/${pr}/head:${local_ref}" >/dev/null 2>&1 || {
   echo "guard: git fetch $remote refs/pull/${pr}/head failed (is $pr a pull request on $remote?)" >&2
   exit 1
 }
 
-tip=$(git rev-parse "${remote}/${branch}") || exit 1
+tip=$(git rev-parse "$tip_ref") || exit 1
 head=$(git rev-parse "$local_ref") || exit 1
 base=$(git merge-base "$tip" "$head") || exit 1
 
@@ -60,7 +68,10 @@ if [ "$tip" = "$base" ]; then
   exit 0
 fi
 
-behind=$(git rev-list --count "$base".."$tip")
+behind=$(git rev-list --count "$base".."$tip") || {
+  echo "guard: git rev-list --count $base..$tip failed" >&2
+  exit 1
+}
 echo "guard: PR #$pr is $behind commit(s) behind $remote/$branch." >&2
 echo "guard: its CI ran against $(git rev-parse --short "$base"), not $(git rev-parse --short "$tip")." >&2
 echo "guard: most recent unseen commits:" >&2
