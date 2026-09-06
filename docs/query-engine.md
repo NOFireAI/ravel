@@ -1899,15 +1899,19 @@ lane's resolve is only reached after the metrics lane has already been
 awaited to completion, never alongside it -- and each field's combining
 rule follows from one criterion, not from the same criterion applied
 loosely three times:
-`listPageDepth` and `serviceBatches` are both SERIALIZATION-ROUND counts
-(the number of sequential rounds a lane's own fan-out actually waited
-through), and ADD across lanes for that reason: because the lanes never
-overlap, the rounds a query waits through end-to-end are one lane's rounds
-followed by the other's. A query whose metrics lane paginated 4 LIST pages
-and whose log lane paginated 2 more waited through 6 serial pages, not 4,
-and a query whose metrics fetch was forced into 3 concurrency-permit
-batches and whose log fetch needed 2 more waited through 5 serial batches,
-not `max(3, 2)`.
+`listPageDepth` and `serviceBatches` are both SERIALIZATION-ROUND figures,
+and ADD across lanes for that reason: because the lanes never overlap, a
+query's end-to-end figure is one lane's followed by the other's. They differ
+in what the per-lane figure is. `listPageDepth` counts pages the lane really
+paginated through, so a query whose metrics lane paginated 4 LIST pages and
+whose log lane paginated 2 more paginated 6 serial pages, not 4.
+`serviceBatches` is a deterministic MODEL of a lane's rounds, not a count of
+rounds it waited through (see the field's own description above: within one
+wave it is a lower bound, and the cross-wave sum can overcount or undercount
+the real sliding-window scheduler). Adding the lanes therefore adds two model
+figures: a query whose metrics lane models 3 batches and whose log lane
+models 2 reports 5, not `max(3, 2)`, and that 5 carries the same
+model-versus-scheduler caveat each lane's figure does.
 `dependencyDepth` uses a DIFFERENT criterion -- DATA independence, not
 serialization order -- and stays max-based across lanes: the log lane's
 fetch chain has no DATA dependency on the metrics lane's bytes, so the two

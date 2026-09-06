@@ -366,7 +366,10 @@ pub struct IoShapeJson {
     #[serde(rename = "listPageDepth")]
     pub list_page_depth: u32,
     /// A deterministic model figure for the serial service rounds this
-    /// query's metrics fan-out needs: the sum over outer plan waves of
+    /// QUERY needs, metrics lane plus log lane: the two lanes never overlap
+    /// (the log resolve is awaited only after the metrics lane completes), so
+    /// their figures ADD, and this field is the sum. Each lane's own figure
+    /// is the sum over its outer plan waves of
     /// `ceil(segments * active_plans / max(1, min(fanout * active_plans,
     /// shared_permits)))`, with plans counted as distinct matcher sets (the
     /// `max(1, ..)` is the helper's own clamp, so a zero permit count divides
