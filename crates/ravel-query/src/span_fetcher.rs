@@ -688,6 +688,11 @@ impl SpanSegmentFetcher {
             Source::Cache => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
+                // Same two-ledger overlap as the log fetcher's hit path: the
+                // returned `Bytes` clones the cache entry's allocation, so the
+                // cache cap and this guard both cover it until the caller drops
+                // it (ADR-1170 decision 2).
+                reservation.mark_handed_off();
             }
             // A miss issues one store GET for the resulting bytes, recorded
             // by the closure above.
