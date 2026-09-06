@@ -114,6 +114,69 @@ incremental fold, which re-lists only hours after the watermark. The repair is
 the HEAD-deletion rebuild in
 [troubleshooting](troubleshooting.md#queries-are-missing-recently-written-data).
 
+### Ingest flush cadence: byte-driven vs timer-driven, and what tightening `max_flush_lifetime` costs
+
+Two different things move independently here: how often a shard flushes
+(the write side's record cadence) and how long a published record sits in
+the unfolded listing path before the fold above can seal its hour away
+(the seal margin just described).
+
+On an acknowledged (strict) write, cadence is set by `--max-flush-delay`
+(2s default), not by `target_bytes`: a strict write keeps a waiter on its
+buffer for the whole flush window, so the size trigger almost never wins
+the race against the age clock at realistic write rates. It is not disabled
+there, though, so a tenant sustaining more than roughly `target_bytes /
+max_flush_delay` per shard (about 4 MiB/s at the defaults) does flush on
+size; below that, turning `target_bytes` down does not reduce an
+acknowledged tenant's commit-record rate. Raising `--max-flush-delay` is the
+knob that does, at the cost of acknowledged write latency, since a strict
+acknowledgement waits for its own flush to land. Budget that cost as bounded
+by the increase rather than equal to it: ages are checked on the
+`flush_tick` interval rather than continuously.
+
+Two configurations change this picture. With `--adaptive-flush-delay` on
+(off by default, and metrics only: the log and span shard actors do not
+consult it, so for those signals `--max-flush-delay` is always the
+threshold), `--max-flush-delay` becomes the floor of a per-tenant corridor
+rather than the threshold itself, so raising the floor moves only the bottom
+of a range the shard picks from. And a tenant fast enough to hit the size
+trigger is byte-driven even on the strict path, which puts it in the regime
+described next rather than this one.
+
+A buffered write (no waiter) is different, and this is where the
+byte-driven/timer-driven split applies. It has three regimes, not two,
+because `min_flush_bytes` selects which age clock a buffered tenant gets:
+
+- reaches `target_bytes` before any age trigger fires: byte-driven, and the
+  only regime that exercises the size trigger at all;
+- below `target_bytes` but holding at least `min_flush_bytes`: flushes on
+  `max_flush_delay` (2s default), the same fast clock a strict write gets,
+  so its PUT cadence is nothing like idle;
+- below `min_flush_bytes`: flushes on `max_flush_delay_idle` (40s default),
+  however little it holds.
+
+Only the third is genuinely timer-driven in the slow sense. A tenant that
+merely fails to reach `target_bytes` is not automatically in it, which
+matters when sizing `max_flush_lifetime` below: a middle-regime tenant
+flushes twenty times more often than the idle figure suggests.
+
+`max_flush_lifetime` is neither of those triggers: it is never consulted
+before a flush opens, only after, to bound how long an already-open flush
+may run before it is abandoned (waiters errored, nothing published). It is
+also, per the seal-margin arithmetic above, the largest single term in how
+long a published record sits in the unfolded tail. Lowering it shortens
+that tail, but the same tighter deadline now bounds every in-flight flush,
+including a byte-driven tenant's largest buffers, which take longer to
+encode and PUT than a timer-driven tenant's small ones. Cut it too close
+for that tenant's typical flush duration and legitimate flushes start
+hitting the deadline instead of completing, which is a write-availability
+cost, not just a slower one. Reviewing `fold_safety_margin` alongside a
+`max_flush_lifetime` change, as above, protects the seal-timing invariant;
+it does nothing for in-flight flush completion. A tenant that stays
+timer-driven, with small buffers that always PUT well inside the deadline,
+tolerates a much tighter `max_flush_lifetime` than a byte-driven one with
+large buffers near `target_bytes`.
+
 ### Routine verification
 
 ```sh

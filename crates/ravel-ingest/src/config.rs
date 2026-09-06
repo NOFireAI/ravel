@@ -130,16 +130,46 @@ pub struct IngestConfig {
     pub shard_count: u32,
     /// Bounded mpsc channel depth per shard.
     pub channel_depth: usize,
-    /// Flush a tenant's buffer once its estimated size reaches this many bytes.
+    /// Flush a tenant's buffer once its estimated size reaches this many
+    /// bytes, checked on every message received regardless of whether the
+    /// buffer has a strict-mode waiter. On the acknowledged (strict) path
+    /// this rarely wins the race against `max_flush_delay`: doing so needs
+    /// a sustained arrival rate above roughly `target_bytes /
+    /// max_flush_delay`, well over normal per-shard write rates, so at
+    /// realistic strict traffic `max_flush_delay` decides every flush and
+    /// this knob does not move commit-record cadence there (docs/ingest.md,
+    /// "Flush cadence on the acknowledged path"). It only sets a
+    /// buffered-mode tenant's cadence, and only once that tenant's arrival
+    /// rate is high enough to reach it before `max_flush_delay_idle` does.
+    /// The size trigger is not gated on the strict path, so a strict tenant
+    /// sustaining that rate does flush on size; the measurements show only
+    /// that it did not win in either measured run.
     pub target_bytes: usize,
     /// Flush a tenant's buffer once its oldest point is at least this old.
+    /// This is the trigger that actually sets commit-record cadence on the
+    /// acknowledged (strict) path: a strict write leaves the buffer's
+    /// waiters non-empty for its whole flush window, so the age-trigger
+    /// selector returns this value there rather than `max_flush_delay_idle`,
+    /// and `target_bytes` rarely wins the race against it. With
+    /// `adaptive_flush_delay` on, this is the FLOOR of a per-tenant corridor
+    /// rather than the threshold itself; the description above holds for the
+    /// default, which is off, and for the log and span shard actors in every
+    /// configuration, since only the metrics actor consults that knob. Raising it lowers acknowledged-path record
+    /// cadence at the cost of acknowledged write latency, since a strict
+    /// acknowledgement waits for its own flush to land. The added latency is
+    /// bounded by the increase rather than equal to it: ages are checked on
+    /// the `flush_tick` interval, and a buffer that reaches `target_bytes`
+    /// first flushes without waiting for the age trigger at all. Not a knob
+    /// to retune without owning that latency trade.
     pub max_flush_delay: Duration,
     /// Interval on which each shard actor checks buffered ages against
     /// `max_flush_delay`.
     pub flush_tick: Duration,
     /// Age threshold applied instead of `max_flush_delay` when a buffer has
     /// no strict-mode waiter and holds fewer than `min_flush_bytes`
-    /// (ADR-0051 section 7). Keeps the fast age trigger for
+    /// (ADR-0051 section 7). Unreachable whenever a strict-mode waiter is
+    /// present, so this never applies on the acknowledged path: it sets a
+    /// buffered-mode tenant's cadence only, keeping the fast age trigger for
     /// buffers a caller is blocked on or that are already worth a PUT, while
     /// an idle, low-volume buffered-mode tenant waits this long instead of
     /// paying a PUT every `max_flush_delay` regardless of how little data it
@@ -147,7 +177,9 @@ pub struct IngestConfig {
     pub max_flush_delay_idle: Duration,
     /// A buffer at or above this many estimated bytes is never treated as
     /// idle for the age trigger, even with no strict-mode waiter: it is
-    /// already worth the PUT cost `max_flush_delay` pays for.
+    /// already worth the PUT cost `max_flush_delay` pays for. Irrelevant
+    /// whenever a strict-mode waiter is present: that buffer is never idle
+    /// regardless of size, so this has no effect on the acknowledged path.
     pub min_flush_bytes: usize,
     /// Retries after the first attempt for the data-object PUT (total
     /// attempts = this + 1). Also bounds retries of the commit-record PUT.
@@ -158,7 +190,17 @@ pub struct IngestConfig {
     pub put_retry_base_delay: Duration,
     pub put_retry_max_delay: Duration,
     /// A flush that cannot complete within this long after it opened is
-    /// abandoned: never published, waiters errored (ADR-0010 §1/§11).
+    /// abandoned: never published, waiters errored (ADR-0010 §1/§11). Not a
+    /// flush trigger: never consulted before a flush opens, only after, to
+    /// bound how long an already-open one may run. It is also the largest
+    /// single term in how long a published record sits in the catalog's
+    /// unfolded listing path before a fold can seal it away
+    /// (docs/guides/operations/maintenance.md, "the seal margin"). Lowering
+    /// it shortens that window but tightens the deadline every in-flight
+    /// flush must complete inside, including the largest, slowest-to-encode
+    /// buffers; too tight for a tenant's typical flush duration turns
+    /// legitimate flushes into abandoned ones instead of shortening
+    /// anything.
     pub max_flush_lifetime: Duration,
     /// Window width of the flush-scoped exemplar admission cap (ADR-0047
     /// decision 2): at most one exemplar per series per window reaches the

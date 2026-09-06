@@ -229,6 +229,64 @@ object written) rather than defaulting to bucket 0 (ADR-0051 section 7):
 a fallback bucket would make the data undiscoverable by hour
 with no trace of the failure.
 
+### Flush cadence on the acknowledged path
+
+On `mode=strict`, `age_threshold_ns` (the shard actor's age-trigger
+selector, mirrored across the metrics, log and span shard actors) picks a
+threshold of `max_flush_delay_idle` only when a buffer has no strict-mode
+waiter and holds fewer than `min_flush_bytes`. A strict write keeps a
+`oneshot::Sender` in `waiters` for its whole flush window, so that
+condition never holds on the acknowledged path: `age_threshold_ns` returns
+`max_flush_delay` there, regardless of how many bytes are buffered.
+
+That last step assumes `adaptive_flush_delay` is off, which is the default,
+and it is a metrics-pipeline knob: only the metrics shard actor consults it.
+The log and span shard actors return `max_flush_delay` or
+`max_flush_delay_idle` flatly, so for those two signals the description above
+is the whole story in every configuration. On the metrics path with the knob
+on, the selector returns a per-tenant threshold in `[max_flush_delay,
+ceiling]` derived from the tenant's arrival rate and the shard's observed PUT
+round trip, so `max_flush_delay` becomes the floor of a corridor rather than
+the value. Everything below describes the default.
+
+`target_bytes` is checked separately, on the message-received branch, and
+is not gated on `waiters`: a buffer that crosses `target_bytes` before the
+next age check flushes on size, strict or buffered. In practice this
+almost never happens on the acknowledged path, because winning that race
+needs a sustained arrival rate above roughly `target_bytes /
+max_flush_delay` (about 4 MiB/s at the defaults, 8 MiB over 2 s), well
+above normal per-shard write rates. Measured across two loads spanning a
+47x range in ingest rate (8,474 points/second and 178 points/second), both
+produced close to the same commit-record rate per shard per hour, 1,413.6
+and 1,435.7 respectively, a 1.6% difference against the 47x difference in
+input rate, and the `target_bytes` size trigger fired zero times in either
+run. So the flush clock, not ingest volume, set the commit-record count in
+both measured runs. That is a statement about the rates measured, not a
+property of the strict path: the size trigger is live there, and a tenant
+sustaining more than roughly 4 MiB/s per shard would reach it.
+
+What each knob actually moves there:
+
+- `target_bytes`: does not set acknowledged-path cadence at realistic
+  write rates. It matters only for a buffered-mode tenant (see [Modes]
+  below) whose arrival rate is high enough to reach it before an age
+  trigger does.
+- `min_flush_bytes` and `max_flush_delay_idle`: unreachable whenever a
+  strict-mode waiter is present, so they have no effect on the
+  acknowledged path. On the buffered path `min_flush_bytes` is the
+  threshold that selects between the two age clocks: a buffer holding at
+  least that much takes `max_flush_delay`, and only one holding less waits
+  `max_flush_delay_idle`.
+- `max_flush_delay`: the knob that sets acknowledged-path flush cadence.
+  Raising it produces fewer, larger commit records per hour at the cost of
+  acknowledged write latency, since a strict acknowledgement waits for its
+  own flush to land. The cost is bounded by the increase rather than equal
+  to it: ages are checked on the `flush_tick` interval rather than
+  continuously, and a buffer reaching `target_bytes` flushes without waiting
+  for the age trigger at all. It is not a free tuning knob; see the
+  operations guide for the seal-delay trade-off this interacts with through
+  `max_flush_lifetime`.
+
 ### Pipelined flushes (ADR-0067)
 
 The PUTs no longer run inline in the actor. At flush-open the actor pins
