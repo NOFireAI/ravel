@@ -4039,16 +4039,7 @@ mod tests {
         let recent_hours = [sealed_hour + 10, sealed_hour + 11];
         for (i, &hour) in recent_hours.iter().enumerate() {
             let event = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
-            publish_segment(
-                &store,
-                0,
-                2 + i as u64,
-                hour,
-                event,
-                event - 1_000,
-                event,
-            )
-            .await;
+            publish_segment(&store, 0, 2 + i as u64, hour, event, event - 1_000, event).await;
         }
         let now_ns = (i64::from(sealed_hour + 11) + 1) * NS_PER_HOUR + fold_margin;
 
