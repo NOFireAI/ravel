@@ -205,16 +205,22 @@ Reservations are released when the buffer is dropped, not when the GET
 completes.
 
 Buffers outlive the fetch layer, so the guard needs a handoff rule, and the
-rule is: **every byte is under exactly one of three ledgers at every instant,
-the cache cap, a fetch guard, or an SQL reservation, and a handoff may
-double-count transiently but may never leave a gap.** Concretely:
+rule is: **every LIVE byte is under at least one of three ledgers at every
+instant, the cache cap, a fetch guard, or an SQL reservation; a handoff may
+put a byte under two, and that overlap is accounted rather than tolerated, but
+no byte may ever be under none.** Coverage is the invariant and a gap is the
+violation; the overlap is measured by `handoff_overlap` so `unique` can
+subtract it. "Exactly one" was the original wording and it contradicted the
+handoff cases immediately below it. Concretely:
 
 - A fetched buffer handed to an SQL scan is charged by that scan's own
   `try_grow` (the `LogScanStream` reservation over pending and emitted buffers,
   `crates/ravel-sql/src/logs_scan.rs:2992-3068`, and `scan.rs:598` for RSEG),
   which now reaches the same process budget through the adapter. The fetch
   guard is released only after that `try_grow` has succeeded, so the bytes are
-  double-counted for the width of one call and never uncounted. A `try_grow`
+  double-counted from the handoff until the buffer drops (see the amendment
+  below, which corrects an earlier "width of one call" reading) and never
+  uncounted. A `try_grow`
   refusal at handoff drops the buffer and surfaces the SQL error; the fetch
   guard's release follows the drop.
 - A buffer inserted into a cache is covered by the cache's hard cap from the
@@ -235,6 +241,94 @@ Concurrency knobs stop being the only thing bounding fetch memory. Raising
 choice whose memory cost is charged and refused, instead of the kernel's
 problem. That is the precondition ADR-1196 needs before a latency-first policy
 can be a default.
+
+#### Amendment (2026-09-06, Refs: #1254)
+
+Reviewing the implemented fetch reservations against the text above found two
+claims that describe an intended design the code does not implement. The
+decision stands; these correct its accounting description and record the sites
+that are not yet reserved or tracked.
+
+1. **The SQL cross-boundary overlap lasts the buffer's life, not "the width of
+   one call."** The bullet above says a fetched buffer handed to an SQL scan has
+   its fetch guard "released only after that `try_grow` has succeeded, so the
+   bytes are double-counted for the width of one call." The fetch layer cannot
+   do this: it returns the `Bytes` before the SQL layer calls `try_grow`, and
+   the guard rides inside those `Bytes` (`attach_reservation` /
+   `Bytes::from_owner`, `log_fetcher.rs`, `span_fetcher.rs`). So on the SQL
+   path the fetch reservation and the scan's `try_grow` reservation coexist for
+   the whole life of the buffer in the scan, releasing only when the consumer
+   drops the `Bytes`, not for one call. This is the same lifetime
+   `docs/query-engine.md` already describes.
+
+2. **`unique` is not exact by construction.** Decision 3 defines
+   `unique = cache_resident + sql_reserved + fetch_reserved - handoff_overlap`
+   and calls it exact. `handoff_overlap` counts only overlaps that call
+   `Reservation::mark_handed_off`, and the only site that does is a cache
+   *insert* (`Source::Upstream`, `log_fetcher.rs`/`span_fetcher.rs`). Two real
+   overlaps are therefore not in the gauge, so `unique` overstates the tracked
+   total by their size:
+   - the SQL cross-boundary overlap from correction 1 (fetch guard riding in the
+     returned `Bytes` while the scan also holds its `try_grow`), never marked;
+   - a cache **hit** (`Source::Cache`), where the returned buffer is the resident
+     cache entry and the fetch guard reserves the same bytes the cache cap
+     already holds. This one is now marked in both fetchers, so the residual `d`
+     below is the SQL boundary alone; the reasoning is kept because it is the
+     same shape and because a hit was as real an overlap as an insert all along.
+
+   The direction is an overcount of `unique` by the untracked overlap `d`, and
+   that overcount does not stop at the decision-4 acceptance assertion: decision
+   3's frozen reserve is `max_t(resident_t - unique_t) x 1.25` (plus margin),
+   calibrated from the SAME overstated `unique_t`. Subtracting a too-large
+   `unique_t` understates `resident_t - unique_t` by `d` at calibration time, so
+   the frozen reserve is itself undersized by about `1.25 x d`, not merely
+   `unique`'s term in the assertion. At acceptance time the same overcount raises
+   `unique_t` by `d` again, so the assertion's RHS, `unique_t + reserve`, nets to
+   about `0.25 x d` BELOW what it would be with an exact `unique`: the assertion
+   is tighter than intended, not looser, because the reserve lost more to the
+   overcount than the `unique_t` term gained back. A tighter assertion is not
+   free slack: the frozen reserve is also required to exceed the `partitions x
+   max batch bytes` exposure from decision 1 (the infallible-`grow` overshoot
+   bound), and an `1.25 x d`-undersized reserve can fail to clear that bound
+   even where it looks like it clears the acceptance band, which is a safety
+   property, not headroom to spend. The calibration run must therefore do one
+   of two things, not silently ship the 1.25 constant unchanged: either mark
+   the handoff at the remaining untracked site first (the SQL boundary) so
+   calibration measures an exact `unique` and the reserve is derived from the
+   true `resident_t - unique_t`, or, if calibration still runs against the
+   overstated `unique`, measure and record the residual `d` (now the SQL
+   cross-boundary overlap alone, sampled the same way as
+   `ravel_memory_handoff_overlap_bytes` would if it covered it) and widen the
+   multiplier to cover `1.25 x d` on top of the existing margin, with that
+   arithmetic in the constant's doc comment. Making `unique` exact means
+   marking the handoff at these two sites too (or subtracting them another
+   way), which is follow-up work; until it lands, the reserve derivation must
+   account for `d` explicitly rather than assume the overcount is harmless.
+
+**Known-unreserved / not-yet-enforcing sites** (the budget observes nothing at
+these until a finite budget is wired and, for the last two, the overlap is
+marked):
+
+- RSPAN fetchers and every fetcher `build_sql_state` constructs
+  (`services/ravel-server/src/query.rs`) reserve against their default
+  `MemoryBudget::unlimited()`: `QueryEngine::with_memory_budget` reaches only its
+  `fetcher` and `log_fetcher`, and no server task installs a finite budget yet.
+- The SQL cross-boundary overlap is untracked by `handoff_overlap`. The
+  cache-hit overlap was too, and is now marked in both the log and span
+  fetchers, so the residual is the SQL boundary alone.
+- **Idle assembly buffers.** The invariant above is stated over LIVE bytes for
+  a reason: `AssemblyBuffer::drop` returns its allocation to
+  `AssemblyBufferPool`'s free list, not to the allocator, so those bytes stay
+  resident under none of the three ledgers. This is structural to every RLOG
+  path, not to any one of them, and it is bounded separately by
+  `MAX_IDLE_ASSEMBLY_BUFFERS` and `MAX_IDLE_ASSEMBLY_BYTES` per fetcher, which
+  is why it is a known gap rather than an unbounded one. It matters most at the
+  coverage crossover, which drops its assembler before the covering read
+  reserves fresh: the reservation figure is then one object while residency is
+  briefly two, until the pool hands that buffer to the next read or evicts it.
+  Anything comparing `resident_t` against reserved totals, decision 4's
+  acceptance assertion included, must count the pool's idle bytes on the
+  resident side or it will read the difference as an accounting error.
 
 ### 3. A static carve under one number
 
@@ -263,9 +357,19 @@ the reserve. The fetch layer therefore keeps one more gauge,
 moment the receiving `try_grow` or cache insert succeeds and subtracts it on
 its own drop, so the gauge is exactly the bytes currently in two ledgers.
 `unique = cache_resident + sql_reserved + fetch_reserved - handoff_overlap`,
-exact by construction rather than bounded by a margin, and the same expression
-is what the acceptance assertion in decision 4 subtracts. The margin covers
-allocator slack and sampling, not accounting overlap. That value lands as a
+and the same expression is what the acceptance assertion in decision 4
+subtracts.
+
+This paragraph originally said that expression was exact by construction. It is
+exact only if every overlap is marked, which the first implementation did not
+achieve: see the amendment under decision 2. Cache hits are now marked
+alongside cache inserts, so the remaining unmarked overlap is the SQL
+cross-boundary one, where the fetch guard and the scan's `try_grow` both cover
+the buffer. Until that is marked too, `unique` is an upper bound, the reserve
+derived from it is undersized by roughly 1.25 times the residual, and the
+calibration run must either mark it first or measure the residual and widen the
+multiplier. The margin covers allocator slack and sampling, not accounting
+overlap, so it cannot be leaned on to absorb this. That value lands as a
 constant in the derivation with the calibration figures in its doc comment, the
 way `CACHE_MEMORY_PERCENT` carries the sweep, in a commit that precedes the
 first acceptance run. The acceptance runs then use the frozen value and can

@@ -43,6 +43,7 @@
 use std::sync::Arc;
 
 use crate::fetcher::ReadCache;
+use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -161,6 +162,18 @@ pub enum SpanFetchError {
     },
     #[error("span segment {key} belongs to a different tenant than the query")]
     TenantMismatch { key: String },
+    /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
+    /// reservation for the bytes this GET would materialize. Carries only the
+    /// three accounting figures, never a key or tenant value. Mirrors
+    /// [`crate::FetchError::FetchMemoryExhausted`].
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    FetchMemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
 }
 
 /// Fetches and scans one RSPAN span segment at a time. Constructed with the
@@ -189,6 +202,12 @@ pub struct SpanSegmentFetcher {
     /// wires it to the one process-shared limiter every query-side fetcher can
     /// hold instead.
     get_limiter: Arc<crate::GetLimiter>,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). Each
+    /// whole-object GET reserves the object's size against it before the GET,
+    /// and the reservation travels with the returned bytes. Default unlimited
+    /// (never refuses); [`Self::with_memory_budget`] wires the shared one,
+    /// mirroring [`Self::with_get_limiter`].
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 impl SpanSegmentFetcher {
@@ -200,7 +219,38 @@ impl SpanSegmentFetcher {
             get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
                 crate::fetcher::DEFAULT_MAX_CONCURRENT_GETS,
             )),
+            memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         }
+    }
+
+    /// Wires this fetcher to a caller-owned [`ravel_memory::MemoryBudget`]
+    /// (ADR-1170 decision 2), so its whole-object GETs reserve against the same
+    /// budget as every other fetcher (and, via
+    /// [`crate::QueryEngine::with_memory_budget`], every other engine) holding
+    /// the same `Arc`. Mirrors [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// This fetcher's current memory budget, for a test to `Arc::ptr_eq`.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a whole-object
+    /// GET, mapping a refusal to [`SpanFetchError::FetchMemoryExhausted`]. The
+    /// guard is owned for the fetched buffer's lifetime (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, SpanFetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| SpanFetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
     }
 
     /// Sets the in-flight GET bound by building a new private limiter. Shared
@@ -312,6 +362,11 @@ impl SpanSegmentFetcher {
         }
 
         let key = &seg_ref.data_object_key;
+        // Reserve the whole object's bytes before the GET (ADR-1170 decision 2):
+        // a refusal fails typed with zero GETs. Held to the end of this call,
+        // covering the decode below; released when the fully-decoded rows are
+        // returned.
+        let _reservation = self.reserve_fetch(seg_ref.object_size)?;
         // The permit covers the GET only; decode below runs without it, as on
         // every other funnel.
         let got = async {
@@ -552,6 +607,11 @@ impl SpanSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Bytes, SpanFetchError> {
         let key = &seg_ref.data_object_key;
+        // Reserve the whole object's bytes before the direct whole-object GET
+        // (ADR-1170 decision 2): a refusal fails typed with zero GETs. The guard
+        // travels with the returned bytes, owned for the fetched buffer's
+        // lifetime rather than released when the GET completes.
+        let reservation = self.reserve_fetch(seg_ref.object_size)?;
 
         let Some(cache) = &self.cache else {
             let _permit = self
@@ -574,7 +634,7 @@ impl SpanSegmentFetcher {
                 })?;
             accounting.record_s3_request(AccountedOp::Get);
             accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
-            return Ok(got.data);
+            return Ok(attach_reservation(got.data, reservation));
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
@@ -599,18 +659,30 @@ impl SpanSegmentFetcher {
             // error type.
             .map_err(|err| from_cache_error(key, err))?;
 
+        let mut reservation = reservation;
         match source {
             Source::Cache => {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
+                // Same two-ledger overlap as the log fetcher's hit path: the
+                // returned `Bytes` clones the cache entry's allocation, so the
+                // cache cap and this guard both cover it until the caller drops
+                // it (ADR-1170 decision 2).
+                reservation.mark_handed_off();
             }
             // A miss issues one store GET for the resulting bytes, recorded
             // by the closure above.
             Source::Upstream => {
                 accounting.record_cache_miss();
+                // Admitted to the read cache, which has its own byte ledger:
+                // mark the reservation handed off so the transient overlap is
+                // visible while both this buffer and the cache entry hold the
+                // same bytes (ADR-1170 decision 2). Cleared when this guard
+                // drops.
+                reservation.mark_handed_off();
             }
         }
-        Ok(bytes)
+        Ok(attach_reservation(bytes, reservation))
     }
 
     /// Candidate selection over one whole-object's bytes, with no block decoded:
@@ -1145,6 +1217,23 @@ mod tests {
     use uuid::Uuid;
 
     const TENANT: TenantHash = TenantHash([9u8; 16]);
+
+    /// Deliverable 1: `SpanSegmentFetcher::new` defaults to an unlimited budget
+    /// (inert accounting) and `with_memory_budget` installs the shared one the
+    /// engine hands every fetcher.
+    #[test]
+    fn with_memory_budget_installs_the_shared_budget() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let fetcher = SpanSegmentFetcher::new(store);
+        assert_eq!(
+            fetcher.memory_budget_for_test().limit(),
+            u64::MAX,
+            "the default budget is unlimited, so the accounting is inert"
+        );
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let fetcher = fetcher.with_memory_budget(budget.clone());
+        assert!(Arc::ptr_eq(fetcher.memory_budget_for_test(), &budget));
+    }
 
     /// The columnar exit's projection for these tests: every FIXED column, and
     /// nothing dynamic. It decodes `trace_id`, `span_id`, `parent_span_id`,
