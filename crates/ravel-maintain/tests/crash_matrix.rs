@@ -167,11 +167,21 @@ async fn row4_partial_part_upload() {
 }
 
 /// Row 10: two compactors race on the same inputs. One wins the record's
-/// CreateIfAbsent; the loser HEAD-and-repairs the winner's parts and reports
-/// convergence. Here the winner runs first, one of its parts is dropped, then
-/// the loser's publish converges and repairs the missing part.
+/// CreateIfAbsent; the loser HEADs the winner's parts on the converging path.
+/// Here the winner runs first, one of its parts is dropped, then the loser
+/// publishes.
+///
+/// Since ADR-0979 decision 3 (issue #981 for the metrics path) the loser
+/// released its own parts' bytes at PUT, so it holds nothing to repair the
+/// dropped part from: the converging publish fails closed with
+/// [`ravel_maintain::MaintainError::ConvergedWinnerPartMissing`] rather than
+/// reporting `Converged` over a record that references an absent object. The
+/// hole is healed by re-running the build, whose PUT of the now-absent key is a
+/// FRESH put that restores the byte-identical part before the record resolves;
+/// the publish then converges by presence, repairing nothing. This is the same
+/// convergence-by-presence shape `tombstone_race.rs` pins for RLOG.
 #[tokio::test]
-async fn row10_racing_compactors_loser_converges_and_repairs() {
+async fn row10_racing_compactors_loser_converges_by_presence_after_rerun() {
     let store = MemoryStore::new();
     let specs = seed(&store).await;
     let clock = FixedClock::new(sealed_now_ns());
@@ -207,15 +217,22 @@ async fn row10_racing_compactors_loser_converges_and_repairs() {
     .await
     .unwrap();
 
+    // ... releasing each part's bytes at its PUT, so no in-RAM repair copy
+    // exists (ADR-0979 decision 3).
+    assert!(
+        parts.iter().all(|p| p.bytes.is_none()),
+        "the loser's build released every part's bytes at PUT"
+    );
+
     // ... then a winner part goes missing (e.g. a stray delete), so the
-    // loser's converging publish must HEAD-and-repair it.
+    // loser's converging publish HEADs an absent key it cannot re-PUT.
     let victim = ravel_commit::keys::reconstruct_l1_part_key(&winner, &winner.parts[0]).unwrap();
     store.delete(&victim).await.unwrap();
     assert!(store.get(&victim, GetRange::Full).await.is_err());
 
     // The loser's record PUT hits AlreadyExists with the same input_set_hash,
-    // so it converges and repairs the dropped part.
-    let outcome = publish::publish_record(
+    // so it converges -- and fails closed on the hole it cannot fill.
+    let err = publish::publish_record(
         &store,
         &cfg(),
         &clock,
@@ -226,12 +243,48 @@ async fn row10_racing_compactors_loser_converges_and_repairs() {
         clock.now_ns(),
     )
     .await
-    .expect("loser publish");
-    assert_eq!(outcome, PublishOutcome::Converged { parts_repaired: 1 });
+    .expect_err("an unrepairable missing winner part must fail typed");
+    match err {
+        ravel_maintain::MaintainError::ConvergedWinnerPartMissing { part_key } => {
+            assert_eq!(part_key, victim, "the error names the absent winner part");
+        }
+        other => panic!("expected ConvergedWinnerPartMissing, got {other:?}"),
+    }
+
+    // The re-run heals it: the deleted key is absent, so rebuilding PUTs it
+    // fresh, and the converging publish then finds every winner part present.
+    let mut rerun_catalogs = Vec::new();
+    for i in &inputs {
+        rerun_catalogs.push(read::load_input_catalog(&store, &cfg(), i).await.unwrap());
+    }
+    let rerun_parts = build::build_parts(
+        &store,
+        &cfg(),
+        &bucket,
+        &inputs,
+        rerun_catalogs,
+        &HashSet::new(),
+        &hash,
+    )
+    .await
+    .unwrap();
     assert!(
         store.get(&victim, GetRange::Full).await.is_ok(),
-        "part repaired"
+        "the rerun's fresh PUT restored the part before record resolution"
     );
+    let outcome = publish::publish_record(
+        &store,
+        &cfg(),
+        &clock,
+        &bucket,
+        &inputs,
+        &hash,
+        &rerun_parts,
+        clock.now_ns(),
+    )
+    .await
+    .expect("rerun publish");
+    assert_eq!(outcome, PublishOutcome::Converged { parts_repaired: 0 });
 
     let record = fetch_compaction_record(&store, &bucket).await;
     assert_eq!(

@@ -94,7 +94,7 @@ use crate::request_ledger::RequestLedger;
 ///   accumulated records, decoded heap.
 /// - retained closed parts ([`Self::add_retained_part_bytes`]): the encoded
 ///   bytes of every closed part still held resident until publish. Since
-///   ADR-0979 decision 3 the bounded RLOG compaction path releases each part's
+///   ADR-0979 decision 3 the RLOG and RSEG compaction paths release each part's
 ///   bytes at PUT, so this term is ZERO there; it is nonzero only for a path
 ///   that defers its PUTs and keeps the bytes (the erasure rewrite).
 /// - finish and publish ([`Self::set_publish_record_bytes`]): the encoded
@@ -853,8 +853,9 @@ pub struct CompactorConfig {
     ///   on [`Self::max_l1_part_bytes`] (the estimated stored object), and that path's
     ///   peak is one fetch window's raw pages, plus one series' decoded samples
     ///   (a multi-run series is decoded and merged whole, so it is bounded by
-    ///   that series' size and by nothing configurable), plus every finished
-    ///   part's encoded bytes, which are retained until publish.
+    ///   that series' size and by nothing configurable). A finished part's
+    ///   encoded bytes are released at its PUT (ADR-0979 decision 3), so they
+    ///   are not a term of that peak.
     ///
     /// Named for what it measures and what it does: a split target in decoded
     /// heap. It was `max_l1_part_memory_bytes`, which reads as a resident-bytes

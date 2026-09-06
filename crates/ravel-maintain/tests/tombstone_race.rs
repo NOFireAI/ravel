@@ -1,9 +1,11 @@
-//! ADR-0979 decision 3: the bounded RLOG compaction path releases each part's
-//! bytes at PUT and closes the tombstone race by post-publish HEAD verification
-//! rather than by retaining bytes.
+//! ADR-0979 decision 3: the RLOG and RSEG compaction paths release each part's
+//! bytes at PUT and close the tombstone race by post-publish HEAD verification
+//! rather than by retaining bytes. The RLOG tests come first, then the RSEG
+//! (metrics) ones (issue #981), which assert the same two properties on
+//! [`RsegCodec::build_parts`].
 //!
 //! These tests drive the compaction pipeline at its two seams --
-//! [`RlogCodec::build_parts`] (which PUTs the content-addressed parts) and
+//! `build_parts` (which PUTs the content-addressed parts) and
 //! [`publish_record`] (which PUTs the record, then verifies) -- in sequence,
 //! exactly as `rewrite_and_publish` calls them. Splitting the two lets a test
 //! delete an already-PUT part in the window between the part PUTs and the
@@ -27,7 +29,7 @@ use ravel_maintain::error::MaintainError;
 use ravel_maintain::publish::{PublishOutcome, publish_record};
 use ravel_maintain::read::{input_set_hash, list_bucket, load_inputs};
 use ravel_maintain::rlog::RlogCodec;
-use ravel_maintain::{Bucket, CompactorConfig, FixedClock};
+use ravel_maintain::{Bucket, CompactorConfig, FixedClock, RsegCodec};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use uuid::Uuid;
@@ -496,4 +498,206 @@ async fn rerun_with_revanished_part_fails_typed_not_converged() {
     // referencing a key this deterministic, content-addressed build did not
     // produce would require a corrupted record. The arm stays as
     // defense-in-depth against exactly that corruption.
+}
+
+/// Seed a small metrics bucket whose whole output fits one L1 part, so a test
+/// reasons about exactly one content-addressed part key.
+async fn seed_one_part_metrics_bucket(store: &MemoryStore) -> Bucket {
+    // Two small inputs over two shared series, well under the default
+    // stored-size target, so the rewrite closes a single part.
+    seed_input(
+        store,
+        &InputSpec::new(
+            Uuid::from_u128(11),
+            5,
+            1,
+            vec![
+                raw_series("m", &[("k", "a")], &[(1_000, 1.0), (5_000, 2.0)]),
+                raw_series("m", &[("k", "b")], &[(2_000, 3.0)]),
+            ],
+        ),
+    )
+    .await;
+    seed_input(
+        store,
+        &InputSpec::new(
+            Uuid::from_u128(12),
+            5,
+            2,
+            vec![
+                raw_series("m", &[("k", "a")], &[(3_000, 4.0)]),
+                raw_series("m", &[("k", "b")], &[(4_000, 5.0)]),
+            ],
+        ),
+    )
+    .await;
+    bucket()
+}
+
+/// Load every input's RSEG catalog in canonical input order, aligned with
+/// `inputs`, exactly as `rewrite_and_publish` does before `build_parts`.
+async fn load_rseg_catalogs(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    inputs: &[ravel_maintain::read::InputRecord],
+) -> Vec<<RsegCodec as SegmentCodec>::Catalog> {
+    let mut catalogs = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        catalogs.push(
+            RsegCodec::load_input_catalog(store, config, input)
+                .await
+                .expect("load catalog"),
+        );
+    }
+    catalogs
+}
+
+/// Build and PUT one run's metrics parts, the seam `rewrite_and_publish` calls
+/// before `publish_record`.
+async fn rseg_build(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    inputs: &[ravel_maintain::read::InputRecord],
+    hash: &[u8; 32],
+) -> Vec<ravel_maintain::build::BuiltPart> {
+    let catalogs = load_rseg_catalogs(store, config, inputs).await;
+    RsegCodec::build_parts(store, config, bucket, inputs, catalogs, hash)
+        .await
+        .expect("rseg build_parts")
+}
+
+/// Issue #981: the RSEG (metrics) compaction path releases each finished part's
+/// encoded bytes as soon as its `CreateIfAbsent` PUT succeeds, instead of
+/// holding the bucket's whole output until publish. The parts are provably in
+/// the store, so `bytes == None` is a release after a real PUT rather than a
+/// PUT that never ran, and the run still publishes.
+///
+/// Flip proof (non-vacuous): drop the `part.bytes = None;` line in
+/// `build.rs::put_and_release_part` (the pre-fix behaviour, where
+/// `flush_part`'s `bytes: Some(written.bytes)` survived to publish) and the
+/// `bytes.is_none()` assertion fails on every part. The assertion is on the
+/// released state directly, not on a byte total.
+#[tokio::test]
+async fn rseg_flush_part_drops_bytes_after_put() {
+    let store = MemoryStore::new();
+    let bucket = seed_one_part_metrics_bucket(&store).await;
+    let config = CompactorConfig::default();
+    let commit_keys = list_bucket(&store, &bucket)
+        .await
+        .expect("list")
+        .commit_keys;
+    let inputs = load_inputs(&store, &bucket, &commit_keys, config.input_read_concurrency)
+        .await
+        .expect("inputs");
+    let hash = input_set_hash(&inputs);
+
+    let parts = rseg_build(&store, &config, &bucket, &inputs, &hash).await;
+    assert_eq!(parts.len(), 1, "the fixture builds exactly one part");
+    for p in &parts {
+        assert!(
+            p.bytes.is_none(),
+            "RSEG compaction releases a part's bytes at PUT (ADR-0979 D3)"
+        );
+        assert!(
+            !p.put_already_existed,
+            "a first build PUTs every part fresh"
+        );
+        assert!(
+            store.head(&p.key).await.is_ok(),
+            "the released part must be present in the store"
+        );
+    }
+
+    // The run still publishes with no part bytes retained anywhere.
+    let clock = FixedClock::new(sealed_now_ns());
+    let outcome = publish_record(
+        &store,
+        &config,
+        &clock,
+        &bucket,
+        &inputs,
+        &hash,
+        &parts,
+        sealed_now_ns(),
+    )
+    .await
+    .expect("publish must complete without retained part bytes");
+    assert_eq!(outcome, PublishOutcome::Published);
+    let record = fetch_compaction_record(&store, &bucket).await;
+    assert_eq!(record.level, 1);
+}
+
+/// Issue #981, the `AlreadyExists` half: a metrics part whose PUT answered
+/// `AlreadyExists` retains no bytes either (retaining them on an abandoned-run
+/// retry would rebuild the whole-output term D3 removes), and is covered
+/// instead by `publish.rs`'s existing `verify_already_existed_parts` HEAD
+/// check. Deleting that part in the window between the part PUTs and the record
+/// PUT -- the tombstone race -- makes the run fail loud with
+/// [`MaintainError::AlreadyExistsPartVanished`], which only that verification
+/// produces, so this pins the routing as well as the flag.
+///
+/// Flip proof (non-vacuous): drop the `PartPut::AlreadyExisted =>
+/// part.put_already_existed = true` arm in `build.rs::put_and_release_part` (the
+/// pre-fix behaviour: RSEG discarded the `PartPut` outcome) and the run reports
+/// `Published` over a record referencing the deleted part, failing both the
+/// `put_already_existed` assertion and the `expect_err`.
+#[tokio::test]
+async fn rseg_already_exists_part_retains_no_bytes_and_is_head_verified() {
+    let store = MemoryStore::new();
+    let bucket = seed_one_part_metrics_bucket(&store).await;
+    let config = CompactorConfig::default();
+    let commit_keys = list_bucket(&store, &bucket)
+        .await
+        .expect("list")
+        .commit_keys;
+    let inputs = load_inputs(&store, &bucket, &commit_keys, config.input_read_concurrency)
+        .await
+        .expect("inputs");
+    let hash = input_set_hash(&inputs);
+
+    // An abandoned run that died between its part PUTs and its record PUT: the
+    // content-addressed parts are in the store, no record is.
+    let abandoned = rseg_build(&store, &config, &bucket, &inputs, &hash).await;
+    let vanished = abandoned[0].key.clone();
+
+    // Our run rebuilds the byte-identical part; its PUT answers AlreadyExists.
+    let parts = rseg_build(&store, &config, &bucket, &inputs, &hash).await;
+    assert!(
+        parts.iter().all(|p| p.put_already_existed),
+        "every rebuilt part's PUT must answer AlreadyExists"
+    );
+    assert!(
+        parts.iter().all(|p| p.bytes.is_none()),
+        "no AlreadyExists part retains bytes (D3 kills the whole-output term)"
+    );
+
+    // The unreferenced-part sweep deletes the abandoned part between our part
+    // PUTs and our record PUT. Prove the deletion took effect, so the failure
+    // below is a real vanished part rather than a vacuous check.
+    store.delete(&vanished).await.expect("delete part");
+    assert!(
+        matches!(store.head(&vanished).await, Err(StoreError::NotFound)),
+        "the raced deletion must actually remove the part"
+    );
+
+    let clock = FixedClock::new(sealed_now_ns());
+    let err = publish_record(
+        &store,
+        &config,
+        &clock,
+        &bucket,
+        &inputs,
+        &hash,
+        &parts,
+        sealed_now_ns(),
+    )
+    .await
+    .expect_err("a vanished AlreadyExists part must fail the run loud");
+    match err {
+        MaintainError::AlreadyExistsPartVanished { part_key } => {
+            assert_eq!(part_key, vanished, "the error names the vanished part");
+        }
+        other => panic!("expected AlreadyExistsPartVanished, got {other:?}"),
+    }
 }

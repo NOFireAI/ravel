@@ -11,7 +11,8 @@
 //! metadata bound. The verbatim TS/VAL/HIST page bytes are
 //! fetched lazily during the merge ([`crate::build`]) with ranged GETs, so
 //! peak memory is catalog metadata plus one fetch window, plus the series being
-//! materialized, plus the parts held until publish -- not the whole bucket's
+//! materialized -- a finished part releases its encoded bytes at its PUT
+//! (ADR-0979 decision 3), so the parts are not a term -- not the whole bucket's
 //! page data ([`crate::build`]'s header comment splits those terms and says
 //! which of them a config knob sizes).
 
