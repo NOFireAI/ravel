@@ -146,10 +146,12 @@ Waiting is event-driven, never babysat. The harness kills background
 processes after about 10 minutes; an unbounded watcher dies unnoticed and
 the fallback becomes no-op status polls that burn turns and tokens.
 
-- Arm `scripts/fleet-watch-managed.sh` under a Monitor until-loop: each
-  bounded run exits 75 when its budget elapses and the Monitor relaunches
-  it; exit 0 prints the terminal event. Never nohup a watcher and never
-  poll one with `ps`.
+- Arm `scripts/fleet-watch-loop.sh <watch-url>` under a Monitor, as the
+  whole command. It relaunches the bounded watcher across budget
+  rollovers and emits one line only when the watch is actually over.
+  Writing that loop by hand in the Monitor command is a step that has
+  been got wrong twice: a command that prints the 75 and exits ends the
+  watch silently. Never nohup a watcher and never poll one with `ps`.
 - Idle fallback wakeups: 15 minutes or longer. Embed the current ledger
   state in every wakeup prompt so a compaction between wakeups costs
   nothing.
@@ -209,7 +211,15 @@ connection, a pushed-but-broken main).
   same polling, in bounded runs sized to survive the harness's 10-minute
   background cap. Exit 0 = terminal event printed; exit 75 = budget
   elapsed, relaunch (arm it under a Monitor until-loop that relaunches
-  on 75).
+  on 75). Prefer `fleet-watch-loop.sh` below, which is that loop.
+- `scripts/fleet-watch-loop.sh <watch-url> [budget-s] [poll-s]`: the
+  relaunch loop around `fleet-watch-managed.sh`, so a Monitor command is
+  the script name and nothing else. Arm this rather than hand-writing the
+  loop: a command that reports the 75 instead of relaunching ends the
+  watch, and every later terminal event is lost with nothing to say the
+  watch died. One stdout line per event, each worth a notification:
+  `TERMINAL <data: line>`, `WATCH-ERROR code=N`, or `WATCH-GAVE-UP` once
+  `FLEET_WATCH_MAX_SECONDS` (default 18000) elapses.
 - `scripts/epic-status.sh <epic-issue> [--fresh]`: one-call "where are we
   at?": reads the epic ledger (cached 60 s) and reconciles every task id
   in it against `refs/heads/task/*` on origin and the task-branch PRs.
