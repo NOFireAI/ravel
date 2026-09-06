@@ -1911,7 +1911,8 @@ impl Catalog {
     /// those shards even under a small configured `shard_count`, and a
     /// shard-count decrease keeps a retiring generation's higher indices in
     /// scope for `DEFAULT_SCAN_SLACK_HOURS`. Shards are fanned out
-    /// concurrently, `MAX_CONCURRENT_REQUESTS` at a time.
+    /// concurrently, `CatalogConfig::resolve_get_concurrency` at a time, the
+    /// same bound every other listing fan-out in this file uses.
     ///
     /// This cannot use `list_delimited`: that call has no `start_after` and
     /// no pagination, so it cannot be floored without listing a shard's
@@ -1967,7 +1968,7 @@ impl Catalog {
                 .map(|shard| {
                     self.latest_ingest_hour_for_shard(tenant, signal, shard, max_hour, accounting)
                 })
-                .buffered(MAX_CONCURRENT_REQUESTS)
+                .buffered(self.config.resolve_get_concurrency)
                 .collect()
                 .await;
 
