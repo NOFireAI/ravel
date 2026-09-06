@@ -55,9 +55,9 @@
 //!   recorded separately from `dependency_depth` because pagination
 //!   (`Catalog::list_shard_hours`) and the GET dependency chain are different
 //!   object-store mechanisms with different causes.
-//! - [`service_batches`](QueryIoShape::service_batches): a LOWER bound on
-//!   the serial service rounds this query's per-segment fan-out needed,
-//!   under a wave-synchronous model of the nested fan-out
+//! - [`service_batches`](QueryIoShape::service_batches): a deterministic
+//!   model figure for the serial service rounds this query's per-segment
+//!   fan-out needs, under a wave-synchronous model of the nested fan-out
 //!   (`crates/ravel-query/src/engine.rs`) with three levels of admission,
 //!   all of which bound the round count:
 //!   1. the OUTER `buffer_unordered(promql_fetch_fanout)` over distinct
@@ -73,23 +73,38 @@
 //!      docs/query-engine.md), which every GET from every plan passes
 //!      through regardless of which plan or segment issued it.
 //!
-//!   It is a lower bound, never an upper bound or an exact count, because
-//!   the OUTER `buffer_unordered` is a SLIDING window, not a wave-synchronous
-//!   one: as soon as one admitted plan finishes, the next plan is admitted
-//!   immediately, without waiting for its siblings. A model that assumed the
-//!   whole outer window empties and refills together (`ceil(segment_count *
-//!   service_fetch_multiplier / min(promql_fetch_fanout *
-//!   min(service_fetch_multiplier, promql_fetch_fanout),
-//!   shared_get_permits))`, dividing TOTAL work by PEAK capacity) undercounts
-//!   whenever the outer window is not full for the query's entire duration:
-//!   3 distinct plans, 1 segment each, `promql_fetch_fanout` 2, and a
-//!   1000-permit limiter gives peak capacity `min(2 * 2, 1000) = 4`, so that
-//!   model reports `ceil(3 / 4) = 1` round -- but plans 1 and 2 admit
-//!   together in the first round, and plan 3 is only admitted after one of
-//!   them finishes, in a second round: the real scheduler takes at least 2
-//!   rounds, never fewer than the wave-synchronous model computes, because a
-//!   sliding window can only pack work as tightly as a synchronized one, not
-//!   more loosely.
+//!   Within a single wave, `batches_w` (defined below) is a lower bound on
+//!   that wave's own serial rounds: the OUTER `buffer_unordered`'s binding
+//!   capacity for that wave is `capacity_w`, and a wave cannot service more
+//!   than `capacity_w` requests per round, so it cannot finish in fewer than
+//!   `batches_w` rounds. But `service_batches` sums `batches_w` across
+//!   waves, and that sum is a model figure, not a bound in either direction,
+//!   because the OUTER `buffer_unordered` is a SLIDING window, not a
+//!   wave-synchronous one: as soon as one admitted plan finishes, the next
+//!   plan is admitted immediately, without waiting for its siblings, so a
+//!   later wave's work can start -- and finish -- before an earlier wave's
+//!   is done. Concretely: 16 shared permits, 17 distinct matcher plans
+//!   admitted through an outer fan-out width of 16 (one segment each), plus
+//!   one further plan whose single segment fetch only becomes eligible
+//!   after the first of the 17 resolves. The real scheduler finishes all of
+//!   it in two rounds, because that further fetch is admitted into the same
+//!   round that drains the 17th plan's leftover request, while the summed
+//!   per-wave model reports `ceil(17 / 16) + ceil(1 / 16) = 3`, one round
+//!   too many. The same sliding window can also undercount: a model that
+//!   assumed the whole outer window empties and refills together
+//!   (`ceil(segment_count * service_fetch_multiplier /
+//!   min(promql_fetch_fanout * min(service_fetch_multiplier,
+//!   promql_fetch_fanout), shared_get_permits))`, dividing TOTAL work by
+//!   PEAK capacity) reports `ceil(3 / 4) = 1` round for 3 distinct plans, 1
+//!   segment each, `promql_fetch_fanout` 2, and a 1000-permit limiter
+//!   (peak capacity `min(2 * 2, 1000) = 4`), but plans 1 and 2 admit
+//!   together in the first round and plan 3 only after one of them
+//!   finishes, in a second round -- the real scheduler needs at least 2.
+//!   `service_batches` is therefore a deterministic model figure: identical
+//!   work always produces the same number, which makes it comparable across
+//!   queries and useful for spotting a regression in fan-out width or
+//!   permit sizing, but the cross-wave sum is neither an upper nor a lower
+//!   bound on the rounds the real scheduler takes.
 //!
 //!   So this figure is computed per WAVE of the outer fan-out instead of
 //!   once over the total: `waves = ceil(service_fetch_multiplier /
@@ -99,12 +114,13 @@
 //!   wave, `capacity_w = min(promql_fetch_fanout * active_w,
 //!   shared_get_permits)` is that wave's binding concurrency, and `batches_w
 //!   = ceil(segment_count * active_w / capacity_w)` is the serial rounds
-//!   that wave alone needs. `service_batches` sums `batches_w` over every
-//!   wave: because the outer stream never admits a plan from wave `w + 1`
-//!   until wave `w`'s plans have all been admitted (though not necessarily
-//!   finished -- see the sliding-window caveat above, which is exactly why
-//!   this sum is a lower rather than an exact bound), the waves are at least
-//!   this serial, and their round counts add.
+//!   that wave alone needs (a true lower bound on that wave in isolation).
+//!   `service_batches` sums `batches_w` over every wave: the outer stream
+//!   never admits a plan from wave `w + 1` until wave `w`'s plans have all
+//!   been admitted (though not necessarily finished -- see the
+//!   counterexample above), so the sum is a deterministic model of the
+//!   nested fan-out, not a bound on the true round count in either
+//!   direction once more than one wave is involved.
 //!
 //!   Reviewer's case above: 2 waves. Wave 0: `active_0 = min(2, 3) = 2`,
 //!   `capacity_0 = min(2 * 2, 1000) = 4`, `batches_0 = ceil(1 * 2 / 4) = 1`.
