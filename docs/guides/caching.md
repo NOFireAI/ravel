@@ -146,6 +146,9 @@ When the cache is on, `ravel-server` warms it before it reports ready
 (`/readyz`). For each tenant storage holds data for, it reads a small,
 bounded number of that tenant's most recent metric and log segments, so the
 first real query after a restart is not the one paying full cold cost.
+"Most recent" is measured from each tenant's own latest ingest hour, not
+from wall-clock time: a tenant that has not ingested in the
+last day still gets its most recent parts warmed, not zero.
 
 Warmup is best-effort:
 
@@ -154,6 +157,58 @@ Warmup is best-effort:
   starts with a smaller warm set.
 - A failure warming one tenant or one segment is logged and skipped. It
   never fails startup.
+
+To tell a warmed restart from an unwarmed one, or to see what was warmed,
+read the `cache_warm` module's log lines rather than guessing from query
+latency. `cache_warm` alone decides the level of the per-(tenant, signal)
+line -- `Catalog::latest_ingest_hour` never logs above `debug!`, so a
+signal a tenant does not use never produces a `warn!` on its own.
+The line is an `info!` (or `warn!` if the tenant has a live part for that
+signal but none of them warmed -- a resolve or fetch failure ate the
+whole signal) and carries `tenant_hash`, `signal`, `parts_warmed`, and
+`latest_ingest_hour`, which takes one of three values:
+
+- an hour number: the tenant's own latest ingest hour was found -- the
+  newest hour bucket holding a commit-record-shaped key of any kind
+  (commit, compaction, rewrite, or tombstone), not only a live commit
+  record. `parts_warmed` counts what actually warmed from it, which is 0
+  when that hour's only key was a tombstone; that case still logs at
+  `info!`, since a tombstone-only hour has no live part to have failed to
+  warm. An hour that holds both a live record and a tombstone counts as
+  having a live part while the resolve drops the tombstoned bucket, so
+  when nothing else in the window warms the `warn!` can fire for it;
+  read that warning as a hint to look at the resolve, not as a fault.
+- `"none"`: `Catalog::latest_ingest_hour` returned `Ok(None)` -- the
+  tenant has no discoverable ingest for that signal, either because it
+  never ingested it or because its last ingest predates the discovery
+  lookback cap (see below). `parts_warmed` is always 0 for this value,
+  and the `cache_warm` pass logs it at `info!`, not `warn!`: no parts to
+  warm is a normal outcome, not a failure.
+- `"error"`: the `Catalog::latest_ingest_hour` listing itself failed
+  (an object store fault, or the per-shard LIST budget refused). This
+  value appears on a separate `warn!` event, `cache warmup:
+  latest_ingest_hour failed; skipping this tenant and signal`, which
+  carries `tenant_hash`, `signal`, `error` and `latest_ingest_hour` and
+  no `parts_warmed`; the pass emits no result line for that tenant and
+  signal, so a filter on `parts_warmed` alone will not show it. It is
+  distinct from the `"none"` case so a store fault is never mistaken for
+  a tenant that has no data.
+
+`Catalog::latest_ingest_hour` exhausting its lookback cap (64 days)
+without finding anything logs at `debug!`, not `warn!`: it cannot itself
+tell a tenant that never used a signal apart from one whose ingest is
+genuinely stuck past the cap -- both produce the identical `Ok(None)` --
+and neither case is a failure worth a warning on its own. Do not expect a
+`warn!` from this path on a normal warmup pass; the only `warn!` a
+tenant/signal combination can produce is the `"error"` case above or
+`cache_warm`'s own "has parts but none warmed" line.
+
+One final `info!` at the end of the pass
+carries the total `parts_warmed` across every tenant and signal and the
+pass's `elapsed_ms`. A restart whose log shows this final line warmed the cache; one that hit
+the time budget above never reaches it, and logs the `warn!` naming the
+deadline instead -- the per-(tenant, signal) lines up to that point are
+whatever the pass warmed before it ran out of time.
 
 ## Metrics
 
