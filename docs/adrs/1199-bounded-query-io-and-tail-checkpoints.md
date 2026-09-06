@@ -384,8 +384,10 @@ frequency` in write amplification. The bound is a number, not an adjective:
   across every shard-hour in its window (default 16), chosen
   deterministically in a canonical order: shard-hours by ingest hour
   DESCENDING, then shard ASCENDING, so the freshest hour (the one a query over
-  recent data needs most and the one with the most uncheckpointed records) is
-  served first and two nodes resolving the same window load the same packs;
+  recent data needs most) is served first; freshness is the only property the
+  order claims, since how many uncheckpointed records an hour holds depends on
+  ingest volume and maintenance lag and is not something the order can
+  guarantee and two nodes resolving the same window load the same packs;
   within a shard-hour, the base first, then deltas newest first; stop when the
   budget is spent. Records in packs the budget did not reach resolve through
   direct GETs. Two figures report that, in their own units and never mixed:
