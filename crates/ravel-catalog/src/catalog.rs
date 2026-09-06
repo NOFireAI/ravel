@@ -487,7 +487,7 @@ impl Catalog {
         }
         if config.resolve_get_concurrency > crate::config::MAX_RESOLVE_GET_CONCURRENCY {
             return Err(CatalogError::InvalidConfig(
-                "resolve_get_concurrency must be <= MAX_RESOLVE_GET_CONCURRENCY (4096)",
+                "resolve_get_concurrency exceeds MAX_RESOLVE_GET_CONCURRENCY",
             ));
         }
         // `byte_cache_max_bytes == 0` is the disabled sentinel:
@@ -4604,7 +4604,7 @@ mod tests {
                 .await
         });
 
-        gate.wait_until_held(concurrency).await;
+        wait_until_held_bounded(&gate, concurrency).await;
         assert_eq!(
             gate.held_count(),
             concurrency,
@@ -4617,7 +4617,7 @@ mod tests {
         for id in gate.held() {
             gate.release(id);
         }
-        gate.wait_until_held(concurrency).await;
+        wait_until_held_bounded(&gate, concurrency).await;
         assert_eq!(
             gate.held_count(),
             concurrency,
@@ -4668,11 +4668,12 @@ mod tests {
     /// Second acceptance case for the same fix (Issue #1238 review round 2):
     /// `assert_fan_out_peaks_at` above publishes every record into ONE
     /// `(shard, hour)` bucket, so it only exercises
-    /// `Catalog::prewarm_commit_records` (catalog.rs:2521) -- every other
-    /// `.buffered`/`buffer_unordered` fan-out site (catalog.rs:1932, 1970,
-    /// 2486, `snapshot_resolve.rs:751`) iterates a single element there and
-    /// cannot prove anything about its width. This drives
-    /// `load_snapshot_parts`'s buffered fan-out (`snapshot_resolve.rs:751`,
+    /// `Catalog::prewarm_commit_records` -- every other `.buffered`/
+    /// `buffer_unordered` fan-out site (both call sites inside
+    /// `Catalog::list_window_bounded`, `Catalog::list_window_by_prefix`,
+    /// `Catalog::prewarm_compaction_records`) iterates a single element
+    /// there and cannot prove anything about its width. This drives
+    /// `load_snapshot_parts`'s buffered fan-out (`snapshot_resolve.rs`,
     /// the snapshot-part load, the hot path for a FOLDED tenant): fold the
     /// tenant first with `snapshot_part_max_entries: 1` so `concurrency * 4`
     /// distinct sealed hours each seal into their own snapshot part,
@@ -4680,10 +4681,16 @@ mod tests {
     /// over a fresh catalog (empty part cache) and observe the exact number
     /// of part GETs in flight at once.
     ///
-    /// FLIP (pre-fix demonstration): revert `snapshot_resolve.rs:751` to a
-    /// literal `.buffered(16)`. At `concurrency = 32` the fan-out never
-    /// exceeds 16 in flight, so this fails with "held 16, expected 32"
-    /// (via `wait_until_held_bounded`) instead of hanging CI.
+    /// FLIP (pre-fix demonstration): this proves only the lower direction --
+    /// `guarded_get` acquires `Catalog::request_semaphore`, sized from the
+    /// same knob, on every part GET, so a hardcoded width BELOW the
+    /// configured value at `load_snapshot_parts`'s fan-out site still fails
+    /// this test (revert it to a literal `.buffered(16)`; at
+    /// `concurrency = 32` the fan-out never exceeds 16 in flight, so this
+    /// fails with "held 16, expected 32" via `wait_until_held_bounded`
+    /// instead of hanging CI). A hardcoded width ABOVE the configured value
+    /// at that site is masked by the semaphore and still passes; this is
+    /// structural, not a gap this test closes.
     #[tokio::test]
     async fn resolve_fan_out_reaches_the_configured_concurrency_after_fold() {
         assert_folded_snapshot_fan_out_peaks_at(32).await;
@@ -4842,6 +4849,59 @@ mod tests {
             }
             Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
             Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
+    }
+
+    /// Issue #1238: `resolve_get_concurrency` above
+    /// `MAX_RESOLVE_GET_CONCURRENCY` is rejected at `Catalog::new` with a
+    /// typed error (past that ceiling, `tokio::sync::Semaphore::new` panics
+    /// instead of failing typed).
+    ///
+    /// FLIP (pre-fix demonstration): deleting the upper-bound `if` block in
+    /// `Catalog::new` leaves this test failing with `Ok` instead of
+    /// `Err(CatalogError::InvalidConfig(_))`.
+    #[test]
+    fn resolve_get_concurrency_above_max_is_rejected() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: crate::config::MAX_RESOLVE_GET_CONCURRENCY + 1,
+                ..config(1)
+            },
+        );
+        match result {
+            Err(CatalogError::InvalidConfig(msg)) => {
+                assert_eq!(
+                    msg,
+                    "resolve_get_concurrency exceeds MAX_RESOLVE_GET_CONCURRENCY"
+                );
+            }
+            Err(other) => panic!("expected CatalogError::InvalidConfig, got {other:?}"),
+            Ok(_) => panic!("expected CatalogError::InvalidConfig, got Ok"),
+        }
+    }
+
+    /// Issue #1238: `resolve_get_concurrency` exactly at
+    /// `MAX_RESOLVE_GET_CONCURRENCY` is accepted -- the check rejects past
+    /// the ceiling, not at it.
+    ///
+    /// FLIP (pre-fix demonstration): flipping the upper-bound comparison in
+    /// `Catalog::new` from `>` to `>=` leaves this test failing with
+    /// `Err(CatalogError::InvalidConfig(_))` instead of `Ok`.
+    #[test]
+    fn resolve_get_concurrency_at_max_is_accepted() {
+        let store = Arc::new(MemoryStore::new());
+        let result = Catalog::new(
+            store,
+            CatalogConfig {
+                resolve_get_concurrency: crate::config::MAX_RESOLVE_GET_CONCURRENCY,
+                ..config(1)
+            },
+        );
+        match result {
+            Ok(_) => {}
+            Err(err) => panic!("expected Ok at the configured max, got Err({err})"),
         }
     }
 
