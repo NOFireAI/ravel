@@ -401,6 +401,95 @@ fn every_role_has_kms_decrypt() {
     }
 }
 
+/// Every statement whose `Action` grants any `kms:` action must not name a
+/// `Resource` that covers every key in the account/region: neither the bare
+/// wildcard `"*"` nor any ARN ending `:key/*`. Pinned as a negation (not an
+/// exact tenant-key ARN) so it survives an operator's post-substitution
+/// value. Widen any of the four templates' KMS `Resource` back to
+/// `arn:aws:kms:us-east-1:111122223333:key/*` and this test fails, naming
+/// the role and the statement `Sid`.
+#[test]
+fn no_kms_statement_grants_every_key_in_the_region() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        for stmt in policy.statements.as_array().unwrap() {
+            let actions: Vec<String> = match &stmt["Action"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                _ => continue,
+            };
+            if !actions.iter().any(|a| a.starts_with("kms:")) {
+                continue;
+            }
+            let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
+            let resources: Vec<String> = match &stmt["Resource"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .map(|v| v.as_str().expect("Resource entry is a string").to_string())
+                    .collect(),
+                other => {
+                    panic!("{role}/{sid}: Resource is neither a string nor an array: {other:?}")
+                }
+            };
+            for resource in &resources {
+                assert!(
+                    resource != "*" && !resource.ends_with(":key/*"),
+                    "{role}: statement {sid:?} grants a kms: action on {resource:?}, \
+                     which covers every key in the account/region"
+                );
+            }
+        }
+    }
+}
+
+/// Every statement whose `Action` grants any `kms:` action must name a
+/// `Resource` that pins a specific key id, so an operator cannot re-widen
+/// the grant to every key by substituting `arn:aws:kms:<region>:<account>:key/*`
+/// (or any other bare-wildcard variant) in place of the placeholder.
+#[test]
+fn every_kms_statement_names_a_key_id() {
+    let key_arn_pattern =
+        regex::Regex::new(r"^arn:aws:kms:[^:]+:[^:]+:key/[^*]+$").expect("valid regex");
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        for stmt in policy.statements.as_array().unwrap() {
+            let actions: Vec<String> = match &stmt["Action"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                _ => continue,
+            };
+            if !actions.iter().any(|a| a.starts_with("kms:")) {
+                continue;
+            }
+            let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
+            let resources: Vec<String> = match &stmt["Resource"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .map(|v| v.as_str().expect("Resource entry is a string").to_string())
+                    .collect(),
+                other => {
+                    panic!("{role}/{sid}: Resource is neither a string nor an array: {other:?}")
+                }
+            };
+            for resource in &resources {
+                assert!(
+                    key_arn_pattern.is_match(resource),
+                    "{role}: statement {sid:?} resource {resource:?} does not name a \
+                     specific key id (expected arn:aws:kms:<region>:<account>:key/<id>)"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn discovery_prefix_admitted_for_every_discovering_role() {
     for role in ROLES_WITH_DISCOVERY {
