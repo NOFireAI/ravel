@@ -476,6 +476,26 @@ segment at or below the block-range threshold counts there too: the fetch reads
 such an object whole in one GET regardless, so planning it from the skip index
 would cost a second read rather than save one.
 
+That plan-phase whole-object read is now carried forward into
+the scan (`ravel_query::CarriedWholeObject`) instead of being thrown away,
+for the first `plan_concurrency` segments whose plan completes: those
+objects cross the wire once. Every other relevant segment is re-fetched by
+the scan exactly as before, and the peak retained bytes are bounded by the
+plan fan-out times object size, not by corpus size. Removing the remaining
+duplicate reads needs the plan carry to stream per partition instead of
+being held at the plan barrier; that redesign is tracked separately. Before
+the fix, only a cache large enough to still hold the object by the time the
+scan reached it turned the second read into a hit instead of a real GET, so
+a corpus larger than the cache paid the full double read on every such
+statement. Reuse needs no etag re-check: the plan and scan of one statement
+share the same immutable `SegmentRef` out of one resolved snapshot, and the
+whole-object cache key is already keyed on `seg_ref.content_hash`, so there
+is no live GET spanning the gap between the two reads for a changed object
+to be missed by. The one `plan_full_reads` GET remains the true cost; the
+reused bytes are charged to `QueryAccounting::add_bytes_reused`, not folded
+into the GET-bytes figure the plan phase already recorded, so a report
+distinguishes a genuine wire GET from a carried reuse.
+
 ### Requests per object on a version-4 object
 
 A version-4 RLOG object (ADR-0699) stores each row group's pages column-major

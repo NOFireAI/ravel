@@ -2726,6 +2726,46 @@ mod tests {
         write_records_as_objects(store, tenant, shard, &build_records(objects.max(1), 0)).await
     }
 
+    /// The number of segments whose plan-phase whole-object read is carried
+    /// into the scan (issue #835). The carry budget is the SQL partition
+    /// count, which on this lane resolves from
+    /// [`ExecutorSettings::fetch_concurrency`]; the fixtures below pin that to
+    /// this value so one object more than the budget already owns a segment
+    /// the carry does not cover, and the scan phase is exercised on a fixture
+    /// small enough to state its byte split exactly.
+    const CARRY_BUDGET: usize = 1;
+
+    /// `objects` RLOG objects on `shard`, each holding the SAME single record,
+    /// whose body carries the word `timeout`.
+    ///
+    /// Two properties the multi-segment fixtures rely on and
+    /// [`write_shard_objects`] does not give: every object survives
+    /// [`PROBE_MISS_SQL`]'s predicate and so reaches the scan (`build_records`
+    /// only puts `timeout` in every third body, and a segment the predicate
+    /// prunes to zero survivors is never opened and never carries), and every
+    /// object has the same length, which is what lets a fixture with more
+    /// segments than [`CARRY_BUDGET`] still state its per-phase byte split as
+    /// exact literals over one section table.
+    async fn write_matching_objects(
+        store: &Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantId,
+        shard: u32,
+        objects: usize,
+    ) -> Vec<Vec<u8>> {
+        let one = build_records(1, 0).into_iter().next().expect("one record");
+        assert!(
+            one.body.contains("timeout"),
+            "fixture: the repeated record's body must match the has_word predicate"
+        );
+        let records = vec![one; objects.max(1)];
+        let written = write_records_as_objects(store, tenant, shard, &records).await;
+        assert!(
+            written.iter().all(|o| o.len() == written[0].len()),
+            "fixture: every object must be the same length"
+        );
+        written
+    }
+
     /// One RLOG object per record in `records`, each with its own commit
     /// record, on `shard`. Returns the object bytes in write order, so a test
     /// that needs the object's own layout (section offsets, total size) reads it
@@ -2759,7 +2799,13 @@ mod tests {
                 writer_epoch: 1,
                 writer_seq,
                 object_size: bytes.len() as u64,
-                content_hash: [0u8; 32],
+                // The real BLAKE3 of the bytes, not a zero placeholder: ADR-0046's
+                // cache key is `(tenant, content_hash, offset, object_size)`, so
+                // objects sharing a zero hash collide with each other whenever
+                // their sizes also match, and a fixture with several equal-size
+                // objects would read one object's bytes for all of them and count
+                // the collisions as cache hits.
+                content_hash: *blake3::hash(&bytes).as_bytes(),
                 sample_count: 1,
                 series_count: 1,
                 min_event_ts_ns: rec.ts_ns,
@@ -3778,37 +3824,63 @@ mod tests {
     /// The `--cache-bytes` cache is not inert: attaching it to the log fetcher
     /// cuts object-store GETs and adds fetch-cache hits.
     ///
-    /// Reachability (issue #677): the bench's SQL scan reaches the cache through
-    /// `LogSegmentFetcher::tenant_bytes` (via `plan_segment` +
-    /// `scan_accounted_with_tenant_subset` in `ravel_sql::logs_scan`), NOT the
-    /// `fetch_accounted_with_tenant` funnel the flag's ADR names. That path reads
-    /// each segment more than once per query (once to plan the surviving blocks,
-    /// once to scan them), so with the fetcher cache attached the scan is served
-    /// from the plan's fill within a single run. The catalog's own byte cache is
-    /// on under `CatalogConfig::default()` in both arms, so an isolated,
-    /// attributable comparison holds the catalog state identical (two FRESH
-    /// executors, one cold run each) and reads off the delta the fetcher cache
-    /// alone makes: strictly fewer store GETs, strictly more cache hits. This is
-    /// why the literal "warm hits == cold misses" identity does not hold and is
-    /// not asserted -- the cold run already hits, and the catalog cache
-    /// contributes hits of its own. Building the cached arm without `with_cache`
-    /// collapses both deltas to zero, which is what flips the assertions red.
+    /// Reachability (issue #677, restated for issue #835): the bench's SQL scan
+    /// reaches the cache through `LogSegmentFetcher::tenant_bytes` (via
+    /// `plan_segment` + `scan_accounted_with_tenant_subset` in
+    /// `ravel_sql::logs_scan`), NOT the `fetch_accounted_with_tenant` funnel the
+    /// flag's ADR names. That path plans each segment and then scans it. Since
+    /// #835 the plan phase's whole-object bytes are CARRIED into the scan for
+    /// the first [`CARRY_BUDGET`] segments whose plan completes, so those
+    /// segments cross the wire once and leave the fetcher cache nothing to
+    /// absorb; the carry is charged to `bytes_reused`, not to a cache hit. The
+    /// cache's contribution is on the segments the budget does not cover: their
+    /// plan read fills the cache and their scan re-open is served from it
+    /// instead of paying a second wire GET. So the fixture writes
+    /// `CARRY_BUDGET + SURPLUS_SEGMENTS` objects against an executor whose
+    /// partition count (and therefore whose carry budget) is `CARRY_BUDGET`,
+    /// and the surplus is what the two arms differ by.
+    ///
+    /// The catalog's own byte cache is on under `CatalogConfig::default()` in
+    /// both arms, so an isolated, attributable comparison holds the catalog
+    /// state identical (two FRESH executors, one cold run each) and reads off
+    /// the delta the fetcher cache alone makes: exactly one store GET per
+    /// surplus segment, and strictly more cache hits. This is why the literal
+    /// "warm hits == cold misses" identity does not hold and is not asserted --
+    /// the cold run already hits, and the catalog cache contributes hits of its
+    /// own. Building the cached arm without `with_cache` collapses both deltas
+    /// to zero (`get_on=9 get_off=9`), which is what flips the assertions red.
+    /// Dropping the `carried_seen < budget` bound from `compute_plan_counts` in
+    /// `ravel_sql::logs_scan` flips them red from the other side: every segment
+    /// is then carried, no scan re-open is left for the cache to serve, and both
+    /// arms read `get_on=7 get_off=7`.
     ///
     /// The `has_word` predicate is what keeps the query on that plan-then-scan
     /// path (issue #739). A predicate-free full-window statement now takes
     /// `LogsScanExec`'s whole-segment fast path, which reads each segment exactly
-    /// once and so leaves the fetcher cache nothing to absorb within a run -- the
-    /// double read this test is about is precisely what that path eliminates. The
-    /// fixture's single record body is `request 0 timeout after 30s`, so the
-    /// predicate matches it and the returned rows are the same as without it.
+    /// once and so leaves the fetcher cache nothing to absorb within a run. Since
+    /// #835 that fast path has a sibling: a carried segment on the plan-then-scan
+    /// path is also read exactly once. Both are why the fixture needs surplus
+    /// segments rather than a predicate alone. Every object holds the same
+    /// `request 0 timeout after 30s` body, so the predicate matches all of them
+    /// and every segment reaches the scan.
     #[tokio::test]
     async fn cache_flag_cuts_store_gets_within_a_run() {
         use ravel_types::accounting::AccountedOp;
 
+        // Segments beyond the carry budget. Each one's scan re-opens its object:
+        // a real store GET with the cache off, a cache hit with it on. The margin
+        // the assertion below states is this number, not whatever the fixture
+        // happens to produce.
+        const SURPLUS_SEGMENTS: usize = 2;
+
         let store = empty_store();
         let tenant = TenantId::new("cache-tenant");
         let th = tenant.hash();
-        write_shard_objects(&store, &tenant, 0, 1).await;
+        write_matching_objects(&store, &tenant, 0, CARRY_BUDGET + SURPLUS_SEGMENTS).await;
+        let settings = ExecutorSettings {
+            fetch_concurrency: CARRY_BUDGET,
+            ..ExecutorSettings::default()
+        };
         let req = SqlRequest {
             sql: "SELECT body FROM logs WHERE has_word(body, 'timeout')".to_string(),
             window: TimeRange {
@@ -3823,7 +3895,7 @@ mod tests {
         // Fetcher cache ON: a fresh executor (cold catalog byte cache, cold
         // fetcher cache), one run.
         let cache = build_read_cache(64 << 20);
-        let cached = cold_executor(&store, &[], Some(cache), ExecutorSettings::default())
+        let cached = cold_executor(&store, &[], Some(cache), settings)
             .expect("build cached executor")
             .executor;
         let on = cached.execute(th, &req).await.expect("cached run");
@@ -3831,17 +3903,24 @@ mod tests {
         // Fetcher cache OFF: a fresh executor (identical cold catalog byte cache,
         // no fetcher cache), one run. The catalog contribution is the same in
         // both, so any delta is the fetcher cache alone.
-        let uncached = cold_executor(&store, &[], None, ExecutorSettings::default())
+        let uncached = cold_executor(&store, &[], None, settings)
             .expect("build uncached executor")
             .executor;
         let off = uncached.execute(th, &req).await.expect("uncached run");
 
         let get_on = on.accounting.s3_requests(AccountedOp::Get);
         let get_off = off.accounting.s3_requests(AccountedOp::Get);
+
         assert!(
             get_on < get_off,
             "the fetcher cache must cut store GETs within a run; got get_on={get_on} \
              get_off={get_off}"
+        );
+        assert_eq!(
+            get_off - get_on,
+            SURPLUS_SEGMENTS as u64,
+            "the cache absorbs exactly the segments the carry budget does not \
+             cover: one scan re-open each; got get_on={get_on} get_off={get_off}"
         );
         assert!(
             on.accounting.cache_hits > off.accounting.cache_hits,
@@ -3963,13 +4042,16 @@ mod tests {
     ///
     /// The exact figures the fixture produces (pinned below, never `> 0`): the
     /// single RLOG object plus the catalog resolve are 3 store GETs on the cold
-    /// run (`l/HEAD` pointer, the commit record, the data object; the
-    /// plan-then-scan second read of the data object is absorbed by the fetcher
-    /// cache, 2 hits). On the warm run the data object and most of the resolve
-    /// are cache-served, so store GETs fall to 1 and cache hits rise to 4, with
-    /// no store bytes transferred. The `has_word` predicate keeps the query on
-    /// the plan-then-scan path so the cache has a within-run second read to
-    /// absorb (see `cache_flag_cuts_store_gets_within_a_run`).
+    /// run (`l/HEAD` pointer, the commit record, the data object). This
+    /// fixture's one segment is inside the carry budget (issue #835), so the
+    /// plan phase's whole-object read is handed to the scan rather than
+    /// re-read, and the cache has no within-run second read of the data object
+    /// to absorb: the cold run's hit is the catalog's, not the scan's. On the
+    /// warm run the data object and most of the resolve are cache-served, so
+    /// store GETs fall to 1 and cache hits rise from 1 to 3, with no store
+    /// bytes transferred. What the cache does absorb within a run is a segment
+    /// the carry budget does not cover, which needs more segments than this
+    /// fixture has (see `cache_flag_cuts_store_gets_within_a_run`).
     ///
     /// Red against the `run == 0` guard: moving the `per_run_accounting.push`
     /// back under `if run == 0` leaves the array length 1 with the warm entry
@@ -4020,7 +4102,11 @@ mod tests {
             acc[0].object_store_get_requests, 3,
             "cold run's store GETs: l/HEAD + commit record + the data object"
         );
-        assert_eq!(acc[0].cache_hits, 2, "cold run's fetcher-cache hits");
+        assert_eq!(
+            acc[0].cache_hits, 1,
+            "cold run's fetcher-cache hits: the carried plan read leaves the \
+             scan nothing to look up"
+        );
         assert_eq!(acc[0].cache_misses, 3, "cold run's fetcher-cache misses");
         assert_eq!(acc[0].object_store_bytes, 836, "cold run's store bytes");
 
@@ -4030,8 +4116,8 @@ mod tests {
             "warm run's store GETs fall from 3 to 1 (the rest cache-served)"
         );
         assert_eq!(
-            acc[1].cache_hits, 4,
-            "warm run's cache hits rise from 2 to 4"
+            acc[1].cache_hits, 3,
+            "warm run's cache hits rise from 1 to 3"
         );
         assert_eq!(
             acc[1].object_store_bytes, 0,
@@ -4072,23 +4158,58 @@ mod tests {
 
     /// The `has_word` statement the probe-miss tests measure. It is deliberately
     /// not skip-decidable: `plan_segment` falls back to a whole-object plan read
-    /// and hands no footer forward, so the scan probes the object a second time
-    /// on its own. That is what makes both phases counted, which is the split
-    /// the two `probe_misses_*` fields exist to show.
+    /// and hands no footer forward, so a scan open that is not served by the
+    /// plan phase's carried whole object (issue #835) probes the object a second
+    /// time on its own. That is what makes both phases counted, which is the
+    /// split the two `probe_misses_*` fields exist to show.
     const PROBE_MISS_SQL: &str = "SELECT body FROM logs WHERE has_word(body, 'timeout')";
+
+    /// The segment count the probe-miss and phase-split fixtures write: one more
+    /// than the carry budget, so exactly one segment's scan open is served from
+    /// the plan phase's carried whole object and exactly one pays its own probe
+    /// and its own data read. A one-object fixture would have its only segment
+    /// carried and report a scan phase of all zeros.
+    const PROBE_MISS_OBJECTS: usize = CARRY_BUDGET + 1;
+
+    /// Every scan-side expectation in those fixtures is
+    /// `PROBE_MISS_OBJECTS - CARRY_BUDGET`, so a fixture shrunk to the budget
+    /// would expect zero, never reach the scan phase, and pass while measuring
+    /// nothing. Refused at compile time rather than at review time.
+    const _: () = assert!(PROBE_MISS_OBJECTS > CARRY_BUDGET);
+
+    /// The executor settings the probe-miss and phase-split fixtures measure
+    /// under. `logs_block_range_threshold: 0` disables the whole-object
+    /// crossover so the reads go through the ranged probe-then-fetch path, the
+    /// only path that probes at all; `fetch_concurrency` pins both the partition
+    /// count and the carry budget to [`CARRY_BUDGET`].
+    fn probe_miss_settings(suffix: u64) -> ExecutorSettings {
+        ExecutorSettings {
+            logs_block_range_threshold: 0,
+            logs_suffix_len: Some(suffix),
+            fetch_concurrency: CARRY_BUDGET,
+            ..ExecutorSettings::default()
+        }
+    }
 
     /// A trailer that EXCEEDS the probe is reported in the per-run accounting,
     /// per phase, on every run.
     ///
-    /// The fixture is one RLOG object read through the ranged path
-    /// (`logs_block_range_threshold: 0`, the whole-object crossover disabled --
-    /// at the default threshold this object is read whole in one GET and never
-    /// probes at all, so none of the miss-counting sites is reached and the test
-    /// would be vacuous). The probe is pinned to start at SKIP_IDX's end, so
-    /// each read that has to locate blocks through SKIP_IDX misses exactly one
-    /// tail section: one in the plan phase (`plan_segment`'s whole-object
-    /// fallback) and one in the scan phase (the data read, which re-probes
-    /// because the fallback carried no footer).
+    /// The fixture is [`PROBE_MISS_OBJECTS`] equal-size RLOG objects read
+    /// through the ranged path (`logs_block_range_threshold: 0`, the
+    /// whole-object crossover disabled -- at the default threshold these
+    /// objects are read whole in one GET each and never probe at all, so none
+    /// of the miss-counting sites is reached and the test would be vacuous).
+    /// The probe is pinned to start at SKIP_IDX's end, so each read that has to
+    /// locate blocks through SKIP_IDX misses exactly one tail section.
+    ///
+    /// The two phases are counted separately, and the counts differ, which is
+    /// the point of splitting them. Every segment pays a plan-phase read
+    /// (`plan_segment`'s whole-object fallback), so the plan phase misses once
+    /// per object. Only the segments the carry budget does not cover pay a
+    /// scan-phase read: since issue #835 the plan phase hands its bytes to the
+    /// scan for the first [`CARRY_BUDGET`] segments whose plan completes, and
+    /// that open short-circuits before any probe. So the scan phase misses once
+    /// for the one surplus segment, not once per object.
     ///
     /// Both runs report the same figures even though the warm run's store GETs
     /// fall: a miss is measured against the probe WINDOW, not against what the
@@ -4098,16 +4219,20 @@ mod tests {
     /// during development by deleting the
     /// `self.probe_misses.record(phase, stats.probe_misses)` line from
     /// `LogSegmentFetcher::record_probe_misses` in `ravel-query` (reads 0
-    /// against the expected 1), and by deleting `stats.probe_misses += 1` from
-    /// `fetch_object_v4`'s tail-section loop, the counting site this version-4
-    /// fixture actually reaches (same result, from the other end of the
-    /// plumbing). Deleting the version-3 site in `fetch_object_with_footer`
+    /// against the expected count), and by deleting `stats.probe_misses += 1`
+    /// from `fetch_object_v4`'s tail-section loop, the counting site this
+    /// version-4 fixture actually reaches (same result, from the other end of
+    /// the plumbing). Deleting the version-3 site in `fetch_object_with_footer`
     /// instead leaves it green, which is what says the fixture is version 4.
+    /// Dropping the `carried_seen < budget` bound from `compute_plan_counts` in
+    /// `ravel_sql::logs_scan` carries every segment, so the scan-phase count
+    /// reads 0 against the expected 1: that is what says the surplus segment,
+    /// not the fixture's size alone, is what reaches the scan-phase site.
     #[tokio::test]
     async fn probe_misses_reach_per_run_accounting_when_the_trailer_exceeds_the_probe() {
         let store = empty_store();
         let tenant = TenantId::new("probe-miss-tenant");
-        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let objects = write_matching_objects(&store, &tenant, 0, PROBE_MISS_OBJECTS).await;
         let suffix = suffix_just_past_skip_idx(&objects[0]);
         let window = TimeRange {
             start_ns: 0,
@@ -4125,11 +4250,7 @@ mod tests {
             Duration::from_secs(30),
             false,
             None,
-            ExecutorSettings {
-                logs_block_range_threshold: 0,
-                logs_suffix_len: Some(suffix),
-                ..ExecutorSettings::default()
-            },
+            probe_miss_settings(suffix),
             false,
             None,
         )
@@ -4142,21 +4263,31 @@ mod tests {
             .expect("an in-process lane records per-run accounting");
         assert_eq!(acc.len(), 2, "one accounting entry per run");
 
+        // One plan-phase read per object; one scan-phase read for the segment
+        // the carry budget does not cover.
+        let plan_misses = PROBE_MISS_OBJECTS as u64;
+        let scan_misses = (PROBE_MISS_OBJECTS - CARRY_BUDGET) as u64;
         assert_eq!(
-            acc[0].probe_misses_plan, 1,
-            "cold run: the plan-phase read missed SKIP_IDX exactly once"
+            acc[0].probe_misses_plan, plan_misses,
+            "cold run: every object's plan-phase read missed SKIP_IDX exactly once"
         );
         assert_eq!(
-            acc[0].probe_misses_scan, 1,
-            "cold run: the scan-phase read missed SKIP_IDX exactly once"
+            acc[0].probe_misses_scan, scan_misses,
+            "cold run: only the uncarried segment took a scan-phase read, and it \
+             missed SKIP_IDX exactly once"
         );
         assert_eq!(
-            acc[1].probe_misses_plan, 1,
+            acc[1].probe_misses_plan, plan_misses,
             "warm run: the same window misses the same section"
         );
         assert_eq!(
-            acc[1].probe_misses_scan, 1,
+            acc[1].probe_misses_scan, scan_misses,
             "warm run: a miss is a property of the probe window, not of the cache"
+        );
+        assert_ne!(
+            plan_misses, scan_misses,
+            "the fixture must separate the phases: equal counts would pass a \
+             plumbing that reported one figure under both names"
         );
 
         // What a measurement pass actually reads: the figure has to be in the
@@ -4165,31 +4296,40 @@ mod tests {
         let per_run = v["per_run_accounting"]
             .as_array()
             .expect("per_run_accounting is a JSON array");
-        assert_eq!(per_run[0]["probe_misses_plan"], 1);
-        assert_eq!(per_run[0]["probe_misses_scan"], 1);
-        assert_eq!(per_run[1]["probe_misses_plan"], 1);
-        assert_eq!(per_run[1]["probe_misses_scan"], 1);
+        assert_eq!(per_run[0]["probe_misses_plan"], plan_misses);
+        assert_eq!(per_run[0]["probe_misses_scan"], scan_misses);
+        assert_eq!(per_run[1]["probe_misses_plan"], plan_misses);
+        assert_eq!(per_run[1]["probe_misses_scan"], scan_misses);
     }
 
     /// A trailer that FITS inside the derived probe reports exactly zero, on
     /// both phases and both runs.
     ///
-    /// Same fixture and same ranged path as the exceeding case, with the probe
-    /// left at the per-object derivation: this object is far below
-    /// `LOG_SUFFIX_FLOOR_BYTES`, so the derived window is the whole object and
-    /// covers every tail section. Paired with the exceeding case so a plumbing
-    /// change that reported a constant zero could not pass both.
+    /// Same fixture and same ranged path as the exceeding case,
+    /// [`PROBE_MISS_OBJECTS`] equal-size objects at a carry budget of
+    /// [`CARRY_BUDGET`], with the probe left at the per-object derivation:
+    /// these objects are far below `LOG_SUFFIX_FLOOR_BYTES`, so the derived
+    /// window is the whole object and covers every tail section. Paired with
+    /// the exceeding case so a plumbing change that reported a constant zero
+    /// could not pass both.
     ///
-    /// Prove-the-test: pinned to 0, never `>= 0`. Demonstrated failing during
-    /// development by making `probe_window_covers` in `ravel-query` return
-    /// `false` unconditionally: every counting read then reports its tail
-    /// sections as missed and the first assertion reads 2 (SKIP_IDX and
-    /// PAGE_DIR) against the expected 0.
+    /// The fixture has to exceed the carry budget for the SCAN half of this
+    /// test to mean anything. With one object the plan's bytes are carried
+    /// into the scan, the scan opens nothing, and `probe_misses_scan` is zero
+    /// for want of a read rather than because the probe covered the trailer:
+    /// no production change could falsify it. The surplus segment restores a
+    /// real scan-phase read.
+    ///
+    /// Prove-the-test: pinned to 0, never `>= 0`. Making `probe_window_covers`
+    /// in `ravel-query` return `false` unconditionally fails the plan
+    /// assertion at 2 (SKIP_IDX and PAGE_DIR) against the expected 0; suppress
+    /// that assertion and the scan assertion fails the same way, which is what
+    /// the one-object fixture could not do.
     #[tokio::test]
     async fn probe_misses_are_zero_when_the_derived_probe_covers_the_trailer() {
         let store = empty_store();
         let tenant = TenantId::new("probe-fit-tenant");
-        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let objects = write_matching_objects(&store, &tenant, 0, PROBE_MISS_OBJECTS).await;
         let total = objects[0].len() as u64;
         assert!(
             ravel_query::derive_suffix_len(total) >= total,
@@ -4216,6 +4356,7 @@ mod tests {
             ExecutorSettings {
                 logs_block_range_threshold: 0,
                 logs_suffix_len: None,
+                fetch_concurrency: CARRY_BUDGET,
                 ..ExecutorSettings::default()
             },
             false,
@@ -4248,13 +4389,19 @@ mod tests {
     /// on every run.
     ///
     /// Same fixture and same ranged path as the probe-miss tests above (at the
-    /// default threshold this object is read whole in one GET, which is a real
+    /// default threshold each object is read whole in one GET, which is a real
     /// but uninteresting amplification shape and would exercise none of the
     /// per-phase split), and with the read cache OFF. With a cache, this
     /// statement's plan-phase whole-object fallback admits `(0, object_size)`
     /// and the scan that follows is served entirely from it, so the scan phase
     /// correctly reports zero wire bytes and the numerator this test is about
     /// is never exercised.
+    ///
+    /// The fixture needs [`PROBE_MISS_OBJECTS`] objects against a carry budget
+    /// of [`CARRY_BUDGET`] for the same reason (issue #835): the carried
+    /// segments' scan opens are served from the plan phase's bytes and are
+    /// charged to `bytes_reused`, so a fixture with no surplus segment reports
+    /// a zero scan phase and a zero numerator, cache or no cache.
     ///
     /// What is pinned exactly:
     ///
@@ -4283,7 +4430,7 @@ mod tests {
     async fn wire_bytes_and_amplification_reach_per_run_accounting() {
         let store = empty_store();
         let tenant = TenantId::new("amplification-tenant");
-        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let objects = write_matching_objects(&store, &tenant, 0, PROBE_MISS_OBJECTS).await;
         let suffix = suffix_just_past_skip_idx(&objects[0]);
         let window = TimeRange {
             start_ns: 0,
@@ -4301,11 +4448,7 @@ mod tests {
             Duration::from_secs(30),
             false,
             None,
-            ExecutorSettings {
-                logs_block_range_threshold: 0,
-                logs_suffix_len: Some(suffix),
-                ..ExecutorSettings::default()
-            },
+            probe_miss_settings(suffix),
             false,
             None,
         )
@@ -4433,25 +4576,46 @@ mod tests {
     /// path; `logs_suffix_len: Some(suffix)` pins the probe window to start
     /// exactly at SKIP_IDX's end, so every probe misses SKIP_IDX and chases it;
     /// and `PROBE_MISS_SQL` is not skip-decidable, so `plan_segment` gives up
-    /// and reads the whole object, handing no footer forward, which is why the
-    /// data read that follows probes the object again on its own account.
+    /// and reads the whole object, handing no footer forward, which is why a
+    /// data read that is not served by the plan phase's carried bytes probes
+    /// the object again on its own account.
     ///
-    /// That makes each phase a named list of GETs whose lengths the section
+    /// The fixture is [`PROBE_MISS_OBJECTS`] equal-size objects against a carry
+    /// budget of [`CARRY_BUDGET`] (issue #835), so the counts per phase differ:
+    /// every segment pays a plan read, and the one surplus segment pays the
+    /// scan-side probe and data read that the carried segments do not. That is
+    /// what makes each phase a named list of GETs whose lengths the section
     /// table gives:
     ///
     /// - `resolve`: nothing. The RLOG read path issues no resolve request at
     ///   all; the catalog's commit-record GETs are the unattributed residual.
-    /// - `plan`: the pinned suffix probe, the SKIP_IDX chase it forces, and the
-    ///   whole-object fallback. `suffix + skip_idx_len + object_len`.
-    /// - `probe`: the data read's own suffix probe, its SKIP_IDX chase, and
-    ///   FIELD_DIR. `suffix + skip_idx_len + field_dir_len`.
-    /// - `scan`: one whole-object GET for the block data. `object_len`.
+    /// - `plan`: per object, the pinned suffix probe, the SKIP_IDX chase it
+    ///   forces, and the whole-object fallback.
+    ///   `PROBE_MISS_OBJECTS * (suffix + skip_idx_len + object_len)`.
+    /// - `probe`: the uncarried segment's data read pays its own suffix probe,
+    ///   its SKIP_IDX chase, and FIELD_DIR.
+    ///   `surplus * (suffix + skip_idx_len + field_dir_len)`.
+    /// - `scan`: one whole-object GET for that segment's block data.
+    ///   `surplus * object_len`.
+    ///
+    /// The carried segments contribute nothing to `probe` or `scan`: their
+    /// subset open short-circuits on the carried bytes and is charged to
+    /// `bytes_reused`, never to a phase's wire bytes.
     ///
     /// Prove-the-test: the four `reconcile_rejects_*` tests below perturb one
     /// field of this same measured run and show the reconciler failing on each.
+    /// For the carry-dependent half of the split, dropping the
+    /// `carried_seen < budget` bound from `compute_plan_counts` in
+    /// `ravel_sql::logs_scan` carries every segment: the probe literal then
+    /// reads 0 against the expected 438 and the scan literal 0 against the
+    /// expected object length.
     #[tokio::test]
     async fn reconcile_accepts_a_measured_run_with_an_exact_phase_split() {
         let (measured, object_len, suffix, object) = probe_miss_fixture_run().await;
+        // Segments whose scan open the carry does not cover: they, and only
+        // they, pay the scan-side probe and data read.
+        let surplus = (PROBE_MISS_OBJECTS - CARRY_BUDGET) as u64;
+        let planned = PROBE_MISS_OBJECTS as u64;
         let footer = ravel_logseg::footer::open(&object).expect("footer");
         let section = |kind: u32| {
             footer
@@ -4480,26 +4644,30 @@ mod tests {
         );
         assert_eq!(
             phase(QueryPhase::Plan),
-            suffix + skip_idx_len + object_len,
-            "plan: the {suffix}-byte suffix probe, the {skip_idx_len}-byte \
-             SKIP_IDX chase, and the {object_len}-byte whole-object fallback"
+            planned * (suffix + skip_idx_len + object_len),
+            "plan: per object, the {suffix}-byte suffix probe, the \
+             {skip_idx_len}-byte SKIP_IDX chase, and the {object_len}-byte \
+             whole-object fallback, over {planned} objects"
         );
         assert_eq!(
             phase(QueryPhase::Probe),
-            suffix + skip_idx_len + field_dir_len,
-            "probe: the data read's own {suffix}-byte suffix probe, its \
-             {skip_idx_len}-byte SKIP_IDX chase, and {field_dir_len} bytes of FIELD_DIR"
+            surplus * (suffix + skip_idx_len + field_dir_len),
+            "probe: the {surplus} uncarried segment's data read pays its own \
+             {suffix}-byte suffix probe, its {skip_idx_len}-byte SKIP_IDX \
+             chase, and {field_dir_len} bytes of FIELD_DIR"
         );
         assert_eq!(
             phase(QueryPhase::Scan),
-            object_len,
-            "scan: one whole-object GET for the block data"
+            surplus * object_len,
+            "scan: one whole-object GET for the {surplus} uncarried segment's \
+             block data"
         );
 
         // The residual is the catalog's, and it is the whole of the difference:
         // nothing else in this statement's read path goes unattributed.
-        let attributed =
-            suffix + skip_idx_len + object_len + suffix + skip_idx_len + field_dir_len + object_len;
+        let attributed = planned * (suffix + skip_idx_len + object_len)
+            + surplus * (suffix + skip_idx_len + field_dir_len)
+            + surplus * object_len;
         assert_eq!(
             attributed + cold.wire_bytes_unattributed,
             cold.object_store_bytes,
@@ -4557,10 +4725,20 @@ mod tests {
         );
     }
 
-    /// The same flip in the other direction: keep all four phases but charge
-    /// one GET's bytes to two of them, which is what a call site that recorded
-    /// into the wrong handle alongside the right one would produce. The pooled
-    /// GET total does not move, so the attributed sum rises above it.
+    /// The same flip in the other direction: keep all four phases but charge a
+    /// phase's GET bytes to a second phase as well, which is what a call site
+    /// that recorded into the wrong handle alongside the right one would
+    /// produce. The pooled GET total does not move, so the attributed sum rises
+    /// above it.
+    ///
+    /// The bytes double-charged are the PLAN phase's, not the scan's, and the
+    /// choice is the point rather than a detail: the detector this test is
+    /// about fires on `attributed > pooled`, so a double-charge smaller than
+    /// the unattributed residual stays inside the pooled total and is caught by
+    /// the residual rule instead, under a different message. The plan phase
+    /// reads every object whole and the residual is only the catalog's
+    /// commit-record GETs, so the plan phase is larger by construction; the
+    /// assertion below states that as a precondition rather than trusting it.
     #[tokio::test]
     async fn reconcile_rejects_a_get_charged_to_two_phases() {
         let (measured, _, _, _) = probe_miss_fixture_run().await;
@@ -4569,12 +4747,15 @@ mod tests {
             .as_ref()
             .expect("per-run accounting")[0]
             .clone();
-        let scan = cold.wire_bytes_by_phase[QueryPhase::Scan.index()].wire_bytes;
+        let plan = cold.wire_bytes_by_phase[QueryPhase::Plan.index()].wire_bytes;
         assert!(
-            scan > 0,
-            "the fixture must have scan bytes to double-charge"
+            plan > cold.wire_bytes_unattributed,
+            "the double-charged bytes must exceed the unattributed residual, or \
+             the attributed sum stays inside the pooled total and the residual \
+             rule fires instead; plan={plan} residual={}",
+            cold.wire_bytes_unattributed
         );
-        cold.wire_bytes_by_phase[QueryPhase::Probe.index()].wire_bytes += scan;
+        cold.wire_bytes_by_phase[QueryPhase::Probe.index()].wire_bytes += plan;
 
         let err = reconcile_run_accounting("q", 0, &cold)
             .expect_err("a doubly-charged GET must not reconcile");
@@ -4719,10 +4900,16 @@ mod tests {
 
     /// One cold-plus-warm measurement over the #913 probe-miss fixture, with the
     /// object length and pinned suffix the exact per-phase literals derive from.
+    ///
+    /// [`PROBE_MISS_OBJECTS`] equal-size objects, not one: with a single
+    /// segment the carry (issue #835) serves the whole scan and the probe and
+    /// scan phases both report zero, which would make the exact-split test
+    /// state nothing about them and leave the double-charge flip with no bytes
+    /// to double-charge.
     async fn probe_miss_fixture_run() -> (EntryReport, u64, u64, Vec<u8>) {
         let store = empty_store();
         let tenant = TenantId::new("reconcile-tenant");
-        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let objects = write_matching_objects(&store, &tenant, 0, PROBE_MISS_OBJECTS).await;
         let object_len = objects[0].len() as u64;
         let suffix = suffix_just_past_skip_idx(&objects[0]);
         let window = TimeRange {
@@ -4741,11 +4928,7 @@ mod tests {
             Duration::from_secs(30),
             false,
             None,
-            ExecutorSettings {
-                logs_block_range_threshold: 0,
-                logs_suffix_len: Some(suffix),
-                ..ExecutorSettings::default()
-            },
+            probe_miss_settings(suffix),
             false,
             None,
         )
@@ -5017,31 +5200,36 @@ mod tests {
     /// Asserted at the point of reliance, not the parse site: the exact pinned
     /// window flows through the config-to-settings seam
     /// ([`tenant_executor_settings`]) and, at the fetcher, misses exactly the
-    /// SKIP_IDX section it cannot cover -- once in the plan phase and once in the
-    /// scan phase, the same fixture and reasoning as
+    /// SKIP_IDX section it cannot cover -- once per plan-phase read and once for
+    /// the one segment the carry budget does not cover in the scan phase, the
+    /// same fixture and reasoning as
     /// [`probe_misses_reach_per_run_accounting_when_the_trailer_exceeds_the_probe`].
     ///
     /// The whole-object crossover is dropped for this tiny fixture
     /// (`logs_block_range_threshold: 0`) only so the ranged probe path runs at
-    /// all; the value under test is `logs_suffix_len`, which the settings step
-    /// carries verbatim (first assertion) and the fetcher then applies (the
-    /// probe-miss assertions).
+    /// all, and the config's `fetch_concurrency` is pinned to [`CARRY_BUDGET`]
+    /// only so a scan-phase read exists to probe at all (issue #835); the value
+    /// under test is `logs_suffix_len`, which the settings step carries verbatim
+    /// (first assertion) and the fetcher then applies (the probe-miss
+    /// assertions).
     ///
     /// Prove-the-test: pinned exact values, never `> 0`. Demonstrated failing
     /// against the pre-change code by removing `logs_suffix_len: cfg.logs_suffix_len`
     /// from [`tenant_executor_settings`] (the field then falls back to
     /// `ExecutorSettings::default()`'s `None`): the settings assertion reads
     /// `None` against `Some(suffix)`, and the derived probe covers the whole
-    /// tiny object so both probe-miss assertions read 0 against the expected 1.
+    /// tiny object so both probe-miss assertions read 0 against the expected
+    /// counts.
     #[tokio::test]
     async fn tenant_config_logs_suffix_len_reaches_the_fetcher() {
         let store = empty_store();
         let tenant = TenantId::new("suffix-flag-tenant");
-        let objects = write_shard_objects(&store, &tenant, 0, 1).await;
+        let objects = write_matching_objects(&store, &tenant, 0, PROBE_MISS_OBJECTS).await;
         let suffix = suffix_just_past_skip_idx(&objects[0]);
 
         let mut cfg = tenant_cfg(&store, "suffix-flag-tenant", None, 0);
         cfg.logs_suffix_len = Some(suffix);
+        cfg.fetch_concurrency = CARRY_BUDGET;
         // The seam the loaded-tenant lane builds carries the pinned window
         // verbatim; run_tenant feeds this same value to measure_corpus.
         let settings = tenant_settings_for(&cfg, 1);
@@ -5082,12 +5270,14 @@ mod tests {
             .as_ref()
             .expect("an in-process lane records per-run accounting");
         assert_eq!(
-            acc[0].probe_misses_plan, 1,
-            "the pinned window misses SKIP_IDX in the plan phase exactly once"
+            acc[0].probe_misses_plan, PROBE_MISS_OBJECTS as u64,
+            "the pinned window misses SKIP_IDX once per plan-phase read"
         );
         assert_eq!(
-            acc[0].probe_misses_scan, 1,
-            "the pinned window misses SKIP_IDX in the scan phase exactly once"
+            acc[0].probe_misses_scan,
+            (PROBE_MISS_OBJECTS - CARRY_BUDGET) as u64,
+            "the pinned window misses SKIP_IDX once in the scan phase, for the \
+             one segment the carry budget does not cover"
         );
     }
 
