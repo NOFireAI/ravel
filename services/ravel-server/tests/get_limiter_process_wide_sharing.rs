@@ -390,6 +390,7 @@ async fn build_gated_app(get_limiter: Arc<GetLimiter>) -> (Router, GateHandle) {
         cli.disable_cache,
         ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
         cli.cache_dir.clone(),
+        None,
     )
     .expect("catalog");
 
