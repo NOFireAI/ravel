@@ -55,8 +55,8 @@ use crate::distrib::{
 use crate::engine::merge_soa_runs;
 use crate::erasure::{ErasurePredicate, is_erased_span};
 use crate::fetcher::SegmentFetcher;
-use crate::log_fetcher::{LogQuery, LogSegmentFetcher};
-use crate::span_fetcher::{SpanRow, SpanSegmentFetcher};
+use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
+use crate::span_fetcher::{SpanFetchError, SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -5045,11 +5045,14 @@ fn duplicate_partial_series_id_is_a_hard_error() {
 
 /// The coordinator reconstructs a worker's memory refusal from the frozen proto
 /// `Status` message alone: `parse_fetch_memory_exhausted` is the exact inverse
-/// of `FetchError::FetchMemoryExhausted`'s `Display`. This pins that coupling so
-/// a change to the `#[error(..)]` format that this parser no longer matches
-/// fails here rather than silently degrading the coordinator to a generic
-/// `Distrib`. Changing the format string without updating the parser makes the
-/// `assert_eq` on the round-tripped figures fail.
+/// of `FetchMemoryExhausted`'s `Display`. Three independently-editable
+/// `#[error(..)]` strings render that variant -- `FetchError` (series fold,
+/// `distrib/mod.rs:355`), `LogFetchError` (log fold, `:529`), and
+/// `SpanFetchError` (span fold, `:682`) -- and nothing but this test keeps them
+/// textually identical to each other and to the parser. This pins all three:
+/// a reword of any one of them, alone, fails the corresponding `assert_eq`
+/// below rather than silently degrading that fold's coordinator-side
+/// reconstruction to a generic `Distrib`.
 #[test]
 fn fetch_memory_exhausted_message_round_trips() {
     let original = crate::fetcher::FetchError::FetchMemoryExhausted {
@@ -5061,8 +5064,33 @@ fn fetch_memory_exhausted_message_round_trips() {
     assert_eq!(
         super::parse_fetch_memory_exhausted(&rendered),
         Some((4_194_304, 268_435_456, 268_500_000)),
-        "parser must invert the Display of {rendered:?}"
+        "parser must invert the Display of FetchError::FetchMemoryExhausted {rendered:?}"
     );
+
+    let original = LogFetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of LogFetchError::FetchMemoryExhausted {rendered:?}"
+    );
+
+    let original = SpanFetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of SpanFetchError::FetchMemoryExhausted {rendered:?}"
+    );
+
     // A message that is not this error's Display parses to None, so the fold
     // falls back to a generic Distrib rather than fabricating figures.
     assert_eq!(
