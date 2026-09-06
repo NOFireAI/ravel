@@ -6094,13 +6094,26 @@ type = "i64"
         );
         tokio::pin!(load_fut);
 
+        // Give the load every scheduler turn it can take, then confirm it is
+        // still parked and nothing was made durable. There is no wall-clock
+        // wait: the FixedClock never fires the age trigger and no write
+        // reaches the 8 MiB size trigger, so the load can never answer an ack
+        // however many turns it gets. 256 yields is far more than this tiny
+        // fixture needs to reach that parked state, and a `biased` select
+        // polls the load first on every turn, so a spurious completion still
+        // trips the panic.
         let stored = tokio::select! {
+            biased;
             _ = &mut load_fut => panic!(
                 "the load must not complete: at an 8 MiB target no write reaches the size \
                  trigger, and a FixedClock never fires the age trigger, so no ack can be \
                  answered"
             ),
-            () = tokio::time::sleep(Duration::from_millis(300)) => {
+            () = async {
+                for _ in 0..256 {
+                    tokio::task::yield_now().await;
+                }
+            } => {
                 list_data_objects(store.as_ref()).await
             }
         };
@@ -8158,7 +8171,7 @@ type = "i64"
                 watch_completed: Arc::new(AtomicUsize::new(0)),
             });
 
-            let started = Instant::now();
+            let started = Instant::now(); // allow-wall-clock: measures real wall for the diagnostic printed below, never asserted on; the test's claim is the exact peak-concurrency count, not any elapsed time
             let report = load_instrumented(
                 store as Arc<dyn ObjectStoreBackend>,
                 &pq,
@@ -8180,7 +8193,7 @@ type = "i64"
             )
             .await
             .expect("the load succeeds");
-            let wall = started.elapsed();
+            let wall = started.elapsed(); // allow-wall-clock: real elapsed for the printed diagnostic only; the peak-concurrency assertions below carry the whole claim
             assert_eq!(
                 report.rows_processed, BATCHES as u64,
                 "every row is written at depth {depth} / flushes {flushes}"

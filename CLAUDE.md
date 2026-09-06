@@ -375,16 +375,34 @@ there before changing a rule.
   manual amend or script-bypassing merge. A wrong identity on protected
   `main` cannot be fixed later.
 - `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
-  injected-clock test helper in `services/ravel-cli/src/load.rs` (any
-  function whose signature or body mentions `TestClock`, plus the two
-  helpers issue #1260 names by name) contains `thread::sleep`,
-  `tokio::time::sleep`, `Instant::`, `tokio::time::timeout`, or
-  `SystemTime`. Wired into `gates.sh`. Run it after touching that helper
-  region: a wall-clock wait smuggled back into a clock-driven test reads
-  as a real defect on a loaded machine, then as flakiness on a quiet one,
-  and both readings cost a full gate rerun before anyone thinks to look at
-  the test's own timing model. A scan that finds zero helpers is itself a
-  failure (a `TestClock` rename would otherwise empty the scan silently).
+  injected-clock test helper contains `thread::sleep`, `tokio::time::sleep`,
+  a bare or aliased `sleep()` call, `tokio::time::timeout`, `Instant::`,
+  `.elapsed()`, or `SystemTime`. A helper is any function in the
+  `#[cfg(test)]` module whose signature or body mentions an injected-clock
+  type (`TestClock` or `FixedClock`), plus the two helpers issue #1260 names
+  by name so a rename of a clock type cannot silently empty the scan. It is
+  bypassable per line with a trailing `// allow-wall-clock: <reason>`
+  comment; the reason is required (an empty reason does not suppress), and
+  the marker is matched on the string-stripped line so a string literal
+  containing the marker text cannot suppress a real finding. Wired into
+  `gates.sh` and into `.github/workflows/ci.yml` (its own cases run first,
+  so a suite broken into always-passing fails CI rather than going quiet).
+  Run it after touching that helper region: a wall-clock wait smuggled back
+  into a clock-driven test reads as a real defect on a loaded machine, then
+  as flakiness on a quiet one, and both readings cost a full gate rerun
+  before anyone thinks to look at the test's own timing model. A scan that
+  finds zero helpers is itself a failure (a clock-type rename would
+  otherwise empty the scan silently).
+  Scope: the default target is the single file
+  `services/ravel-cli/src/load.rs`; the rule is NOT yet enforced
+  workspace-wide. Pointing it at every other `.rs` that mentions an
+  injected-clock type surfaces 9 findings across 5 files (in ravel-cache,
+  ravel-maintain, and ravel-server; a mix of idle-eviction sleeps that poll
+  a clock-controlled state and `tokio::time::timeout` deadlock guards that
+  would each need a real allow-wall-clock reason), and it cannot anchor at
+  all in 78 more clock-mentioning files (70 of them integration tests under
+  `crates/*/tests/`) that carry no `#[cfg(test)]` module. A follow-up ticket
+  should widen the scan and resolve those.
 
 ### Writing gate and poll shell
 

@@ -5,18 +5,33 @@
 # (the flaky pair test, then its rewrite under #1235). That rule is now a
 # check, not a paragraph: this scans every injected-clock test helper in
 # services/ravel-cli/src/load.rs for thread::sleep, tokio::time::sleep,
-# Instant::, tokio::time::timeout and SystemTime, and fails on a hit.
+# a bare/aliased sleep() call, tokio::time::timeout, Instant::, .elapsed()
+# and SystemTime, and fails on a hit.
 #
-# The scanned region is derived mechanically, not from a hand-maintained line
-# list: every function item in the `#[cfg(test)]` module whose signature or
-# body mentions `TestClock` is scanned, plus the two helpers issue #1260 names
-# by name (load_two_writes_across_one_clock_advance, load_with_released_tail)
-# so a rename of the TestClock type cannot silently empty the scan. A scan
-# that finds zero helpers is itself a failure -- see below.
+# Scan span and predicate. The whole `#[cfg(test)]` module (from the first
+# `#[cfg(test)]` line to end of file) is the scan region, not a hand-picked
+# set of helper spans. Inside it, a function item is scanned when its
+# signature or body mentions one of the injected-clock types named once in
+# CLOCK_TYPES below (TestClock, FixedClock), plus the two helpers issue #1260
+# names by name (load_two_writes_across_one_clock_advance,
+# load_with_released_tail) so a rename of a clock type cannot silently empty
+# the scan. A scan that finds zero helpers is itself a failure -- see below.
+#
+# Not covered, on purpose: a helper that delegates its wait to another
+# function which never names a clock type. The scan keys on the clock type
+# appearing in the function that also holds the wall-clock construct; a wait
+# hidden one call deep in a clock-free helper is out of scope. Widening to it
+# would need a call graph, which this source-only scan does not build.
 #
 # Allowlist: a single trailing comment marker on the offending line,
-# `// allow-wall-clock: <reason>`, and nothing else (no env var, no exempt
-# file).
+# `// allow-wall-clock: <reason>`, with a non-empty reason and nothing else
+# (no env var, no exempt file). The marker is matched on the string-stripped
+# line, so a string literal that merely contains the marker text cannot
+# suppress a real finding.
+#
+# Scope note. This guard scans one file, services/ravel-cli/src/load.rs. It is
+# not yet enforced workspace-wide: other crates hold injected-clock tests it
+# does not read (see CLAUDE.md for the measured out-of-scope counts).
 #
 # Usage:
 #   scripts/check-injected-clock-helpers.sh [file]
@@ -31,7 +46,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
 case "${1:-}" in
   -h | --help)
-    sed -n '2,26p' "$0"
+    sed -n '2,42p' "$0"
     exit 0
     ;;
 esac
@@ -53,14 +68,18 @@ fi
 # Single-file scan, so no per-file state reset is needed (unlike
 # check-test-hygiene.sh, which processes many files through one awk pass).
 #
-# strip_line/charlit_len strip comment and string-literal content so the
-# scan for `TestClock`, the five wall-clock symbols, and the `fn` keyword
-# itself never matches inside a doc comment or a string; the allow-wall-clock
-# marker is deliberately checked against the RAW line instead, because it is
-# itself a trailing comment that strip_line would otherwise erase.
+# strip_both computes two views of each line in one walk that carries string
+# and block-comment state across lines:
+#   clean[] -- comment AND string/char-literal content removed. Used for the
+#     `fn` keyword, the clock-type mention, and the wall-clock symbols, so
+#     none of them ever match inside a comment or a string.
+#   nostr[] -- string/char-literal content removed but comments KEPT. Used
+#     only for the allow-wall-clock marker, which is itself a trailing
+#     comment: clean[] would erase it, and the raw line would let a string
+#     literal containing the marker text suppress a real finding.
 #
-# A function's body span is found by paren/brace counting on the stripped
-# text, starting from column 1 of its `fn` line: any parens in a `pub(crate)`
+# A function's body span is found by paren/brace counting on the clean text,
+# starting from column 1 of its `fn` line: any parens in a `pub(crate)`
 # prefix close before `fn` is reached, so paren depth is already back at 0 by
 # the time the real argument list opens, and the first top-level `{` after
 # that is unambiguously the body open. This needs no argument-list special
@@ -84,14 +103,18 @@ function charlit_len(s, i,   c2, c, j) {
   if (substr(s, i + 2, 1) == SQ) return 3
   return 0
 }
-function strip_line(s,   out, i, n, c, j, k, hashes, hs, cl) {
-  out = ""; n = length(s); i = 1
+# Walk s once, setting globals CLEAN (code only) and NOSTR (code + comments,
+# strings blanked). String/block-comment state (bdepth, sstate, sesc,
+# shashes) is global on purpose so a multi-line string or block comment is
+# tracked across successive calls.
+function strip_both(s,   i, n, c, j, k, hashes, hs, cl) {
+  CLEAN = ""; NOSTR = ""; n = length(s); i = 1
   while (i <= n) {
     c = substr(s, i, 1)
     if (bdepth > 0) {
-      if (c == "/" && substr(s, i + 1, 1) == "*") { bdepth++; i += 2; continue }
-      if (c == "*" && substr(s, i + 1, 1) == "/") { bdepth--; i += 2; continue }
-      i++; continue
+      if (c == "/" && substr(s, i + 1, 1) == "*") { bdepth++; NOSTR = NOSTR "/*"; i += 2; continue }
+      if (c == "*" && substr(s, i + 1, 1) == "/") { bdepth--; NOSTR = NOSTR "*/"; i += 2; continue }
+      NOSTR = NOSTR c; i++; continue
     }
     if (sstate == 1) {
       if (sesc) { sesc = 0; i++; continue }
@@ -109,12 +132,12 @@ function strip_line(s,   out, i, n, c, j, k, hashes, hs, cl) {
       }
       i++; continue
     }
-    if (c == "/" && substr(s, i + 1, 1) == "*") { bdepth = 1; i += 2; continue }
-    if (c == "/" && substr(s, i + 1, 1) == "/") break
+    if (c == "/" && substr(s, i + 1, 1) == "*") { bdepth = 1; NOSTR = NOSTR "/*"; i += 2; continue }
+    if (c == "/" && substr(s, i + 1, 1) == "/") { NOSTR = NOSTR substr(s, i); break }
     if (c == SQ) {
       cl = charlit_len(s, i)
       if (cl > 0) { i += cl; continue }
-      out = out c; i++; continue
+      CLEAN = CLEAN c; NOSTR = NOSTR c; i++; continue
     }
     if (c == "r" || (c == "b" && substr(s, i + 1, 1) == "r")) {
       j = i
@@ -127,9 +150,8 @@ function strip_line(s,   out, i, n, c, j, k, hashes, hs, cl) {
       }
     }
     if (c == "\"") { sstate = 1; i++; continue }
-    out = out c; i++
+    CLEAN = CLEAN c; NOSTR = NOSTR c; i++
   }
-  return out
 }
 # Returns the function name if `line` (already comment/string-stripped) is
 # the start of a `fn` item -- optionally preceded by pub()/async/unsafe/
@@ -163,8 +185,10 @@ function fn_candidate(line,   t, i, n, c) {
 BEGIN { SQ = sprintf("%c", 39) }
 {
   nlines++
+  strip_both($0)
   raw[nlines] = $0
-  clean[nlines] = strip_line($0)
+  clean[nlines] = CLEAN
+  nostr[nlines] = NOSTR
   if (cfg_test_line == 0 && $0 ~ /#\[cfg\(test\)\]/) cfg_test_line = nlines
 }
 END {
@@ -177,12 +201,23 @@ END {
   NAMED_1 = "load_two_writes_across_one_clock_advance"
   NAMED_2 = "load_with_released_tail"
 
-  nsyms = 0
-  syms[++nsyms] = "thread::sleep"
-  syms[++nsyms] = "tokio::time::sleep"
-  syms[++nsyms] = "Instant::"
-  syms[++nsyms] = "tokio::time::timeout"
-  syms[++nsyms] = "SystemTime"
+  # The injected-clock types, named once. A function that mentions any of
+  # these (or is one of the two named helpers) is scanned.
+  nct = 0
+  clock_types[++nct] = "TestClock"
+  clock_types[++nct] = "FixedClock"
+
+  # Wall-clock constructs, matched as regexes on the clean line. First match
+  # per line wins, so the qualified sleep names report before the bare
+  # sleep() pattern (which exists to catch an aliased `use ...::sleep`).
+  np = 0
+  pname[++np] = "thread::sleep";        pre[np] = "thread::sleep"
+  pname[++np] = "tokio::time::sleep";   pre[np] = "tokio::time::sleep"
+  pname[++np] = "tokio::time::timeout"; pre[np] = "tokio::time::timeout"
+  pname[++np] = "Instant::";            pre[np] = "Instant::"
+  pname[++np] = "SystemTime";           pre[np] = "SystemTime"
+  pname[++np] = ".elapsed()";           pre[np] = "\\.elapsed\\(\\)"
+  pname[++np] = "sleep()";              pre[np] = "(^|[^A-Za-z0-9_:])sleep[ \t]*\\("
 
   helper_count = 0
   finding_count = 0
@@ -227,21 +262,26 @@ END {
     if (end_line == 0) { i++; continue }
 
     mentions = 0
-    for (k = i; k <= end_line; k++) {
-      if (index(clean[k], "TestClock") > 0) { mentions = 1; break }
+    for (k = i; k <= end_line && !mentions; k++) {
+      for (ci = 1; ci <= nct; ci++) {
+        if (index(clean[k], clock_types[ci]) > 0) { mentions = 1; break }
+      }
     }
     is_named = (name == NAMED_1 || name == NAMED_2)
 
     if (mentions || is_named) {
       helper_count++
       for (k = i; k <= end_line; k++) {
-        for (si = 1; si <= nsyms; si++) {
-          if (index(clean[k], syms[si]) > 0) {
-            if (index(raw[k], "// allow-wall-clock:") > 0) continue
-            finding_count++
-            printf "%s:%d: %s in %s\n", FILENAME, k, syms[si], name
-          }
+        sym = ""
+        for (pi = 1; pi <= np; pi++) {
+          if (clean[k] ~ pre[pi]) { sym = pname[pi]; break }
         }
+        if (sym == "") continue
+        # allow-wall-clock marker, matched on the string-stripped line and
+        # requiring a non-empty reason.
+        if (nostr[k] ~ /\/\/ allow-wall-clock:[ \t]*[^ \t]/) continue
+        finding_count++
+        printf "%s:%d: %s in %s\n", FILENAME, k, sym, name
       }
     }
 
@@ -255,7 +295,7 @@ END {
   }
   if (helper_count == 0) {
     printf "check-injected-clock-helpers.sh: 0 injected-clock helpers scanned in %s -- " \
-      "TestClock renamed, or the named helpers (%s / %s) removed?\n", \
+      "a clock type renamed, or the named helpers (%s / %s) removed?\n", \
       FILENAME, NAMED_1, NAMED_2 > "/dev/stderr"
     exit 1
   }
