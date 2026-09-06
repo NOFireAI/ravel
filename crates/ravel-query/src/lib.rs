@@ -16,6 +16,7 @@ mod log_fetcher;
 pub mod log_series;
 mod phase_accounting;
 mod query_admission;
+mod reserved_bytes;
 mod segment_admission;
 pub mod span_fetcher;
 #[cfg(test)]

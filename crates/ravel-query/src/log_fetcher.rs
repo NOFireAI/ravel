@@ -54,6 +54,7 @@ use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
+use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -3310,33 +3311,6 @@ impl AsRef<[u8]> for AssembledBytes {
     fn as_ref(&self) -> &[u8] {
         self.buf.as_ref()
     }
-}
-
-/// Owns a fetched `Bytes` together with its fetch-layer reservation (ADR-1170
-/// decision 2), so [`attach_reservation`] can make the reservation guard ride
-/// with a bare-`Bytes` return value: the guard releases when the last clone of
-/// the returned `Bytes` is dropped, never because the GET completed. The
-/// `AsRef<[u8]>` forwards to the inner `Bytes`, so the wrapped view is
-/// byte-identical to the original.
-struct ReservedBytes {
-    bytes: Bytes,
-    _reservation: ravel_memory::Reservation,
-}
-
-impl AsRef<[u8]> for ReservedBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-/// Wraps `bytes` so `reservation` lives exactly as long as the returned
-/// `Bytes` (ADR-1170 decision 2). Zero-copy: the backing allocation is shared,
-/// only the owner changes.
-fn attach_reservation(bytes: Bytes, reservation: ravel_memory::Reservation) -> Bytes {
-    Bytes::from_owner(ReservedBytes {
-        bytes,
-        _reservation: reservation,
-    })
 }
 
 impl ObjectAssembler {

@@ -43,6 +43,7 @@
 use std::sync::Arc;
 
 use crate::fetcher::ReadCache;
+use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -66,26 +67,6 @@ use ravel_types::accounting::{AccountedOp, QueryAccounting};
 /// with a bare-`Bytes` return value: the guard releases when the last clone of
 /// the returned `Bytes` is dropped, never because the GET completed. `AsRef`
 /// forwards to the inner `Bytes`, so the wrapped view is byte-identical.
-struct ReservedBytes {
-    bytes: Bytes,
-    _reservation: ravel_memory::Reservation,
-}
-
-impl AsRef<[u8]> for ReservedBytes {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
-/// Wraps `bytes` so `reservation` lives exactly as long as the returned
-/// `Bytes` (ADR-1170 decision 2). Zero-copy: the backing allocation is shared.
-fn attach_reservation(bytes: Bytes, reservation: ravel_memory::Reservation) -> Bytes {
-    Bytes::from_owner(ReservedBytes {
-        bytes,
-        _reservation: reservation,
-    })
-}
-
 /// One scanned span: the rebuilt record plus its `service_name` read straight
 /// from the v3 dictionary-encoded `COL_SERVICE_NAME` column (ADR-0054), rather
 /// than looked up by linear scan of the record's merged `attrs` map at build
