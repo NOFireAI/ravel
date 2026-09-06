@@ -6171,6 +6171,20 @@ mod tests {
         );
     }
 
+    /// Issue #1238 review round: a `--catalog-resolve-concurrency` exactly at
+    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` is the inclusive boundary
+    /// and must be accepted, not rejected.
+    #[test]
+    fn catalog_resolve_concurrency_at_max_is_accepted_at_startup() {
+        let at_max = ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY.to_string();
+        let cli = Cli::try_parse_from(["ravel-server", "--catalog-resolve-concurrency", &at_max])
+            .expect("flag parses at the CLI layer");
+        cli.validate().expect(
+            "--catalog-resolve-concurrency == MAX_RESOLVE_GET_CONCURRENCY must be accepted \
+             (inclusive boundary)",
+        );
+    }
+
     /// ADR-0076 decision 4: a `--max-flush-delay` whose DERIVED
     /// `strict_visibility_budget_ns` (`max_flush_delay +
     /// STRICT_VISIBILITY_RESERVE_NS`) meets or exceeds
