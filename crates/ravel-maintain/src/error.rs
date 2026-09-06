@@ -40,6 +40,21 @@ pub enum MergeCursorBudgetSite {
         /// holds.
         grow_bytes: u64,
     },
+    /// Growing an already-open cursor's charge to cover the two-block raw
+    /// prefetch `next_raw_block` is about to issue. The growth is checked
+    /// BEFORE the `try_join!` that fetches, so the refusal costs nothing but
+    /// the run: no byte was moved and nothing was allocated.
+    RawFetch {
+        /// Index, into the stream's candidate loc list, of the first loc the
+        /// refused fetch would have read.
+        first_loc_index: usize,
+        /// How many locs the refused fetch would have read: one, or two when
+        /// `try_join!`'s look-ahead prefetch applies (issue #711).
+        loc_count: usize,
+        /// Combined raw byte count of the locs the refused fetch would have
+        /// landed.
+        fetch_bytes: u64,
+    },
 }
 
 impl std::fmt::Display for MergeCursorBudgetSite {
@@ -58,6 +73,14 @@ impl std::fmt::Display for MergeCursorBudgetSite {
             } => write!(
                 f,
                 "growing an open cursor by {grow_bytes} bytes to decode block {block_index} before that decode starts"
+            ),
+            Self::RawFetch {
+                first_loc_index,
+                loc_count,
+                fetch_bytes,
+            } => write!(
+                f,
+                "growing an open cursor to fetch {fetch_bytes} raw bytes across {loc_count} loc(s) starting at loc {first_loc_index} before that fetch starts"
             ),
         }
     }
