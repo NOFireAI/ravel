@@ -404,7 +404,9 @@ and calls `finish` once, which computes the record-level two-tier winner
 (columnar occurrences ascending by type byte, then overflow occurrences
 ascending by `canonical_value_bytes`, last wins) and overlays it on the
 stream seed. `emit_merged` then projects that one merged view onto POSTINGS:
-every indexed entry becomes a term.
+an indexed entry becomes a term when the slot is indexed and the object
+carries a dynamic column for that slot's type byte. An indexed slot whose
+type byte resolves to no column emits nothing.
 
 The two-tier winner order and the emitted terms are unchanged. This
 amendment renames nothing in the decision above and changes no on-disk
