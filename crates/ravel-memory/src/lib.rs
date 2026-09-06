@@ -40,8 +40,11 @@ impl MemoryBudget {
         }
     }
 
-    /// Builds a budget that never refuses a reservation. Still counts
-    /// exactly: `reserved()` and `handoff_overlap()` remain accurate.
+    /// Builds a budget that never refuses a reservation for any total that
+    /// fits in a `u64`. At the `u64` ceiling it refuses rather than
+    /// miscounts: see [`try_reserve`]'s overflow rule.
+    ///
+    /// [`try_reserve`]: MemoryBudget::try_reserve
     pub fn unlimited() -> Self {
         Self::new(u64::MAX)
     }
@@ -66,17 +69,24 @@ impl MemoryBudget {
     /// Reserves `n` bytes if doing so would not exceed `limit`. On
     /// success, `reserved()` grows by exactly `n`. On failure, nothing
     /// changes.
+    ///
+    /// Overflow rule: a total that would not fit in a `u64` is refused
+    /// with `Err`, regardless of `limit` (so `unlimited()`, whose limit is
+    /// `u64::MAX`, still refuses at the ceiling instead of recording fewer
+    /// bytes than it admitted).
     pub fn try_reserve(&self, n: u64) -> Result<(), MemoryExhausted> {
         let mut current = self.reserved.load(Ordering::Acquire);
         loop {
-            let next = current.saturating_add(n);
-            if next > self.limit {
-                return Err(MemoryExhausted {
-                    requested: n,
-                    reserved: current,
-                    limit: self.limit,
-                });
-            }
+            let next = match current.checked_add(n) {
+                Some(next) if next <= self.limit => next,
+                _ => {
+                    return Err(MemoryExhausted {
+                        requested: n,
+                        reserved: current,
+                        limit: self.limit,
+                    });
+                }
+            };
             match self.reserved.compare_exchange_weak(
                 current,
                 next,
@@ -92,7 +102,11 @@ impl MemoryBudget {
     /// Unconditionally reserves `n` bytes, ignoring `limit`, and returns
     /// the new total so a caller can detect a breach itself. This is the
     /// infallible-grow path: it never fails, it saturates instead of
-    /// wrapping.
+    /// wrapping. Saturating at the `u64` ceiling here is a caller bug the
+    /// counter cannot repair: a `reserve_unchecked` call that pins the
+    /// counter at `u64::MAX` makes every later `try_reserve` on this
+    /// budget refuse (per its overflow rule above), which is the closest
+    /// this type can come to surfacing the caller's error.
     pub fn reserve_unchecked(&self, n: u64) -> u64 {
         let mut current = self.reserved.load(Ordering::Acquire);
         loop {
@@ -253,10 +267,49 @@ mod tests {
         let budget = MemoryBudget::new(100);
         budget.try_reserve(60).expect("60 of 100 fits");
         budget.try_reserve(40).expect("100 of 100 fits exactly");
+        let before = budget.reserved();
         let err = budget.try_reserve(1).expect_err("101 of 100 must not fit");
         assert_eq!(err.requested, 1);
         assert_eq!(err.reserved, 100);
         assert_eq!(err.limit, 100);
+        assert_eq!(budget.reserved(), before);
+    }
+
+    #[test]
+    fn try_reserve_over_limit_from_zero_fails_and_counts_nothing() {
+        let budget = MemoryBudget::new(100);
+        let err = budget
+            .try_reserve(101)
+            .expect_err("101 of 100 must not fit");
+        assert_eq!(err.requested, 101);
+        assert_eq!(err.reserved, 0);
+        assert_eq!(err.limit, 100);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Discriminates the CAS loop from a fetch_add-then-rollback
+    /// implementation: a losing thread must observe no change at all, not
+    /// a transient over-admit that gets corrected after the fact.
+    /// Replacing the CAS loop in `try_reserve` with a bare `fetch_add`
+    /// followed by a check-and-subtract makes this test flaky/fail, since
+    /// the losing thread's rollback runs after other threads may have
+    /// already observed the bogus intermediate total.
+    #[test]
+    fn concurrent_try_reserve_rolls_back_losing_attempt_cleanly() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        budget.try_reserve(60).expect("60 of 100 fits");
+
+        let budget_b = Arc::clone(&budget);
+        let b = thread::spawn(move || budget_b.try_reserve(110));
+        let budget_c = Arc::clone(&budget);
+        let c = thread::spawn(move || budget_c.try_reserve(40));
+
+        let b_result = b.join().expect("thread B panicked");
+        let c_result = c.join().expect("thread C panicked");
+
+        assert!(b_result.is_err(), "60 + 110 must not fit in 100");
+        assert!(c_result.is_ok(), "60 + 40 must fit in 100 exactly");
+        assert_eq!(budget.reserved(), 100);
     }
 
     #[test]
@@ -276,11 +329,12 @@ mod tests {
 
     #[test]
     fn reservation_drop_releases_exact_size_either_order() {
-        let budget = Arc::new(MemoryBudget::new(1000));
+        let budget = Arc::new(MemoryBudget::new(100));
         let a = budget.reserve(30).expect("30 fits");
         let b = budget.reserve(70).expect("70 fits");
         assert_eq!(budget.reserved(), 100);
         drop(a);
+        assert_eq!(budget.reserved(), 70);
         drop(b);
         assert_eq!(budget.reserved(), 0);
 
@@ -288,6 +342,7 @@ mod tests {
         let b = budget.reserve(70).expect("70 fits");
         assert_eq!(budget.reserved(), 100);
         drop(b);
+        assert_eq!(budget.reserved(), 30);
         drop(a);
         assert_eq!(budget.reserved(), 0);
     }
@@ -317,6 +372,36 @@ mod tests {
         budget.try_reserve(half).expect("unlimited never fails");
         budget.try_reserve(half).expect("unlimited never fails");
         assert_eq!(budget.reserved(), u64::MAX - 1);
+
+        // At the u64 ceiling, unlimited() refuses rather than miscounts.
+        let err = budget
+            .try_reserve(2)
+            .expect_err("u64::MAX - 1 + 2 overflows u64 and must be refused");
+        assert_eq!(err.requested, 2);
+        assert_eq!(err.reserved, u64::MAX - 1);
+        assert_eq!(err.limit, u64::MAX);
+        assert_eq!(budget.reserved(), u64::MAX - 1);
+
+        budget
+            .try_reserve(1)
+            .expect("u64::MAX - 1 + 1 fits exactly at the ceiling");
+        assert_eq!(budget.reserved(), u64::MAX);
+    }
+
+    #[test]
+    fn reserve_unchecked_saturates_at_ceiling() {
+        let budget = MemoryBudget::new(100);
+        assert_eq!(budget.reserve_unchecked(u64::MAX), u64::MAX);
+        assert_eq!(budget.reserve_unchecked(1), u64::MAX);
+        assert_eq!(budget.reserved(), u64::MAX);
+    }
+
+    #[test]
+    fn clear_handoff_past_zero_saturates() {
+        let budget = MemoryBudget::new(100);
+        budget.note_handoff(5);
+        budget.clear_handoff(10);
+        assert_eq!(budget.handoff_overlap(), 0);
     }
 
     #[test]
@@ -325,6 +410,12 @@ mod tests {
         budget.try_reserve(10).expect("10 of 100 fits");
         budget.release(50);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn reservation_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Reservation>();
     }
 
     #[test]
