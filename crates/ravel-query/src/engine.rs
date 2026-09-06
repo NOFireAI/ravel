@@ -1955,6 +1955,19 @@ impl QueryEngine {
                     source: StoreError::Corrupted(source.to_string()),
                 })
             }
+            // A carry paired with the wrong segment breaks the caller's
+            // contract rather than the object: it surfaces as hard corruption
+            // like `Corrupt`, never as a retryable store fault.
+            log_series::LogSeriesError::Fetch(carry @ LogFetchError::CarryMismatch { .. }) => {
+                let key = match &carry {
+                    LogFetchError::CarryMismatch { key, .. } => key.clone(),
+                    _ => String::new(),
+                };
+                QueryError::Fetch(FetchError::Store {
+                    key,
+                    source: StoreError::Corrupted(carry.to_string()),
+                })
+            }
             log_series::LogSeriesError::Decode(source) => QueryError::Fetch(FetchError::Store {
                 key: String::new(),
                 source: StoreError::Corrupted(source.to_string()),

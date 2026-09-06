@@ -433,7 +433,13 @@ impl SqlError {
                 }
             },
             SqlError::LogFetch(fetch) => match fetch {
-                LogFetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
+                // A carry paired with the wrong segment is an integrity
+                // violation of the read relative to the request, redacted like
+                // corruption: its `Display` names both object keys and both
+                // tenant hashes, none of which reaches the client.
+                LogFetchError::Corrupt { .. } | LogFetchError::CarryMismatch { .. } => {
+                    MSG_CORRUPT.to_string()
+                }
                 LogFetchError::Store { .. } | LogFetchError::EtagChanged { .. } => {
                     MSG_UNAVAILABLE.to_string()
                 }
@@ -636,6 +642,25 @@ mod tests {
         // The detail string stays available server-side and leaks nothing.
         assert!(reverify.to_string().contains("stream_attrs truncated"));
         assert_redacted(&reverify.client_message());
+    }
+
+    #[test]
+    fn a_carry_mismatch_is_redacted_like_corruption() {
+        // `CarryMismatch`'s Display names BOTH object keys and BOTH tenant
+        // hashes, so an un-redacted arm would leak two keys at once rather
+        // than one. It shares the corruption class: the read's integrity
+        // relative to the request is broken, and no retry can fix it.
+        let err = SqlError::LogFetch(LogFetchError::CarryMismatch {
+            key: LEAKY_KEY.to_string(),
+            carried_key: format!("{LEAKY_KEY}.other"),
+            tenant: ravel_types::TenantHash([1u8; 16]),
+            carried_tenant: ravel_types::TenantHash([2u8; 16]),
+        });
+        assert_eq!(err.client_message(), MSG_CORRUPT);
+        assert_eq!(err.class(), ErrorClass::Unavailable);
+        // The detail survives server-side, where it is the whole point.
+        assert!(err.to_string().contains(LEAKY_KEY));
+        assert_redacted(&err.client_message());
     }
 
     #[test]

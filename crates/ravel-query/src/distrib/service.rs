@@ -1032,7 +1032,9 @@ fn map_fetch_error(err: FetchError) -> (pb::status::Code, String) {
 /// Maps an RLOG fetch-path error to the worker's typed status, mirroring
 /// [`map_fetch_error`]: a vanished object is a snapshot invalidation
 /// (retryable), a transient store error is unavailable, and a corrupt object is
-/// terminal.
+/// terminal. A carried whole object paired with the wrong segment is terminal
+/// too, like [`map_span_fetch_error`]'s tenant mismatch: the pairing is fixed
+/// by the caller, so retrying or re-dispatching it elsewhere reproduces it.
 fn map_log_fetch_error(err: LogFetchError) -> (pb::status::Code, String) {
     match err {
         LogFetchError::Store {
@@ -1042,6 +1044,7 @@ fn map_log_fetch_error(err: LogFetchError) -> (pb::status::Code, String) {
         LogFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         LogFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         LogFetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        LogFetchError::CarryMismatch { .. } => (pb::status::Code::Corrupt, err.to_string()),
     }
 }
 

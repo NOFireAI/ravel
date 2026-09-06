@@ -510,6 +510,23 @@ pub enum LogFetchError {
     /// (ADR-0107 decision 1).
     #[error("etag changed between reads of log segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
+    /// A [`CarriedWholeObject`] produced by one `plan_segment` read was supplied
+    /// to a read of a different object, or of the same object under a different
+    /// tenant. The carry short-circuits the fetch, so decoding it would answer
+    /// from the wrong object's bytes whenever both are decodable, rather than
+    /// fail; the mismatch is rejected before any decode. Terminal like
+    /// `SpanFetchError::TenantMismatch`, never a retry: the pairing is fixed by
+    /// the caller, so the same request retried anywhere reproduces it.
+    #[error(
+        "carried whole object from {carried_key} (tenant {carried_tenant:?}) was supplied to a \
+         read of log segment {key} (tenant {tenant:?})"
+    )]
+    CarryMismatch {
+        key: String,
+        carried_key: String,
+        tenant: TenantHash,
+        carried_tenant: TenantHash,
+    },
 }
 
 /// Fetches and scans one RLOG log segment at a time. Constructed with the same
@@ -1476,6 +1493,8 @@ impl LogSegmentFetcher {
             let carried = match blocks_read {
                 None => Some(CarriedWholeObject {
                     bytes: bytes.clone(),
+                    source_key: seg_ref.data_object_key.clone(),
+                    source_tenant: tenant_hash,
                 }),
                 Some(_) => None,
             };
@@ -1916,7 +1935,9 @@ impl LogSegmentFetcher {
     /// issuing no store GET and no cache lookup at all. The reused bytes are
     /// charged to `accounting.add_bytes_reused`, not to a cache hit -- the
     /// object was never asked of the cache on this call. Safe with no etag
-    /// re-check: see [`CarriedWholeObject`]'s doc.
+    /// re-check: see [`CarriedWholeObject`]'s doc. A carry whose own
+    /// `(key, tenant)` is not this call's is rejected as
+    /// [`LogFetchError::CarryMismatch`] before any decode.
     #[allow(clippy::too_many_arguments)]
     async fn tenant_bytes_with_footer(
         &self,
@@ -1934,6 +1955,18 @@ impl LogSegmentFetcher {
         }
 
         if let Some(carried) = carried_whole {
+            // The carry answers without consulting `seg_ref`, so a carry paired
+            // with another segment would decode that segment's rows out of these
+            // bytes wherever both objects are decodable. Prove the pairing first.
+            if carried.source_key != seg_ref.data_object_key || carried.source_tenant != tenant_hash
+            {
+                return Err(LogFetchError::CarryMismatch {
+                    key: seg_ref.data_object_key.clone(),
+                    carried_key: carried.source_key,
+                    tenant: tenant_hash,
+                    carried_tenant: carried.source_tenant,
+                });
+            }
             accounting.add_bytes_reused(carried.bytes.len() as u64);
             return Ok(Some((carried.bytes, None)));
         }
@@ -2898,9 +2931,22 @@ pub struct CarriedFooter<'a> {
 /// whole-object GET), never a column-selection-scoped ranged read. So the
 /// bytes are valid for the scan's column selection whatever it is, even
 /// though the plan fetched with [`ColumnSelection::all`].
+///
+/// The bytes travel with the identity of the read that produced them, and a
+/// consumer proves the pairing before decoding. Nothing in the type system
+/// stops a caller from handing this carry to a read of a different segment:
+/// the carry branch answers from these bytes without consulting the supplied
+/// `SegmentRef` at all, so a mismatched pairing would return the wrong
+/// object's rows wherever both objects decode. The key alone would settle it
+/// in practice (a data-object key embeds the tenant hex), but the tenant is
+/// stored and checked too rather than inferred from that.
 #[derive(Clone)]
 pub struct CarriedWholeObject {
     bytes: Bytes,
+    /// `data_object_key` of the segment the plan read fetched these bytes for.
+    source_key: String,
+    /// Tenant the plan read fetched them under.
+    source_tenant: TenantHash,
 }
 
 impl CarriedWholeObject {
@@ -5732,6 +5778,19 @@ fn to_cache_error(err: LogFetchError) -> crate::fetcher::CacheFetchError {
             key,
             message: source.to_string(),
         },
+        // A carry mismatch is refused before any fetch, so it never reaches a
+        // single-flight waiter today. Preserved as hard corruption rather than
+        // flattened, so it stays in its class if a carry ever fronts the cache.
+        carry @ LogFetchError::CarryMismatch { .. } => {
+            let key = match &carry {
+                LogFetchError::CarryMismatch { key, .. } => key.clone(),
+                _ => String::new(),
+            };
+            crate::fetcher::CacheFetchError::Corrupt {
+                key,
+                message: carry.to_string(),
+            }
+        }
     }
 }
 
