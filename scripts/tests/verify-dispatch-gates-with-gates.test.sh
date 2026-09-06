@@ -161,6 +161,39 @@ receipt_file="$(
 check_eq "printed receipt path matches fleet-result-merge.sh's lookup" "${receipt_file}" "${printed_receipt}"
 check_true "the receipt file the stub wrote actually exists there" "$([[ -f "${receipt_file}" ]] && echo 1 || echo 0)"
 
+# === (b2) VERIFY_WITH_GATES=1 with no flag selects the same gated mode:
+#     the gate runs once inside the worktree and the receipt lands where
+#     fleet-result-merge.sh looks for it. ====================================
+repo="${tmproot}/repo-b2"
+worktree_parent="${tmproot}/wt-b2"
+new_repo "${repo}"
+stub_gates="${tmproot}/stub-gates-b2.sh"
+make_stub_gates "${stub_gates}"
+call_log="${tmproot}/call-log-b2"
+: >"${call_log}"
+
+out="$(cd "${repo}" && CALL_LOG="${call_log}" STUB_GATES_EXIT=0 VERIFY_WITH_GATES=1 \
+  GATES_SH="${stub_gates}" "${VERIFY_SCRIPT}" HEAD "${worktree_parent}" 2>&1)"
+got_exit=$?
+
+check_eq "VERIFY_WITH_GATES=1 exit code propagated" "0" "${got_exit}"
+
+call_count="$(wc -l <"${call_log}" | tr -d ' ')"
+check_eq "VERIFY_WITH_GATES=1 invokes the gate exactly once" "1" "${call_count}"
+
+worktree_dir="${worktree_parent}/verify-$(cd "${repo}" && git rev-parse --short HEAD)"
+logged_cwd="$(sed -n 's/^cwd=\(.*\) args=.*/\1/p' "${call_log}")"
+check_eq "VERIFY_WITH_GATES=1 runs the gate inside the worktree" "${worktree_dir}" "${logged_cwd}"
+
+printed_receipt="$(printf '%s\n' "${out}" | sed -n 's/^==> Gates receipt: //p')"
+receipt_file="$(
+  cd "${repo}"
+  skip_tree="$(git rev-parse "HEAD^{tree}")"
+  echo "$(cd "$(git rev-parse --git-common-dir)" && pwd)/gates-pass/${skip_tree}"
+)"
+check_eq "VERIFY_WITH_GATES=1 receipt path matches the merge script's lookup" "${receipt_file}" "${printed_receipt}"
+check_true "VERIFY_WITH_GATES=1 receipt file exists" "$([[ -f "${receipt_file}" ]] && echo 1 || echo 0)"
+
 # === (c) default mode (no --with-gates) still runs the five cargo
 #     commands, in the documented order, unchanged. =========================
 repo="${tmproot}/repo-c"

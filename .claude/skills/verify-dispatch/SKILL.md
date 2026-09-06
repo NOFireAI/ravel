@@ -239,8 +239,10 @@ On tier-1 FAIL:
 3. Re-run this skill against the fix's result branch.
 4. Tier-1 PASS now: proceed to the normal merge flow
    (`scripts/fleet-result-merge.sh` / the merge-fleet-result skill). If
-   tier 1 ran with `--with-gates`, pass `FLEET_MERGE_SKIP_GATES=1` to the
-   merge script so it does not redo the same workspace-wide build.
+   tier 1 ran in gated mode (either `--with-gates` or `VERIFY_WITH_GATES=1`,
+   which select the same mode and write the same receipt), pass
+   `FLEET_MERGE_SKIP_GATES=1` to the merge script so it does not redo the
+   same workspace-wide build.
 5. Tier-1 FAIL again (2nd consecutive failure): stop. Surface both
    reports to the user directly. Do not dispatch a third attempt without
    explicit direction.
