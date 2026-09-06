@@ -1742,10 +1742,11 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   shared `GetLimiter` described under "GET concurrency (ADR-1195)" above,
   whose permit count is the resolved `store_get_concurrency` and which every
   GET from every plan passes through regardless of which level admitted it.
-  That limiter is shared inside one `QueryEngine`, which is the scope this
-  figure models: it says nothing about GETs another engine in the same
-  process issues, and nothing about the RLOG whole-object funnel, which
-  takes no permit at all.
+  In `ravel-server` that limiter is process-wide (one `Arc` shared by every
+  engine and fetcher), but this figure models only the PromQL plans of one
+  query: GETs that other queries, the SQL path, or the RLOG whole-object
+  funnel (which takes a permit too since ADR-1195) issue at the same time
+  compete for the same permits and are not counted here.
   It is a lower bound, never an upper bound or an exact count, because the
   OUTER `buffer_unordered` is a SLIDING window, not a wave-synchronous one:
   as soon as one admitted plan finishes, the next plan is admitted
