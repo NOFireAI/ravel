@@ -1778,9 +1778,9 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   shards' LIST pages ran concurrently with each other or one after another,
   only that they happened (`ravel-catalog` owns that fan-out; out of this
   task's scope to change).
-- `serviceBatches`: a LOWER bound on the serial service rounds this query's
-  per-segment fan-out needed, under a wave-synchronous model of the nested
-  fan-out. The metrics fetch is a NESTED fan-out with three levels of
+- `serviceBatches`: a deterministic model figure for the serial service
+  rounds this query's per-segment fan-out needs, under a wave-synchronous
+  model of the nested fan-out. The metrics fetch is a NESTED fan-out with three levels of
   admission, all of which bound the round count: an OUTER
   `buffer_unordered(promql_fetch_fanout)` over distinct matcher plans
   (`distinct_plans_by_matcher` in `crates/ravel-query/src/engine.rs`), which
@@ -1796,35 +1796,50 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   query: GETs that other queries, the SQL path, or the RLOG whole-object
   funnel (which takes a permit too since ADR-1195) issue at the same time
   compete for the same permits and are not counted here.
-  It is a lower bound, never an upper bound or an exact count, because the
-  OUTER `buffer_unordered` is a SLIDING window, not a wave-synchronous one:
-  as soon as one admitted plan finishes, the next plan is admitted
-  immediately, without waiting for its siblings. Modeling it as
-  wave-synchronous anyway -- one binding concurrency
-  (`min(promql_fetch_fanout * min(distinctMatcherSets,
-  promql_fetch_fanout), sharedGetPermits)`) dividing the total work
-  (`segment_count * distinctMatcherSets` GETs) in a single division --
-  undercounts whenever the outer window is not full for the query's whole
-  duration: 3 distinct matcher sets, 1 segment each, `promql_fetch_fanout`
-  2, and 1000 shared permits gives peak capacity `min(2 * 2, 1000) = 4`, so
-  that single division reports `ceil(3 / 4) = 1` round, but plans 1 and 2
-  admit together in the first round and plan 3 only after one of them
-  finishes, in a second round -- the real schedule needs at least 2 rounds,
-  not 1.
+  Within a single wave, that wave's own `batches_w` (defined below) is a
+  true lower bound: the OUTER `buffer_unordered`'s binding capacity for
+  that wave cannot service more than `capacity_w` requests per round, so
+  the wave cannot finish in fewer than `batches_w` rounds. But
+  `serviceBatches` sums `batches_w` across waves, and that sum is a model
+  figure, not a bound in either direction, because the OUTER
+  `buffer_unordered` is a SLIDING window, not a wave-synchronous one: as
+  soon as one admitted plan finishes, the next plan is admitted
+  immediately, without waiting for its siblings, so a later wave's work
+  can start -- and finish -- before an earlier wave's is done. Concretely:
+  16 shared permits, 17 distinct matcher plans admitted through an outer
+  fan-out width of 16 (one segment each), plus one further plan whose
+  single segment fetch only becomes eligible after the first of the 17
+  resolves. The real scheduler finishes all of it in two rounds, because
+  that further fetch is admitted into the same round that drains the 17th
+  plan's leftover request, while the summed per-wave model reports
+  `ceil(17 / 16) + ceil(1 / 16) = 3`, one round too many. The same sliding
+  window can also undercount: modeling the whole query as wave-synchronous
+  in one shot -- one binding concurrency (`min(promql_fetch_fanout *
+  min(distinctMatcherSets, promql_fetch_fanout), sharedGetPermits)`)
+  dividing the total work (`segment_count * distinctMatcherSets` GETs) in a
+  single division -- undercounts whenever the outer window is not full for
+  the query's whole duration: 3 distinct matcher sets, 1 segment each,
+  `promql_fetch_fanout` 2, and 1000 shared permits gives peak capacity
+  `min(2 * 2, 1000) = 4`, so that single division reports `ceil(3 / 4) = 1`
+  round, but plans 1 and 2 admit together in the first round and plan 3
+  only after one of them finishes, in a second round -- the real schedule
   So this figure is computed per WAVE of the outer fan-out instead: `waves
   = ceil(distinctMatcherSets / promql_fetch_fanout)`; for 0-based wave `w`,
   `active_w = min(promql_fetch_fanout, distinctMatcherSets - w *
   promql_fetch_fanout)` plans are admitted, `capacity_w =
   min(promql_fetch_fanout * active_w, sharedGetPermits)` is that wave's
   binding concurrency, and `batches_w = ceil(segment_count * active_w /
-  capacity_w)` is its own serial round count; `serviceBatches` sums
-  `batches_w` over every wave (distinct matcher sets, not the raw plan
-  count `stats.estimate` scales by -- a query naming two `SelectorPlan`s
-  that share one matcher set, `up + up offset 5m`, is fetched in one pass,
-  so its `serviceBatches` does not double). This sum is still a lower
-  bound, never exact: the sliding window can only pack work at least as
-  tightly as the wave-synchronous model assumes, never more loosely, so the
-  real scheduler takes at least this many rounds. 64 segments,
+  capacity_w)` is its own serial round count, a true lower bound on that
+  wave in isolation; `serviceBatches` sums `batches_w` over every wave
+  (distinct matcher sets, not the raw plan count `stats.estimate` scales
+  by -- a query naming two `SelectorPlan`s that share one matcher set, `up
+  + up offset 5m`, is fetched in one pass, so its `serviceBatches` does not
+  double). This sum is a deterministic model, not a bound: identical work
+  always produces the same number, which makes it comparable across
+  queries and useful for spotting a fan-out or permit-sizing regression,
+  but once more than one wave is involved the sum is neither an upper nor
+  a lower bound on the real scheduler's round count (see the 17-plus-1
+  counterexample above). 64 segments,
   `promql_fetch_fanout` 8, two distinct matcher sets, and 16 shared permits:
   one wave, `active_0 = 2`, `capacity_0 = min(16, 16) = 16`, `batches_0 =
   ceil(128 / 16) = 8`. `promql_fetch_fanout` 1 with three distinct matcher
