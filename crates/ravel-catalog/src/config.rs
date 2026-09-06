@@ -182,10 +182,11 @@ pub const DEFAULT_RESOLVE_GET_CONCURRENCY: usize = 128;
 /// [`DEFAULT_RESOLVE_GET_CONCURRENCY`]'s doc comment measures against, 4,096
 /// in flight sustains roughly 4,096 / 0.030s ~= 136,000 GET/s, about
 /// twenty-five times S3's published per-prefix guidance of ~5,500 GET/s.
-/// Nothing above this is a sane operator value; anything above it is a typo,
-/// and unbounded it parses into a `usize` that panics inside
-/// `tokio::sync::Semaphore::new` (its `permits <= usize::MAX >> 3`
-/// invariant) at startup instead of failing with a typed error.
+/// Nothing above this is a sane operator value; anything above it is a typo.
+/// The bound sits here for that arithmetic, not for tokio's sake: tokio's own
+/// ceiling (`Semaphore::MAX_PERMITS`, `usize::MAX >> 3`) is far above it, and
+/// only a value past that would panic in `Semaphore::new`; with a bound, both
+/// the typo and that extreme fail with a typed error at startup.
 pub const MAX_RESOLVE_GET_CONCURRENCY: usize = 4_096;
 
 /// Catalog configuration.

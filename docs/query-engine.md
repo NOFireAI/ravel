@@ -698,8 +698,12 @@ and record-GET requests one `Catalog` instance keeps in flight at once, via
 a per-instance `tokio::sync::Semaphore`. It defaults to 128 and is rejected
 at construction time (a typed `CatalogError::InvalidConfig`, never a silent
 clamp to 1) if configured to `0`, since a zero-permit semaphore would
-deadlock every resolve, or above `MAX_RESOLVE_GET_CONCURRENCY` (4096), since
-past that ceiling `tokio::sync::Semaphore::new` itself panics. `ravel-server`
+deadlock every resolve, or above `MAX_RESOLVE_GET_CONCURRENCY` (4096), because
+nothing past that is a sane operator value: at roughly 30 ms per round it is
+about 136,000 GET/s, twenty-five times S3's per-prefix guidance, so a larger
+number is a typo, not a setting. Tokio's own ceiling
+(`Semaphore::MAX_PERMITS`, `usize::MAX >> 3`) is far above it and is not what
+the bound exists for. `ravel-server`
 exposes it as
 `--catalog-resolve-concurrency`; unset, the catalog's own default applies.
 
@@ -723,7 +727,7 @@ shard-hour.
 This bounds one `Catalog` instance, not the process: `ravel-server` builds
 exactly one `Catalog` and shares it (an `Arc` clone per request, one
 underlying `request_semaphore`), so N concurrent queries against that
-instance are capped at 128 in flight TOTAL, not N * 128. N * 128 in flight
+instance are capped at 128 in flight TOTAL, not `N * 128`. `N * 128` in flight
 holds only across N distinct `Catalog` instances (separate CLI invocations
 or tests), never within one running server. A process-wide cap across
 instances is not implemented and is tracked as a follow-up.

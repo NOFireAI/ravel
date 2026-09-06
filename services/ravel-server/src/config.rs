@@ -906,8 +906,9 @@ pub struct Cli {
     /// `ravel_catalog::CatalogConfig`'s own default (currently 128). `0` is
     /// rejected by [`Cli::validate`]: a zero-permit semaphore would deadlock
     /// every resolve, never silently clamped to 1. A value above
-    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` is rejected too, rather
-    /// than panicking inside `tokio::sync::Semaphore::new` at startup.
+    /// `ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY` is rejected too: past
+    /// that ceiling the number is a typo, not a setting (see the constant's
+    /// doc for the per-prefix arithmetic).
     #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
     pub catalog_resolve_concurrency: Option<usize>,
 
@@ -3167,9 +3168,9 @@ impl Cli {
         {
             anyhow::bail!(
                 "--catalog-resolve-concurrency '{concurrency}' exceeds the maximum of {}: \
-                 past that ceiling the value is not a sane operator setting and \
-                 tokio::sync::Semaphore::new would panic at startup instead of failing \
-                 cleanly. Set a smaller count.",
+                 past that ceiling the value is not a sane operator setting (at about \
+                 30 ms per round it is 25x S3's per-prefix request guidance). Set a \
+                 smaller count.",
                 ravel_catalog::MAX_RESOLVE_GET_CONCURRENCY
             );
         }
