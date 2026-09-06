@@ -4452,6 +4452,14 @@ mod tests {
             0,
             "a cold resolve fetches every record it touches, so none is served from cache"
         );
+        // Two records fetched cold plus the one non-record GET a resolve makes
+        // regardless, which is what fixes the constant the full-window
+        // assertion below subtracts.
+        assert_eq!(
+            warm_acc.snapshot().s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
+            3,
+            "a cold resolve over two records issues two record GETs plus one fixed GET"
+        );
 
         // Full window: the two warmed records are served from cache, the other
         // three are fetched cold. Exactly K.
@@ -4471,10 +4479,24 @@ mod tests {
             )
             .await
             .expect("full resolve");
+        let full_snap = full_acc.snapshot();
         assert_eq!(
-            full_acc.snapshot().commit_record_cache_hits,
-            2,
+            full_snap.commit_record_cache_hits, 2,
             "exactly the two pre-warmed commit records are counted as cache serves"
+        );
+        // The counter's claim is that a counted record cost no GET, and the
+        // counter alone cannot show that: it is incremented from a `contains`
+        // peek, and stays 2 whether or not the following read actually hit. The
+        // GET count is the independent witness. Five records, two counted as
+        // serves, so exactly three record GETs. Insert anything that suspends
+        // between the peek and `load_and_validate`'s `cache.get` and an evicted
+        // entry turns a counted serve into a fourth GET here, which the
+        // commit-record assertion above would not notice.
+        assert_eq!(
+            full_snap.s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
+            4,
+            "the three unwarmed records are fetched, plus the same one fixed GET the cold \
+             resolve above showed, and the two counted serves fetch nothing"
         );
     }
 
