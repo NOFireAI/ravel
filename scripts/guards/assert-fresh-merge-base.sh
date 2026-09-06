@@ -56,7 +56,18 @@ git fetch "$remote" "+${branch}:${tip_ref}" >/dev/null 2>&1 || {
 # update means a later run that draws the same pid overwrites the orphan instead
 # of failing on it.
 local_ref="refs/remotes/${remote}/freshness-check-$$"
-trap 'git update-ref -d "$local_ref" 2>/dev/null || true' EXIT HUP INT TERM
+# shellcheck disable=SC2329  # invoked via the exit trap below
+cleanup() {
+  git update-ref -d "$local_ref" 2>/dev/null || true
+}
+# Cleanup on exit, and make each signal actually exit. A handler bound directly
+# to HUP/INT/TERM only runs and RETURNS in POSIX sh, so the script would carry
+# on past the interruption having already deleted the ref it is about to read.
+# Exiting from the handler runs the exit trap, so cleanup still happens once.
+trap cleanup 0
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 git fetch "$remote" "+refs/pull/${pr}/head:${local_ref}" >/dev/null 2>&1 || {
   echo "guard: git fetch $remote refs/pull/${pr}/head failed (is $pr a pull request on $remote?)" >&2
   exit 1
