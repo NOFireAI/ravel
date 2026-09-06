@@ -762,7 +762,7 @@ deployment transfer is free and the bill is requests, so a ranged read spends a
 billed request to save bytes that cost nothing. Elsewhere the reverse holds.
 Three flags size this, all read at startup only.
 
-`--logs-fetch-policy` takes one of three values, spelled exactly as here. Its
+`--logs-fetch-policy` takes one of four values, spelled exactly as here. Its
 default is `cost-based`.
 
 | Value | Optimizes for | Pick it when |
@@ -770,9 +770,24 @@ default is `cost-based`.
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
 | `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
 | `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved from the profile's prices at startup. | You want the shape the deployment's own prices imply. At the reference intra-region profile this resolves to request-minimal. |
+| `latency-first` | Fewest transferred bytes, exactly like `byte-minimal`. An intent, not a tuning constant: it says spend requests to save wall time, and leaves how up to the concurrency you configure. | Cold wall-clock matters more than the request bill, and you are willing to raise object-store GET concurrency explicitly to cash in the trade: measured at a 5.45x request increase for roughly 41% less cold time on a reference corpus, at the concurrency that measurement used. |
 
 For any policy value a query returns exactly the same rows. Only request counts
 and timing differ.
+
+`latency-first` resolves `--store-get-concurrency`, `--sql-partition-count`,
+and `--promql-fetch-fanout` the same way every other policy does -- it sets no
+default of its own. The measured trade above only pays off once you raise
+those three explicitly to the concurrency the measurement used. Selecting the
+policy on its own is not inert: the byte quantities change immediately, so
+every logs object is read in ranged pieces instead of one covering GET, and on
+the reference corpus that shape at the default concurrency measured slower
+than the default policy, not faster. Treat the concurrency as a precondition,
+not a suggestion. The startup line says which side of it this process is on.
+Raising concurrency also raises in-flight fetch memory, and that memory is not
+yet bounded by a process-wide budget: watch process memory yourself when
+trying this policy, since an under-provisioned raise can end in an
+out-of-memory kill instead of a faster query.
 
 The policy is an operator surface only. It is never derivable from query text, a
 header or a ticket: under request billing, a tenant that could force

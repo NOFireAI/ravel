@@ -467,7 +467,7 @@ derived values already satisfy the order. Both adjustments are logged at
 startup (`clamped` and `raised` on the resolved lines, plus a WARN).
 
 Every resolved value is logged at startup, one line per setting with its source
-(`derived`, `flag`, or `fallback`):
+(`derived`, `flag`, `fallback`, or `legacy-flag`):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
@@ -476,6 +476,12 @@ INFO performance default resolved setting="sql_partition_count" value=32 source=
 INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
 ```
+
+`--logs-fetch-policy latency-first` resolves these three concurrency knobs the
+same way every other policy does; it pays off only once an operator raises
+them explicitly, and it carries a memory caveat -- see the fetch-policy table
+in [Operations: configuration](operations/configuration.md#logs-fetch-policy-and-store-cost-profile) before
+turning it on.
 
 `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout`
 replace the old single `--fetch-concurrency` knob's three coupled effects with
