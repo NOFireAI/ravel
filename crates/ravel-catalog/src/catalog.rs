@@ -1861,6 +1861,235 @@ impl Catalog {
         }
     }
 
+    /// The newest-ingest-hour probe widths [`Catalog::latest_ingest_hour`]
+    /// tries per shard, newest-window-first, each one doubling the last
+    /// (issue #1233). The widest entry is [`LATEST_HOUR_MAX_LOOKBACK_HOURS`];
+    /// once it also misses, the tenant/signal is reported as having no
+    /// ingest within the lookback cap rather than paging through its entire
+    /// history.
+    const LATEST_HOUR_PROBE_WINDOWS_HOURS: [u32; 7] = [24, 48, 96, 192, 384, 768, 1536];
+
+    /// The widest window [`Catalog::latest_ingest_hour`] will probe: 64 days,
+    /// the last entry of `LATEST_HOUR_PROBE_WINDOWS_HOURS`. A tenant whose
+    /// latest ingest for a signal is older than this returns `Ok(None)`.
+    pub const LATEST_HOUR_MAX_LOOKBACK_HOURS: u32 = 24 * 64;
+
+    /// The newest ingest-hour bucket holding any commit-record-shaped part
+    /// (a raw commit record, a compaction record, a rewrite record, or a
+    /// tombstone -- any of the four [`BucketEntry`] shapes anchors the hour,
+    /// not only a raw ingest) for this tenant and signal, across every
+    /// shard, or `None` if it has none within
+    /// [`Catalog::LATEST_HOUR_MAX_LOOKBACK_HOURS`] (issue #1233: startup cache
+    /// warmup needs this to warm a tenant whose last ingest is older than its
+    /// lookback window, rather than always resolving `[now - lookback,
+    /// now]`). The returned `bool` is `true` when the winning hour's page(s)
+    /// carried at least one non-tombstone entry (a commit, compaction, or
+    /// rewrite record): a caller resolving the warm window around a
+    /// tombstone-only anchor hour should expect an empty snapshot, since
+    /// [`Catalog::process_bucket`] drops a bucket outright the moment it
+    /// observes a tombstone, and that emptiness is not evidence of a failed
+    /// fetch.
+    ///
+    /// Probes each shard with a bounded, floored `list_after` starting at
+    /// `now - w` for each width `w` in
+    /// [`Catalog::LATEST_HOUR_PROBE_WINDOWS_HOURS`], newest first, stopping at
+    /// the first width whose probe returns any object: a narrower width
+    /// already came back empty, so nothing in this shard falls between it and
+    /// the current floor, and the returned page(s) already carry the shard's
+    /// true maximum (commit keys sort chronologically by ingest hour, so the
+    /// last page of a hit drains to the newest key). This bounds the shard to
+    /// at most seven probes -- one for a tenant that ingested in the last
+    /// 24h -- each probe draining its pages under
+    /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests),
+    /// refusing with [`CatalogError::WindowTooWide`] rather than paging a
+    /// shard's dense window unboundedly; it never lists the tenant's full
+    /// history. The shard set scanned is
+    /// [`crate::provisioning::scan_shards_over_range`] over
+    /// `[now - LATEST_HOUR_MAX_LOOKBACK_HOURS, now]`, the same mandated
+    /// over-a-range derivation every other read path uses (ADR-0052 section
+    /// 4, ADR-1101 decision 2): a signal with fixed read shards is probed on
+    /// those shards even under a small configured `shard_count`, and a
+    /// shard-count decrease keeps a retiring generation's higher indices in
+    /// scope for `DEFAULT_SCAN_SLACK_HOURS`. Shards are fanned out
+    /// concurrently, `MAX_CONCURRENT_REQUESTS` at a time.
+    ///
+    /// This cannot use `list_delimited`: that call has no `start_after` and
+    /// no pagination, so it cannot be floored without listing a shard's
+    /// entire commit-record prefix on every call, which is the exact
+    /// unbounded cost this method exists to avoid. `list_after` is the
+    /// in-scope primitive that supports a floor, at the cost of counting
+    /// object keys rather than one common prefix per ingest hour; a sparse
+    /// shard still resolves in one page per probe.
+    ///
+    /// An hour text past `now_ns + clock_skew_allowance_ns` is ignored, the
+    /// same guard [`Catalog::window_hour_bounds`] applies to a listing
+    /// window's upper edge: a clock-skewed or corrupt future-dated bucket
+    /// must never masquerade as "most recent". Symmetrically, a part is only
+    /// treated as anchoring "now" when its event time is within
+    /// `max_ingest_lag_ns` of its ingest hour AND that ingest hour is not
+    /// itself ahead of the wall clock: a part filed into an hour within
+    /// `clock_skew_allowance_ns` of the future can still move the anchor
+    /// forward by up to an hour, but never past `max_hour_ns` above.
+    ///
+    /// Past the lookback cap this returns `Ok(None)` silently (a `debug!` at
+    /// most, carrying the cap): a tenant that simply does not use a signal is
+    /// not a warning-worthy event in a library that cannot know the caller's
+    /// intent. The caller (`services/ravel-server/src/cache_warm.rs`'s
+    /// `log_warm_result`) alone decides the log level a caller should see for
+    /// that outcome.
+    pub async fn latest_ingest_hour(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        now_ns: i64,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<(u32, bool)>, CatalogError> {
+        let max_hour_ns = now_ns.saturating_add(self.config.clock_skew_allowance_ns);
+        if max_hour_ns < 0 {
+            return Ok(None);
+        }
+        let max_hour = u32::try_from(max_hour_ns.div_euclid(NS_PER_HOUR)).unwrap_or(u32::MAX);
+        let earliest_hour = max_hour.saturating_sub(Self::LATEST_HOUR_MAX_LOOKBACK_HOURS);
+
+        let generations = self
+            .read_scan_generations(tenant, signal, accounting)
+            .await?;
+        let scan_shards = crate::provisioning::scan_shards_over_range(
+            signal,
+            &generations,
+            earliest_hour,
+            max_hour,
+            crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
+        );
+
+        let shard_results: Vec<Result<Option<(u32, bool)>, CatalogError>> =
+            stream::iter(0..scan_shards)
+                .map(|shard| {
+                    self.latest_ingest_hour_for_shard(tenant, signal, shard, max_hour, accounting)
+                })
+                .buffered(MAX_CONCURRENT_REQUESTS)
+                .collect()
+                .await;
+
+        let mut latest: Option<(u32, bool)> = None;
+        for shard_result in shard_results {
+            if let Some((hour, has_ingest_part)) = shard_result? {
+                latest = Some(match latest {
+                    None => (hour, has_ingest_part),
+                    Some((cur_hour, _)) if hour > cur_hour => (hour, has_ingest_part),
+                    Some((cur_hour, cur_ingest)) if hour == cur_hour => {
+                        (cur_hour, cur_ingest || has_ingest_part)
+                    }
+                    Some(existing) => existing,
+                });
+            }
+        }
+        if latest.is_none() {
+            tracing::debug!(
+                tenant_hash = %tenant.to_hex(),
+                signal = ?signal,
+                max_lookback_hours = Self::LATEST_HOUR_MAX_LOOKBACK_HOURS,
+                "latest_ingest_hour: no ingest found for tenant/signal within max lookback"
+            );
+        }
+        Ok(latest)
+    }
+
+    /// One shard's contribution to [`Catalog::latest_ingest_hour`]: see that
+    /// method's doc comment for the probe/bound rationale. The LIST budget
+    /// in `self.config.max_catalog_list_requests` is applied PER SHARD here,
+    /// counted across every probe of this one shard (a dense window can
+    /// otherwise force many pages within a single probe); unlike
+    /// [`Catalog::list_window_by_prefix`], whose counter spans the whole
+    /// scan, the bound a start-up pays for one tenant and signal is
+    /// therefore `shard_count` times that budget.
+    async fn latest_ingest_hour_for_shard(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        max_hour: u32,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<(u32, bool)>, CatalogError> {
+        let tenant_prefix = format!("t/{}/", tenant.to_hex());
+        let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+        let cap = self.config.max_catalog_list_requests;
+        let mut lists_issued: u64 = 0;
+        for width_hours in Self::LATEST_HOUR_PROBE_WINDOWS_HOURS {
+            let floor_hour = max_hour.saturating_sub(width_hours);
+            let start_after = keys::commit_shard_hour_prefix(tenant, signal, shard, floor_hour)?;
+            let mut latest: Option<(u32, bool)> = None;
+            let mut page_token = None;
+            'pages: loop {
+                // Refuse before issuing a page that would exceed the
+                // ceiling, so at most `cap` LISTs are ever issued for this
+                // shard across all its probes (the request bound).
+                if lists_issued >= cap {
+                    return Err(CatalogError::WindowTooWide {
+                        estimate: lists_issued.saturating_add(1),
+                        limit: cap,
+                    });
+                }
+                let page = {
+                    let _permit = self.request_semaphore.acquire().await.map_err(|_| {
+                        StoreError::Transient("catalog request semaphore closed".to_string())
+                    })?;
+                    let page = self
+                        .store
+                        .list_after(&prefix, Some(&start_after), page_token)
+                        .await;
+                    accounting.record_s3_request(AccountedOp::List);
+                    lists_issued += 1;
+                    page?
+                };
+                for meta in &page.objects {
+                    // ADR-0050 §2 isolation assertion, identical to
+                    // `list_shard_hours` and `list_window_by_prefix`: every
+                    // returned key is under this tenant's prefix or the scan
+                    // hard-fails.
+                    if !meta.key.starts_with(&tenant_prefix) {
+                        self.record_isolation_breach();
+                        return Err(CatalogError::FieldMismatch {
+                            key: prefix.clone(),
+                            field: "list_prefix",
+                            expected: tenant_prefix,
+                            actual: meta.key.clone(),
+                        });
+                    }
+                    let (hour, is_tombstone) = match keys::partition_bucket_entry(&meta.key)? {
+                        BucketEntry::CommitRecord(k) => (k.ingest_hour_bucket, false),
+                        BucketEntry::CompactionRecord(k) => (k.ingest_hour_bucket, false),
+                        BucketEntry::RewriteRecord(k) => (k.ingest_hour_bucket, false),
+                        BucketEntry::Tombstone(k) => (k.ingest_hour_bucket, true),
+                    };
+                    // Keys sort chronologically, so the first hour past
+                    // `max_hour` (clock skew, a corrupt key) ends this probe:
+                    // paging on would spend the budget on the future tail at
+                    // every probe width, the same stop `list_shard_hours` takes.
+                    if hour > max_hour {
+                        break 'pages;
+                    }
+                    latest = Some(match latest {
+                        None => (hour, !is_tombstone),
+                        Some((cur, _)) if hour > cur => (hour, !is_tombstone),
+                        Some((cur, cur_ingest)) if hour == cur => {
+                            (cur, cur_ingest || !is_tombstone)
+                        }
+                        Some(existing) => existing,
+                    });
+                }
+                match page.next {
+                    Some(next) => page_token = Some(next),
+                    None => break,
+                }
+            }
+            if latest.is_some() {
+                return Ok(latest);
+            }
+        }
+        Ok(None)
+    }
+
     /// The (start_hour, end_hour) ingest-hour bucket range the listing
     /// window covers, inclusive, or `None` if the window is empty. Applies
     /// to every shard alike; callers cross it with `0..shard_count`
@@ -3873,6 +4102,261 @@ mod tests {
         // shard: 1 bounded LIST for shard 0, plus 1 for the empty `del/`
         // prefix. Total 2, exactly one fewer than audit's 3.
         assert_eq!(accounting.snapshot().s3_requests(AccountedOp::List), 2);
+    }
+
+    /// #1233 finding 7: the newest hour must be found regardless of which
+    /// shard holds it, and the count pins the floor's use, not merely the
+    /// early return. `hour_old` sits 40h before `max_hour` -- past the first
+    /// (24h) probe width, inside the second (48h) one -- so shard 0 must
+    /// widen once (2 list calls: a floored 24h miss, then a floored 48h hit)
+    /// while shard 1's fresh part hits its first probe (1 list call), for 3
+    /// total. An implementation that dropped the `start_after` floor would
+    /// still return the correct max (shard 0's unfloored first probe would
+    /// list its object directly, without needing to widen), but at 2 total
+    /// list calls, not 3 -- this test's exact count of 3 fails the moment
+    /// the floor is removed, which the bare early-return check on the
+    /// returned hour alone could not catch.
+    #[tokio::test]
+    async fn latest_ingest_hour_finds_the_newest_hour_across_shards() {
+        let memory = MemoryStore::new();
+        let max_hour = 500_010u32;
+        let hour_old = max_hour - 40;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        publish_segment(&memory, 0, 1, hour_old, now, now - 1_000, now).await;
+        publish_segment(&memory, 1, 1, max_hour, now, now - 1_000, now).await;
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(2)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, Some((max_hour, true)));
+
+        // Provisioning enforcement is off (the default `Catalog::new`), so
+        // the generation-history read costs nothing: 3 list calls, 0 gets.
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 3);
+        assert_eq!(instrumented.metrics().snapshot().get.calls, 0);
+    }
+
+    /// #1233 finding 1: a tenant whose latest part is older than the first
+    /// probe width but inside the second must widen exactly once per shard,
+    /// costing 2 * shard_count listings, and still find the true max.
+    /// #1233 finding 5: also pins the new path's `AccountedOp::List`
+    /// bookkeeping -- one credit per page issued, exactly matching the
+    /// instrumented store's own list-call count.
+    #[tokio::test]
+    async fn latest_ingest_hour_widens_once_for_a_tenant_outside_the_first_probe() {
+        let memory = MemoryStore::new();
+        let max_hour = 500_010u32;
+        // 40h before max_hour: outside the 24h probe width, inside the 48h
+        // one, so the 24h probe must miss and the 48h probe must hit.
+        let hour = max_hour - 40;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        publish_segment(&memory, 0, 1, hour, now, now - 1_000, now).await;
+        publish_segment(&memory, 1, 1, hour, now, now - 1_000, now).await;
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(2)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, Some((hour, true)));
+
+        // Each of the 2 shards misses its 24h probe and hits its 48h probe:
+        // 2 * shard_count listings, exactly.
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 4);
+        assert_eq!(accounting.snapshot().s3_requests(AccountedOp::List), 4);
+    }
+
+    /// #1233 finding 1: a tenant with no commit-record parts at all still
+    /// costs exactly the full 7-probe sweep per shard before giving up --
+    /// there is no cheaper way to prove "nothing newer than the cap exists"
+    /// than exhausting every probe width.
+    #[tokio::test]
+    async fn latest_ingest_hour_is_none_for_a_tenant_with_no_parts() {
+        let memory = MemoryStore::new();
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(2)).expect("catalog");
+        let now = 500_000i64 * NS_PER_HOUR;
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, None);
+
+        // All 7 probe widths miss for each of the 2 shards: 7 * shard_count.
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 14);
+    }
+
+    /// #1233 finding 1: a part older than the widest (1536h / 64 day) probe
+    /// is indistinguishable from "no parts" -- it must not be found, and the
+    /// cap must still cost exactly the full 7-probe sweep, not an early
+    /// give-up.
+    #[tokio::test]
+    async fn latest_ingest_hour_ignores_a_part_older_than_the_lookback_cap() {
+        let memory = MemoryStore::new();
+        let max_hour = 500_010u32;
+        // 1600h before max_hour: past the widest (1536h) probe width.
+        let hour = max_hour - 1600;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        publish_segment(&memory, 0, 1, hour, now, now - 1_000, now).await;
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, None);
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 7);
+    }
+
+    /// #1233 finding 1: pagination inside a hit window must not lose the
+    /// maximum. 5 hour buckets in one shard, all inside the 24h probe width,
+    /// with `with_page_size(2)` forcing 3 pages (2 + 2 + 1); the newest hour
+    /// is on the last page and must still win.
+    #[tokio::test]
+    async fn latest_ingest_hour_finds_the_max_across_pages_within_a_probe() {
+        let memory = MemoryStore::with_page_size(2);
+        let max_hour = 500_010u32;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        let hours = [
+            max_hour - 4,
+            max_hour - 3,
+            max_hour - 2,
+            max_hour - 1,
+            max_hour,
+        ];
+        for (seq, hour) in hours.iter().enumerate() {
+            publish_segment(&memory, 0, seq as u64, *hour, now, now - 1_000, now).await;
+        }
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let catalog = Catalog::new(instrumented.clone(), config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("latest_ingest_hour");
+        assert_eq!(latest, Some((max_hour, true)));
+
+        // 5 objects at page_size 2: 3 pages, all on the first (24h) probe.
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 3);
+    }
+
+    /// #1233 finding 1: a foreign-tenant key surfacing inside
+    /// `latest_ingest_hour`'s listing must hard-fail with the same typed
+    /// error and isolation-breach counter the sibling listing paths use
+    /// (`list_shard_hours`, `list_window_by_prefix`), not be silently
+    /// consumed as if it were this tenant's own key.
+    #[tokio::test]
+    async fn latest_ingest_hour_hard_fails_on_a_foreign_tenant_key() {
+        let memory = MemoryStore::new();
+        let max_hour = 500_010u32;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        publish_segment(&memory, 0, 1, max_hour, now, now - 1_000, now).await;
+
+        let target_prefix =
+            keys::commit_shard_prefix(&tenant(), Signal::Metrics, 0).expect("commit shard prefix");
+        let store = Arc::new(ForeignKeyInjectingStore {
+            inner: memory,
+            target_prefix,
+            foreign_key: format!("t/{}/m/c/s0000/h{max_hour:08}/foreign-key", "f".repeat(32)),
+        });
+        let catalog = Catalog::new(store, config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        assert_eq!(catalog.isolation_breaches(), 0);
+        let err = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect_err("foreign key must hard-fail");
+        match err {
+            CatalogError::FieldMismatch { field, .. } => assert_eq!(field, "list_prefix"),
+            other => panic!("expected a list_prefix FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(catalog.isolation_breaches(), 1);
+    }
+
+    /// #1233 finding 4: a shard whose newest probe window holds more commit
+    /// records than the configured `max_catalog_list_requests` budget must
+    /// refuse with `WindowTooWide` rather than paging unboundedly. 3 commit
+    /// records at `with_page_size(1)` force 3 pages; a budget of 2 refuses
+    /// on the 3rd page, having already issued exactly 2 lists.
+    #[tokio::test]
+    async fn latest_ingest_hour_refuses_past_the_list_request_budget() {
+        let memory = MemoryStore::with_page_size(1);
+        let max_hour = 500_010u32;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        for (seq, hour) in [max_hour - 2, max_hour - 1, max_hour].iter().enumerate() {
+            publish_segment(&memory, 0, seq as u64, *hour, now, now - 1_000, now).await;
+        }
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let mut cfg = config(1);
+        cfg.max_catalog_list_requests = 2;
+        let catalog = Catalog::new(instrumented.clone(), cfg).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let err = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect_err("budget of 2 must refuse the 3rd page");
+        match err {
+            CatalogError::WindowTooWide { estimate, limit } => {
+                assert_eq!(estimate, 3);
+                assert_eq!(limit, 2);
+            }
+            other => panic!("expected WindowTooWide, got {other:?}"),
+        }
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 2);
+    }
+
+    /// #1233 finding 4: the mirror case, with the budget exactly sufficient
+    /// for the same 3-object scan -- must succeed, find the correct hour,
+    /// and issue exactly 4 list calls, not 3: `MemoryStore::list_after`
+    /// reports `next: Some` on any page that comes back completely full,
+    /// even when that page happened to hold the last object, so a 4th,
+    /// empty page is required before the per-shard loop's `match page.next
+    /// { ... None => break }` can conclude the listing is exhausted. A
+    /// budget of 3 refuses on the would-be 4th call (that is exactly
+    /// `latest_ingest_hour_refuses_past_the_list_request_budget`, one
+    /// object fewer into the same scan); 4 is the true boundary.
+    #[tokio::test]
+    async fn latest_ingest_hour_succeeds_at_the_list_request_budget_boundary() {
+        let memory = MemoryStore::with_page_size(1);
+        let max_hour = 500_010u32;
+        let now = i64::from(max_hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        for (seq, hour) in [max_hour - 2, max_hour - 1, max_hour].iter().enumerate() {
+            publish_segment(&memory, 0, seq as u64, *hour, now, now - 1_000, now).await;
+        }
+
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let mut cfg = config(1);
+        cfg.max_catalog_list_requests = 4;
+        let catalog = Catalog::new(instrumented.clone(), cfg).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let latest = catalog
+            .latest_ingest_hour(&tenant(), Signal::Metrics, now, &accounting)
+            .await
+            .expect("budget of 4 must be exactly sufficient");
+        assert_eq!(latest, Some((max_hour, true)));
+        assert_eq!(instrumented.metrics().snapshot().list.calls, 4);
     }
 
     #[tokio::test]
