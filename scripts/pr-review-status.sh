@@ -22,6 +22,8 @@
 # gate exactly as without it.
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 pr="${1:?usage: pr-review-status.sh <pr-number> [--confirm-addressed]}"
 repo="NOFireAI/ravel"
 confirm_addressed=0
@@ -214,6 +216,15 @@ elif [[ "${cr_comments}" != "0" && "${confirm_addressed}" != "1" ]]; then
   echo "  -> ${cr_comments} CodeRabbit inline comment(s); read them, then re-run with --confirm-addressed once each is fixed or answered (the API cannot tell; see the header comment)"
 elif [[ "${cr_outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
   echo "  -> ${cr_outside_diff} CodeRabbit outside-diff finding(s) in the review BODY at head, not inline; read the body with \`gh api repos/${repo}/pulls/${pr}/reviews --jq '.[] | select(.commit_id==\"${head_sha}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered"
+# Ahead of the mergeState check on purpose. A stale base is always actionable
+# and the fix is always the same; mergeState UNKNOWN is often just GitHub still
+# computing. Green CI on a stale base says nothing about the merge: `main` runs
+# no CI of its own, so a PR that passed against an older base can still break
+# it, and a gate added to `main` after the PR went green has never run against
+# the PR at all. Costs one fetch.
+elif ! stale_base="$("${script_dir}/guards/assert-fresh-merge-base.sh" "${pr}" 2>&1)"; then
+  echo "  -> merge base is behind origin/main; rebase and let CI re-run before merging"
+  echo "${stale_base//guard: /     }"
 elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
 else
