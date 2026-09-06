@@ -293,8 +293,10 @@ struct Args {
 /// The `--logs-fetch-policy` values, the CLI-facing mirror of
 /// [`ravel_query::LogsFetchPolicy`] (which lives in a crate that does not depend
 /// on clap). The variant names are the server flag's, so clap derives the same
-/// spellings: `request-minimal`, `byte-minimal`, `cost-based`. No value exists
-/// here that the server's flag does not accept.
+/// spellings: `request-minimal`, `byte-minimal`, `cost-based`, `latency-first`.
+/// No value exists here that the server's flag does not accept, and
+/// `every_engine_policy_is_reachable_from_the_bench_flag` fails if a value the
+/// server accepts is missing here.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
 enum LogsFetchPolicyArg {
     /// Minimize object-store requests: every object is read whole in one
@@ -308,6 +310,11 @@ enum LogsFetchPolicyArg {
     /// behaviour.
     #[default]
     CostBased,
+    /// Spend requests to save wall-clock: the byte-minimizing quantities,
+    /// chosen as an intent rather than from prices. It pays off only at the
+    /// concurrency the trade was measured at, which the pass sets through
+    /// `--fetch-concurrency` here.
+    LatencyFirst,
 }
 
 impl LogsFetchPolicyArg {
@@ -317,6 +324,7 @@ impl LogsFetchPolicyArg {
             LogsFetchPolicyArg::RequestMinimal => ravel_query::LogsFetchPolicy::RequestMinimal,
             LogsFetchPolicyArg::ByteMinimal => ravel_query::LogsFetchPolicy::ByteMinimal,
             LogsFetchPolicyArg::CostBased => ravel_query::LogsFetchPolicy::CostBased,
+            LogsFetchPolicyArg::LatencyFirst => ravel_query::LogsFetchPolicy::LatencyFirst,
         }
     }
 }
@@ -896,6 +904,33 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new `ravel_query::LogsFetchPolicy` value must not silently desync this
+    /// binary's mirror enum, which the internal ClickBench notes describe as
+    /// carrying the same values as the server flag. The match below is
+    /// exhaustive over the engine policy, so adding a variant there stops this
+    /// file from compiling until the flag grows the same value, and the
+    /// assertion pins the round trip through `policy()`.
+    ///
+    /// Prove-the-test: map `LatencyFirst` to `ByteMinimal` in `policy()` and
+    /// this fails with `left: ByteMinimal, right: LatencyFirst`.
+    #[test]
+    fn every_engine_policy_is_reachable_from_the_bench_flag() {
+        for policy in [
+            ravel_query::LogsFetchPolicy::RequestMinimal,
+            ravel_query::LogsFetchPolicy::ByteMinimal,
+            ravel_query::LogsFetchPolicy::CostBased,
+            ravel_query::LogsFetchPolicy::LatencyFirst,
+        ] {
+            let arg = match policy {
+                ravel_query::LogsFetchPolicy::RequestMinimal => LogsFetchPolicyArg::RequestMinimal,
+                ravel_query::LogsFetchPolicy::ByteMinimal => LogsFetchPolicyArg::ByteMinimal,
+                ravel_query::LogsFetchPolicy::CostBased => LogsFetchPolicyArg::CostBased,
+                ravel_query::LogsFetchPolicy::LatencyFirst => LogsFetchPolicyArg::LatencyFirst,
+            };
+            assert_eq!(arg.policy(), policy);
+        }
+    }
 
     /// The Flight lane's effective-aggregation label is "server-controlled",
     /// not "server default" (issue #763): a `None` effective value means only
