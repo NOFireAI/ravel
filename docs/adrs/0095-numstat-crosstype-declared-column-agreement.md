@@ -298,3 +298,35 @@ flowchart TD
     SKIP -->|range cannot overlap min/max| PRUNE["block skipped"]
     SKIP -->|range may overlap| LOAD["block loaded, declared_column_array resolves via same winner rule"]
 ```
+
+## Amendment 2026-09-06: the write-side function names in this ADR (#1135)
+
+This ADR names `record_level_winners` (Context, Decision 1, Consequences,
+and the diagram above) and cites `writer.rs:753-791`; it also names
+`merged_indexed_terms` (Context). Issue #1135 replaced the name-keyed,
+per-record path all three described with a slot-keyed one-pass stamp, so
+this amendment names the current implementation shape rather than editing
+the original text above. The winner rule and the stamped output are
+unchanged; this decision stands exactly as written.
+
+Old name, or cite | Current implementation
+--- | ---
+`record_level_winners` / `record_level_winners_slot` | `StampScratch::finish` (`crates/ravel-logseg/src/writer.rs`) computes the same two-tier winner order (columnar occurrences ascending by type byte, then overflow occurrences ascending by `canonical_value_bytes`, last wins), fed by `StampScratch::push_columnar` / `push_overflow`.
+`resolved_tracked_values` | the stream-seed overlay inside `StampScratch::finish`, seeded once per stream by `StreamSeed`.
+`stat_winner_columns` and `indexed_term_columns` | `emit_merged`, which projects the one merged view onto both consumers: every indexed entry becomes a POSTINGS term, and the first entry per name becomes the SKIP_IDX NumStat winner.
+`merged_indexed_terms` | `resolve_row` plus `StampScratch::finish`.
+`writer.rs:753-791` | stale. That range today spans the BLOOM/POSTINGS `push_section` calls (through roughly line 770) and the `LogFooter` construction that follows; no part of it computes a winner. The winner now lives in `StampScratch::finish` (`writer.rs:2049`).
+
+`intern_tracked_names` interns the tracked name set (`indexed_names` union
+`numstat_names`, decision 1 above) into ascending slots once per object, and
+`StampIndex` resolves each `(slot, type byte)` pair to a dynamic column id,
+also once per object. Both are new plumbing `resolve_row` and
+`StampScratch::finish` use to reach the same winner this ADR already
+decided on, not a change to the winner rule itself.
+
+Decision 1's requirement -- one shared resolution for POSTINGS and NumStat,
+not two implementations -- is what the single `StampScratch::finish` plus
+`emit_merged` pair now enforces structurally: both consumers read the one
+merged view `emit_merged` projects, so a second divergent implementation is
+no longer even reachable as a separate code path. The RLOG v3 trailer
+decision (decision 4) is untouched by any of this.

@@ -380,3 +380,37 @@ declines a `Str`-literal prune arm on a name that also has a non-`Str` column
 (widen-only, ADR-0013). This is a different mechanism than the duplicate fold
 order -- the term written is right, the column probed is wrong -- and is fixed
 here because it sits in the same prune path.
+
+## Amendment 2026-09-06: the write-side function names in this ADR (#1135)
+
+The 2026-08-20 amendment named `writer.rs::indexed_term_columns` as the
+write side's cross-type winner computation, with `stat_winner_columns` as
+the sibling that computed the NumStat projection. Neither function exists
+any more. Issue #1135 replaced the name-keyed, per-record path both used
+with a slot-keyed one-pass stamp, so this amendment names the current
+implementation shape rather than editing the original text above.
+
+The write side's prediction of what `rebuild_record` plus `merged_attrs`
+report for an indexed key is now computed in `StampScratch::finish`
+(`crates/ravel-logseg/src/writer.rs`) and projected onto POSTINGS terms by
+`emit_merged`. `intern_tracked_names` interns the tracked names into
+ascending slots once per object; `StampIndex` resolves each `(slot, type
+byte)` pair to a dynamic column id, also once per object, replacing the old
+per-record two-level hash probe over owned `String` keys; `StreamSeed`
+decodes one stream's tracked resource and scope attributes once per stream,
+keyed by slot, seeding the value a record-level occurrence may override.
+`resolve_row` pushes a record's tracked occurrences into a `StampScratch`
+and calls `finish` once, which computes the record-level two-tier winner
+(columnar occurrences ascending by type byte, then overflow occurrences
+ascending by `canonical_value_bytes`, last wins) and overlays it on the
+stream seed. `emit_merged` then projects that one merged view onto POSTINGS:
+every indexed entry becomes a term.
+
+The two-tier winner order and the emitted terms are unchanged. This
+amendment renames nothing in the decision above and changes no on-disk
+format: the `POSTINGS_VERSION` byte stays exactly as the 2026-08-20
+amendment left it. The old names survive only as a frozen pre-#1135
+reference, verbatim, inside `writer.rs`'s `stamp_differential` test module
+and in `benches/common/stamp_shape.rs`; that frozen copy is the differential
+reference the #1135 regression test compares the new stamp against and is
+not code to maintain.
