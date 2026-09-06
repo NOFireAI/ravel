@@ -2081,6 +2081,7 @@ impl LogSegmentFetcher {
                     phase,
                     &pin,
                     accounting,
+                    None,
                 )
                 .instrument(fetch_span.clone())
                 .await?;
@@ -3242,6 +3243,16 @@ impl ObjectAssembler {
             _reservation: self.reservation,
         })
     }
+
+    /// Moves the object reservation out of the assembler, leaving it holding
+    /// none. Used when a coverage crossover abandons this assembler's buffer and
+    /// hands its already-live reservation to [`covering_read`](BlockRangeFetcher::covering_read)
+    /// to reuse (ADR-1170 decision 2): the object bytes stay reserved exactly
+    /// once across the crossover instead of being reserved a second time for the
+    /// covering read while this assembler still holds the first.
+    fn take_reservation(&mut self) -> Option<ravel_memory::Reservation> {
+        self.reservation.take()
+    }
 }
 
 /// `[offset, offset + len)` sliced out of whichever already-fetched region
@@ -3627,13 +3638,26 @@ impl BlockRangeFetcher {
         phase: QueryPhase,
         pin: &EtagPin,
         accounting: &QueryAccounting,
+        held_reservation: Option<ravel_memory::Reservation>,
     ) -> Result<(Bytes, u64, u64), LogFetchError> {
         // Reserve the covering read's whole extent before any GET (ADR-1170
         // decision 2): a refusal fails typed with zero GETs. The guard travels
         // with the returned `Bytes` -- attached directly in the single-GET
         // branch, or carried by the `ObjectAssembler` in the segmented branch --
         // so it releases when the reader drops the assembled buffer.
-        let reservation = self.reserve_fetch(total_size)?;
+        //
+        // A coverage crossover reaches here already holding a live reservation
+        // for this same object (the assembler's, taken via `take_reservation`).
+        // Reuse it instead of reserving the object bytes a second time: the
+        // covering read materializes the same total extent the crossover's caller
+        // already reserved, so a fresh `reserve_fetch(total_size)` here would
+        // double-count the object for the width of the covering GET. When no
+        // reservation is handed in (the pre-probe crossover and the whole-object
+        // funnel), reserve now.
+        let reservation = match held_reservation {
+            Some(reservation) => reservation,
+            None => self.reserve_fetch(total_size)?,
+        };
         if total_size <= self.max_fetch_run_bytes {
             let (bytes, live) = self
                 .cached_extent(
@@ -4483,6 +4507,9 @@ impl BlockRangeFetcher {
                     phases.blocks,
                     &pin,
                     accounting,
+                    // No assembler exists yet on the pre-probe crossover: reserve
+                    // the object bytes here for the first and only time.
+                    None,
                 )
                 .await?;
             if live_gets > 0 {
@@ -4741,6 +4768,10 @@ impl BlockRangeFetcher {
                     phases.blocks,
                     &pin,
                     accounting,
+                    // Reuse the assembler's live object reservation rather than
+                    // reserving `total_size` again for the covering read: the
+                    // object is materialized once, so it is reserved once.
+                    asm.take_reservation(),
                 )
                 .await?;
             if live_gets > 0 {
@@ -5043,6 +5074,9 @@ impl BlockRangeFetcher {
                     phases.blocks,
                     pin,
                     accounting,
+                    // Reuse the assembler's live object reservation, as the
+                    // version-3 coverage crossover does: reserved once, not twice.
+                    asm.take_reservation(),
                 )
                 .await?;
             if live_gets > 0 {
@@ -7217,6 +7251,66 @@ mod whole_object_get_limiter_tests {
             budget.reserved(),
             0,
             "the reservation releases with the buffer"
+        );
+    }
+
+    /// A block-range read that crosses over to a covering whole-object read
+    /// (ADR-0107 decision 1) reserves the object's bytes exactly once, not once
+    /// for the assembler and again for the covering read. `fetch_object_with_footer`
+    /// reserves the object-sized assembly buffer, then the coverage crossover
+    /// hands that same live reservation to `covering_read` (via
+    /// `ObjectAssembler::take_reservation`) instead of reserving `total_size` a
+    /// second time. A budget sized for exactly one object therefore ADMITS a
+    /// crossover fetch of that one object; two reservations for the same bytes
+    /// would exceed it.
+    ///
+    /// `with_block_range_threshold(0)` routes the object to the block-range path
+    /// and sets that path's own whole-object crossover to zero, so the object is
+    /// above it and the read skips the pre-probe crossover and reaches the
+    /// coverage crossover (a predicate-free, all-columns read makes every block a
+    /// candidate, so coverage is ~1.0, past the 0.75 default).
+    ///
+    /// Non-vacuity: reverting either coverage-crossover call site in
+    /// `covering_read` from `asm.take_reservation()` back to `None` reserves the
+    /// object twice; the second reservation cannot fit the one-object budget, so
+    /// the fetch fails `FetchMemoryExhausted` and the `expect` below panics
+    /// (confirmed by making exactly that edit).
+    #[tokio::test]
+    async fn coverage_crossover_reserves_the_object_once() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        // Room for exactly one object: a second reservation of the same bytes
+        // would be refused.
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(size));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_block_range_threshold(0)
+            .with_memory_budget(budget.clone());
+
+        let scan = fetcher
+            .scan_accounted_with_tenant(
+                &seg_ref(size),
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::all(),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("a crossover fetch of one object must fit a one-object budget")
+            .expect("the segment is relevant to a full-window query");
+
+        assert_eq!(
+            budget.reserved(),
+            size,
+            "the object is reserved exactly once across the coverage crossover, \
+             never twice"
+        );
+        drop(scan);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "dropping the scan releases the single reservation"
         );
     }
 }

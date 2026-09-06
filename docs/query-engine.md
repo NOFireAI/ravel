@@ -613,10 +613,25 @@ The within-segment GET/byte model is the `selective_read_accounting` bench.
 The fetch layer reserves the bytes a GET will materialize on a shared
 `MemoryBudget` (crate `ravel-memory`) before it issues the GET, and owns that
 reservation for as long as the fetched buffer lives. `QueryEngine` holds one
-`Arc<MemoryBudget>` and hands it to every fetcher, exactly as it shares one
-`GetLimiter`; the default is `MemoryBudget::unlimited()`, so the accounting is
-inert until a server task installs a finite budget with
-`QueryEngine::with_memory_budget`.
+`Arc<MemoryBudget>` and, through `QueryEngine::with_memory_budget`, wires it to
+the two fetchers it owns: the RSEG metrics fetcher (`fetcher`) and the RLOG log
+fetcher (`log_fetcher`), exactly as it shares one `GetLimiter`. Two fetch paths
+draw on their own default budget, not this shared one, and so are not yet
+bounded by a finite process budget:
+
+- **RSPAN.** `QueryEngine` owns no span fetcher, so `with_memory_budget` reaches
+  none; each `SpanSegmentFetcher` reserves against its own
+  `MemoryBudget::unlimited()`.
+- **The SQL query path.** `build_sql_state` (`services/ravel-server/src/query.rs`)
+  constructs its metrics, logs, and span fetchers with `with_get_limiter` but
+  not `with_memory_budget`, so they reserve against their default unlimited
+  budgets too.
+
+The default is `MemoryBudget::unlimited()`, and no server task installs a finite
+budget yet, so the accounting is inert everywhere today. Wiring a finite,
+process-shared budget into both the PromQL `AppState` builder and `build_sql_state`
+(the seam `with_memory_budget` exists for) is the follow-up that makes it
+enforcing; until then the reservations below run but never refuse.
 
 Reservation sites, each taken **before** its GET, with the guard's lifetime
 tied to the buffer it accounts for:
