@@ -2520,17 +2520,25 @@ impl Catalog {
         // lifetime for the future, which then fails to unify with axum's
         // `Handler` blanket impl at the HTTP router (the same "FnOnce is not
         // general enough" wall the prefetch closure in `ravel-query` hit).
-        let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
+        // Report per key whether the record was already cache-resident when
+        // this resolve's prewarm first touched it. The prewarm is the resolve's
+        // first touch of each commit-record key, so a hit here is exactly a
+        // record this resolve served from cache rather than re-fetched (issue
+        // #1251). Counting at this single site is what makes the later include
+        // pass's re-touch of the same key not double-count it.
+        let loads: Vec<Result<bool, CatalogError>> = stream::iter(keys.iter().cloned())
             .map(|key| async move {
-                self.load_and_validate(tenant, signal, shard, &key, accounting)
+                self.load_and_validate_reporting_cache_hit(tenant, signal, shard, &key, accounting)
                     .await
-                    .map(|_| ())
+                    .map(|(_record, served_from_cache)| served_from_cache)
             })
             .buffer_unordered(self.config.resolve_get_concurrency)
             .collect()
             .await;
         for load in loads {
-            load?;
+            if load? {
+                accounting.record_commit_record_cache_hit();
+            }
         }
         Ok(())
     }
@@ -2990,9 +2998,34 @@ impl Catalog {
         key: &str,
         accounting: &QueryAccounting,
     ) -> Result<Arc<CommitRecord>, CatalogError> {
+        self.load_and_validate_reporting_cache_hit(tenant, signal, shard, key, accounting)
+            .await
+            .map(|(record, _served_from_cache)| record)
+    }
+
+    /// [`load_and_validate`](Self::load_and_validate) that also reports whether
+    /// the commit record was served from the decoded-record cache (`true`) or
+    /// freshly fetched from the store (`false`).
+    ///
+    /// Only the resolve prewarm pass needs the flag, to count a commit record
+    /// served from cache exactly once per resolve (issue #1251,
+    /// [`QueryAccounting::record_commit_record_cache_hit`]): the prewarm is a
+    /// resolve's FIRST touch of each commit-record key, so a hit here means the
+    /// record was already cache-resident at the start of this resolve, and the
+    /// later include pass (or a warm second resolve) re-touching the same key
+    /// must not count it again. Every other caller uses
+    /// [`load_and_validate`](Self::load_and_validate) and ignores the flag.
+    async fn load_and_validate_reporting_cache_hit(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        key: &str,
+        accounting: &QueryAccounting,
+    ) -> Result<(Arc<CommitRecord>, bool), CatalogError> {
         if let Some(cached) = self.cache.get(tenant, key, accounting) {
             validate_expected_fields(self, &cached, tenant, signal, shard, key)?;
-            return Ok(cached);
+            return Ok((cached, true));
         }
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
         let bytes = got.data.len() as u64;
@@ -3006,7 +3039,7 @@ impl Catalog {
             bytes,
             self.config.cache_capacity_per_tenant,
         );
-        Ok(record)
+        Ok((record, false))
     }
 }
 
@@ -3898,6 +3931,177 @@ mod tests {
         );
         assert_eq!(seg.shard, 0);
         assert_eq!(seg.content_hash.to_vec(), record.content_hash);
+    }
+
+    /// Issue #1251: the per-resolve count of unfolded commit records served
+    /// from the decoded-record cache is exact. Warm K records with a first
+    /// resolve, then a second resolve over a superset must count exactly K
+    /// cache-served commit records -- not 2K (the prewarm-plus-include double
+    /// touch) and not the freshly-listed records added between the resolves.
+    ///
+    /// FLIP (pre-fix demonstration): in `prewarm_commit_records`, drop the
+    /// `if load?` guard and call `record_commit_record_cache_hit()`
+    /// unconditionally (count misses too). The first resolve's delta then reads
+    /// K instead of 0, and the second reads N instead of K.
+    #[tokio::test]
+    async fn commit_record_cache_hits_counts_warmed_records_exactly_on_a_resolve() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let hour = 700_000u32;
+        let now = i64::from(hour) * NS_PER_HOUR + 30 * 60_000_000_000;
+        let range = TimeRange {
+            start_ns: i64::from(hour) * NS_PER_HOUR,
+            end_ns: now,
+        };
+
+        // K commit records in one bucket, warmed by a first resolve.
+        const K: u64 = 3;
+        for seq in 0..K {
+            publish_segment(&store, 0, seq + 1, hour, now, now - 1_000, now).await;
+        }
+        let first = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now, &first)
+            .await
+            .expect("first resolve");
+        assert_eq!(
+            first.snapshot().commit_record_cache_hits,
+            0,
+            "the first resolve fetches every record fresh: none are cache-served"
+        );
+
+        // Two more records above the K already cached, then resolve the whole set.
+        for seq in K..(K + 2) {
+            publish_segment(&store, 0, seq + 1, hour, now, now - 1_000, now).await;
+        }
+        let second = QueryAccounting::new();
+        let snapshot = catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now, &second)
+            .await
+            .expect("second resolve");
+        assert_eq!(snapshot.segments.len(), (K + 2) as usize);
+        assert_eq!(
+            second.snapshot().commit_record_cache_hits,
+            K,
+            "exactly the K pre-resident commit records are cache-served; the 2 records \
+             listed for the first time this resolve are not, and neither key is \
+             double-counted across the prewarm and include passes"
+        );
+    }
+
+    /// Issue #1251, the case that broke the old `(hits - (misses - 1)) / 2`
+    /// inference: a tenant WITH a folded snapshot HEAD. The HEAD probe is a hit
+    /// on the warm resolve and lands on the pooled `cache_hits` counter, so an
+    /// inference over the shared counters reads one too high. The dedicated
+    /// counter still reads exactly K.
+    ///
+    /// FLIP (pre-fix / exclusion demonstration): in `read_head`
+    /// (snapshot_resolve.rs), add `accounting.record_commit_record_cache_hit()`
+    /// inside the `head_cache().get(..)` hit branch. This test's second-resolve
+    /// assertion then reads K + 1, proving the HEAD probe is excluded.
+    #[tokio::test]
+    async fn commit_record_cache_hits_is_exact_even_with_a_folded_snapshot_head() {
+        let store = Arc::new(MemoryStore::new());
+        let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        let base_hour = 800_000u32;
+        // `base_hour` is exactly sealed at this instant; `base_hour + 1` is not.
+        let now_ns = (i64::from(base_hour) + 1) * NS_PER_HOUR + fold_margin;
+
+        // A sealed base hour, folded into a snapshot HEAD whose probe becomes a
+        // pooled cache hit on every later warm resolve.
+        let base_created = (i64::from(base_hour) + 1) * NS_PER_HOUR - 1_000;
+        publish_segment(
+            &store,
+            0,
+            1,
+            base_hour,
+            base_created,
+            base_created - 1_000,
+            base_created,
+        )
+        .await;
+        let fold_catalog = Catalog::new(store.clone(), config(1)).expect("fold catalog");
+        fold_catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold writes a HEAD");
+
+        // Commit records ABOVE the watermark (in `base_hour + 1`, event times
+        // still below `now_ns`), resolved through the L0 listing suffix.
+        let unfolded_hour = base_hour + 1;
+        let event_ts = i64::from(unfolded_hour) * NS_PER_HOUR + 1_000_000;
+        assert!(
+            event_ts < now_ns,
+            "the above-watermark records must still be in the past relative to now"
+        );
+        const K: u64 = 3;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("resolve catalog");
+        let range = TimeRange {
+            start_ns: i64::from(base_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+
+        for seq in 0..K {
+            publish_segment(
+                &store,
+                0,
+                seq + 10,
+                unfolded_hour,
+                event_ts,
+                event_ts - 1_000,
+                event_ts,
+            )
+            .await;
+        }
+        let first = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now_ns, &first)
+            .await
+            .expect("first resolve");
+        assert_eq!(
+            first.snapshot().commit_record_cache_hits,
+            0,
+            "the first resolve fetches every above-watermark record fresh"
+        );
+
+        for seq in K..(K + 2) {
+            publish_segment(
+                &store,
+                0,
+                seq + 10,
+                unfolded_hour,
+                event_ts,
+                event_ts - 1_000,
+                event_ts,
+            )
+            .await;
+        }
+        let second = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now_ns, &second)
+            .await
+            .expect("second resolve");
+        let snap = second.snapshot();
+        assert!(
+            snap.cache_hits >= 1,
+            "the folded HEAD probe is itself a pooled cache hit on the warm resolve -- \
+             the confounder that made the old inference read one too high"
+        );
+        assert_eq!(
+            snap.commit_record_cache_hits, K,
+            "exactly the K pre-resident commit records count; the HEAD probe hit and the \
+             2 newly-listed records are excluded"
+        );
     }
 
     /// ADR-0046 decision 4, the disk-tier half of the acceptance gate: a

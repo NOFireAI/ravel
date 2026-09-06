@@ -109,6 +109,10 @@ struct Inner {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     cache_bytes: AtomicU64,
+    /// Commit records served from the catalog's decoded commit-record cache
+    /// during a resolve, counted once per record per resolve. See the snapshot
+    /// field of the same name for exactly what is and is not counted.
+    commit_record_cache_hits: AtomicU64,
     decompressed_bytes: AtomicU64,
     segments_opened: AtomicU64,
     segments_pruned: AtomicU64,
@@ -208,6 +212,36 @@ impl QueryAccounting {
     /// Record one in-process cache miss.
     pub fn record_cache_miss(&self) {
         self.0.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one commit record served from the catalog's decoded
+    /// commit-record cache during a snapshot resolve, counted exactly once per
+    /// record per resolve.
+    ///
+    /// This is the exact, per-resolve count of unfolded commit records whose
+    /// bytes came from the local decoded-record cache rather than a store GET
+    /// (issue #1251). A downstream "how many of this resolve's unfolded
+    /// segments were cache-served" figure reads it directly instead of
+    /// inferring one from the pooled [`record_cache_hit`](Self::record_cache_hit) /
+    /// [`record_cache_miss`](Self::record_cache_miss) counters, which several
+    /// resolve-path caches share: an inference over a counter that counts more
+    /// than one thing reads one too high whenever a folded snapshot HEAD exists
+    /// (its probe adds a shared hit).
+    ///
+    /// Counted at the single resolve site that decides a commit record was
+    /// already cache-resident (the L0 prewarm pass), so the prewarm-plus-include
+    /// double touch of one key counts once, and a record freshly fetched this
+    /// resolve counts zero. It is deliberately NOT incremented by the four other
+    /// resolve-path caches that share the pooled hit/miss counters: the
+    /// decoded-HEAD cache (the per-resolve HEAD probe), the decoded snapshot-part
+    /// cache, the decoded name-postings cache, and the content-addressed byte
+    /// cache. Compaction records take a separate decoded cache on a separate
+    /// path and are not counted here either; this counter is commit-record only,
+    /// as its name says.
+    pub fn record_commit_record_cache_hit(&self) {
+        self.0
+            .commit_record_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Add bytes served from an in-process cache.
@@ -347,6 +381,10 @@ impl QueryAccounting {
         saturating_fetch_add(&self.0.cache_hits, other.cache_hits);
         saturating_fetch_add(&self.0.cache_misses, other.cache_misses);
         saturating_fetch_add(&self.0.cache_bytes, other.cache_bytes);
+        saturating_fetch_add(
+            &self.0.commit_record_cache_hits,
+            other.commit_record_cache_hits,
+        );
         saturating_fetch_add(&self.0.decompressed_bytes, other.decompressed_bytes);
         saturating_fetch_add(&self.0.segments_opened, other.segments_opened);
         saturating_fetch_add(&self.0.segments_pruned, other.segments_pruned);
@@ -380,6 +418,7 @@ impl QueryAccounting {
             cache_hits: self.0.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.0.cache_misses.load(Ordering::Relaxed),
             cache_bytes: self.0.cache_bytes.load(Ordering::Relaxed),
+            commit_record_cache_hits: self.0.commit_record_cache_hits.load(Ordering::Relaxed),
             decompressed_bytes: self.0.decompressed_bytes.load(Ordering::Relaxed),
             segments_opened: self.0.segments_opened.load(Ordering::Relaxed),
             segments_pruned: self.0.segments_pruned.load(Ordering::Relaxed),
@@ -408,6 +447,25 @@ pub struct QueryAccountingSnapshot {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_bytes: u64,
+    /// Commit records served from the catalog's decoded commit-record cache
+    /// during a resolve, counted exactly once per record per resolve (issue
+    /// #1251). The exact, per-resolve count of unfolded commit records whose
+    /// bytes came from that cache rather than a store GET, so a "how many of
+    /// this resolve's unfolded segments were cache-served" figure is read here
+    /// directly rather than inferred from the pooled [`Self::cache_hits`] /
+    /// [`Self::cache_misses`] counters (which several resolve-path caches
+    /// share, making such an inference read one too high when a folded snapshot
+    /// HEAD's probe adds a shared hit).
+    ///
+    /// Counted at the single resolve site that decides a record was already
+    /// cache-resident (the L0 prewarm pass): the prewarm-plus-include double
+    /// touch of one key counts once, and a record freshly fetched this resolve
+    /// counts zero. NOT incremented by the four other resolve-path caches that
+    /// share the pooled counters -- the decoded-HEAD cache (the HEAD probe), the
+    /// decoded snapshot-part cache, the decoded name-postings cache, and the
+    /// content-addressed byte cache -- nor by compaction records, which take a
+    /// separate decoded cache on a separate path. Commit-record only.
+    pub commit_record_cache_hits: u64,
     pub decompressed_bytes: u64,
     pub segments_opened: u64,
     pub segments_pruned: u64,
@@ -543,6 +601,9 @@ impl QueryAccountingSnapshot {
             cache_hits: self.cache_hits.saturating_add(other.cache_hits),
             cache_misses: self.cache_misses.saturating_add(other.cache_misses),
             cache_bytes: self.cache_bytes.saturating_add(other.cache_bytes),
+            commit_record_cache_hits: self
+                .commit_record_cache_hits
+                .saturating_add(other.commit_record_cache_hits),
             decompressed_bytes: self
                 .decompressed_bytes
                 .saturating_add(other.decompressed_bytes),
@@ -1190,6 +1251,57 @@ mod tests {
                 .saturating_merge(&s2.snapshot())
                 .data_objects_touched,
             12
+        );
+    }
+
+    #[test]
+    fn commit_record_cache_hits_round_trip_snapshot_and_merge_are_exact() {
+        // The exact per-resolve count of unfolded commit records served from
+        // cache (issue #1251), so it must be exact, never indicative: a fresh
+        // handle reads zero, a recorded handle reads exactly what was recorded,
+        // an already-taken snapshot is a value unaffected by later increments,
+        // and it is independent of the pooled cache_hits it must not be inferred
+        // from. Folding slice snapshots sums it, and the per-selector sum agrees.
+        assert_eq!(
+            QueryAccounting::new().snapshot().commit_record_cache_hits,
+            0
+        );
+
+        let acc = QueryAccounting::new();
+        acc.record_commit_record_cache_hit();
+        acc.record_commit_record_cache_hit();
+        acc.record_cache_hit(); // a pooled hit must not leak into the new counter
+        let snap = acc.snapshot();
+        assert_eq!(snap.commit_record_cache_hits, 2, "recorded hits are exact");
+        assert_eq!(
+            snap.cache_hits, 1,
+            "the pooled hit counter is independent of the commit-record counter"
+        );
+        acc.record_commit_record_cache_hit();
+        assert_eq!(
+            snap.commit_record_cache_hits, 2,
+            "an already-taken snapshot is a value, unaffected by later increments"
+        );
+        assert_eq!(acc.snapshot().commit_record_cache_hits, 3);
+
+        let s1 = QueryAccounting::new();
+        s1.record_commit_record_cache_hit();
+        let s2 = QueryAccounting::new();
+        s2.record_commit_record_cache_hit();
+        s2.record_commit_record_cache_hit();
+        let agg = QueryAccounting::new();
+        agg.merge_snapshot(&s1.snapshot());
+        agg.merge_snapshot(&s2.snapshot());
+        assert_eq!(
+            agg.snapshot().commit_record_cache_hits,
+            3,
+            "merge_snapshot sums the slices' commit-record cache hits"
+        );
+        assert_eq!(
+            s1.snapshot()
+                .saturating_add(&s2.snapshot())
+                .commit_record_cache_hits,
+            3
         );
     }
 
