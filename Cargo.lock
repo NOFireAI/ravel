@@ -4807,6 +4807,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ravel-memory"
+version = "0.13.0"
+
+[[package]]
 name = "ravel-object-store"
 version = "0.13.0"
 dependencies = [
