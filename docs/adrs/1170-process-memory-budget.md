@@ -172,9 +172,16 @@ hidden: the bytes are allocated before the breach is visible, and a delta larger
 than the headroom between the budget and the kill boundary kills the process
 before the next poll runs. The overshoot per poll is bounded by what DataFusion
 allocates between two polls of the query stream, one batch per partition, so
-the exposure is `partitions x max batch bytes` per query; the overhead reserve
-in decision 3 must exceed it, and the acceptance in decision 4 says what a kill
-that slips through counts as.
+the exposure is `partitions x max batch bytes` per query, and it ADDS across
+statements that reach `grow` in the same interval. The bound that matters is
+therefore the aggregate, `max_concurrent_queries x partitions x max batch
+bytes`, where `max_concurrent_queries` is the server's existing admission cap
+(`--max-concurrent-queries`, `services/ravel-server/src/config.rs:483`,
+enforced by `QueryAdmissionController`). The overhead reserve in decision 3
+must exceed that aggregate; a deployment that leaves the cap unset has an
+unbounded exposure, and the startup aggregate line in decision 4 says so in
+words rather than printing a number that is not a bound. The acceptance in
+decision 4 says what a kill that slips through counts as.
 
 ### 2. A fetch byte reservation at the points where the unit is known
 
@@ -284,11 +291,15 @@ allocation that calibration did not see, which is a finding, not a recalibration
   sample `t` of the window, `resident_t <= unique_t + frozen reserve`, which is
   `max_t(resident_t - unique_t) <= frozen reserve` with both figures from the
   SAME scrape, never a peak of one against a peak of the other, where unique
-  subtracts the handoff overlap gauge; and zero kernel kills attributable to a tracked ledger. A kill is
-  attributable to the infallible `grow` path only if the server's last breach
-  record names an unchecked delta larger than the reserve, and such a kill is
-  itself a finding against the reserve's sizing, recorded and re-run, not
-  accepted. A run that survives with resident above the band has an untracked
+  subtracts the handoff overlap gauge; the runs set `--max-concurrent-queries`
+  to the window's connection count (10) so the exposure bound is finite and
+  the reserve is checked against it; and zero kernel kills attributable to a tracked ledger. A kill is
+  attributable to the infallible `grow` path only if the SUM of the unchecked
+  deltas in the breach records of every statement in flight at the kill (each
+  statement's stream records its own `CeilingBreach`) exceeds the reserve;
+  several deltas each below the reserve that add past it are exactly the
+  aggregate case, and are attributed the same way. Such a kill is itself a
+  finding against the reserve's sizing, recorded and re-run, not accepted. A run that survives with resident above the band has an untracked
   allocation and fails the gate.
 
 ```mermaid
