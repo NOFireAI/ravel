@@ -804,7 +804,7 @@ async fn plan_segment_on_a_version_4_object_fetches_no_page_bytes() {
     let query = LogQuery::new(i64::MIN, i64::MAX).with_prune(code_between(0, 0));
     let acc = QueryAccounting::new();
 
-    let (survivors, stats, footer) = fetcher
+    let (survivors, stats, footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &query, &acc)
         .await
         .expect("plan_segment")
