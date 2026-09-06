@@ -664,8 +664,8 @@ async fn resolve_serves_exactly_one_part_set_after_a_rewrite() {
 /// Reachability: the maintenance pass the server's tick runs per owned unit
 /// (`scan_and_maintain_with_memo`, the single ravel-maintain entry point
 /// `run_tick_with_clock` calls for compaction and retention) leaves a bucket
-/// holding a live erasure rewrite record uncompacted, and memoizes it as
-/// terminal so later ticks skip it.
+/// holding a live erasure rewrite record uncompacted, and records the
+/// refusal in the memo as a terminal state.
 ///
 /// The guarded production line is the same `RewritePresent` early return in
 /// `compact_bucket_scoped`. With that return removed the pass reports
