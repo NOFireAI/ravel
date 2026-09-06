@@ -1295,6 +1295,51 @@ stream's attribute blob does not decode, the producer emits no stamps at all
 for that object rather than an affirmative statement over an unresolved
 view, which is the fail-closed reading of decision 3's staleness rule.
 
+## Amendment 2026-09-07: the stamp is a direct record fold, not a fold over the writer's per-block NumStats
+
+Issue #1168. Decision 3 ("Capture at write time") routes both stamp
+producers through `RlogWriter`'s per-block NumStats: the L0 flush folds the
+writer's per-block statistics through `finish_with_stats`, and the L1
+compaction through `finish_compacted_with_stats`. Both shipped producers
+instead fold the records directly and never read the writer's per-block
+NumStats:
+
+- the ingest flush fold, `crates/ravel-ingest/src/log_declared_stats.rs`
+  (its module doc already records this posture), which folds a flush
+  buffer's records through `DeclaredStatAccum::observe_records`;
+- the compaction recompute, `crates/ravel-maintain/src/rlog.rs`
+  (`DeclaredStatAccum`), which folds each part's records through
+  `observe_record` on the same per-record `PartBuilder::push` path the
+  encode rides.
+
+This amendment records the direct record fold as the decision. The
+producers are correct as shipped and are not to be changed to match
+decision 3's sketch.
+
+The rationale is a units mismatch between what the writer measures and what
+the stamp must state. The writer's NumStats are per block and per resolved
+column: each entry bounds one column over the rows of one encoded block,
+and the resolution the block already performed. The stamp, by contrast, is
+one figure per `CommitRecord` (or `CompactionPart`), and its null count
+depends on the stream-level fallback multiplicity of the merged attribute
+view -- how many rows resolve a declared column's value off their stream's
+resource or scope layer rather than off the record's own attributes. That
+multiplicity is a property of the record-to-stream fan-out, which is
+present at the record fold and absent from the writer's per-block,
+per-resolved-column tally: folding NumStats would recover a per-block extent
+but not the per-commit-record fallback count the reader's null contract
+needs. So both producers fold the merged-attribute records, where the
+fallback view is available, rather than the writer's statistics.
+
+This is a separate divergence from the 2026-09-03 merged-view amendment
+above, and predates it. That amendment fixed the *semantic basis* of the
+fold (record-own attributes versus the merged resource/scope view) and took
+the record fold as given; this one records *which component* computes the
+stamp at all (a direct record fold versus decision 3's fold over the
+writer's per-block NumStats). Read together: the stamp is a record fold
+(this amendment) over the merged attribute view (the merged-view
+amendment).
+
 ## Out-of-scope findings, reported not fixed
 
 1. **docs/adrs/README.md index drift**: the index (111 rows) is missing
