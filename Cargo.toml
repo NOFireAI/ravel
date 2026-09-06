@@ -49,6 +49,7 @@ ravel-query = { path = "crates/ravel-query", version = "0.13.0" }
 ravel-analytics = { path = "crates/ravel-analytics", version = "0.13.0" }
 ravel-tracing-export = { path = "crates/ravel-tracing-export", version = "0.13.0" }
 ravel-affinity = { path = "crates/ravel-affinity", version = "0.13.0" }
+ravel-memory = { path = "crates/ravel-memory", version = "0.13.0" }
 
 # async runtime / rpc / http
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
