@@ -171,6 +171,12 @@ pub async fn compact(
         CompactionOutcome::AlreadyCompacted => {
             println!("outcome: AlreadyCompacted (a compaction record already exists)")
         }
+        CompactionOutcome::RewritePresent => {
+            println!(
+                "outcome: RewritePresent (a live erasure rewrite record holds the record set; \
+                 not compacted)"
+            )
+        }
         CompactionOutcome::BelowMinInputs { count } => {
             println!("outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)")
         }
@@ -251,6 +257,11 @@ pub struct CompactTenantReport {
     pub below_min: usize,
     /// Buckets carrying a retention tombstone.
     pub tombstoned: usize,
+    /// Buckets left uncompacted because a live erasure rewrite record already
+    /// holds the record set (ADR-0064 decision 3). Compacting would make the
+    /// catalog serve two record sets over the same inputs, so this is a
+    /// refusal, not an error.
+    pub rewrite_present: usize,
     /// L1 parts written across every compacted bucket (would-be writes under
     /// `--dry-run`).
     pub parts_written: usize,
@@ -586,16 +597,18 @@ pub async fn compact_tenant_to(
     writeln!(out, "not_sealed: {}", report.not_sealed)?;
     writeln!(out, "below_min: {}", report.below_min)?;
     writeln!(out, "tombstoned: {}", report.tombstoned)?;
+    writeln!(out, "rewrite_present: {}", report.rewrite_present)?;
     writeln!(out, "parts ({verb}): {}", report.parts_written)?;
     writeln!(out, "wall_time_ms: {}", started.elapsed().as_millis())?;
     // Buckets that reported any non-error outcome (compacted, already,
-    // not-sealed, below-min, tombstoned). `failed` is the count of buckets
-    // whose compaction returned a typed error.
+    // not-sealed, below-min, tombstoned, rewrite-present). `failed` is the
+    // count of buckets whose compaction returned a typed error.
     let succeeded = report.compacted
         + report.already
         + report.not_sealed
         + report.below_min
-        + report.tombstoned;
+        + report.tombstoned
+        + report.rewrite_present;
     writeln!(out, "failed: {failed}")?;
     writeln!(out, "bucket_concurrency: {bucket_concurrency}")?;
     // The counters above are printed first even on the refusal path: an
@@ -674,6 +687,10 @@ fn emit_bucket_outcome(
         Ok(CompactionOutcome::AlreadyCompacted) => {
             report.already += 1;
             writeln!(out, "shard={shard} hour={hour} outcome=AlreadyCompacted")?;
+        }
+        Ok(CompactionOutcome::RewritePresent) => {
+            report.rewrite_present += 1;
+            writeln!(out, "shard={shard} hour={hour} outcome=RewritePresent")?;
         }
         Ok(CompactionOutcome::BelowMinInputs { count }) => {
             report.below_min += 1;

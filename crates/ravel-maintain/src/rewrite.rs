@@ -284,6 +284,13 @@ pub enum MigrateOutcome {
     /// touch, which reads L1 parts as inputs. This caller handles the pre-
     /// compaction L0 case only.
     AlreadyCompacted,
+    /// The bucket holds a live erasure rewrite record (ADR-0064 decision 3).
+    /// Migrating now would produce a second record set over the same inputs,
+    /// and the catalog would serve both the rewrite's parts and this
+    /// migration's parts (overlap harmlessness does not hold across a
+    /// rewrite), so migration refuses. This is a correctness requirement, not
+    /// an optimization.
+    RewritePresent,
     /// No L0 input below `target_version`: the bucket is already at or above
     /// the floor, nothing to migrate.
     UpToDate,
@@ -363,6 +370,15 @@ async fn migrate_bucket_format_scoped(
     }
     if !listing.compaction_record_keys.is_empty() {
         return Ok(MigrateOutcome::AlreadyCompacted);
+    }
+    // A live erasure rewrite record already holds a record set over this
+    // bucket's inputs (ADR-0064 decision 3 point 5). Migrating now would
+    // publish a second record set over the same L0s, and the catalog would
+    // serve both record sets, resurrecting the records the rewrite dropped.
+    // Refuse, so one bucket never serves two record sets. Producer-side
+    // correctness, not an efficiency measure.
+    if !listing.rewrite_record_keys.is_empty() {
+        return Ok(MigrateOutcome::RewritePresent);
     }
     if listing.commit_keys.is_empty() {
         return Ok(MigrateOutcome::UpToDate);
@@ -1122,5 +1138,90 @@ mod tests {
         .await
         .expect("drop-aware predicate must accept the reduced count");
         assert_eq!(outcome, PublishOutcome::Published);
+    }
+
+    /// Format migration refuses a sealed bucket that already holds a live
+    /// erasure rewrite record (ADR-0064 decision 3 point 5), the same
+    /// producer-side exclusivity compaction enforces. The two seeded L0s are
+    /// recorded below `FUTURE_VERSION`, so absent the guard this bucket
+    /// migrates (and publishes a second record set over the rewritten inputs);
+    /// the guard turns that into `RewritePresent`.
+    ///
+    /// Prove-the-test: deleting the new `rewrite_record_keys` early return in
+    /// `migrate_bucket_format_scoped` makes this fail at the `RewritePresent`
+    /// assertion, with the observed outcome `Rewritten { parts: 1, publish:
+    /// Published }`.
+    #[tokio::test]
+    async fn migrate_refuses_a_bucket_holding_a_live_rewrite_record() {
+        use prost::Message;
+        use ravel_commit::erasure::compute_rewrite_input_set_hash;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, RewriteRecord};
+
+        let store = MemoryStore::new();
+        seed(&store, 1, vec![series("alpha", &[(10, 1.0)])]).await;
+        seed(&store, 2, vec![series("beta", &[(20, 2.0)])]).await;
+
+        // A RawL0 rewrite record naming both seeded L0s. Empty parts are legal;
+        // the guard keys only on the record's presence.
+        let b = bucket();
+        let inputs = vec![
+            CompactionInputIdentity {
+                writer_id: Uuid::from_u128(1).to_string(),
+                writer_epoch: EPOCH,
+                writer_seq: 1,
+            },
+            CompactionInputIdentity {
+                writer_id: Uuid::from_u128(2).to_string(),
+                writer_epoch: EPOCH,
+                writer_seq: 2,
+            },
+        ];
+        let input_set_hash = compute_rewrite_input_set_hash(&inputs, None, &[]);
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: b.tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(b.signal) as i32,
+            shard: b.shard,
+            ingest_hour_bucket: b.ingest_hour_bucket,
+            inputs,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: Vec::new(),
+            drops: Vec::new(),
+            created_unix_ns: sealed_now_ns(),
+            superseded_record_key: String::new(),
+        };
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite record key");
+        store
+            .put(
+                &key,
+                record.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put rewrite record");
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let outcome = migrate_bucket_format(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            &b,
+            FUTURE_VERSION,
+        )
+        .await
+        .expect("migrate");
+        assert_eq!(
+            outcome,
+            MigrateOutcome::RewritePresent,
+            "a bucket holding a live rewrite record must refuse migration"
+        );
+        assert!(
+            !matches!(outcome, MigrateOutcome::Rewritten { .. }),
+            "the outcome must not be Rewritten"
+        );
+        assert!(
+            read_record(&store).await.is_none(),
+            "the refusal published no compaction record over the rewritten inputs"
+        );
     }
 }

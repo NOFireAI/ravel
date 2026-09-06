@@ -83,6 +83,7 @@ pub async fn scan_and_compact(
                 highest_done = Some(hour);
             }
             CompactionOutcome::AlreadyCompacted
+            | CompactionOutcome::RewritePresent
             | CompactionOutcome::Tombstoned
             | CompactionOutcome::BelowMinInputs { .. } => {
                 report.already_done += 1;
@@ -1057,6 +1058,13 @@ fn classify_terminal(
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
             match compaction {
                 Some(CompactionOutcome::AlreadyCompacted) => Some(TerminalState::Compacted),
+                // A live erasure rewrite record makes the bucket terminal for
+                // compaction exactly as an existing compaction record does: a
+                // sealed bucket's L0 set is frozen, and nothing deletes a live
+                // rewrite record, so the refusal is stable. Memoizing it is
+                // safe: memoization only skips work, a lost memo costs a
+                // re-list, and the terminal state cannot go stale.
+                Some(CompactionOutcome::RewritePresent) => Some(TerminalState::Compacted),
                 Some(CompactionOutcome::BelowMinInputs { .. }) => {
                     Some(TerminalState::BelowThreshold)
                 }
@@ -1212,6 +1220,7 @@ pub async fn scan_and_maintain_with_memo(
                 Some(CompactionOutcome::Compacted { .. }) => report.compacted += 1,
                 Some(
                     CompactionOutcome::AlreadyCompacted
+                    | CompactionOutcome::RewritePresent
                     | CompactionOutcome::Tombstoned
                     | CompactionOutcome::BelowMinInputs { .. },
                 ) => report.already_done += 1,

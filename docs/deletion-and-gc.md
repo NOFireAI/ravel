@@ -379,9 +379,15 @@ every bound is measured.
   contain), so the query-time filter (Query exclusion, above) stays active
   for a request's
   predicate until its `.dreq` is removed, which by construction happens only
-  after no resolvable snapshot can still reference a pre-rewrite input.
-  Correctness never depends on the per-bucket compaction/rewrite
-  serialization; that serialization is an efficiency measure.
+  after no resolvable snapshot can still reference a pre-rewrite input. On top
+  of that filter, compaction and format migration refuse any bucket that
+  already holds a live rewrite record (they return `RewritePresent` rather
+  than publishing), so a producer never lays a second record set over inputs a
+  rewrite already superseded: one bucket never serves two record sets. That
+  producer-side refusal is a correctness requirement, not an optimization.
+  Only the per-bucket *serialization* of the two passes (which one happens to
+  run first) remains an efficiency measure; correctness rests on the refusal
+  and the query-time filter, not on the race never happening.
 
 - **The 72 h rewrite bound derives from the maintenance ownership cadence
   (ADR-0065).** The rewrite pass runs on the Maintain worker that owns each

@@ -518,6 +518,7 @@ pub async fn migrate_family(
             if bucket.is_sealed(now, config)
                 && listing.tombstone_key.is_none()
                 && listing.compaction_record_keys.is_empty()
+                && listing.rewrite_record_keys.is_empty()
                 && !listing.commit_keys.is_empty()
             {
                 let inputs = load_inputs(
@@ -543,10 +544,13 @@ pub async fn migrate_family(
                         // A concurrent compaction/tombstone/rewrite landed
                         // between our listing and the call: harmless, the other
                         // actor's result stands and the re-audit still gates the
-                        // floor.
+                        // floor. `RewritePresent` is the same shape: a live
+                        // rewrite record makes the bucket ineligible, so
+                        // migration was correctly refused.
                         MigrateOutcome::NotSealed
                         | MigrateOutcome::Tombstoned
                         | MigrateOutcome::AlreadyCompacted
+                        | MigrateOutcome::RewritePresent
                         | MigrateOutcome::UpToDate => {}
                     }
                 }

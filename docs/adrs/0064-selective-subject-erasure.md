@@ -226,15 +226,22 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    harmlessness does not hold for rewrites** — the outputs deliberately
    lack records the inputs contain, so a snapshot including both would
    resurrect erased records through query-time dedup. Two things close
-   that hole: (a) the maintenance driver serializes compaction and rewrite
-   per bucket — both already run inside the single per-tenant Maintain
-   loop (single-replica Recreate deployment, ADR-0034), and leased
-   maintenance (ADR-0065) must preserve per-bucket exclusivity as a stated
-   requirement; (b) the §2 query-time filter remains active for a
-   request's predicate until the `.dreq` is removed in §5, which by
-   construction happens only after no resolvable snapshot can still
-   reference any pre-rewrite input. Correctness therefore never depends on
-   the race not happening; the serialization is an efficiency measure.
+   that hole: (a) compaction and format migration refuse a bucket that
+   already holds a live rewrite record (`CompactionOutcome::RewritePresent`
+   / `MigrateOutcome::RewritePresent`), so a producer can never publish a
+   second record set over inputs a rewrite already superseded — one bucket
+   never serves two record sets. This producer-side refusal is a
+   *correctness* requirement, not merely an efficiency measure. On top of it
+   the maintenance driver still serializes compaction and rewrite per bucket
+   — both already run inside the single per-tenant Maintain loop
+   (single-replica Recreate deployment, ADR-0034), and leased maintenance
+   (ADR-0065) must preserve per-bucket exclusivity as a stated requirement —
+   but that ordering is now the efficiency measure, not the thing correctness
+   rests on; (b) the §2 query-time filter remains active for a request's
+   predicate until the `.dreq` is removed in §5, which by construction
+   happens only after no resolvable snapshot can still reference any
+   pre-rewrite input. Correctness therefore rests on the producer-side
+   refusal and the query-time filter, never on the race not happening.
 6. **Physical removal**: the rewrite's inputs become superseded inputs to
    the existing sweep (`sweep_superseded`), deleted after
    `protection_horizon`, under the same `LegalHoldCheck` gate as every
