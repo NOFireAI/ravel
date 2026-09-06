@@ -239,10 +239,19 @@ records, per query:
   the same execution reports differently twice cannot gate anything. It is a
   LOWER bound on serial service rounds under a wave-synchronous model of the
   nested fan-out (outer plan admission, inner segment admission, shared
-  permits): a sliding-window scheduler can never beat peak capacity and does
-  worse whenever the outer window is not full, so the real figure can only
-  exceed it. The docs must say "lower bound", and this ADR's first draft
-  called it an upper bound, which was backwards.
+  permits). Within ONE stage that model is a lower bound on the rounds a
+  sliding-window scheduler takes: it cannot beat peak capacity and does worse
+  whenever the window is not full. Across stages it is not a bound in either
+  direction, because the per-stage ceilings are summed as if each stage were a
+  full barrier, and a sliding window lets a child request start before its
+  parent stage's last wave completes (16 permits, 17 parent requests and one
+  child released by the first parent finish in two waves where the sum says
+  three). So the figure is stated as a deterministic model figure, comparable
+  across queries and identical for identical work, with the single-stage
+  lower-bound property named and the cross-stage sum named as a model, never
+  as a bound the real scheduler can only exceed. This ADR's first draft called
+  it an upper bound, and its second called the cross-stage sum a lower bound;
+  both were wrong, and the landed docs are corrected to this wording.
 - `unfolded_segments_resolved`: how many SEGMENTS this resolve took from the
   listing path rather than from a snapshot part. Segments, not records:
   `SegmentOrigins.origins` is parallel to `Snapshot::segments`, so an L1
@@ -373,10 +382,19 @@ frequency` in write amplification. The bound is a number, not an adjective:
   shard-hour, exactly as for a corrupt head.
 - A query loads at most `tail_checkpoint_max_packs_per_query` packs in total
   across every shard-hour in its window (default 16), chosen
-  deterministically: for each shard-hour, the base first, then deltas newest
-  first, until the budget is spent. Records in packs the budget did not reach
-  resolve through direct GETs; the count of such records is what
-  `unfolded_segments_resolved` minus the served-from-pack figure reports.
+  deterministically in a canonical order: shard-hours by ingest hour
+  DESCENDING, then shard ASCENDING, so the freshest hour (the one a query over
+  recent data needs most and the one with the most uncheckpointed records) is
+  served first and two nodes resolving the same window load the same packs;
+  within a shard-hour, the base first, then deltas newest first; stop when the
+  budget is spent. Records in packs the budget did not reach resolve through
+  direct GETs. Two figures report that, in their own units and never mixed:
+  `unfolded_segments_served_from_pack` (segments, the same unit as
+  `unfolded_segments_resolved`, so their difference is the segments that came
+  from direct GETs) and `record_gets_direct` (requests, the direct commit and
+  compaction record GETs the resolve phase issued, which is the cost figure and
+  which a compaction record naming several segments keeps distinct from the
+  segment count).
 - Publication never waits and never adds a `K+1`th delta. A builder that finds
   the head at `K` deltas for its target consolidates instead: it merges the
   base and all deltas by exact record key, re-LISTs so the new base is not
@@ -457,7 +475,15 @@ own ADR.
 ### 4. The gate that decides whether decision 3 gets built
 
 Build the tail checkpoint only if, after decision 2's resolve concurrency
-default is applied, both hold over a 24-hour window on a real workload. The
+default is applied, both hold over a 24-hour window on a real workload, with
+the population and the arithmetic fixed in advance: the population is every
+resolve whose query window includes at least one hour above the folded
+watermark (a resolve that touched no unfolded hour is not evidence about the
+tail); the window must contain at least 1,000 such resolves across at least
+three tenants, and a window with fewer is inconclusive rather than a pass; p99
+is the nearest-rank quantile over that population (the value at position
+`ceil(0.99 x N)` of the ascending sort), computed from the per-query `io`
+figures as logged, not from a sampled subset. The
 baseline the checkpoint has to beat is the 128-permit column above, about 2.3 s
 for a 10,000-record tail, not the 16 s the first measurement showed:
 
