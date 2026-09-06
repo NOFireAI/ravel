@@ -57,15 +57,53 @@ fi
 
 give_up_at=$(( $(date +%s) + max_seconds ))
 
+give_up() {
+  echo "WATCH-GAVE-UP after ${max_seconds}s with no terminal event"
+  exit 75
+}
+
+# Run the managed watcher and kill it if it is still going at `give_up_at`.
+#
+# Shrinking the budget argument is not enough on its own. The managed watcher
+# checks its own deadline between polls, so after that check it can still spend
+# a `curl --max-time 25` and then a full `sleep ${poll}`, overrunning by most of
+# a poll interval; with a 60 s poll that is a minute past a cap the caller set.
+# Worse, an event arriving in that overrun would be reported as TERMINAL after
+# the watch was supposed to be over.
+#
+# Killing the process group rather than the pid matters: the watcher's own time
+# is spent inside `curl` and `sleep` children, and signalling only the wrapper
+# leaves those running. `setsid` is not on macOS, so the child is put in its own
+# group with `set -m` and signalled by negated pgid.
+run_bounded() {
+  local budget_arg="$1" out_file="$2" child code=0
+  set -m
+  "${managed}" "${watch_url}" "${budget_arg}" "${poll}" > "${out_file}" &
+  child=$!
+  set +m
+  while kill -0 "${child}" 2>/dev/null; do
+    if (( $(date +%s) >= give_up_at )); then
+      kill -TERM -"${child}" 2>/dev/null || kill -TERM "${child}" 2>/dev/null || true
+      wait "${child}" 2>/dev/null || true
+      return 75
+    fi
+    sleep 1
+  done
+  wait "${child}" || code=$?
+  return "${code}"
+}
+
+out_file="$(mktemp -t fleet-watch-loop)"
+trap 'rm -f "${out_file}"' EXIT
+
 while (( $(date +%s) < give_up_at )); do
-  # Never let a run outlive the cap: the last one gets only the time that is
-  # actually left, so a terminal event arriving after the cap is reported as
-  # WATCH-GAVE-UP rather than as a TERMINAL the caller no longer expects.
   remaining=$(( give_up_at - $(date +%s) ))
   run_budget=$(( budget < remaining ? budget : remaining ))
-  event="$("${managed}" "${watch_url}" "${run_budget}" "${poll}")" && code=0 || code=$?
+  run_bounded "${run_budget}" "${out_file}" && code=0 || code=$?
   if (( code == 0 )); then
-    echo "TERMINAL ${event}"
+    # A terminal event, but only one that arrived inside the cap: run_bounded
+    # returns 75 rather than 0 when it had to kill the child.
+    echo "TERMINAL $(cat "${out_file}")"
     exit 0
   fi
   if (( code != 75 )); then
@@ -74,5 +112,4 @@ while (( $(date +%s) < give_up_at )); do
   fi
 done
 
-echo "WATCH-GAVE-UP after ${max_seconds}s with no terminal event"
-exit 75
+give_up
