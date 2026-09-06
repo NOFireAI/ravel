@@ -390,6 +390,20 @@ pub struct IoShapeJson {
     /// underlying records (`crate::io_shape` module docs).
     #[serde(rename = "unfoldedSegmentsResolved")]
     pub unfolded_segments_resolved: u64,
+    /// EXACT count of COMMIT RECORDS this query's resolve served from the
+    /// catalog's local decoded commit-record cache
+    /// (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
+    /// from accounting. A RECORD count, not a segment count: the listing
+    /// window is padded by `max_ingest_lag_ns` and runs to the current hour
+    /// regardless of the query's end, so a resolve prewarms buckets its
+    /// range never touches and `include_l0_if_overlaps` drops those records
+    /// afterwards -- on a live tenant a narrow range counts records from
+    /// hours that contribute no segment at all, so this figure reads above
+    /// any segment-based cache count. Meant as the numerator of a
+    /// cold-resolve fraction (records served from cache over records the
+    /// resolve touched), not a segment total.
+    #[serde(rename = "unfoldedRecordsServedFromCache")]
+    pub unfolded_records_served_from_cache: u64,
     /// Pre-execution access-pattern classification: `metadata_only`,
     /// `selective_indexed`, `exhaustive_scan`, or `unclassified` (a lane,
     /// such as the log lane, whose own resolve carries no signal this crate
@@ -406,6 +420,7 @@ impl From<crate::io_shape::QueryIoShape> for IoShapeJson {
             list_page_depth: shape.list_page_depth,
             service_batches: shape.service_batches,
             unfolded_segments_resolved: shape.unfolded_segments_resolved,
+            unfolded_records_served_from_cache: shape.unfolded_records_served_from_cache,
             plan_class: shape.plan_class.name(),
         }
     }
@@ -1391,6 +1406,7 @@ mod tests {
             list_page_depth: 13,
             service_batches: 4,
             unfolded_segments_resolved: 2_500,
+            unfolded_records_served_from_cache: 1_800,
             plan_class: crate::io_shape::PlanClass::SelectiveIndexed,
         };
         let stats = crate::QueryStats {
@@ -1405,16 +1421,20 @@ mod tests {
         assert_eq!(io["listPageDepth"], serde_json::json!(13));
         assert_eq!(io["serviceBatches"], serde_json::json!(4));
         assert_eq!(io["unfoldedSegmentsResolved"], serde_json::json!(2_500));
+        assert_eq!(
+            io["unfoldedRecordsServedFromCache"],
+            serde_json::json!(1_800)
+        );
         assert_eq!(io["planClass"], serde_json::json!("selective_indexed"));
 
         // Every figure exactly once: no duplicate key, and no field beyond
-        // the five `QueryIoShape` carries (an object key, field value,
+        // the six `QueryIoShape` carries (an object key, field value,
         // predicate, or index term would show up here as an extra field).
         let obj = io.as_object().expect("io is a JSON object");
         assert_eq!(
             obj.len(),
-            5,
-            "io carries exactly the five QueryIoShape figures, no more"
+            6,
+            "io carries exactly the six QueryIoShape figures, no more"
         );
 
         assert!(
@@ -1446,6 +1466,7 @@ mod tests {
             list_page_depth: 13,
             service_batches: 4,
             unfolded_segments_resolved: 2_500,
+            unfolded_records_served_from_cache: 1_800,
             plan_class: crate::io_shape::PlanClass::SelectiveIndexed,
         };
         let stats = crate::QueryStats {
@@ -1473,6 +1494,7 @@ mod tests {
             "\"listPageDepth\"",
             "\"serviceBatches\"",
             "\"unfoldedSegmentsResolved\"",
+            "\"unfoldedRecordsServedFromCache\"",
             "\"planClass\"",
         ] {
             let occurrences = io_text.matches(key).count();

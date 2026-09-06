@@ -152,6 +152,20 @@
 //!   documented, for the quantity it actually counts.
 //! - [`plan_class`](QueryIoShape::plan_class): decided before any segment is
 //!   opened, from the query's shape and the resolve's own pruning outcome.
+//! - [`unfolded_records_served_from_cache`](QueryIoShape::unfolded_records_served_from_cache):
+//!   the EXACT count of COMMIT RECORDS this query's resolve served from the
+//!   catalog's local decoded commit-record cache
+//!   (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
+//!   from accounting, never inferred from the pooled cache counters. A
+//!   RECORD count, not a segment count, and the two differ for the same
+//!   reason `unfolded_segments_resolved` above is a segment count: the
+//!   listing window is padded by `max_ingest_lag_ns` and runs to the current
+//!   hour regardless of the query's end, so a resolve prewarms buckets its
+//!   range never touches and `include_l0_if_overlaps` drops those records
+//!   afterwards -- on a live tenant a narrow range counts records from hours
+//!   that contribute no segment at all. The figure exists to be the
+//!   numerator of a cold-resolve fraction (records served from cache over
+//!   records the resolve touched), not a segment total.
 //!
 //! # Tests
 //!
@@ -212,6 +226,15 @@ pub struct QueryIoShape {
     pub list_page_depth: u32,
     pub service_batches: u32,
     pub unfolded_segments_resolved: u64,
+    /// EXACT count of commit records this query's resolve served from the
+    /// catalog's local decoded commit-record cache
+    /// (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
+    /// from accounting for the resolve(s) this query ran. A RECORD count,
+    /// not a segment count -- see the module docs' entry of the same name
+    /// for why a padded listing window makes the two diverge on a live
+    /// tenant. Meant as the numerator of a cold-resolve fraction, not a
+    /// segment total.
+    pub unfolded_records_served_from_cache: u64,
     pub plan_class: PlanClass,
 }
 
@@ -229,6 +252,7 @@ impl Default for QueryIoShape {
             list_page_depth: 0,
             service_batches: 0,
             unfolded_segments_resolved: 0,
+            unfolded_records_served_from_cache: 0,
             plan_class: PlanClass::MetadataOnly,
         }
     }
@@ -422,6 +446,7 @@ impl IoShapeCounts {
     pub fn into_shape(
         self,
         unfolded_segments_resolved: u64,
+        unfolded_records_served_from_cache: u64,
         plan_class: PlanClass,
     ) -> QueryIoShape {
         QueryIoShape {
@@ -429,6 +454,7 @@ impl IoShapeCounts {
             list_page_depth: self.list_page_depth,
             service_batches: self.service_batches,
             unfolded_segments_resolved,
+            unfolded_records_served_from_cache,
             plan_class,
         }
     }
