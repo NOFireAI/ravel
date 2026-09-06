@@ -79,8 +79,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pass issued about 1,900 small object reads from the first query's own path
   before warming nothing; those reads are gone, and the first query on a cold
   process is about 3 s faster on the reference corpus. The replacement probe
-  costs about 1 s at startup, so end to end a cold start is about 2.5 s
-  faster, not 3. The probe fans out on the configured resolve concurrency,
+  costs about 1 s at startup, so the end-to-end saving on a cold start is
+  about 2.5 s, not 3. The probe fans out on the configured resolve concurrency,
   asserts tenant isolation on every listed key, and is bounded per shard.
 - **Catalog resolve GET concurrency is configurable, default 128.** Every
   record GET in `Catalog::resolve_impl` passed through a fixed bound of 16.
