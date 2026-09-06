@@ -133,8 +133,9 @@
 //! place. Since #835, [`LogSegmentFetcher::plan_segment`]'s fallback branch carries its fetched
 //! bytes forward as a [`ravel_query::CarriedWholeObject`] (`SegPlan::whole_object`,
 //! threaded through [`OwnedSeg::whole_object`] to the subset open), so the
-//! object crosses the wire once for the first `plan_concurrency` segments
-//! whose plan completes. Every other relevant segment is re-fetched by the
+//! object is read once for the statement, rather than twice, for the first
+//! `plan_concurrency` segments whose plan completes: their subset open issues
+//! neither a store GET nor a cache lookup. Every other relevant segment is re-fetched by the
 //! scan exactly as it was before #835; the peak bytes this carry retains is
 //! bounded by the plan fan-out (`plan_concurrency` objects) times object
 //! size, not by corpus size. Removing the remaining duplicate reads needs
@@ -152,7 +153,8 @@
 //! segment order, so which segments those are is scheduling-dependent -- keep
 //! their [`SegPlan::whole_object`]; every later arrival has its
 //! `whole_object` forced to `None` before it is stored, so that segment's
-//! subset open pays a real wire GET during the scan, exactly as it would have
+//! subset open pays a second read during the scan, a wire GET whenever the
+//! cache does not still hold the object, exactly as it would have
 //! before #835. `compute_plan_counts` sums only the bytes actually retained
 //! and records that figure via
 //! [`ravel_types::accounting::QueryAccounting::observe_intermediate_bytes`]; a

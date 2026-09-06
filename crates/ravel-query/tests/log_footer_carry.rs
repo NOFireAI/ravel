@@ -89,6 +89,33 @@ fn one_record_cfg() -> RlogConfig {
     }
 }
 
+/// A second key in the same tenant, for the carry-pairing test below.
+const OTHER_KEY: &str = "logs/other.rlog";
+
+/// The same `N` records as [`build_object`], written as ONE block instead of
+/// `N`. Same tenant and same schema, so its bytes and [`build_object`]'s decode
+/// under each other's `SegmentRef`; the block shape is what tells the two apart,
+/// so reading the wrong one shows up as a row count rather than an error.
+fn build_other_object() -> Vec<u8> {
+    let cfg = RlogConfig {
+        block_target_records: N,
+        ..RlogConfig::default()
+    };
+    let mut w = RlogWriter::new(cfg, identity());
+    for ts in 0..N as i64 {
+        w.push(record(ts)).expect("push");
+    }
+    w.finish().expect("finish")
+}
+
+/// [`seg_ref`] for [`build_other_object`]: same tenant and window, different key.
+fn other_seg_ref(size: u64) -> SegmentRef {
+    SegmentRef {
+        data_object_key: OTHER_KEY.to_string(),
+        ..seg_ref(size)
+    }
+}
+
 fn seg_ref(size: u64) -> SegmentRef {
     SegmentRef {
         data_object_key: KEY.to_string(),
@@ -400,5 +427,167 @@ async fn footer_carried_open_still_catches_an_etag_change() {
     assert!(
         matches!(&err, Some(m) if m.contains("etag changed")),
         "a footer-carried open must catch a mid-sequence etag change, got {err:?}"
+    );
+}
+
+/// A [`CarriedWholeObject`] is bound to the object and tenant its plan read
+/// fetched, and a read that supplies it for anything else is refused before the
+/// bytes are decoded (issue #835 review).
+///
+/// The carry branch answers from the carried bytes without consulting the
+/// supplied `SegmentRef` at all, so without the guard this is not an error at
+/// all: both fixtures are valid RLOG objects in one tenant, so the wrong bytes
+/// decode happily and the scan returns the wrong object's rows. That is what
+/// the row-count assertion pins. The two objects hold the same `N` records in
+/// different block shapes -- `N` blocks of one row against one block of `N` --
+/// so selecting block 0 of the intended object yields `N` rows and block 0 of
+/// the carried one yields exactly 1.
+#[tokio::test]
+async fn a_carried_whole_object_is_refused_for_another_segment_or_tenant() {
+    let carried_bytes = build_object();
+    let target_bytes = build_other_object();
+    let carried_seg = seg_ref(carried_bytes.len() as u64);
+    let target_seg = other_seg_ref(target_bytes.len() as u64);
+    let query = LogQuery::new(i64::MIN, i64::MAX);
+
+    let store = Arc::new(MemoryStore::new());
+    for (key, bytes) in [
+        (KEY, carried_bytes.clone()),
+        (OTHER_KEY, target_bytes.clone()),
+    ] {
+        store
+            .put(key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+    }
+    let fetcher = LogSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>);
+    let acc = QueryAccounting::new();
+
+    // The carry under test, produced by a real plan read of `carried_seg`.
+    let (_survivors, _stats, _footer, carry) = fetcher
+        .plan_segment(&carried_seg, TENANT, &query, &acc)
+        .await
+        .expect("plan")
+        .expect("relevant");
+    let carry = carry.expect(
+        "a below-threshold plan read carries its whole object; without one this test is vacuous",
+    );
+
+    // Wrong segment, right tenant. Both objects decode, so the guard is the only
+    // thing standing between this call and the wrong object's rows.
+    let refused = fetcher
+        .scan_accounted_with_tenant_subset(
+            &target_seg,
+            TENANT,
+            &query,
+            &ColumnSelection::all(),
+            &[0],
+            None,
+            Some(carry.clone()),
+            &acc,
+        )
+        .await;
+    let err = match refused {
+        Err(e) => e,
+        Ok(ok) => {
+            let mut leaked = 0usize;
+            let mut s = ok.expect("relevant");
+            while let Some(b) = s.next_block().expect("decode") {
+                leaked += b.len();
+            }
+            panic!(
+                "a carry from {KEY} was decoded for a read of {OTHER_KEY} and returned \
+                 {leaked} row(s) of the wrong object instead of being refused"
+            );
+        }
+    };
+    assert!(
+        matches!(
+            &err,
+            ravel_query::LogFetchError::CarryMismatch { key, carried_key, .. }
+                if key == OTHER_KEY && carried_key == KEY
+        ),
+        "expected CarryMismatch naming both objects, got {err:?}"
+    );
+
+    // Right segment, wrong tenant. The key matches, so only the tenant check
+    // can refuse this one.
+    let other_tenant = TenantHash([8u8; 16]);
+    let refused = fetcher
+        .scan_accounted_with_tenant_subset(
+            &carried_seg,
+            other_tenant,
+            &query,
+            &ColumnSelection::all(),
+            &[0],
+            None,
+            Some(carry.clone()),
+            &acc,
+        )
+        .await;
+    let Err(err) = refused else {
+        panic!("a carry fetched for another tenant must be refused, not decoded");
+    };
+    assert!(
+        matches!(
+            &err,
+            ravel_query::LogFetchError::CarryMismatch { tenant, carried_tenant, .. }
+                if *tenant == other_tenant && *carried_tenant == TENANT
+        ),
+        "expected CarryMismatch naming both tenants, got {err:?}"
+    );
+
+    // The matching pairing still works, and the guard costs it nothing.
+    let mut scan = fetcher
+        .scan_accounted_with_tenant_subset(
+            &carried_seg,
+            TENANT,
+            &query,
+            &ColumnSelection::all(),
+            &[0],
+            None,
+            Some(carry),
+            &acc,
+        )
+        .await
+        .expect("the carry's own segment and tenant are accepted")
+        .expect("relevant");
+    let mut carried_rows = 0usize;
+    while let Some(block) = scan.next_block().expect("decode") {
+        carried_rows += block.len();
+    }
+    assert_eq!(
+        carried_rows, 1,
+        "block 0 of the carried object holds exactly one row"
+    );
+
+    // The row count the refused call would have returned had it decoded the
+    // carried bytes, against what its own object actually holds. They differ,
+    // so a dropped guard returns wrong rows rather than an error.
+    let mut target_scan = fetcher
+        .scan_accounted_with_tenant_subset(
+            &target_seg,
+            TENANT,
+            &query,
+            &ColumnSelection::all(),
+            &[0],
+            None,
+            None,
+            &acc,
+        )
+        .await
+        .expect("target scan")
+        .expect("relevant");
+    let mut target_rows = 0usize;
+    while let Some(block) = target_scan.next_block().expect("decode") {
+        target_rows += block.len();
+    }
+    assert_eq!(
+        target_rows, N,
+        "block 0 of the intended object holds all N rows"
+    );
+    assert_ne!(
+        carried_rows, target_rows,
+        "the fixtures must disagree on row count, or the guard's absence would be invisible"
     );
 }
