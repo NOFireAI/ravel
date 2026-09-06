@@ -117,6 +117,55 @@
 //! not a general result about striping. Cache size, eviction, object size, and
 //! store latency all move it.
 //!
+//! # Whole-object fallback carry, and its memory bound (issue #835)
+//!
+//! `plan_segment`'s whole-object fallback (an undecidable block predicate, e.g.
+//! a text `has_word` arm the skip index cannot resolve) already reads the
+//! entire object to count survivors. Before #835 that read was thrown away:
+//! the scan phase re-opened the same object and, unless a read cache happened
+//! to be wired AND large enough to still hold every relevant object's bytes by
+//! the time the scan reached it, paid a second real wire GET for content the
+//! plan phase had just fetched. This is a different failure from issue #691's
+//! "an evicted plan entry is simply re-fetched by the scan" a few paragraphs
+//! up: #691 is about a cache-keyed footer/probe/section entry on the ABOVE-
+//! threshold ranged path, which by design may be re-fetched on a miss; #835 is
+//! about the whole object itself never being cache-size-dependent in the first
+//! place. Since #835, [`LogSegmentFetcher::plan_segment`]'s fallback branch carries its fetched
+//! bytes forward as a [`ravel_query::CarriedWholeObject`] (`SegPlan::whole_object`,
+//! threaded through [`OwnedSeg::whole_object`] to the subset open), so the
+//! object crosses the wire at most once per statement regardless of cache size
+//! or eviction; a reused read is charged to
+//! [`ravel_types::accounting::QueryAccounting::add_bytes_reused`], not folded
+//! into the GET-bytes figure the issuing (plan) phase already recorded.
+//!
+//! This carry's memory cost is bounded by `plan_concurrency`, not by corpus
+//! size: [`compute_plan_counts`] consumes the segment-plan stream as each
+//! `plan_segment` call completes (`buffer_unordered(plan_concurrency)`), not
+//! after the whole pass finishes, so it never retains more carried whole
+//! objects than are actually in flight at once. The first `plan_concurrency`
+//! segments to COMPLETE with a carried whole object -- arrival order, not
+//! segment order, so which segments those are is scheduling-dependent -- keep
+//! their [`SegPlan::whole_object`]; every later arrival has its
+//! `whole_object` forced to `None` before it is stored, so that segment's
+//! subset open pays a real wire GET during the scan, exactly as it would have
+//! before #835. `compute_plan_counts` sums only the bytes actually retained
+//! and records that figure via
+//! [`ravel_types::accounting::QueryAccounting::observe_intermediate_bytes`]; a
+//! dropped whole object is never charged to
+//! [`ravel_types::accounting::QueryAccounting::add_bytes_reused`], since the
+//! scan performs a real GET for it and that GET's own accounting covers it.
+//!
+//! The barrier itself is unchanged by this bound: no partition drains a block
+//! until every segment's survivor count is known, because the flattened
+//! block-striping assignment (ADR-0102) needs every segment's count to
+//! compute unit `i`'s owning partition, not just the segments before it in
+//! isolation. Only the CARRIED-BYTES retention is now concurrency-bounded;
+//! survivor counts, stats, and footers for every relevant segment are still
+//! held until the pass completes, because `owned_work` indexes all of them by
+//! segment position regardless. Letting a partition start draining before the
+//! whole pass completes would need ADR-0102's partitioning protocol itself to
+//! change, and is not made here.
+//!
 //! # Streaming, and why no ordering is declared (ADR-0087)
 //!
 //! This stage declares **no** output ordering. It used to declare `ts`
@@ -250,7 +299,7 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream, Statistics,
 };
 use datafusion::scalar::ScalarValue;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt};
 use ravel_catalog::{
     DeclaredColumnStats, LoadedColumnStats, SegmentRef, unique_column_stat,
     validate_min_max_presence,
@@ -265,7 +314,8 @@ use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{
-    ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher, LogSegmentScan,
+    CarriedWholeObject, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
+    LogSegmentScan,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -2073,6 +2123,7 @@ impl RowFetchSource {
                 &self.columns,
                 &[block],
                 None,
+                None,
                 &self.accounting,
             )
             .await
@@ -2380,6 +2431,7 @@ impl ExecutionPlan for LogsScanExec {
             pending_range: None,
             current_indices: Vec::new(),
             current_footer: None,
+            current_whole_object: None,
             seg_columnar_blocks: 0,
             state,
         }))
@@ -2417,6 +2469,16 @@ struct SegPlan {
     /// instead. Carried to each per-partition subset open through [`OwnedSeg`] so
     /// the open reuses it and skips its own suffix probe.
     footer: Option<LogFooter>,
+    /// The whole-object bytes the plan fallback branch already fetched for
+    /// this segment (issue #835), when that branch resolved the entire
+    /// object. Carried to the subset open through [`OwnedSeg`] so it does not
+    /// pay a second wire GET for bytes the plan phase already holds. `None`
+    /// on the fast/skip-decidable footer branches (no block read), on the
+    /// fallback's ranged crossover (not the whole object), and when
+    /// [`compute_plan_counts`]'s concurrency bound dropped an already-fetched
+    /// whole object because `plan_concurrency` other segments' bytes were
+    /// retained first -- that segment's subset open re-fetches instead.
+    whole_object: Option<CarriedWholeObject>,
 }
 
 type CountsFuture = Pin<Box<dyn Future<Output = DFResult<Arc<PlanCounts>>> + Send>>;
@@ -2439,19 +2501,43 @@ fn plan_counts_future(
     })
 }
 
+/// One segment's [`LogSegmentFetcher::plan_segment`] result: survivor count,
+/// stats, a carried footer (skip-decidable branches), and a carried
+/// whole-object body (the fallback branch, issue #835). `None` when the
+/// segment was pruned by ts bounds alone and never reached the fetcher.
+type PlanSegmentResult = Option<(
+    usize,
+    ScanStats,
+    Option<LogFooter>,
+    Option<CarriedWholeObject>,
+)>;
+
 /// Prune every segment once (no block decode) to build the shared block plan.
 ///
-/// The prunes run `plan_concurrency` at a time (`buffered`, so `segs` keeps
-/// snapshot order and [`owned_work`] can index it by segment position). Every
-/// partition awaits this whole pass before it drains anything, so the plan
-/// phase sits alone on the query's critical path: run serially it costs one
-/// object-store round trip per segment in sequence (issue #691 measured about
-/// 20 minutes per statement on 8424 objects, one GET in flight for the whole
-/// time). Concurrency here changes only how many of those reads are in flight,
-/// never their count (still one plan read sequence per segment) or their
-/// semantics (the first error aborts the plan, and `get_or_try_init` does not
-/// cache it); the fetcher's own in-flight GET semaphore remains the global
-/// bound, so an oversized `plan_concurrency` is safe.
+/// The prunes run `plan_concurrency` at a time (`buffer_unordered`, consumed
+/// as each completes rather than after the whole pass), and results are
+/// written into a position-indexed `Vec` so `segs` keeps snapshot order and
+/// [`owned_work`] can still index it by segment position even though
+/// completion order does not match it. Every partition awaits this whole pass
+/// before it drains anything, so the plan phase sits alone on the query's
+/// critical path: run serially it costs one object-store round trip per
+/// segment in sequence (issue #691 measured about 20 minutes per statement on
+/// 8424 objects, one GET in flight for the whole time). Concurrency here
+/// changes only how many of those reads are in flight, never their count
+/// (still one plan read sequence per segment) or their semantics (the first
+/// error aborts the plan, and `get_or_try_init` does not cache it); the
+/// fetcher's own in-flight GET semaphore remains the global bound, so an
+/// oversized `plan_concurrency` is safe.
+///
+/// `plan_concurrency` also bounds how many carried whole objects (issue #835)
+/// this pass retains at once (issue #835 follow-up): the first
+/// `plan_concurrency` segments to COMPLETE with a carried whole object (not
+/// the first `plan_concurrency` by segment position -- completion order under
+/// `buffer_unordered` is scheduling-dependent) keep their bytes; every later
+/// one has its `whole_object` forced to `None` before it is stored, so its
+/// subset open pays a real re-fetch in the scan phase instead of holding
+/// bytes the rest of the pass has not yet caught up to consuming. See this
+/// module's doc, "Whole-object fallback carry, and its memory bound".
 // Issue #693 part 3: the predicate-free full-window fast path in `execute`
 // skips this whole pass; see `owned_work` and `plan_segment_fast`.
 async fn compute_plan_counts(
@@ -2459,49 +2545,69 @@ async fn compute_plan_counts(
     segments: &[SegmentRef],
     plan_concurrency: usize,
 ) -> DFResult<Arc<PlanCounts>> {
-    // Not-yet-polled futures, one per segment, so `buffered` decides how many
-    // run at once. Built with a loop rather than a `map` closure: a closure
-    // returning a future that borrows its argument cannot satisfy the
-    // higher-ranked bound this `Send` boxed future needs.
+    // Not-yet-polled futures, one per segment tagged with its snapshot
+    // position, so `buffer_unordered` decides how many run at once and the
+    // consumer loop below can still store each result at its original index.
+    // Built with a loop rather than a `map` closure: a closure returning a
+    // future that borrows its argument cannot satisfy the higher-ranked bound
+    // this `Send` boxed future needs.
     let mut prunes = Vec::with_capacity(segments.len());
-    for seg in segments {
+    for (idx, seg) in segments.iter().enumerate() {
         // Refuse an unreadable version BEFORE the plan probe, not after. This
         // is a second entry point into the fetch layer alongside the three
         // route choices below, and `plan_segment` issues its footer probe
         // before the open phase can reject the version -- so without this the
         // ordering guarantee holds on the scan path and quietly fails here.
         refuse_unreadable_version(seg)?;
-        prunes.push(
-            ctx.fetcher
-                .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting),
-        );
+        let prune = ctx
+            .fetcher
+            .plan_segment(seg, ctx.tenant_hash, &ctx.query, &ctx.accounting);
+        prunes.push(async move { (idx, prune.await) });
     }
-    let planned: Vec<Option<(usize, ScanStats, Option<LogFooter>)>> = futures::stream::iter(prunes)
-        .buffered(plan_concurrency.max(1))
-        .map_err(SqlError::from)
-        .try_collect()
-        .await?;
-    let mut segs = Vec::with_capacity(segments.len());
+    let budget = plan_concurrency.max(1);
+    let mut stream = futures::stream::iter(prunes).buffer_unordered(budget);
+    let mut segs: Vec<Option<SegPlan>> = std::iter::repeat_with(|| None)
+        .take(segments.len())
+        .collect();
     let mut total_blocks = 0usize;
     let mut full_reads = 0usize;
-    for entry in planned {
-        match entry {
-            Some((survivors, stats, footer)) => {
-                total_blocks += survivors;
-                // A relevant segment planned from the skip index carries its
-                // footer forward; the whole-object fallback (#761) carries none.
-                if footer.is_none() {
-                    full_reads += 1;
-                }
-                segs.push(Some(SegPlan {
-                    survivors,
-                    stats,
-                    footer,
-                }));
+    // Only the RETAINED carried bytes -- the first `budget` segments to
+    // complete with a whole object -- are summed here, so this is the true
+    // peak `compute_plan_counts` holds at once, not the whole corpus. A
+    // dropped whole object never reaches this sum: its `whole_object` is
+    // `None` before `SegPlan` is built below.
+    let mut carried_bytes = 0u64;
+    let mut carried_seen = 0usize;
+    while let Some((idx, entry)) = stream.next().await {
+        let entry: PlanSegmentResult = entry.map_err(SqlError::from)?;
+        if let Some((survivors, stats, footer, whole_object)) = entry {
+            total_blocks += survivors;
+            // A relevant segment planned from the skip index carries its
+            // footer forward; the whole-object fallback (#761) carries none.
+            if footer.is_none() {
+                full_reads += 1;
             }
-            None => segs.push(None),
+            let whole_object = match whole_object {
+                Some(w) if carried_seen < budget => {
+                    carried_seen += 1;
+                    carried_bytes += w.byte_len();
+                    Some(w)
+                }
+                // Either no whole object to begin with, or one arrived after
+                // the budget was already spent by earlier completions: drop
+                // it before it is ever stored, so it is never retained and
+                // never charged as reused.
+                _ => None,
+            };
+            segs[idx] = Some(SegPlan {
+                survivors,
+                stats,
+                footer,
+                whole_object,
+            });
         }
     }
+    ctx.accounting.observe_intermediate_bytes(carried_bytes);
     Ok(Arc::new(PlanCounts {
         segs,
         total_blocks,
@@ -2521,6 +2627,11 @@ struct OwnedSeg {
     /// carried to the subset open so it skips its own suffix probe. `None` on the
     /// whole-segment fast path (no plan phase) and when the plan slow branch ran.
     footer: Option<LogFooter>,
+    /// The plan fallback's whole-object bytes for this segment (issue #835),
+    /// carried to the subset open so it does not pay a second wire GET.
+    /// `None` whenever [`SegPlan::whole_object`] was `None`, and always
+    /// `None` on the whole-segment fast path (no plan phase).
+    whole_object: Option<CarriedWholeObject>,
 }
 
 /// This partition's share of the block assignment, in one of two modes
@@ -2565,6 +2676,7 @@ fn owned_work(
                     ordinal: seg_idx,
                     indices,
                     footer: plan.footer.clone(),
+                    whole_object: plan.whole_object.clone(),
                 });
             }
         }
@@ -2581,6 +2693,7 @@ fn owned_work(
                     ordinal: seg_idx,
                     indices: (0..plan.survivors).collect(),
                     footer: plan.footer.clone(),
+                    whole_object: plan.whole_object.clone(),
                 });
             }
             seg_ordinal += 1;
@@ -2619,6 +2732,7 @@ fn owned_whole_segments(
                 ordinal: seg_idx,
                 indices: Vec::new(),
                 footer: None,
+                whole_object: None,
             });
         }
         ordinal += 1;
@@ -2777,6 +2891,7 @@ fn open_segment_subset(
     seg: SegmentRef,
     indices: Vec<usize>,
     footer: Option<LogFooter>,
+    whole_object: Option<CarriedWholeObject>,
 ) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
@@ -2789,6 +2904,7 @@ fn open_segment_subset(
                 &ctx.columns,
                 &indices,
                 footer.as_ref(),
+                whole_object,
                 &ctx.accounting,
             )
             .await
@@ -3059,6 +3175,17 @@ struct LogScanStream {
     /// 2), kept so the `attrs_raw` fallback re-opens the subset with the same
     /// footer it first used. `None` on the whole-segment fast path.
     current_footer: Option<LogFooter>,
+    /// The plan fallback's whole-object bytes for [`Self::current_seg`]
+    /// (issue #835), consumed exactly once by the FIRST open of this segment
+    /// (`Option::take` at the `NextSegment` state, before `open_segment_subset`).
+    /// `None` whenever the plan phase did not carry whole-object bytes
+    /// forward for this segment, always `None` on the whole-segment fast
+    /// path, and `None` here after that first take even though the carry
+    /// existed -- a later `ReopenRows`/`attrs_raw`-overflow reopen of the SAME
+    /// segment therefore takes the normal fetch/cache path rather than
+    /// reusing these bytes a second time, which would otherwise double-charge
+    /// `QueryAccounting::add_bytes_reused` for one buffer.
+    current_whole_object: Option<CarriedWholeObject>,
     /// How many of this partition's blocks in the current segment the columnar
     /// fast path has already emitted. The `attrs_raw` fallback re-opens the
     /// segment over `current_indices` and skips this many positions so none is
@@ -3284,11 +3411,20 @@ impl Stream for LogScanStream {
                         ordinal,
                         indices,
                         footer,
+                        whole_object,
                     }) => {
                         this.current_seg = Some(seg.clone());
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = indices.clone();
                         this.current_footer = footer.clone();
+                        // Moved, not cloned: the carried whole object is
+                        // consumed exactly once, by whichever open below
+                        // `take()`s it first. A later `ReopenRows` reopen
+                        // must see `None` and pay for its own fetch (real GET
+                        // or read-cache hit), or `tenant_bytes_with_footer`
+                        // charges `add_bytes_reused` twice for one buffer
+                        // (issue #835 follow-up).
+                        this.current_whole_object = whole_object;
                         this.seg_columnar_blocks = 0;
                         this.block_cursor = 0;
                         // Whole-segment fast path reads the object in one GET
@@ -3312,11 +3448,18 @@ impl Stream for LogScanStream {
                                 by_chunk,
                             ))
                         } else {
+                            // `take()`, not the moved-in value directly: this
+                            // IS the one consumption of the carried whole
+                            // object (see the comment above where it moved
+                            // into `current_whole_object`). Taking it here
+                            // leaves `None` behind for any later reopen.
+                            let whole_object = this.current_whole_object.take();
                             LogScanState::Opening(open_segment_subset(
                                 Arc::clone(&this.ctx),
                                 seg,
                                 indices,
                                 footer,
+                                whole_object,
                             ))
                         };
                     }
@@ -3480,11 +3623,19 @@ impl Stream for LogScanStream {
                                 let by_chunk = this.ctx.open_by_column_chunk(&seg);
                                 open_segment_fast(Arc::clone(&this.ctx), seg, by_chunk)
                             } else {
+                                // `take()`, not `clone()`: the first open
+                                // already took the carried whole object (if
+                                // any), so this is always `None` here. `take`
+                                // rather than reading the field directly keeps
+                                // that single-consumption invariant true by
+                                // construction instead of by this call site
+                                // happening to run after the first one.
                                 open_segment_subset(
                                     Arc::clone(&this.ctx),
                                     seg,
                                     this.current_indices.clone(),
                                     this.current_footer.clone(),
+                                    this.current_whole_object.take(),
                                 )
                             };
                             this.state = LogScanState::ReopenRows {

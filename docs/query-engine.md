@@ -476,6 +476,26 @@ segment at or below the block-range threshold counts there too: the fetch reads
 such an object whole in one GET regardless, so planning it from the skip index
 would cost a second read rather than save one.
 
+Since issue #835, that plan-phase whole-object read is carried forward into
+the scan (`ravel_query::CarriedWholeObject`) instead of being thrown away:
+the scan that follows opens the identical bytes from the carry rather than
+issuing its own GET, so the object crosses the wire at most once per
+statement regardless of read-cache size. Before the fix, only a cache large
+enough to still hold the object by the time the scan reached it turned the
+second read into a hit instead of a real GET, so a corpus larger than the
+cache paid the full double read on every such statement. Reuse needs no etag
+re-check: the plan and scan of one statement share the same immutable
+`SegmentRef` out of one resolved snapshot, and the whole-object cache key is
+already keyed on `seg_ref.content_hash`, so there is no live GET spanning the
+gap between the two reads for a changed object to be missed by. The one
+`plan_full_reads` GET remains the true cost; the reused bytes are charged to
+`QueryAccounting::add_bytes_reused`, not folded into the GET-bytes figure the
+plan phase already recorded, so a report distinguishes a genuine wire GET
+from a carried reuse. This carry has a real memory cost of its own -- see
+`crates/ravel-sql/src/logs_scan.rs`'s module doc, "Whole-object fallback
+carry, and its memory bound (issue #835)", for what the shipped design
+actually bounds it to.
+
 ### Requests per object on a version-4 object
 
 A version-4 RLOG object (ADR-0699) stores each row group's pages column-major

@@ -1300,7 +1300,15 @@ impl LogSegmentFetcher {
         tenant_hash: TenantHash,
         query: &LogQuery,
         caller_accounting: &QueryAccounting,
-    ) -> Result<Option<(usize, ScanStats, Option<footer::LogFooter>)>, LogFetchError> {
+    ) -> Result<
+        Option<(
+            usize,
+            ScanStats,
+            Option<footer::LogFooter>,
+            Option<CarriedWholeObject>,
+        )>,
+        LogFetchError,
+    > {
         let phase = PhaseAccounting::new();
         let accounting = phase.plan();
         let result = async {
@@ -1336,7 +1344,9 @@ impl LogSegmentFetcher {
                     .await?;
                 // Footer-carrying branch: no block byte is read here, so the
                 // touch is the scan that follows a nonzero survivor count.
-                return Ok(Some((n, stats, Some(footer), n > 0)));
+                // No whole-object bytes to carry either: this branch reads
+                // only the footer, never a block.
+                return Ok(Some((n, stats, Some(footer), n > 0, None)));
             }
 
             // Skip-index-only survivor count (#761): when every block-level predicate
@@ -1406,8 +1416,15 @@ impl LogSegmentFetcher {
                 };
                 // Footer-carrying branch: only the probe, SKIP_IDX and FIELD_DIR
                 // were read, no block byte, so the touch is the scan a nonzero
-                // survivor count will drive.
-                return Ok(Some((survivors, plan_stats, Some(footer), survivors > 0)));
+                // survivor count will drive. No whole-object bytes either, for
+                // the same reason as the fast path above.
+                return Ok(Some((
+                    survivors,
+                    plan_stats,
+                    Some(footer),
+                    survivors > 0,
+                    None,
+                )));
             }
 
             // Fallback: a predicate the skip index cannot decide (a `has_word`/text
@@ -1417,7 +1434,11 @@ impl LogSegmentFetcher {
             // buffer -- and hand no footer forward. This whole-object plan read is the
             // amplification #761 could not remove for these shapes; the caller counts
             // it (a `None` footer on a relevant segment) as a `plan_full_reads` so a
-            // report can see which queries still pay it.
+            // report can see which queries still pay it. Issue #835: when it resolved
+            // the WHOLE object (`blocks_read` is `None`), these bytes are carried
+            // forward as a [`CarriedWholeObject`] so the scan that follows does not
+            // pay a second wire GET for them -- the amplification #761 could not
+            // remove from this plan read no longer forces a second one at scan time.
             let all = ColumnSelection::all();
             let Some((bytes, blocks_read)) = self
                 .tenant_bytes(
@@ -1445,7 +1466,26 @@ impl LogSegmentFetcher {
                 None => true,
                 Some(n) => n > 0,
             };
-            Ok(Some((scan.remaining_blocks(), scan.stats(), None, touched)))
+            // `blocks_read` is `None` exactly when the whole object is present in
+            // `bytes` (the below-threshold path, or an above-threshold read that
+            // crossed over to a whole-object GET): safe to carry forward whatever
+            // the scan's own column selection turns out to be. `Some(_)` is a
+            // ranged read fetched under `ColumnSelection::all`, which is not
+            // necessarily what the scan will select on a version-4 object (ADR-0699
+            // decision 5), so it is not carried.
+            let carried = match blocks_read {
+                None => Some(CarriedWholeObject {
+                    bytes: bytes.clone(),
+                }),
+                Some(_) => None,
+            };
+            Ok(Some((
+                scan.remaining_blocks(),
+                scan.stats(),
+                None,
+                touched,
+                carried,
+            )))
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -1488,12 +1528,14 @@ impl LogSegmentFetcher {
         // fallback from whether `tenant_bytes` read any block (contract:
         // `ravel_types::accounting`, blocks read are cache-inclusive, so the
         // signal is resolved blocks, never wire bytes).
-        if let Ok(Some((_, _, _, touched))) = &result
+        if let Ok(Some((_, _, _, touched, _))) = &result
             && *touched
         {
             caller_accounting.add_data_objects_touched(1);
         }
-        result.map(|opt| opt.map(|(survivors, stats, footer, _)| (survivors, stats, footer)))
+        result.map(|opt| {
+            opt.map(|(survivors, stats, footer, _, carried)| (survivors, stats, footer, carried))
+        })
     }
 
     /// Whether [`plan_segment`](Self::plan_segment)'s survivor count can be read
@@ -1744,6 +1786,14 @@ impl LogSegmentFetcher {
     /// [`fetch_object_with_footer`](Self::fetch_object_with_footer)); `None`
     /// probes as before. It changes only the read shape, never the bytes decoded.
     ///
+    /// `carried_whole`, when `Some`, is the whole-object [`Bytes`] a prior
+    /// [`plan_segment`](Self::plan_segment) fallback already fetched for this
+    /// exact (immutable) object (issue #835). Supplying it skips this call's own
+    /// wire GET entirely -- no cache lookup, no store round trip -- and charges
+    /// the reused bytes to `accounting.add_bytes_reused` instead of a cache hit
+    /// or miss. `None` fetches as before (cache-aware whole-object or ranged
+    /// read, per [`tenant_bytes_with_footer`](Self::tenant_bytes_with_footer)).
+    ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
     ///
     /// Issue #796: `scan` phase, same reasoning and the same not-buffered
@@ -1759,6 +1809,7 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         indices: &[usize],
         footer: Option<&footer::LogFooter>,
+        carried_whole: Option<CarriedWholeObject>,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
         let Some((bytes, _blocks_read)) = self
@@ -1768,6 +1819,7 @@ impl LogSegmentFetcher {
                 query,
                 columns,
                 footer,
+                carried_whole,
                 ProbePhase::Scan,
                 accounting,
             )
@@ -1824,6 +1876,7 @@ impl LogSegmentFetcher {
             query,
             columns,
             None,
+            None,
             phase,
             accounting,
         )
@@ -1855,6 +1908,15 @@ impl LogSegmentFetcher {
     /// a caller decide "were this object's blocks read" from the blocks actually
     /// resolved, not from wire bytes, which a fully-pruned ranged read moves none
     /// of even though the read happened.
+    ///
+    /// `carried_whole`, when `Some`, is a [`CarriedWholeObject`] a prior
+    /// `plan_segment` fallback fetched for this exact object (issue #835): its
+    /// bytes are the whole object, valid for any `columns` selection, so this
+    /// short-circuits both the below- and above-threshold branches below,
+    /// issuing no store GET and no cache lookup at all. The reused bytes are
+    /// charged to `accounting.add_bytes_reused`, not to a cache hit -- the
+    /// object was never asked of the cache on this call. Safe with no etag
+    /// re-check: see [`CarriedWholeObject`]'s doc.
     #[allow(clippy::too_many_arguments)]
     async fn tenant_bytes_with_footer(
         &self,
@@ -1863,11 +1925,17 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         footer: Option<&footer::LogFooter>,
+        carried_whole: Option<CarriedWholeObject>,
         phase: ProbePhase,
         accounting: &QueryAccounting,
     ) -> Result<Option<(Bytes, Option<u64>)>, LogFetchError> {
         if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
             return Ok(None);
+        }
+
+        if let Some(carried) = carried_whole {
+            accounting.add_bytes_reused(carried.bytes.len() as u64);
+            return Ok(Some((carried.bytes, None)));
         }
 
         // #913: which phase this read's metadata GETs and its BLOCKS-section
@@ -2807,6 +2875,41 @@ pub struct CarriedFooter<'a> {
     /// this object's tail-section probe misses
     /// ([`BlockRangeStats::probe_misses`]).
     pub tail_misses_counted: bool,
+}
+
+/// The whole-object bytes [`LogSegmentFetcher::plan_segment`]'s whole-object
+/// fallback already fetched for this exact (immutable) `SegmentRef`, carried
+/// into the scan so it does not issue a second wire GET for the same object
+/// (issue #835).
+///
+/// Reuse needs no etag re-check, unlike [`CarriedFooter`]'s scan read: the
+/// plan and the scan of one statement share the very same `SegmentRef` out of
+/// one resolved snapshot, and `LogSegmentFetcher`'s whole-object cache key is
+/// keyed on `seg_ref.content_hash` (see [`EtagPin`]'s doc: "a cache key
+/// carries the object's `content_hash`, so an entry is by construction bytes
+/// of this exact content rather than of whatever the store holds now"). No
+/// live GET spans the gap between the plan read and the scan read for this
+/// carry to defend against -- there is no second live GET at all -- so the
+/// same reasoning that exempts a cache hit from the pin applies here.
+///
+/// Always the ENTIRE object: the plan fallback only carries these bytes
+/// forward when its own read resolved every block (the below-threshold
+/// whole-object path, or an above-threshold read that crossed over to a
+/// whole-object GET), never a column-selection-scoped ranged read. So the
+/// bytes are valid for the scan's column selection whatever it is, even
+/// though the plan fetched with [`ColumnSelection::all`].
+#[derive(Clone)]
+pub struct CarriedWholeObject {
+    bytes: Bytes,
+}
+
+impl CarriedWholeObject {
+    /// The carried object's byte length, for a caller that needs to account
+    /// for held-but-not-yet-consumed carry bytes (issue #835's memory bound)
+    /// without decoding or copying them.
+    pub fn byte_len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
 }
 
 /// One candidate block's absolute byte extent in the object and its stored crc,
@@ -5994,7 +6097,7 @@ mod plan_fast_path_tests {
 
         // Predicate-free, ts window strictly contains [min, max].
         let query = LogQuery::new(i64::MIN, i64::MAX);
-        let (count, stats, _footer) = f
+        let (count, stats, _footer, _carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
@@ -6032,7 +6135,7 @@ mod plan_fast_path_tests {
 
         // Exact span bounds: ts_min == min_event_ts_ns, ts_max == max_event_ts_ns.
         let query = LogQuery::new(seg.min_event_ts_ns, seg.max_event_ts_ns);
-        let (count, _stats, _footer) = f
+        let (count, _stats, _footer, _carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
@@ -6064,7 +6167,7 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -6082,7 +6185,7 @@ mod plan_fast_path_tests {
             AttrValue::Str("svc".into()),
         ));
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -6099,7 +6202,7 @@ mod plan_fast_path_tests {
             vec![("request.id".into(), "r0".into())],
         )]);
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -6115,7 +6218,7 @@ mod plan_fast_path_tests {
         // run and the survivor count is N-2, not N.
         let q = LogQuery::new(2, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -6137,7 +6240,7 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
@@ -6175,7 +6278,7 @@ mod plan_fast_path_tests {
             );
         let query = LogQuery::new(i64::MIN, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _, _) = f
+        let (count, _, _, _) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan")
@@ -7274,7 +7377,7 @@ mod plan_skip_decidable_span_tests {
             min: Some(0i64 as u64),
             max: Some(1_000i64 as u64),
         });
-        let (count, _stats, footer) = f
+        let (count, _stats, footer, carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
@@ -7283,6 +7386,10 @@ mod plan_skip_decidable_span_tests {
         assert!(
             footer.is_some(),
             "skip-decidable branch forwards the parsed footer like the fast path does"
+        );
+        assert!(
+            carried.is_none(),
+            "skip-decidable branch reads no block byte, so it carries no whole-object bytes"
         );
 
         let closed = collector.closed.lock().expect("lock");
@@ -7403,7 +7510,7 @@ mod plan_skip_decidable_span_tests {
             let f = fetcher_with_suffix(store, suffix);
             let acc = QueryAccounting::new();
 
-            let (count, _stats, footer) = f
+            let (count, _stats, footer, _carried) = f
                 .plan_segment(&seg, TENANT, &query, &acc)
                 .await
                 .expect("plan_segment")
@@ -7419,6 +7526,7 @@ mod plan_skip_decidable_span_tests {
                     &ColumnSelection::all(),
                     &indices,
                     footer.as_ref(),
+                    None,
                     &acc,
                 )
                 .await

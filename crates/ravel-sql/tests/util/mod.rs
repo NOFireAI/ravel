@@ -351,7 +351,8 @@ impl ObjectStoreBackend for CountingStore {
         range: ravel_object_store::GetRange,
     ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
         self.gets.fetch_add(1, Ordering::AcqRel);
-        self.inner.get(key, range).await
+        let outcome = self.inner.get(key, range).await?;
+        Ok(outcome)
     }
 
     async fn head(

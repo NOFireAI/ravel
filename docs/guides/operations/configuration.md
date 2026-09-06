@@ -987,6 +987,11 @@ memory is unknown; an explicit flag bounds both at that one value) and
 `--gc-max-query-duration` (11 minutes). Memory is read from `/proc/meminfo`'s
 `MemTotal` on Linux and is "unknown" everywhere else; cores come from the
 process's available parallelism, floored at 1. Percentages truncate.
+`--cache-max-bytes` no longer changes how many times a logs statement moves a
+given object's bytes: since issue #835, a query's plan-phase whole-object read
+(the `has_word`/text and other skip-index-undecidable fallback) is carried
+into the scan regardless of cache size, so undersizing this flag can no
+longer turn one wire GET per relevant object into two.
 
 Every resolved value is logged once at startup with the source it came from
 (`derived`, `flag`, or `fallback`), so `journalctl -u ravel-server | grep
