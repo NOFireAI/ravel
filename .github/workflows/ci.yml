@@ -215,6 +215,10 @@ jobs:
         run: bash scripts/guards/check-test-hygiene.test.sh
       - name: Test-hygiene guard (issue #778)
         run: scripts/guards/check-test-hygiene.sh
+      - name: Injected-clock helper guard cases (issue #1260)
+        run: bash scripts/tests/check-injected-clock-helpers.test.sh
+      - name: Injected-clock helper guard (issue #1260)
+        run: bash scripts/check-injected-clock-helpers.sh
       - name: Python script unit tests
         run: make test-python
 

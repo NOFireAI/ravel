@@ -62,6 +62,13 @@ cargo --locked fmt --all --check
 echo "==> scripts/guards/check-test-hygiene.sh"
 "$(dirname "$0")/guards/check-test-hygiene.sh"
 
+# "No wall-clock wait in an injected-clock test helper" cost two gate reruns
+# (issue #1260: the flaky pair test, then its rewrite under #1235). Another
+# check rather than another paragraph, same reasoning as the hygiene guard
+# above: a source scan, no build, ahead of the expensive lanes.
+echo "==> scripts/check-injected-clock-helpers.sh"
+"$(dirname "$0")/check-injected-clock-helpers.sh"
+
 # Match CI's `check` job: it runs `cargo nextest run --workspace
 # --cargo-profile ci`. Use nextest when it is installed so a local run
 # warms the same `ci`-profile artifacts CI reuses; fall back to `cargo
