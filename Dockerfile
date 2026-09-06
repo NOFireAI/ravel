@@ -13,7 +13,7 @@
 # ---- Builder ----------------------------------------------------------------
 # Pinned to the workspace toolchain (rust-toolchain.toml channel = 1.97.1) so
 # the image build uses the same compiler CI and local development pin to.
-FROM rust:1.97.1-bookworm AS builder
+FROM rust:1.97.1-bookworm@sha256:0e2bcaef56d041a486784e54104a81aebe0da44bd03019bd70bc0401e42e4a97 AS builder
 
 WORKDIR /app
 
@@ -78,7 +78,7 @@ RUN set -eux; \
 # distroless/cc: glibc (no untested musl), ships ca-certificates for
 # object_store's TLS path against real AWS S3, and carries no shell or package
 # manager. The :nonroot tag runs as an unprivileged user by default.
-FROM gcr.io/distroless/cc-debian12:nonroot AS server
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS server
 
 COPY --from=builder /app/target/release/ravel-server /usr/local/bin/ravel-server
 COPY --from=builder /app/target/release/ravel-cli /usr/local/bin/ravel-cli
@@ -101,7 +101,7 @@ ENTRYPOINT ["/usr/local/bin/ravel-server"]
 # base and the same CARGO_BUILD_JOBS=2 builder stage as the server image, so it
 # inherits the OOM fix without a second build configuration.
 # `--target operator` builds only this image.
-FROM gcr.io/distroless/cc-debian12:nonroot AS operator
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS operator
 
 COPY --from=builder /app/target/release/ravel-operator /usr/local/bin/ravel-operator
 
@@ -119,7 +119,7 @@ ENTRYPOINT ["/usr/local/bin/ravel-operator"]
 # same CARGO_BUILD_JOBS=2 builder stage as the server and operator images, so it
 # inherits the OOM fix without a second build configuration.
 # `--target ingest-router` builds only this image.
-FROM gcr.io/distroless/cc-debian12:nonroot AS ingest-router
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS ingest-router
 
 COPY --from=builder /app/target/release/ravel-ingest-router /usr/local/bin/ravel-ingest-router
 

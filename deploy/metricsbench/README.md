@@ -73,16 +73,31 @@ docker compose -f deploy/metricsbench/docker-compose.yml down -v
 deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
 ```
 
-Exit 0 means every image reference in the deployment carries an `@sha256:`
-digest, every ADR-0927-required comparator is present, and the number of image
-references equals the expected count. Any unpinned reference, any missing
-required comparator, or a reference count that drifts from the expected number
-fails the check with a non-zero exit. The script prints what it checked and how
-many references it found.
+Originally scoped to this directory's compose file alone (issue #934), the
+script now also checks the two repo-wide supply-chain pins issue #1310 added:
+every `FROM`/`ARG` base image in the root `Dockerfile` and `Dockerfile.prebuilt`,
+and every `uses:` action reference under `.github/workflows/` and
+`.github/actions/`. All three categories run in one invocation and each is
+checked against its own expected count:
 
-This check is **not yet run by CI**. Wiring it into `scripts/gates.sh` or a CI
-workflow is a deliberate follow-up: those are shared files outside issue #934's
-scope.
+- **Compose images** (this directory): every image reference carries an
+  `@sha256:` digest, every ADR-0927-required comparator is present, and the
+  number of image references equals the expected count.
+- **Dockerfile base images**: every `FROM`/`ARG` base image reference in the
+  root `Dockerfile` and `Dockerfile.prebuilt` carries an `@sha256:` digest
+  (`FROM scratch` is exempt: no registry manifest exists for it), and the
+  number of references equals the expected count.
+- **Workflow actions**: every `uses:` reference in every workflow and
+  composite action carries a 40-hex commit SHA pin, and the number of
+  references equals the expected count.
+
+Exit 0 means all three categories passed. Any unpinned reference, any missing
+required comparator, or a reference count that drifts from any category's
+expected number fails the check with a non-zero exit. The script prints what
+it checked and how many references it found in each category.
+
+This check runs in CI, wired into the `doc-scripts` job in
+`.github/workflows/ci.yml`.
 
 ## Pinned image digests
 

@@ -23,6 +23,9 @@ on:
     # week is enough to keep the numbers current without a per-PR cost.
     - cron: "17 4 * * 1"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -34,7 +37,7 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Credential guard: the org-level secret is mapped into an env var and
       # checked for non-emptiness. On a fork or an unconfigured org the secret
       # is empty, `have_creds` is false, and every real step below is skipped,
@@ -66,7 +69,7 @@ jobs:
       - name: Disable sccache if its install flaked
         if: steps.creds.outputs.have_creds == 'true' && steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: steps.creds.outputs.have_creds == 'true'
       - name: Build the bench_report bin
         if: steps.creds.outputs.have_creds == 'true'
@@ -92,7 +95,7 @@ jobs:
             --out bench/reports/report-s3.json
       - name: Upload the JSON report
         if: steps.creds.outputs.have_creds == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bench-s3-report
           path: bench/reports/report-s3.json
