@@ -388,8 +388,8 @@ ratios for PromQL to compute, per `cache` and per `tier`.
 Labels: `mode`, `tenant_hash`, `signal`, plus `reason` on the rejection
 counter. This family folds tenants per the rule above. The
 [admission limits guide](admission-limits.md) covers this family in
-operational depth, and [troubleshooting](operations/troubleshooting.md) gives
-its alert rules.
+operational depth. No alert rule for it is written yet; alert on a rejection
+rate against the workload's expected admission behavior until one is.
 
 | Metric | Meaning |
 |---|---|
@@ -485,7 +485,7 @@ the family entirely.
 | Metric | Meaning |
 |---|---|
 | `ravel_distrib_fragment_requests_total` | Inbound fragment (`SeriesFetch`) requests served after passing token auth and fragment admission. Worker side. |
-| `ravel_distrib_fragment_auth_failures_total` | Inbound fragment requests refused for a missing or invalid cluster bearer token. |
+| `ravel_distrib_fragment_auth_failures_total` | Inbound fragment requests refused at capability auth: missing, bad MAC, expired, tenant mismatch, or query mismatch. |
 | `ravel_distrib_fragment_inflight` | Gauge. Fragment requests currently holding a fragment-admission permit. |
 | `ravel_distrib_slices_local_total` | Slices this coordinator executed locally because it owns them (self-mapped, no network hop). |
 | `ravel_distrib_slices_remote_total` | Slices this coordinator dispatched to a remote worker and read back over the wire (counts the attempt that produced the usable result, whether the primary or the re-dispatch). |
@@ -562,11 +562,13 @@ Each example is a short procedure. Run the PromQL against Ravel's own
 
 ## Known gaps
 
-Three gaps limit what the per-query cost family can show: a failed query
-records no cost, a Flight SQL statement records two folds for one logical
-query, and an abandoned Flight fetch still records its partial cost. The
-[cost model guide](cost-model.md#per-query-cost-accounting) sets each one out
-in full, because each is a property of the accounting rather than of the
+Three gaps limit what the per-query cost family can show: a failed, timed-out,
+or cancelled query folds the cost it actually incurred, but the exported
+counters do not yet split by outcome, so that spend is indistinguishable from
+a successful query's; a Flight SQL statement records two folds for one
+logical query; and an abandoned Flight fetch still records its partial cost.
+The [cost model guide](cost-model.md#per-query-cost-accounting) sets each one
+out in full, because each is a property of the accounting rather than of the
 metric route.
 
 ## Background
