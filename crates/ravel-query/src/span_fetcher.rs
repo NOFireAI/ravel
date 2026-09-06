@@ -62,11 +62,6 @@ use ravel_rspan::{
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
-/// Owns a fetched `Bytes` together with its fetch-layer reservation (ADR-1170
-/// decision 2), so [`attach_reservation`] can make the reservation guard ride
-/// with a bare-`Bytes` return value: the guard releases when the last clone of
-/// the returned `Bytes` is dropped, never because the GET completed. `AsRef`
-/// forwards to the inner `Bytes`, so the wrapped view is byte-identical.
 /// One scanned span: the rebuilt record plus its `service_name` read straight
 /// from the v3 dictionary-encoded `COL_SERVICE_NAME` column (ADR-0054), rather
 /// than looked up by linear scan of the record's merged `attrs` map at build
