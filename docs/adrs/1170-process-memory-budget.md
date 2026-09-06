@@ -205,8 +205,8 @@ Reservations are released when the buffer is dropped, not when the GET
 completes.
 
 Buffers outlive the fetch layer, so the guard needs a handoff rule, and the
-rule is: **every byte is under exactly one of three ledgers at every instant,
-the cache cap, a fetch guard, or an SQL reservation, and a handoff may
+rule is: **every LIVE byte is under exactly one of three ledgers at every
+instant, the cache cap, a fetch guard, or an SQL reservation, and a handoff may
 double-count transiently but may never leave a gap.** Concretely:
 
 - A fetched buffer handed to an SQL scan is charged by that scan's own
@@ -307,6 +307,19 @@ marked):
   `fetcher` and `log_fetcher`, and no server task installs a finite budget yet.
 - The SQL cross-boundary overlap and the cache-hit overlap above are untracked
   by `handoff_overlap`.
+- **Idle assembly buffers.** The invariant above is stated over LIVE bytes for
+  a reason: `AssemblyBuffer::drop` returns its allocation to
+  `AssemblyBufferPool`'s free list, not to the allocator, so those bytes stay
+  resident under none of the three ledgers. This is structural to every RLOG
+  path, not to any one of them, and it is bounded separately by
+  `MAX_IDLE_ASSEMBLY_BUFFERS` and `MAX_IDLE_ASSEMBLY_BYTES` per fetcher, which
+  is why it is a known gap rather than an unbounded one. It matters most at the
+  coverage crossover, which drops its assembler before the covering read
+  reserves fresh: the reservation figure is then one object while residency is
+  briefly two, until the pool hands that buffer to the next read or evicts it.
+  Anything comparing `resident_t` against reserved totals, decision 4's
+  acceptance assertion included, must count the pool's idle bytes on the
+  resident side or it will read the difference as an accounting error.
 
 ### 3. A static carve under one number
 

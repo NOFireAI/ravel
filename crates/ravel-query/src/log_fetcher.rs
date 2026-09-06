@@ -2182,7 +2182,6 @@ impl LogSegmentFetcher {
                     phase,
                     &pin,
                     accounting,
-                    None,
                 )
                 .instrument(fetch_span.clone())
                 .await?;
@@ -3777,7 +3776,6 @@ impl BlockRangeFetcher {
         phase: QueryPhase,
         pin: &EtagPin,
         accounting: &QueryAccounting,
-        held_reservation: Option<ravel_memory::Reservation>,
     ) -> Result<(Bytes, u64, u64), LogFetchError> {
         // Reserve the covering read's whole extent before any GET (ADR-1170
         // decision 2): a refusal fails typed with zero GETs. The guard travels
@@ -3785,20 +3783,17 @@ impl BlockRangeFetcher {
         // branch, or carried by the `ObjectAssembler` in the segmented branch --
         // so it releases when the reader drops the assembled buffer.
         //
-        // Every current caller passes `None`: a coverage crossover that already
-        // holds a live assembler for this object drops it (releasing both the
-        // buffer and its reservation guard) before calling in here, rather than
-        // handing the live reservation across, because the assembler's borrows
-        // into its buffer can still be held past the crossover decision on some
-        // paths -- reusing the reservation without also proving no borrow
-        // survives the await would risk exactly the kind of gap ADR-1170
-        // decision 2 forbids. `held_reservation` stays available for a caller
-        // that can prove it holds no such borrow and wants to avoid the
-        // momentary reserve-then-release; today none does.
-        let reservation = match held_reservation {
-            Some(reservation) => reservation,
-            None => self.reserve_fetch(total_size)?,
-        };
+        // This always reserves fresh, and a coverage crossover holding a live
+        // assembler for the same object drops it first rather than handing its
+        // guard across. Accepting a caller's live reservation would mean
+        // proving, at every such call site, that no borrow into the assembler's
+        // buffer survives the await, and a caller that got that wrong would
+        // leave the buffer resident under no ledger, which is the gap decision 2
+        // forbids. The cost of reserving fresh is that a saturated budget can
+        // hand the freed extent to another task in between, turning a fetch that
+        // a handover would have completed into a typed refusal. That is
+        // fail-closed and allowed.
+        let reservation = self.reserve_fetch(total_size)?;
         if total_size <= self.max_fetch_run_bytes {
             let (bytes, live) = self
                 .cached_extent(
@@ -4648,9 +4643,6 @@ impl BlockRangeFetcher {
                     phases.blocks,
                     &pin,
                     accounting,
-                    // No assembler exists yet on the pre-probe crossover: reserve
-                    // the object bytes here for the first and only time.
-                    None,
                 )
                 .await?;
             if live_gets > 0 {
@@ -4917,9 +4909,6 @@ impl BlockRangeFetcher {
                     phases.blocks,
                     &pin,
                     accounting,
-                    // No live reservation to hand in: `asm` was just dropped,
-                    // so this reserves the object bytes fresh.
-                    None,
                 )
                 .await?;
             if live_gets > 0 {
@@ -5229,9 +5218,6 @@ impl BlockRangeFetcher {
                     phases.blocks,
                     pin,
                     accounting,
-                    // No live reservation to hand in: `asm` was just dropped,
-                    // so this reserves the object bytes fresh.
-                    None,
                 )
                 .await?;
             if live_gets > 0 {
@@ -7448,12 +7434,12 @@ mod whole_object_get_limiter_tests {
     /// exactly the second.
     ///
     /// Non-vacuity: removing the `drop(asm)` line immediately before the
-    /// `covering_read` call at the version-4 coverage crossover (this
-    /// fixture's `segment_format_version` is always `footer::VERSION`, so it
-    /// always dispatches to `fetch_object_v4`) restores the shape ADR-1170
-    /// decision 2 forbids: the assembler stays alive holding its own
-    /// reservation for the rest of the function while `covering_read` (still
-    /// handed `None`) reserves a second, independent one for the same object.
+    /// `covering_read` call at the version-4 coverage crossover (the dispatch
+    /// takes that branch because `RlogWriter` always emits `PAGE_DIR`, not
+    /// because of the stamped `segment_format_version`, which it never reads)
+    /// restores the shape ADR-1170 decision 2 forbids: the assembler stays
+    /// alive holding its own reservation for the rest of the function while
+    /// `covering_read` reserves a second, independent one for the same object.
     /// The budget below is sized for two objects specifically so this second
     /// reservation still succeeds instead of failing closed -- with that
     /// single line removed, `budget.reserved()` while the covering GET is

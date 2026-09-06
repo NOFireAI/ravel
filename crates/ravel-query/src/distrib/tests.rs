@@ -5043,9 +5043,12 @@ fn duplicate_partial_series_id_is_a_hard_error() {
     });
 }
 
-/// The coordinator reconstructs a worker's memory refusal from the frozen proto
-/// `Status` message alone: `parse_fetch_memory_exhausted` is the exact inverse
-/// of `FetchMemoryExhausted`'s `Display`. Three independently-editable
+/// The coordinator reconstructs a worker's memory refusal by parsing the
+/// figures back out of the gRPC status message, because today's `Status`
+/// carries only a code and a message: `parse_fetch_memory_exhausted` is the
+/// exact inverse of `FetchMemoryExhausted`'s `Display`. That is a stopgap, not
+/// a constraint -- the proto evolves additively, so three `uint64` fields would
+/// carry the figures and delete this coupling. Three independently-editable
 /// `#[error(..)]` strings render that variant -- `FetchError` (series fold,
 /// `distrib/mod.rs:355`), `LogFetchError` (log fold, `:529`), and
 /// `SpanFetchError` (span fold, `:682`) -- and nothing but this test keeps them
