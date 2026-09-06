@@ -374,6 +374,17 @@ there before changing a rule.
   merge script runs it after its rewrite; run it yourself after any
   manual amend or script-bypassing merge. A wrong identity on protected
   `main` cannot be fixed later.
+- `scripts/check-injected-clock-helpers.sh [file]`: exits non-zero when an
+  injected-clock test helper in `services/ravel-cli/src/load.rs` (any
+  function whose signature or body mentions `TestClock`, plus the two
+  helpers issue #1260 names by name) contains `thread::sleep`,
+  `tokio::time::sleep`, `Instant::`, `tokio::time::timeout`, or
+  `SystemTime`. Wired into `gates.sh`. Run it after touching that helper
+  region: a wall-clock wait smuggled back into a clock-driven test reads
+  as a real defect on a loaded machine, then as flakiness on a quiet one,
+  and both readings cost a full gate rerun before anyone thinks to look at
+  the test's own timing model. A scan that finds zero helpers is itself a
+  failure (a `TestClock` rename would otherwise empty the scan silently).
 
 ### Writing gate and poll shell
 
