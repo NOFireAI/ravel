@@ -1832,8 +1832,7 @@ leftover request, so the model is one round too many. The same sliding
   capacity_w)` is its own serial round count, a true lower bound on that
   wave in isolation; `serviceBatches` sums `batches_w` over every wave
   (distinct matcher sets, not the raw plan count `stats.estimate` scales
-  by -- a query naming two `SelectorPlan`s that share one matcher set, `up
-  + up offset 5m`, is fetched in one pass, so its `serviceBatches` does not
+  by -- a query naming two `SelectorPlan`s that share one matcher set, `up + up offset 5m`, is fetched in one pass, so its `serviceBatches` does not
   double). This sum is a deterministic model, not a bound: identical work
   always produces the same number, which makes it comparable across
   queries and useful for spotting a fan-out or permit-sizing regression,
