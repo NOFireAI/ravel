@@ -93,7 +93,11 @@ run_bounded() {
   return "${code}"
 }
 
-out_file="$(mktemp -t fleet-watch-loop)"
+# An explicit XXXXXX template rather than `mktemp -t fleet-watch-loop`: BSD
+# mktemp treats the argument as a prefix, GNU mktemp requires the Xs and fails
+# with "too few X's in template", which under `set -e` exits before the loop
+# ever starts. The bug is invisible on macOS and fatal on a Linux runner.
+out_file="$(mktemp "${TMPDIR:-/tmp}/fleet-watch-loop.XXXXXX")"
 trap 'rm -f "${out_file}"' EXIT
 
 while (( $(date +%s) < give_up_at )); do
