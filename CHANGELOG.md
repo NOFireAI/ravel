@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0]
+
 ### Added
 
 - **A `latency-first` logs fetch policy** (ADR-0996 amendment, superseded by
@@ -43,8 +45,55 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   provisioning history and the signal's fixed shard count. An `audit` query on
   a `--shards 1` deployment reads the query-audit shard instead of silently
   omitting it, and a wider deployment scans exactly as before.
+- **`ravel-memory`, one process-wide memory budget** (ADR-1170). The server
+  derived four memory ceilings from the host and enforced each in a component
+  that knew nothing of the others, so N tenants could each reserve half the
+  box. `ravel-memory` is a leaf crate holding one counter every ledger draws
+  from: a compare-and-swap reserve for the SQL adapter and an RAII reservation
+  for the fetch layer.
+- **Bloom pruning for PromQL `__body__` matchers** (ADR-1103 follow-up). A
+  `__body__` equality, or an anchored regex with a token-bounded mandatory
+  literal run, now pushes that literal onto the scan as a `has_word`
+  predicate, so the RLOG block bloom skips blocks before decode. The
+  per-record check still runs on every decoded record: the pushed word only
+  prunes, it never decides. Negated matchers, unsupported metacharacters and
+  `+`-quantified patterns are rejected by the extractor rather than pushed,
+  because token matching is not a superset of substring matching.
+- **A gate against wall-clock waits in injected-clock tests.**
+  `scripts/check-injected-clock-helpers.sh`, run by `gates.sh` and CI, fails on
+  `thread::sleep`, `tokio::time::sleep`, `tokio::time::timeout`, `Instant::`,
+  `SystemTime`, a bare `sleep(...)` or `.elapsed()` inside a helper that takes
+  a `TestClock` or `FixedClock`, unless the line carries
+  `// allow-wall-clock: <reason>`. Its default scope is the loader's test
+  module in `ravel-cli`; the one wait it found there was made clock-driven
+  rather than exempted.
+- **`scripts/verify-dispatch-gates.sh --with-gates`** runs `gates.sh` itself
+  inside the cold worktree instead of a hand-listed command set, so a
+  dispatched branch is checked against the same feature lanes CI runs and the
+  run leaves a gate receipt the merge script can reuse.
 
 ### Changed
+
+- **Cache warm-up keys off each tenant's latest ingest hour, not the current
+  hour.** On a tenant whose data is older than the warm-up window the previous
+  pass issued about 1,900 small object reads from the first query's own path
+  before warming nothing; those reads are gone, and the first query on a cold
+  process is about 3 s faster on the reference corpus. The replacement probe
+  costs about 1 s at startup, so end to end a cold start is about 2.5 s
+  faster, not 3. The probe fans out on the configured resolve concurrency,
+  asserts tenant isolation on every listed key, and is bounded per shard.
+- **Catalog resolve GET concurrency is configurable, default 128.** Every
+  record GET in `Catalog::resolve_impl` passed through a fixed bound of 16.
+  Measured against S3 on a 10,000-record unsealed tail, one cold resolve each:
+  23.2 s at 16, 4.4 s at 64, 2.3 s at 128, with the same 10,001 GETs at every
+  level. Cold resolve is concurrency-bound; this was the lever.
+- **SQL reservations are charged to the process budget** (ADR-1170). Every SQL
+  reservation now flows query, then tenant, then process on the way up, with a
+  process refusal rolling the tenant and query charges back before surfacing
+  as `ResourcesExhausted` naming the process figures. The infallible grow path
+  trips a ceiling breach when the process limit is exceeded, so a DataFusion
+  overshoot still ends in a typed error on the stream's next poll rather than
+  an unaccounted allocation.
 
 - **`--fetch-concurrency` unbundled into three flags** (ADR-1195): the SQL
   scan partition count, the PromQL/analytics per-query fetch fan-out, and the
@@ -70,6 +119,26 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   no GET limit at all, so a span-heavy deployment can see lower read
   concurrency and should size `--store-get-concurrency` for it. No fetcher in
   the server process owns a private limiter anymore.
+
+### Fixed
+
+- **The RLOG plan phase's whole-object read is carried into the scan.** On the
+  whole-object fallback, `plan_segment` fetched each object to plan it and the
+  scan fetched the same object again. The plan phase now hands its bytes to
+  the scan, which short-circuits on them before any GET and charges them to a
+  `bytesReused` figure rather than a cache hit. Retention is bounded: the
+  first segments to complete their plan keep their buffer, up to the SQL
+  partition count, and every later segment is re-fetched exactly as before, so
+  peak retained bytes are the partition count times the object size, never
+  the corpus. The saving is therefore about one duplicate read per unit of
+  plan fan-out; removing the rest needs the carry to stream per partition
+  instead of being held at the plan barrier, tracked separately.
+- **The RLOG raw prefetch is gated on the cursor budget before `try_join!`**
+  (ADR-0979 decision 4). The merge cursor's refill fetched the next two
+  row-group blocks before the budget had been checked, so up to twice the
+  group size was allocated and only accounted for on the following iteration.
+  The pending fetch window is now priced from resident metadata and reserved
+  before the fetch is issued.
 
 ## [0.13.0]
 
