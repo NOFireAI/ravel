@@ -1,12 +1,18 @@
 # Predicting the S3 request bill
 
 Storage is a rounding error in Ravel's cost. Request charges dominate: at a
-modeled 100-tenant, 1 TB/day workload, request fees run roughly $7-8k/month
-against roughly $100-150/month of storage, so request fees are over 97% of the
-total bill. This guide gives an operator the formula and the levers to predict
-and control that bill before deploying, not after the first invoice. The write
-path sets most of it and comes first; the read path adds a request count the
-engine itself chooses, and one flag moves it.
+modeled 100-tenant, 1 TB/day workload (three signals -- metrics, logs, and
+spans; audit runs its own separate maintenance path and is excluded here --
+at the shipped `--shards` default of 4, one ingest replica, and the shipped
+flush cadence from the next section), request fees run roughly $7-8k/month
+against roughly $100-150/month of storage, so request fees are over 97% of
+the total bill. A different shard count, replica count, or flush cadence
+moves this ratio; plug your own values into the formula below rather than
+trusting this sentence at a different scale. This guide gives an operator
+the formula and the levers to predict and control that bill before
+deploying, not after the first invoice. The write path sets most of it and
+comes first; the read path adds a request count the engine itself chooses,
+and one flag moves it.
 
 ## The formula
 
@@ -185,12 +191,19 @@ constant.
 
 ### Choosing a value, cheapest lever first
 
-1. **Leave it unset** (prefer latency). Costs nothing and changes nothing. It
-   is the right starting point for a latency-bound read path on a store whose
-   round-trip latency and single-stream bandwidth resemble the configuration
-   the default was measured on. A different store, region, or fetch
-   concurrency has a different break-even, so treat unset as a default to
-   measure against rather than one known to be correct everywhere.
+1. **Leave it unset** (this is the cost-preferring choice, not the
+   latency-preferring one). Costs nothing and changes nothing on its own, but
+   at the shipped reference profile the separate fetch-policy resolver
+   already saturates to whole-object reads regardless of this value, and that
+   shape measures slower and heavier, not faster: 486.0s and 463.79 GB
+   transferred against 285.8s and 150.28 GB for the ranged shape, on the same
+   42-statement corpus, cold. Leaving this unset is still the right starting
+   point when the object-store bill, not wall-clock time, is what is being
+   minimized. An operator who wants the faster, byte-lighter shape has to ask
+   for it explicitly through the fetch-policy flag (see
+   [caching.md](caching.md)); this knob does not select it, and a different
+   store, region, or fetch concurrency shifts the break-even for this knob
+   independently of that choice.
 2. **Leave it unset on an egress-billed backend** too. The default already
    sits far above that deployment's dollar break-even, so there is no lower
    value worth inventing.
@@ -248,10 +261,13 @@ measurement only.
 
 Three gaps limit what the per-query cost family can show:
 
-- A query that fails records no cost. A deadline breach, an admission
-  rejection, and an execution error all return before the fold, and the error
-  type carries no accounting snapshot. Read a sudden drop in the completed-query
-  count against steady request logs as failures, not as idle capacity.
+- A query that fails still folds the cost it actually incurred before
+  failing, including a deadline breach: what an accounting snapshot cannot
+  yet show is which of success, error, timeout, or cancellation the query
+  ended in, so a failed query's spend and a successful one's are not
+  distinguishable in the exported family today. Read a sudden drop in the
+  completed-query count against steady request logs as failures, not as idle
+  capacity, until that split is exported.
 - A Flight SQL statement records two folds, one per RPC. The plan request
   records the first fold and the fetch request records the second, so the
   completed-query counter counts 2 for one logical query, and the two folds sum
@@ -290,4 +306,5 @@ The two-object commit protocol and request-cost reduction through flush
 cadence and ingest affinity: ADR-0076. Per-query cost accounting and the
 `/metrics` cost family: ADR-0044. The read-side request-cost knob and its
 whole-versus-ranged routing: ADR-0904. The read-side request budget derived
-from shard count and cadence: ADR-0075. Fetch concurrency: ADR-0088.
+from shard count and cadence: ADR-0075. Fetch concurrency: ADR-0088. The
+cost-based-versus-latency-first fetch policy and its measured trade: ADR-1196.
