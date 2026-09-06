@@ -123,6 +123,12 @@ for exit_code in 0 3; do
   logged_cwd="$(sed -n 's/^cwd=\(.*\) args=.*/\1/p' "${call_log}")"
   check_eq "with-gates stub ran inside the worktree (stub exit ${exit_code})" "${worktree_dir}" "${logged_cwd}"
 
+  # Unscoped, or the real gates.sh writes no receipt: it only stamps one when
+  # its crate-argument list is empty, so a scoped invocation here would leave
+  # FLEET_MERGE_SKIP_GATES=1 with nothing to find.
+  logged_args="$(sed -n 's/^cwd=.* args=\(.*\)/\1/p' "${call_log}")"
+  check_eq "with-gates invokes the gate unscoped (stub exit ${exit_code})" "0" "${logged_args}"
+
   if [[ "${exit_code}" == "0" ]]; then
     printed_receipt="$(printf '%s\n' "${out}" | sed -n 's/^==> Gates receipt: //p')"
     check_true "with-gates prints a receipt path on success" "$([[ -n "${printed_receipt}" ]] && echo 1 || echo 0)"
@@ -184,6 +190,9 @@ check_eq "VERIFY_WITH_GATES=1 invokes the gate exactly once" "1" "${call_count}"
 worktree_dir="${worktree_parent}/verify-$(cd "${repo}" && git rev-parse --short HEAD)"
 logged_cwd="$(sed -n 's/^cwd=\(.*\) args=.*/\1/p' "${call_log}")"
 check_eq "VERIFY_WITH_GATES=1 runs the gate inside the worktree" "${worktree_dir}" "${logged_cwd}"
+
+logged_args="$(sed -n 's/^cwd=.* args=\(.*\)/\1/p' "${call_log}")"
+check_eq "VERIFY_WITH_GATES=1 invokes the gate unscoped" "0" "${logged_args}"
 
 printed_receipt="$(printf '%s\n' "${out}" | sed -n 's/^==> Gates receipt: //p')"
 receipt_file="$(
