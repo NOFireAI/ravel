@@ -4,17 +4,21 @@
 //! valid decode, never a panic, and a `BatchError` must leave the stream
 //! usable (docs/otap-ingest.md, CLAUDE.md testing patterns).
 //!
-//! KNOWN LIMITATION: a single-bit flip of a *valid* Arrow IPC stream can make
-//! the underlying `arrow_ipc::reader::StreamDecoder` panic inside
-//! `arrow-buffer` (`the offset of the new Buffer cannot exceed the existing
-//! length`) instead of returning `Err`. `StreamState::decode` forwards that
-//! panic; it does not convert an arrow-boundary panic into a typed
-//! `BatchError`, so the CLAUDE.md invariant "corrupt-input tests must produce
-//! typed errors, never panics" is not yet met at the arrow boundary. The
-//! reproducer `single_bit_flip_of_valid_ipc_can_panic_decoder` (ignored by
-//! default) demonstrates it; the proptest targets below catch the unwind so
-//! the fuzz job stays green while still exercising the path, and a caught
-//! panic is treated as this known gap, never as a harness bug.
+//! FORMERLY A KNOWN LIMITATION, now fixed in production: a single-bit flip of
+//! a *valid* Arrow IPC stream can make the underlying
+//! `arrow_ipc::reader::StreamDecoder` panic inside `arrow-buffer` (`the
+//! offset of the new Buffer cannot exceed the existing length`) instead of
+//! returning `Err`. `StreamState::decode` now catches that unwind at the
+//! arrow boundary itself and returns a typed
+//! `DecodeError::Batch(BatchError::InternalPanic(_))`, meeting the CLAUDE.md
+//! invariant "corrupt-input tests must produce typed errors, never panics" at
+//! the arrow boundary too (see `tests/decode_panic_caught.rs`, which asserts
+//! the production catch directly). The reproducer
+//! `single_bit_flip_of_valid_ipc_can_panic_decoder` (ignored by default) is
+//! kept as a minimal repro of the underlying arrow-buffer panic; the proptest
+//! targets below still catch the unwind themselves as defense in depth for
+//! this harness process, not because the decode path can still let one
+//! through.
 //!
 //! Non-overlap: tests/roundtrip.rs already has a `decode_never_panics_on_
 //! arbitrary_bytes` proptest that wraps random bytes as one zstd payload.
