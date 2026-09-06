@@ -279,7 +279,7 @@ pub enum MigrateOutcome {
     NotSealed,
     /// A retention tombstone is present; the bucket is never rewritten.
     Tombstoned,
-    /// A compaction (or rewrite) record already exists. The live record set is
+    /// A compaction record already exists. The live record set is
     /// L1 parts, not raw L0 objects; migrating those is the rewrite-on-
     /// touch, which reads L1 parts as inputs. This caller handles the pre-
     /// compaction L0 case only.

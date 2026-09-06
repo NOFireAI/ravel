@@ -1058,11 +1058,13 @@ fn classify_terminal(
         RetentionOutcome::NoPolicy | RetentionOutcome::NotSealed | RetentionOutcome::NotExpired => {
             match compaction {
                 Some(CompactionOutcome::AlreadyCompacted) => Some(TerminalState::Compacted),
-                // A live rewrite record refuses compaction for as long as it
-                // is there, and nothing deletes one, so the refusal is as
-                // terminal as an existing compaction record. Memoizing it only
-                // skips work: a lost memo costs a re-list, and a sealed
-                // bucket's L0 set is frozen.
+                // Mapped like an existing compaction record because the memo
+                // is advisory and never correctness-bearing: only interior-zone
+                // hours ever consult it, head and tail hours re-evaluate every
+                // tick regardless, and an interior entry is force-re-verified
+                // at least every re-verify interval. Even a wrong terminal
+                // state here only defers the next real evaluation by at most
+                // that interval; it gates no deletion or durability decision.
                 Some(CompactionOutcome::RewritePresent) => Some(TerminalState::Compacted),
                 Some(CompactionOutcome::BelowMinInputs { .. }) => {
                     Some(TerminalState::BelowThreshold)
