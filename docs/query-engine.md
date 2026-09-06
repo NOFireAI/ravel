@@ -1805,14 +1805,14 @@ and rendered as `stats.io`, additive beside `stats.phases`:
   `buffer_unordered` is a SLIDING window, not a wave-synchronous one: as
   soon as one admitted plan finishes, the next plan is admitted
   immediately, without waiting for its siblings, so a later wave's work
-  can start -- and finish -- before an earlier wave's is done. Concretely:
-  16 shared permits, 17 distinct matcher plans admitted through an outer
-  fan-out width of 16 (one segment each), plus one further plan whose
-  single segment fetch only becomes eligible after the first of the 17
-  resolves. The real scheduler finishes all of it in two rounds, because
-  that further fetch is admitted into the same round that drains the 17th
-  plan's leftover request, while the summed per-wave model reports
-  `ceil(17 / 16) + ceil(1 / 16) = 3`, one round too many. The same sliding
+  can start -- and finish -- before an earlier wave's is done. Concretely, in the formula's own
+inputs: 18 distinct matcher plans of one segment each, an outer fan-out width
+of 17, and 16 shared permits. Wave 0 admits 17 plans, 17 requests against a
+capacity of `min(17 * 17, 16) = 16`, so `ceil(17 / 16) = 2` batches; wave 1
+admits the last plan, 1 request, 1 batch; the summed model reports 3. The real
+scheduler drains all 18 requests through the 16 permits in two rounds, because
+the last plan's request is admitted into the round that clears wave 0's one
+leftover request, so the model is one round too many. The same sliding
   window can also undercount: modeling the whole query as wave-synchronous
   in one shot -- one binding concurrency (`min(promql_fetch_fanout *
   min(distinctMatcherSets, promql_fetch_fanout), sharedGetPermits)`)
