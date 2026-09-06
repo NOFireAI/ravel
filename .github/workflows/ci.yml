@@ -202,6 +202,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Supply-chain pin check (issue #1310)
+        run: deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh
       - name: Check derived-doc drift (docs/query-engine.md)
         run: scripts/check-doc-drift.sh
       # Documentation gate (ADR-1040 D3). Run UNPIPED: a pipeline's exit code is

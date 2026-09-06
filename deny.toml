@@ -1,5 +1,5 @@
 [graph]
-all-features = false
+all-features = true
 
 [advisories]
 version = 2
@@ -18,17 +18,35 @@ ignore = [
   # acceptable to ignore. No fixed bincode 1.x exists; revisit when
   # promql-parser drops the lrpar bincode dependency.
   "RUSTSEC-2025-0141",
-  # RUSTSEC-2024-0436: paste 1.0.15 is unmaintained (repo archived). It
-  # enters only through parquet (services/ravel-cli's bulk-import loader,
-  # ADR-0089), which uses it purely as a proc-macro for compile-time
-  # identifier concatenation. paste has no runtime API surface at all: it
-  # expands entirely during macro invocation and contributes nothing to
-  # the compiled binary or its runtime behavior, so "unmaintained" has no
+  # RUSTSEC-2024-0436: paste 1.0.15 is unmaintained (repo archived).
+  # `cargo tree -i paste --depth 1 --all-features` shows three entry
+  # points: arrow-flight, parquet (services/ravel-cli's bulk-import
+  # loader, ADR-0089), and tikv-jemalloc-ctl (dev-dependency only). All
+  # three use it purely as a proc-macro for compile-time identifier
+  # concatenation. paste has no runtime API surface at all: it expands
+  # entirely during macro invocation and contributes nothing to the
+  # compiled binary or its runtime behavior, so "unmaintained" has no
   # runtime security implication here, unlike a crate that ships code
   # that executes. No safe upgrade exists (the advisory's own suggested
-  # forks, pastey and with_builtin_macros, are not drop-in and parquet
-  # does not depend on either); revisit if parquet drops paste upstream.
+  # forks, pastey and with_builtin_macros, are not drop-in and none of
+  # the three depends on either); revisit if they drop paste upstream.
   "RUSTSEC-2024-0436",
+  # RUSTSEC-2026-0194 and RUSTSEC-2026-0195: quick-xml 0.26.0 and 0.39.4
+  # (two versions, both affected) enter only through inferno's SVG
+  # rendering (inferno <- pprof, `flamegraph` feature), which both
+  # ravel-bench and services/ravel-cli pull behind their own
+  # off-by-default `profiling` feature (see the matching `inferno`
+  # CDDL-1.0 license exception below). Both advisories describe CPU/memory
+  # exhaustion from parsing attacker-controlled, untrusted XML with many
+  # attributes or namespace declarations on a single start tag. inferno's
+  # quick-xml usage here only parses and writes flamegraph SVG built from
+  # locally generated pprof sample data (symbol names and stack frames
+  # from the same process), never externally supplied or untrusted XML,
+  # so the reachable input is not attacker-controlled even when the
+  # feature is enabled. No fixed inferno release pins quick-xml
+  # >=0.41.0 yet; revisit when it does.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
 ]
 
 [licenses]
@@ -49,11 +67,14 @@ allow = [
 # Scoped so the global allow list above stays tight.
 #
 # inferno 0.11.x is CDDL-1.0. It enters only through pprof's `flamegraph`
-# feature (inferno <- pprof), which ravel-bench pulls behind its
-# off-by-default `profiling` feature. ravel-bench is `publish = false` and
-# is a benchmark harness with no production caller, so inferno never reaches
-# a shipped binary. Scoped to the crate name so the global allow list stays
-# tight and CDDL-1.0 is not permitted for any other dependency.
+# feature (inferno <- pprof), which both ravel-bench and services/ravel-cli
+# pull behind their own off-by-default `profiling` feature. ravel-bench is
+# `publish = false` with no production caller; ravel-cli is a shipped
+# binary, but its default build (the root Dockerfile's `cargo build
+# --release --locked -p ravel-cli`, no --features) never turns `profiling`
+# on, so inferno never reaches the shipped image either. Scoped to the
+# crate name so the global allow list stays tight and CDDL-1.0 is not
+# permitted for any other dependency.
 exceptions = [
   { name = "tiny-keccak", allow = ["CC0-1.0"] },
   { name = "inferno", allow = ["CDDL-1.0"] },
