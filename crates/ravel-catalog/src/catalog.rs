@@ -2752,6 +2752,21 @@ impl Catalog {
         // general enough" wall the prefetch closure in `ravel-query` hit).
         let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
             .map(|key| async move {
+                // The single per-resolve site that decides "served from cache"
+                // for a commit record (ADR-0044, issue #1251). Prewarm is the
+                // first of the two touches every commit-record key gets in a
+                // resolve (this concurrent warming pass, then a sequential
+                // include), so a record already resident when prewarm reaches it
+                // was resident when the resolve began and is a cache serve;
+                // counting it here, not at the include touch, credits each
+                // record exactly once and never credits one this resolve fetched
+                // itself (a prewarm miss then an include hit off its own insert).
+                // `contains` peeks without recording a pooled hit/miss, so the
+                // pooled counters `load_and_validate`'s own `cache.get` keeps are
+                // untouched.
+                if self.cache.contains(tenant, &key) {
+                    accounting.record_commit_record_cache_hit();
+                }
                 self.load_and_validate(tenant, signal, shard, &key, accounting)
                     .await
                     .map(|_| ())
@@ -4358,6 +4373,204 @@ mod tests {
             .expect("budget of 4 must be exactly sufficient");
         assert_eq!(latest, Some((max_hour, true)));
         assert_eq!(instrumented.metrics().snapshot().list.calls, 4);
+    }
+
+    /// Issue #1251: the exact per-resolve count of commit records served from
+    /// the local decoded-record cache. Five commit records in five distinct
+    /// recent hours, no fold, one catalog so its record cache persists across
+    /// resolves. A first resolve over the two most-recent hours warms K = 2
+    /// records (cold, so its own delta is 0); a second resolve over all five
+    /// then serves exactly those two from cache and fetches the other three, so
+    /// its delta is exactly K.
+    ///
+    /// FLIP: delete the `record_commit_record_cache_hit()` call in
+    /// `prewarm_commit_records` and the `full ..., 2` assertion fails (the
+    /// counter stays 0).
+    #[tokio::test]
+    async fn commit_record_cache_serves_are_counted_exactly_without_a_snapshot() {
+        let store = Arc::new(MemoryStore::new());
+        // Zero lag/skew so the listing window is exactly [range.start hour,
+        // now_ns hour]; range.start then selects how many recent hours (hence
+        // records) a resolve lists and prewarms.
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                max_ingest_lag_ns: 0,
+                clock_skew_allowance_ns: 0,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+
+        let base_hour = 500_000u32;
+        let record_count = 5u32;
+        for offset in 0..record_count {
+            let hour = base_hour + offset;
+            let event = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+            publish_segment(
+                &store,
+                0,
+                u64::from(offset) + 1,
+                hour,
+                event,
+                event - 1_000,
+                event,
+            )
+            .await;
+        }
+        let now_ns = i64::from(base_hour + record_count - 1) * NS_PER_HOUR + 30 * 60_000_000_000;
+
+        // Warm the two most-recent hours (K = 2). Cold, so nothing is served
+        // from the cache yet: the new counter's delta is 0 even though the
+        // pooled cache_hits is not (each prewarmed key is hit on its include
+        // touch).
+        let warm_start_hour = base_hour + record_count - 2; // covers the last two hours
+        let warm_range = TimeRange {
+            start_ns: i64::from(warm_start_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        let warm_acc = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(
+                &tenant(),
+                Signal::Metrics,
+                warm_range,
+                &[],
+                now_ns,
+                &warm_acc,
+            )
+            .await
+            .expect("warm resolve");
+        assert_eq!(
+            warm_acc.snapshot().commit_record_cache_hits,
+            0,
+            "a cold resolve fetches every record it touches, so none is served from cache"
+        );
+
+        // Full window: the two warmed records are served from cache, the other
+        // three are fetched cold. Exactly K.
+        let full_range = TimeRange {
+            start_ns: i64::from(base_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+        let full_acc = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(
+                &tenant(),
+                Signal::Metrics,
+                full_range,
+                &[],
+                now_ns,
+                &full_acc,
+            )
+            .await
+            .expect("full resolve");
+        assert_eq!(
+            full_acc.snapshot().commit_record_cache_hits,
+            2,
+            "exactly the two pre-warmed commit records are counted as cache serves"
+        );
+    }
+
+    /// Issue #1251, the case that broke the old `(hits - (misses - 1)) / 2`
+    /// inference: a tenant WITH a folded snapshot HEAD. The sealed hour is
+    /// served from the snapshot part; K = 2 commit records published above the
+    /// watermark are the only listed commit records. A first resolve warms them
+    /// and admits the HEAD to the head cache (its own delta is 0); a second
+    /// resolve, at the same `now_ns` so the HEAD probe is a cache hit, serves
+    /// both recent records from cache. The HEAD hit does NOT inflate the count:
+    /// the delta is exactly K.
+    ///
+    /// FLIP: add `accounting.record_commit_record_cache_hit()` to the head-cache
+    /// hit branch of `read_head` (snapshot_resolve.rs) and this test's
+    /// `commit_record_cache_hits, 2` assertion fails (it reads 3, the HEAD probe
+    /// folded in) -- the same off-by-one the old inference had.
+    #[tokio::test]
+    async fn commit_record_cache_serves_are_counted_exactly_with_a_folded_snapshot_head() {
+        let store = Arc::new(MemoryStore::new());
+        let fold_margin = crate::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + crate::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + crate::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+        // One sealed hour, folded into a snapshot (HEAD + one part).
+        let sealed_hour = 500_000u32;
+        let sealed_created = (i64::from(sealed_hour) + 1) * NS_PER_HOUR - 1_000;
+        publish_segment(
+            &store,
+            0,
+            1,
+            sealed_hour,
+            sealed_created,
+            sealed_created - 1_000,
+            sealed_created,
+        )
+        .await;
+        let fold_now = (i64::from(sealed_hour) + 1) * NS_PER_HOUR + fold_margin;
+        let fold_catalog = Catalog::new(store.clone(), config(1)).expect("fold catalog");
+        fold_catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                fold_now,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold produces a snapshot HEAD");
+
+        // K = 2 commit records above the watermark (published after the fold, in
+        // two later hours), the only listed commit records.
+        let recent_hours = [sealed_hour + 10, sealed_hour + 11];
+        for (i, &hour) in recent_hours.iter().enumerate() {
+            let event = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+            publish_segment(
+                &store,
+                0,
+                2 + i as u64,
+                hour,
+                event,
+                event - 1_000,
+                event,
+            )
+            .await;
+        }
+        let now_ns = (i64::from(sealed_hour + 11) + 1) * NS_PER_HOUR + fold_margin;
+
+        // A fresh catalog so both the head cache and the record cache start
+        // empty; the same instance across both resolves so they persist.
+        let catalog = Catalog::new(store.clone(), config(1)).expect("resolve catalog");
+        let range = TimeRange {
+            start_ns: i64::from(sealed_hour) * NS_PER_HOUR,
+            end_ns: now_ns,
+        };
+
+        let warm_acc = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now_ns, &warm_acc)
+            .await
+            .expect("warm resolve");
+        assert_eq!(
+            warm_acc.snapshot().commit_record_cache_hits,
+            0,
+            "a cold resolve serves no commit record from cache"
+        );
+
+        let hit_acc = QueryAccounting::new();
+        catalog
+            .resolve_with_accounting(&tenant(), Signal::Metrics, range, &[], now_ns, &hit_acc)
+            .await
+            .expect("second resolve");
+        let hit_snap = hit_acc.snapshot();
+        assert!(
+            hit_snap.cache_hits > hit_snap.commit_record_cache_hits,
+            "the HEAD probe and the part cache are pooled hits this resolve, so the pooled \
+             counter exceeds the commit-record-only counter"
+        );
+        assert_eq!(
+            hit_snap.commit_record_cache_hits, 2,
+            "the two recent commit records are counted; the folded HEAD cache hit is not"
+        );
     }
 
     #[tokio::test]
