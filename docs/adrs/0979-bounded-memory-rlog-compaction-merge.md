@@ -259,7 +259,11 @@ heap_estimate()` alone is wrong while raw bytes remain resident. On
 the same admission lock as the initial reserve) to at least
 `metadata + retained raw + ceiling(block k+1)` — a later, larger block
 must clear the budget before its decode starts, never after — then
-reconciles down to actuals once the decode completes. The paired
+reconciles down to actuals once the decode completes. The same grow-and-check
+gates the OTHER point residency can rise: before `next_raw_block` issues its
+two-block raw prefetch, the charge GROWS atomically to at least
+`metadata + retained raw + fetch bytes`, so the fetch is refused rather than
+allocated-then-accounted. The paired
 invariant is pinned by a test in both directions and across the
 first-small/next-large sequence: at every point in a cursor's life the
 charge is ≥ its actual resident footprint (the ceiling really is a

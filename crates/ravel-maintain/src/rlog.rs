@@ -1849,9 +1849,14 @@ impl<'a> StreamCursor<'a> {
     /// about to be decoded BEFORE the decode starts, and a growth that would
     /// cross the budget refuses instead, so a later, larger block cannot be
     /// materialized past a budget the reconcile has already lowered the charge
-    /// below. `None` is for the first refill of a freshly admitted cursor,
-    /// whose reservation already covers every block it can decode, and for
-    /// tests driving a cursor with no budget in play.
+    /// below. A second gate point covers the raw two-block prefetch the same
+    /// way: BEFORE `next_raw_block`'s `try_join!` issues the fetch of the
+    /// current and "ahead" locs, the charge rises to cover the cursor's
+    /// metadata, its already-retained raw bytes, and the fetch's own byte
+    /// count, and a growth that would cross the budget refuses there instead,
+    /// before either GET lands. `None` is for the first refill of a freshly
+    /// admitted cursor, whose reservation already covers every block it can
+    /// decode, and for tests driving a cursor with no budget in play.
     async fn refill(
         &mut self,
         store: &dyn ObjectStoreBackend,
@@ -1875,7 +1880,18 @@ impl<'a> StreamCursor<'a> {
             if self.decode_next_block(tracker)? {
                 continue;
             }
-            // The current loc is fully decoded: fetch the next one.
+            // The current loc is fully decoded: fetch the next one. Gate the
+            // fetch on the budget BEFORE `next_raw_block`'s `try_join!` issues
+            // the two GETs (ADR-0979 decision 4 as amended): the refusal then
+            // costs nothing but the run, since no byte was moved and nothing
+            // was allocated. Nothing `.await`s between this check and the
+            // `try_join!` it gates.
+            if let (Some(b), Some((first, count, bytes))) =
+                (budget.as_deref_mut(), self.pending_raw_fetch())
+            {
+                let required = self.raw_fetch_charge_requirement(bytes);
+                b.grow_to_raw_fetch(&mut self.charged, first, count, bytes, required)?;
+            }
             match self.next_raw_block(store, tracker, ledger).await? {
                 Some((loc, data)) => {
                     self.group_raw_bytes = data.len() as u64;
@@ -2021,6 +2037,37 @@ impl<'a> StreamCursor<'a> {
         self.next_loc += 1;
         Some(loc)
     }
+
+    /// The fetch [`Self::next_raw_block`] would issue right now, or `None` if
+    /// a prefetch already covers the next loc (nothing to fetch, so nothing
+    /// to gate) or the candidate list is exhausted. Returns the first loc's
+    /// index, how many locs the fetch reads (one, or two when
+    /// `try_join!`'s look-ahead prefetch applies, issue #711), and their
+    /// combined raw byte count -- read-only, so calling this never advances
+    /// `next_loc` the way `take_next_loc` does.
+    fn pending_raw_fetch(&self) -> Option<(usize, usize, u64)> {
+        if self.prefetched.is_some() {
+            return None;
+        }
+        let first = self.locs.get(self.next_loc)?;
+        let ahead = self.locs.get(self.next_loc + 1);
+        let loc_count = if ahead.is_some() { 2 } else { 1 };
+        let fetch_bytes = first
+            .byte_len()
+            .saturating_add(ahead.map_or(0, |l| l.byte_len()));
+        Some((self.next_loc, loc_count, fetch_bytes))
+    }
+
+    /// What this cursor must be charged before [`Self::next_raw_block`] lands
+    /// `fetch_bytes` of raw loc data: everything it already holds plus the
+    /// fetch about to land, priced from metadata and the fetch's own byte
+    /// count alone (ADR-0979 decision 4 as amended). No decoded term:
+    /// fetching raw bytes decodes nothing, so there is no ceiling to add.
+    fn raw_fetch_charge_requirement(&self, fetch_bytes: u64) -> u64 {
+        loc_metadata_bytes(&self.locs)
+            .saturating_add(self.raw_resident_bytes())
+            .saturating_add(fetch_bytes)
+    }
 }
 
 /// One block's raw bytes by range. Named (not an inline `async` block) so its
@@ -2096,6 +2143,73 @@ impl CursorBudget<'_> {
         let Some(grow) = required.checked_sub(*cursor_charged).filter(|g| *g > 0) else {
             return Ok(());
         };
+        self.grow_by(
+            cursor_charged,
+            required,
+            grow,
+            MergeCursorBudgetSite::BlockGrow {
+                block_index: block,
+                grow_bytes: grow,
+            },
+        )
+    }
+
+    /// Raise one cursor's charge to `required` before [`StreamCursor::next_raw_block`]
+    /// issues the two-block raw fetch, refusing with
+    /// [`MaintainError::MergeCursorBudgetExceeded`] if the stream's running
+    /// charge cannot take the growth (ADR-0979 decision 4 as amended: the
+    /// same fail-closed check [`Self::grow_to`] runs before a decode, moved
+    /// to the point before the raw GETs are issued, so the fetch is refused
+    /// rather than allocated-then-accounted).
+    ///
+    /// Same non-`.await` adjacency guarantee as [`Self::grow_to`]: this runs
+    /// inside [`StreamCursor::refill`] immediately before the `try_join!`
+    /// it gates, with nothing else able to admit a cursor or grow a charge in
+    /// between.
+    fn grow_to_raw_fetch(
+        &mut self,
+        cursor_charged: &mut u64,
+        first_loc_index: usize,
+        loc_count: usize,
+        fetch_bytes: u64,
+        required: u64,
+    ) -> Result<()> {
+        let Some(grow) = required.checked_sub(*cursor_charged).filter(|g| *g > 0) else {
+            return Ok(());
+        };
+        self.grow_by(
+            cursor_charged,
+            required,
+            grow,
+            MergeCursorBudgetSite::RawFetch {
+                first_loc_index,
+                loc_count,
+                fetch_bytes,
+            },
+        )
+    }
+
+    /// Shared grow-and-check body for both gate points (ADR-0979 decision 4
+    /// as amended): raise the stream's running charge and this cursor's own
+    /// charge to `required`, refusing with
+    /// [`MaintainError::MergeCursorBudgetExceeded`] at `site` if the
+    /// stream's running charge cannot take `grow`.
+    ///
+    /// A `try_join!` that lands after this succeeds and then fails leaves
+    /// the charge grown to `required`: the fetch it was gating never
+    /// completed, so the growth overstates the cursor's real residency by
+    /// `grow` until the cursor is dropped. This is unobservable, because
+    /// `refill(..).await?` at the merge's call site
+    /// (`merge_stream_into_parts`) propagates that error out of the whole
+    /// run before anything -- another admission, another growth -- reads
+    /// the charge again.
+    fn grow_by(
+        &mut self,
+        cursor_charged: &mut u64,
+        required: u64,
+        grow: u64,
+        site: MergeCursorBudgetSite,
+    ) -> Result<()> {
         let charged_bytes = *self.charged;
         let required_bytes = charged_bytes.saturating_add(grow);
         if required_bytes > self.budget {
@@ -2106,10 +2220,7 @@ impl CursorBudget<'_> {
                 budget_bytes: self.budget,
                 required_bytes,
                 inputs_carrying_stream: self.inputs_carrying_stream,
-                site: MergeCursorBudgetSite::BlockGrow {
-                    block_index: block,
-                    grow_bytes: grow,
-                },
+                site,
             });
         }
         *self.charged = required_bytes;
@@ -7472,6 +7583,488 @@ mod tests {
             .expect("compact");
         let (rec, _parts) = read_output(&store).await;
         rec.parts.iter().map(|p| p.content_hash.clone()).collect()
+    }
+
+    /// Deterministic, non-repeating bytes so a large loc's stored
+    /// `byte_len()` reflects real payload size rather than a handful of
+    /// compressed tokens: an LCG stream has none of `"x".repeat(n)`'s
+    /// run-length structure for `zstd` to fold away.
+    fn raw_fetch_lcg_body(seed: u64, len: usize) -> String {
+        let mut state = seed.wrapping_add(1);
+        let mut out = String::with_capacity(len);
+        while out.len() < len {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let byte = (state >> 33) as u8;
+            out.push((32 + (byte % 95)) as char);
+        }
+        out
+    }
+
+    /// 16 records across four four-record blocks, one loc per block
+    /// ([`raw_fetch_fixture_cfg`]): eight tiny bodies (blocks 0 and 1), then
+    /// eight large, poorly-compressible LCG bodies (blocks 2 and 3), so the
+    /// SECOND two-block raw fetch (locs 2 and 3) moves real bytes, not a
+    /// vacuous growth.
+    fn raw_fetch_fixture_records(base: i64) -> Vec<LogRecord> {
+        (0..8i64)
+            .map(|i| record(0, base + i * 2, "tiny", Vec::new()))
+            .chain((0..8i64).map(|i| {
+                record(
+                    0,
+                    base + 16 + i * 2,
+                    &raw_fetch_lcg_body(i as u64, 4_000),
+                    Vec::new(),
+                )
+            }))
+            .collect()
+    }
+
+    /// Four-record blocks, ONE block per row group: every candidate block is
+    /// its own loc, so `next_raw_block`'s two-block prefetch always reads two
+    /// DIFFERENT locs, and `pending_block_index` goes `None` between every
+    /// pair of blocks -- the new raw-fetch gate, not the existing decode
+    /// gate, is what a refill reaches first there.
+    fn raw_fetch_fixture_cfg() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 4,
+            group_target_blocks: 1,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// Seed one [`raw_fetch_fixture_records`] input and load its catalog.
+    async fn raw_fetch_fixture_catalog(
+        store: &MemoryStore,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[LogRecord],
+    ) -> RlogInputCatalog {
+        let bytes = seed_l0(store, writer_id, seq, records, raw_fetch_fixture_cfg(), &[]).await;
+        stream_catalog(store, writer_id, seq, &bytes).await
+    }
+
+    /// Open a [`raw_fetch_fixture_catalog`] cursor and drive it exactly to
+    /// the point where the NEW raw-fetch gate is the first budget check a
+    /// refill reaches: block 0 decoded and drained by the initial
+    /// (budget-`None`) refill inside [`open_cursor`], then block 1 drained
+    /// after a refill under a deliberately generous budget (block 1's decode
+    /// goes through the EXISTING [`CursorBudget::grow_to`] gate, which this
+    /// test does not pin). Returns the cursor, the stream's running charge at
+    /// that point, and the eight timestamps blocks 0 and 1 yielded, in order.
+    async fn raw_fetch_fixture_cursor_before_second_fetch<'a>(
+        store: &'a MemoryStore,
+        catalog: &'a RlogInputCatalog,
+        stream_id: &LogStreamId,
+        tracker: &MergeMemoryTracker,
+        ledger: &RequestLedger,
+    ) -> (StreamCursor<'a>, u64, Vec<i64>) {
+        let mut cursor = open_cursor(store, catalog, 0, stream_id, Some(tracker), Some(ledger))
+            .await
+            .expect("open cursor")
+            .expect("input carries stream 0");
+        let reservation = cursor_reservation_bytes(catalog, stream_id)
+            .expect("reservation")
+            .expect("input carries stream 0");
+        cursor.reservation = reservation;
+        cursor.charged = reservation;
+        let mut charged = reservation;
+        reconcile_cursor_charge(&mut cursor, &mut charged);
+        let mut yielded = Vec::new();
+        for _ in 0..4 {
+            yielded.push(cursor.next_record().expect("record").expect("a row").ts_ns);
+        }
+        assert!(
+            cursor.peek_ts().is_none(),
+            "block 0 is drained but not yet released"
+        );
+
+        let mut generous = CursorBudget {
+            budget: u64::MAX / 2,
+            charged: &mut charged,
+            stream_id,
+            open_cursors: 1,
+            inputs_carrying_stream: 1,
+        };
+        cursor
+            .refill(store, Some(tracker), Some(ledger), Some(&mut generous))
+            .await
+            .expect("block 1 must decode under a generous budget");
+        reconcile_cursor_charge(&mut cursor, &mut charged);
+        for _ in 0..4 {
+            yielded.push(cursor.next_record().expect("record").expect("a row").ts_ns);
+        }
+        assert!(
+            cursor.peek_ts().is_none(),
+            "block 1 is drained but not yet released"
+        );
+        assert!(
+            cursor.group.is_none() && cursor.prefetched.is_none(),
+            "block 1 drained: the cursor must hold neither a group nor a prefetched loc, so \
+             the next refill's first budget check is the new raw-fetch gate"
+        );
+        (cursor, charged, yielded)
+    }
+
+    /// ADR-0979 decision 4 as amended, the raw-fetch clause: BEFORE
+    /// `next_raw_block` issues its two-block `try_join!`, an open cursor's
+    /// charge GROWS to `metadata + retained raw + the fetch's own byte
+    /// count`, and the growth is checked against the budget before the
+    /// `try_join!` runs -- a refusal there costs zero bytes moved, because
+    /// the gate sits ahead of the GETs, not after them.
+    ///
+    /// [`raw_fetch_fixture_records`] lays out four four-record blocks, one
+    /// loc per block. [`raw_fetch_fixture_cursor_before_second_fetch`]
+    /// replays a cursor's life up to the point where block 1 is drained and
+    /// the cursor holds neither a `group` nor a `prefetched` loc, so a
+    /// refill's first budget check is the NEW gate, over the fetch of locs 2
+    /// and 3 -- the two large, LCG-bodied blocks, so the growth this test
+    /// pins is a real one, not a vacuous pass.
+    ///
+    /// Both arms below replay that identical setup on a fresh store, then
+    /// diverge only on the budget over the locs-2/3 fetch: one byte below
+    /// [`StreamCursor::raw_fetch_charge_requirement`]'s figure refuses with
+    /// `MergeCursorBudgetSite::RawFetch` naming the refused fetch, with the
+    /// ledger's `block_read` counters UNCHANGED from right after the initial
+    /// open (proving neither GET of the refused fetch was issued); at
+    /// exactly that figure plus block 2's decode ceiling, the same refill
+    /// call both fetches locs 2 and 3 (the ledger's `block_read` requests
+    /// grow by exactly 2, its bytes by exactly locs 2 and 3's combined
+    /// `byte_len()`) and decodes block 2, and the cursor goes on to drain
+    /// blocks 2 and 3 to exhaustion in order.
+    ///
+    /// On this fixture the raw-fetch requirement before locs 2 and 3 land is
+    /// 26,801 B (location metadata plus their combined 26,577 B of stored
+    /// LCG bytes, against 50 B of tiny bytes for locs 0 and 1 combined),
+    /// against nothing already charged for a raw term (block 1 left no
+    /// group or prefetched loc resident), so the whole figure is the
+    /// growth. Block 2's decode ceiling is 22,255 B, so the admitted arm's
+    /// budget is 49,056 B, which the same refill call also grows the charge
+    /// to in full (block 2's decode-grow check finds the raw-fetch charge
+    /// covers only the fetch, not its own ceiling, and grows again up to
+    /// the budget).
+    ///
+    /// Demonstrated red by deleting the new gate arm entirely (the
+    /// `if let (Some(b), Some((first, count, bytes))) = ...` block in
+    /// `StreamCursor::refill`, immediately before the call into
+    /// `next_raw_block`): `expect_err` itself does NOT panic, because an
+    /// error still occurs -- but too late, and for the wrong reason. With
+    /// the new gate gone, the fetch of locs 2 and 3 succeeds unchecked, and
+    /// it is the pre-existing, unmodified `BlockGrow` decode-grow check
+    /// (over block 2's decode, run after the fetch) that trips instead, so
+    /// `err` is still `MergeCursorBudgetExceeded` but with the wrong `site`
+    /// and the wrong `required_bytes`. The match on `err`'s fields then
+    /// panics at the `required_bytes` assertion:
+    /// `assertion `left == right` failed: the number a retry must budget \
+    /// for is the raw-fetch requirement` with `left: 49056, right: 26801`
+    /// (49,056 is `admitted_budget`, i.e. block 2's decode requirement
+    /// including the raw-fetch bytes it now finds already resident, not the
+    /// raw-fetch-only figure of 26,801 this test pins).
+    ///
+    /// Demonstrated red for ORDERING by moving ONLY the
+    /// `grow_to_raw_fetch` call (keeping the SAME pre-fetch-snapshotted
+    /// `first`/`count`/`bytes`/`required`, computed before the fetch, so
+    /// every field the `err` match asserts on still lines up) to run after
+    /// `next_raw_block(store, tracker, ledger).await?` resolves, inside its
+    /// `Some((loc, data)) => { .. }` arm, instead of before the call: the
+    /// refusal still fires with the right `site` and `required_bytes`
+    /// (`expect_err` and the whole `err` match still pass), because
+    /// `required` was captured before the fetch ran, not recomputed after
+    /// it. What the relocated check can no longer prevent is the fetch
+    /// itself: `next_raw_block`'s `try_join!` has already issued and landed
+    /// both GETs of locs 2 and 3 by the time the refusal fires. The test's
+    /// "no byte moved" assertion catches exactly that, panicking at
+    /// `assertion `left == right` failed: a refused raw-fetch gate must
+    /// move zero requests and zero bytes` with
+    /// `left: PhaseRequests { requests: 4, wire_bytes_received: 26627, \
+    /// wire_bytes_sent: 0 }, right: PhaseRequests { requests: 2, \
+    /// wire_bytes_received: 50, wire_bytes_sent: 0 }` -- two more requests
+    /// and locs 2 and 3's combined bytes, moved by a "refused" fetch that
+    /// ran anyway because the gate was checked too late.
+    #[tokio::test]
+    async fn raw_fetch_refused_before_the_two_block_prefetch_lands() {
+        let recs = raw_fetch_fixture_records(0);
+        let (stream_id, _) = stream_ident(0);
+
+        // ---- Derive the fixture's real figures from a throwaway probe, via
+        // the same production methods the gate itself calls. ----
+        let probe_store = MemoryStore::new();
+        let probe_catalog =
+            raw_fetch_fixture_catalog(&probe_store, Uuid::from_u128(1), 1, &recs).await;
+        assert_eq!(
+            probe_catalog.pricing.block_rows,
+            vec![4, 4, 4, 4],
+            "the fixture must be four four-record blocks"
+        );
+        let locs = probe_catalog
+            .reader
+            .stream_blocks(&stream_id)
+            .expect("stream blocks")
+            .expect("input carries stream 0")
+            .clone();
+        assert_eq!(
+            locs.len(),
+            4,
+            "one loc per block under group_target_blocks: 1"
+        );
+        for (i, loc) in locs.iter().enumerate() {
+            assert_eq!(
+                loc.block_indices(),
+                [i],
+                "loc {i} must hold exactly its own block"
+            );
+        }
+        let tiny_bytes = locs[0].byte_len().saturating_add(locs[1].byte_len());
+        let probe_tracker = MergeMemoryTracker::new();
+        let probe_ledger = RequestLedger::new();
+        let (mut probe_cursor, _, _) = raw_fetch_fixture_cursor_before_second_fetch(
+            &probe_store,
+            &probe_catalog,
+            &stream_id,
+            &probe_tracker,
+            &probe_ledger,
+        )
+        .await;
+        let block1_heap = probe_cursor.decoded_bytes();
+        let (first_loc_index, loc_count, fetch_bytes) = probe_cursor
+            .pending_raw_fetch()
+            .expect("locs 2 and 3 remain, with no prefetch to cover them");
+        assert_eq!(
+            (first_loc_index, loc_count),
+            (2, 2),
+            "the second fetch reads locs 2 and 3 together"
+        );
+        let two_max_locs = 2 * locs.iter().map(|l| l.byte_len()).max().unwrap_or(0);
+        assert_eq!(
+            fetch_bytes,
+            locs[2].byte_len().saturating_add(locs[3].byte_len()),
+            "the pending fetch's bytes ({fetch_bytes} B) are exactly locs 2 and 3's stored \
+             lengths, not merely bounded by twice the largest loc ({two_max_locs} B)"
+        );
+        // Compose the requirement independently of
+        // `raw_fetch_charge_requirement`, the function under test, so an
+        // over-charge in that function cannot slip past its own assertion.
+        // Mirror `refill`'s own release of the drained block right before it
+        // computes this figure (`StreamCursor::refill`, immediately before
+        // the raw-fetch gate): the gate runs with nothing resident.
+        probe_cursor.release_block(Some(&probe_tracker));
+        assert_eq!(
+            probe_cursor.raw_resident_bytes(),
+            0,
+            "no raw loc is held between the locs-0/1 fetch and the locs-2/3 fetch"
+        );
+        assert_eq!(
+            probe_cursor.decoded_bytes(),
+            0,
+            "the gate runs with nothing resident: block 1 is released before it"
+        );
+        let required = loc_metadata_bytes(&locs) + probe_cursor.raw_resident_bytes() + fetch_bytes;
+        let ceiling_2 =
+            block_decode_ceiling_bytes(&probe_catalog.pricing, 2).expect("block 2 ceiling");
+
+        // ---- Arm 1: a budget one byte below `required` refuses, before
+        // either GET of the locs-2/3 fetch is issued. ----
+        let store = MemoryStore::new();
+        let catalog = raw_fetch_fixture_catalog(&store, Uuid::from_u128(1), 1, &recs).await;
+        let tracker = MergeMemoryTracker::new();
+        let ledger = RequestLedger::new();
+        let (mut cursor, charged, _prefix_ts) = raw_fetch_fixture_cursor_before_second_fetch(
+            &store, &catalog, &stream_id, &tracker, &ledger,
+        )
+        .await;
+        let before_gate = ledger.report().block_read;
+        assert_eq!(
+            before_gate.requests, 2,
+            "only the initial locs-0/1 fetch has run so far"
+        );
+        assert_eq!(
+            before_gate.wire_bytes_received, tiny_bytes,
+            "the initial fetch's bytes are locs 0 and 1 alone"
+        );
+
+        let charge_before = charged;
+        assert_eq!(
+            charge_before,
+            loc_metadata_bytes(&locs) + block1_heap,
+            "the charge before the gate is exactly what block 1 left resident: its metadata \
+             plus the drained-but-unreleased block's heap"
+        );
+        assert!(
+            required > charge_before,
+            "the raw-fetch requirement ({required} B) must exceed what block 1 left charged \
+             ({charge_before} B) by {} B, or the gate never has anything to refuse",
+            required - charge_before
+        );
+        let cursor_charged_before = cursor.charged;
+        let peak_before_refusal = tracker.peak_transient_bytes();
+
+        let mut refused_charged = charged;
+        let mut budget = CursorBudget {
+            budget: required - 1,
+            charged: &mut refused_charged,
+            stream_id: &stream_id,
+            open_cursors: 1,
+            inputs_carrying_stream: 1,
+        };
+        let err = cursor
+            .refill(&store, Some(&tracker), Some(&ledger), Some(&mut budget))
+            .await
+            .expect_err("a budget below the raw-fetch requirement must refuse the fetch");
+        match err {
+            MaintainError::MergeCursorBudgetExceeded {
+                stream_id: got_stream,
+                open_cursors,
+                charged_bytes,
+                budget_bytes,
+                required_bytes,
+                inputs_carrying_stream,
+                site,
+            } => {
+                assert_eq!(got_stream, stream_id.to_hex());
+                assert_eq!(open_cursors, 1, "the growing cursor is itself open");
+                assert_eq!(
+                    charged_bytes, charged,
+                    "the charge at refusal is what block 1 left it at"
+                );
+                assert_eq!(budget_bytes, required - 1);
+                assert_eq!(
+                    required_bytes, required,
+                    "the number a retry must budget for is the raw-fetch requirement"
+                );
+                assert_eq!(inputs_carrying_stream, 1);
+                assert_eq!(
+                    site,
+                    MergeCursorBudgetSite::RawFetch {
+                        first_loc_index: 2,
+                        loc_count: 2,
+                        fetch_bytes,
+                    },
+                    "the refusal names the fetch it refused: both locs, starting at index 2"
+                );
+            }
+            other => panic!("expected MergeCursorBudgetExceeded, got {other:?}"),
+        }
+        // The fetch never ran: no GET was issued, no loc was consumed, no
+        // group or prefetch was populated, and the charge never grew.
+        let after_gate = ledger.report().block_read;
+        assert_eq!(
+            after_gate, before_gate,
+            "a refused raw-fetch gate must move zero requests and zero bytes"
+        );
+        assert_eq!(
+            cursor.next_loc, 2,
+            "loc 2 is still unconsumed after a refusal"
+        );
+        assert!(
+            cursor.prefetched.is_none(),
+            "nothing was prefetched by a refused fetch"
+        );
+        assert!(
+            cursor.group.is_none(),
+            "no group was fetched by a refused fetch"
+        );
+        assert_eq!(refused_charged, charged, "a refused grow charges nothing");
+        assert_eq!(
+            cursor.charged, cursor_charged_before,
+            "a refused grow leaves the cursor's own charge unchanged too"
+        );
+        assert_eq!(
+            tracker.peak_transient_bytes(),
+            peak_before_refusal,
+            "a refused raw fetch must not move the transient high-water mark: nothing was \
+             fetched, decoded, or released beyond what block 1 already left behind"
+        );
+
+        // ---- Arm 2: a budget at exactly `required + ceiling(block 2)`
+        // admits both the fetch and block 2's decode in the same refill
+        // call. ----
+        let store = MemoryStore::new();
+        let catalog = raw_fetch_fixture_catalog(&store, Uuid::from_u128(1), 1, &recs).await;
+        let tracker = MergeMemoryTracker::new();
+        let ledger = RequestLedger::new();
+        let (mut cursor, mut charged, mut got) = raw_fetch_fixture_cursor_before_second_fetch(
+            &store, &catalog, &stream_id, &tracker, &ledger,
+        )
+        .await;
+        let before_admit = ledger.report().block_read;
+
+        let admitted_budget = required + ceiling_2;
+        let mut budget = CursorBudget {
+            budget: admitted_budget,
+            charged: &mut charged,
+            stream_id: &stream_id,
+            open_cursors: 1,
+            inputs_carrying_stream: 1,
+        };
+        cursor
+            .refill(&store, Some(&tracker), Some(&ledger), Some(&mut budget))
+            .await
+            .expect("a budget at required + block 2's ceiling admits the fetch and its decode");
+        let after_admit = ledger.report().block_read;
+        assert_eq!(
+            after_admit.requests,
+            before_admit.requests + 2,
+            "the admitted fetch issues exactly the two locs-2/3 GETs"
+        );
+        assert_eq!(
+            after_admit.wire_bytes_received,
+            before_admit.wire_bytes_received + fetch_bytes,
+            "the admitted fetch's bytes are exactly locs 2 and 3"
+        );
+        assert_eq!(
+            cursor.charged, admitted_budget,
+            "the same refill call also grows the charge past the raw-fetch requirement to cover \
+             block 2's decode, via the EXISTING decode-grow gate, right up to the budget"
+        );
+        assert_eq!(
+            *budget.charged, admitted_budget,
+            "the stream's running charge moved with the cursor's growth"
+        );
+
+        // Block 2 decoded in the SAME refill call; block 3 follows on drain
+        // through the EXISTING decode-grow gate, trivially, since its
+        // requirement (only loc 3's raw bytes) is already covered by the
+        // charge the raw-fetch gate left behind. `got` already carries blocks
+        // 0 and 1's eight timestamps from the fixture helper.
+        while cursor.peek_ts().is_some() {
+            got.push(cursor.next_record().expect("record").expect("a row").ts_ns);
+            cursor
+                .refill(&store, Some(&tracker), Some(&ledger), Some(&mut budget))
+                .await
+                .expect("refill");
+        }
+        assert_eq!(
+            got,
+            recs.iter().map(|r| r.ts_ns).collect::<Vec<_>>(),
+            "all 16 records, across all four blocks, are yielded in order once the raw fetch is \
+             admitted"
+        );
+        let final_read = ledger.report().block_read;
+        assert_eq!(
+            final_read.requests, 4,
+            "four block_read GETs total: the initial locs-0/1 fetch plus the admitted locs-2/3 \
+             fetch"
+        );
+        assert_eq!(
+            final_read.wire_bytes_received,
+            locs.iter().map(|l| l.byte_len()).sum::<u64>(),
+            "the ledger's total wire bytes are exactly the four locs' combined stored length"
+        );
+        reconcile_cursor_charge(&mut cursor, &mut charged);
+        assert_eq!(
+            charged,
+            cursor.resident_bytes(),
+            "reconciling after a full drain leaves the charge at exactly what the exhausted \
+             cursor holds"
+        );
+        assert!(
+            charged < required + ceiling_2,
+            "the reconciled charge ({charged} B) must fall back below the admitted budget \
+             ({} B = required {required} B + block 2's ceiling {ceiling_2} B), or the reconcile \
+             after drain did nothing",
+            required + ceiling_2
+        );
     }
 
     /// Rewrite `obj` with its PAGE_DIR descriptor dropped from the footer,
