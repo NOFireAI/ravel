@@ -698,7 +698,9 @@ and record-GET requests one `Catalog` instance keeps in flight at once, via
 a per-instance `tokio::sync::Semaphore`. It defaults to 128 and is rejected
 at construction time (a typed `CatalogError::InvalidConfig`, never a silent
 clamp to 1) if configured to `0`, since a zero-permit semaphore would
-deadlock every resolve. `ravel-server` exposes it as
+deadlock every resolve, or above `MAX_RESOLVE_GET_CONCURRENCY` (4096), since
+past that ceiling `tokio::sync::Semaphore::new` itself panics. `ravel-server`
+exposes it as
 `--catalog-resolve-concurrency`; unset, the catalog's own default applies.
 
 The default was raised from a fixed 16 after measuring against real S3 on a
