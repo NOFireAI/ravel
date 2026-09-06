@@ -236,6 +236,55 @@ choice whose memory cost is charged and refused, instead of the kernel's
 problem. That is the precondition ADR-1196 needs before a latency-first policy
 can be a default.
 
+#### Amendment (2026-09-06, Refs: #1254)
+
+Reviewing the implemented fetch reservations against the text above found two
+claims that describe an intended design the code does not implement. The
+decision stands; these correct its accounting description and record the sites
+that are not yet reserved or tracked.
+
+1. **The SQL cross-boundary overlap lasts the buffer's life, not "the width of
+   one call."** The bullet above says a fetched buffer handed to an SQL scan has
+   its fetch guard "released only after that `try_grow` has succeeded, so the
+   bytes are double-counted for the width of one call." The fetch layer cannot
+   do this: it returns the `Bytes` before the SQL layer calls `try_grow`, and
+   the guard rides inside those `Bytes` (`attach_reservation` /
+   `Bytes::from_owner`, `log_fetcher.rs`, `span_fetcher.rs`). So on the SQL
+   path the fetch reservation and the scan's `try_grow` reservation coexist for
+   the whole life of the buffer in the scan, releasing only when the consumer
+   drops the `Bytes`, not for one call. This is the same lifetime
+   `docs/query-engine.md` already describes.
+
+2. **`unique` is not exact by construction.** Decision 3 defines
+   `unique = cache_resident + sql_reserved + fetch_reserved - handoff_overlap`
+   and calls it exact. `handoff_overlap` counts only overlaps that call
+   `Reservation::mark_handed_off`, and the only site that does is a cache
+   *insert* (`Source::Upstream`, `log_fetcher.rs`/`span_fetcher.rs`). Two real
+   overlaps are therefore not in the gauge, so `unique` overstates the tracked
+   total by their size:
+   - the SQL cross-boundary overlap from correction 1 (fetch guard riding in the
+     returned `Bytes` while the scan also holds its `try_grow`), never marked;
+   - a cache **hit** (`Source::Cache`), where the returned buffer is the resident
+     cache entry and the fetch guard reserves the same bytes the cache cap
+     already holds, also never marked.
+
+   The direction is an overcount of `unique`, which loosens the decision-4
+   acceptance assertion `resident_t <= unique_t + reserve` rather than tightening
+   it; the assertion is still usable but its `unique` term is an upper bound, not
+   the exact tracked total. Making it exact means marking the handoff at these
+   two sites too (or subtracting them another way), which is follow-up work.
+
+**Known-unreserved / not-yet-enforcing sites** (the budget observes nothing at
+these until a finite budget is wired and, for the last two, the overlap is
+marked):
+
+- RSPAN fetchers and every fetcher `build_sql_state` constructs
+  (`services/ravel-server/src/query.rs`) reserve against their default
+  `MemoryBudget::unlimited()`: `QueryEngine::with_memory_budget` reaches only its
+  `fetcher` and `log_fetcher`, and no server task installs a finite budget yet.
+- The SQL cross-boundary overlap and the cache-hit overlap above are untracked
+  by `handoff_overlap`.
+
 ### 3. A static carve under one number
 
 `resolve_performance_defaults` derives one `memory_budget_bytes` from the
