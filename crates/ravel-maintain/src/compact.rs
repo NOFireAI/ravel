@@ -33,6 +33,13 @@ pub enum CompactionOutcome {
     Tombstoned,
     /// A compaction record already exists; nothing to do.
     AlreadyCompacted,
+    /// The bucket holds a live erasure rewrite record, so producing a second
+    /// record set over the same inputs would make the catalog serve both
+    /// (ADR-0064 decision 3 point 5: overlap harmlessness does not hold for a
+    /// rewrite, whose outputs deliberately lack records its inputs contain, so
+    /// a compaction record built from those same inputs would resurrect the
+    /// erased records through query-time dedup).
+    RewritePresent,
     /// Fewer than `min_compaction_inputs` L0 records; not worth compacting.
     BelowMinInputs { count: usize },
     /// Built and published (or converged / abandoned): `parts` parts written,
@@ -65,7 +72,8 @@ pub async fn compact_bucket(
     let outcome = compact_bucket_scoped(store, clock, config, bucket).await;
     // As the opener, this driver emits the run's report on EVERY outcome: the
     // gates that return before any rewrite (NotSealed, AlreadyCompacted,
-    // Tombstoned, BelowMinInputs) still paid their LIST and report it
+    // RewritePresent, Tombstoned, BelowMinInputs) still paid their LIST and
+    // report it
     // (ADR-0996 task 996-8). The guard closes the scope even on cancellation.
     crate::rewrite::emit_request_report(config, bucket, outcome.is_ok());
     if let Some(scope) = scope {
@@ -93,6 +101,14 @@ async fn compact_bucket_scoped(
     }
     if !listing.compaction_record_keys.is_empty() {
         return Ok(CompactionOutcome::AlreadyCompacted);
+    }
+    // One bucket serves one record set. A live rewrite record already covers
+    // these inputs with records deliberately removed from its outputs, and a
+    // compaction record over the same inputs is not overlap-harmless against
+    // it: a snapshot including both resurrects the erased records
+    // (ADR-0064 decision 3 point 5). Refuse rather than publish the second set.
+    if !listing.rewrite_record_keys.is_empty() {
+        return Ok(CompactionOutcome::RewritePresent);
     }
     if listing.commit_keys.len() < config.min_compaction_inputs {
         return Ok(CompactionOutcome::BelowMinInputs {
@@ -197,11 +213,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use bytes::Bytes;
-    use ravel_commit::keys;
     use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_commit::{erasure, keys, signal};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
-    use ravel_proto::commit::v1::CompactionRecord;
+    use ravel_proto::commit::v1::{
+        CompactionInputIdentity, CompactionPart, CompactionRecord, RewriteDrop, RewriteRecord,
+    };
     use ravel_segment::{
         ExemplarInput, IngestBounds, ReaderLimits, SegmentIdentity, SegmentWriter, SeriesInputV3,
         SeriesValues, VERSION_V7,
@@ -455,6 +473,159 @@ mod tests {
         }
         all.sort();
         all
+    }
+
+    /// The L0 identity of the input [`seed`] writes for `seq`.
+    fn input_identity(seq: u64) -> CompactionInputIdentity {
+        CompactionInputIdentity {
+            writer_id: Uuid::from_u128(u128::from(seq)).to_string(),
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+        }
+    }
+
+    /// One rewrite output part covering `[min_ts, max_ts]`. `tag` fills the
+    /// content hash, so the reconstructed part key is distinct per part.
+    fn rewrite_part(tag: u8, min_ts: i64, max_ts: i64) -> CompactionPart {
+        CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xff; 16],
+            content_hash: vec![tag; 32],
+            object_size: 4096,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            segment_format_version: VERSION_V7 as u32,
+            declared_column_stats: Vec::new(),
+        }
+    }
+
+    /// Publish a `RewriteRecord` over `inputs` into the bucket, plus an object
+    /// at each of its parts' reconstructed keys, exactly as the erasure pass
+    /// publishes one. Returns the record key.
+    async fn put_rewrite_record(
+        store: &dyn ObjectStoreBackend,
+        inputs: Vec<CompactionInputIdentity>,
+        parts: Vec<CompactionPart>,
+        request_id: Uuid,
+        created_unix_ns: i64,
+    ) -> String {
+        use prost::Message;
+        let b = bucket();
+        let request_ids = vec![request_id.to_string()];
+        let input_set_hash = erasure::compute_rewrite_input_set_hash(&inputs, None, &request_ids);
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: b.tenant_hash.0.to_vec(),
+            signal: signal::to_proto(b.signal) as i32,
+            shard: b.shard,
+            ingest_hour_bucket: b.ingest_hour_bucket,
+            inputs,
+            input_set_hash: input_set_hash.to_vec(),
+            parts,
+            drops: request_ids
+                .iter()
+                .map(|id| RewriteDrop {
+                    request_id: id.clone(),
+                    dropped_count: 1,
+                })
+                .collect(),
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        for p in &record.parts {
+            let part_key =
+                keys::reconstruct_rewrite_part_key(&record, p).expect("rewrite part key");
+            store
+                .put(
+                    &part_key,
+                    Bytes::from_static(b"rw-part"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put rewrite part object");
+        }
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite record key");
+        store
+            .put(
+                &key,
+                record.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put rewrite record");
+        key
+    }
+
+    /// Compaction refuses a bucket that already holds a live erasure rewrite
+    /// record. A rewrite's outputs deliberately lack records its inputs
+    /// contain, so overlap harmlessness does not hold for it (ADR-0064
+    /// decision 3 point 5): a compaction record built from those same L0
+    /// inputs would leave the catalog serving two record sets over one bucket,
+    /// and a snapshot including both resurrects the erased records through
+    /// query-time dedup.
+    ///
+    /// The guarded production line is the `RewritePresent` early return in
+    /// `compact_bucket_scoped`. With that return removed the outcome is
+    /// `Compacted { .. }` and the bucket ends the call holding one compaction
+    /// record next to the rewrite record.
+    #[tokio::test]
+    async fn compaction_refuses_a_bucket_holding_a_live_rewrite_record() {
+        let store = MemoryStore::new();
+        let base = i64::from(HOUR) * NS_PER_HOUR;
+        seed(
+            &store,
+            1,
+            vec![series("alpha", &[(base + 1_000, 1.0)])],
+            Vec::new(),
+        )
+        .await;
+        seed(
+            &store,
+            2,
+            vec![series("beta", &[(base + 2_000, 2.0)])],
+            Vec::new(),
+        )
+        .await;
+        // One erasure rewrite already supersedes both L0 inputs.
+        put_rewrite_record(
+            &store,
+            vec![input_identity(1), input_identity(2)],
+            vec![rewrite_part(0x11, base + 1_000, base + 2_000)],
+            Uuid::from_u128(0x0E45),
+            base + 3_000,
+        )
+        .await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let outcome = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+
+        assert_eq!(
+            outcome,
+            CompactionOutcome::RewritePresent,
+            "a live rewrite record refuses compaction"
+        );
+        assert!(
+            !matches!(outcome, CompactionOutcome::Compacted { .. }),
+            "nothing was compacted"
+        );
+        let listing = read::list_bucket(&store, &bucket()).await.expect("list");
+        assert_eq!(
+            listing.compaction_record_keys.len(),
+            0,
+            "no second record set was published over the rewritten inputs"
+        );
+        assert_eq!(listing.rewrite_record_keys.len(), 1);
+        assert_eq!(
+            listing.commit_keys.len(),
+            2,
+            "both L0 inputs stay live behind the rewrite record"
+        );
     }
 
     /// The acceptance test: the exemplars in the L1 output are

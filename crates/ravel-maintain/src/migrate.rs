@@ -514,10 +514,15 @@ pub async fn migrate_family(
             // below-target L0 record is rewritten here; a compacted bucket's L1
             // parts are the rewrite-on-touch scope, and the re-audit below
             // still refuses the floor raise if any such L1 straggler survives.
+            // A bucket holding a live erasure rewrite record is skipped for the
+            // same reason `migrate_bucket_format` refuses it: a second record
+            // set over the same inputs would make the catalog serve both
+            // (ADR-0064 decision 3 point 5).
             let listing = list_bucket(store, &bucket).await?;
             if bucket.is_sealed(now, config)
                 && listing.tombstone_key.is_none()
                 && listing.compaction_record_keys.is_empty()
+                && listing.rewrite_record_keys.is_empty()
                 && !listing.commit_keys.is_empty()
             {
                 let inputs = load_inputs(
@@ -547,6 +552,7 @@ pub async fn migrate_family(
                         MigrateOutcome::NotSealed
                         | MigrateOutcome::Tombstoned
                         | MigrateOutcome::AlreadyCompacted
+                        | MigrateOutcome::RewritePresent
                         | MigrateOutcome::UpToDate => {}
                     }
                 }
