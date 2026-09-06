@@ -171,6 +171,11 @@ pub async fn compact(
         CompactionOutcome::AlreadyCompacted => {
             println!("outcome: AlreadyCompacted (a compaction record already exists)")
         }
+        CompactionOutcome::RewritePresent => println!(
+            "outcome: RewritePresent (a live erasure rewrite record already \
+             serves this bucket; compacting it would make the catalog serve \
+             two record sets)"
+        ),
         CompactionOutcome::BelowMinInputs { count } => {
             println!("outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)")
         }
@@ -244,6 +249,12 @@ pub struct CompactTenantReport {
     pub compacted: usize,
     /// Buckets that already carried a compaction record.
     pub already: usize,
+    /// Buckets refused because a live erasure rewrite record already serves
+    /// them (ADR-0064 decision 3 point 5). Counted separately from `already`:
+    /// the bucket is not compacted and never will be while the rewrite record
+    /// stands, which is a different operator-visible state from a bucket whose
+    /// compaction is done.
+    pub rewrite_present: usize,
     /// Buckets reached that are not yet sealed. Hours ascend, so the walk stops
     /// at the first one in each shard; this is therefore at most one per shard.
     pub not_sealed: usize,
@@ -583,16 +594,18 @@ pub async fn compact_tenant_to(
     let verb = if dry_run { "would write" } else { "wrote" };
     writeln!(out, "compacted: {}", report.compacted)?;
     writeln!(out, "already: {}", report.already)?;
+    writeln!(out, "rewrite_present: {}", report.rewrite_present)?;
     writeln!(out, "not_sealed: {}", report.not_sealed)?;
     writeln!(out, "below_min: {}", report.below_min)?;
     writeln!(out, "tombstoned: {}", report.tombstoned)?;
     writeln!(out, "parts ({verb}): {}", report.parts_written)?;
     writeln!(out, "wall_time_ms: {}", started.elapsed().as_millis())?;
     // Buckets that reported any non-error outcome (compacted, already,
-    // not-sealed, below-min, tombstoned). `failed` is the count of buckets
-    // whose compaction returned a typed error.
+    // rewrite-present, not-sealed, below-min, tombstoned). `failed` is the
+    // count of buckets whose compaction returned a typed error.
     let succeeded = report.compacted
         + report.already
+        + report.rewrite_present
         + report.not_sealed
         + report.below_min
         + report.tombstoned;
@@ -674,6 +687,10 @@ fn emit_bucket_outcome(
         Ok(CompactionOutcome::AlreadyCompacted) => {
             report.already += 1;
             writeln!(out, "shard={shard} hour={hour} outcome=AlreadyCompacted")?;
+        }
+        Ok(CompactionOutcome::RewritePresent) => {
+            report.rewrite_present += 1;
+            writeln!(out, "shard={shard} hour={hour} outcome=RewritePresent")?;
         }
         Ok(CompactionOutcome::BelowMinInputs { count }) => {
             report.below_min += 1;

@@ -235,6 +235,21 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    construction happens only after no resolvable snapshot can still
    reference any pre-rewrite input. Correctness therefore never depends on
    the race not happening; the serialization is an efficiency measure.
+   **Amended:** that last clause is wrong for the producer side. The
+   query-time filter bounds what a query returns while a request is pending,
+   but it does not stop a compactor from publishing a second record set over
+   a bucket a rewrite already covers, and once both records are live the
+   bucket serves two part sets for good -- including after the `.dreq` is
+   removed and the filter stops applying, which is exactly when the erased
+   records become returnable again. Per-bucket exclusivity is therefore a
+   correctness requirement, not an optimization, and it is enforced where the
+   second record set would be produced: compaction
+   (`crate::compact::compact_bucket`) and format migration
+   (`crate::rewrite::migrate_bucket_format`) refuse a bucket whose listing
+   holds any rewrite record, reporting `RewritePresent` and leaving the bucket
+   untouched. Serializing the passes in the driver remains the efficiency
+   measure; the refusal is what makes the serialization unnecessary for
+   correctness.
 6. **Physical removal**: the rewrite's inputs become superseded inputs to
    the existing sweep (`sweep_superseded`), deleted after
    `protection_horizon`, under the same `LegalHoldCheck` gate as every
