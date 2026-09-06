@@ -636,11 +636,13 @@ pub struct Cli {
     /// plus `--sql-partition-count`, since both the GET permits and the SQL
     /// scan width need to move together to reach it. At a lower concurrency
     /// the trade does not pay off, and selecting this policy alone is not
-    /// inert: the byte quantities already change, so every logs object is read
-    /// in ranged pieces instead of one covering GET. On the reference corpus
-    /// that shape at the default concurrency measured 712.4 s against
-    /// `cost-based`'s 525.0 s, 36% SLOWER, which is why the concurrency is a
-    /// precondition and not a tuning suggestion. In-flight fetch memory at the
+    /// inert: the byte quantities already change, so a logs read is routed the
+    /// way `byte-minimal` routes it, taking ranged reads wherever they save
+    /// more bytes than a request costs and whole-object reads where they do
+    /// not. On the reference corpus that shape at the default concurrency
+    /// measured 712.4 s against `cost-based`'s 525.0 s, 36% SLOWER, which is
+    /// why the concurrency is a precondition and not a tuning suggestion.
+    /// In-flight fetch memory at the
     /// measured concurrency is not yet bounded by a process-wide budget (see
     /// #1170 and #1007), so raising concurrency without watching process
     /// memory can end in an out-of-memory kill instead of a faster query.
@@ -1389,6 +1391,7 @@ impl QueryBudgets {
                 _ => None,
             },
             store_get_concurrency: self.store_get_concurrency,
+            sql_partition_count: self.sql_partition_count,
         }
     }
 
@@ -1479,26 +1482,32 @@ pub struct LogsFetchStamp {
     /// line below; this policy resolves the same value every other policy
     /// does (ADR-1196), so it is not itself part of the fetch resolution.
     pub store_get_concurrency: usize,
+    /// The resolved `sql_partition_count` (ADR-1195), carried for the same
+    /// reason as [`Self::store_get_concurrency`]: a logs read reaches the
+    /// measured concurrency only when the GET permits and the SQL scan width
+    /// are both there, so the precondition below reads both.
+    pub sql_partition_count: usize,
     /// `Some(`[`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`]`)` when
     /// [`Self::policy`] is `latency-first`, `None` otherwise (ADR-1196). This
     /// is the concurrency the policy's trade was measured at, not a resolved
     /// default: `latency-first` carries no concurrency preference of its own,
     /// so this field exists to make the memory precondition operator-visible
-    /// in [`Self::emit`], which compares it against
-    /// [`Self::store_get_concurrency`] and says whether the precondition is
-    /// met. It does not describe what `store_get_concurrency` resolved to.
+    /// in [`Self::emit`]. It does not describe what any knob resolved to.
     pub latency_first_measured_concurrency: Option<usize>,
 }
 
 impl LogsFetchStamp {
-    /// Whether the resolved GET concurrency has reached the one
-    /// `latency-first`'s measured trade needs. `None` under every other
-    /// policy, which stamps no measured concurrency at all. [`Self::emit`]
-    /// words its precondition line from this, so an operator who has already
-    /// raised the concurrency is not told to raise it.
+    /// Whether this process has reached the concurrency `latency-first`'s
+    /// measured trade needs. Both the GET permits and the SQL scan width have
+    /// to be there: `--store-get-concurrency` alone leaves logs scanning at
+    /// the derived partition count, which is not the shape that was measured.
+    /// `None` under every other policy, which stamps no measured concurrency
+    /// at all. [`Self::emit`] words its precondition line from this, so an
+    /// operator who has already raised both is not told to raise them.
     fn latency_first_precondition_met(&self) -> Option<bool> {
-        self.latency_first_measured_concurrency
-            .map(|measured| self.store_get_concurrency >= measured)
+        self.latency_first_measured_concurrency.map(|measured| {
+            self.store_get_concurrency >= measured && self.sql_partition_count >= measured
+        })
     }
 
     /// Emit this stamp at startup. One INFO line with the whole effective
@@ -1532,17 +1541,19 @@ impl LogsFetchStamp {
                 tracing::info!(
                     policy = self.policy,
                     store_get_concurrency = self.store_get_concurrency,
+                    sql_partition_count = self.sql_partition_count,
                     latency_first_measured_concurrency = measured_concurrency,
                     precondition_met = false,
                     "latency-first is an intent, not a tuning constant: its measured trade \
-                     needs store_get_concurrency raised to the measured concurrency \
-                     explicitly, and below it this policy's ranged reads have measured \
-                     slower than the default policy"
+                     needs both store_get_concurrency and sql_partition_count raised to \
+                     the measured concurrency explicitly, and below it this policy's \
+                     byte-minimal routing has measured slower than the default policy"
                 );
             } else {
                 tracing::info!(
                     policy = self.policy,
                     store_get_concurrency = self.store_get_concurrency,
+                    sql_partition_count = self.sql_partition_count,
                     latency_first_measured_concurrency = measured_concurrency,
                     precondition_met = true,
                     "latency-first is running at or above the concurrency its trade was \
@@ -6209,6 +6220,26 @@ mod tests {
             ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY
         );
         assert_eq!(stamp.latency_first_precondition_met(), Some(true));
+
+        // Raising the GET permits alone does not reach the measured shape:
+        // logs still scan at the derived partition count, which is not what
+        // was measured. This is the case the precondition existed to catch and
+        // originally reported as met.
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--logs-fetch-policy",
+            "latency-first",
+            "--store-get-concurrency",
+            "256",
+        ])
+        .expect("flags parse");
+        let stamp = stamp_from(&cli);
+        assert_eq!(
+            stamp.store_get_concurrency,
+            ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY
+        );
+        assert_eq!(stamp.sql_partition_count, REFERENCE_FETCH_CONCURRENCY);
+        assert_eq!(stamp.latency_first_precondition_met(), Some(false));
 
         let cli = Cli::try_parse_from(["ravel-server", "--fetch-concurrency", "256"])
             .expect("flags parse");
