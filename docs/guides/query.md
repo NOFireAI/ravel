@@ -444,7 +444,7 @@ run used.
 | Flag | Reaches | Default (unset) | Reference host |
 |---|---|---|---|
 | `--fetch-concurrency <N>` | legacy: sets all three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
-| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | derived: `max(8, 2 x cores)`, or 256 under `--logs-fetch-policy latency-first` (source `policy`) if neither this flag nor `--fetch-concurrency` is set | 32 |
+| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | derived: `max(8, 2 x cores)` | 32 |
 | `--sql-partition-count <N>` | `EngineConfig::sql_partition_count`, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
 | `--promql-fetch-fanout <N>` | `EngineConfig::promql_fetch_fanout`, per-selector fetch stream fan-out | derived: `max(8, 2 x cores)` | 32 |
 | `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
@@ -467,8 +467,7 @@ derived values already satisfy the order. Both adjustments are logged at
 startup (`clamped` and `raised` on the resolved lines, plus a WARN).
 
 Every resolved value is logged at startup, one line per setting with its source
-(`derived`, `flag`, `fallback`, `legacy-flag`, or -- for `store_get_concurrency`
-alone, under `--logs-fetch-policy latency-first` -- `policy`):
+(`derived`, `flag`, `fallback`, or `legacy-flag`):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
@@ -477,6 +476,12 @@ INFO performance default resolved setting="sql_partition_count" value=32 source=
 INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
 ```
+
+`--logs-fetch-policy latency-first` resolves these three concurrency knobs the
+same way every other policy does; it pays off only once an operator raises
+them explicitly, and it carries a memory caveat -- see the fetch-policy table
+in [Operations: configuration](operations/configuration.md#logs-fetch-policy-and-store-cost-profile) before
+turning it on.
 
 `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout`
 replace the old single `--fetch-concurrency` knob's three coupled effects with

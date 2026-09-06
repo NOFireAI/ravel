@@ -8,18 +8,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **A `latency-first` logs fetch policy** (ADR-0996 amendment). Measured on a
-  reference cold-cache corpus, the `cost-based` default resolves to
-  whole-object reads and moves 3x the bytes of `byte-minimal` at a
-  deployment where transfer and retrieval are free, because the derived
-  per-request rate saturates. `--logs-fetch-policy latency-first` resolves
-  the same byte quantities as `byte-minimal` and, in addition, raises the
-  default `--store-get-concurrency` to 256 (source `policy` in the startup
-  log) unless an explicit `--store-get-concurrency` or the legacy
-  `--fetch-concurrency` is already set. `cost-based` stays the default;
-  this is an operator opt-in for deployments where cold wall-clock matters
-  more than the request bill, at a measured cost of about 5.45x the GET
-  requests for about 46% less cold time.
+- **A `latency-first` logs fetch policy** (ADR-0996 amendment, superseded by
+  ADR-1196). Measured on a reference cold-cache corpus, the `cost-based`
+  default resolves to whole-object reads and moves 3x the bytes of
+  `byte-minimal` at a deployment where transfer and retrieval are free,
+  because the derived per-request rate saturates. `--logs-fetch-policy
+  latency-first` resolves the same byte quantities as `byte-minimal`. It is
+  an intent, not a tuning constant: it carries no concurrency default of its
+  own, and resolves `--store-get-concurrency`, `--sql-partition-count`, and
+  `--promql-fetch-fanout` exactly as every other policy does. `cost-based`
+  stays the default; `latency-first` is an operator opt-in for deployments
+  where cold wall-clock matters more than the request bill, and it pays off
+  only once the operator raises concurrency explicitly to the measured
+  configuration (`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`, 256), at
+  a measured cost of about 5.45x the GET requests for about 41% less cold
+  time. Raising that concurrency also raises in-flight fetch memory, which
+  is not yet bounded by a process-wide budget (issues #1170, #1007); the
+  flag's own documentation and a startup log line under `latency-first` make
+  that precondition operator-visible.
 - **The `alerts` and `audit` SQL tables** (ADR-1101). `POST /api/v1/sql` and
   Flight SQL serve five tables, and Flight `GetTables` lists all five; naming
   two in one query is still rejected before any listing. `alerts` is alert

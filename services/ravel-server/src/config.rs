@@ -62,7 +62,7 @@ impl S3Auth {
 /// The `--logs-fetch-policy` values (ADR-0996 decision 2). The CLI-facing
 /// mirror of [`ravel_query::LogsFetchPolicy`], which lives in a crate that does
 /// not depend on clap. The spellings clap derives from these variant names are
-/// the ADR's: `request-minimal`, `byte-minimal`, `cost-based`.
+/// the ADR's: `request-minimal`, `byte-minimal`, `cost-based`, `latency-first`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum LogsFetchPolicyArg {
     /// Minimize object-store requests: every object is read whole in one
@@ -77,13 +77,13 @@ pub enum LogsFetchPolicyArg {
     /// behaviour; at egress prices it resolves to a small byte cost.
     #[default]
     CostBased,
-    /// Resolves the byte quantities exactly as `byte-minimal` does, and in
-    /// addition prefers a 256 process-wide object-store GET concurrency
-    /// (source `policy` in the startup log) over the host-derived default
-    /// (issue #1196). Trades about 5.45x the GET requests for about 46% less
-    /// cold wall-clock on the reference corpus; an explicit
-    /// `--store-get-concurrency` or the legacy `--fetch-concurrency` still
-    /// wins over this preference.
+    /// Resolves the byte quantities exactly as `byte-minimal` does (issue
+    /// #1196): an intent, not a tuning constant. Trades about 5.45x the GET
+    /// requests for about 41% less cold wall-clock on the reference corpus,
+    /// at a raised object-store GET concurrency the operator sets explicitly
+    /// (this policy carries no concurrency default of its own). In-flight
+    /// fetch memory at that concurrency is not yet bounded by a process-wide
+    /// budget (ADR-1196, #1170, #1007).
     LatencyFirst,
 }
 
@@ -623,12 +623,23 @@ pub struct Cli {
     /// more bytes than a request costs; `cost-based` (the default) derives the
     /// rate from `--store-cost-profile`, which at the reference intra-region
     /// profile means request-minimal behaviour; `latency-first` (issue #1196)
-    /// resolves the byte quantities exactly as `byte-minimal` does and in
-    /// addition prefers a 256 `--store-get-concurrency` (source `policy`) over
-    /// the host-derived default, trading more GET requests for less cold
-    /// wall-clock. Read at startup only: the running engine never changes its
-    /// own policy, so the stamped effective policy describes the whole process
-    /// lifetime.
+    /// resolves the byte quantities exactly as `byte-minimal` does. Read at
+    /// startup only: the running engine never changes its own policy, so the
+    /// stamped effective policy describes the whole process lifetime.
+    ///
+    /// `latency-first` is an intent, not a tuning constant: it says spend
+    /// requests to save wall time, and carries no concurrency default of its
+    /// own. On the reference corpus it trades 5.45x the GET requests for 41%
+    /// less cold wall-clock than `cost-based`, at
+    /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256) -- set
+    /// explicitly with `--fetch-concurrency` or with `--store-get-concurrency`
+    /// plus `--sql-partition-count`, since both the GET permits and the SQL
+    /// scan width need to move together to reach it. At a lower concurrency
+    /// the trade does not pay off. In-flight fetch memory at that concurrency
+    /// is not yet bounded by a process-wide budget (see #1170 and #1007);
+    /// selecting `latency-first` without also raising concurrency changes
+    /// nothing, and raising concurrency without watching process memory can
+    /// end in an out-of-memory kill instead of a faster query.
     #[arg(long = "logs-fetch-policy", value_enum, default_value_t = LogsFetchPolicyArg::CostBased)]
     pub logs_fetch_policy: LogsFetchPolicyArg,
 
@@ -1367,6 +1378,13 @@ impl QueryBudgets {
             overridden_block_range_threshold: resolved.overridden_block_range_threshold,
             saturated_profile: resolved.saturated_profile,
             max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
+            latency_first_supported_concurrency: match self.logs_fetch_policy {
+                ravel_query::LogsFetchPolicy::LatencyFirst => {
+                    Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)
+                }
+                _ => None,
+            },
+            store_get_concurrency: self.store_get_concurrency,
         }
     }
 
@@ -1452,6 +1470,19 @@ pub struct LogsFetchStamp {
     pub saturated_profile: Option<String>,
     /// The resolved fetch bound (`--logs-max-fetch-run-bytes`).
     pub max_fetch_run_bytes: u64,
+    /// The resolved `store_get_concurrency` (ADR-1195), carried here only so
+    /// [`Self::emit`] can name it on the `latency-first` memory-precondition
+    /// line below; this policy resolves the same value every other policy
+    /// does (ADR-1196), so it is not itself part of the fetch resolution.
+    pub store_get_concurrency: usize,
+    /// `Some(`[`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`]`)` when
+    /// [`Self::policy`] is `latency-first`, `None` otherwise (ADR-1196). This
+    /// is the concurrency the policy's trade was measured at, not a resolved
+    /// default: `latency-first` carries no concurrency preference of its own,
+    /// so this field exists to make the un-met memory precondition
+    /// operator-visible in [`Self::emit`], not to describe what
+    /// `store_get_concurrency` resolved to.
+    pub latency_first_supported_concurrency: Option<usize>,
 }
 
 impl LogsFetchStamp {
@@ -1479,6 +1510,17 @@ impl LogsFetchStamp {
                 effective_block_range_threshold = self.block_range_threshold,
                 "--logs-block-range-threshold is overridden by the resolved fetch policy: \
                  every logs object is read whole-object"
+            );
+        }
+        if let Some(measured_concurrency) = self.latency_first_supported_concurrency {
+            tracing::info!(
+                policy = self.policy,
+                store_get_concurrency = self.store_get_concurrency,
+                latency_first_measured_concurrency = measured_concurrency,
+                "latency-first is an intent, not a tuning constant: its measured trade needs \
+                 store_get_concurrency raised to the measured concurrency explicitly, and \
+                 in-flight fetch memory at that concurrency is not yet bounded by a \
+                 process-wide budget"
             );
         }
     }
@@ -1706,12 +1748,6 @@ pub const PERF_SOURCE_FALLBACK: &str = "fallback";
 /// was set, but the legacy `--fetch-concurrency` was, and its value is used
 /// verbatim (ADR-1195 legacy precedence).
 pub const PERF_SOURCE_LEGACY_FLAG: &str = "legacy-flag";
-/// [`ResolvedPerformanceDefaults`] source: no explicit flag or legacy
-/// `--fetch-concurrency` was set for `store_get_concurrency`, but
-/// `--logs-fetch-policy` resolved to a policy carrying its own preferred
-/// concurrency ([`ravel_query::LogsFetchPolicy::preferred_store_get_concurrency`],
-/// issue #1196), and that value is used ahead of the host-derived default.
-pub const PERF_SOURCE_POLICY: &str = "policy";
 
 /// The operator's explicit performance flags: `None` per field means "derive".
 ///
@@ -2016,29 +2052,6 @@ pub fn resolve_performance_defaults(
         sql_max_query_bytes_clamped,
         sql_tenant_max_bytes_raised,
     }
-}
-
-/// Apply `--logs-fetch-policy`'s preferred `store_get_concurrency` (issue
-/// #1196) as the fourth-ranked source for that one knob, strictly between the
-/// legacy `--fetch-concurrency` and the host-derived default:
-/// [`resolve_performance_defaults`] itself never sees the policy, so this only
-/// overrides a resolution that already landed on [`PERF_SOURCE_DERIVED`] --
-/// an explicit `--store-get-concurrency` or a legacy `--fetch-concurrency`
-/// (both of which resolve to a different source) are left untouched. A
-/// policy with no preference (every variant but
-/// [`ravel_query::LogsFetchPolicy::LatencyFirst`]) leaves the derived value
-/// and its source alone.
-fn apply_policy_store_get_concurrency(
-    mut resolved: ResolvedPerformanceDefaults,
-    policy: ravel_query::LogsFetchPolicy,
-) -> ResolvedPerformanceDefaults {
-    if resolved.sources.store_get_concurrency == PERF_SOURCE_DERIVED
-        && let Some(preferred) = policy.preferred_store_get_concurrency()
-    {
-        resolved.store_get_concurrency = preferred;
-        resolved.sources.store_get_concurrency = PERF_SOURCE_POLICY;
-    }
-    resolved
 }
 
 impl ResolvedPerformanceDefaults {
@@ -3595,20 +3608,17 @@ impl Cli {
     /// [`HostProfile::detect`], and threads the result into every consumer;
     /// a test calls it with an injected profile.
     ///
-    /// `store_get_concurrency` additionally carries a fourth source (issue
-    /// #1196): once neither an explicit `--store-get-concurrency` nor the
-    /// legacy `--fetch-concurrency` fired, `--logs-fetch-policy`'s resolved
-    /// [`ravel_query::LogsFetchPolicy::preferred_store_get_concurrency`]
-    /// (if any) is preferred over the host-derived default. See
-    /// [`apply_policy_store_get_concurrency`].
+    /// `--logs-fetch-policy` carries no concurrency default (ADR-1196):
+    /// `latency-first` resolves `store_get_concurrency` exactly as every
+    /// other policy does, from `--store-get-concurrency`, the legacy
+    /// `--fetch-concurrency`, or the host-derived default.
     pub fn resolve_performance(
         &self,
         host: HostProfile,
     ) -> anyhow::Result<ResolvedPerformanceDefaults> {
-        let resolved = resolve_performance_defaults(host, self.performance_flags()?);
-        Ok(apply_policy_store_get_concurrency(
-            resolved,
-            self.logs_fetch_policy.policy(),
+        Ok(resolve_performance_defaults(
+            host,
+            self.performance_flags()?,
         ))
     }
 
@@ -5099,126 +5109,70 @@ mod tests {
         assert_eq!(engine.promql_fetch_fanout(), 9);
     }
 
-    /// Issue #1196: `--logs-fetch-policy latency-first` with no
-    /// `--store-get-concurrency` and no legacy `--fetch-concurrency` must
-    /// resolve `store_get_concurrency` to
-    /// `ravel_query::LATENCY_FIRST_STORE_GET_CONCURRENCY` (256) at source
-    /// `"policy"`, and that value must reach the running engine. The other
-    /// two unbundled knobs are untouched: only `store_get_concurrency` takes
-    /// a policy preference.
+    /// Issue #1196 / ADR-1196: `--logs-fetch-policy latency-first` carries no
+    /// concurrency default of its own. With no `--store-get-concurrency`, no
+    /// `--sql-partition-count`, no `--promql-fetch-fanout`, and no legacy
+    /// `--fetch-concurrency`, all three ADR-1195 knobs must resolve to the
+    /// same values AND the same sources as under `cost-based` (the shipped
+    /// default): the host-derived value, source `"derived"`.
     ///
-    /// Prove-the-test: delete the `apply_policy_store_get_concurrency` call
-    /// from `Cli::resolve_performance` and the first assertion reads
-    /// `left: 32, right: 256` (the reference host's plain derived value
-    /// instead of the policy's).
+    /// Prove-the-test: reintroduce a policy-sourced override for
+    /// `store_get_concurrency` in `Cli::resolve_performance` and the first
+    /// pair of assertions reads `left: 256, right: 32` /
+    /// `left: "policy", right: "derived"`.
     #[test]
-    fn latency_first_sets_store_get_concurrency_from_the_policy() {
-        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
-            .expect("flag parses");
-        let resolved = resolved_from(&cli);
-        assert_eq!(resolved.store_get_concurrency, 256);
-        assert_eq!(resolved.sources.store_get_concurrency, PERF_SOURCE_POLICY);
-        // Unaffected: this policy carries no opinion on the other two knobs.
-        assert_eq!(resolved.sql_partition_count, REFERENCE_FETCH_CONCURRENCY);
-        assert_eq!(resolved.promql_fetch_fanout, REFERENCE_FETCH_CONCURRENCY);
+    fn latency_first_resolves_all_three_knobs_exactly_like_cost_based() {
+        let cost_based = Cli::try_parse_from(["ravel-server"]).expect("no flags parses");
+        let latency_first =
+            Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
+                .expect("flag parses");
 
-        let engine = engine_from(&cli);
+        let cost_based_resolved = resolved_from(&cost_based);
+        let latency_first_resolved = resolved_from(&latency_first);
+
         assert_eq!(
-            engine.store_get_concurrency(),
-            256,
-            "the running engine's store_get_concurrency must reach the policy's preference"
+            latency_first_resolved.store_get_concurrency,
+            cost_based_resolved.store_get_concurrency
         );
+        assert_eq!(
+            latency_first_resolved.store_get_concurrency,
+            REFERENCE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            latency_first_resolved.sources.store_get_concurrency,
+            PERF_SOURCE_DERIVED
+        );
+
+        assert_eq!(
+            latency_first_resolved.sql_partition_count,
+            cost_based_resolved.sql_partition_count
+        );
+        assert_eq!(
+            latency_first_resolved.sql_partition_count,
+            REFERENCE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            latency_first_resolved.sources.sql_partition_count,
+            PERF_SOURCE_DERIVED
+        );
+
+        assert_eq!(
+            latency_first_resolved.promql_fetch_fanout,
+            cost_based_resolved.promql_fetch_fanout
+        );
+        assert_eq!(
+            latency_first_resolved.promql_fetch_fanout,
+            REFERENCE_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            latency_first_resolved.sources.promql_fetch_fanout,
+            PERF_SOURCE_DERIVED
+        );
+
+        let engine = engine_from(&latency_first);
+        assert_eq!(engine.store_get_concurrency(), REFERENCE_FETCH_CONCURRENCY);
         assert_eq!(engine.sql_partition_count(), REFERENCE_FETCH_CONCURRENCY);
         assert_eq!(engine.promql_fetch_fanout(), REFERENCE_FETCH_CONCURRENCY);
-    }
-
-    /// Issue #1196: an explicit `--store-get-concurrency` outranks
-    /// `latency-first`'s preference, with no conflict error -- the two flags
-    /// are allowed together, and the explicit value wins at source `"flag"`.
-    ///
-    /// Prove-the-test: swap the `if` in `apply_policy_store_get_concurrency`
-    /// to fire whenever a preference exists, ignoring `resolved.sources`, and
-    /// this reads `left: 256, right: 7` (the policy clobbering the explicit
-    /// flag).
-    #[test]
-    fn explicit_store_get_concurrency_beats_the_policy() {
-        let cli = Cli::try_parse_from([
-            "ravel-server",
-            "--logs-fetch-policy",
-            "latency-first",
-            "--store-get-concurrency",
-            "7",
-        ])
-        .expect("flags parse together with no conflict");
-        let resolved = resolved_from(&cli);
-        assert_eq!(resolved.store_get_concurrency, 7);
-        assert_eq!(resolved.sources.store_get_concurrency, PERF_SOURCE_FLAG);
-
-        let engine = engine_from(&cli);
-        assert_eq!(engine.store_get_concurrency(), 7);
-    }
-
-    /// Issue #1196: the legacy `--fetch-concurrency` also outranks
-    /// `latency-first`'s preference: `resolve_knob` already resolved to
-    /// `PERF_SOURCE_LEGACY_FLAG` before the policy override runs, so the
-    /// `PERF_SOURCE_DERIVED` guard in `apply_policy_store_get_concurrency`
-    /// never fires.
-    ///
-    /// Prove-the-test: widen that guard to match `PERF_SOURCE_LEGACY_FLAG` as
-    /// well as `PERF_SOURCE_DERIVED`, and this reads `left: 9, right: 256`.
-    #[test]
-    fn legacy_fetch_concurrency_beats_the_policy() {
-        let cli = Cli::try_parse_from([
-            "ravel-server",
-            "--logs-fetch-policy",
-            "latency-first",
-            "--fetch-concurrency",
-            "9",
-        ])
-        .expect("flag parses");
-        let resolved = resolved_from(&cli);
-        assert_eq!(resolved.store_get_concurrency, 9);
-        assert_eq!(
-            resolved.sources.store_get_concurrency,
-            PERF_SOURCE_LEGACY_FLAG
-        );
-
-        let engine = engine_from(&cli);
-        assert_eq!(engine.store_get_concurrency(), 9);
-    }
-
-    /// Issue #1196: `cost-based` (the shipped default) has no preference, so
-    /// it never sets the policy source: the reference host still derives
-    /// `store_get_concurrency` the plain ADR-1195 way.
-    ///
-    /// Prove-the-test: return `Some(LATENCY_FIRST_STORE_GET_CONCURRENCY)` from
-    /// `LogsFetchPolicy::preferred_store_get_concurrency` for `CostBased` too,
-    /// and this reads `left: 32, right: 256` / `left: "derived", right:
-    /// "policy"`.
-    #[test]
-    fn cost_based_takes_no_policy_default() {
-        let cli = Cli::try_parse_from(["ravel-server"]).expect("no flags parses");
-        let resolved = resolved_from(&cli);
-        assert_eq!(resolved.store_get_concurrency, REFERENCE_FETCH_CONCURRENCY);
-        assert_eq!(resolved.sources.store_get_concurrency, PERF_SOURCE_DERIVED);
-    }
-
-    /// Issue #1196: the startup log's `performance default resolved` line for
-    /// `store_get_concurrency` under `latency-first` must carry
-    /// `value=256 source="policy"` with no other flag set -- the exact
-    /// fields `ResolvedPerformanceDefaults::emit` interpolates into that
-    /// tracing line.
-    ///
-    /// Prove-the-test: same mutation as
-    /// [`latency_first_sets_store_get_concurrency_from_the_policy`]; the
-    /// second assertion here reads `left: "derived", right: "policy"`.
-    #[test]
-    fn latency_first_stamps_the_policy_source_at_256() {
-        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
-            .expect("flag parses");
-        let resolved = resolved_from(&cli);
-        assert_eq!(resolved.store_get_concurrency, 256);
-        assert_eq!(resolved.sources.store_get_concurrency, PERF_SOURCE_POLICY);
     }
 
     /// ADR-1195: combining `--fetch-concurrency` with any of the three new
@@ -6156,6 +6110,39 @@ mod tests {
         assert_eq!(stamp.policy, "latency-first");
         assert_eq!(stamp.request_cost_bytes, 1_887_437);
         assert_eq!(stamp.block_range_threshold, 524_288);
+    }
+
+    /// ADR-1196: the memory precondition must be operator-visible in the
+    /// startup stamp. Only `latency-first` stamps
+    /// `latency_first_supported_concurrency`, and it stamps the measured
+    /// concurrency (256), not whatever `store_get_concurrency` happens to
+    /// resolve to -- the two are independent (this policy carries no
+    /// concurrency default of its own).
+    ///
+    /// Prove-the-test: stamp `Some(self.store_get_concurrency)` instead of
+    /// `Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)` in
+    /// `logs_fetch_stamp`, and the second assertion reads `left: Some(32),
+    /// right: Some(256)` (the reference host's resolved concurrency, not the
+    /// measured constant).
+    #[test]
+    fn latency_first_stamps_the_measured_concurrency_and_cost_based_stamps_none() {
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "latency-first"])
+            .expect("flag parses");
+        let stamp = stamp_from(&cli);
+        assert_eq!(
+            stamp.latency_first_supported_concurrency,
+            Some(ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY)
+        );
+        assert_eq!(
+            stamp.latency_first_supported_concurrency,
+            Some(256),
+            "the measured concurrency is a fixed constant, not this run's resolved value"
+        );
+        assert_eq!(stamp.store_get_concurrency, REFERENCE_FETCH_CONCURRENCY);
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.latency_first_supported_concurrency, None);
     }
 
     /// ADR-0996 decision 2's "Knob relations": `request-minimal` overrides an

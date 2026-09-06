@@ -654,23 +654,27 @@ keep separate.
 
 Decision: `cost-based` stays the default (it is right for the bill, and
 ADR-0904 shipped it with defaults unchanged from day one). A new named
-policy,
-`latency-first`, is added as an operator opt-in for deployments where
-cold wall-clock matters more than the request count: it resolves the
-same byte quantities `byte-minimal` does (ADR-0904's ranged behaviour,
-unaffected by cost profile), and in addition prefers a 256 process-wide
-object-store GET concurrency over the host-derived default, unless an
-operator's explicit `--store-get-concurrency` or the legacy
-`--fetch-concurrency` already set one. The 256 figure is the measured
-configuration behind the 285.8 s row above, not a value derived from
-core count or any other host property. Selecting `latency-first`
-accepts 5.45x the GET requests (570,752 vs 104,780) for 46% less cold
+policy, `latency-first`, is added as an operator opt-in for deployments
+where cold wall-clock matters more than the request count: it resolves
+the same byte quantities `byte-minimal` does (ADR-0904's ranged
+behaviour, unaffected by cost profile). Superseded by ADR-1196:
+`latency-first` is an intent, not a tuning constant, and carries no
+concurrency default of its own -- it resolves `store_get_concurrency`
+exactly as every other policy does. The 256 figure behind the 285.8 s
+row above is the concurrency the trade was measured at, documented as
+`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`; an operator who wants
+the measured trade sets `--store-get-concurrency` (and, for SQL,
+`--sql-partition-count`) to it explicitly. Selecting `latency-first`
+accepts 5.45x the GET requests (570,752 vs 104,780) for 41% less cold
 wall-clock (285.8 s vs 486.0 s) than the `cost-based` default at this
-profile.
+profile and concurrency.
 
 The extra in-flight fetch memory a raised GET concurrency implies is
 unbounded today; ADR-1170's process-wide memory budget, once it lands,
-will bound it. This amendment implements no such bound.
+will bound it. This amendment implements no such bound: ADR-1196 makes
+that precondition operator-visible (the flag's own documentation, and a
+startup log line under `latency-first`) rather than closing it. See
+ADR-1196 for the full decision and rationale.
 
 Rejected alternative: rescaling `DEFAULT_LOG_REQUEST_COST_BYTES` by 27x
 so a cost-based derivation lands closer to `byte-minimal`'s routing.
