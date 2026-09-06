@@ -1617,6 +1617,11 @@ async fn body_literal_prunes_blocks_without_changing_results() {
         LabelMatcher::not_equal(BODY_MATCHER_LABEL, "needle alpha found"),
     )
     .await;
+    assert_eq!(out.blocks_total, 4);
+    assert_eq!(
+        out.blocks_scanned, 4,
+        "a negated matcher pushes no literal, so no block is pruned"
+    );
     let total: usize = out.series.iter().map(|s| s.samples.len()).sum();
     assert_eq!(total, 11, "__body__!=\"needle alpha found\"");
 }
