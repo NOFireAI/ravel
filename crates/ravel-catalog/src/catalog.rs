@@ -3123,6 +3123,16 @@ impl Catalog {
             rewrite_records.push((rkey.clone(), record));
         }
 
+        // Overlapping input sets in this bucket (issue #1171, the same
+        // hazard #1070 fixed on the listing path): without this, a token
+        // covered by a losing record's inputs is satisfied via that loser's
+        // parts even though `process_bucket` never serves them, so a snapshot
+        // can carry parts from both overlapping records. Pick one
+        // authoritative record per overlap component here too, and skip a
+        // loser below before testing whether it covers the token.
+        let losing_compaction_records =
+            select_authoritative_compaction_records(&compaction_records);
+
         // Which records a live rewrite superseded as a whole (their parts must
         // never be served). No rewrites -> empty set -> exactly the pre-ADR-0064
         // behavior below.
@@ -3161,7 +3171,9 @@ impl Catalog {
 
         // A live compaction record whose inputs cover the token: serve its parts.
         for (ckey, record) in &compaction_records {
-            if superseded_records.contains(ckey) {
+            if superseded_records.contains(ckey)
+                || losing_compaction_records.contains(ckey.as_str())
+            {
                 continue;
             }
             let covers = record.inputs.iter().any(|input| {
