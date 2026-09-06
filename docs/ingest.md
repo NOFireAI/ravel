@@ -273,8 +273,10 @@ What each knob actually moves there:
   trigger does.
 - `min_flush_bytes` and `max_flush_delay_idle`: unreachable whenever a
   strict-mode waiter is present, so they have no effect on the
-  acknowledged path. They set a buffered-mode tenant's PUT cadence when its
-  arrival rate is too low to reach `target_bytes`.
+  acknowledged path. On the buffered path `min_flush_bytes` is the
+  threshold that selects between the two age clocks: a buffer holding at
+  least that much takes `max_flush_delay`, and only one holding less waits
+  `max_flush_delay_idle`.
 - `max_flush_delay`: the knob that sets acknowledged-path flush cadence.
   Raising it produces fewer, larger commit records per hour at the cost of
   acknowledged write latency, since a strict acknowledgement waits for its

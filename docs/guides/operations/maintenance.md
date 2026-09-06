@@ -144,12 +144,21 @@ trigger is byte-driven even on the strict path, which puts it in the regime
 described next rather than this one.
 
 A buffered write (no waiter) is different, and this is where the
-byte-driven/timer-driven split applies: a buffered-mode tenant is
-byte-driven when its arrival rate reaches `target_bytes` before
-`max_flush_delay_idle` (40s default) elapses, and timer-driven otherwise.
-Only a byte-driven buffered tenant ever exercises the size trigger; a
-timer-driven one always flushes on `max_flush_delay_idle`, however little
-data it holds.
+byte-driven/timer-driven split applies. It has three regimes, not two,
+because `min_flush_bytes` selects which age clock a buffered tenant gets:
+
+- reaches `target_bytes` before any age trigger fires: byte-driven, and the
+  only regime that exercises the size trigger at all;
+- below `target_bytes` but holding at least `min_flush_bytes`: flushes on
+  `max_flush_delay` (2s default), the same fast clock a strict write gets,
+  so its PUT cadence is nothing like idle;
+- below `min_flush_bytes`: flushes on `max_flush_delay_idle` (40s default),
+  however little it holds.
+
+Only the third is genuinely timer-driven in the slow sense. A tenant that
+merely fails to reach `target_bytes` is not automatically in it, which
+matters when sizing `max_flush_lifetime` below: a middle-regime tenant
+flushes twenty times more often than the idle figure suggests.
 
 `max_flush_lifetime` is neither of those triggers: it is never consulted
 before a flush opens, only after, to bound how long an already-open flush
