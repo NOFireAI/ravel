@@ -6202,31 +6202,59 @@ type = "i64"
     /// pair. Every argument of the load is fixed here, so the only thing the
     /// two calls differ in is `max_flush_delay`.
     ///
-    /// The injected clock advances 5s of load time every 20ms of real time and
-    /// stops once it has advanced `GATE_NS`; the decoder is gated on that same
-    /// point, blocking after the first batch is queued until the clock reaches
-    /// it. So batch 1's write sits alone in the shard buffer across the whole
-    /// advance, and batch 2's write arrives only once the clock has stopped
-    /// moving. Whether the first buffer survives that window is the delay's
-    /// decision and nothing else's.
+    /// Pacing comes only from the injected [`TestClock`], modelled on
+    /// [`load_with_released_tail`]: the decoder is held on a two-phase gate
+    /// (`on_batch_queued` reports each batch's ordinal on `gate_tx`, then
+    /// blocks on `release_rx.recv()`) so batch 1's write reaches the shard
+    /// buffer alone, the driver advances the clock by a single `ADVANCE_NS`
+    /// (5s) once the router has gone quiet, then releases the decoder for
+    /// batch 2. Quiescence is read off [`TestClock::reads`] via
+    /// [`yield_until_router_is_quiet`]; there is no wall-clock sleep, poll, or
+    /// timeout anywhere in this path.
+    ///
+    /// 5s clears `SHORT`'s 1s delay (so the first buffer always ages out on
+    /// that side) while staying far under `LONG`'s 3600s delay, under
+    /// `max_flush_lifetime`'s 3600s default, and unreachable by the real-time
+    /// 60s Strict ack deadline, so exactly one deadline can come due on the
+    /// jump.
+    ///
+    /// The bounded wait for a published object before the second quiesce
+    /// proves different things on each side, which is why both sides share
+    /// this one helper instead of diverging: on `LONG` the only object that
+    /// can exist there is write 2's size flush, so the wait pins that write 2
+    /// reached the shard buffer before `Done` and the end-of-input
+    /// `flush_all` could split it. On `SHORT` the aged object from the
+    /// advance already satisfies it; a `SHORT`-side write 2 published as a
+    /// straggler and one published as an ordered tail both count as the same
+    /// `final_drain` flush, so that side's expected layout does not depend on
+    /// the ordering.
     async fn load_two_writes_across_one_clock_advance(
         store: Arc<dyn ObjectStoreBackend>,
         pq: &Path,
         m: &Mapping,
         max_flush_delay: Duration,
     ) -> LoadReport {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         // TARGET between one 4.1 KB slice and two, with margin on both sides,
         // so one write never reaches it and two always do.
         const TARGET: usize = 6_000;
-        const ADVANCE_STEP_NS: i64 = 5 * 1_000_000_000;
-        const GATE_NS: i64 = 100 * 1_000_000_000;
+        const ADVANCE_NS: i64 = 5 * 1_000_000_000;
 
         let clock = TestClock::new(NOW_NS);
-        let gate = Arc::clone(&clock);
+        let probe: Arc<dyn ObjectStoreBackend> = Arc::clone(&store);
+
+        let ordinal = Arc::new(AtomicUsize::new(0));
+        let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(release_rx);
         let on_batch_queued: BuildStartHook = Arc::new(move || {
-            while gate.now_ns() < NOW_NS + GATE_NS {
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            let n = ordinal.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = gate_tx.send(n);
+            let guard = release_rx
+                .lock()
+                .expect("the release channel is not poisoned");
+            let _ = guard.recv();
         });
 
         let load_fut = load_instrumented(
@@ -6248,17 +6276,59 @@ type = "i64"
             None,
             Some(on_batch_queued),
         );
-        tokio::pin!(load_fut);
-        loop {
-            tokio::select! {
-                report = &mut load_fut => break report.expect("the load completes"),
-                () = tokio::time::sleep(Duration::from_millis(20)) => {
-                    if clock.now_ns() < NOW_NS + GATE_NS {
-                        clock.advance_ns(ADVANCE_STEP_NS);
-                    }
-                }
+
+        let driver = async {
+            assert_eq!(
+                gate_rx.recv().await,
+                Some(1),
+                "the first batch reaches the decoder before anything else runs"
+            );
+            yield_until_router_is_quiet(&clock).await;
+            assert_eq!(
+                list_data_objects(probe.as_ref()).await.len(),
+                0,
+                "one write alone is under TARGET and the clock has not moved: nothing can \
+                 have flushed yet"
+            );
+            clock.advance_ns(ADVANCE_NS);
+            yield_until_router_is_quiet(&clock).await;
+            release_tx
+                .send(())
+                .expect("the hook is still waiting on its first release");
+            assert_eq!(
+                gate_rx.recv().await,
+                Some(2),
+                "the second batch reaches the decoder once released"
+            );
+
+            const MAX_SETTLE_ROUNDS: usize = 10_000;
+            let mut rounds = 0;
+            while list_data_objects(probe.as_ref()).await.is_empty() {
+                rounds += 1;
+                assert!(
+                    rounds < MAX_SETTLE_ROUNDS,
+                    "issue #1235: settle loop exceeded {MAX_SETTLE_ROUNDS} rounds \
+                     without a published object"
+                );
+                tokio::task::yield_now().await;
             }
-        }
+            yield_until_router_is_quiet(&clock).await;
+            drop(release_tx);
+            std::future::pending::<()>().await
+        };
+
+        let report = tokio::select! {
+            report = load_fut => report.expect("the load completes"),
+            () = driver => unreachable!("the driver parks once the decoder is released"),
+        };
+
+        assert_eq!(
+            clock.now_ns(),
+            NOW_NS + ADVANCE_NS,
+            "the driver advances the injected clock exactly once, by exactly ADVANCE_NS"
+        );
+
+        report
     }
 
     /// The `--max-flush-delay` lever decides an object layout, not just a config
@@ -6267,10 +6337,10 @@ type = "i64"
     /// `--target-bytes`, same `--pipeline-depth`, same injected clock advanced
     /// by the same pattern, only the delay flipped.
     ///
-    /// - `LONG` (1h) outlasts the 100s the clock ever advances, so nothing can
-    ///   age out. The second write merges into the first's buffer, pushes it
-    ///   past the target and flushes both as ONE object by size.
-    /// - `SHORT` (1s) is shorter than a single 5s advance step, so the first
+    /// - `LONG` (1h) outlasts the single 5s advance the driver ever makes, so
+    ///   nothing can age out. The second write merges into the first's buffer,
+    ///   pushes it past the target and flushes both as ONE object by size.
+    /// - `SHORT` (1s) is shorter than the single 5s advance, so the first
     ///   write's buffer ages out while the decoder is gated: one object by age.
     ///   The second write then lands in a fresh buffer with the clock already
     ///   stopped, so nothing can age it either, and the loader's end-of-input
@@ -6285,6 +6355,15 @@ type = "i64"
     /// `LONG` to the split side fails at `left: 1, right: 2`, with its mix at
     /// `size: 1, age: 0, final: 0` where `size: 0, age: 1, final: 1` is
     /// required.
+    ///
+    /// Inside the helper itself: removing its single `clock.advance_ns` call
+    /// fails the helper's own post-select clock assertion on the first
+    /// (coalesced) call, at `left: 1700000000000000000, right:
+    /// 1700000005000000000`, before the split side ever runs; calling it
+    /// twice fails the same assertion at
+    /// `left: 1700000010000000000, right: 1700000005000000000`; and lowering
+    /// the helper's `TARGET` to `3_000` (so write 1 flushes by size alone)
+    /// fails the pre-advance zero-object assertion at `left: 1, right: 0`.
     #[tokio::test]
     async fn max_flush_delay_decides_whether_two_writes_coalesce() {
         use ravel_object_store::memory::MemoryStore;
