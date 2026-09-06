@@ -218,6 +218,72 @@ code=$?
 if [ "$code" -eq 0 ]; then ok; else bad "e: expected exit 0, got $code; output: $out"; fi
 rm -rf "$edir"
 
+# --- (f) traceability: two Rust references in one row (issue #1243) --------
+# A property whose transition spans two symbols in two crates records both
+# in the source-ref column, whitespace separated. Each reference must
+# resolve independently against its own file: a passing two-ref row, and a
+# failing one where only the second reference's symbol is missing (the bug
+# this closes made a second file's symbol get grepped against the first
+# file instead of its own).
+echo "--- (f) traceability: multi-ref row resolves, and a bad second ref fails"
+frepo="$(mktemp -d)"
+mkdir -p "$frepo/crates" "$frepo/formal/tla/fakearea"
+cat > "$frepo/crates/a.rs" <<'EOF'
+struct Foo;
+impl Foo {
+    fn bar() {}
+}
+EOF
+cat > "$frepo/crates/b.rs" <<'EOF'
+fn Baz() {}
+EOF
+cat > "$frepo/formal/tla/fakearea/traceability.md" <<'EOF'
+# Fake area traceability
+
+| TLA+ action or property | meaning | Rust path and symbol | existing test | new test needed |
+|---|---|---|---|---|
+| TwoRefProp | a transition spanning two crates | `crates/a.rs::Foo::bar` `crates/b.rs::Baz` | none | none |
+EOF
+
+orig_repo_root="$REPO_ROOT"
+orig_formal_dir="$FORMAL_DIR"
+REPO_ROOT="$frepo"
+FORMAL_DIR="$frepo/formal/tla"
+
+fout=""
+fout="$(check_traceability fakearea 2>&1)"
+fcode=$?
+if [ "$fcode" -eq 0 ]; then ok; else bad "f1: expected exit 0 on a valid two-ref row, got $fcode; output: $fout"; fi
+if printf '%s' "$fout" | grep -qF 'PASS (1 rows resolve)'; then
+    ok
+else
+    bad "f1: expected the row to be counted; output: $fout"
+fi
+
+# Break only the second reference's symbol: the row must fail, and the
+# reported line must name the second file, never the first.
+cat > "$frepo/formal/tla/fakearea/traceability.md" <<'EOF'
+# Fake area traceability
+
+| TLA+ action or property | meaning | Rust path and symbol | existing test | new test needed |
+|---|---|---|---|---|
+| TwoRefProp | a transition spanning two crates | `crates/a.rs::Foo::bar` `crates/b.rs::Qux` | none | none |
+EOF
+fout="$(check_traceability fakearea 2>&1)"
+fcode=$?
+if [ "$fcode" -ne 0 ]; then ok; else bad "f2: expected nonzero exit on a bad second ref, got 0; output: $fout"; fi
+failing_line="$(printf '%s\n' "$fout" | grep -F "symbol 'Qux' not found in 'crates/b.rs'" | head -1)"
+if [ -n "$failing_line" ]; then
+    ok
+    echo "    failure line: $failing_line"
+else
+    bad "f2: expected a \"symbol 'Qux' not found in 'crates/b.rs'\" line; output: $fout"
+fi
+
+REPO_ROOT="$orig_repo_root"
+FORMAL_DIR="$orig_formal_dir"
+rm -rf "$frepo"
+
 # --- (c) normal operation is unchanged (see report; needs the real TLC jar
 # and a JDK, so it is not run unpiped here) ----------------------------------
 echo "(c) is proved manually and reported, not replayed here: it needs the" \
