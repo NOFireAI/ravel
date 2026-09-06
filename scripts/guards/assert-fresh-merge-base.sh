@@ -51,7 +51,10 @@ git fetch "$remote" "+${branch}:${tip_ref}" >/dev/null 2>&1 || {
 # branch and cannot be aimed at the wrong ref by a stale local copy. The
 # destination carries the pid and is deleted on exit: a name per PR would leave
 # one ref behind for every PR ever checked, and a single fixed name would race
-# two concurrent runs against each other.
+# two concurrent runs against each other. The leading `+` is load-bearing rather
+# than habit: SIGKILL cannot run the trap, so a ref can survive, and forcing the
+# update means a later run that draws the same pid overwrites the orphan instead
+# of failing on it.
 local_ref="refs/remotes/${remote}/freshness-check-$$"
 trap 'git update-ref -d "$local_ref" 2>/dev/null || true' EXIT HUP INT TERM
 git fetch "$remote" "+refs/pull/${pr}/head:${local_ref}" >/dev/null 2>&1 || {
