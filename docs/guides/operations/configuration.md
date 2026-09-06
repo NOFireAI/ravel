@@ -169,8 +169,11 @@ shipped topology does.
 One policy document per role lives in [`deploy/iam/`](../../../deploy/iam/)
 rather than being transcribed here, so a policy edit is a diff that a test
 checks against the real object-key layout in CI. Replace `my-ravel-bucket` with
-your bucket in each file, then attach each document to the principal whose
-access key that role's deployment uses.
+your bucket, and `arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID`
+with your tenant key ARN(s), in each file, then attach each document to the
+principal whose access key that role's deployment uses. An operator who
+attaches a template without substituting the KMS ARN gets `AccessDenied` on
+the first KMS-routed PUT: the placeholder names no real key.
 
 Three facts about those documents are worth knowing before you edit them.
 
@@ -356,8 +359,10 @@ to narrow.
 }
 ```
 
-The matching role-side statement in each `deploy/iam/*.json` template is scoped
-to the tenant key ARNs rather than to every key:
+The matching role-side statement in each `deploy/iam/*.json` template holds a
+placeholder tenant key ARN that you must replace with your own (see
+[the shipped policy documents](#the-shipped-policy-documents)); scoped to a
+real tenant key rather than to every key:
 
 - Gateway and Maintain write tenant data through the routing store and read some
   of what they write, so they hold encrypt, generate-data-key and decrypt.
