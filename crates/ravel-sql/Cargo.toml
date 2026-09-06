@@ -44,6 +44,13 @@ ravel-logseg = { workspace = true }
 # (ADR-0041 phase 5 is the SQL table alone), so ravel-rspan is a direct
 # dependency here, the same way ravel-logseg is for the `logs` table.
 ravel-rspan = { workspace = true }
+# The process-wide memory accountant (ADR-1170 decision 1).
+# `TenantMemoryAccountant` is the adapter over it: every tenant charge the
+# `TenantDelegatingPool` makes is forwarded to the same `MemoryBudget`, so the
+# per-tenant ceilings nest inside one process ceiling instead of multiplying by
+# the number of active tenants. A leaf crate with no dependency beyond std, so
+# this adds no cycle and no external supply-chain surface.
+ravel-memory = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the

@@ -1,12 +1,15 @@
 //! The tenant-delegating memory pool bridge.
 //!
 //! DataFusion memory pools are per-`RuntimeEnv`, not hierarchical. Ravel needs
-//! two nested budgets: a per-query byte ceiling and a per-tenant ceiling that
+//! three nested budgets: a per-query byte ceiling, a per-tenant ceiling that
 //! outlives any single query and is shared across a tenant's concurrent
-//! queries. [`TenantDelegatingPool`] is the bridge: it is the `MemoryPool`
+//! queries, and one process-wide ceiling every tenant draws from (ADR-1170
+//! decision 1). [`TenantDelegatingPool`] is the bridge: it is the `MemoryPool`
 //! installed on the query's `RuntimeEnv`, it enforces the per-query ceiling
 //! locally, and it forwards every `grow`/`try_grow`/`shrink` to the
-//! [`TenantMemoryAccountant`] so tenant usage is accounted across queries.
+//! [`TenantMemoryAccountant`] so tenant usage is accounted across queries; the
+//! accountant forwards the same delta to the process-wide
+//! [`ravel_memory::MemoryBudget`] it adapts.
 //!
 //! The forwarding of `shrink` is load-bearing for cancellation:
 //! DataFusion frees a `MemoryReservation` on `Drop`, which calls
@@ -21,6 +24,7 @@ use std::sync::{Arc, OnceLock};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
+use ravel_memory::{MemoryBudget, MemoryExhausted};
 use ravel_types::accounting::QueryAccounting;
 
 /// A one-shot per-query abort flag for the best-effort memory ceiling.
@@ -64,26 +68,68 @@ impl CeilingBreach {
     }
 }
 
+/// Which ledger refused a forwarded [`TenantMemoryAccountant::try_grow`], with
+/// the figures that explain the refusal. A refusal leaves both ledgers exactly
+/// as it found them: the tenant charge is rolled back before a process refusal
+/// is returned, and the process reserved nothing on its own refusal.
+#[derive(Debug)]
+enum GrowRefused {
+    /// The tenant ceiling refused. `used` is the tenant bytes reserved at the
+    /// moment of refusal.
+    Tenant { used: usize },
+    /// The process budget refused, after the tenant charge was rolled back.
+    Process(MemoryExhausted),
+}
+
+/// The totals both ledgers reached after an infallible
+/// [`TenantMemoryAccountant::grow`], so the caller can compare each against its
+/// own ceiling without a second racy load.
+#[derive(Debug, Clone, Copy)]
+struct GrowTotals {
+    tenant: usize,
+    process: u64,
+}
+
 /// Per-tenant memory accountant: a byte counter with a ceiling, shared (via
 /// `Arc`) across every query a tenant runs concurrently. Independent of
 /// DataFusion; the query's [`TenantDelegatingPool`] forwards into it.
 ///
-/// This is a ravel-sql-local stand-in for Ravel's tenant accountant: nothing
-/// tenant-wide exists to delegate to yet (there is no cross-crate accountant
-/// type), so this crate defines the shape here. When a process-wide accountant lands,
-/// this becomes a thin adapter over it; the pool bridge above does not change.
+/// This is the adapter over the process-wide [`MemoryBudget`] (ADR-1170
+/// decision 1): every charge the pool bridge above makes is applied to the
+/// tenant counter and forwarded to the process counter with the same delta,
+/// tenant then process on the way up and process then tenant on the way down,
+/// so the per-tenant ceilings are a fairness bound nested inside one process
+/// ceiling rather than N ceilings that multiply with the number of active
+/// tenants. The tenant ceiling keeps its own meaning and its own refusal.
+///
+/// A budget built with [`MemoryBudget::unlimited`] counts every charge and
+/// refuses none, which is the default until a caller installs a bounded one.
 #[derive(Debug)]
 pub struct TenantMemoryAccountant {
     limit: usize,
     used: AtomicUsize,
+    budget: Arc<MemoryBudget>,
 }
 
 impl TenantMemoryAccountant {
-    /// A tenant accountant capped at `limit` bytes.
+    /// A tenant accountant capped at `limit` bytes whose charges are counted
+    /// against a private unlimited process budget, so it refuses on the tenant
+    /// ceiling alone.
+    ///
+    /// [`Self::with_process_budget`] is the constructor that shares one budget
+    /// across a process's tenants; this one exists for callers (tests in this
+    /// and other crates) that only exercise the tenant ceiling.
     pub fn new(limit: usize) -> Arc<Self> {
+        TenantMemoryAccountant::with_process_budget(limit, Arc::new(MemoryBudget::unlimited()))
+    }
+
+    /// A tenant accountant capped at `limit` bytes that also charges `budget`,
+    /// the process-wide accountant shared by every tenant in this process.
+    pub fn with_process_budget(limit: usize, budget: Arc<MemoryBudget>) -> Arc<Self> {
         Arc::new(TenantMemoryAccountant {
             limit,
             used: AtomicUsize::new(0),
+            budget,
         })
     }
 
@@ -97,12 +143,40 @@ impl TenantMemoryAccountant {
         self.limit
     }
 
-    /// Reserve `additional` bytes if doing so stays at or under the ceiling.
-    /// Returns `Err(used)` (reserving nothing) when it would overflow the
-    /// tenant budget, where `used` is the bytes reserved at the moment of
-    /// refusal so the caller can name the pool's occupancy, not just the
-    /// rejected delta. CAS loop so concurrent queries account correctly.
-    fn try_grow(&self, additional: usize) -> Result<(), usize> {
+    /// Bytes currently reserved on the process-wide budget, across every
+    /// tenant sharing it (and every non-SQL component charging it).
+    pub fn process_reserved(&self) -> u64 {
+        self.budget.reserved()
+    }
+
+    /// The process-wide ceiling. `u64::MAX` under the unlimited default.
+    pub fn process_limit(&self) -> u64 {
+        self.budget.limit()
+    }
+
+    /// Reserve `additional` bytes on the tenant counter if doing so stays at or
+    /// under the tenant ceiling, then on the process budget. Reserves nothing
+    /// on either ledger when it returns `Err`: a tenant refusal never reaches
+    /// the process budget, and a process refusal rolls the tenant charge back
+    /// before returning (the process reserved nothing to release, per
+    /// `MemoryBudget::try_reserve`'s all-or-nothing rule).
+    fn try_grow(&self, additional: usize) -> Result<(), GrowRefused> {
+        self.tenant_try_grow(additional)
+            .map_err(|used| GrowRefused::Tenant { used })?;
+        if let Err(exhausted) = self.budget.try_reserve(additional as u64) {
+            self.tenant_shrink(additional);
+            return Err(GrowRefused::Process(exhausted));
+        }
+        Ok(())
+    }
+
+    /// The tenant half of [`Self::try_grow`]: reserve `additional` bytes if
+    /// doing so stays at or under the ceiling. Returns `Err(used)` (reserving
+    /// nothing) when it would overflow the tenant budget, where `used` is the
+    /// bytes reserved at the moment of refusal so the caller can name the
+    /// pool's occupancy, not just the rejected delta. CAS loop so concurrent
+    /// queries account correctly.
+    fn tenant_try_grow(&self, additional: usize) -> Result<(), usize> {
         let mut cur = self.used.load(Ordering::Acquire);
         loop {
             let next = cur.saturating_add(additional);
@@ -119,19 +193,31 @@ impl TenantMemoryAccountant {
         }
     }
 
-    /// Reserve `additional` bytes unconditionally (mirrors the infallible
-    /// `MemoryPool::grow`, which the trait requires never fail). Returns the
-    /// new total so the caller can compare it against the ceiling and trip a
-    /// [`CeilingBreach`] without a second racy load.
-    fn grow(&self, additional: usize) -> usize {
-        self.used
+    /// Reserve `additional` bytes unconditionally on both ledgers (mirrors the
+    /// infallible `MemoryPool::grow`, which the trait requires never fail).
+    /// Returns both new totals so the caller can compare each against its
+    /// ceiling and trip a [`CeilingBreach`] without a second racy load.
+    fn grow(&self, additional: usize) -> GrowTotals {
+        let tenant = self
+            .used
             .fetch_add(additional, Ordering::AcqRel)
-            .saturating_add(additional)
+            .saturating_add(additional);
+        let process = self.budget.reserve_unchecked(additional as u64);
+        GrowTotals { tenant, process }
     }
 
-    /// Release `amount` bytes, saturating at zero so a double-shrink or an
-    /// accounting drift can never underflow.
+    /// Release `amount` bytes from the process budget and then the tenant
+    /// counter, the reverse of the order [`Self::try_grow`] charges them in.
     fn shrink(&self, amount: usize) {
+        self.budget.release(amount as u64);
+        self.tenant_shrink(amount);
+    }
+
+    /// The tenant half of [`Self::shrink`], saturating at zero so a
+    /// double-shrink or an accounting drift can never underflow. Also the
+    /// rollback for a process refusal, which must leave the process counter
+    /// alone because nothing was reserved there.
+    fn tenant_shrink(&self, amount: usize) {
         let mut cur = self.used.load(Ordering::Acquire);
         loop {
             let next = cur.saturating_sub(amount);
@@ -149,10 +235,11 @@ impl TenantMemoryAccountant {
 /// The query's DataFusion `MemoryPool`: enforces a per-query byte ceiling and
 /// forwards all accounting to a shared [`TenantMemoryAccountant`].
 ///
-/// `try_grow` fails if either budget is exhausted, and it checks the query
-/// budget first so a high-cardinality query trips its own pool before it can
-/// threaten the tenant budget (the ordering the sizing test asserts).
-/// A failed `try_grow` reserves nothing on either budget.
+/// `try_grow` fails if any of the three budgets is exhausted (query, tenant,
+/// then the process-wide [`MemoryBudget`] the accountant adapts), and it checks
+/// the query budget first so a high-cardinality query trips its own pool before
+/// it can threaten the tenant budget (the ordering the sizing test asserts).
+/// A failed `try_grow` reserves nothing on any of them.
 pub struct TenantDelegatingPool {
     query_limit: usize,
     query_used: AtomicUsize,
@@ -176,6 +263,8 @@ impl fmt::Debug for TenantDelegatingPool {
             .field("query_used", &self.query_used.load(Ordering::Relaxed))
             .field("tenant_reserved", &self.tenant.reserved())
             .field("tenant_limit", &self.tenant.limit())
+            .field("process_reserved", &self.tenant.process_reserved())
+            .field("process_limit", &self.tenant.process_limit())
             .finish()
     }
 }
@@ -284,27 +373,38 @@ impl MemoryPool for TenantDelegatingPool {
         // trip the shared CeilingBreach. This does not prevent the overshoot
         // -- it cannot, per the paragraph above -- it lets the query's stream
         // notice at its next poll and abort rather than run over budget. Only
-        // one of the two checks trips per call (whichever ceiling was actually
-        // breached); the query check is first so a query overrunning its own
-        // budget is reported against the per-query ceiling, not the tenant's.
+        // one of the three checks trips per call (whichever ceiling was
+        // actually breached); the query check is first so a query overrunning
+        // its own budget is reported against the per-query ceiling, not the
+        // tenant's, and the process check is last because it is the widest
+        // ceiling: a query or tenant overshoot names the narrower budget that
+        // it also crossed.
         let query_total = self
             .query_used
             .fetch_add(additional, Ordering::AcqRel)
             .saturating_add(additional);
         self.accounting
             .observe_intermediate_bytes(query_total as u64);
-        let tenant_total = self.tenant.grow(additional);
+        let totals = self.tenant.grow(additional);
         if query_total > self.query_limit {
             self.breach.trip(format!(
                 "query memory ceiling breached: {query_total} bytes reserved exceeds \
                  per-query limit {}",
                 self.query_limit
             ));
-        } else if tenant_total > self.tenant.limit() {
+        } else if totals.tenant > self.tenant.limit() {
             self.breach.trip(format!(
-                "tenant memory ceiling breached: {tenant_total} bytes reserved exceeds \
+                "tenant memory ceiling breached: {} bytes reserved exceeds \
                  tenant limit {}",
+                totals.tenant,
                 self.tenant.limit()
+            ));
+        } else if totals.process > self.tenant.process_limit() {
+            self.breach.trip(format!(
+                "process memory ceiling breached: {} bytes reserved exceeds \
+                 process limit {}",
+                totals.process,
+                self.tenant.process_limit()
             ));
         }
     }
@@ -328,15 +428,33 @@ impl MemoryPool for TenantDelegatingPool {
                 self.query_limit
             ))
         })?;
-        if let Err(used) = self.tenant.try_grow(additional) {
-            // Roll the query reservation back so a tenant-budget failure
-            // leaves nothing reserved on either budget.
+        if let Err(refused) = self.tenant.try_grow(additional) {
+            // Roll the query reservation back so a tenant- or process-budget
+            // failure leaves nothing reserved on any of the three budgets. The
+            // accountant has already rolled its own tenant charge back on a
+            // process refusal, and the process reserved nothing to release.
             self.query_shrink(additional);
-            return Err(DataFusionError::ResourcesExhausted(format!(
-                "tenant memory budget exhausted: {additional} more bytes on top of {used} \
-                 already reserved exceeds tenant limit {}",
-                self.tenant.limit()
-            )));
+            let message = match refused {
+                GrowRefused::Tenant { used } => format!(
+                    "tenant memory budget exhausted: {additional} more bytes on top of {used} \
+                     already reserved exceeds tenant limit {}",
+                    self.tenant.limit()
+                ),
+                // No tenant identifier here, only figures: the process budget
+                // is shared, so this message is read by an operator looking at
+                // process-wide pressure, and the tenant figures are what say
+                // how much of it this tenant held.
+                GrowRefused::Process(exhausted) => format!(
+                    "process memory budget exhausted: {additional} more bytes on top of {} \
+                     already reserved exceeds process limit {} (tenant reserved {} of \
+                     tenant limit {})",
+                    exhausted.reserved,
+                    exhausted.limit,
+                    self.tenant.reserved(),
+                    self.tenant.limit()
+                ),
+            };
+            return Err(DataFusionError::ResourcesExhausted(message));
         }
         // Observed only once BOTH budgets have granted the growth. Recording it
         // before the tenant check leaves a peak for bytes that no successful
@@ -477,5 +595,141 @@ mod tests {
             6144,
             "a shrink must not lower the recorded peak"
         );
+    }
+
+    /// A pool over `tenant` with ceilings wide enough that only the process
+    /// budget can refuse or breach.
+    fn pool_over(
+        tenant: Arc<TenantMemoryAccountant>,
+        breach: Arc<CeilingBreach>,
+    ) -> Arc<dyn MemoryPool> {
+        Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            tenant,
+            breach,
+            QueryAccounting::new(),
+        ))
+    }
+
+    /// ADR-1170 decision 1: two tenants over ONE process budget. B's 50 bytes
+    /// fit B's own 60-byte tenant ceiling, and are refused anyway because A
+    /// already holds 60 of the process budget's 100. The refusal names the
+    /// process figures, and it reserves nothing anywhere: B's tenant counter is
+    /// back at zero, B's query counter is rolled back, and the process still
+    /// holds exactly A's 60 bytes (a process refusal reserves nothing, so there
+    /// is nothing to release from it).
+    #[test]
+    fn a_process_refusal_names_the_process_figures_and_rolls_the_tenant_back() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        let tenant_a = TenantMemoryAccountant::with_process_budget(60, Arc::clone(&budget));
+        let tenant_b = TenantMemoryAccountant::with_process_budget(60, Arc::clone(&budget));
+        let pool_a = pool_over(Arc::clone(&tenant_a), CeilingBreach::new());
+        let pool_b = pool_over(Arc::clone(&tenant_b), CeilingBreach::new());
+        let res_a = MemoryConsumer::new("tenant-a").register(&pool_a);
+        let res_b = MemoryConsumer::new("tenant-b").register(&pool_b);
+
+        res_a
+            .try_grow(60)
+            .expect("60 fits A's tenant ceiling and the process budget");
+        assert_eq!(budget.reserved(), 60);
+
+        let err = res_b
+            .try_grow(50)
+            .expect_err("50 fits B's tenant ceiling but not the process budget's remaining 40");
+        let DataFusionError::ResourcesExhausted(message) = &err else {
+            panic!("a process refusal must stay a ResourcesExhausted; got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "process memory budget exhausted: 50 more bytes on top of 60 already reserved \
+             exceeds process limit 100 (tenant reserved 0 of tenant limit 60)"
+        );
+
+        assert_eq!(
+            tenant_b.reserved(),
+            0,
+            "the refused tenant charge is rolled back"
+        );
+        assert_eq!(
+            pool_b.reserved(),
+            0,
+            "the refused query charge is rolled back"
+        );
+        assert_eq!(
+            budget.reserved(),
+            60,
+            "a process refusal reserves nothing, so only A's bytes are held"
+        );
+        assert_eq!(tenant_a.reserved(), 60, "A's charge is untouched");
+    }
+
+    /// Shrink order: process then tenant, the reverse of the way up. A's
+    /// release returns its bytes to the shared process budget and to A's own
+    /// counter, and touches B's counter not at all.
+    #[test]
+    fn a_shrink_returns_the_bytes_to_the_process_and_only_the_shrinking_tenant() {
+        let budget = Arc::new(MemoryBudget::new(1000));
+        let tenant_a = TenantMemoryAccountant::with_process_budget(100, Arc::clone(&budget));
+        let tenant_b = TenantMemoryAccountant::with_process_budget(100, Arc::clone(&budget));
+        let pool_a = pool_over(Arc::clone(&tenant_a), CeilingBreach::new());
+        let pool_b = pool_over(Arc::clone(&tenant_b), CeilingBreach::new());
+        let res_a = MemoryConsumer::new("tenant-a").register(&pool_a);
+        let res_b = MemoryConsumer::new("tenant-b").register(&pool_b);
+
+        res_a.try_grow(40).expect("40 fits every ceiling");
+        res_b.try_grow(40).expect("40 fits every ceiling");
+        assert_eq!(budget.reserved(), 80);
+
+        res_a.shrink(40);
+        assert_eq!(budget.reserved(), 40);
+        assert_eq!(tenant_a.reserved(), 0);
+        assert_eq!(tenant_b.reserved(), 40);
+    }
+
+    /// The infallible path over the process budget: `grow` cannot decline, so
+    /// the overshoot is counted past the process limit and the breach records
+    /// it with the process figures, exactly as a tenant overshoot does.
+    #[test]
+    fn grow_past_only_the_process_ceiling_names_the_process() {
+        let budget = Arc::new(MemoryBudget::new(1024));
+        let tenant = TenantMemoryAccountant::with_process_budget(1 << 30, Arc::clone(&budget));
+        let breach = CeilingBreach::new();
+        let pool = pool_over(Arc::clone(&tenant), Arc::clone(&breach));
+        let res = MemoryConsumer::new("process-ceiling").register(&pool);
+
+        res.grow(4096);
+        assert_eq!(
+            budget.reserved(),
+            4096,
+            "the infallible path reserves the bytes it was asked for, over the limit"
+        );
+        let message = breach
+            .message()
+            .expect("a process ceiling overshoot must trip the breach");
+        assert_eq!(
+            message,
+            "process memory ceiling breached: 4096 bytes reserved exceeds process limit 1024"
+        );
+    }
+
+    /// The default an executor starts with: an unlimited budget refuses
+    /// nothing, and still COUNTS every SQL reservation, which is what makes the
+    /// gauge a later server task reads meaningful before any limit is set.
+    #[test]
+    fn the_unlimited_default_counts_the_reservation_and_refuses_nothing() {
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let breach = CeilingBreach::new();
+        let pool = pool_over(Arc::clone(&tenant), Arc::clone(&breach));
+        let res = MemoryConsumer::new("unlimited-default").register(&pool);
+
+        assert_eq!(tenant.process_limit(), u64::MAX);
+        res.try_grow(4096)
+            .expect("an unlimited budget refuses nothing");
+        assert_eq!(tenant.process_reserved(), 4096);
+        assert_eq!(tenant.reserved(), 4096);
+        assert!(breach.message().is_none());
+
+        res.shrink(4096);
+        assert_eq!(tenant.process_reserved(), 0);
     }
 }

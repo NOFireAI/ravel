@@ -89,6 +89,7 @@ use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
+use ravel_memory::MemoryBudget;
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::{LogSegmentFetcher, QueryError, SegmentFetcher, admit};
 use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
@@ -353,6 +354,15 @@ pub struct SqlExecutor {
     /// process-local byte-counter state, rebuilt on the tenant's next query, so
     /// dropping an idle one with no outstanding reservations changes no result.
     tenants: Mutex<HashMap<TenantHash, TenantAccountantEntry>>,
+    /// The process-wide memory budget every tenant accountant this executor
+    /// builds is an adapter over (ADR-1170 decision 1), so the per-tenant
+    /// ceilings are a fairness bound nested inside one process ceiling rather
+    /// than N ceilings that multiply with the number of active tenants.
+    /// [`SqlExecutor::new`] defaults it to `MemoryBudget::unlimited()`, which
+    /// counts every SQL reservation and refuses none, so nothing observable
+    /// changes until a caller installs a bounded budget with
+    /// [`Self::with_process_memory_budget`].
+    process_memory_budget: Arc<MemoryBudget>,
     /// The source of each tenant's declared typed attribute columns for the
     /// `logs` table (ADR-0090 decision 2). Resolved once per plan at the entry
     /// point (`run` for HTTP, Flight's `get_flight_info`) and threaded down as a
@@ -392,8 +402,30 @@ impl SqlExecutor {
             config,
             max_tenant_bytes,
             tenants: Mutex::new(HashMap::new()),
+            process_memory_budget: Arc::new(MemoryBudget::unlimited()),
             declared_source: default_declared_source(),
         }
+    }
+
+    /// Install the process-wide memory budget every tenant accountant this
+    /// executor builds charges (ADR-1170 decision 1), replacing the unlimited
+    /// default [`Self::new`] starts with. This is the seam the server wires its
+    /// derived budget through, without changing [`Self::new`]'s signature or
+    /// any existing call site.
+    ///
+    /// Call it before the first query: accountants already in the tenant map
+    /// keep the budget they were built with, and the map is populated on each
+    /// tenant's first use.
+    pub fn with_process_memory_budget(mut self, budget: Arc<MemoryBudget>) -> Self {
+        self.process_memory_budget = budget;
+        self
+    }
+
+    /// The process-wide memory budget this executor's tenant accountants charge
+    /// (ADR-1170 decision 1). Exposed so the server can gauge its reserved
+    /// bytes and assert the configured budget actually reached the executor.
+    pub fn process_memory_budget(&self) -> &Arc<MemoryBudget> {
+        &self.process_memory_budget
     }
 
     /// Install the source of per-tenant declared typed attribute columns for the
@@ -462,7 +494,10 @@ impl SqlExecutor {
             &tenants
                 .entry(tenant)
                 .or_insert_with(|| TenantAccountantEntry {
-                    accountant: TenantMemoryAccountant::new(self.max_tenant_bytes),
+                    accountant: TenantMemoryAccountant::with_process_budget(
+                        self.max_tenant_bytes,
+                        Arc::clone(&self.process_memory_budget),
+                    ),
                     last_touch_ns: i64::MIN,
                 })
                 .accountant,
@@ -480,7 +515,10 @@ impl SqlExecutor {
         let entry = tenants
             .entry(tenant)
             .or_insert_with(|| TenantAccountantEntry {
-                accountant: TenantMemoryAccountant::new(self.max_tenant_bytes),
+                accountant: TenantMemoryAccountant::with_process_budget(
+                    self.max_tenant_bytes,
+                    Arc::clone(&self.process_memory_budget),
+                ),
                 last_touch_ns: now_ns,
             });
         entry.last_touch_ns = now_ns;
@@ -3316,6 +3354,138 @@ mod tests {
         drop(reservation);
         assert_eq!(accountant.reserved(), 0);
         assert_eq!(exec.evict_idle_accountants(10 * NS_PER_HOUR, ttl_ns), 1);
+    }
+
+    /// ADR-1170 decision 1: every accountant the executor builds charges the
+    /// ONE process budget it carries, so two tenants' reservations add on it
+    /// rather than being counted against N independent ceilings. Installed
+    /// budget, so the refusal is reachable; the default is exercised by
+    /// `the_installed_process_budget_defaults_to_unlimited_and_counts`.
+    #[test]
+    fn every_tenant_accountant_charges_the_executors_one_process_budget() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        use crate::memory::TenantDelegatingPool;
+
+        let budget = Arc::new(MemoryBudget::new(100));
+        let exec = eviction_test_executor().with_process_memory_budget(Arc::clone(&budget));
+        let a = exec.tenant_budget(TenantHash([1; 16]));
+        let b = exec.tenant_budget(TenantHash([2; 16]));
+
+        let pool_a: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&a),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let pool_b: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&b),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let res_a = MemoryConsumer::new("tenant-a").register(&pool_a);
+        let res_b = MemoryConsumer::new("tenant-b").register(&pool_b);
+
+        res_a.try_grow(60).expect("60 of the 100-byte budget fits");
+        assert_eq!(a.process_reserved(), 60);
+        assert_eq!(
+            b.process_reserved(),
+            60,
+            "both accountants read the same process counter"
+        );
+        res_b
+            .try_grow(50)
+            .expect_err("A's 60 leaves 40, so B's 50 is refused by the process budget");
+        assert_eq!(budget.reserved(), 60);
+        assert_eq!(b.reserved(), 0, "the refused tenant charge is rolled back");
+    }
+
+    /// The default: an executor built without an installed budget counts every
+    /// SQL reservation against an unlimited one and refuses nothing, so nothing
+    /// observable changes until a caller sets a limit.
+    #[test]
+    fn the_installed_process_budget_defaults_to_unlimited_and_counts() {
+        use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+
+        use crate::memory::TenantDelegatingPool;
+
+        let exec = eviction_test_executor();
+        assert_eq!(exec.process_memory_budget().limit(), u64::MAX);
+        let accountant = exec.tenant_budget(TenantHash([3; 16]));
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            Arc::clone(&accountant),
+            CeilingBreach::new(),
+            QueryAccounting::new(),
+        ));
+        let reservation = MemoryConsumer::new("default-budget").register(&pool);
+
+        reservation
+            .try_grow(4096)
+            .expect("the unlimited default refuses nothing");
+        assert_eq!(exec.process_memory_budget().reserved(), 4096);
+        assert_eq!(accountant.process_reserved(), 4096);
+
+        drop(reservation);
+        assert_eq!(exec.process_memory_budget().reserved(), 0);
+    }
+
+    /// ADR-1170 decision 1, the infallible path end to end: a `grow` that
+    /// overshoots the process budget cannot be declined, so it trips the
+    /// `CeilingBreach` with the process figures and the query's real stream
+    /// turns that into `SqlError::ResourcesExhausted` on its next poll, the
+    /// same seam a query or tenant overshoot uses.
+    #[tokio::test]
+    async fn a_process_ceiling_breach_aborts_the_stream_with_resources_exhausted() {
+        use datafusion::execution::memory_pool::MemoryConsumer;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion::prelude::SessionConfig;
+
+        use crate::memory::{TenantDelegatingPool, TenantMemoryAccountant};
+
+        let budget = Arc::new(MemoryBudget::new(1024));
+        let accountant = TenantMemoryAccountant::with_process_budget(1 << 30, Arc::clone(&budget));
+        let breach = CeilingBreach::new();
+        let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            accountant,
+            Arc::clone(&breach),
+            QueryAccounting::new(),
+        ));
+
+        // The unchecked delta DataFusion's `resize` and join operators reach
+        // `grow` with: the bytes are reserved past the process limit and the
+        // breach records the overshoot.
+        let reservation = MemoryConsumer::new("process-overshoot").register(&pool);
+        reservation.grow(4096);
+        assert_eq!(budget.reserved(), 4096);
+
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()
+            .expect("runtime builds");
+        let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+        let plan = ctx
+            .sql("SELECT 1 AS one")
+            .await
+            .expect("query plans")
+            .create_physical_plan()
+            .await
+            .expect("physical plan builds");
+        let schema = plan.schema();
+        let mut stream =
+            PinnedStream::start(ctx, plan, schema, Arc::clone(&breach)).expect("stream starts");
+
+        let first = stream.next().await.expect("the stream yields one item");
+        let err = first.expect_err("a tripped breach must abort the stream");
+        let SqlError::ResourcesExhausted(message) = &err else {
+            panic!("a process ceiling breach must surface as ResourcesExhausted; got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "process memory ceiling breached: 4096 bytes reserved exceeds process limit 1024"
+        );
     }
 
     /// ADR-0044 acceptance test: one `execute` call, checked
