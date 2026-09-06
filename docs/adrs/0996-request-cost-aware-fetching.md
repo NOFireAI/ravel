@@ -629,3 +629,54 @@ summary: ravel-query is touched only by 996-3; ravel-sql only by 996-6;
 ravel-object-store by nothing (attempts seam already complete);
 ravel-bench by 996-2/996-4/996-7 in three separate waves;
 ravel-logseg by nothing.
+
+## Amendment 2026-09-06 (issue #1196): a named latency-first policy
+
+996-9's reference-box cold run (#1185, 42 statements, true cold) measured
+`cost-based` against `byte-minimal` at `--store-get-concurrency=256`:
+
+| policy | GB moved | wall time | GET requests |
+|---|---|---|---|
+| `cost-based` (default) | 463.79 | 486.0 s | 104,780 |
+| `byte-minimal` | 150.28 | 285.8 s | 570,752 |
+
+`cost-based` moves 3x the bytes and takes 70% longer wall-clock than
+`byte-minimal`, on the same corpus and concurrency. The cause is
+`resolve_cost_based_rate`: at `s3-intra-region-2026` prices, transfer and
+retrieval are both billed at zero, so the derived per-request rate
+saturates to `u64::MAX` and every object is read whole. That rate is
+correct for the bill this profile prices (a whole-object GET is never
+more expensive than a ranged one when bytes are free) and wrong for the
+clock (more bytes on the wire is still more bytes on the wire). Nothing
+in `StoreCostProfile` expresses time, so no adjustment to the cost model
+closes this gap without conflating two different things it is meant to
+keep separate.
+
+Decision: `cost-based` stays the default (it is right for the bill, and
+ADR-0904 shipped it with defaults unchanged from day one). A new named
+policy,
+`latency-first`, is added as an operator opt-in for deployments where
+cold wall-clock matters more than the request count: it resolves the
+same byte quantities `byte-minimal` does (ADR-0904's ranged behaviour,
+unaffected by cost profile), and in addition prefers a 256 process-wide
+object-store GET concurrency over the host-derived default, unless an
+operator's explicit `--store-get-concurrency` or the legacy
+`--fetch-concurrency` already set one. The 256 figure is the measured
+configuration behind the 285.8 s row above, not a value derived from
+core count or any other host property. Selecting `latency-first`
+accepts 5.45x the GET requests (570,752 vs 104,780) for 46% less cold
+wall-clock (285.8 s vs 486.0 s) than the `cost-based` default at this
+profile.
+
+The extra in-flight fetch memory a raised GET concurrency implies is
+unbounded today; ADR-1170's process-wide memory budget, once it lands,
+will bound it. This amendment implements no such bound.
+
+Rejected alternative: rescaling `DEFAULT_LOG_REQUEST_COST_BYTES` by 27x
+so a cost-based derivation lands closer to `byte-minimal`'s routing.
+Refuted by reproduction: both `byte-minimal` cold runs in #1185 used the
+same request-cost scalar and issued identical requests and bytes: the
+divergence between `cost-based` and `byte-minimal` is entirely the
+saturated rate inside `resolve_cost_based_rate`, not the scalar's
+magnitude, so rescaling it changes nothing about which shape
+`cost-based` selects at this profile.

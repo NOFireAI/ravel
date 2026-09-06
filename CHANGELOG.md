@@ -8,6 +8,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A `latency-first` logs fetch policy** (ADR-0996 amendment). Measured on a
+  reference cold-cache corpus, the `cost-based` default resolves to
+  whole-object reads and moves 3x the bytes of `byte-minimal` at a
+  deployment where transfer and retrieval are free, because the derived
+  per-request rate saturates. `--logs-fetch-policy latency-first` resolves
+  the same byte quantities as `byte-minimal` and, in addition, raises the
+  default `--store-get-concurrency` to 256 (source `policy` in the startup
+  log) unless an explicit `--store-get-concurrency` or the legacy
+  `--fetch-concurrency` is already set. `cost-based` stays the default;
+  this is an operator opt-in for deployments where cold wall-clock matters
+  more than the request bill, at a measured cost of about 5.45x the GET
+  requests for about 46% less cold time.
 - **The `alerts` and `audit` SQL tables** (ADR-1101). `POST /api/v1/sql` and
   Flight SQL serve five tables, and Flight `GetTables` lists all five; naming
   two in one query is still rejected before any listing. `alerts` is alert

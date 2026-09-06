@@ -444,7 +444,7 @@ run used.
 | Flag | Reaches | Default (unset) | Reference host |
 |---|---|---|---|
 | `--fetch-concurrency <N>` | legacy: sets all three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
-| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | derived: `max(8, 2 x cores)` | 32 |
+| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | derived: `max(8, 2 x cores)`, or 256 under `--logs-fetch-policy latency-first` (source `policy`) if neither this flag nor `--fetch-concurrency` is set | 32 |
 | `--sql-partition-count <N>` | `EngineConfig::sql_partition_count`, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
 | `--promql-fetch-fanout <N>` | `EngineConfig::promql_fetch_fanout`, per-selector fetch stream fan-out | derived: `max(8, 2 x cores)` | 32 |
 | `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
@@ -467,7 +467,8 @@ derived values already satisfy the order. Both adjustments are logged at
 startup (`clamped` and `raised` on the resolved lines, plus a WARN).
 
 Every resolved value is logged at startup, one line per setting with its source
-(`derived`, `flag`, or `fallback`):
+(`derived`, `flag`, `fallback`, `legacy-flag`, or -- for `store_get_concurrency`
+alone, under `--logs-fetch-policy latency-first` -- `policy`):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"

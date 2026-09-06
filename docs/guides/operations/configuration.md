@@ -762,7 +762,7 @@ deployment transfer is free and the bill is requests, so a ranged read spends a
 billed request to save bytes that cost nothing. Elsewhere the reverse holds.
 Three flags size this, all read at startup only.
 
-`--logs-fetch-policy` takes one of three values, spelled exactly as here. Its
+`--logs-fetch-policy` takes one of four values, spelled exactly as here. Its
 default is `cost-based`.
 
 | Value | Optimizes for | Pick it when |
@@ -770,9 +770,15 @@ default is `cost-based`.
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
 | `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
 | `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved from the profile's prices at startup. | You want the shape the deployment's own prices imply. At the reference intra-region profile this resolves to request-minimal. |
+| `latency-first` | Fewest transferred bytes, exactly like `byte-minimal`, plus a raised object-store GET concurrency by default. | Cold wall-clock matters more than the request bill: measured at a 5.45x request increase for roughly 46% less cold time on a reference corpus, at a fixed test concurrency. |
 
 For any policy value a query returns exactly the same rows. Only request counts
 and timing differ.
+
+`latency-first` also raises the process-wide `--store-get-concurrency` default
+to 256 (reported at startup with source `policy`), unless an explicit
+`--store-get-concurrency` or the legacy `--fetch-concurrency` is set, in which
+case that value wins instead.
 
 The policy is an operator surface only. It is never derivable from query text, a
 header or a ticket: under request billing, a tenant that could force
