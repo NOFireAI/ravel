@@ -1456,3 +1456,135 @@ async fn log_series_equal_timestamp_samples_order_by_value_bits() {
         "same ascending order even though the write/scan order was reversed"
     );
 }
+
+/// A single-stream, single-segment fixture for the `__body__` bloom-pruning
+/// acceptance test (issue #1202): 12 INFO records at ts 1..=12, `small_blocks`
+/// (`block_target_records: 3`) cutting them into blocks. Body at ts 4 is
+/// "needle alpha found" (an exact-equality and an anchored-literal-regex
+/// target); body at ts 7 is "needles-only" -- it contains "needle" as a
+/// *substring* but tokenizes to the single token "needles", so no
+/// `HasWord{word:"needle"}` bloom probe or `phrase_match` can match it. The
+/// other ten bodies are ts-keyed fillers containing neither token.
+async fn body_prune_fixture(store: &MemoryStore) -> SegmentRef {
+    let records: Vec<LogRecord> = (1..=12)
+        .map(|ts| {
+            let body = match ts {
+                4 => "needle alpha found".to_string(),
+                7 => "needles-only".to_string(),
+                _ => format!("filler-{ts}"),
+            };
+            record("prune", "check", "i-1", ts, "INFO", &body)
+        })
+        .collect();
+    write_object(store, "logs/body-prune.rlog", &records).await
+}
+
+/// Issue #1202 acceptance test: `body_prune_literal` extracts a superset
+/// literal from an extractable `__body__` matcher and pushes it as a
+/// bloom-pruning `Predicate::HasWord`, so an equality or anchored-literal
+/// regex matcher decodes only the one block holding its match, while a bare
+/// `.*word.*` regex (no extractable literal) still decodes every block --
+/// unchanged from before this change -- and both shapes return exactly the
+/// same samples as the unpruned per-record filter alone would.
+#[tokio::test]
+async fn body_literal_prunes_blocks_without_changing_results() {
+    let mem = Arc::new(MemoryStore::new());
+    let seg = body_prune_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+
+    async fn run(
+        fetcher: &LogSegmentFetcher,
+        seg: &SegmentRef,
+        body_matcher: LabelMatcher,
+    ) -> ravel_query::log_series::LogSeriesOutput {
+        let matchers = [
+            LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+            body_matcher,
+        ];
+        let req = lines_request(&matchers, full_window());
+        let accounting = PhaseAccounting::new();
+        fetch_log_series(
+            fetcher,
+            TENANT,
+            std::slice::from_ref(seg),
+            &req,
+            &accounting,
+        )
+        .await
+        .expect("fetch_log_series")
+    }
+
+    // (ii) Exact equality: extracts the whole body as the literal, prunes to
+    // the one block holding ts 4.
+    let out = run(
+        &fetcher,
+        &seg,
+        LabelMatcher::equal(BODY_MATCHER_LABEL, "needle alpha found"),
+    )
+    .await;
+    assert_eq!(
+        out.blocks_total, 4,
+        "small_blocks cuts 12 records into 4 blocks of 3"
+    );
+    assert_eq!(
+        out.blocks_scanned, 1,
+        "the literal prunes to the one block holding ts 4"
+    );
+    let samples: Vec<_> = out.series.iter().flat_map(|s| s.samples.iter()).collect();
+    assert_eq!(samples.len(), 1, "__body__=\"needle alpha found\"");
+    assert_eq!(samples[0].ts_ns, 4);
+    assert_eq!(samples[0].value, 1.0);
+
+    // (iii) Anchored regex with no metacharacters: same literal, same prune.
+    let out = run(
+        &fetcher,
+        &seg,
+        LabelMatcher::regex(BODY_MATCHER_LABEL, "needle alpha found").unwrap(),
+    )
+    .await;
+    assert_eq!(out.blocks_total, 4);
+    assert_eq!(
+        out.blocks_scanned, 1,
+        "__body__=~\"needle alpha found\" extracts the whole (anchored) value, same as equality"
+    );
+    let samples: Vec<_> = out.series.iter().flat_map(|s| s.samples.iter()).collect();
+    assert_eq!(samples.len(), 1, "__body__=~\"needle alpha found\"");
+    assert_eq!(samples[0].ts_ns, 4);
+    assert_eq!(samples[0].value, 1.0);
+
+    // (iv) `.*needle.*` extracts no literal (no token-bounded run survives the
+    // trim): every block is still decoded, and the per-record filter alone
+    // finds both ts 4 ("needle alpha found") and ts 7 ("needles-only",
+    // substring match, not a token match -- this is exactly why no literal
+    // may be pushed here).
+    let out = run(
+        &fetcher,
+        &seg,
+        LabelMatcher::regex(BODY_MATCHER_LABEL, ".*needle.*").unwrap(),
+    )
+    .await;
+    assert_eq!(out.blocks_total, 4);
+    assert_eq!(
+        out.blocks_scanned, 4,
+        "no literal is extractable from .*needle.*, so no block is pruned"
+    );
+    let mut samples: Vec<_> = out
+        .series
+        .iter()
+        .flat_map(|s| s.samples.iter())
+        .map(|s| s.ts_ns)
+        .collect();
+    samples.sort_unstable();
+    assert_eq!(samples, vec![4, 7], "__body__=~\".*needle.*\"");
+
+    // Negated matcher: `body_prune_literal` must decline it (Ne/Nre always
+    // None), so every one of the other 11 records still surfaces.
+    let out = run(
+        &fetcher,
+        &seg,
+        LabelMatcher::not_equal(BODY_MATCHER_LABEL, "needle alpha found"),
+    )
+    .await;
+    let total: usize = out.series.iter().map(|s| s.samples.len()).sum();
+    assert_eq!(total, 11, "__body__!=\"needle alpha found\"");
+}

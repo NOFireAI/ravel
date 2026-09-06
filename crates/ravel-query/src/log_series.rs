@@ -2,10 +2,27 @@
 //! whose `__name__` matcher equals one of the two reserved metric names --
 //! from the logs signal, with one sample per matching log record.
 //!
-//! Nothing in production calls [`fetch_log_series`] or [`log_metric_of`]
-//! yet: task #1108 wires them into `QueryEngine::prefetch` and
-//! `resolve_series_inner`. This module is self-contained and has no
-//! dependency on `engine.rs`.
+//! [`fetch_log_series`] and [`log_metric_of`] are called from
+//! `engine.rs`'s `resolve_series_inner` (via `resolve_log_series_inner`) and
+//! `QueryEngine::prefetch`'s log lane. This module itself stays
+//! self-contained and has no dependency on `engine.rs`.
+//!
+//! # Bloom pruning of `__body__` matchers
+//!
+//! [`fetch_log_series`] extracts a literal from each `__body__` matcher
+//! ([`body_prune_literal`]) that is a provable superset of the matcher --
+//! true whenever the matcher itself is true of a body -- and pushes it as a
+//! `Predicate::HasWord` content arm so the RLOG block bloom prunes blocks
+//! before decode. The per-record `__body__` check ([`body_matches`]) still
+//! runs on every decoded record exactly as before: the pushed word only
+//! prunes, it never decides, so a body that survives the bloom but not the
+//! matcher (`phrase_match` is true, `matches_str` is false) is dropped same
+//! as always. An equality matcher's value extracts whole; an anchored regex
+//! extracts the token-bounded mandatory literal run with the most
+//! alphanumeric characters, or nothing when no such run exists (`.*word.*`,
+//! any `+`-quantified pattern) -- token
+//! matching is not a superset of substring matching, so those matchers are
+//! left unpruned rather than risk dropping a matching row.
 //!
 //! # Plan-phase stream discovery
 //!
@@ -303,6 +320,15 @@ pub struct LogSeriesOutput {
     pub records_scanned: u64,
     pub segments_fetched: usize,
     pub segments_pruned: usize,
+    /// Blocks the reader decoded, from its own per-object `ScanStats`, summed
+    /// over every segment this call actually opened a scan for. Zero for a
+    /// segment pruned before Scan-phase (no bloom/skip-index pruning to
+    /// report, because nothing was opened).
+    pub blocks_scanned: u64,
+    /// Blocks the opened segments hold in total (`ScanStats::blocks_total`,
+    /// fixed when each scan is built), summed the same way, so
+    /// `blocks_total - blocks_scanned` is the count the bloom pruned.
+    pub blocks_total: u64,
 }
 
 /// Errors [`fetch_log_series`] can return. Every arm is a typed budget or
@@ -368,6 +394,178 @@ fn body_matchers(matchers: &[LabelMatcher]) -> Vec<&LabelMatcher> {
 
 fn body_matches(matchers: &[&LabelMatcher], body: &str) -> bool {
     matchers.iter().all(|m| matches_str(m, body))
+}
+
+/// A literal that is a provable superset of `m` (ADR-1103 decision 3's
+/// follow-up): for every body `b` where `matches_str(m, b)` is true,
+/// `ravel_logseg::reader::phrase_match(b.as_bytes(), &literal)` is also true.
+/// That property is the whole contract here -- a literal that fails it
+/// silently drops matching rows once pushed as a bloom-pruning `HasWord`.
+/// `None` means no such literal was proven; the caller must then skip bloom
+/// pruning for `m` rather than push an unsound approximation.
+fn body_prune_literal(m: &LabelMatcher) -> Option<String> {
+    let literal = match &m.op {
+        // A negated matcher's literal would invert the query.
+        MatchOp::Ne | MatchOp::Nre(_) => return None,
+        // Sound because the matching body IS `m.value`, whose token stream
+        // trivially contains `m.value`'s own token stream as a contiguous
+        // run.
+        MatchOp::Eq => m.value.clone(),
+        MatchOp::Re(_) => regex_prune_literal(&m.value)?,
+    };
+    // A literal with no alphanumeric character tokenizes to nothing: it is a
+    // no-op arm (`bloom_arms` skips it, `phrase_match` returns true for it),
+    // so declining it outright is simpler than pushing dead weight.
+    if literal.chars().any(char::is_alphanumeric) {
+        Some(literal)
+    } else {
+        None
+    }
+}
+
+/// Strips at most one leading `^` and one trailing `$`. `None` if `^` or `$`
+/// occurs anywhere else in `pattern` (an allowlist scanner: an unrecognized
+/// anchor position yields no literal, not a guess).
+fn strip_anchors(pattern: &str) -> Option<&str> {
+    let mut s = pattern;
+    if let Some(rest) = s.strip_prefix('^') {
+        s = rest;
+    }
+    if let Some(rest) = s.strip_suffix('$') {
+        s = rest;
+    }
+    if s.contains('^') || s.contains('$') {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Rejected outright: any of these makes the mandatory-literal-run analysis
+/// below unsound or inapplicable. `+` is rejected on purpose, not merely
+/// unhandled: a rule that kept a `+`-quantified character as part of a
+/// mandatory run would be unsound against the tokenizer (`^a+$` extracts
+/// `a`, but body `aa` satisfies the regex and tokenizes to the single token
+/// `aa`, so `phrase_match(b"aa", "a")` is false and the pushed `HasWord`,
+/// evaluated as an exact per-row filter, would drop a matching row).
+const REJECTED_METACHARS: [char; 9] = ['|', '(', ')', '[', ']', '{', '}', '\\', '+'];
+
+/// Splits `stripped` into maximal runs of mandatory literal characters: `.`
+/// (wildcard) and any character immediately followed by `*` or `?`
+/// (optional) end a run and contribute nothing. `None` if the pattern uses a
+/// quantifier this scanner does not understand (two quantifier characters in
+/// a row, or one with no preceding literal/wildcard).
+fn literal_runs(chars: &[(usize, char)]) -> Option<Vec<(usize, usize)>> {
+    let len = chars.len();
+    let mut runs = Vec::new();
+    let mut run_start: Option<usize> = None;
+    let mut i = 0;
+    while i < len {
+        let c = chars[i].1;
+        if c == '*' || c == '?' {
+            return None;
+        }
+        let is_wildcard = c == '.';
+        let quantified = i + 1 < len && matches!(chars[i + 1].1, '*' | '?');
+        if quantified && i + 2 < len && matches!(chars[i + 2].1, '*' | '?') {
+            return None;
+        }
+        if is_wildcard || quantified {
+            if let Some(start) = run_start.take() {
+                runs.push((start, i));
+            }
+        } else if run_start.is_none() {
+            run_start = Some(i);
+        }
+        i += if quantified { 2 } else { 1 };
+    }
+    if let Some(start) = run_start.take() {
+        runs.push((start, len));
+    }
+    Some(runs)
+}
+
+/// Trims `[start, end)` to the token-bounded core the tokenizer guarantees,
+/// independently at each edge. An edge is already a boundary if the run sits
+/// at the pattern's own edge (index 0, or the pattern's last character -- the
+/// anchored match begins and ends there) or if the run's own first/last
+/// character there is not alphanumeric (a literal separator is a boundary
+/// regardless of what precedes or follows it in the pattern). Otherwise the
+/// edge is unsafe -- what's adjacent in the pattern could be a wildcard that
+/// matches an alphanumeric character -- and the partial token is dropped by
+/// cutting back to the nearest non-alphanumeric character inside the run;
+/// with none inside, the whole run carries no guaranteed boundary and is
+/// dropped. `None` if trimming empties the run.
+fn trim_run(
+    chars: &[(usize, char)],
+    start: usize,
+    end: usize,
+    len: usize,
+) -> Option<(usize, usize)> {
+    let left_safe = start == 0 || !chars[start].1.is_alphanumeric();
+    let new_start = if left_safe {
+        start
+    } else {
+        (start..end).find(|&j| !chars[j].1.is_alphanumeric())? + 1
+    };
+
+    let right_safe = end == len || !chars[end - 1].1.is_alphanumeric();
+    let new_end = if right_safe {
+        end
+    } else {
+        (start..end)
+            .rev()
+            .find(|&k| !chars[k].1.is_alphanumeric())?
+    };
+
+    if new_start < new_end {
+        Some((new_start, new_end))
+    } else {
+        None
+    }
+}
+
+/// The regex-literal-extraction allowlist scanner (ADR-1103 decision 3's
+/// follow-up): anything it does not explicitly recognize yields `None`.
+/// Among the trimmed candidate runs, picks the one with the most
+/// alphanumeric characters (first wins a tie), and returns it only if it
+/// holds at least one. Operates on `char_indices` throughout so a run is
+/// always sliced out of `pattern` on a character boundary, never mid-byte.
+fn regex_prune_literal(pattern: &str) -> Option<String> {
+    let stripped = strip_anchors(pattern)?;
+    if stripped.contains(|c: char| REJECTED_METACHARS.contains(&c)) {
+        return None;
+    }
+
+    let chars: Vec<(usize, char)> = stripped.char_indices().collect();
+    let len = chars.len();
+    let runs = literal_runs(&chars)?;
+
+    let mut best: Option<(usize, usize, usize)> = None;
+    for (start, end) in runs {
+        let Some((trimmed_start, trimmed_end)) = trim_run(&chars, start, end, len) else {
+            continue;
+        };
+        let alnum_count = chars[trimmed_start..trimmed_end]
+            .iter()
+            .filter(|(_, c)| c.is_alphanumeric())
+            .count();
+        if alnum_count == 0 {
+            continue;
+        }
+        let is_better = match best {
+            Some((_, _, best_count)) => alnum_count > best_count,
+            None => true,
+        };
+        if is_better {
+            best = Some((trimmed_start, trimmed_end, alnum_count));
+        }
+    }
+
+    let (start, end, _) = best?;
+    let start_byte = chars[start].0;
+    let end_byte = chars.get(end).map_or(stripped.len(), |(b, _)| *b);
+    Some(stripped[start_byte..end_byte].to_string())
 }
 
 /// The first `severity_text` equality matcher, kept by index so
@@ -436,6 +634,13 @@ pub async fn fetch_log_series(
 ) -> Result<LogSeriesOutput, LogSeriesError> {
     let stream_ms = stream_matchers(req.matchers);
     let body_ms = body_matchers(req.matchers);
+    // A provable superset literal per extractable `__body__` matcher (ADR-1103
+    // decision 3's follow-up): pushed as a bloom-pruning `HasWord` content arm
+    // below, never in place of `body_matches`'s per-record check.
+    let body_words: Vec<String> = body_ms
+        .iter()
+        .filter_map(|m| body_prune_literal(m))
+        .collect();
     let needs_body = req.metric.needs_body() || !body_ms.is_empty();
     let severity_eq = severity_content_predicate(req.matchers);
     let severity_post = severity_postfilters(req.matchers, severity_eq.map(|(i, _)| i));
@@ -462,6 +667,8 @@ pub async fn fetch_log_series(
     let mut records_scanned: u64 = 0u64;
     let mut segments_fetched = 0usize;
     let mut segments_pruned = 0usize;
+    let mut blocks_scanned: u64 = 0u64;
+    let mut blocks_total: u64 = 0u64;
 
     for seg_ref in segments {
         if let Some(err) = deadline_exceeded(req.deadline) {
@@ -522,6 +729,17 @@ pub async fn fetch_log_series(
             query = query.with_content(Predicate::Equals {
                 field: FieldSel::SeverityText,
                 value: AttrValue::Str(m.value.clone()),
+            });
+        }
+        // One arm per extractable `__body__` matcher, never collapsed into
+        // one: `__body__` matchers AND together (ADR-1103 decision 3), and
+        // the conjunction of per-matcher supersets is itself a superset of
+        // the conjunction. Bloom-prune only; `body_matches` below still
+        // decides.
+        for word in &body_words {
+            query = query.with_content(Predicate::HasWord {
+                field: FieldSel::Body,
+                word: word.clone(),
             });
         }
 
@@ -595,6 +813,12 @@ pub async fn fetch_log_series(
             }
         }
 
+        // Read after the drain loop above, not before: both counters grow as
+        // blocks are decoded (docs/log-segment-format.md; reader.rs ScanStats).
+        let scan_stats = scan.stats();
+        blocks_scanned += u64::from(scan_stats.blocks_scanned);
+        blocks_total += u64::from(scan_stats.blocks_total);
+
         // Checked only here, once per completed segment: `scan_accounted_with_tenant`
         // has already fetched and charged this segment's bytes above, and
         // `next_block` only decodes bytes already resident, so nothing inside
@@ -631,6 +855,8 @@ pub async fn fetch_log_series(
         records_scanned,
         segments_fetched,
         segments_pruned,
+        blocks_scanned,
+        blocks_total,
     })
 }
 
@@ -921,5 +1147,111 @@ mod tests {
         let nre = LabelMatcher::not_regex(BODY_MATCHER_LABEL, "^boo.*").unwrap();
         assert!(!matches_str(&nre, "boom"));
         assert!(matches_str(&nre, "other"));
+    }
+
+    // --- body_prune_literal ---
+
+    #[test]
+    fn body_prune_literal_declines_negated_matchers() {
+        let ne = LabelMatcher::not_equal(BODY_MATCHER_LABEL, "needle alpha found");
+        assert_eq!(body_prune_literal(&ne), None);
+
+        let nre = LabelMatcher::not_regex(BODY_MATCHER_LABEL, "needle alpha found").unwrap();
+        assert_eq!(body_prune_literal(&nre), None);
+    }
+
+    #[test]
+    fn body_prune_literal_is_a_superset_of_its_matcher() {
+        let cases: &[(LabelMatcher, &str)] = &[
+            (
+                LabelMatcher::equal(BODY_MATCHER_LABEL, "needle alpha found"),
+                "needle alpha found",
+            ),
+            (
+                LabelMatcher::equal(BODY_MATCHER_LABEL, "solo-exact-body"),
+                "solo-exact-body",
+            ),
+            (
+                LabelMatcher::regex(BODY_MATCHER_LABEL, "^needle alpha$").unwrap(),
+                "needle alpha",
+            ),
+            (
+                LabelMatcher::regex(BODY_MATCHER_LABEL, ".*needle.*").unwrap(),
+                "needles-only",
+            ),
+            (
+                LabelMatcher::regex(BODY_MATCHER_LABEL, "id=needle;.*").unwrap(),
+                "id=needle;rest",
+            ),
+            (
+                LabelMatcher::equal(BODY_MATCHER_LABEL, "Needle Alpha"),
+                "Needle Alpha",
+            ),
+        ];
+        for (m, body) in cases {
+            assert!(
+                matches_str(m, body),
+                "fixture bug: {body:?} does not match {m:?}"
+            );
+            if let Some(lit) = body_prune_literal(m) {
+                assert!(
+                    ravel_logseg::reader::phrase_match(body.as_bytes(), &lit),
+                    "literal {lit:?} extracted from {m:?} does not phrase_match body {body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_prune_literal_pattern_subset() {
+        let cases: &[(&str, Option<&str>)] = &[
+            ("needle alpha found", Some("needle alpha found")),
+            ("^needle alpha$", Some("needle alpha")),
+            (".*needle.*", None),
+            ("needle.*", None),
+            (".*needle", None),
+            ("needle .*", Some("needle ")),
+            (".* needle", Some(" needle")),
+            ("id=needle;.*", Some("id=needle;")),
+            ("nee.le", None),
+            ("a|b", None),
+            ("[abc]needle", None),
+            ("\\dneedle", None),
+            ("(ab)needle", None),
+            ("a*?needle", None),
+            ("needle$x", None),
+            ("^a+$", None),
+            ("a+needle", None),
+            ("^ab+c$", None),
+            // A multi-byte character sitting at a run edge: the literal `;`
+            // ends the run before the wildcard, so the run keeps `é` intact
+            // and the byte-offset slice must land on its boundary, not
+            // mid-codepoint.
+            ("café;.*", Some("café;")),
+        ];
+        for (pattern, want) in cases {
+            assert_eq!(
+                regex_prune_literal(pattern),
+                want.map(str::to_string),
+                "pattern {pattern:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn body_prune_literal_plus_bug_would_drop_a_matching_row() {
+        // The `+` rejection exists because keeping a `+`-quantified char in a
+        // mandatory run is unsound: `^a+$` would otherwise extract `a`, but
+        // body "aa" satisfies the regex and tokenizes to the single token
+        // "aa", so `phrase_match(b"aa", "a")` is false. Declining extraction
+        // (None) leaves the per-record regex check as the sole filter, which
+        // still matches "aa" correctly.
+        let m = LabelMatcher::regex(BODY_MATCHER_LABEL, "^a+$").unwrap();
+        assert!(matches_str(&m, "aa"));
+        assert_eq!(body_prune_literal(&m), None);
+
+        let m = LabelMatcher::regex(BODY_MATCHER_LABEL, "a+needle").unwrap();
+        assert!(matches_str(&m, "aaneedle"));
+        assert_eq!(body_prune_literal(&m), None);
     }
 }
