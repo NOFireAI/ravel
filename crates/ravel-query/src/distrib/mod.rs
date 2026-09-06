@@ -777,11 +777,16 @@ fn fold_span_slice(
 /// bytes-scanned trip (the query's `max_bytes_scanned` cap, re-enforced here
 /// over the folded total) and a fetch-layer memory refusal
 /// ([`FetchError::FetchMemoryExhausted`], mapped to `BudgetExceeded` by the
-/// worker's `map_*_fetch_error` in `service.rs`). The frozen proto `Status`
-/// (`docs/adrs/1170`) carries only a code and a message, so this disambiguates
-/// by re-checking the bytes cap over `folded_bytes` first, then parsing the
-/// memory-refusal figures back out of `status_message`. A message that matches
-/// neither falls back to a generic `Distrib` rather than mislabelling the cause.
+/// worker's `map_*_fetch_error` in `service.rs`). Today's proto `Status`
+/// carries only a code and a message, so this disambiguates by re-checking
+/// the bytes cap over `folded_bytes` first, then parsing the memory-refusal
+/// figures back out of `status_message`. A message that matches neither
+/// falls back to a generic `Distrib` rather than mislabelling the cause.
+/// Parsing rendered text back into figures is a stopgap, not the frozen
+/// contract: an additive field on `Status` (the `fragment_capability = 14`
+/// precedent in `proto/ravel/queryfrag.proto`) is the durable fix and would
+/// let the coordinator read the figures directly instead of round-tripping
+/// them through a `Display` string.
 fn budget_exceeded_error(
     folded_bytes: u64,
     max_bytes_scanned: ByteLimit,
@@ -803,12 +808,18 @@ fn budget_exceeded_error(
 }
 
 /// Reconstructs the `(requested, reserved, limit)` figures from the `Display`
-/// text of [`FetchError::FetchMemoryExhausted`]. The frozen proto `Status`
+/// text of [`FetchError::FetchMemoryExhausted`]. Today's proto `Status`
 /// carries only a message string, so a worker's memory refusal survives the
-/// wire as its rendered text and this is the exact inverse of that `Display`.
-/// The coupling is pinned by `fetch_memory_exhausted_message_round_trips`;
-/// changing the `#[error(..)]` format without updating this parser makes that
-/// test fail rather than silently degrading the coordinator to a generic error.
+/// wire as its rendered text and this is the exact inverse of that `Display`
+/// -- a stopgap that holds only as long as `FetchError`, `LogFetchError`,
+/// and `SpanFetchError` keep textually identical `FetchMemoryExhausted`
+/// messages, which is why `fetch_memory_exhausted_message_round_trips`
+/// pins all three, not just this one. An additive `Status` field (the
+/// `fragment_capability = 14` precedent in `proto/ravel/queryfrag.proto`)
+/// is the durable fix; that proto change is out of scope here. Until then,
+/// changing any of the three `#[error(..)]` formats without updating this
+/// parser makes that test fail rather than silently degrading the
+/// coordinator to a generic error.
 fn parse_fetch_memory_exhausted(msg: &str) -> Option<(u64, u64, u64)> {
     let rest = msg.strip_prefix("fetch memory exhausted: requested ")?;
     let (requested, rest) = rest.split_once(" bytes, ")?;

@@ -268,11 +268,34 @@ that are not yet reserved or tracked.
      cache entry and the fetch guard reserves the same bytes the cache cap
      already holds, also never marked.
 
-   The direction is an overcount of `unique`, which loosens the decision-4
-   acceptance assertion `resident_t <= unique_t + reserve` rather than tightening
-   it; the assertion is still usable but its `unique` term is an upper bound, not
-   the exact tracked total. Making it exact means marking the handoff at these
-   two sites too (or subtracting them another way), which is follow-up work.
+   The direction is an overcount of `unique` by the untracked overlap `d`, and
+   that overcount does not stop at the decision-4 acceptance assertion: decision
+   3's frozen reserve is `max_t(resident_t - unique_t) x 1.25` (plus margin),
+   calibrated from the SAME overstated `unique_t`. Subtracting a too-large
+   `unique_t` understates `resident_t - unique_t` by `d` at calibration time, so
+   the frozen reserve is itself undersized by about `1.25 x d`, not merely
+   `unique`'s term in the assertion. At acceptance time the same overcount raises
+   `unique_t` by `d` again, so the assertion's RHS, `unique_t + reserve`, nets to
+   about `0.25 x d` BELOW what it would be with an exact `unique`: the assertion
+   is tighter than intended, not looser, because the reserve lost more to the
+   overcount than the `unique_t` term gained back. A tighter assertion is not
+   free slack: the frozen reserve is also required to exceed the `partitions x
+   max batch bytes` exposure from decision 1 (the infallible-`grow` overshoot
+   bound), and an `1.25 x d`-undersized reserve can fail to clear that bound
+   even where it looks like it clears the acceptance band, which is a safety
+   property, not headroom to spend. The calibration run must therefore do one
+   of two things, not silently ship the 1.25 constant unchanged: either mark
+   the handoff at the two untracked overlap sites first (correction above) so
+   calibration measures an exact `unique` and the reserve is derived from the
+   true `resident_t - unique_t`, or, if calibration still runs against the
+   overstated `unique`, measure and record the residual `d` (the SQL
+   cross-boundary overlap plus the cache-hit overlap, sampled the same way as
+   `ravel_memory_handoff_overlap_bytes` would if it covered them) and widen the
+   multiplier to cover `1.25 x d` on top of the existing margin, with that
+   arithmetic in the constant's doc comment. Making `unique` exact means
+   marking the handoff at these two sites too (or subtracting them another
+   way), which is follow-up work; until it lands, the reserve derivation must
+   account for `d` explicitly rather than assume the overcount is harmless.
 
 **Known-unreserved / not-yet-enforcing sites** (the budget observes nothing at
 these until a finite budget is wired and, for the last two, the overlap is
