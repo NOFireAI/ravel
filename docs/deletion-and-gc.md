@@ -392,8 +392,15 @@ every bound is measured.
   report `RewritePresent`: the bucket is left untouched, its L0 inputs stay
   live behind the rewrite record, and the maintenance pass memoizes the
   refusal as terminal. The query-time filter (Query exclusion, above) remains
-  the guarantee that covers the window before a rewrite lands; this refusal is
-  what keeps a second record set from ever being produced afterwards.
+  the guarantee that covers the window before a rewrite lands. This refusal
+  closes the case where the rewrite record is already durable when the
+  compactor lists the bucket; it does not close the concurrent case, where
+  compaction and the rewrite pass each list before the other publishes and
+  neither can see the other's record yet. The maintenance driver's per-bucket
+  serialization of compaction and rewrite is what covers that case today, and
+  it remains load-bearing -- not an optimization this refusal makes
+  unnecessary. Closing the residual window needs a compare-and-swap or an
+  explicit claim on the bucket; this change does not add one.
 
 - **The 72 h rewrite bound derives from the maintenance ownership cadence
   (ADR-0065).** The rewrite pass runs on the Maintain worker that owns each

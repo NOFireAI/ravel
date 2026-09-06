@@ -241,15 +241,25 @@ and sweep in `crates/ravel-maintain`), driven per tenant by the same loop:
    a bucket a rewrite already covers, and once both records are live the
    bucket serves two part sets for good -- including after the `.dreq` is
    removed and the filter stops applying, which is exactly when the erased
-   records become returnable again. Per-bucket exclusivity is therefore a
-   correctness requirement, not an optimization, and it is enforced where the
-   second record set would be produced: compaction
+   records become returnable again. Compaction
    (`crate::compact::compact_bucket`) and format migration
-   (`crate::rewrite::migrate_bucket_format`) refuse a bucket whose listing
-   holds any rewrite record, reporting `RewritePresent` and leaving the bucket
-   untouched. Serializing the passes in the driver remains the efficiency
-   measure; the refusal is what makes the serialization unnecessary for
-   correctness.
+   (`crate::rewrite::migrate_bucket_format`) now refuse a bucket whose listing
+   already holds a rewrite record, reporting `RewritePresent` and leaving the
+   bucket untouched. This closes the case where the rewrite record is already
+   durable by the time the compactor lists the bucket, and that closure is a
+   correctness requirement, not an efficiency measure. It does not replace the
+   driver's per-bucket serialization of compaction and rewrite, which stays
+   load-bearing for the concurrent case: both the guard and the rewrite pass
+   list-then-act with no compare-and-swap, and the two passes publish under
+   different keys, so neither can observe the other's record before it
+   commits. An interleaving where compaction lists first (no rewrite record
+   yet), then the rewrite pass lists, resolves, and publishes before
+   compaction publishes, still ends with both records live and neither
+   superseding the other -- worse than the original hazard, because every
+   later rewrite pass over that bucket then fails on multiple live records
+   and the pending request's marker is never removed. That window is closed
+   only by a compare-and-swap or an explicit claim on the bucket, and this
+   change does not close it.
 6. **Physical removal**: the rewrite's inputs become superseded inputs to
    the existing sweep (`sweep_superseded`), deleted after
    `protection_horizon`, under the same `LegalHoldCheck` gate as every
