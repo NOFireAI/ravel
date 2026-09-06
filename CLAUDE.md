@@ -363,6 +363,21 @@ there before changing a rule.
   SHA read earlier in the session goes stale the moment another PR merges,
   and dispatching it silently rebuilds on a superseded tree.
   `ALLOW_STALE_REF=1` to dispatch an intentionally older ref.
+- `scripts/guards/assert-fresh-merge-base.sh <pr-number>`: exits non-zero
+  when a PR's merge base is behind `origin/main`, printing how far and what
+  it has not seen. `pr-review-status.sh` runs it, so a stale PR never gets
+  the merge command printed; run it directly for any merge that bypasses
+  that script. Green CI on a stale base is not evidence about the merge:
+  `main` runs no CI of its own, so a PR green against an older base can
+  still break it (8a534f43 left main uncompilable exactly this way, a
+  five-argument call site landing minutes before another PR made the
+  function take six, both PRs green), and a gate added to `main` after a PR
+  went green has never run against that PR at all. Four PRs were CI-green
+  and behind simultaneously on 2026-09-06. `ALLOW_STALE_MERGE_BASE=1` to
+  proceed anyway. Note it fetches with an explicit destination refspec: a
+  hand-rolled version using `git fetch origin main <other-ref>` and then
+  `rev-parse FETCH_HEAD` reads back MAIN, so it compares main with itself
+  and reports every branch fresh.
 - `scripts/guards/assert-gh-auth.sh [hostname]`: exits non-zero when gh
   cannot complete an authenticated API call. Run it before any landing
   sequence: tokens die mid-session, and a failure found at push time
