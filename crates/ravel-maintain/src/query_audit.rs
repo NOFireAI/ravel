@@ -31,10 +31,14 @@
 //! request is unbounded, permanent growth - collocating it with the
 //! legal-hold control plane would mean every future legal-hold refresh (a
 //! full shard listing) reads and discards an ever-growing pile of query
-//! records. A distinct shard costs nothing today (no `Signal::Audit`
-//! resolution exists yet for either shard - the generic `audit` SQL table,
-//! crates/ravel-sql/src/audit_schema.rs, is not yet registered in any
-//! session) and is unfixable later, once records are immutable and keyed.
+//! records. The split is invisible to readers: `Signal::Audit`'s
+//! `fixed_read_shards` is 2 (crates/ravel-types/src/lib.rs), so the
+//! `Catalog::resolve` behind an `audit` query floors its scan set at both
+//! shards, and the generic `audit` SQL table
+//! (crates/ravel-sql/src/audit_schema.rs) is registered in the session
+//! `crates/ravel-sql/src/session.rs` builds for that query. Which shard a
+//! record rides is a write-side layout choice no reader sees, and it is
+//! unfixable later, once records are immutable and keyed.
 //!
 //! Every record carries:
 //!
