@@ -1552,6 +1552,38 @@ async fn body_literal_prunes_blocks_without_changing_results() {
     assert_eq!(samples[0].ts_ns, 4);
     assert_eq!(samples[0].value, 1.0);
 
+    // (iii-b) Two extractable `__body__` matchers on one selector: one
+    // `Predicate::HasWord` arm is pushed per matcher, never collapsed, and the
+    // conjunction of two supersets is still a superset of the conjunction. The
+    // prune and the samples must be exactly what either arm alone produces.
+    let out = {
+        let matchers = [
+            LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+            LabelMatcher::equal(BODY_MATCHER_LABEL, "needle alpha found"),
+            LabelMatcher::regex(BODY_MATCHER_LABEL, "needle alpha found").unwrap(),
+        ];
+        let req = lines_request(&matchers, full_window());
+        let accounting = PhaseAccounting::new();
+        fetch_log_series(
+            &fetcher,
+            TENANT,
+            std::slice::from_ref(&seg),
+            &req,
+            &accounting,
+        )
+        .await
+        .expect("fetch_log_series")
+    };
+    assert_eq!(out.blocks_total, 4);
+    assert_eq!(
+        out.blocks_scanned, 1,
+        "two extractable matchers push two arms and still prune to the one block holding ts 4"
+    );
+    let samples: Vec<_> = out.series.iter().flat_map(|s| s.samples.iter()).collect();
+    assert_eq!(samples.len(), 1, "equality AND anchored regex on the body");
+    assert_eq!(samples[0].ts_ns, 4);
+    assert_eq!(samples[0].value, 1.0);
+
     // (iv) `.*needle.*` extracts no literal (no token-bounded run survives the
     // trim): every block is still decoded, and the per-record filter alone
     // finds both ts 4 ("needle alpha found") and ts 7 ("needles-only",
