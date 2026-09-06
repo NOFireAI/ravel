@@ -170,7 +170,27 @@ pub enum LogsFetchPolicy {
     /// fetching with no operator action.
     #[default]
     CostBased,
+    /// Trade money for wall-clock (issue #1196): resolves the rate and routing
+    /// threshold EXACTLY as [`Self::ByteMinimal`] (ADR-0904's ranged behaviour),
+    /// and additionally prefers [`LATENCY_FIRST_STORE_GET_CONCURRENCY`] for the
+    /// process-wide object-store GET concurrency
+    /// ([`Self::preferred_store_get_concurrency`]). Measured on the reference
+    /// corpus (#1185, 42 statements, true cold): 5.45x the GET requests
+    /// (570,752 vs 104,780) for 46% less cold wall-clock (285.8s vs 486.0s)
+    /// against the `cost-based` default at `s3-intra-region-2026` prices, where
+    /// free transfer and retrieval saturate the cost-based rate to whole-object
+    /// reads. Cost-first stays the default because it is right for the bill;
+    /// this is an operator opt-in for the deployments where the clock matters
+    /// more than the request bill. The extra in-flight fetch memory this
+    /// concurrency holds is bounded by the process-wide memory budget of
+    /// ADR-1170 once that lands; nothing here implements that bound.
+    LatencyFirst,
 }
+
+/// [`LogsFetchPolicy::LatencyFirst`]'s preferred `--store-get-concurrency`
+/// (issue #1196): the measured configuration the 285.8s cold run used, not a
+/// value derived from core count or any other host property.
+pub const LATENCY_FIRST_STORE_GET_CONCURRENCY: usize = 256;
 
 impl LogsFetchPolicy {
     /// The policy name as it appears on the `--logs-fetch-policy` flag and in a
@@ -180,6 +200,22 @@ impl LogsFetchPolicy {
             LogsFetchPolicy::RequestMinimal => "request-minimal",
             LogsFetchPolicy::ByteMinimal => "byte-minimal",
             LogsFetchPolicy::CostBased => "cost-based",
+            LogsFetchPolicy::LatencyFirst => "latency-first",
+        }
+    }
+
+    /// This policy's preferred process-wide object-store GET concurrency
+    /// (issue #1196), a default the CLI's performance-knob resolution ranks
+    /// ahead of the host-derived default but behind an explicit
+    /// `--store-get-concurrency` or the legacy `--fetch-concurrency`. `None`
+    /// for every policy except [`Self::LatencyFirst`]: the other three carry no
+    /// concurrency opinion of their own.
+    pub fn preferred_store_get_concurrency(self) -> Option<usize> {
+        match self {
+            LogsFetchPolicy::LatencyFirst => Some(LATENCY_FIRST_STORE_GET_CONCURRENCY),
+            LogsFetchPolicy::RequestMinimal
+            | LogsFetchPolicy::ByteMinimal
+            | LogsFetchPolicy::CostBased => None,
         }
     }
 }
@@ -270,8 +306,14 @@ pub fn resolve_logs_fetch(
             // byte-minimal is today's behaviour byte for byte, which includes a
             // configured (non-default) `--logs-request-cost-bytes`: ADR-0904's
             // knob keeps its meaning under this policy rather than being
-            // silently replaced by the compiled default.
-            LogsFetchPolicy::ByteMinimal => (configured_request_cost_bytes, None),
+            // silently replaced by the compiled default. latency-first resolves
+            // the byte quantities exactly the same way (issue #1196): it trades
+            // GET requests for wall-clock only through
+            // `preferred_store_get_concurrency`, never by changing what the
+            // fetch layer sees here.
+            LogsFetchPolicy::ByteMinimal | LogsFetchPolicy::LatencyFirst => {
+                (configured_request_cost_bytes, None)
+            }
             LogsFetchPolicy::CostBased => resolve_cost_based_rate(profile),
         },
     };
@@ -863,6 +905,64 @@ mod tests {
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
         );
         assert_eq!(cb.saturated_profile, None);
+    }
+
+    /// Issue #1196: `latency-first` must resolve the byte quantities exactly as
+    /// `byte-minimal` does -- only `preferred_store_get_concurrency` (checked
+    /// below) differs -- and its concurrency preference must be `None` for
+    /// every other policy.
+    ///
+    /// Prove-the-test: route `LogsFetchPolicy::LatencyFirst` through the
+    /// `CostBased` arm instead of `ByteMinimal`'s and the first two assertions
+    /// read `request_cost_bytes: u64::MAX` (or the profile-derived rate) against
+    /// the expected configured value.
+    #[test]
+    fn latency_first_resolves_like_byte_minimal() {
+        let reference = StoreCostProfile::reference();
+        let configured = 700_000u64;
+
+        let bm = resolve_logs_fetch(
+            LogsFetchPolicy::ByteMinimal,
+            &reference,
+            None,
+            configured,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        let lf = resolve_logs_fetch(
+            LogsFetchPolicy::LatencyFirst,
+            &reference,
+            None,
+            configured,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(lf.request_cost_bytes, bm.request_cost_bytes);
+        assert_eq!(lf.request_cost_bytes, configured);
+        assert_eq!(lf.block_range_threshold, bm.block_range_threshold);
+        assert_eq!(
+            lf.block_range_threshold,
+            crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert_eq!(lf.overridden_block_range_threshold, None);
+        assert_eq!(lf.saturated_profile, None);
+
+        assert_eq!(
+            LogsFetchPolicy::LatencyFirst.preferred_store_get_concurrency(),
+            Some(256)
+        );
+        assert_eq!(
+            LogsFetchPolicy::RequestMinimal.preferred_store_get_concurrency(),
+            None
+        );
+        assert_eq!(
+            LogsFetchPolicy::ByteMinimal.preferred_store_get_concurrency(),
+            None
+        );
+        assert_eq!(
+            LogsFetchPolicy::CostBased.preferred_store_get_concurrency(),
+            None
+        );
     }
 
     #[test]
