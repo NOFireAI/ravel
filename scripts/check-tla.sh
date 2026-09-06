@@ -513,12 +513,21 @@ check_traceability() {
             *[Aa]ction*[Pp]roperty*) continue ;;   # header row
         esac
         # The required source ref is column 3 (awk field 4 after the leading |).
+        # It may hold more than one whitespace-separated reference, for a
+        # property whose transition spans two symbols in two crates; each is
+        # resolved independently against its own file, never pooled into a
+        # single resolve_rust_ref call, so a row still rejects a reference
+        # whose own ::-segments don't resolve in its own file.
         local src
         src="$(echo "$line" | awk -F'|' '{print $4}' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr -d '`')"
         if [ -z "$src" ]; then
             note "$area traceability: row has no Rust source ref: $line"; rc=1; continue
         fi
-        resolve_rust_ref "$area" "$src" || { rc=1; continue; }
+        local one row_failed=0
+        for one in $src; do
+            resolve_rust_ref "$area" "$one" || row_failed=1
+        done
+        [ "$row_failed" -eq 0 ] || { rc=1; continue; }
         count=$((count + 1))
 
         # Resolve any further crates/... references in the remaining columns.
