@@ -434,9 +434,10 @@ startup, but only some resolve **from host resources**: `--store-get-concurrency
 `--fetch-concurrency`, which sets all three) follow the core count, and the two
 SQL ceilings follow memory (shares of `MemTotal`, capped by the cgroup memory
 limit in a container), while `--max-segments` is a fixed 1,000,000 on every
-host. Set, the flag value is used verbatim, except that the per-query SQL pool
-is clamped to an explicit per-tenant ceiling set below it (see the clamp rule
-below). All are process-wide, not per-tenant. The "reference host" column is
+host. Set, a nonzero flag value is used verbatim (`0` in any of the four
+concurrency flags is a startup error, see below), except that the per-query
+SQL pool is clamped to an explicit per-tenant ceiling set below it (see the
+clamp rule below). All are process-wide, not per-tenant. The "reference host" column is
 what a 16-core, 30 GB host resolves to, the settings the published ClickBench
 run used.
 

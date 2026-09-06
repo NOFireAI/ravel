@@ -735,9 +735,14 @@ on each. No fetcher in the server process owns a private limiter.
 
 `EngineConfig::fetch_concurrency` remains the legacy uniform knob: a bare
 `EngineConfig::default()` (or any config that leaves the three knobs below
-unset) behaves exactly as before ADR-1195, because splitting the knob
-changes which lever an operator turns, not what an untouched deployment
-does. Three `Option<usize>` overrides on `EngineConfig` take precedence
+unset) resolves to the same numeric values as before ADR-1195, because
+splitting the knob changes which lever an operator turns, not the numbers an
+untouched deployment resolves. What does change for an untouched deployment
+is the aggregate: the fetchers now draw on one process-wide limiter where
+each used to hold its own, so the in-flight GET ceiling is one value for the
+process rather than that value per fetcher (the CHANGELOG entry for ADR-1195
+names the two paths whose behaviour this moves). Three `Option<usize>`
+overrides on `EngineConfig` take precedence
 over it when set, each resolved through a same-named accessor method:
 
 - `store_get_concurrency` / `store_get_concurrency()` -- the resolved
