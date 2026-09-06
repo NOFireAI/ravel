@@ -365,8 +365,14 @@ pub struct IoShapeJson {
     /// object-store mechanisms with different causes.
     #[serde(rename = "listPageDepth")]
     pub list_page_depth: u32,
-    /// Batches this query's per-segment fan-out was forced into by its
-    /// concurrency permit: `ceil(segment_count / fetch_concurrency)`.
+    /// A deterministic model figure for the serial service rounds this
+    /// query's metrics fan-out needs: the sum over outer plan waves of
+    /// `ceil(segments * active_plans / min(fanout * active_plans,
+    /// shared_permits))`, with plans counted as distinct matcher sets. Exact
+    /// for identical work and comparable across queries; a lower bound only
+    /// within a single wave, not across the sum. See
+    /// [`crate::io_shape::service_batches_over_plan_waves`] for the model and
+    /// its counterexample.
     #[serde(rename = "serviceBatches")]
     pub service_batches: u32,
     /// EXACT count of SEGMENTS (`SegmentOrigin::Recent` entries, one per
