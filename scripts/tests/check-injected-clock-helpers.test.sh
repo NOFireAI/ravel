@@ -509,6 +509,41 @@ check_eq "the real default target scans clean" "0" "${rc}"
 check_ge "the real default target's scanned-helper count clears the floor" \
   "${REAL_TARGET_HELPER_FLOOR}" "$(helper_count_of "${out}")"
 
+# === (s) the scan start is anchored on the stripped line ===================
+# `scan_start` is found by matching the cfg(test) attribute. Matched on the RAW
+# line, a doc comment or string literal naming that attribute starts the scan
+# above the real test module, and production functions that mention a clock
+# type then enter the scan. The wall-clock call below sits in production code
+# and must NOT be reported.
+anchor="${tmproot}/anchor.rs"
+cat >"${anchor}" <<'RS'
+//! Module docs that mention #[cfg(test)] in prose.
+
+pub struct TestClock;
+
+/// Production helper. Not a test, not scanned.
+pub fn prod_helper_on_testclock(_c: &TestClock) {
+    std::thread::sleep(std::time::Duration::from_millis(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn helper_on_testclock(clock: &TestClock) {
+        let _ = clock;
+        tokio::task::yield_now().await;
+    }
+
+    #[test]
+    fn t() {}
+}
+RS
+out="$(bash "${CHECK}" "${anchor}" 2>&1)"
+rc=$?
+check_eq "a cfg(test) mention in a doc comment does not move the scan start" "0" "${rc}"
+check_eq "only the real test module's helper is scanned past a doc-comment mention"   "1" "$(helper_count_of "${out}")"
+
 echo
 echo "passed: ${pass}  failed: ${fail}"
 [[ ${fail} -eq 0 ]]

@@ -250,7 +250,10 @@ BEGIN { SQ = sprintf("%c", 39) }
   raw[nlines] = $0
   clean[nlines] = CLEAN
   nostr[nlines] = NOSTR
-  if (cfg_test_line == 0 && $0 ~ /#\[cfg\(test\)\]/) cfg_test_line = nlines
+  # Anchored on the stripped line like every other predicate here: a doc
+  # comment or string literal mentioning the attribute would otherwise start
+  # the scan above the real test module and pull production functions in.
+  if (cfg_test_line == 0 && CLEAN ~ /#\[cfg\(test\)\]/) cfg_test_line = nlines
 }
 END {
   if (nlines == 0) {
