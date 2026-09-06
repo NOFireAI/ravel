@@ -313,7 +313,7 @@ Old name, or cite | Current implementation
 --- | ---
 `record_level_winners` / `record_level_winners_slot` | `StampScratch::finish` (`crates/ravel-logseg/src/writer.rs`) computes the same two-tier winner order (columnar occurrences ascending by type byte, then overflow occurrences ascending by `canonical_value_bytes`, last wins), fed by `StampScratch::push_columnar` / `push_overflow`.
 `resolved_tracked_values` | the stream-seed overlay inside `StampScratch::finish`, seeded once per stream by `StreamSeed`.
-`stat_winner_columns` and `indexed_term_columns` | `emit_merged`, which projects the one merged view onto both consumers: every indexed entry becomes a POSTINGS term, and the first entry per name becomes the SKIP_IDX NumStat winner.
+`stat_winner_columns` and `indexed_term_columns` | `emit_merged`, which projects the one merged view onto both consumers under each one's own eligibility. An entry becomes a POSTINGS term when its slot is indexed and a dynamic column exists for that slot's type byte. It becomes the SKIP_IDX NumStat winner when its slot is a NumStat slot, no entry for that slot has been taken yet, the type is `I64`, `F64` or `Bool`, and a dynamic column exists for that pair; a first entry of any other type consumes the slot's one chance and emits nothing.
 `merged_indexed_terms` | `resolve_row` plus `StampScratch::finish`.
 `writer.rs:753-791` | stale. That range today spans the BLOOM/POSTINGS `push_section` calls (through roughly line 770) and the `LogFooter` construction that follows; no part of it computes a winner. The winner now lives in `StampScratch::finish` (`writer.rs:2049`).
 
