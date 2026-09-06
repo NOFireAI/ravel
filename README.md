@@ -139,7 +139,9 @@ Also live:
 - Alert rules whose every transition is written to object storage as immutable
   data, and readable back through the `alerts` SQL table.
 - An analytics endpoint for change point detection and summary statistics.
-- Compaction, age-based retention, and garbage collection across all signals.
+- Compaction, age-based retention, and garbage collection for metrics, logs,
+  and spans, with audit compacted and retained on its own separate schedule.
+  Alert transitions have no maintenance path yet.
 - A Kubernetes operator with a `RavelCluster` custom resource.
 - Per-tenant typed attribute columns on the `logs` SQL table, so typed
   comparisons and aggregates need no `CAST` over the stringified `attrs` map.
@@ -179,7 +181,7 @@ curl -s -H "Authorization: Bearer demo-token" \
 Logs answer the same PromQL API, through the reserved `ravel_log_lines` and
 `ravel_log_bytes` metric names ([details](docs/guides/query.md#promql-over-logs)):
 
-<!-- ravel:run status=200; json:.data.resultType=vector -->
+<!-- ravel:run status=200; json:.data.resultType=vector; nonempty:.data.result -->
 ```sh
 curl -s -H "Authorization: Bearer demo-token" \
   --data-urlencode 'query=sum by (job) (count_over_time(ravel_log_lines[5m]))' \

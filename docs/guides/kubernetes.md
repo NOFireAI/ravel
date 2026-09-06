@@ -213,6 +213,7 @@ A minimal example is in
 | `spec.query.replicas` | integer | `1` | |
 | `spec.query.resources` | object | none | |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
+| `spec.maintain.replicas` | integer | `1` | |
 | `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. |
 | `spec.maintain.resources` | object | none | |
 | `spec.gc.protectionHorizon` | string | none | `--gc-protection-horizon` on the maintain pods, a duration such as `25h5m`. It must equal the protection horizon stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
@@ -284,17 +285,21 @@ For a `RavelCluster` named `dev`:
 | `dev-gateway` | Service | Ports 4318 (HTTP/OTLP/query API) and 4317 (OTLP/gRPC). |
 | `dev-query` | Deployment | `--mode query`, RollingUpdate. |
 | `dev-query` | Service | Port 4318. |
-| `dev-maintain` | Deployment | `--mode maintain`, one replica, `Recreate` strategy. Absent when `maintain.enabled` is `false`. |
+| `dev-maintain` | Deployment | `--mode maintain`, `spec.maintain.replicas` replicas (default 1), `RollingUpdate` strategy. Absent when `maintain.enabled` is `false`. |
 | `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
 | `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
 | `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
 | `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi`, independent of the backend. |
 | `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
 
-Maintain is pinned to one replica with `Recreate` to avoid rolling-update
-overlap. This is not an at-most-one guarantee, and correctness does not need
-one. Because of the CAS commit protocol, a second concurrent maintainer cannot
-corrupt committed state; it only wastes work.
+Maintain renders `RollingUpdate`, the same as gateway and query, and defaults
+to one replica but is not pinned there. Maintenance ownership is leased, not
+exclusive: each maintain process claims its own `(tenant, signal, shard)`
+units through a self-owned heartbeat key in object storage, with rendezvous
+hashing deciding which process owns which unit. A rolling restart can leave
+an old and a new pod briefly claiming overlapping units at once. That only
+duplicates work. It does not corrupt committed state, so scaling
+`spec.maintain.replicas` above one is safe.
 
 ### Status
 
@@ -499,4 +504,6 @@ The operator's design, its condition set and its reconcile model are
 [ADR-0034](../adrs/0034-k8s-operator.md). The per-mode storage credential
 roles are ADR-0055; the deployment key and `sys/auth` ownership are ADR-0072;
 per-tenant resharding is ADR-0052; ingest affinity and the Gateway API
-exposure are ADR-0076 decision 1 and ADR-0080.
+exposure are ADR-0076 decision 1 and ADR-0080. Leased, idempotent
+maintenance ownership, which is why maintain can run more than one replica,
+is ADR-0065.
