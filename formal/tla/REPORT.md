@@ -153,8 +153,11 @@ plus 12 named), omitting `TombstoneNotDeletedBeforeBucketEmpty` and
 `RawInputContentAssumedImmutable`. Both invariants were added to all seven
 `negative/*.cfg` files and the negative lane was re-run: every control still
 violates only its declared target invariant (exit 0 for the lane), so the
-addition is correct. The README's fourteen-invariant claim now matches the
-configs; no wording change was needed there.
+addition is correct. The README's fourteen-invariant claim matched the
+configs by count at the time; the phrase itself was tightened on
+2026-09-07 to "all fifteen INVARIANT lines (TypeOK plus fourteen named)" in
+both this file and `lifecycle/README.md`, for precision rather than because
+the count had drifted again.
 
 ### resharding
 
@@ -490,12 +493,14 @@ inferred by this report.
   timeout with no violation found and 10 million states still queued
   (section 5); `results.md` recommends a longer-budget run, not yet
   executed. This suite does not claim a result for that configuration.
-- **Documentation-note gaps.** Five of commit's eleven negative controls and
-  three of catalog's seven reachability-probe negative controls have no
-  corresponding note under `counterexamples/`, though D6 calls for one per
-  negative case (section 6). This is a documentation completeness gap in
-  those two areas, reported here and not fixed, since fixing it would touch
-  files outside this task's scope.
+- **Documentation-note gaps, closed 2026-09-07.** This entry previously
+  reported five of commit's eleven negative controls and three of catalog's
+  seven nonvacuity negative controls with no corresponding note under
+  `counterexamples/`. Checked against the shipped tree: all eleven of
+  commit's `negative/*.cfg` files and all twenty-one of catalog's have a
+  matching note under their respective `counterexamples/` directories, one
+  per negative case as D6 calls for (section 6). No gap remains in either
+  area.
 
 ## 11. What this does and does not establish
 

@@ -1,7 +1,12 @@
 # Consistency, Durability, and Failure Semantics
 
-Normative. Tests in `crates/ravel-failure-tests` assert every claim here. If
-code and this document disagree, one of them is a bug and the fix updates both.
+Normative. Every claim here is asserted somewhere in the workspace, split by
+subject rather than gathered in one crate: `crates/ravel-failure-tests`
+covers acknowledgement semantics, the crash matrix, and duplicate handling;
+`crates/ravel-catalog` and `crates/ravel-maintain` cover snapshot isolation
+and staleness, compaction, online resharding, deletion and GC, and selective
+subject erasure. If code and this document disagree, one of them is a bug
+and the fix updates both.
 
 Guarantees come first in this file, mechanism second. Four distinctions run
 through it, and keeping them apart is how to read it:
