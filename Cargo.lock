@@ -5036,6 +5036,7 @@ dependencies = [
  "ravel-commit",
  "ravel-logseg",
  "ravel-maintain",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-promql",
  "ravel-proto",
