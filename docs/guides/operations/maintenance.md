@@ -135,11 +135,13 @@ by the increase rather than equal to it: ages are checked on the
 `flush_tick` interval rather than continuously.
 
 Two configurations change this picture. With `--adaptive-flush-delay` on
-(off by default), `--max-flush-delay` becomes the floor of a per-tenant
-corridor rather than the threshold itself, so raising the floor moves only
-the bottom of a range the shard picks from. And a tenant fast enough to hit
-the size trigger is byte-driven even on the strict path, which puts it in
-the regime described next rather than this one.
+(off by default, and metrics only: the log and span shard actors do not
+consult it, so for those signals `--max-flush-delay` is always the
+threshold), `--max-flush-delay` becomes the floor of a per-tenant corridor
+rather than the threshold itself, so raising the floor moves only the bottom
+of a range the shard picks from. And a tenant fast enough to hit the size
+trigger is byte-driven even on the strict path, which puts it in the regime
+described next rather than this one.
 
 A buffered write (no waiter) is different, and this is where the
 byte-driven/timer-driven split applies: a buffered-mode tenant is

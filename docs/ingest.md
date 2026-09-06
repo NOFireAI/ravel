@@ -239,11 +239,15 @@ waiter and holds fewer than `min_flush_bytes`. A strict write keeps a
 condition never holds on the acknowledged path: `age_threshold_ns` returns
 `max_flush_delay` there, regardless of how many bytes are buffered.
 
-That last step assumes `adaptive_flush_delay` is off, which is the default.
-With it on, the selector returns a per-tenant threshold in
-`[max_flush_delay, ceiling]` derived from the tenant's arrival rate and the
-shard's observed PUT round trip, so `max_flush_delay` becomes the floor of a
-corridor rather than the value. Everything below describes the default.
+That last step assumes `adaptive_flush_delay` is off, which is the default,
+and it is a metrics-pipeline knob: only the metrics shard actor consults it.
+The log and span shard actors return `max_flush_delay` or
+`max_flush_delay_idle` flatly, so for those two signals the description above
+is the whole story in every configuration. On the metrics path with the knob
+on, the selector returns a per-tenant threshold in `[max_flush_delay,
+ceiling]` derived from the tenant's arrival rate and the shard's observed PUT
+round trip, so `max_flush_delay` becomes the floor of a corridor rather than
+the value. Everything below describes the default.
 
 `target_bytes` is checked separately, on the message-received branch, and
 is not gated on `waiters`: a buffer that crosses `target_bytes` before the

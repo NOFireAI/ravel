@@ -153,7 +153,8 @@ pub struct IngestConfig {
     /// and `target_bytes` rarely wins the race against it. With
     /// `adaptive_flush_delay` on, this is the FLOOR of a per-tenant corridor
     /// rather than the threshold itself; the description above holds for the
-    /// default, which is off. Raising it lowers acknowledged-path record
+    /// default, which is off, and for the log and span shard actors in every
+    /// configuration, since only the metrics actor consults that knob. Raising it lowers acknowledged-path record
     /// cadence at the cost of acknowledged write latency, since a strict
     /// acknowledgement waits for its own flush to land. The added latency is
     /// bounded by the increase rather than equal to it: ages are checked on
