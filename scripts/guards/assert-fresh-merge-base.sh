@@ -1,0 +1,78 @@
+#!/bin/sh
+# assert-fresh-merge-base.sh <pr-number> [remote] [branch]
+# Verify a pull request's merge base IS the current tip of origin/main, fetched
+# in THIS invocation. Exit 0 when the branch already contains that tip; exit 1
+# when main has moved ahead of it, printing how far behind and what landed.
+#
+# Green CI on a stale base is not evidence about the merge. `main` runs no CI of
+# its own here, so a PR that passed against an older base can still break `main`
+# the moment it lands: that is how commit 8a534f43 left main uncompilable, when a
+# five-argument call site landed minutes before another PR made the same function
+# take six. Both PRs were green. Neither had seen the other.
+#
+# It also silently skips gates. A gate added to `main` after a PR went green has
+# never run against that PR, so the branch merges without the check its author
+# added precisely to catch it.
+#
+# ALLOW_STALE_MERGE_BASE=1 to proceed anyway (a docs-only branch whose CI you
+# have reason to trust across the gap).
+#
+# Fetches with an explicit destination refspec rather than reading FETCH_HEAD.
+# `git fetch origin main <other-ref>` leaves FETCH_HEAD naming main, so a check
+# written that way compares main with itself and reports success for any branch.
+set -u
+
+pr=${1:-}
+remote=${2:-origin}
+branch=${3:-main}
+
+if [ -z "$pr" ]; then
+  echo "guard: usage: assert-fresh-merge-base.sh <pr-number> [remote] [branch]" >&2
+  exit 1
+fi
+
+case "$pr" in
+  *[!0-9]* | '')
+    echo "guard: pr-number must be numeric, got '$pr'" >&2
+    exit 1
+    ;;
+esac
+
+git fetch "$remote" "$branch" >/dev/null 2>&1 || {
+  echo "guard: git fetch $remote $branch failed" >&2
+  exit 1
+}
+
+# refs/pull/<n>/head needs no branch name, so this works for a PR from any
+# branch and cannot be aimed at the wrong ref by a stale local copy.
+local_ref="refs/remotes/${remote}/pr-${pr}-freshness-check"
+git fetch "$remote" "refs/pull/${pr}/head:${local_ref}" -f >/dev/null 2>&1 || {
+  echo "guard: git fetch $remote refs/pull/${pr}/head failed (is $pr a pull request on $remote?)" >&2
+  exit 1
+}
+
+tip=$(git rev-parse "${remote}/${branch}") || exit 1
+head=$(git rev-parse "$local_ref") || exit 1
+base=$(git merge-base "$tip" "$head") || exit 1
+
+if [ "$tip" = "$base" ]; then
+  echo "guard: PR #$pr merge base is the current $remote/$branch ($(git rev-parse --short "$tip"))"
+  exit 0
+fi
+
+behind=$(git rev-list --count "$base".."$tip")
+echo "guard: PR #$pr is $behind commit(s) behind $remote/$branch." >&2
+echo "guard: its CI ran against $(git rev-parse --short "$base"), not $(git rev-parse --short "$tip")." >&2
+echo "guard: most recent unseen commits:" >&2
+git log --oneline --max-count=10 "$base".."$tip" 2>/dev/null | sed 's/^/guard:   /' >&2
+if [ "$behind" -gt 10 ]; then
+  echo "guard:   ... and $((behind - 10)) more" >&2
+fi
+
+if [ "${ALLOW_STALE_MERGE_BASE:-0}" = "1" ]; then
+  echo "guard: ALLOW_STALE_MERGE_BASE=1, proceeding on a stale base" >&2
+  exit 0
+fi
+
+echo "guard: rebase onto $remote/$branch and let CI re-run before merging." >&2
+exit 1
