@@ -421,7 +421,10 @@ fn no_kms_statement_grants_every_key_in_the_region() {
                     .collect(),
                 _ => continue,
             };
-            if !actions.iter().any(|a| a.starts_with("kms:")) {
+            if !actions
+                .iter()
+                .any(|a| a.to_ascii_lowercase().starts_with("kms:"))
+            {
                 continue;
             }
             let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
@@ -465,7 +468,10 @@ fn every_kms_statement_names_a_key_id() {
                     .collect(),
                 _ => continue,
             };
-            if !actions.iter().any(|a| a.starts_with("kms:")) {
+            if !actions
+                .iter()
+                .any(|a| a.to_ascii_lowercase().starts_with("kms:"))
+            {
                 continue;
             }
             let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
@@ -488,6 +494,73 @@ fn every_kms_statement_names_a_key_id() {
             }
         }
     }
+}
+
+/// Regression fixture for the case-sensitivity fix above: `KMS:Decrypt` (or any
+/// other capitalization) on `"Resource": "*"` is exactly as fully-permissive as
+/// `kms:Decrypt`, and the case-sensitive `starts_with("kms:")` selection both
+/// guards above used to run would silently skip it -- reporting the templates
+/// safe while a fully-permissive statement sat unexamined. This is not a real
+/// shipped template; it is a synthetic statement built to prove the matcher
+/// itself, independent of what `deploy/iam/*.json` currently contains.
+#[test]
+fn mixed_case_kms_action_is_not_a_bypass() {
+    let stmt = serde_json::json!({
+        "Sid": "MixedCaseFullyPermissive",
+        "Effect": "Allow",
+        "Action": "KMS:Decrypt",
+        "Resource": "*"
+    });
+    let actions: Vec<String> = match &stmt["Action"] {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => vec![],
+    };
+
+    // Observation 1: the pre-fix selection (case-sensitive) misses the
+    // mixed-case action entirely, exactly the hole this test guards against.
+    let selected_before_fix = actions.iter().any(|a| a.starts_with("kms:"));
+    assert!(
+        !selected_before_fix,
+        "fixture invalid: the pre-fix case-sensitive matcher was expected to \
+         miss \"KMS:Decrypt\" -- if it didn't, this fixture no longer proves \
+         the hole existed"
+    );
+
+    // Observation 2: the post-fix selection (lowercased) catches it.
+    let selected_after_fix = actions
+        .iter()
+        .any(|a| a.to_ascii_lowercase().starts_with("kms:"));
+    assert!(
+        selected_after_fix,
+        "fixture invalid: the post-fix matcher should select \"KMS:Decrypt\""
+    );
+
+    // With the statement selected, the real guard's own assertion (resource
+    // != "*" && !resource.ends_with(":key/*")) must now fire on this
+    // fixture's "Resource": "*". Run it through catch_unwind so this test
+    // reports the panic as an assertion result instead of aborting the binary.
+    let resource = stmt["Resource"]
+        .as_str()
+        .expect("Resource is a string")
+        .to_string();
+    let sid = stmt["Sid"].clone();
+    let guard_result = std::panic::catch_unwind(|| {
+        assert!(
+            resource != "*" && !resource.ends_with(":key/*"),
+            "statement {sid:?} grants a kms: action on {resource:?}, which \
+             covers every key in the account/region"
+        );
+    });
+    assert!(
+        guard_result.is_err(),
+        "the guard must reject \"KMS:Decrypt\" on Resource \"*\" once the \
+         statement is selected -- a mixed-case action must not bypass the \
+         no-account-wide-key assertion"
+    );
 }
 
 #[test]
