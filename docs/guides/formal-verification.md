@@ -29,12 +29,13 @@ promises these protocols keep in production.
 TLC checked each finite model under the bounds and assumptions recorded
 in its own `results.md` and configuration files. This model verifies the
 protocol design. Implementation conformance is argued in the
-traceability tables and asserted by the named Rust tests, not proved.
+traceability tables and asserted by Rust tests where a test exists, not
+proved. The traceability index records the rows still without one.
 
 ## What TLC checked
 
 Every exhaustive configuration runs under a 3600-second ceiling per
-model. The table below names each area, its specification module, and
+configuration. The table below names each area, its specification module, and
 the exhaustive configuration's distinct-state count and wall time.
 
 | Area | Specification | Distinct states | Wall time |
@@ -59,8 +60,9 @@ controls.
 ## What it does not establish
 
 The suite checks finite models, not the Rust implementation. The
-traceability tables tie each checked property to a Rust path and a named
-regression test. That link, not the model, ties the suite to the code.
+traceability tables tie each checked property to a Rust path and, for
+most rows, a named regression test. The index records the rows that
+still lack one. That link, not the model, ties the suite to the code.
 
 Several facts are assumptions the suite states but does not check. The
 lifecycle model assumes raw-input content never changes after it is
@@ -99,10 +101,11 @@ Issue 1244 tracks two wording fixes to the suite report.
 
 ## Run the suite
 
-Install a Java 17 or later runtime before you run any lane. Install GNU
-timeout before you run any lane. On macOS, run `brew install coreutils`
-to get it. If Java or GNU timeout is missing, the harness exits with
-code 2 and prints the reason.
+Install a Java 17 or later runtime before you run the smoke, negative, or
+exhaustive lane. Install GNU timeout before you run those lanes. On
+macOS, run `brew install coreutils` to get it. If Java or GNU timeout is
+missing, the harness exits with code 2 and prints the reason. The
+traceability lane runs without Java or GNU timeout.
 
 Run `scripts/check-tla.sh smoke` to check safety in every area, at a
 300-second budget per configuration. Run `scripts/check-tla.sh negative`
@@ -175,7 +178,7 @@ Add a negative control, with an `.expect` file, for every behavior the
 property forbids. Prove each control is not vacuous with a mutant.
 Record the mutant's exact TLC violation line in a counterexample note.
 
-Keep every configuration inside its time budget. Record its
+Keep every gated configuration inside its time budget. Record its
 distinct-state count and wall time in `results.md` and `bands.tsv`, in
 the same commit as the model.
 

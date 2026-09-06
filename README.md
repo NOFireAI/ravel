@@ -32,8 +32,9 @@ normative for both modes.
 The durability protocols above are modeled in TLA+. TLC checked five finite
 models of the commit, catalog, lifecycle, resharding, and maintenance
 protocols, over one shared object-store model, under stated bounds and
-assumptions. Negative controls show that each invariant can fail, and every
-checked property traces to a Rust symbol and a test. The
+assumptions. Negative controls show that each invariant can fail. Every checked
+property traces to a Rust symbol and, for all but five recorded rows, a
+test. The
 [formal verification guide](docs/guides/formal-verification.md) has the
 bounds, the assumptions, and the results.
 
@@ -345,7 +346,8 @@ hold Ravel to them:
   Each area carries negative controls that show its invariants can fail, and
   reachability obligations that show a guarded state is still reached.
   `scripts/check-tla.sh` runs the smoke, negative, and traceability lanes on
-  every pull request, and the exhaustive lane nightly. See the
+  every pull request that touches formal/ or the paths it models. The
+  exhaustive lane runs nightly. See the
   [formal verification guide](docs/guides/formal-verification.md) for the
   results.
 - A deterministic simulation harness drives the full ingest, fold, compact,
