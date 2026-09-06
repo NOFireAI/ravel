@@ -8,10 +8,18 @@
 //! maintenance paths here have to see it that way: the sweep must not delete
 //! it as superseded, and the completion gate must not treat it as invisible.
 //!
-//! Both fixtures drive the production entries (`sweep_superseded`,
-//! `sweep_unreferenced_parts`, `bucket_erasure_completion`) against a
-//! `MemoryStore`. Each test's doc comment names the assertion that fails
-//! without the fix.
+//! The same "one bucket, one record set" rule constrains the producer side:
+//! a bucket already holding a live erasure rewrite record must never gain a
+//! compaction record over the same inputs, because a rewrite's outputs
+//! deliberately lack records its inputs contain (ADR-0064 decision 3 point 5)
+//! and a snapshot naming both part sets resurrects the erased records. The
+//! last two fixtures pin that refusal, in `compact_bucket` and in the
+//! maintenance pass the server's tick runs.
+//!
+//! Every fixture drives the production entries (`sweep_superseded`,
+//! `sweep_unreferenced_parts`, `bucket_erasure_completion`, `compact_bucket`,
+//! `scan_and_maintain_with_memo`) against a `MemoryStore`. Each test's doc
+//! comment names the assertion that fails without the fix.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -22,9 +30,12 @@ use std::sync::Arc;
 use common::*;
 use prost::Message;
 use ravel_commit::{erasure, keys, signal};
+use ravel_maintain::read::list_bucket;
+use ravel_maintain::scan::{MaintainMemo, TerminalState, scan_and_maintain_with_memo};
 use ravel_maintain::{
-    Bucket, CompactorConfig, FixedClock, NoLeases, PendingErasureRequest,
-    bucket_erasure_completion, sweep_superseded, sweep_unreferenced_parts,
+    Bucket, Clock, CompactionOutcome, CompactorConfig, FixedClock, NoLeases, PendingErasureRequest,
+    RetentionConfig, bucket_erasure_completion, compact_bucket, sweep_superseded,
+    sweep_unreferenced_parts,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
@@ -32,7 +43,7 @@ use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, ErasurePredicateMatcher,
     ErasureRequest, RewriteDrop, RewriteRecord,
 };
-use ravel_types::Signal;
+use ravel_types::{Signal, TimeRange};
 use uuid::Uuid;
 
 /// Event-time base of the logs bucket the fixtures use.
@@ -515,4 +526,224 @@ async fn erasure_completion_sees_the_l0_only_a_losing_record_names() {
         "the subject is provably gone from the bucket"
     );
     assert!(!completion.unresolved);
+}
+
+/// A bucket that already holds a live erasure rewrite record serves exactly
+/// one part set, because compaction refuses it. The producer-side refusal is
+/// what makes that true: a rewrite's outputs deliberately lack records its
+/// inputs contain, so a compaction record over the same inputs is not
+/// overlap-harmless against it (ADR-0064 decision 3 point 5), and a snapshot
+/// naming both part sets resurrects the erased records.
+///
+/// The guarded production line is the `RewritePresent` early return in
+/// `compact_bucket_scoped` (crates/ravel-maintain/src/compact.rs). With that
+/// return removed, `compact_bucket` reports `Compacted { parts: 1, .. }`, the
+/// bucket holds one compaction record, and the resolved key set is the union
+/// of both record sets rather than the rewrite's parts alone.
+#[tokio::test]
+async fn resolve_serves_exactly_one_part_set_after_a_rewrite() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+    let request_id = Uuid::from_u128(0x0E46);
+
+    let a_writer = Uuid::from_u128(0xC1);
+    let b_writer = Uuid::from_u128(0xC2);
+    seed_rlog_input(
+        store.as_ref(),
+        a_writer,
+        1,
+        1,
+        &[log_record(1, base + 1_000, "a")],
+    )
+    .await;
+    seed_rlog_input(
+        store.as_ref(),
+        b_writer,
+        1,
+        2,
+        &[log_record(1, base + 2_000, "b")],
+    )
+    .await;
+
+    // The erasure pass has already rewritten both L0 inputs into one part.
+    let rewrite_key = put_rewrite_record(
+        store.as_ref(),
+        &b,
+        vec![
+            input_identity(a_writer, 1, 1),
+            input_identity(b_writer, 1, 2),
+        ],
+        "",
+        vec![part(0x77, base + 1_000, base + 2_000)],
+        &[request_id],
+        base + 3_000,
+    )
+    .await;
+    let rewrite: RewriteRecord =
+        RewriteRecord::decode(get_full(store.as_ref(), &rewrite_key).await.as_ref())
+            .expect("decode rewrite record");
+    let rewrite_part_keys: BTreeSet<String> = rewrite
+        .parts
+        .iter()
+        .map(|p| keys::reconstruct_rewrite_part_key(&rewrite, p).expect("rewrite part key"))
+        .collect();
+    assert_eq!(rewrite_part_keys.len(), 1, "the rewrite published one part");
+
+    let clock = FixedClock::new(sealed_now_ns());
+    let outcome = compact_bucket(store.as_ref(), &clock, &cfg(), &b)
+        .await
+        .expect("compact");
+    assert_eq!(
+        outcome,
+        CompactionOutcome::RewritePresent,
+        "compaction refuses the rewritten bucket"
+    );
+
+    // What a query would see: exactly the rewrite's parts, nothing else. An
+    // exact key set, never a count: a second record set of the same size would
+    // pass a count check.
+    let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog = ravel_catalog::Catalog::new(
+        dyn_store,
+        ravel_catalog::CatalogConfig {
+            shard_count: SHARD + 1,
+            ..Default::default()
+        },
+    )
+    .expect("catalog");
+    let snapshot = catalog
+        .resolve(
+            &b.tenant_hash,
+            Signal::Logs,
+            TimeRange {
+                start_ns: base,
+                end_ns: base + NS_PER_HOUR,
+            },
+            &[],
+            clock.now_ns(),
+        )
+        .await
+        .expect("resolve");
+    let served: BTreeSet<String> = snapshot
+        .segments
+        .iter()
+        .map(|s| s.data_object_key.clone())
+        .collect();
+    assert_eq!(
+        served, rewrite_part_keys,
+        "the resolved snapshot serves the rewrite's part set and nothing else"
+    );
+
+    // Nothing was published to collect, and nothing the rewrite owns is
+    // unreferenced.
+    let collected = sweep_unreferenced_parts(
+        store.as_ref(),
+        &clock,
+        &cfg(),
+        &NoLeases,
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await
+    .expect("rule 3");
+    assert_eq!(
+        collected, 0,
+        "the rewrite's part is referenced by its own record"
+    );
+    let listing = list_bucket(store.as_ref(), &b).await.expect("list");
+    assert_eq!(
+        listing.compaction_record_keys.len(),
+        0,
+        "the bucket holds zero compaction records"
+    );
+    assert_eq!(listing.rewrite_record_keys, vec![rewrite_key]);
+}
+
+/// Reachability: the maintenance pass the server's tick runs per owned unit
+/// (`scan_and_maintain_with_memo`, the single ravel-maintain entry point
+/// `run_tick_with_clock` calls for compaction and retention) leaves a bucket
+/// holding a live erasure rewrite record uncompacted, and memoizes it as
+/// terminal so later ticks skip it.
+///
+/// The guarded production line is the same `RewritePresent` early return in
+/// `compact_bucket_scoped`. With that return removed the pass reports
+/// `compacted: 1` and the bucket ends the tick holding a compaction record
+/// beside the rewrite record.
+#[tokio::test]
+async fn the_maintenance_tick_leaves_a_rewritten_bucket_uncompacted() {
+    let store = Arc::new(MemoryStore::new());
+    let b = logs_bucket();
+    let base = hour_ns();
+
+    let a_writer = Uuid::from_u128(0xD1);
+    let b_writer = Uuid::from_u128(0xD2);
+    seed_rlog_input(
+        store.as_ref(),
+        a_writer,
+        1,
+        1,
+        &[log_record(1, base + 1_000, "a")],
+    )
+    .await;
+    seed_rlog_input(
+        store.as_ref(),
+        b_writer,
+        1,
+        2,
+        &[log_record(1, base + 2_000, "b")],
+    )
+    .await;
+    put_rewrite_record(
+        store.as_ref(),
+        &b,
+        vec![
+            input_identity(a_writer, 1, 1),
+            input_identity(b_writer, 1, 2),
+        ],
+        "",
+        vec![part(0x88, base + 1_000, base + 2_000)],
+        &[Uuid::from_u128(0x0E47)],
+        base + 3_000,
+    )
+    .await;
+
+    let clock = FixedClock::new(sealed_now_ns());
+    let mut memo = MaintainMemo::new(0);
+    let report = scan_and_maintain_with_memo(
+        &mut memo,
+        store.as_ref(),
+        &clock,
+        &cfg(),
+        &RetentionConfig::default(),
+        &NoLeases,
+        b.tenant_hash,
+        b.signal,
+        b.shard,
+    )
+    .await
+    .expect("tick");
+
+    assert_eq!(report.compacted, 0, "the tick compacts nothing");
+    assert_eq!(
+        report.already_done, 1,
+        "the rewritten bucket is counted as needing no work"
+    );
+    let listing = list_bucket(store.as_ref(), &b).await.expect("list");
+    assert_eq!(
+        listing.compaction_record_keys.len(),
+        0,
+        "the tick published no second record set"
+    );
+    assert_eq!(listing.commit_keys.len(), 2, "both L0 inputs stay live");
+
+    // The refusal is terminal, so the tick memoizes it: a live rewrite record
+    // is never deleted and a sealed bucket's L0 set is frozen, so the state
+    // cannot go stale, and a lost memo costs one re-list.
+    assert_eq!(
+        memo.terminal_state(b.tenant_hash, b.signal, b.shard, b.ingest_hour_bucket),
+        Some(TerminalState::Compacted),
+        "the tick memoizes the refusal as terminal"
+    );
 }

@@ -380,8 +380,20 @@ every bound is measured.
   for a request's
   predicate until its `.dreq` is removed, which by construction happens only
   after no resolvable snapshot can still reference a pre-rewrite input.
-  Correctness never depends on the per-bucket compaction/rewrite
-  serialization; that serialization is an efficiency measure.
+
+- **Compaction and format migration refuse a bucket that already holds a live
+  rewrite record.** This is the producer-side half of the same rule, and it is
+  a correctness requirement rather than an optimization: because overlap
+  harmlessness does not hold for a rewrite, a compaction (or migration) record
+  published over the same inputs leaves one bucket serving two record sets,
+  and a snapshot naming both resurrects the erased records through query-time
+  dedup. `compact_bucket` and `migrate_bucket_format` therefore gate on the
+  bucket's rewrite records exactly as they gate on its compaction records, and
+  report `RewritePresent`: the bucket is left untouched, its L0 inputs stay
+  live behind the rewrite record, and the maintenance pass memoizes the
+  refusal as terminal. The query-time filter (Query exclusion, above) remains
+  the guarantee that covers the window before a rewrite lands; this refusal is
+  what keeps a second record set from ever being produced afterwards.
 
 - **The 72 h rewrite bound derives from the maintenance ownership cadence
   (ADR-0065).** The rewrite pass runs on the Maintain worker that owns each
