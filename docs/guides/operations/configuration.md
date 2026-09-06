@@ -169,11 +169,21 @@ shipped topology does.
 One policy document per role lives in [`deploy/iam/`](../../../deploy/iam/)
 rather than being transcribed here, so a policy edit is a diff that a test
 checks against the real object-key layout in CI. Replace `my-ravel-bucket` with
-your bucket, and `arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID`
-with your tenant key ARN(s), in each file, then attach each document to the
-principal whose access key that role's deployment uses. An operator who
-attaches a template without substituting the KMS ARN gets `AccessDenied` on
-the first KMS-routed PUT: the placeholder names no real key.
+your bucket in each file, then attach each document to the principal whose
+access key that role's deployment uses.
+
+The KMS statement's `Resource` value is a JSON array, shipped with exactly one
+entry: the placeholder `arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID`.
+That single-entry array is correct as shipped only for a deployment with one
+KMS key. `--tenant-kms-config` routes different tenants to different keys (see
+[Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms)), and each
+role's policy must authorize every key its own writes and reads can reach:
+for each key you configure in the tenant-KMS file, add its exact ARN as its own
+entry in that array, rather than replacing the single placeholder with your
+one key and calling it done. A configured tenant key missing from the array
+does not fail at startup: the process starts normally, and the gap surfaces
+only when a request first routes to that key, as `AccessDenied` on that KMS
+call, at runtime rather than at deploy time.
 
 Three facts about those documents are worth knowing before you edit them.
 
