@@ -236,9 +236,14 @@ selector, mirrored across the metrics, log and span shard actors) picks a
 threshold of `max_flush_delay_idle` only when a buffer has no strict-mode
 waiter and holds fewer than `min_flush_bytes`. A strict write keeps a
 `oneshot::Sender` in `waiters` for its whole flush window, so that
-condition never holds on the acknowledged path: `age_threshold_ns` always
-returns `max_flush_delay` there, regardless of how many bytes are
-buffered.
+condition never holds on the acknowledged path: `age_threshold_ns` returns
+`max_flush_delay` there, regardless of how many bytes are buffered.
+
+That last step assumes `adaptive_flush_delay` is off, which is the default.
+With it on, the selector returns a per-tenant threshold in
+`[max_flush_delay, ceiling]` derived from the tenant's arrival rate and the
+shard's observed PUT round trip, so `max_flush_delay` becomes the floor of a
+corridor rather than the value. Everything below describes the default.
 
 `target_bytes` is checked separately, on the message-received branch, and
 is not gated on `waiters`: a buffer that crosses `target_bytes` before the
@@ -251,8 +256,10 @@ above normal per-shard write rates. Measured across two loads spanning a
 produced close to the same commit-record rate per shard per hour, 1,413.6
 and 1,435.7 respectively, a 1.6% difference against the 47x difference in
 input rate, and the `target_bytes` size trigger fired zero times in either
-run. Commit-record count on the acknowledged path is set by the flush
-clock, not by ingest volume.
+run. So the flush clock, not ingest volume, set the commit-record count in
+both measured runs. That is a statement about the rates measured, not a
+property of the strict path: the size trigger is live there, and a tenant
+sustaining more than roughly 4 MiB/s per shard would reach it.
 
 What each knob actually moves there:
 
@@ -265,11 +272,13 @@ What each knob actually moves there:
   acknowledged path. They set a buffered-mode tenant's PUT cadence when its
   arrival rate is too low to reach `target_bytes`.
 - `max_flush_delay`: the knob that sets acknowledged-path flush cadence.
-  Raising it produces fewer, larger commit records per hour, but a strict
-  acknowledgement waits for its own flush to land, so every millisecond
-  added to `max_flush_delay` is added to acknowledged write latency,
-  one for one. It is not a free tuning knob; see the operations guide for
-  the seal-delay trade-off this interacts with through
+  Raising it produces fewer, larger commit records per hour at the cost of
+  acknowledged write latency, since a strict acknowledgement waits for its
+  own flush to land. The cost is bounded by the increase rather than equal
+  to it: ages are checked on the `flush_tick` interval rather than
+  continuously, and a buffer reaching `target_bytes` flushes without waiting
+  for the age trigger at all. It is not a free tuning knob; see the
+  operations guide for the seal-delay trade-off this interacts with through
   `max_flush_lifetime`.
 
 ### Pipelined flushes (ADR-0067)

@@ -141,17 +141,25 @@ pub struct IngestConfig {
     /// "Flush cadence on the acknowledged path"). It only sets a
     /// buffered-mode tenant's cadence, and only once that tenant's arrival
     /// rate is high enough to reach it before `max_flush_delay_idle` does.
+    /// The size trigger is not gated on the strict path, so a strict tenant
+    /// sustaining that rate does flush on size; the measurements show only
+    /// that it did not win in either measured run.
     pub target_bytes: usize,
     /// Flush a tenant's buffer once its oldest point is at least this old.
     /// This is the trigger that actually sets commit-record cadence on the
     /// acknowledged (strict) path: a strict write leaves the buffer's
     /// waiters non-empty for its whole flush window, so the age-trigger
-    /// selector always returns this value there rather than
-    /// `max_flush_delay_idle`, and `target_bytes` rarely wins the race
-    /// against it. Raising it lowers acknowledged-path record cadence, but
-    /// a strict acknowledgement waits for its own flush to land, so every
-    /// millisecond added here is added to acknowledged write latency, one
-    /// for one. Not a knob to retune without owning that latency trade.
+    /// selector returns this value there rather than `max_flush_delay_idle`,
+    /// and `target_bytes` rarely wins the race against it. With
+    /// `adaptive_flush_delay` on, this is the FLOOR of a per-tenant corridor
+    /// rather than the threshold itself; the description above holds for the
+    /// default, which is off. Raising it lowers acknowledged-path record
+    /// cadence at the cost of acknowledged write latency, since a strict
+    /// acknowledgement waits for its own flush to land. The added latency is
+    /// bounded by the increase rather than equal to it: ages are checked on
+    /// the `flush_tick` interval, and a buffer that reaches `target_bytes`
+    /// first flushes without waiting for the age trigger at all. Not a knob
+    /// to retune without owning that latency trade.
     pub max_flush_delay: Duration,
     /// Interval on which each shard actor checks buffered ages against
     /// `max_flush_delay`.

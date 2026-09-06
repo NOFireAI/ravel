@@ -124,13 +124,22 @@ the unfolded listing path before the fold above can seal its hour away
 On an acknowledged (strict) write, cadence is set by `--max-flush-delay`
 (2s default), not by `target_bytes`: a strict write keeps a waiter on its
 buffer for the whole flush window, so the size trigger almost never wins
-the race against the age clock at realistic write rates. Turning
-`target_bytes` down does not reduce an acknowledged tenant's commit-record
-rate. Raising `--max-flush-delay` is the knob that does, and it does so by
-directly raising acknowledged write latency: a strict acknowledgement
-waits for its own flush to land, so every added millisecond of
-`max_flush_delay` is a millisecond added to every strict write for that
-tenant.
+the race against the age clock at realistic write rates. It is not disabled
+there, though, so a tenant sustaining more than roughly `target_bytes /
+max_flush_delay` per shard (about 4 MiB/s at the defaults) does flush on
+size; below that, turning `target_bytes` down does not reduce an
+acknowledged tenant's commit-record rate. Raising `--max-flush-delay` is the
+knob that does, at the cost of acknowledged write latency, since a strict
+acknowledgement waits for its own flush to land. Budget that cost as bounded
+by the increase rather than equal to it: ages are checked on the
+`flush_tick` interval rather than continuously.
+
+Two configurations change this picture. With `--adaptive-flush-delay` on
+(off by default), `--max-flush-delay` becomes the floor of a per-tenant
+corridor rather than the threshold itself, so raising the floor moves only
+the bottom of a range the shard picks from. And a tenant fast enough to hit
+the size trigger is byte-driven even on the strict path, which puts it in
+the regime described next rather than this one.
 
 A buffered write (no waiter) is different, and this is where the
 byte-driven/timer-driven split applies: a buffered-mode tenant is
