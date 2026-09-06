@@ -174,7 +174,12 @@ fn redacted_storage_message(err: &QueryError) -> Option<&'static str> {
                 source: StoreError::Corrupted(_),
                 ..
             } => MSG_CORRUPT,
-            FetchError::Store { .. } | FetchError::EtagChanged { .. } => MSG_UNAVAILABLE,
+            // A memory-budget refusal is transient backpressure carrying only
+            // byte counts, not a storage fault; redacted to the retryable
+            // transient message alongside the other non-corrupt Store causes.
+            FetchError::Store { .. }
+            | FetchError::EtagChanged { .. }
+            | FetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE,
         }),
         // An over-wide-window refusal carries only counts and is
         // safe to show; like the budget errors it is not a storage fault, so

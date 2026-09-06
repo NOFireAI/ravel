@@ -628,6 +628,49 @@ conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
 below any real compacted sparse L1 segment) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
 
+## Fetch-layer memory reservations
+
+The fetch layer reserves the bytes a GET will materialize on a shared
+`MemoryBudget` (crate `ravel-memory`) before it issues the GET, and owns that
+reservation for as long as the fetched buffer lives. `QueryEngine` holds one
+`Arc<MemoryBudget>` and hands it to every fetcher, exactly as it shares one
+`GetLimiter`; the default is `MemoryBudget::unlimited()`, so the accounting is
+inert until a server task installs a finite budget with
+`QueryEngine::with_memory_budget`.
+
+Reservation sites, each taken **before** its GET, with the guard's lifetime
+tied to the buffer it accounts for:
+
+- **RSEG range fetch** (`SegmentFetcher::ensure_ranges`): the sum of the
+  coalesced run lengths, reserved once ahead of the concurrent GETs. The guard
+  is held by the `FetchedRegions` the runs fill, so it releases when those
+  region bytes drop.
+- **RLOG block-range fetch** (`BlockRangeFetcher`): the object size at the
+  `ObjectAssembler` that reassembles a covering read (the guard travels with
+  the assembled `Bytes`), and the summed range lengths ahead of the concurrent
+  GETs in `fetch_blocks` and `fetch_chunk_ranges`.
+- **RLOG / RSPAN whole-object fetch** (`whole_object_bytes`, and the RSPAN
+  `fetch`): the object size, with the guard attached to the returned `Bytes`.
+
+The guard is never released because a GET completed; it releases only when the
+buffer it accounts for drops.
+
+**Handoff.** When a fetched buffer is admitted to the read cache -- a consumer
+with its own byte ledger -- the reservation is marked handed off
+(`Reservation::mark_handed_off`) rather than released, so the transient overlap
+(both ledgers holding the same bytes) stays visible until this guard drops.
+Buffers returned across the crate boundary to a consumer that reserves under its
+own ledger (the SQL scan's `try_grow`) instead carry their guard inside the
+returned `Bytes`; that guard releases when the consumer drops the bytes, so the
+fetch reservation and the consumer's reservation coexist for the buffer's life
+with no double-free.
+
+**Refusal.** When the budget cannot cover a reservation the fetch fails with a
+typed `FetchMemoryExhausted { requested, reserved, limit }` (on each fetcher's
+error enum), mapped onto the query error path. The refusal carries only byte
+counts -- never an object key or tenant identity -- and is never a smaller fetch
+or a partial result: zero GETs are issued and the budget is left unchanged.
+
 ## Endpoints (Prometheus compatibility subset)
 
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.
