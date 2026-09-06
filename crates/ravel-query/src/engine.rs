@@ -1258,7 +1258,12 @@ impl QueryEngine {
         //   data-independent pair of chains does not satisfy.
         // `unfolded_segments_resolved` IS additive (an exact total count
         // across both lanes' resolves, with no ambiguity about how the two
-        // lanes' costs compose).
+        // lanes' costs compose), and `unfolded_records_served_from_cache`
+        // follows the same rule for the same reason: it is an exact count of
+        // commit records served from cache during each lane's own resolve,
+        // and the two lanes' resolves are distinct resolves against
+        // (possibly) distinct commit records, so the query's total is the
+        // sum, not a max.
         //
         // The log lane's `whole_object_threshold` is not reachable from
         // here (`BlockRangeFetcher::effective_whole_object_threshold` is
@@ -1292,10 +1297,8 @@ impl QueryEngine {
             .io_shape
             .service_batches
             .saturating_add(log_counts.service_batches);
-        let log_list_requests = log_accounting
-            .resolve()
-            .snapshot()
-            .s3_requests(AccountedOp::List);
+        let log_resolve_snapshot = log_accounting.resolve().snapshot();
+        let log_list_requests = log_resolve_snapshot.s3_requests(AccountedOp::List);
         log_counts.record_list_pages(log_list_requests.min(u64::from(u32::MAX)) as u32);
         log_counts.list_page_depth = stats
             .io_shape
@@ -1318,6 +1321,8 @@ impl QueryEngine {
         let log_plan_class = PlanClass::Unclassified;
         stats.io_shape = log_counts.into_shape(
             stats.io_shape.unfolded_segments_resolved + log_unfolded,
+            stats.io_shape.unfolded_records_served_from_cache
+                + log_resolve_snapshot.commit_record_cache_hits,
             crate::io_shape::merge_plan_class(stats.io_shape.plan_class, log_plan_class),
         );
 
@@ -2508,10 +2513,8 @@ fn io_shape_for_resolve(
         concurrency,
         shared_get_permits,
     ));
-    let resolve_list_requests = accounting
-        .resolve()
-        .snapshot()
-        .s3_requests(AccountedOp::List);
+    let resolve_snapshot = accounting.resolve().snapshot();
+    let resolve_list_requests = resolve_snapshot.s3_requests(AccountedOp::List);
     counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
     let plan_class = if metadata_only {
         PlanClass::MetadataOnly
@@ -2520,7 +2523,11 @@ fn io_shape_for_resolve(
     } else {
         PlanClass::ExhaustiveScan
     };
-    counts.into_shape(unfolded_segments_resolved, plan_class)
+    counts.into_shape(
+        unfolded_segments_resolved,
+        resolve_snapshot.commit_record_cache_hits,
+        plan_class,
+    )
 }
 
 /// A locally-scoped series identity for a log-derived series returned from
@@ -7618,6 +7625,181 @@ mod prefetch_tests {
              1 batch, summing to 2 -- not the 1 a single peak-capacity \
              division (ceil(3 / min(4, 1000)) == ceil(3 / 4) == 1) would \
              report"
+        );
+    }
+
+    /// Issue #1219: `QueryIoShape::unfolded_records_served_from_cache` must be
+    /// the EXACT count of commit records a resolve served from the catalog's
+    /// local decoded-record cache, read straight from accounting -- never a
+    /// `> 0` check, which the deleted `(cache_hits - (cache_misses - 1)) / 2`
+    /// pooled-counter inference also passed while reading one too high
+    /// whenever a snapshot HEAD exists. Same `QueryEngine` (so the same
+    /// `Catalog` and its decoded-record cache persist across both calls),
+    /// same window, `record_count` commit records both times: the first
+    /// resolve is cold, so its own delta is 0; the second serves every one of
+    /// the `record_count` commit records from cache, so its delta is exactly
+    /// `record_count`.
+    ///
+    /// FLIP: change `record_count` from 3 to 4 (one more `publish_metric`
+    /// call) to watch the second assertion read 4, not 3 -- the figure
+    /// tracks the exact number of commit records the window holds, not a
+    /// fixed constant.
+    #[tokio::test]
+    async fn unfolded_records_served_from_cache_reports_exact_commit_record_serves() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let record_count = 3u64;
+        for seq in 1..=record_count {
+            let ts = BASE_NS - (record_count as i64 + 1 - seq as i64) * NS_PER_MIN;
+            publish_metric(
+                &store,
+                tenant_hash,
+                seq,
+                "cache_serve_metric",
+                ts,
+                seq as f64,
+            )
+            .await;
+        }
+
+        let eng = engine(store);
+        let plans = vec![window_plan("cache_serve_metric")];
+        let eval_window = EvalWindow::Instant { t_ns: BASE_NS };
+
+        let (_source, cold_stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("cold prefetch");
+        assert_eq!(
+            cold_stats.io_shape.unfolded_records_served_from_cache, 0,
+            "a cold resolve fetches every commit record it touches, so none is \
+             served from cache"
+        );
+
+        let (_source, warm_stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], BASE_NS)
+            .await
+            .expect("warm prefetch");
+        assert_eq!(
+            warm_stats.io_shape.unfolded_records_served_from_cache, record_count,
+            "the second resolve over the same window serves every commit \
+             record the first one warmed"
+        );
+    }
+
+    /// Issue #1219, the case the deleted pooled-counter inference got wrong
+    /// by one: a tenant WITH a folded snapshot HEAD must not have its decoded
+    /// snapshot-HEAD probe inflate `unfolded_records_served_from_cache`. One
+    /// sealed hour folds into a snapshot; `record_count` commit records are
+    /// published above the watermark in later hours, the only commit records
+    /// a resolve of this window ever lists. A first resolve (cold) warms them
+    /// and admits the HEAD to the head cache, its own delta 0; a second
+    /// resolve at the same `now_ns` (so the HEAD probe is itself a cache hit)
+    /// serves all `record_count` recent records from the decoded-record
+    /// cache. The figure must read exactly `record_count`, not
+    /// `record_count + 1` with the HEAD probe folded in.
+    ///
+    /// FLIP: add a `record_commit_record_cache_hit()` call to the head-cache
+    /// hit branch of `ravel-catalog`'s `read_head` (`snapshot_resolve.rs`,
+    /// mirroring the same regression the sibling `ravel-catalog` test
+    /// `commit_record_cache_serves_are_counted_exactly_with_a_folded_snapshot_head`
+    /// pins directly) to watch the assertion below fail: it would then read
+    /// `record_count + 1`.
+    #[tokio::test]
+    async fn unfolded_records_served_from_cache_excludes_the_folded_head_probe() {
+        const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let fold_margin = ravel_catalog::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+        // One sealed hour, folded into a snapshot (HEAD + one part).
+        let sealed_hour = 500_000u32;
+        let sealed_created = (i64::from(sealed_hour) + 1) * NS_PER_HOUR - 1_000;
+        publish_metric_segment(
+            &store,
+            tenant_hash,
+            1,
+            "folded_cache_metric",
+            vec![Sample {
+                ts_ns: sealed_created - 1_000,
+                value: 1.0,
+            }],
+            sealed_hour,
+            sealed_created,
+        )
+        .await;
+        let fold_now = (i64::from(sealed_hour) + 1) * NS_PER_HOUR + fold_margin;
+        let fold_backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<_>;
+        let fold_catalog =
+            Catalog::new(Arc::clone(&fold_backend), CatalogConfig::default()).expect("catalog");
+        fold_catalog
+            .fold(
+                &tenant_hash,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                fold_now,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold produces a snapshot HEAD");
+
+        // `record_count` commit records above the watermark, published in
+        // later hours: the only listed commit records a resolve of this
+        // window ever touches.
+        let record_count = 2u32;
+        for i in 0..record_count {
+            let hour = sealed_hour + 10 + i;
+            let created = i64::from(hour) * NS_PER_HOUR + 60 * NS_PER_SEC;
+            publish_metric_segment(
+                &store,
+                tenant_hash,
+                2 + u64::from(i),
+                "folded_cache_metric",
+                vec![Sample {
+                    ts_ns: created - 1_000,
+                    value: 1.0,
+                }],
+                hour,
+                created,
+            )
+            .await;
+        }
+        let now_ns = i64::from(sealed_hour + 10 + record_count) * NS_PER_HOUR + fold_margin;
+
+        // A fresh engine/catalog so both the head cache and the record cache
+        // start empty; the same instance across both prefetches so they
+        // persist.
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<_>;
+        let catalog =
+            Catalog::new(Arc::clone(&backend), CatalogConfig::default()).expect("catalog");
+        let eng = QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default());
+        let plans = vec![SelectorPlan {
+            range_ns: NS_PER_HOUR * i64::from(record_count + 11),
+            ..window_plan("folded_cache_metric")
+        }];
+        let eval_window = EvalWindow::Instant { t_ns: now_ns };
+
+        let (_source, cold_stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], now_ns)
+            .await
+            .expect("cold prefetch over folded tenant");
+        assert_eq!(
+            cold_stats.io_shape.unfolded_records_served_from_cache, 0,
+            "a cold resolve serves no commit record from cache"
+        );
+
+        let (_source, warm_stats) = eng
+            .prefetch(tenant_hash, &plans, &eval_window, &[], now_ns)
+            .await
+            .expect("warm prefetch over folded tenant");
+        assert_eq!(
+            warm_stats.io_shape.unfolded_records_served_from_cache,
+            u64::from(record_count),
+            "the two recent commit records are counted; the folded HEAD cache \
+             hit must not inflate the figure"
         );
     }
 

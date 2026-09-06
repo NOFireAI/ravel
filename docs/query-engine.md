@@ -1869,6 +1869,20 @@ leftover request, so the model is one round too many. The same sliding
   read-your-write token match always costs its own GET by explicit key,
   whether or not a fold has run, so folding can never remove that cost and
   counting it here would overstate the fold benefit.
+- `unfoldedRecordsServedFromCache`: the EXACT count of COMMIT RECORDS this
+  query's resolve served from the catalog's local decoded commit-record
+  cache, read straight from accounting
+  (`QueryAccountingSnapshot::commit_record_cache_hits`) rather than inferred
+  from any pooled cache counter. A RECORD count, not a segment count, and the
+  two differ for the same reason `unfoldedSegmentsResolved` above is a
+  segment count: the listing window is padded by `max_ingest_lag_ns` and
+  runs to the current hour regardless of the query's end, so a resolve
+  prewarms commit-record buckets its range never touches and
+  `include_l0_if_overlaps` drops those records afterwards -- on a live
+  tenant a narrow range counts records from hours that contribute no segment
+  at all. The figure exists to be the numerator of a cold-resolve fraction
+  (records served from cache over records the resolve touched), not a
+  segment total.
 - `planClass`: `metadata_only` (a labels/label-values/series discovery query
   that never reaches a page fetch), `selective_indexed` (the resolve's
   postings-based pruning excluded at least one snapshot-sourced segment),
@@ -1918,7 +1932,12 @@ fetch chain has no DATA dependency on the metrics lane's bytes, so the two
 chains are independent chains that happen to run one after the other, and
 the reported figure is the longest independent chain, not their sum.
 `unfoldedSegmentsResolved` sums across lanes (an exact total count, with no
-ambiguity about how the two lanes' costs compose), and `planClass` takes
+ambiguity about how the two lanes' costs compose).
+`unfoldedRecordsServedFromCache` follows the same rule for the same reason:
+it is an exact count of commit records served from cache during each lane's
+own resolve, and the two lanes' resolves are distinct resolves against
+(possibly) distinct commit records, so the query's total is the sum, not a
+max. `planClass` takes
 the more severe of the two (`exhaustive_scan` outranks `selective_indexed`
 outranks `unclassified` outranks `metadata_only`), so a lane that never ran
 cannot understate a lane that did, and the log lane's `unclassified` result
