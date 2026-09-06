@@ -1026,6 +1026,9 @@ fn map_fetch_error(err: FetchError) -> (pb::status::Code, String) {
         FetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         FetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         FetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        // Budget refusal is transient backpressure: retrying under less memory
+        // pressure can succeed. The message carries only byte counts.
+        FetchError::FetchMemoryExhausted { .. } => (pb::status::Code::Unavailable, err.to_string()),
     }
 }
 
@@ -1042,6 +1045,9 @@ fn map_log_fetch_error(err: LogFetchError) -> (pb::status::Code, String) {
         LogFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         LogFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         LogFetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        LogFetchError::FetchMemoryExhausted { .. } => {
+            (pb::status::Code::Unavailable, err.to_string())
+        }
     }
 }
 
@@ -1060,5 +1066,8 @@ fn map_span_fetch_error(err: SpanFetchError) -> (pb::status::Code, String) {
         SpanFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         SpanFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         SpanFetchError::TenantMismatch { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        SpanFetchError::FetchMemoryExhausted { .. } => {
+            (pb::status::Code::Unavailable, err.to_string())
+        }
     }
 }

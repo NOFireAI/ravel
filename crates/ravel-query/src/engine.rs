@@ -344,6 +344,14 @@ pub struct QueryEngine {
     /// later wants a second engine (or a directly-constructed fetcher) to
     /// also draw permits from.
     get_limiter: Arc<GetLimiter>,
+    /// The one process-shareable fetch memory budget (ADR-1170 decision 2)
+    /// this engine's `fetcher` and `log_fetcher` were built to share. Kept, like
+    /// [`get_limiter`](Self::get_limiter), so [`Self::with_memory_budget`] can
+    /// hand out the SAME `Arc` a caller later wants a second engine (or a
+    /// server task installing a finite budget) to also reserve against. The
+    /// default from [`Self::new`] is [`ravel_memory::MemoryBudget::unlimited`],
+    /// so nothing is refused until a caller installs a finite budget.
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
     config: EngineConfig,
     /// ADR-0071 distributed read fan-out. `None` is the default:
     /// the engine runs the local fetch path untouched. `Some` opts this engine
@@ -390,9 +398,16 @@ impl QueryEngine {
         let get_limiter = Arc::new(GetLimiter::new_unchecked(
             config.store_get_concurrency().max(1),
         ));
+        // One process-owned fetch memory budget shared by every fetcher this
+        // engine owns (ADR-1170 decision 2), wired exactly like `get_limiter`.
+        // The default is unlimited: no reservation is ever refused until a
+        // caller installs a finite budget via `with_memory_budget`, so an
+        // engine built with plain `new` behaves as it did before this budget.
+        let memory_budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
         let log_fetcher = LogSegmentFetcher::new(store.clone())
             .with_block_range_threshold(config.logs_block_range_threshold)
             .with_get_limiter(get_limiter.clone())
+            .with_memory_budget(memory_budget.clone())
             .with_request_cost_bytes(config.logs_request_cost_bytes)
             .with_max_fetch_run_bytes(fetch_run_bytes)
             .unwrap_or_else(|err| {
@@ -404,13 +419,17 @@ impl QueryEngine {
                 LogSegmentFetcher::new(store.clone())
                     .with_block_range_threshold(config.logs_block_range_threshold)
                     .with_get_limiter(get_limiter.clone())
+                    .with_memory_budget(memory_budget.clone())
                     .with_request_cost_bytes(config.logs_request_cost_bytes)
             });
         QueryEngine {
             catalog,
-            fetcher: SegmentFetcher::new(store).with_get_limiter(get_limiter.clone()),
+            fetcher: SegmentFetcher::new(store)
+                .with_get_limiter(get_limiter.clone())
+                .with_memory_budget(memory_budget.clone()),
             log_fetcher,
             get_limiter,
+            memory_budget,
             config,
             distributed: None,
             federation: None,
@@ -472,6 +491,22 @@ impl QueryEngine {
         self
     }
 
+    /// Replaces the fetch memory budget on every fetcher this engine owns
+    /// (`fetcher` and `log_fetcher`) with `budget`, so a process can share one
+    /// [`ravel_memory::MemoryBudget`] -- and so one process-wide fetch memory
+    /// ceiling -- across several `QueryEngine`s (ADR-1170 decision 2).
+    /// `QueryEngine::new` already builds one unlimited budget and wires both
+    /// fetchers to it; this is the seam a server task uses to replace that
+    /// default with a finite, shared budget after construction, mirroring
+    /// [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.fetcher = self.fetcher.with_memory_budget(budget.clone());
+        self.log_fetcher = self.log_fetcher.with_memory_budget(budget.clone());
+        self.memory_budget = budget;
+        self
+    }
+
     pub fn config(&self) -> &EngineConfig {
         &self.config
     }
@@ -483,6 +518,14 @@ impl QueryEngine {
     #[cfg(test)]
     fn get_limiter_for_test(&self) -> &Arc<GetLimiter> {
         &self.get_limiter
+    }
+
+    /// The [`ravel_memory::MemoryBudget`] this engine's `fetcher` and
+    /// `log_fetcher` currently share. Test-only, same rationale as
+    /// [`Self::get_limiter_for_test`].
+    #[cfg(test)]
+    fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
     }
 
     /// Evaluates `query` as an instant query, returning its value paired with
@@ -1955,6 +1998,15 @@ impl QueryEngine {
                     source: StoreError::Corrupted(source.to_string()),
                 })
             }
+            log_series::LogSeriesError::Fetch(LogFetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }) => QueryError::Fetch(FetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit,
+            }),
             log_series::LogSeriesError::Decode(source) => QueryError::Fetch(FetchError::Store {
                 key: String::new(),
                 source: StoreError::Corrupted(source.to_string()),
@@ -8328,6 +8380,57 @@ mod get_limiter_tests {
         ));
         assert!(!Arc::ptr_eq(
             engine.fetcher.get_limiter_for_test(),
+            &original
+        ));
+    }
+
+    /// Deliverable 1: `QueryEngine::new` wires the SAME `MemoryBudget` `Arc` to
+    /// every fetcher it owns, exactly as it does the `GetLimiter`. One shared
+    /// budget is what makes the process-wide fetch-byte ceiling real: two
+    /// independent budgets would each admit up to the limit, doubling peak
+    /// resident fetch bytes.
+    #[test]
+    fn new_wires_one_shared_memory_budget_to_both_owned_fetchers() {
+        let engine = engine(Arc::new(MemoryStore::new()));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            engine.log_fetcher.memory_budget_for_test()
+        ));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            engine.log_fetcher.block_range_memory_budget_for_test()
+        ));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            engine.memory_budget_for_test()
+        ));
+    }
+
+    /// Deliverable 1: `with_memory_budget` replaces the budget on every fetcher
+    /// the engine owns (RSEG `fetcher`, RLOG whole-object, RLOG block-range) and
+    /// records the new `Arc` as the engine's own, mirroring `with_get_limiter`.
+    #[test]
+    fn with_memory_budget_replaces_every_owned_fetcher() {
+        let engine = engine(Arc::new(MemoryStore::new()));
+        let original = engine.memory_budget_for_test().clone();
+        let replacement = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        let engine = engine.with_memory_budget(replacement.clone());
+
+        assert!(Arc::ptr_eq(engine.memory_budget_for_test(), &replacement));
+        assert!(Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            engine.log_fetcher.memory_budget_for_test(),
+            &replacement
+        ));
+        assert!(Arc::ptr_eq(
+            engine.log_fetcher.block_range_memory_budget_for_test(),
+            &replacement
+        ));
+        assert!(!Arc::ptr_eq(
+            engine.fetcher.memory_budget_for_test(),
             &original
         ));
     }

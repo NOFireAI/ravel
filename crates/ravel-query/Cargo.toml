@@ -33,6 +33,12 @@ ravel-promql = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-cache = { workspace = true }
+# Process-wide byte accountant (ADR-1170 decision 2). The fetch layer reserves
+# the bytes a GET will materialize before issuing it, owns the reservation for
+# the buffer's lifetime, and refuses with a typed error when the shared budget
+# is exhausted. `MemoryBudget::unlimited()` is the default, so the edge is
+# inert until a server task installs a finite budget.
+ravel-memory = { workspace = true }
 # The evidential query-audit sink (QueryAuditSink/AuditEvent) the PromQL HTTP
 # handlers submit through and await durability on (ADR-0062 §2a).
 # ravel-maintain does not depend on ravel-query, so this edge is
