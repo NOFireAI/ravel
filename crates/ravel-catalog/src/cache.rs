@@ -143,13 +143,6 @@ impl RecordCache {
     /// count, separately from the pooled hit/miss accounting [`Self::get`]
     /// performs on every touch; peeking here rather than counting a second
     /// [`Self::get`] is what keeps the pooled counters untouched.
-    pub(crate) fn contains(&self, tenant: &TenantHash, key: &str) -> bool {
-        self.tenants
-            .lock()
-            .get(tenant)
-            .is_some_and(|c| c.entries.contains_key(key))
-    }
-
     pub(crate) fn insert(
         &self,
         tenant: TenantHash,

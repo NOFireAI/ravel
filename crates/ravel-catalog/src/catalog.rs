@@ -2753,23 +2753,23 @@ impl Catalog {
         let loads: Vec<Result<(), CatalogError>> = stream::iter(keys.iter().cloned())
             .map(|key| async move {
                 // The single per-resolve site that decides "served from cache"
-                // for a commit record (ADR-0044, issue #1251). Prewarm is the
-                // first of the two touches every commit-record key gets in a
-                // resolve (this concurrent warming pass, then a sequential
-                // include), so a record already resident when prewarm reaches it
-                // was resident when the resolve began and is a cache serve;
-                // counting it here, not at the include touch, credits each
-                // record exactly once and never credits one this resolve fetched
-                // itself (a prewarm miss then an include hit off its own insert).
-                // `contains` peeks without recording a pooled hit/miss, so the
-                // pooled counters `load_and_validate`'s own `cache.get` keeps are
-                // untouched.
-                if self.cache.contains(tenant, &key) {
+                // for a commit record. Prewarm is the first of the two touches
+                // every commit-record key gets in a resolve (this concurrent
+                // warming pass, then a sequential include), so a record already
+                // resident when prewarm reaches it was resident when the resolve
+                // began and is a cache serve; counting it here, not at the
+                // include touch, credits each record exactly once and never
+                // credits one this resolve fetched itself (a prewarm miss then
+                // an include hit off its own insert). The load reports the
+                // outcome of the lookup it actually performed, so nothing can
+                // fall between deciding and serving.
+                let (_, served_from_cache) = self
+                    .load_and_validate_reporting_cache(tenant, signal, shard, &key, accounting)
+                    .await?;
+                if served_from_cache {
                     accounting.record_commit_record_cache_hit();
                 }
-                self.load_and_validate(tenant, signal, shard, &key, accounting)
-                    .await
-                    .map(|_| ())
+                Ok(())
             })
             .buffer_unordered(self.config.resolve_get_concurrency)
             .collect()
@@ -3235,15 +3235,29 @@ impl Catalog {
         key: &str,
         accounting: &QueryAccounting,
     ) -> Result<Arc<CommitRecord>, CatalogError> {
-        // This lookup must stay the first statement, with no await ahead of it.
-        // `prewarm_commit_records` counts a cache serve by peeking `contains`
-        // and relying on this `get` running in the same poll, so anything that
-        // suspends in between (a single-flight, a semaphore acquire) lets the
-        // entry be evicted and turns counted serves into GETs, silently and
-        // with no test failing.
+        self.load_and_validate_reporting_cache(tenant, signal, shard, key, accounting)
+            .await
+            .map(|(record, _served_from_cache)| record)
+    }
+
+    /// [`Catalog::load_and_validate`], also reporting whether the record came
+    /// from the decoded-record cache rather than a GET.
+    ///
+    /// The flag is the same lookup that decides the outcome, not a separate
+    /// prediction of it, which is what makes it exact: a peek followed by a
+    /// load can be falsified in between by an eviction or an invalidation, and
+    /// would then count a serve for a record this call fetched.
+    pub(crate) async fn load_and_validate_reporting_cache(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        key: &str,
+        accounting: &QueryAccounting,
+    ) -> Result<(Arc<CommitRecord>, bool), CatalogError> {
         if let Some(cached) = self.cache.get(tenant, key, accounting) {
             validate_expected_fields(self, &cached, tenant, signal, shard, key)?;
-            return Ok(cached);
+            return Ok((cached, true));
         }
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
         let bytes = got.data.len() as u64;
@@ -3257,7 +3271,7 @@ impl Catalog {
             bytes,
             self.config.cache_capacity_per_tenant,
         );
-        Ok(record)
+        Ok((record, false))
     }
 }
 
@@ -4485,12 +4499,11 @@ mod tests {
             "exactly the two pre-warmed commit records are counted as cache serves"
         );
         // The counter's claim is that a counted record cost no GET, and the
-        // counter alone cannot show that: it is incremented from a `contains`
-        // peek, and stays 2 whether or not the following read actually hit. The
-        // GET count is the independent witness. Five records, two counted as
-        // serves, so exactly three record GETs. Insert anything that suspends
-        // between the peek and `load_and_validate`'s `cache.get` and an evicted
-        // entry turns a counted serve into a fourth GET here, which the
+        // counter cannot witness that on its own: it is derived from the same
+        // lookup whose result it reports, so it agrees with itself either way.
+        // The GET count is the independent witness. Five records, two counted
+        // as serves, so exactly three record GETs. Anything that lets a counted
+        // serve issue a GET after all shows up here as a fourth, which the
         // commit-record assertion above would not notice.
         assert_eq!(
             full_snap.s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
