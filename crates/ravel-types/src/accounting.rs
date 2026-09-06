@@ -109,6 +109,11 @@ struct Inner {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     cache_bytes: AtomicU64,
+    /// Commit records served from the catalog's local decoded commit-record
+    /// cache on the resolve path, counted once per record. See the snapshot
+    /// field of the same name for the full contract and the four caches it
+    /// excludes.
+    commit_record_cache_hits: AtomicU64,
     decompressed_bytes: AtomicU64,
     segments_opened: AtomicU64,
     segments_pruned: AtomicU64,
@@ -213,6 +218,32 @@ impl QueryAccounting {
     /// Add bytes served from an in-process cache.
     pub fn add_cache_bytes(&self, bytes: u64) {
         self.0.cache_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record one commit record whose decoded bytes were served from the
+    /// catalog's local decoded commit-record cache on the resolve path.
+    ///
+    /// Counted **once per commit record per resolve**, at the single site that
+    /// warms the cache before the include passes run (the prewarm pass). The
+    /// resolve path touches each commit-record key twice (a concurrent prewarm,
+    /// then a sequential include); crediting only the first, warming touch means
+    /// the double touch of one key counts once, and a record the resolve itself
+    /// fetched (not yet resident when prewarm reached it) counts zero, because
+    /// only a record already resident when the resolve began is a serve.
+    ///
+    /// This is a **commit-record-only** count, deliberately narrower than the
+    /// pooled [`record_cache_hit`](Self::record_cache_hit): unlike that counter,
+    /// which several resolve-path caches share, this is NOT incremented for the
+    /// decoded snapshot-HEAD probe, the part cache, the postings cache, or the
+    /// content-addressed byte cache. Compaction records use a separate cache on
+    /// a separate load path and are not counted here. It exists so the
+    /// cold-resolve "segments served from cache" figure is an exact count rather
+    /// than the inference `(cache_hits - (cache_misses - 1)) / 2` over the pooled
+    /// counters, which reads one too high whenever a snapshot HEAD exists.
+    pub fn record_commit_record_cache_hit(&self) {
+        self.0
+            .commit_record_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Add bytes produced by decompressing a fetched object.
@@ -347,6 +378,10 @@ impl QueryAccounting {
         saturating_fetch_add(&self.0.cache_hits, other.cache_hits);
         saturating_fetch_add(&self.0.cache_misses, other.cache_misses);
         saturating_fetch_add(&self.0.cache_bytes, other.cache_bytes);
+        saturating_fetch_add(
+            &self.0.commit_record_cache_hits,
+            other.commit_record_cache_hits,
+        );
         saturating_fetch_add(&self.0.decompressed_bytes, other.decompressed_bytes);
         saturating_fetch_add(&self.0.segments_opened, other.segments_opened);
         saturating_fetch_add(&self.0.segments_pruned, other.segments_pruned);
@@ -380,6 +415,7 @@ impl QueryAccounting {
             cache_hits: self.0.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.0.cache_misses.load(Ordering::Relaxed),
             cache_bytes: self.0.cache_bytes.load(Ordering::Relaxed),
+            commit_record_cache_hits: self.0.commit_record_cache_hits.load(Ordering::Relaxed),
             decompressed_bytes: self.0.decompressed_bytes.load(Ordering::Relaxed),
             segments_opened: self.0.segments_opened.load(Ordering::Relaxed),
             segments_pruned: self.0.segments_pruned.load(Ordering::Relaxed),
@@ -408,6 +444,24 @@ pub struct QueryAccountingSnapshot {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_bytes: u64,
+    /// Commit records whose decoded bytes were served from the catalog's local
+    /// decoded commit-record cache during this resolve, counted **once per
+    /// record** no matter how many times its key was touched: the resolve path
+    /// touches each commit-record key twice (a concurrent prewarm, then a
+    /// sequential include), and both together count once. A record the resolve
+    /// fetched itself does not count; only one already resident when the resolve
+    /// began is a serve. This makes the counter an exact count of the
+    /// cold-resolve "segments served from cache" figure, rather than the
+    /// inference `(cache_hits - (cache_misses - 1)) / 2` over the pooled
+    /// counters, which reads one too high whenever a snapshot HEAD exists.
+    ///
+    /// **Commit records only.** Unlike the pooled [`Self::cache_hits`], this is
+    /// NOT incremented for any of the other four caches on the resolve path: the
+    /// decoded snapshot-HEAD cache (the per-resolve HEAD probe), the part cache,
+    /// the postings cache, and the content-addressed byte cache. Compaction
+    /// records have their own cache and their own load path and are not counted
+    /// here.
+    pub commit_record_cache_hits: u64,
     pub decompressed_bytes: u64,
     pub segments_opened: u64,
     pub segments_pruned: u64,
@@ -543,6 +597,9 @@ impl QueryAccountingSnapshot {
             cache_hits: self.cache_hits.saturating_add(other.cache_hits),
             cache_misses: self.cache_misses.saturating_add(other.cache_misses),
             cache_bytes: self.cache_bytes.saturating_add(other.cache_bytes),
+            commit_record_cache_hits: self
+                .commit_record_cache_hits
+                .saturating_add(other.commit_record_cache_hits),
             decompressed_bytes: self
                 .decompressed_bytes
                 .saturating_add(other.decompressed_bytes),
