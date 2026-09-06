@@ -19,7 +19,7 @@
 //! did not forward `shrink` would leak tenant budget on every cancellation.
 
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -78,7 +78,13 @@ enum GrowRefused {
     /// moment of refusal.
     Tenant { used: usize },
     /// The process budget refused, after the tenant charge was rolled back.
-    Process(MemoryExhausted),
+    /// `tenant_held` is the tenant total read BEFORE that rollback, so the
+    /// message reports what this tenant held when it was refused rather than
+    /// what it holds after the refused reservation was returned.
+    Process {
+        exhausted: MemoryExhausted,
+        tenant_held: usize,
+    },
 }
 
 /// The totals both ledgers reached after an infallible
@@ -109,6 +115,17 @@ pub struct TenantMemoryAccountant {
     limit: usize,
     used: AtomicUsize,
     budget: Arc<MemoryBudget>,
+    /// Bytes THIS accountant currently holds on `budget`. The process counter
+    /// is shared, and `MemoryBudget::release` saturates rather than reporting
+    /// an over-release, so a shrink larger than this accountant's own charge
+    /// would hand another tenant's bytes back to the budget and make the
+    /// process figure under-report. Releasing `min(amount, outstanding)`
+    /// bounds the damage to this tenant's own ledger. A correct DataFusion
+    /// cannot over-shrink (its `MemoryReservation::shrink` panics on an
+    /// over-free before it reaches the pool), so this is containment, not a
+    /// live bug fix: a cross-tenant safety property should not rest on a
+    /// dependency's internal invariant.
+    process_outstanding: AtomicU64,
 }
 
 impl TenantMemoryAccountant {
@@ -130,6 +147,7 @@ impl TenantMemoryAccountant {
             limit,
             used: AtomicUsize::new(0),
             budget,
+            process_outstanding: AtomicU64::new(0),
         })
     }
 
@@ -164,9 +182,19 @@ impl TenantMemoryAccountant {
         self.tenant_try_grow(additional)
             .map_err(|used| GrowRefused::Tenant { used })?;
         if let Err(exhausted) = self.budget.try_reserve(additional as u64) {
+            // Read the tenant total BEFORE the rollback: the refusal message
+            // reports how much this tenant held when it was refused, and after
+            // the rollback that figure excludes the very reservation being
+            // refused (a single-query tenant would report zero).
+            let tenant_held = self.reserved();
             self.tenant_shrink(additional);
-            return Err(GrowRefused::Process(exhausted));
+            return Err(GrowRefused::Process {
+                exhausted,
+                tenant_held,
+            });
         }
+        self.process_outstanding
+            .fetch_add(additional as u64, Ordering::AcqRel);
         Ok(())
     }
 
@@ -203,14 +231,49 @@ impl TenantMemoryAccountant {
             .fetch_add(additional, Ordering::AcqRel)
             .saturating_add(additional);
         let process = self.budget.reserve_unchecked(additional as u64);
+        self.process_outstanding
+            .fetch_add(additional as u64, Ordering::AcqRel);
         GrowTotals { tenant, process }
     }
 
     /// Release `amount` bytes from the process budget and then the tenant
     /// counter, the reverse of the order [`Self::try_grow`] charges them in.
     fn shrink(&self, amount: usize) {
-        self.budget.release(amount as u64);
+        self.release_process_at_most(amount as u64);
         self.tenant_shrink(amount);
+    }
+
+    /// Release at most this accountant's own outstanding process charge, so an
+    /// oversized shrink cannot reach bytes another tenant reserved. CAS loop
+    /// because `process_outstanding` and the release must move by the same
+    /// amount even when two of this tenant's queries shrink concurrently.
+    fn release_process_at_most(&self, amount: u64) {
+        let mut cur = self.process_outstanding.load(Ordering::Acquire);
+        loop {
+            let release = amount.min(cur);
+            if release == 0 {
+                return;
+            }
+            match self.process_outstanding.compare_exchange_weak(
+                cur,
+                cur - release,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.budget.release(release);
+                    return;
+                }
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Bytes this accountant currently holds on the process budget. Equal to
+    /// [`Self::reserved`] in the absence of accounting drift; they are tracked
+    /// separately so an oversized shrink is contained to this tenant.
+    pub fn process_outstanding(&self) -> u64 {
+        self.process_outstanding.load(Ordering::Acquire)
     }
 
     /// The tenant half of [`Self::shrink`], saturating at zero so a
@@ -444,13 +507,16 @@ impl MemoryPool for TenantDelegatingPool {
                 // is shared, so this message is read by an operator looking at
                 // process-wide pressure, and the tenant figures are what say
                 // how much of it this tenant held.
-                GrowRefused::Process(exhausted) => format!(
+                GrowRefused::Process {
+                    exhausted,
+                    tenant_held,
+                } => format!(
                     "process memory budget exhausted: {additional} more bytes on top of {} \
                      already reserved exceeds process limit {} (tenant reserved {} of \
                      tenant limit {})",
                     exhausted.reserved,
                     exhausted.limit,
-                    self.tenant.reserved(),
+                    tenant_held,
                     self.tenant.limit()
                 ),
             };
@@ -642,7 +708,9 @@ mod tests {
         assert_eq!(
             message,
             "process memory budget exhausted: 50 more bytes on top of 60 already reserved \
-             exceeds process limit 100 (tenant reserved 0 of tenant limit 60)"
+             exceeds process limit 100 (tenant reserved 50 of tenant limit 60)",
+            "the tenant figure is read before the rollback, so it names what B held \
+             when it was refused, not what it holds after the refused charge came back"
         );
 
         assert_eq!(
@@ -661,6 +729,76 @@ mod tests {
             "a process refusal reserves nothing, so only A's bytes are held"
         );
         assert_eq!(tenant_a.reserved(), 60, "A's charge is untouched");
+    }
+
+    /// An oversized shrink releases only this accountant's own outstanding
+    /// process charge, so it cannot hand another tenant's bytes back to the
+    /// shared budget.
+    ///
+    /// FLIP: in `shrink`, call `self.budget.release(amount as u64)` directly
+    /// instead of `release_process_at_most`; the process counter then reads 0
+    /// and B's 40 bytes are gone from the budget while B still holds them.
+    #[test]
+    fn an_oversized_shrink_cannot_release_another_tenants_process_bytes() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        let tenant_a = TenantMemoryAccountant::with_process_budget(60, Arc::clone(&budget));
+        let tenant_b = TenantMemoryAccountant::with_process_budget(60, Arc::clone(&budget));
+
+        tenant_a.try_grow(40).expect("40 fits both ledgers");
+        tenant_b.try_grow(40).expect("40 fits both ledgers");
+        assert_eq!(budget.reserved(), 80);
+
+        // Larger than A's own charge: DataFusion cannot produce this, the
+        // containment exists so a future caller that does cannot corrupt the
+        // shared counter.
+        tenant_a.shrink(100);
+
+        assert_eq!(
+            budget.reserved(),
+            40,
+            "only A's own 40 bytes leave the process budget"
+        );
+        assert_eq!(
+            tenant_b.reserved(),
+            40,
+            "B's tenant counter is untouched by A's shrink"
+        );
+        assert_eq!(
+            tenant_a.process_outstanding(),
+            0,
+            "A now holds nothing on the process budget"
+        );
+    }
+
+    /// The tracked outstanding charge returns to zero across a matching
+    /// grow/shrink pair, and a shrink with nothing outstanding releases
+    /// nothing at all.
+    ///
+    /// FLIP: drop the `if release == 0 { return; }` guard in
+    /// `release_process_at_most` and the CAS spins on an unchanged value; drop
+    /// the `fetch_add` in `try_grow` and the pair leaves the budget at 40.
+    #[test]
+    fn a_matching_grow_and_shrink_leave_nothing_outstanding() {
+        let budget = Arc::new(MemoryBudget::new(100));
+        let tenant = TenantMemoryAccountant::with_process_budget(60, Arc::clone(&budget));
+
+        tenant.try_grow(40).expect("40 fits both ledgers");
+        assert_eq!(tenant.process_outstanding(), 40);
+        tenant.shrink(40);
+        assert_eq!(tenant.process_outstanding(), 0);
+        assert_eq!(budget.reserved(), 0);
+
+        // Nothing outstanding: the shrink is a no-op on both ledgers rather
+        // than a saturating release of someone else's bytes.
+        let other = TenantMemoryAccountant::with_process_budget(60, Arc::clone(&budget));
+        other.try_grow(25).expect("25 fits both ledgers");
+        tenant.shrink(25);
+        assert_eq!(
+            budget.reserved(),
+            25,
+            "a shrink with nothing outstanding releases nothing"
+        );
+        assert_eq!(other.process_outstanding(), 25);
     }
 
     /// Shrink order: process then tenant, the reverse of the way up. A's
