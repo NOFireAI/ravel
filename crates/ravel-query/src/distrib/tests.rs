@@ -5042,3 +5042,76 @@ fn duplicate_partial_series_id_is_a_hard_error() {
         );
     });
 }
+
+/// The coordinator reconstructs a worker's memory refusal from the frozen proto
+/// `Status` message alone: `parse_fetch_memory_exhausted` is the exact inverse
+/// of `FetchError::FetchMemoryExhausted`'s `Display`. This pins that coupling so
+/// a change to the `#[error(..)]` format that this parser no longer matches
+/// fails here rather than silently degrading the coordinator to a generic
+/// `Distrib`. Changing the format string without updating the parser makes the
+/// `assert_eq` on the round-tripped figures fail.
+#[test]
+fn fetch_memory_exhausted_message_round_trips() {
+    let original = crate::fetcher::FetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of {rendered:?}"
+    );
+    // A message that is not this error's Display parses to None, so the fold
+    // falls back to a generic Distrib rather than fabricating figures.
+    assert_eq!(
+        super::parse_fetch_memory_exhausted("slice tripped its budget: something else"),
+        None,
+        "an unrelated message must not parse as a memory refusal"
+    );
+}
+
+/// The coordinator's `BudgetExceeded` fold surfaces a fetch-layer memory refusal
+/// as the typed `Fetch(FetchMemoryExhausted)` -- the same error the local path
+/// raises -- when the folded bytes-scanned total is under the query's cap (so
+/// the trip is memory, not bytes). Replacing the `parse_fetch_memory_exhausted`
+/// branch in `budget_exceeded_error` with the `Distrib` fallback makes the
+/// `matches!` below fail. When the folded total is at or over the bytes cap, the
+/// same helper yields the bytes-scanned error instead, proving the
+/// disambiguation.
+#[test]
+fn budget_exceeded_fold_renders_memory_refusal_typed() {
+    let msg = crate::fetcher::FetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    }
+    .to_string();
+
+    // Folded bytes under the cap: the trip is a memory refusal, surfaced typed.
+    let err =
+        super::budget_exceeded_error(1_000, crate::config::ByteLimit::Bounded(1_000_000), &msg);
+    assert!(
+        matches!(
+            err,
+            crate::error::QueryError::Fetch(crate::fetcher::FetchError::FetchMemoryExhausted {
+                requested: 4_194_304,
+                reserved: 268_435_456,
+                limit: 268_500_000,
+            })
+        ),
+        "a memory refusal under the bytes cap must fold to a typed FetchMemoryExhausted, got {err:?}"
+    );
+
+    // Folded bytes at or over the cap: the bytes-scanned trip dominates.
+    let err = super::budget_exceeded_error(
+        2_000_000,
+        crate::config::ByteLimit::Bounded(1_000_000),
+        &msg,
+    );
+    assert!(
+        matches!(err, crate::error::QueryError::TooManyBytesScanned { .. }),
+        "a folded total over the bytes cap must fold to TooManyBytesScanned, got {err:?}"
+    );
+}
