@@ -2284,6 +2284,14 @@ impl LogSegmentFetcher {
                 // Served from cache: no S3 GET on this call.
                 fetch_span.record("s3_requests", 0u64);
                 fetch_span.record("s3_bytes", 0u64);
+                // The returned `Bytes` is a clone of the cache entry's, so the
+                // same allocation is under the cache's byte ledger AND this
+                // fetch guard for as long as the caller holds it. That is the
+                // two-ledger overlap decision 2's handoff rule describes, and
+                // it is no less real for arriving by a hit than by an insert:
+                // leaving it unmarked understates `handoff_overlap` by every
+                // cache hit, which is what makes the `unique` term inexact.
+                reservation.mark_handed_off();
             }
             // A miss issues one store GET for the resulting bytes. A
             // single-flight follower that rode another caller's GET is the
@@ -7406,6 +7414,76 @@ mod whole_object_get_limiter_tests {
             0,
             "the reservation releases with the buffer"
         );
+    }
+
+    /// The same overlap on a cache HIT, which is the case the first version of
+    /// this work left unmarked. The returned `Bytes` clones the cache entry's
+    /// allocation, so the cache cap and the fetch guard both cover it for as
+    /// long as the caller holds it, exactly as after an insert. Leaving a hit
+    /// unmarked understates `handoff_overlap` by every hit, and it is that
+    /// undercount which makes decision 3's `unique` term inexact and its
+    /// derived reserve undersized.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call on the
+    /// `Source::Cache` arm leaves `handoff_overlap()` at 0 on the second fetch
+    /// while its buffer is held, so the hit assertion fails while the insert
+    /// assertion above still passes.
+    #[tokio::test]
+    async fn cache_hit_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        // First fetch admits the object and is the insert case; drop it so the
+        // only overlap the second fetch can report is its own.
+        let first = fetcher
+            .whole_object_bytes(
+                &seg_ref(size),
+                TENANT,
+                QueryPhase::Plan,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("first whole_object_bytes");
+        drop(first);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the insert's overlap clears before the hit is measured"
+        );
+
+        let accounting = QueryAccounting::new();
+        let hit = fetcher
+            .whole_object_bytes(&seg_ref(size), TENANT, QueryPhase::Plan, &accounting)
+            .await
+            .expect("second whole_object_bytes");
+        assert_eq!(
+            accounting.snapshot().cache_hits,
+            1,
+            "the second fetch is served from the cache, not the store"
+        );
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "a cache hit holds the same bytes under the cache cap and this guard"
+        );
+        drop(hit);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(budget.reserved(), 0, "the reservation releases with it");
     }
 
     /// A block-range read that crosses over to a covering whole-object read
