@@ -450,10 +450,22 @@ pub struct QueryAccountingSnapshot {
     /// touches each commit-record key twice (a concurrent prewarm, then a
     /// sequential include), and both together count once. A record the resolve
     /// fetched itself does not count; only one already resident when the resolve
-    /// began is a serve. This makes the counter an exact count of the
-    /// cold-resolve "segments served from cache" figure, rather than the
-    /// inference `(cache_hits - (cache_misses - 1)) / 2` over the pooled
-    /// counters, which reads one too high whenever a snapshot HEAD exists.
+    /// began is a serve. It replaces the inference
+    /// `(cache_hits - (cache_misses - 1)) / 2` over the pooled counters, which
+    /// reads one too high whenever a snapshot HEAD exists.
+    ///
+    /// **This counts records prewarmed, not segments resolved, and the two
+    /// differ.** The listing window is padded by `max_ingest_lag_ns` and runs to
+    /// the current hour regardless of the query's end, so a resolve prewarms
+    /// buckets its range never touches and `include_l0_if_overlaps` drops those
+    /// records afterwards; supersession drops more. On a live tenant a narrow
+    /// range therefore counts records from hours that contribute no segment, and
+    /// the figure reads systematically above segments-served-from-cache. Two
+    /// serves are also outside it: a record read through `resolve_min_token`
+    /// after the listing pass, and, on a resolve that retried after
+    /// `SnapshotInvalidated`, records the abandoned attempt warmed (the retry
+    /// counts them as serves having fetched them cold). Band this as a record
+    /// count. Anything wanting segments needs its own figure.
     ///
     /// **Commit records only.** Unlike the pooled [`Self::cache_hits`], this is
     /// NOT incremented for any of the other four caches on the resolve path: the

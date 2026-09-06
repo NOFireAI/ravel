@@ -3235,6 +3235,12 @@ impl Catalog {
         key: &str,
         accounting: &QueryAccounting,
     ) -> Result<Arc<CommitRecord>, CatalogError> {
+        // This lookup must stay the first statement, with no await ahead of it.
+        // `prewarm_commit_records` counts a cache serve by peeking `contains`
+        // and relying on this `get` running in the same poll, so anything that
+        // suspends in between (a single-flight, a semaphore acquire) lets the
+        // entry be evicted and turns counted serves into GETs, silently and
+        // with no test failing.
         if let Some(cached) = self.cache.get(tenant, key, accounting) {
             validate_expected_fields(self, &cached, tenant, signal, shard, key)?;
             return Ok(cached);
@@ -4553,10 +4559,19 @@ mod tests {
             .await
             .expect("second resolve");
         let hit_snap = hit_acc.snapshot();
-        assert!(
-            hit_snap.cache_hits > hit_snap.commit_record_cache_hits,
-            "the HEAD probe and the part cache are pooled hits this resolve, so the pooled \
-             counter exceeds the commit-record-only counter"
+        // Exactly why the pooled counter cannot serve as a commit-record figure.
+        // Six pooled hits: four from the two commit records, which each cost TWO
+        // pooled hits (the prewarm's `load_and_validate` and the sequential
+        // include both call `cache.get`), plus the decoded snapshot-HEAD probe
+        // and the folded part read. A `>` against the commit-record counter
+        // would be cleared by the record cache's double touch alone and could
+        // not show this; the exact total fails if any term moves.
+        assert_eq!(
+            hit_snap.cache_hits, 6,
+            "pooled hits are 2 per commit record plus the HEAD probe and the part \
+             cache, none of which the commit-record counter counts; got {} against \
+             {} commit-record serves",
+            hit_snap.cache_hits, hit_snap.commit_record_cache_hits
         );
         assert_eq!(
             hit_snap.commit_record_cache_hits, 2,
