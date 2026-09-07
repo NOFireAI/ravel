@@ -3278,6 +3278,8 @@ mod tests {
     use ravel_commit::publish::RetryPolicy;
     use ravel_commit::record::NewCommitRecord;
     use ravel_commit::{keys, publish, record};
+    use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
+    use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
     use ravel_object_store::StoreError;
     use ravel_object_store::fault::{
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -3286,6 +3288,9 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
     use ravel_query::FetchError;
+    use ravel_rspan::{
+        ObjectIdentity as SpanObjectIdentity, RspanConfig, RspanWriter, SpanRecord, StatusCode,
+    };
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
     use uuid::Uuid;
@@ -4266,6 +4271,166 @@ mod tests {
         (store, tenant_hash, data_key)
     }
 
+    /// One published RSPAN segment holding `count` spans whose `start_ts` is
+    /// `0, 100, 200, ...`, under the same instrumented store the metrics
+    /// fixture uses. Published as a real `Signal::Spans` commit record, so the
+    /// executor resolves it exactly as a production caller would.
+    async fn one_spans_segment(
+        tenant_name: &str,
+        count: i64,
+    ) -> (Arc<InstrumentedStore<FaultStore<MemoryStore>>>, TenantHash) {
+        let tenant = TenantId::new(tenant_name.to_string());
+        let tenant_hash = tenant.hash();
+        let writer_id = Uuid::from_u128(1_376);
+        let records: Vec<SpanRecord> = (0..count)
+            .map(|i| SpanRecord {
+                trace_id: [1u8; 16],
+                span_id: [u8::try_from(i).unwrap_or(u8::MAX); 8],
+                parent_span_id: None,
+                name: "op".to_string(),
+                start_ts_ns: i * 100,
+                end_ts_ns: i * 100 + 10,
+                status_code: StatusCode::Ok,
+                status_message: None,
+                attrs: vec![("service.name".to_string(), "checkout".to_string())],
+            })
+            .collect();
+
+        let identity = SpanObjectIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: *writer_id.as_bytes(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer = RspanWriter::new(RspanConfig::default(), identity);
+        for record in &records {
+            writer.push(record.clone());
+        }
+        let bytes = writer.finish().expect("finish span object");
+
+        let min = records.iter().map(|r| r.start_ts_ns).min().expect("rows");
+        let max = records.iter().map(|r| r.end_ts_ns).max().expect("rows");
+        let store = publish_one_segment(
+            tenant_hash,
+            Signal::Spans,
+            writer_id,
+            bytes,
+            records.len() as u64,
+            min,
+            max,
+            1,
+        )
+        .await;
+        (store, tenant_hash)
+    }
+
+    /// One published RLOG segment on the audit stream holding `count` records
+    /// whose `ts_ns` is `0, 100, 200, ...`. The RLOG footer carries a tenant
+    /// hash the read path checks, so the identity below names the same tenant
+    /// the query resolves as.
+    async fn one_audit_segment(
+        tenant_name: &str,
+        count: i64,
+    ) -> (Arc<InstrumentedStore<FaultStore<MemoryStore>>>, TenantHash) {
+        let tenant = TenantId::new(tenant_name.to_string());
+        let tenant_hash = tenant.hash();
+        let writer_id = Uuid::from_u128(1_376);
+        let records: Vec<LogRecord> = (0..count)
+            .map(|i| LogRecord {
+                stream_id: ravel_types::logstream::log_stream_id(&[], "audit", "1", &[]),
+                stream_attrs: stream_attrs_bytes(&[], "audit", "1", &[]),
+                ts_ns: i * 100,
+                observed_ts_ns: i * 100,
+                severity_num: 0,
+                severity_text: "INFO".to_string(),
+                body: "query".to_string(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: Vec::new(),
+            })
+            .collect();
+
+        let identity = LogObjectIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: *writer_id.as_bytes(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+        for record in &records {
+            writer.push(record.clone()).expect("push audit record");
+        }
+        let bytes = writer.finish().expect("finish audit object");
+
+        let min = records.iter().map(|r| r.ts_ns).min().expect("rows");
+        let max = records.iter().map(|r| r.ts_ns).max().expect("rows");
+        let store = publish_one_segment(
+            tenant_hash,
+            Signal::Audit,
+            writer_id,
+            bytes,
+            records.len() as u64,
+            min,
+            max,
+            u32::from(ravel_logseg::footer::VERSION),
+        )
+        .await;
+        (store, tenant_hash)
+    }
+
+    /// Put one already-encoded data object and publish its commit record, then
+    /// wrap the store the way [`one_metrics_segment`] does.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_one_segment(
+        tenant_hash: TenantHash,
+        signal: Signal,
+        writer_id: Uuid,
+        bytes: Vec<u8>,
+        row_count: u64,
+        min_event_ts_ns: i64,
+        max_event_ts_ns: i64,
+        segment_format_version: u32,
+    ) -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
+        let new_record = NewCommitRecord {
+            tenant_hash,
+            signal,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: row_count,
+            series_count: 0,
+            min_event_ts_ns,
+            max_event_ts_ns,
+            min_ingest_ts_ns: min_event_ts_ns,
+            max_ingest_ts_ns: max_event_ts_ns,
+            segment_format_version,
+            created_unix_ns: 1,
+            ingest_hour_bucket: 0,
+        };
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+
+        let memory = MemoryStore::new();
+        memory
+            .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(&memory, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+
+        Arc::new(InstrumentedStore::new(FaultStore::new(
+            memory,
+            FaultPlan::empty(),
+        )))
+    }
+
     fn executor_over(store: Arc<InstrumentedStore<FaultStore<MemoryStore>>>) -> SqlExecutor {
         let catalog =
             Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
@@ -4281,9 +4446,16 @@ mod tests {
 
     /// The `ts` column of a metrics result, as raw nanoseconds.
     fn ts_values(output: &QueryOutput) -> Vec<i64> {
+        ts_column_values(output, "ts")
+    }
+
+    /// The named event-time column of a result, as raw nanoseconds. Every
+    /// table's event-time column is `Timestamp(Nanosecond, None)`, so the same
+    /// reader serves `ts`, `start_ts`, and `ts_ns`.
+    fn ts_column_values(output: &QueryOutput, name: &str) -> Vec<i64> {
         let mut values = Vec::new();
         for batch in output.batches() {
-            let column = batch.column_by_name("ts").expect("ts column");
+            let column = batch.column_by_name(name).expect("event-time column");
             let ts = column
                 .as_any()
                 .downcast_ref::<TimestampNanosecondArray>()
@@ -4293,7 +4465,9 @@ mod tests {
         values
     }
 
-    fn samples_request(sql: &str, window: TimeRange) -> SqlRequest {
+    /// A request carrying the T1 defaults off: the struct names no table, so
+    /// the statement is the only thing that selects one.
+    fn sql_request(sql: &str, window: TimeRange) -> SqlRequest {
         SqlRequest {
             sql: sql.to_string(),
             window,
@@ -4325,7 +4499,7 @@ mod tests {
             start_ns: 200,
             end_ns: 500,
         };
-        let base = samples_request("SELECT ts, value FROM samples", window);
+        let base = sql_request("SELECT ts, value FROM samples", window);
 
         let before = store.metrics().snapshot();
         let unfiltered = executor_over(store.clone())
@@ -4446,7 +4620,7 @@ mod tests {
                 tenant_hash,
                 &SqlRequest {
                     row_window: true,
-                    ..samples_request(
+                    ..sql_request(
                         "SELECT ts FROM samples WHERE value > (SELECT avg(value) FROM samples)",
                         window,
                     )
@@ -4472,7 +4646,7 @@ mod tests {
                 tenant_hash,
                 &SqlRequest {
                     row_window: true,
-                    ..samples_request(
+                    ..sql_request(
                         "SELECT ts FROM samples WHERE ts IN (SELECT ts FROM samples WHERE value >= 400)",
                         window,
                     )
@@ -4514,7 +4688,7 @@ mod tests {
 
         let request = SqlRequest {
             row_window: true,
-            ..samples_request(
+            ..sql_request(
                 "SELECT ts, value FROM samples",
                 TimeRange {
                     start_ns: 200,
@@ -4607,7 +4781,7 @@ mod tests {
             .hold(Op::Get, Some(".cmt".to_string()), Occurrence::Nth(1));
         let executor = executor_over(store);
 
-        let request = samples_request(
+        let request = sql_request(
             "SELECT ts, value FROM samples",
             TimeRange {
                 start_ns: 0,
@@ -4656,7 +4830,7 @@ mod tests {
             one_metrics_segment("max-rows-1376", 1_000, FaultPlan::empty()).await;
         let executor = executor_over(store);
 
-        let base = samples_request(
+        let base = sql_request(
             "SELECT ts, value FROM samples",
             TimeRange {
                 start_ns: 0,
@@ -4706,5 +4880,153 @@ mod tests {
             .expect("execute with no cap");
         assert_eq!(uncapped.output.num_rows(), 1_000);
         assert!(!uncapped.stats.row_cap_hit);
+
+        // The two boundaries, where an off-by-one lives. At `max_rows` exactly
+        // equal to the result size the stream drains and nothing was cut: the
+        // cap-plus-one'th row does not exist. One row lower, the extra row does
+        // exist, so the same `max_rows + 1` rows come back and the flag is set.
+        // The two cases return the SAME row count (1_000) and differ only in
+        // the flag, which is what makes the flag the only usable signal.
+        let exact = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    max_rows: Some(1_000),
+                    ..base.clone()
+                },
+            )
+            .await
+            .expect("execute under a cap equal to the result size");
+        assert_eq!(exact.output.num_rows(), 1_000);
+        assert!(
+            !exact.stats.row_cap_hit,
+            "a cap equal to the result size cuts nothing"
+        );
+
+        let one_short = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    max_rows: Some(999),
+                    ..base.clone()
+                },
+            )
+            .await
+            .expect("execute under a cap one row below the result size");
+        assert_eq!(
+            one_short.output.num_rows(),
+            1_000,
+            "max_rows + 1 rows, which here is the whole result"
+        );
+        assert!(
+            one_short.stats.row_cap_hit,
+            "the 1000th row is the cap-plus-one'th, so the result is reported cut"
+        );
+    }
+
+    /// Finding 6. The window column is per table, and only `samples` was
+    /// covered. `spans` filters on `start_ts` and `audit` on `ts_ns`, so a
+    /// wrong entry in [`window_ts_column`] for either would plan a predicate on
+    /// a column that is not in scope, or on the wrong one. Both fixtures
+    /// straddle the window, so widen-only pruning returns every row without
+    /// `row_window` and exactly the in-window rows with it.
+    #[tokio::test]
+    async fn row_window_applies_to_spans_start_ts_and_audit_ts_ns() {
+        let window = TimeRange {
+            start_ns: 200,
+            end_ns: 500,
+        };
+
+        let (spans_store, spans_tenant) = one_spans_segment("row-window-spans-1376", 10).await;
+        let spans_sql = "SELECT start_ts FROM spans";
+        let spans_base = sql_request(spans_sql, window);
+
+        let spans_unfiltered = executor_over(spans_store.clone())
+            .execute(spans_tenant, &spans_base)
+            .await
+            .expect("execute spans without the row window");
+        assert_eq!(
+            spans_unfiltered.output.num_rows(),
+            10,
+            "widen-only pruning returns the whole overlapping span segment"
+        );
+        assert_eq!(spans_unfiltered.stats.window_predicate, None);
+
+        let spans_filtered = executor_over(spans_store)
+            .execute(
+                spans_tenant,
+                &SqlRequest {
+                    row_window: true,
+                    ..spans_base
+                },
+            )
+            .await
+            .expect("execute spans with the row window");
+        assert_eq!(
+            spans_filtered.stats.window_predicate.as_deref(),
+            Some(
+                window_filter_expr(&TableReference::bare("spans"), "start_ts", window)
+                    .to_string()
+                    .as_str()
+            )
+        );
+        let mut spans_kept = ts_column_values(&spans_filtered.output, "start_ts");
+        spans_kept.sort_unstable();
+        assert_eq!(
+            spans_kept,
+            vec![200, 300, 400],
+            "exactly the spans starting inside [200, 500)"
+        );
+        assert_eq!(
+            spans_unfiltered.output.num_rows() - spans_filtered.output.num_rows(),
+            7,
+            "the seven spans starting outside the window are excluded"
+        );
+
+        let (audit_store, audit_tenant) = one_audit_segment("row-window-audit-1376", 10).await;
+        let audit_sql = "SELECT ts_ns FROM audit";
+        let audit_base = sql_request(audit_sql, window);
+
+        let audit_unfiltered = executor_over(audit_store.clone())
+            .execute(audit_tenant, &audit_base)
+            .await
+            .expect("execute audit without the row window");
+        assert_eq!(
+            audit_unfiltered.output.num_rows(),
+            10,
+            "widen-only pruning returns the whole overlapping audit segment"
+        );
+        assert_eq!(audit_unfiltered.stats.window_predicate, None);
+
+        let audit_filtered = executor_over(audit_store)
+            .execute(
+                audit_tenant,
+                &SqlRequest {
+                    row_window: true,
+                    ..audit_base
+                },
+            )
+            .await
+            .expect("execute audit with the row window");
+        assert_eq!(
+            audit_filtered.stats.window_predicate.as_deref(),
+            Some(
+                window_filter_expr(&TableReference::bare("audit"), "ts_ns", window)
+                    .to_string()
+                    .as_str()
+            )
+        );
+        let mut audit_kept = ts_column_values(&audit_filtered.output, "ts_ns");
+        audit_kept.sort_unstable();
+        assert_eq!(
+            audit_kept,
+            vec![200, 300, 400],
+            "exactly the audit records inside [200, 500)"
+        );
+        assert_eq!(
+            audit_unfiltered.output.num_rows() - audit_filtered.output.num_rows(),
+            7,
+            "the seven audit records outside the window are excluded"
+        );
     }
 }
