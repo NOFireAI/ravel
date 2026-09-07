@@ -327,6 +327,13 @@ refusal is permanent until the overlap itself is resolved and re-running reports
 the same count forever. `buckets_blocked` in the report counts the buckets in
 that state; when it is non-zero, re-running is not the remedy.
 
+The counter is narrowed to that case deliberately. The rewrite primitive also
+refuses a bucket when a concurrent compaction or erasure lands between the
+walk's listing and its own, which is harmless and converges on a later run.
+Because the refusal alone cannot tell the two apart, the walk re-reads the
+bucket after a refusal and counts it only when a below-target record is still
+served raw.
+
 The re-audit's liveness definition excludes a bucket's pre-rewrite L0 commit
 records once an authoritative compaction or rewrite record supersedes them.
 Those records are dead, sweepable leftovers of a rewrite this same invocation may have

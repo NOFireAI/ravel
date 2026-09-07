@@ -693,21 +693,41 @@ pub async fn migrate_family(
                         }
                         // The rewrite primitive serves one record set per
                         // bucket, so it refuses a bucket that already carries
-                        // compaction or rewrite records. Reached two ways, and
-                        // recorded rather than dropped either way: a concurrent
-                        // compaction or erasure landed between our listing and
-                        // the call (harmless, the other actor's result stands),
-                        // or the bucket holds overlapping compaction records
-                        // whose loser-only inputs are still served raw and
-                        // below the target. The second case cannot be migrated
-                        // by rewriting a subset -- a new record over those
-                        // inputs would join the same overlap component and lose
-                        // to the existing winner -- so the re-audit's straggler
-                        // refusal is the correct end state, and this counter is
-                        // what tells the operator which buckets it is waiting
-                        // on.
+                        // compaction or rewrite records. Two different things
+                        // reach this arm and only one of them is permanent:
+                        // a concurrent compaction or erasure landed between our
+                        // listing and the call, which is harmless and converges
+                        // on a later run; or the bucket holds overlapping
+                        // compaction records whose loser-only inputs are still
+                        // served raw and below the target, which no rewrite can
+                        // migrate, because a new record over those inputs joins
+                        // the same overlap component and loses to the existing
+                        // winner.
+                        //
+                        // The outcome alone cannot tell them apart: both are
+                        // returned on nothing more than the bucket carrying a
+                        // record at re-list time. So ask the question again
+                        // against current state rather than counting the
+                        // refusal. `buckets_blocked` claims the permanent case
+                        // on both the CLI and in the guide, and a counter that
+                        // also counted a raced-past bucket would send an
+                        // operator looking for an overlap that is not there.
                         MigrateOutcome::AlreadyCompacted | MigrateOutcome::RewritePresent => {
-                            report.buckets_blocked += 1;
+                            let fresh = list_bucket(store, &bucket).await?;
+                            let still_served =
+                                raw_served_commit_keys(store, &bucket, &fresh).await?;
+                            let still_below = load_inputs(
+                                store,
+                                &bucket,
+                                &still_served,
+                                config.input_read_concurrency,
+                            )
+                            .await?
+                            .iter()
+                            .any(|i| i.record.segment_format_version < target_version);
+                            if still_below {
+                                report.buckets_blocked += 1;
+                            }
                         }
                         // A concurrent tombstone or a bucket already at the
                         // target: nothing to migrate and nothing to report.
