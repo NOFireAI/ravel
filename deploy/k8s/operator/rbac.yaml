@@ -10,9 +10,16 @@
 #     the Gateway API exposure routes (ADR-0080 decision 2). Delete is what lets
 #     gateway.exposure be removed without leaving an orphan route attached to
 #     the Gateway.
+#   - PodDisruptionBudgets (policy): full lifecycle, for the per-tier PDBs the
+#     operator renders (issue #126, ADR-0034 hardening amendment). Delete is what
+#     converges maintain's PDB away when maintain.enabled goes back to false.
 #   - RavelCluster (and its status subresource): watch the spec, write status.
-#   - Secrets: get only. The operator reads the credentials and tenant-token
-#     Secrets to resolve tenant names; it never lists, writes, or watches them.
+#   - Secrets: get only, and granted by a NAMESPACED Role, not this ClusterRole
+#     (issue #126). The operator reads the credentials, tenant-token, and
+#     deployment-key Secrets to resolve tenant names; it never lists, writes, or
+#     watches them. The cluster-wide secrets rule is gone; the least-privilege
+#     Role/RoleBinding at the bottom of this file grants the read in ravel-system
+#     only. See that block for the per-namespace follow-up.
 #   - ServiceAccounts, Roles, and RoleBindings: the same lifecycle, for the
 #     ravel-native ingest router's own ServiceAccount and its namespaced,
 #     least-privilege Role/RoleBinding (ADR-0080 decision 3). The operator's own
@@ -72,9 +79,9 @@ rules:
   - apiGroups: ["ravel.nofire.ai"]
     resources: ["ravelclusters/status"]
     verbs: ["get", "update", "patch"]
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["get"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -87,6 +94,51 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: ravel-operator
+subjects:
+  - kind: ServiceAccount
+    name: ravel-operator
+    namespace: ravel-system
+---
+# Secrets: get only, and namespaced rather than cluster-wide (issue #126). The
+# operator reads the credentials, tenant-token, and deployment-key Secrets a
+# RavelCluster references (crate::controller resolves them via
+# Api::<Secret>::namespaced on the RavelCluster's OWN namespace) to resolve
+# tenant names and stamp resource versions; it never lists, writes, or watches
+# them. The Secret names are user-chosen CRD fields
+# (credentialsSecretRef/tenantTokensSecretRef/deploymentKeySecretRef and the
+# per-tier credential overrides), not a fixed set, so resourceNames cannot
+# enumerate them; a namespaced Role is the tightest grant that still works.
+#
+# This Role+RoleBinding grants the read only in ravel-system. A RavelCluster in
+# another namespace needs one RoleBinding of this Role (or an equivalent Role)
+# in that namespace; running the operator cluster-wide over many namespaces is a
+# follow-up. Scoping the read to a Role here removes the operator's standing
+# ability to read every Secret in the cluster, which was the finding.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ravel-operator-secrets
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ravel-operator-secrets
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ravel-operator-secrets
 subjects:
   - kind: ServiceAccount
     name: ravel-operator

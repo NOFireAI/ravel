@@ -15,14 +15,17 @@ use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction, KeyToPath, PodSpec,
-    PodTemplateSpec, Probe, ResourceRequirements, SecretKeySelector, SecretVolumeSource, Service,
-    ServiceAccount, ServicePort, ServiceSpec, Volume, VolumeMount,
+    Affinity, Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
+    KeyToPath, PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec,
+    Probe, ResourceRequirements, SeccompProfile, SecretKeySelector, SecretVolumeSource,
+    SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec, Volume, VolumeMount,
+    WeightedPodAffinityTerm,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, IngressTLS, ServiceBackendPort,
 };
+use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -476,6 +479,75 @@ fn probes_on(port: i32) -> (Probe, Probe) {
     (liveness, readiness)
 }
 
+/// The hardened container-level SecurityContext stamped on every container the
+/// operator renders (issue #126, ADR-0034 hardening amendment). Runs non-root,
+/// forbids privilege escalation, drops every Linux capability, and mounts the
+/// root filesystem read-only.
+///
+/// `read_only_root_filesystem` is correct for every container the operator
+/// renders: ravel-server's only local-disk write path is the opt-in ADR-0046
+/// disk cache tier (`--cache-dir`), which the operator renders no flag for, so
+/// the server and the ingest-router run RAM-only and write nothing outside the
+/// read-only mounts the pod already carries (the deployment-key Secret, mounted
+/// read-only). Object storage is the only durable backend, so no rendered
+/// container needs a writable root. A future CRD field that wires `--cache-dir`
+/// must back it with its own writable volume mount, which is writable
+/// independently of the root filesystem.
+fn container_security_context() -> SecurityContext {
+    SecurityContext {
+        run_as_non_root: Some(true),
+        allow_privilege_escalation: Some(false),
+        read_only_root_filesystem: Some(true),
+        capabilities: Some(Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
+            add: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// The hardened pod-level SecurityContext stamped on every PodSpec the operator
+/// renders (issue #126): run as non-root and confine every container to the
+/// `RuntimeDefault` seccomp profile.
+fn pod_security_context() -> PodSecurityContext {
+    PodSecurityContext {
+        run_as_non_root: Some(true),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".to_string(),
+            localhost_profile: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// Preferred (soft) pod anti-affinity spreading a component's replicas across
+/// nodes (issue #126). Preferred, never required: a required rule leaves a
+/// single-node cluster (a `kind` dev cluster, the reference environment) unable
+/// to schedule a second replica, wedging every multi-replica tier. The term
+/// selects the component's own pods by the standard `instance`+`component`
+/// labels and spreads on `kubernetes.io/hostname`.
+fn pod_anti_affinity(instance: &str, component: &str) -> Affinity {
+    Affinity {
+        pod_anti_affinity: Some(PodAntiAffinity {
+            preferred_during_scheduling_ignored_during_execution: Some(vec![
+                WeightedPodAffinityTerm {
+                    weight: 100,
+                    pod_affinity_term: PodAffinityTerm {
+                        label_selector: Some(LabelSelector {
+                            match_labels: Some(labels(instance, component)),
+                            ..Default::default()
+                        }),
+                        topology_key: "kubernetes.io/hostname".to_string(),
+                        ..Default::default()
+                    },
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Build a Deployment for `component` from its rendered args, env, container
 /// ports, replica count, and strategy. The single place the common container
 /// shape (image, probes, resources) is assembled, so gateway/query/maintain
@@ -508,6 +580,7 @@ fn deployment(
         readiness_probe: Some(readiness),
         resources: resources(resources_spec),
         volume_mounts: volume_mount.map(|m| vec![m]),
+        security_context: Some(container_security_context()),
         ..Default::default()
     };
     Deployment {
@@ -540,6 +613,8 @@ fn deployment(
                 spec: Some(PodSpec {
                     containers: vec![container],
                     volumes: volume.map(|v| vec![v]),
+                    security_context: Some(pod_security_context()),
+                    affinity: Some(pod_anti_affinity(instance, component)),
                     ..Default::default()
                 }),
             },
@@ -1302,6 +1377,7 @@ pub fn desired_router_deployment(
         }]),
         liveness_probe: Some(liveness),
         readiness_probe: Some(readiness),
+        security_context: Some(container_security_context()),
         ..Default::default()
     };
     Ok(Some(Deployment {
@@ -1330,6 +1406,8 @@ pub fn desired_router_deployment(
                     // The router reads EndpointSlices/Services under its own
                     // least-privilege ServiceAccount (deliverable 7).
                     service_account_name: Some(child_name(instance, ROUTER_COMPONENT)),
+                    security_context: Some(pod_security_context()),
+                    affinity: Some(pod_anti_affinity(instance, ROUTER_COMPONENT)),
                     ..Default::default()
                 }),
             },
@@ -1828,6 +1906,75 @@ pub fn gc_bootstrap_plan(spec: &RavelClusterSpec) -> GcBootstrapPlan {
     }
 }
 
+/// A tier's PodDisruptionBudget (issue #126, deliverable 4), capping how many of
+/// its pods a voluntary disruption (a node drain, a cluster upgrade) may take
+/// down at once.
+///
+/// `maxUnavailable: 1` rather than a `minAvailable`: it protects a multi-replica
+/// tier (gateway/query) during a rolling node drain while never blocking a drain
+/// on a single-replica tier (maintain, or a one-replica gateway on a single-node
+/// `kind` cluster). A `minAvailable` equal to the replica count would wedge a
+/// node drain on such a cluster, the same failure the preferred (not required)
+/// anti-affinity avoids. The selector matches the tier's own pods by the
+/// standard `instance`+`component` labels, exactly as its Deployment selector
+/// does.
+fn pod_disruption_budget(instance: &str, component: &str) -> PodDisruptionBudget {
+    let labels = labels(instance, component);
+    PodDisruptionBudget {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, component)),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        },
+        spec: Some(PodDisruptionBudgetSpec {
+            max_unavailable: Some(IntOrString::Int(1)),
+            selector: Some(LabelSelector {
+                match_labels: Some(labels),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// One PodDisruptionBudget per rendered tier (issue #126, deliverable 4): always
+/// gateway and query, plus maintain when `maintain.enabled`. The count equals
+/// the number of tiers the reconcile renders a Deployment for. The controller
+/// applies and sweeps these exactly like the Deployments, so a manual patch does
+/// not survive a reconcile. The router is an optional affinity backend, not a
+/// tier, and gets no PDB (its Deployment is swept as a unit with its other
+/// objects when the backend is switched away).
+pub fn desired_pod_disruption_budgets(
+    spec: &RavelClusterSpec,
+    instance: &str,
+) -> Vec<PodDisruptionBudget> {
+    let mut tiers = vec![DeploymentTier::Gateway, DeploymentTier::Query];
+    if spec.maintain.enabled {
+        tiers.push(DeploymentTier::Maintain);
+    }
+    tiers
+        .into_iter()
+        .map(|tier| pod_disruption_budget(instance, tier.component()))
+        .collect()
+}
+
+/// Every PodDisruptionBudget name the render can produce for `instance`, in a
+/// fixed order, whether or not the current spec renders that tier. The
+/// controller applies the ones [`desired_pod_disruption_budgets`] returns and
+/// deletes every other name here, so disabling `maintain` removes its PDB
+/// instead of orphaning one that guards a Deployment that no longer exists.
+pub fn possible_pod_disruption_budget_names(instance: &str) -> Vec<String> {
+    [
+        DeploymentTier::Gateway,
+        DeploymentTier::Query,
+        DeploymentTier::Maintain,
+    ]
+    .into_iter()
+    .map(|tier| child_name(instance, tier.component()))
+    .collect()
+}
+
 /// Everything one `RavelCluster` reconcile applies, rendered in one place.
 ///
 /// [`crate::controller`] builds this and applies exactly its contents, so a
@@ -1876,6 +2023,10 @@ pub struct DesiredObjects {
     /// The maintain Deployment, or `None` when `maintain.enabled` is false (the
     /// controller deletes it in that case).
     pub maintain_deployment: Option<Deployment>,
+    /// One PodDisruptionBudget per rendered tier (issue #126, deliverable 4).
+    /// The controller applies and sweeps these like the Deployments, so a manual
+    /// patch does not survive a reconcile.
+    pub pod_disruption_budgets: Vec<PodDisruptionBudget>,
     /// The order this pass applies the three Deployments in, and the condition
     /// it records while an ordering constraint holds the request-serving tiers
     /// back.
@@ -1949,6 +2100,7 @@ pub fn desired_objects(
         query_deployment: desired_query_deployment(spec, instance, ctx),
         query_service: desired_query_service(spec, instance),
         maintain_deployment: desired_maintain_deployment(spec, instance, ctx)?,
+        pod_disruption_budgets: desired_pod_disruption_budgets(spec, instance),
         gc_bootstrap,
     })
 }
@@ -4709,5 +4861,260 @@ mod tests {
         // The name the previous mode created is still in the sweep list, so the
         // controller deletes it on this pass.
         assert!(possible_router_object_names("prod").contains(&"prod-ingest-router".to_string()));
+    }
+
+    /// Every Deployment the reconciler can render for a fully-populated spec,
+    /// paired with a label naming its container: the three tiers plus the
+    /// ravel-native ingest router. The hardening sweeps assert over this exact
+    /// set, so a newly added rendered container or pod cannot escape the
+    /// SecurityContext unnoticed. `AuthorizationHeader` affinity is used because
+    /// it needs no tenant-token resolver, so the router renders even with
+    /// `tenant_tokens_secret_ref` cleared.
+    fn every_rendered_deployment() -> Vec<(&'static str, Deployment)> {
+        let mut spec = ravel_native_spec(3, AffinityKeySource::AuthorizationHeader);
+        spec.maintain.enabled = true;
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
+        let deployments = vec![
+            ("gateway", objects.gateway_deployment),
+            ("query", objects.query_deployment),
+            (
+                "maintain",
+                objects
+                    .maintain_deployment
+                    .expect("maintain.enabled renders a maintain Deployment"),
+            ),
+            (
+                "ingest-router",
+                objects
+                    .router_deployment
+                    .expect("ravelNative renders a router Deployment"),
+            ),
+        ];
+        // Guard against a future render path silently dropping out of this
+        // enumeration: the four names above are every container the operator
+        // ships today.
+        assert_eq!(
+            deployments.len(),
+            4,
+            "expected exactly four rendered Deployments to sweep"
+        );
+        deployments
+    }
+
+    fn pod_spec_of(dep: &Deployment) -> &PodSpec {
+        dep.spec
+            .as_ref()
+            .expect("deployment spec")
+            .template
+            .spec
+            .as_ref()
+            .expect("pod spec")
+    }
+
+    #[test]
+    fn every_rendered_container_drops_all_capabilities_and_runs_non_root() {
+        // Deliverable 1: the container-level SecurityContext is on EVERY
+        // container the reconciler can render, not just the shared tier builder.
+        // Render-level assertion: it checks the object the operator applies, not
+        // a live pod (the k8s CI lane covers the runtime effect).
+        for (tier, dep) in every_rendered_deployment() {
+            for container in &pod_spec_of(&dep).containers {
+                let sc = container
+                    .security_context
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{tier}: container has no SecurityContext"));
+                assert_eq!(
+                    sc.run_as_non_root,
+                    Some(true),
+                    "{tier}: runAsNonRoot must be true"
+                );
+                assert_eq!(
+                    sc.allow_privilege_escalation,
+                    Some(false),
+                    "{tier}: allowPrivilegeEscalation must be false"
+                );
+                assert_eq!(
+                    sc.read_only_root_filesystem,
+                    Some(true),
+                    "{tier}: readOnlyRootFilesystem must be true"
+                );
+                let dropped = sc
+                    .capabilities
+                    .as_ref()
+                    .and_then(|c| c.drop.as_ref())
+                    .unwrap_or_else(|| panic!("{tier}: capabilities.drop unset"));
+                assert_eq!(
+                    dropped,
+                    &vec!["ALL".to_string()],
+                    "{tier}: every capability must be dropped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_rendered_pod_spec_sets_a_non_root_security_context() {
+        // Deliverable 2: the pod-level SecurityContext (runAsNonRoot + the
+        // RuntimeDefault seccomp profile) is on EVERY rendered PodSpec.
+        // Render-level assertion.
+        for (tier, dep) in every_rendered_deployment() {
+            let pod = pod_spec_of(&dep);
+            let sc = pod
+                .security_context
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier}: PodSpec has no securityContext"));
+            assert_eq!(
+                sc.run_as_non_root,
+                Some(true),
+                "{tier}: pod runAsNonRoot must be true"
+            );
+            let profile = sc
+                .seccomp_profile
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier}: no seccompProfile"));
+            assert_eq!(
+                profile.type_, "RuntimeDefault",
+                "{tier}: seccompProfile must be RuntimeDefault"
+            );
+        }
+    }
+
+    #[test]
+    fn each_tier_renders_a_pod_disruption_budget_and_anti_affinity() {
+        // Deliverable 3 and 4, render-level. The PDB count equals the number of
+        // tiers the reconcile renders a Deployment for, and every tier PodSpec
+        // carries preferred (soft) anti-affinity keyed on its own labels.
+        //
+        // With maintain enabled: three tiers, three PDBs. Disabling maintain
+        // drops it to two, proving the count tracks the rendered tiers rather
+        // than a constant.
+        let mut spec = base_spec();
+        spec.maintain.enabled = true;
+        let objects = desired_objects(&spec, "prod", "default", &ctx()).expect("render");
+        assert_eq!(
+            objects.pod_disruption_budgets.len(),
+            3,
+            "one PDB per rendered tier (gateway, query, maintain)"
+        );
+        // Each PDB caps voluntary disruption at one pod and selects its tier's
+        // own labels.
+        for (pdb, component) in objects
+            .pod_disruption_budgets
+            .iter()
+            .zip(["gateway", "query", "maintain"])
+        {
+            let pdb_spec = pdb.spec.as_ref().expect("pdb spec");
+            assert_eq!(
+                pdb_spec.max_unavailable,
+                Some(IntOrString::Int(1)),
+                "{component}: maxUnavailable must be 1"
+            );
+            assert_eq!(
+                pdb.metadata.name.as_deref(),
+                Some(child_name("prod", component).as_str()),
+                "{component}: PDB name must match the tier"
+            );
+            assert_eq!(
+                pdb_spec
+                    .selector
+                    .as_ref()
+                    .and_then(|s| s.match_labels.clone()),
+                Some(labels("prod", component)),
+                "{component}: PDB selects its tier labels"
+            );
+        }
+
+        // Preferred, not required: a required term would wedge scheduling on a
+        // single-node cluster. Assert the preferred list is populated and the
+        // required list is empty, on every tier.
+        for (tier, dep) in [
+            ("gateway", objects.gateway_deployment),
+            ("query", objects.query_deployment),
+            (
+                "maintain",
+                objects.maintain_deployment.expect("maintain enabled"),
+            ),
+        ] {
+            let anti = pod_spec_of(&dep)
+                .affinity
+                .as_ref()
+                .and_then(|a| a.pod_anti_affinity.as_ref())
+                .unwrap_or_else(|| panic!("{tier}: no podAntiAffinity"));
+            assert!(
+                anti.required_during_scheduling_ignored_during_execution
+                    .as_ref()
+                    .map(|r| r.is_empty())
+                    .unwrap_or(true),
+                "{tier}: anti-affinity must be preferred, never required"
+            );
+            let preferred = anti
+                .preferred_during_scheduling_ignored_during_execution
+                .as_ref()
+                .unwrap_or_else(|| panic!("{tier}: no preferred anti-affinity term"));
+            assert_eq!(preferred.len(), 1, "{tier}: one preferred term");
+            assert_eq!(
+                preferred[0].pod_affinity_term.topology_key, "kubernetes.io/hostname",
+                "{tier}: spread across nodes"
+            );
+            assert_eq!(
+                preferred[0]
+                    .pod_affinity_term
+                    .label_selector
+                    .as_ref()
+                    .and_then(|s| s.match_labels.clone()),
+                Some(labels("prod", tier)),
+                "{tier}: term selects the tier's own pods"
+            );
+        }
+
+        // Disabling maintain drops its PDB, proving the count tracks tiers.
+        let mut disabled = base_spec();
+        disabled.maintain.enabled = false;
+        let objects = desired_objects(&disabled, "prod", "default", &ctx()).expect("render");
+        assert_eq!(
+            objects.pod_disruption_budgets.len(),
+            2,
+            "maintain disabled: only gateway and query PDBs"
+        );
+    }
+
+    #[test]
+    fn rbac_manifest_carries_no_cluster_wide_secrets_rule() {
+        // Deliverable 5, manifest lint. A dependency-free text scan of the
+        // shipped rbac.yaml, run by the existing `cargo test -p ravel-operator`
+        // gate: the operator's ClusterRole must NOT grant `secrets`, and the
+        // read must instead come from a namespaced Role. It fails on the current
+        // rbac.yaml before the narrowing lands, which is exactly the
+        // prove-the-test demonstration.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/k8s/operator/rbac.yaml");
+        let manifest = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // Split into YAML documents and classify each by its `kind:` line. A
+        // ClusterRoleBinding also contains the text "ClusterRole", so match the
+        // kind line exactly rather than with a substring.
+        let docs: Vec<&str> = manifest.split("\n---").collect();
+        let kind_is =
+            |doc: &str, kind: &str| doc.lines().any(|l| l.trim() == format!("kind: {kind}"));
+
+        let cluster_role = docs
+            .iter()
+            .find(|d| kind_is(d, "ClusterRole"))
+            .expect("rbac.yaml defines a ClusterRole");
+        assert!(
+            !cluster_role.contains("secrets"),
+            "the operator ClusterRole must not grant a cluster-wide secrets rule; \
+             narrow it to a namespaced Role"
+        );
+
+        let secrets_role = docs
+            .iter()
+            .find(|d| kind_is(d, "Role") && d.contains("secrets"))
+            .expect("a namespaced Role must grant the secrets read");
+        assert!(
+            secrets_role.contains("verbs: [\"get\"]"),
+            "the namespaced secrets Role grants get only"
+        );
     }
 }
