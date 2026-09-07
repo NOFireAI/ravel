@@ -494,14 +494,19 @@ There is no separate capacity flag for the disk tier. Each tier is bounded by
 
 The fetcher cache and the catalog byte cache are two independent LRU caches.
 When `--cache-max-bytes` is **set**, both are bounded at that one value. When it
-is **unset**, the two derive separately from `MemTotal`: the fetcher cache at
-80% and the catalog byte cache at a smaller 5% (`25769803776` and `1610612736`
-on the 30 GB reference host), so deriving both at 80% cannot commit 160% of RAM.
-Both ceilings are LRU caps, not reservations: neither pre-allocates, each holds
-only the bytes it has admitted, and the sum of the two cache ceilings and the
-SQL memory pools may exceed physical RAM by design (the caches fill only under a
-working set that large, and a SQL query aborts rather than growing past its own
-pool). `--disable-cache` turns both off and holds no read-cache memory.
+is **unset**, the two derive separately from the process memory budget (see
+"Per-query budgets" below): the fetcher cache at 25% and the catalog byte
+cache at a smaller 5% (`7516192768` and `1503238553` on the 30 GB reference
+host), so deriving both cannot commit more than 30% of the budget between
+them. Startup refuses to start, rather than silently clamping, if an explicit
+`--cache-max-bytes` pushes the two resolved hard caps above the process
+memory budget. Both ceilings are LRU caps, not reservations: neither
+pre-allocates, each holds only the bytes it has admitted, and the sum of the
+two cache ceilings and the SQL memory pools (which derive from raw host
+memory, not the process memory budget) may exceed physical RAM by design (the
+caches fill only under a working set that large, and a SQL query aborts
+rather than growing past its own pool). `--disable-cache` turns both off and
+holds no read-cache memory.
 
 The disk tier is disposable by design. The directory is created lazily on first
 admission and is never required to exist. A missing, full or corrupt cache
@@ -1029,11 +1034,31 @@ A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
 that flag, raised before any fetcher, engine, or SQL session exists.
 
 Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
-80% of MemTotal, catalog byte cache a separate 5% ceiling, 256 MiB each if
-memory is unknown; an explicit flag bounds both at that one value) and
+25%, catalog byte cache a separate 5% ceiling, 256 MiB each if memory is
+unknown; an explicit flag bounds both at that one value) and
 `--gc-max-query-duration` (11 minutes). Memory is read from `/proc/meminfo`'s
 `MemTotal` on Linux and is "unknown" everywhere else; cores come from the
 process's available parallelism, floored at 1. Percentages truncate.
+
+Unlike the two SQL ceilings above, `--cache-max-bytes` does not derive from
+raw `MemTotal`: it derives from a process-wide memory budget, itself
+`MemTotal` (capped by the cgroup memory limit) minus a fixed 2 GiB overhead
+reserve for the allocator and everything outside this accounting. Whatever
+of that budget the two resolved cache ceilings do not claim sizes a shared
+memory accountant the SQL executor's per-tenant tracking reserves against, so
+raising `--cache-max-bytes` on a memory-constrained host leaves less headroom
+for concurrent SQL queries even though the two are configured by separate
+flags. This budget, its two carves, and the remainder are computed once at
+startup from the host profile observed at that moment; nothing about it
+changes while the process runs, and a container whose cgroup limit changes
+later is not noticed until the next restart. The current state is visible
+live at `/metrics`: `ravel_memory_budget_bytes` (the resolved ceiling,
+`u64::MAX` meaning unlimited), `ravel_memory_reserved_bytes` split by a
+`component` label (`sql` or `fetch`; `fetch` reads `0` today because nothing
+yet reserves against the budget on the fetch layer's behalf, an honest gap
+rather than a bug), and `ravel_memory_handoff_overlap_bytes` (bytes
+double-counted right now because a tenant's memory handed off between
+components overlaps in the budget's accounting window).
 `--cache-max-bytes` changes less than it used to about how many times a logs
 statement moves a given object's bytes: a query's plan-phase whole-object
 read (the `has_word`/text and other skip-index-undecidable fallback) is now
@@ -1055,8 +1080,12 @@ INFO performance default resolved setting="store_get_concurrency" value=32 sourc
 INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
 INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
 INFO performance default resolved setting="max_segments" value=1000000 source="derived"
-INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
-INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=7516192768 source="derived"
+INFO performance default resolved setting="catalog_cache_max_bytes" value=1503238553 source="derived"
+INFO performance default resolved setting="memory_budget_bytes" value=30064771072 source="derived"
+INFO performance default resolved setting="memory_overhead_reserve_bytes" value=2147483648 source="derived"
+INFO performance default resolved setting="memory_hard_caps_bytes" value=9019431321 source="derived"
+INFO performance default resolved setting="memory_remainder_bytes" value=21045339751 source="derived"
 INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived"
 INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived"
 INFO performance default resolved setting="gc_max_query_duration" value=660 source="derived"
