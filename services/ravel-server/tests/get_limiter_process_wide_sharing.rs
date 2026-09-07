@@ -413,6 +413,7 @@ async fn build_gated_app(get_limiter: Arc<GetLimiter>) -> (Router, GateHandle) {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("sql state");
     sql_state.clock = Arc::new(FixedClock);
