@@ -18,6 +18,11 @@
 //! short of an isolation breach degrades to `Ok(None)` and the query scans:
 //! no HEAD yet, no column-stats ref, any GET error, a blake3 mismatch, a
 //! decode error, or a part-binding mismatch against the current HEAD's parts.
+//! One of those degrades is not silent: a DECODE failure on the object HEAD
+//! actually references means the fold wrote an object the reader cannot open,
+//! so [`fetch_stats_object`] surfaces it as [`FetchOutcome::DecodeRefused`]
+//! (rather than folding it into a bare `None`) for the caller to log once and
+//! count. The query still scans; only its visibility changes (issue #1400).
 //! `decode_column_stats` does not itself check part-binding against a
 //! caller-supplied part list (unlike `decode_postings`, which takes the
 //! expected part_blake3 as an argument); this loader performs that check
@@ -131,6 +136,28 @@ pub(crate) struct ResolvedStatsRef {
     pub expected_part_blake3: Vec<[u8; 32]>,
 }
 
+/// Outcome of [`fetch_stats_object`]: an object the reader decoded, or one of
+/// the two degrade-to-`Ok(None)` kinds the caller must tell apart. A store
+/// read that fails and a stale binding are legitimately "no statistics"
+/// ([`Self::Absent`]); a DECODE failure on the object HEAD points at is not
+/// ([`Self::DecodeRefused`]) and the caller logs and counts it (issue #1400).
+pub(crate) enum FetchOutcome {
+    /// Fetched, hash-verified, tenant-checked, part-bound, and decoded.
+    Loaded(LoadedColumnStats),
+    /// No usable object, silently: the store GET failed (the object may simply
+    /// not exist for this HEAD yet), the content hash did not match, a part
+    /// hash was malformed, or the part binding was stale. Every one of these is
+    /// an ordinary "no statistics" and stays quiet.
+    Absent,
+    /// HEAD references an object the reader refused to DECODE: the fold wrote it
+    /// and HEAD points at it, but the bytes will not open (an oversized declared
+    /// body, corruption, a crc or header failure). Never normal. Carries the
+    /// decode error so the caller can name the cause and, for
+    /// [`SnapshotFormatError::ColumnStatsDecompressedTooLarge`], the declared
+    /// and cap bytes.
+    DecodeRefused(SnapshotFormatError),
+}
+
 /// A genuinely unparseable HEAD, or an isolation breach, encountered while
 /// loading column statistics: the only conditions this path
 /// surfaces as an error rather than degrading to `Ok(None)`.
@@ -234,20 +261,25 @@ pub(crate) async fn fetch_stats_object(
     getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
     resolved: &ResolvedStatsRef,
-) -> Result<Option<LoadedColumnStats>, LoadColumnStatsError> {
+) -> Result<FetchOutcome, LoadColumnStatsError> {
     let data = match getter.accounted_get_full(&resolved.key).await {
         Ok(got) => got.data,
-        Err(_) => return Ok(None),
+        // Store read: the object may simply not exist for this HEAD. Silent.
+        Err(_) => return Ok(FetchOutcome::Absent),
     };
     let digest = blake3::hash(&data);
     if *digest.as_bytes() != resolved.blake3 {
-        return Ok(None);
+        return Ok(FetchOutcome::Absent);
     }
 
     let limits = ColumnStatsLimits::default();
     let decoded = match decode_column_stats(&data, &limits) {
         Ok(decoded) => decoded,
-        Err(_) => return Ok(None),
+        // Decode of an object HEAD references: the fold wrote it and HEAD
+        // points at it, so a failure to open it is never the ordinary
+        // not-covered case. Surface it for the caller to log once and count
+        // (issue #1400); the query still degrades to `Ok(None)` and scans.
+        Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
     };
 
     if decoded.header.tenant_hash != tenant.0.to_vec() {
@@ -265,10 +297,10 @@ pub(crate) async fn fetch_stats_object(
         .map(|h| <[u8; 32]>::try_from(h.as_slice()))
         .collect();
     let Ok(actual_part_blake3) = actual_part_blake3 else {
-        return Ok(None);
+        return Ok(FetchOutcome::Absent);
     };
     if actual_part_blake3 != resolved.expected_part_blake3 {
-        return Ok(None);
+        return Ok(FetchOutcome::Absent);
     }
 
     let mut segments = HashMap::with_capacity(decoded.segments.len());
@@ -286,7 +318,7 @@ pub(crate) async fn fetch_stats_object(
         segments.insert(identity, segment);
     }
 
-    Ok(Some(LoadedColumnStats {
+    Ok(FetchOutcome::Loaded(LoadedColumnStats {
         segments,
         part_blake3: resolved.expected_part_blake3.clone(),
     }))
