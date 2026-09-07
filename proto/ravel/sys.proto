@@ -90,14 +90,25 @@ enum Signal {
 message ProvisioningRecord {
   // Format floor: the minimum reader version that understands this record. A
   // reader that only knows a lower version refuses rather than misreading a
-  // future layout as v1 (matching TenancyMarker's format_version guard). = 1.
+  // future layout as v1 (matching TenancyMarker's format_version guard).
   //
-  // Adding `generations` (field 6) is additive and does NOT bump this floor:
-  // a pre-ADR-0052 reader that skips the unknown field 6 still reads the
-  // scalar `shard_count` as generation 0's count, and a post-0052 reader with
-  // an empty `generations` list reads exactly the same single implicit
-  // generation. There is no layout a v1 reader would misread, so the floor
-  // stays 1 (ADR-0052 section 1, "Sequencing with EC5").
+  // Writers stamp 1. Readers accept the SET {1, 2}: this record is CAS-mutable
+  // (append_generation, raise_format_floor rewrite it whole), so per the
+  // ADR-0066 R1 amendment its readers accept the next version before any writer
+  // emits it (readers-before-writers), and its rewrite paths REFUSE a record
+  // whose version exceeds what this build's writer stamps rather than re-encode
+  // it through an older field set and strip a field a newer writer added. This
+  // is why the ADR-0052 note below, which reasons only about an old READER, is
+  // not sufficient on its own for a CAS-mutable record: an old WRITER rewriting
+  // a newer record is the hazard the SET and the rewrite refusal close.
+  //
+  // Adding `generations` (field 6) is additive and does NOT bump the version a
+  // WRITER stamps: a pre-ADR-0052 reader that skips the unknown field 6 still
+  // reads the scalar `shard_count` as generation 0's count, and a post-0052
+  // reader with an empty `generations` list reads exactly the same single
+  // implicit generation. There is no layout a v1 reader would misread
+  // (ADR-0052 section 1, "Sequencing with EC5"). The remaining hazard the R1
+  // amendment addresses is the old-writer rewrite, not the old-reader read.
   uint32 format_version = 1;
   bytes tenant_hash = 2;       // 16 bytes; the `t/<tenant_hash>/` prefix owner
   Signal signal = 3;
@@ -125,13 +136,22 @@ message ProvisioningRecord {
   // format version's read support is legal only when every bucket's floor for
   // that family exceeds the retired version.
   //
-  // Adding this field is additive and does NOT bump `format_version` (field 1),
-  // for the identical reason `generations` (field 6) did not: a reader that
-  // skips this unknown field still reads every earlier field exactly as before,
-  // and a reader that understands it sees an empty list on every pre-EM record,
-  // which reads identically to "no floors raised". There is no layout a v1
-  // reader would misread, so the floor stays 1 (ADR-0066 decision 3, citing the
-  // ADR-0052 `generations` precedent verbatim).
+  // Adding this field is additive and does NOT bump the version a WRITER stamps
+  // (field 1), for the identical reason `generations` (field 6) did not: a
+  // reader that skips this unknown field still reads every earlier field exactly
+  // as before, and a reader that understands it sees an empty list on every
+  // pre-EM record, which reads identically to "no floors raised". There is no
+  // layout a v1 reader would misread (ADR-0066 decision 3, citing the ADR-0052
+  // `generations` precedent).
+  //
+  // That old-READER reasoning is necessary but not sufficient for this
+  // CAS-mutable record: an old WRITER that rewrites a record a newer writer
+  // stamped (append_generation, raise_format_floor) would re-encode it without a
+  // field it does not model and strip it. The R1 amendment (ADR-0066, #1300)
+  // closes that: readers accept the version SET {1, 2}, and the rewrite paths
+  // refuse a record newer than the writer stamps. Any additive field added after
+  // this one still follows the CAS-mutable rule: bump the version, ship the
+  // reader that accepts it fleet-wide, THEN flip the writer.
   //
   // Decode enforces, per family, that floor_version is strictly increasing in
   // append order (floors raised only); a later entry for a family at or below an
@@ -511,7 +531,15 @@ message TypedAttrColumnConfig {
 message TenantConfigRecord {
   // Format floor: the minimum reader version that understands this record. A
   // reader that only knows a lower version refuses rather than misreading a
-  // future layout, matching every other durable record's version guard. = 1.
+  // future layout, matching every other durable record's version guard.
+  //
+  // Writers stamp 1. Readers accept the SET {1, 2}: this record is CAS-mutable
+  // (set_tenant_config rebuilds it whole under CasVersion, naming every field it
+  // knows), so per the ADR-0066 R1 amendment its reader accepts the next version
+  // before any writer emits it, and set_tenant_config REFUSES to rewrite a record
+  // newer than this build's writer stamps rather than rebuild it at the older
+  // field set and strip a field a newer writer added (e.g. a field past
+  // `typed_attr_columns`).
   uint32 format_version = 1;
   bytes tenant_hash = 2;              // 16 bytes; the `t/<tenant_hash>/` prefix owner
   TenantLifecycleState lifecycle_state = 3;
@@ -535,8 +563,12 @@ message TenantConfigRecord {
   // present-but-empty vs absent distinction). Additive field: a reader that
   // skips this unknown field reads every earlier field exactly as before, and a
   // reader that understands it sees an absent sub-message on every pre-ADR-0090
-  // record, identical to "no override". No format_version bump (ADR-0090
-  // Consequences).
+  // record, identical to "no override". No writer version bump for THIS field
+  // (ADR-0090 Consequences). But note this record is CAS-mutable: any field
+  // added AFTER this one must follow the CAS-mutable rule (ADR-0066 R1
+  // amendment) -- bump the version, ship the reader that accepts it fleet-wide,
+  // then flip the writer -- because set_tenant_config rewrites the record whole
+  // and a lagging writer would otherwise strip the new field.
   TypedAttrColumnConfig typed_attr_columns = 12;
 }
 
@@ -694,7 +726,17 @@ message MetricMetadataEntry {
 message MetricMetadataRecord {
   // Format floor: the minimum reader version that understands this record. A
   // reader that only knows a lower version refuses rather than misreading a
-  // future layout, matching every other durable record's version guard. = 1.
+  // future layout, matching every other durable record's version guard.
+  //
+  // Writers stamp 1. The decode gate accepts the SET {1, 2}: this record is
+  // CAS-mutable (the ingest sink reads it, field-wise re-merges via
+  // merge_entries, and CAS-writes it back), so per the ADR-0066 R1 amendment the
+  // decode gate accepts the next version before any writer emits it. The read
+  // that FEEDS that rewrite (read_metrics_meta, which returns the CAS version a
+  // caller writes back with) is stricter: it REFUSES a record newer than this
+  // build's writer stamps, so a lagging binary drops the merge window rather than
+  // re-encoding the record through an older field set and stripping a field a
+  // newer writer added.
   uint32 format_version = 1;
   // One entry per metric family name. Decode enforces: every family_name is
   // non-empty, no family_name repeats (a duplicate would make a
