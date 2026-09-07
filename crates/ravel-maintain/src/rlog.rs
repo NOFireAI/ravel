@@ -1141,9 +1141,26 @@ struct ColumnAccum {
     /// kind. A record that sets the key overrides its stream's attribute of the
     /// same name, so this suppresses the fallback for that record.
     mention_epoch: u64,
-    /// The epoch of the record this column last took a matching-typed value
-    /// from: first-occurrence-wins within one record.
-    value_epoch: u64,
+    /// The record layer's winner for this column within the record being folded:
+    /// the LAST occurrence of the declared name in [`LogRecord::attrs`],
+    /// whatever its kind. Read only while the column is in
+    /// [`DeclaredStatAccum::touched`], so a value left from an earlier record is
+    /// never folded twice.
+    pending: Option<PendingValue>,
+}
+
+/// One record-layer occurrence of a declared name, reduced to what the stamp
+/// needs: the value when its kind is one a declared column can be stamped at,
+/// and otherwise only the fact that an occurrence exists. A `Str`, `Bytes`,
+/// `F64`, `List` or `Map` occurrence wins the record layer exactly like any
+/// other and then reads NULL for either declarable type, so it is kept as
+/// [`PendingValue::Other`] rather than dropped: dropping it would let a
+/// shadowed same-named I64 or BOOL occurrence claim the row.
+#[derive(Clone, Copy, Debug)]
+enum PendingValue {
+    I64(i64),
+    Bool(bool),
+    Other,
 }
 
 /// The declared eligible columns a compaction output stamps, indexed for the
@@ -1249,7 +1266,8 @@ impl DeclaredSchema {
 /// The per-part fold of declared-column extrema for the compaction output
 /// (ADR-0873 decision 3, the L1 half of wave 5). It mirrors the ingest-side
 /// wave-5a accumulator (`ravel_ingest`'s `DeclaredStatAccum`): eligible I64/BOOL
-/// declared columns only, first-occurrence-wins per record, and a stamp whose
+/// declared columns only, last-occurrence-wins per record (issue #1182), and a
+/// stamp whose
 /// `null_count` is derived as `sample_count - non_null` so the part's own reader
 /// ([`ravel_commit::declared_stats::read_compaction_part`]) never drops it.
 ///
@@ -1277,9 +1295,13 @@ struct DeclaredStatAccum {
     schema: Arc<DeclaredSchema>,
     /// Running extrema, positionally aligned with `schema.cols`.
     cols: Vec<ColumnAccum>,
-    /// Monotonic per-record counter driving the first-occurrence-wins and
-    /// override epochs. Incremented before each record, so a live epoch is
-    /// never 0.
+    /// Indices into `cols` the record being folded mentions, so the pass that
+    /// folds each column's winner costs one step per mention rather than one per
+    /// declared column. Reused across records; cleared as each record's winners
+    /// are folded.
+    touched: Vec<usize>,
+    /// Monotonic per-record counter driving the override epochs. Incremented
+    /// before each record, so a live epoch is never 0.
     epoch: u64,
 }
 
@@ -1294,25 +1316,36 @@ impl DeclaredStatAccum {
         DeclaredStatAccum {
             schema,
             cols,
+            touched: Vec::new(),
             epoch: 0,
         }
     }
 
     /// Fold one record's merged attribute view. Each declared column takes at
-    /// most one non-null row from the record: the first attribute matching its
-    /// name AND its declared value kind wins, and a repeat (or a same-named
-    /// value of the other kind, or an absence with no stream-level value) is a
-    /// NULL for the declaration, so no column's non-null count can exceed the
-    /// part's row count and the derived `null_count` can never go negative.
+    /// most one non-null row from the record: the record layer's single winning
+    /// occurrence of the declared name, which is non-null only when its kind
+    /// matches the declaration. A shadowed occurrence, a winner of the other
+    /// kind, and an absence with no stream-level value are all NULL for the
+    /// declaration, so no column's non-null count can exceed the part's row
+    /// count and the derived `null_count` can never go negative.
+    ///
+    /// Which occurrence wins is LAST-occurrence-wins over
+    /// [`LogRecord::attrs`], the rule docs/log-segment-format.md pins ("Within
+    /// the record layer") and `ravel_sql::rlog_attrs::merged_attrs` implements.
+    /// The list this reads is the one `rebuild_record` produced for the input
+    /// object, so its order already IS the format's resolution order (columnar
+    /// occurrences ascending by FIELD_DIR type byte, then the `attrs_raw`
+    /// overflow occurrences in canonical order): folding it last-wins is the
+    /// reader's answer, not an approximation of it.
     ///
     /// A column the record does not name at all takes its stream's resource or
     /// scope value, when the stream supplies one of the declared kind. A record
     /// that names the column at ANY value kind suppresses that fallback, which
     /// is the reader's override order.
     ///
-    /// Cost is one hash lookup per record attribute plus one pass over the
-    /// record's stream's fallback list, with no String comparison per
-    /// (attribute, column) pair.
+    /// Cost is one hash lookup per record attribute, one pass over the columns
+    /// this record mentions, and one pass over the record's stream's fallback
+    /// list, with no String comparison per (attribute, column) pair.
     fn observe_record(&mut self, r: &LogRecord) {
         if self.cols.is_empty() {
             return;
@@ -1320,9 +1353,11 @@ impl DeclaredStatAccum {
         let Self {
             schema,
             cols,
+            touched,
             epoch,
         } = self;
         *epoch += 1;
+        touched.clear();
         for (name, value) in &r.attrs {
             let Some(&i) = schema.index.get(name.as_str()) else {
                 continue;
@@ -1330,25 +1365,32 @@ impl DeclaredStatAccum {
             let Some(c) = cols.get_mut(i) else {
                 continue;
             };
-            c.mention_epoch = *epoch;
-            if c.value_epoch == *epoch {
-                continue;
+            if c.mention_epoch != *epoch {
+                c.mention_epoch = *epoch;
+                touched.push(i);
             }
-            match (schema.cols[i].1, value) {
-                (DeclaredStatType::I64, AttrValue::I64(v)) => {
-                    match &mut c.i64_run {
-                        Some(run) => run.observe(*v),
-                        None => c.i64_run = Some(Running::start(*v)),
-                    }
-                    c.value_epoch = *epoch;
-                }
-                (DeclaredStatType::Bool, AttrValue::Bool(b)) => {
-                    match &mut c.bool_run {
-                        Some(run) => run.observe(*b),
-                        None => c.bool_run = Some(Running::start(*b)),
-                    }
-                    c.value_epoch = *epoch;
-                }
+            // Last occurrence wins: overwrite whatever an earlier occurrence of
+            // the same name left here.
+            c.pending = Some(match value {
+                AttrValue::I64(v) => PendingValue::I64(*v),
+                AttrValue::Bool(b) => PendingValue::Bool(*b),
+                _ => PendingValue::Other,
+            });
+        }
+        for &i in touched.iter() {
+            let Some(c) = cols.get_mut(i) else {
+                continue;
+            };
+            let winner = c.pending.take();
+            match (schema.cols[i].1, winner) {
+                (DeclaredStatType::I64, Some(PendingValue::I64(v))) => match &mut c.i64_run {
+                    Some(run) => run.observe(v),
+                    None => c.i64_run = Some(Running::start(v)),
+                },
+                (DeclaredStatType::Bool, Some(PendingValue::Bool(b))) => match &mut c.bool_run {
+                    Some(run) => run.observe(b),
+                    None => c.bool_run = Some(Running::start(b)),
+                },
                 _ => {}
             }
         }
@@ -3222,6 +3264,141 @@ mod tests {
             .await
             .expect("put commit");
         bytes
+    }
+
+    /// Issue #1182, consumer 4: the compaction recompute must resolve a record
+    /// that carries one attribute name more than once to the SAME value the
+    /// readers do.
+    ///
+    /// The record table and the resolved values are the ones
+    /// `ravel_sql::logs_scan::columnar_lookup_tests::a_duplicate_key_resolves_last_occurrence_wins_on_both_reader_paths`
+    /// pins for the two reader paths and
+    /// `ravel_ingest::log_declared_stats::tests::duplicate_key_stamp_follows_the_readers_rule`
+    /// pins for the ingest fold:
+    ///
+    /// | record's own attributes         | resolved `k`  |
+    /// |---------------------------------|---------------|
+    /// | `I64(5)` then `Str("x")`        | `I64(5)`      |
+    /// | `Str("x")` then `I64(5)`        | `I64(5)`      |
+    /// | `Bool(true)` then `I64(9)`      | `Bool(true)`  |
+    /// | `I64(1)` then `Bytes([0xab])`   | `Bytes(..)`   |
+    /// | `Str("y")`                      | `Str("y")`    |
+    ///
+    /// The records are written with the real `RlogWriter` and read back with the
+    /// real `RlogReader`, so the attribute list the fold sees is the one
+    /// `rebuild_record` produces for a compaction input, in the order
+    /// docs/log-segment-format.md pins. Nothing here hand-orders the
+    /// occurrences: the writer and reader do, and last-occurrence-wins over
+    /// that list is `merged_attrs`'s answer verbatim.
+    ///
+    /// Prove-the-test: restore the base's first-occurrence-of-the-declared-kind
+    /// rule in `observe_record` -- keep the first `pending` a record sets at a
+    /// declarable kind instead of letting a later occurrence overwrite it -- and
+    /// the I64 stamp reads min 1, max 9, null_count 1: the third and fourth rows
+    /// claim the 9 and the 1 that the Bool and the Bytes occurrence shadow, and
+    /// the first assertion below fails with `left: Some(I64(1))`.
+    #[test]
+    fn duplicate_key_stamp_follows_the_readers_rule() {
+        let cfg = RlogConfig::default();
+        let dup = |ts: i64, attrs: Vec<(String, AttrValue)>| record(1, ts, "b", attrs);
+        let written = vec![
+            dup(
+                100,
+                vec![
+                    ("k".to_string(), AttrValue::I64(5)),
+                    ("k".to_string(), AttrValue::Str("x".into())),
+                ],
+            ),
+            dup(
+                101,
+                vec![
+                    ("k".to_string(), AttrValue::Str("x".into())),
+                    ("k".to_string(), AttrValue::I64(5)),
+                ],
+            ),
+            dup(
+                102,
+                vec![
+                    ("k".to_string(), AttrValue::Bool(true)),
+                    ("k".to_string(), AttrValue::I64(9)),
+                ],
+            ),
+            dup(
+                103,
+                vec![
+                    ("k".to_string(), AttrValue::I64(1)),
+                    ("k".to_string(), AttrValue::Bytes(vec![0xab])),
+                ],
+            ),
+            dup(104, vec![("k".to_string(), AttrValue::Str("y".into()))]),
+        ];
+        let mut w = RlogWriter::new(
+            cfg,
+            ObjectIdentity {
+                tenant_hash: [0; 16],
+                shard: 0,
+                writer_id: [0; 16],
+                writer_epoch: 0,
+                writer_seq: 0,
+            },
+        );
+        for r in &written {
+            w.push(r.clone()).expect("push");
+        }
+        let obj = w.finish().expect("finish");
+        let rebuilt = decode_all(&obj);
+        assert_eq!(rebuilt.len(), written.len(), "every record round-trips");
+
+        let (stream_id, blob) = stream_ident(1);
+        let mut streams = BTreeMap::new();
+        streams.insert(stream_id, blob);
+        // `DeclaredSchema` indexes by name, so each declared type is folded in
+        // its own pass rather than declaring `k` twice in one schema.
+        let stamp_at = |ty: DeclaredStatType| -> DeclaredColumnStat {
+            let schema = Arc::new(DeclaredSchema::build(&[("k".to_string(), ty)], &streams));
+            let mut accum = DeclaredStatAccum::new(schema);
+            for r in &rebuilt {
+                accum.observe_record(r);
+            }
+            let mut stamps = accum.build_stamps(5);
+            assert_eq!(stamps.len(), 1, "one declared column, one stamp");
+            stamps.remove(0)
+        };
+        let stamps = [
+            stamp_at(DeclaredStatType::I64),
+            stamp_at(DeclaredStatType::Bool),
+        ];
+
+        let i64_stat = stamps
+            .iter()
+            .find(|s| s.declared_type() == DeclaredStatType::I64)
+            .expect("I64 stamp");
+        assert_eq!(
+            i64_stat.min(),
+            Some(DeclaredStatValue::I64(5)),
+            "I64 min is the two rows resolving to 5, not the shadowed 1"
+        );
+        assert_eq!(
+            i64_stat.max(),
+            Some(DeclaredStatValue::I64(5)),
+            "I64 max is the two rows resolving to 5, not the shadowed 9"
+        );
+        assert_eq!(
+            i64_stat.null_count(),
+            3,
+            "the Bool, Bytes and Str winners are NULL for a declared I64"
+        );
+        let bool_stat = stamps
+            .iter()
+            .find(|s| s.declared_type() == DeclaredStatType::Bool)
+            .expect("BOOL stamp");
+        assert_eq!(bool_stat.min(), Some(DeclaredStatValue::Bool(true)));
+        assert_eq!(bool_stat.max(), Some(DeclaredStatValue::Bool(true)));
+        assert_eq!(
+            bool_stat.null_count(),
+            4,
+            "only the record whose winner is a Bool is non-null"
+        );
     }
 
     /// Decode every record of an RLOG object (no predicate), in the object's
