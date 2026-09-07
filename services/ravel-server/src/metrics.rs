@@ -3837,6 +3837,15 @@ pub struct MetricsState {
     /// in a request-serving mode that built one (`Mode::All`/`Mode::Query`);
     /// `None` otherwise leaves the whole family off the exposition.
     pub metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
+    /// The ADR-1170 decisions 1/3/4 process-wide memory accountant, the SAME
+    /// instance installed on the `sql`-featured `SqlExecutor` via
+    /// `SqlExecutor::with_process_memory_budget` (when `sql` is compiled in
+    /// and the mode serves queries) so a tenant's SQL reservation and this
+    /// gauge read one counter, not two independently drifting ones. Always
+    /// present: `crate::start` builds it in every mode from
+    /// `ServerConfig::process_memory_budget_bytes`, unconditionally of the
+    /// `sql` feature, so the gauge family renders in every build.
+    pub process_memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
