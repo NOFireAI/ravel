@@ -1383,6 +1383,60 @@ mod tests {
         assert_eq!(s.null_count(), 0, "one record, one non-null row");
     }
 
+    /// The same `attrs_raw` tier through the COLUMNAR fold rather than the
+    /// row-major one. Both paths must resolve the row identically, and the
+    /// columnar path reaches the overflow tier through different code.
+    ///
+    /// Repeating one name at ONE type is what makes this reach it: a single
+    /// `(k, i64)` column slot exists, so the column scan alone never sees a
+    /// repeat and the name is marked contested only by the `residual_attrs`
+    /// walk. The sibling test above repeats `k` at two DISTINCT types, which
+    /// the multi-column rule catches on its own, so it does not exercise
+    /// either overflow block.
+    ///
+    /// Prove-the-test, both blocks this covers and nothing else does:
+    /// delete the `residual_attrs` loop in `contested_names` and `k` is never
+    /// contested, so the fold takes the first occurrence and stamps 7; or
+    /// delete the `overflow` scan in `observe_batch_contested` and the
+    /// columnar occurrence wins, also stamping 7. Either way this reads 7
+    /// where the reader resolves 2.
+    #[test]
+    fn the_columnar_fold_also_lets_an_overflowing_duplicate_win() {
+        use ravel_logseg::LogRecord;
+        let records = [rec(vec![
+            ("k", AttrValue::I64(7)),
+            ("k", AttrValue::I64(-1)),
+            ("k", AttrValue::I64(2)),
+        ])];
+        let to_logrecord = |r: &NormalizedLogRecord| LogRecord {
+            stream_id: r.stream_id,
+            stream_attrs: r.stream_attrs.clone(),
+            ts_ns: r.ts_ns,
+            observed_ts_ns: r.observed_ts_ns,
+            severity_num: r.severity_num,
+            severity_text: r.severity_text.clone(),
+            body: r.body.clone(),
+            trace_id: None,
+            span_id: None,
+            flags: r.flags,
+            attrs: r.attrs.clone(),
+        };
+        let batch =
+            ColumnarLogBatch::from_records(&records.iter().map(to_logrecord).collect::<Vec<_>>());
+        let mut columnar = DeclaredStatAccum::default();
+        columnar.observe_batch(&batch);
+        let stamps = columnar.build_stamps(&[i64_col("k")], 1);
+        let s = stat(&stamps, "k").expect("stamped");
+        assert_eq!(
+            s.min(),
+            Some(DeclaredStatValue::I64(2)),
+            "greatest canonical encoding wins, not the first occurrence (7) \
+             and not the largest integer (7)"
+        );
+        assert_eq!(s.max(), Some(DeclaredStatValue::I64(2)));
+        assert_eq!(s.null_count(), 0, "one record, one non-null row");
+    }
+
     /// Issue #1057 finding 1: a stream whose RESOURCE attributes carry the
     /// declared key as a List and whose SCOPE attributes carry it as a
     /// matching-typed I64 must fall back to the scope value, exactly what the
