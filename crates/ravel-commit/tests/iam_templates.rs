@@ -268,6 +268,73 @@ fn put_resource_key_patterns(policy: &Policy) -> Vec<String> {
     out
 }
 
+/// Resource key patterns (bucket prefix stripped) from every `Allow`
+/// statement granting `s3:DeleteObject`. The `DenyDeleteProtected` block names
+/// `DeleteObject` too, but it is a `Deny`: it withdraws capability rather than
+/// granting it (and an explicit IAM `Deny` always wins), so it is excluded
+/// here. This returns the delete capability a role actually holds.
+fn allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy.statements.as_array().unwrap() {
+        let is_allow = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+        if !is_allow {
+            continue;
+        }
+        let grants_delete = statement_actions(stmt)
+            .iter()
+            .any(|a| action_eq(a, "s3:DeleteObject"));
+        if !grants_delete {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+                out.push(key_pattern.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Resource key patterns (bucket prefix stripped) from every `Deny` statement
+/// naming `s3:DeleteObject` --- the `DenyDeleteProtected` block (ADR-0055 §3).
+fn deny_delete_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy.statements.as_array().unwrap() {
+        let is_deny = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case("Deny"));
+        if !is_deny {
+            continue;
+        }
+        let touches_delete = statement_actions(stmt)
+            .iter()
+            .any(|a| action_eq(a, "s3:DeleteObject"));
+        if !touches_delete {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+                out.push(key_pattern.to_string());
+            }
+        }
+    }
+    out
+}
+
 const ROLES_WITH_DISCOVERY: [&str; 3] = ["gateway", "query", "maintain"];
 const ALL_ROLES: [&str; 4] = ["gateway", "query", "maintain", "admin"];
 
@@ -450,6 +517,60 @@ fn admin_has_no_kms_generate_data_key() {
         "admin: policy must not carry kms:GenerateDataKey* (Decrypt-only per ADR-0055). \
          Found kms actions: {actions:?}"
     );
+}
+
+/// Admin's only `s3:DeleteObject` grant is the transient conformance scratch
+/// prefix `sys/qualify/*`, so `ravel-cli store qualify` can run ADR-0050's
+/// delete-visibility probe (which deletes a key under `sys/qualify/<run-id>/`)
+/// on a fresh bucket without failing closed. Admin holds no delete on tenant
+/// data (`t/**`) or on any key the same policy's `DenyDeleteProtected` block
+/// covers, so ADR-0055's property "Admin never deletes tenant data or a
+/// protected key" still holds. Widen the grant beyond that one prefix, or drop
+/// it so qualification fails the delete probe, and this test fails.
+#[test]
+fn admin_delete_grant_is_qualify_scratch_only() {
+    let policy = load_policy("admin");
+    let deletes = allow_delete_key_patterns(&policy);
+    assert_eq!(
+        deletes,
+        vec!["sys/qualify/*".to_string()],
+        "admin: the only s3:DeleteObject Allow must be the qualification scratch \
+         prefix sys/qualify/* (so `store qualify` can exercise the delete probe); \
+         found {deletes:?}"
+    );
+
+    // Whatever the grant list is, it must reach no real tenant object under
+    // t/**. representative_keys() are all t/<hash>/... shapes, so a delete
+    // pattern matching any of them would grant delete on tenant data.
+    let tenant_keys = representative_keys();
+    for pattern in &deletes {
+        for key in &tenant_keys {
+            assert!(
+                !glob_matches(pattern, key),
+                "admin: delete grant {pattern:?} reaches tenant key {key:?}"
+            );
+        }
+    }
+
+    // ...and it must not cover any key the same policy denies delete on. Each
+    // DenyDeleteProtected pattern is instantiated into a concrete key (every
+    // `*` becomes a literal segment) and the grant glob must not match it.
+    let protected = deny_delete_key_patterns(&policy);
+    assert!(
+        !protected.is_empty(),
+        "admin: DenyDeleteProtected names no delete-protected keys -- the \
+         disjointness check below would pass having examined nothing"
+    );
+    for grant in &deletes {
+        for prot in &protected {
+            let sample = prot.replace('*', "x");
+            assert!(
+                !glob_matches(grant, &sample),
+                "admin: delete grant {grant:?} covers protected key {sample:?} \
+                 (from DenyDeleteProtected pattern {prot:?})"
+            );
+        }
+    }
 }
 
 /// Every role reads SSE-KMS objects at some point (fold, query resolve,
