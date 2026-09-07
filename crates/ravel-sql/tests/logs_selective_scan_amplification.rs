@@ -1754,7 +1754,11 @@ async fn write_compressible_segment(store: &dyn ObjectStoreBackend) -> (SegmentR
     let key = "logs/decompressed_seg.rlog".to_string();
     let content_hash = *blake3::hash(&bytes).as_bytes();
     store
-        .put(&key, bytes::Bytes::from(bytes.clone()), PutOptions::default())
+        .put(
+            &key,
+            bytes::Bytes::from(bytes.clone()),
+            PutOptions::default(),
+        )
         .await
         .expect("put");
     let seg = SegmentRef {
@@ -1817,7 +1821,10 @@ async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
     let b1 = reader_decompressed(&obj, 1, 1) - dirs;
     let b2 = reader_decompressed(&obj, 2, 2) - dirs;
     let all = reader_decompressed(&obj, i64::MIN, i64::MAX);
-    assert!(b0 > 0 && b1 > 0 && b2 > 0, "each block carries a zstd body page");
+    assert!(
+        b0 > 0 && b1 > 0 && b2 > 0,
+        "each block carries a zstd body page"
+    );
     assert_eq!(
         all,
         dirs + b0 + b1 + b2,
@@ -1861,25 +1868,54 @@ async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
     drop(wscan);
     let w = phase_w.snapshot();
 
+    // The ranged (version-4) fetch path decodes SKIP_IDX and PAGE_DIR itself,
+    // to resolve candidate blocks and their pages (`fetch_object_v4`), and now
+    // charges that decode to the scan phase (issue #1401 finding 3). `open_scan`
+    // then builds its own `RlogReader` over the fetched buffer, which decodes
+    // every directory section again to open the object -- `dirs`, `b0`, `b1`,
+    // and `b2` above already include that reader-side cost. So the ranged path
+    // legitimately double-charges SKIP_IDX and PAGE_DIR: once for locating the
+    // candidate blocks before the buffer exists, once for opening the reader
+    // over the buffer it fetched. FIELD_DIR is not part of this fixture's
+    // ranged fetch (`LogQuery::new(0, 0)` carries no NumRange arm and the scan
+    // selects every column, so `fetch_object_v4` skips it, per its own doc
+    // comment), so only these two sections double-count.
+    let footer = ravel_logseg::footer::open(&obj).expect("open");
+    let mut fetch_side_dirs = 0u64;
+    for k in [
+        ravel_logseg::footer::kind::SKIP_IDX,
+        ravel_logseg::footer::kind::PAGE_DIR,
+    ] {
+        let desc = *footer.section(k).expect("section");
+        assert_eq!(
+            desc.comp,
+            ravel_logseg::footer::COMP_ZSTD,
+            "fixture section {k} must be zstd for this test"
+        );
+        fetch_side_dirs += desc.uncomp_len;
+    }
+
     // Each path charges exactly the reader reference for the sections it
-    // decompressed: directories plus the block pages it decoded.
+    // decompressed, plus the ranged path's own fetch-side directory decode.
     assert_eq!(
         r.scan.decompressed_bytes,
-        dirs + b0,
-        "the ranged path decoded only block 0"
+        dirs + b0 + fetch_side_dirs,
+        "the ranged path decoded only block 0, plus its own SKIP_IDX/PAGE_DIR fetch-side decode"
     );
     assert_eq!(
-        w.scan.decompressed_bytes,
-        all,
-        "the whole-object path decoded every block"
+        w.scan.decompressed_bytes, all,
+        "the whole-object path never fetch-side decodes a directory section, so it \
+         matches the reader reference exactly"
     );
 
-    // The whole-object figure exceeds the ranged figure by exactly the pages of
-    // the two blocks the ranged path pruned.
+    // The whole-object figure now trails the ranged figure's directory work by
+    // fetch_side_dirs: the difference is the skipped blocks' pages minus the
+    // ranged path's extra double-charged directory bytes.
     assert_eq!(
         w.scan.decompressed_bytes - r.scan.decompressed_bytes,
-        b1 + b2,
-        "the difference is exactly the skipped blocks' decompressed pages"
+        b1 + b2 - fetch_side_dirs,
+        "the difference is the skipped blocks' pages minus the ranged path's \
+         double-charged SKIP_IDX/PAGE_DIR"
     );
 
     // The figure lands in the scan phase and nowhere else: these funnels open
