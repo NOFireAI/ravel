@@ -1122,3 +1122,146 @@ negative-control violations; the smoke and exhaustive logs contain none.
 `exhaustive.cfg` is not in the `ci` lane (that lane is smoke, negative,
 traceability); it runs under `all`, and its figures above are from a direct
 `scripts/check-tla.sh exhaustive -a lifecycle` run.
+
+## Round nine: a publish must keep the first supersession stamp (review of round eight)
+
+Round eight turned `supersededAt` from a scalar into a function over
+`SupersededCandidates` so two publishing passes could stamp at two different
+clocks. It kept the scalar's write shape: each publish rewrote the stamp of
+every input it resolved, whether or not another publish had already superseded
+that input. A second publish over an already superseded input therefore moved
+that input's protection horizon forward.
+
+That is wrong against the catalog it models. The stamp is the clock at which
+supersession was recorded, and it is recorded once. Downstream, `supersededAt`
+is what `SupersededSweep` gates on and what `NoDeleteInsideProtectionWindow`
+measures a delete against, so a re-stamp makes the sweep check a horizon the
+catalog never held, and at `MaxClock = 2` with `ProtectionHorizon = 1` it can
+push the horizon past the bound and make `EventuallySwept`'s antecedent
+permanently false for that object.
+
+### The fix
+
+Both publishing actions now take the first supersession's clock and leave every
+other entry alone:
+
+```tla
+supersededAt' = [i \in SupersededCandidates |->
+                    IF i \in <resolved inputs> /\ i \notin superseded
+                        THEN clock
+                        ELSE supersededAt[i]]
+```
+
+`PublishRewrite` reads `rwInputs[id]` for its resolved set, `PublishCompaction`
+reads `RawInputs`.
+
+### Both actions needed it: the probe
+
+The review expected `PublishRewrite`'s path to be unreachable in the shipped
+configuration, because `LiveInputs` excludes superseded objects. It is
+reachable. The exclusion holds at the LISTING step and the stamp is written at
+the PUBLISH step, after `superseded` has moved, so a listing taken before a
+sibling publish still carries the input to a second stamp.
+
+Two action properties, one per publishing action, keyed to the only transition
+that writes `supersededAt` in each: `rwPhase[id]` moving `listed` to `done` is
+`PublishRewrite(id)` and nothing else, `cmpPhase` moving `listed` to `done` is
+`PublishCompaction` and nothing else. Each asserts the re-stamp is impossible,
+so a VIOLATED result means it is reachable. One `PROPERTY` per run, TLC 1.7.4,
+`-workers 2 -Xmx2g`, `smoke.cfg` constants.
+
+| probe | tree | constants | result | exit | depth |
+|---|---|---|---|---|---|
+| ProbeNoRewriteRestamp | before fix | shipped | VIOLATED | 13 | 11 |
+| ProbeNoCompactionRestamp | before fix | shipped | holds, complete graph | 0 | 31 |
+| ProbeNoCompactionRestamp | before fix | CompactionIgnoresRewrite = TRUE | VIOLATED | 13 | 8 |
+| ProbeNoCompactionRestamp | before fix | SerializeCompactionAndRewrite = FALSE | VIOLATED | 13 | 9 |
+| ProbeNoRewriteRestamp | after fix | shipped | holds, complete graph | 0 | 30 |
+| ProbeNoCompactionRestamp | after fix | shipped | holds, complete graph | 0 | 30 |
+| ProbeNoCompactionRestamp | after fix | CompactionIgnoresRewrite = TRUE | holds, complete graph | 0 | 32 |
+| ProbeNoCompactionRestamp | after fix | SerializeCompactionAndRewrite = FALSE | holds, complete graph | 0 | 32 |
+
+`PublishCompaction`'s re-stamp is unreachable in the shipped configuration:
+`StartCompaction` refuses while a rewrite output is present, the only action
+that removes one is `RetentionSweep`, that needs the tombstone, and
+`StartCompaction` refuses a tombstoned bucket. Turning off either of the two
+things that close it makes the re-stamp reachable, so its guard covers a live
+branch under the negative controls rather than dead code. Full traces and the
+reasoning in `counterexamples/superseded-restamp-probe.md`.
+
+### Figures after the fix, and the bands
+
+| config | spec | result | states generated | distinct | depth | wall |
+|---|---|---|---|---|---|---|
+| smoke.cfg | Spec | PASS, 16 invariants | 25425839 | 3786411 | 30 | 27s |
+| exhaustive.cfg | FairSpec | PASS, 16 invariants + 2 properties | 25425839 | 3786411 | 30 | 11min 27s |
+| negative/compaction-ignores-rewrite.cfg | Spec | VIOLATED as expected, exit 12 | 37429 | 12268 | 10 | 1s |
+
+The counts moved, so `bands.tsv` is re-derived from these runs with the same
+margin round eight used, about 0.12 percent either side of the observed
+distinct count with depth pinned: both configs 3781800 to 3791000 distinct,
+depth 30 exactly, replacing 3768700 to 3777900 at depth 31.
+
+The graph both grew and got shallower, which is the fix's own signature. Keeping
+the first stamp means an input's horizon no longer slides forward with each
+publish, so objects reach their sweep at the earlier clock and the states that
+follow a sweep are now reachable in fewer steps: depth 31 to 30. It also
+distinguishes states the old expression collapsed, since two behaviours that
+differ only in which publish stamped an input now differ in `supersededAt`:
+distinct 3773271 to 3786411. The seven other negative controls are unchanged;
+`compaction-ignores-rewrite` grew for the same reason (8600 to 12268 distinct)
+and still fires `AtMostOneLiveRecordSetServed` and nothing else.
+
+The two configs still report identical figures because they explore the same
+state graph. `exhaustive.cfg` adds the liveness lane: `Checking 3 branches of
+temporal properties for the complete state space with 11359233 total distinct
+states`, finished in 1min 21s with no violation, so `EventuallySwept` and
+`EventuallyCompleted` both still hold.
+
+### Documentation the fix invalidated
+
+Two places argued from the behaviour that was just removed and would have been
+stale on this tree:
+
+- `LifecycleGC.tla`'s comment on why `StartRewrite` is left unfair under
+  `FairSpec` said a fair `StartRewrite` would re-stamp its inputs' horizon and
+  defer their sweep forever. The publish loop it describes is still real
+  (`RetentionSweep` deletes the output, a fair `StartRewrite` recreates it) but
+  it no longer moves the inputs' horizon, so the comment now says that.
+- `README.md`'s fairness paragraph carried the same claim and now points at the
+  probe note instead.
+
+### Traceability
+
+Two rows gained the code the round-eight split behaviour actually runs through,
+after checking each symbol resolves. The `StartRewrite / PublishRewrite /
+RewriteOutputsAreInputsMinusErased` row now cites the listing and dispatch
+(`erasure_rewrite_bucket`), the listing-time hold check (`bucket_is_held`),
+output construction for all three signals (`build_rewrite`,
+`build_rewrite_logs`, `build_rewrite_spans`) and publication
+(`publish_rewrite_record`), with the two per-signal bit-identity tests and the
+hold test alongside the metrics one. The `PublishRewrite (no lease fence)` row
+adds the convergence path (`publish_rewrite_record`,
+`resolve_already_exists_rewrite`), its convergence test, and the key separation
+test `two_batches_over_same_bucket_produce_different_object_keys`.
+
+Its gap cell moved from `none` to a named missing test: no test in
+`crates/ravel-maintain` interleaves two listing steps around a lease expiry.
+Every convergence test there replays one snapshot through the publish path
+twice, which exercises `CreateIfAbsent` convergence but not the race the row is
+about, where identity B lists the bucket after A's lease expires and publishes
+before A's own publish lands. That is the interleaving `ProbeNoRewriteRestamp`'s
+trace walks, and it is the one the model covers and the suite does not.
+
+### Gates
+
+`scripts/check-tla.sh ci` exit 0, `check-tla: ci: all checks passed`, with
+`lifecycle/MCLifecycleGC smoke: PASS states=25425839 distinct=3786411 depth=30`,
+all eight negative controls VIOLATED as expected, and `lifecycle traceability:
+PASS (20 rows resolve)`. `scripts/check-tla.sh exhaustive -a lifecycle` exit 0.
+`python3 scripts/check_docs.py` exit 0, `docs gate: clean.` Each run unpiped
+from the repository root with its own exit code read.
+
+Every TLC log was read in full. No log in `.cache/tla/logs` contains a
+`Deadlock` line, and the only `Error:` lines are the eight expected
+negative-control violations.
