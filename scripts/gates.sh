@@ -69,6 +69,25 @@ echo "==> scripts/guards/check-test-hygiene.sh"
 echo "==> scripts/check-injected-clock-helpers.sh"
 "$(dirname "$0")/check-injected-clock-helpers.sh"
 
+# Ingest-memory flag-doc overclaim guard (issue #1297). The two ingest memory
+# flags (--max-inflight-ingest-requests, --max-ingest-buffer-bytes) once
+# documented a memory bound that silently excluded the transient gzip inflate,
+# so the flags claimed a ceiling they did not enforce. A flag doc in config.rs
+# that speaks of bounding buffered/resident/ingest memory must therefore also
+# name the inflate/decompression term somewhere in the file's flag docs; a
+# memory-bound claim with no inflate term to qualify it fails here, before the
+# expensive lanes, so the overclaim cannot return by edit. grep -q reports its
+# own exit code (no pipe), per the script's own conventions.
+echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
+config_rs="$(dirname "$0")/../services/ravel-server/src/config.rs"
+if grep -qiE '///.*(buffered|resident|ingest)[^.]*memory' "$config_rs" \
+   && ! grep -qiE '///.*(inflate|decompress)' "$config_rs"; then
+  echo "gates.sh: config.rs documents an ingest memory bound without naming the \
+inflate/decompression term (issue #1297); the flag overclaims a ceiling that \
+excludes the gzip inflate" >&2
+  exit 1
+fi
+
 # Match CI's `check` job: it runs `cargo nextest run --workspace
 # --cargo-profile ci`. Use nextest when it is installed so a local run
 # warms the same `ci`-profile artifacts CI reuses; fall back to `cargo
