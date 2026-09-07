@@ -41,6 +41,16 @@ permissions:
 env:
   ISSUE_LABEL: fuzz-nightly
 
+# Serialize runs so the failure-routing step's read-then-create of the
+# tracking issue cannot race. A scheduled run and a workflow_dispatch run
+# failing at once would otherwise both see an empty issue list and both
+# create one, breaking the single-issue dedup contract. cancel-in-progress
+# stays false: cancelling a fuzz run mid-flight throws away the work and
+# could cancel the very run that found a crash.
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -51,6 +61,12 @@ jobs:
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This job executes code against adversarial fuzz input and runs
+          # build scripts (cargo install/check/fuzz) before any scoped token
+          # exists. Do not persist the workflow token into local git config
+          # where those build scripts could read it.
+          persist-credentials: false
       - uses: ./.github/actions/free-disk-space
 
       # Stable toolchain first (the repo's rust-toolchain.toml pin, picked up
@@ -80,28 +96,42 @@ jobs:
             crates/ravel-segment/fuzz -> target
             crates/ravel-rspan/fuzz -> target
 
-      # ravel-segment: five targets, one shared detached fuzz workspace. Each
-      # run reuses the checked-in seed corpus under fuzz/corpus/<target>/.
-      - name: Fuzz parse_footer
-        working-directory: crates/ravel-segment/fuzz
-        run: cargo +nightly fuzz run parse_footer -- -max_total_time=60
-      - name: Fuzz decode_catalog_v4
-        working-directory: crates/ravel-segment/fuzz
-        run: cargo +nightly fuzz run decode_catalog_v4 -- -max_total_time=60
-      - name: Fuzz decode_catalog_matching_v4
-        working-directory: crates/ravel-segment/fuzz
-        run: cargo +nightly fuzz run decode_catalog_matching_v4 -- -max_total_time=60
-      - name: Fuzz decode_catalog_v5
-        working-directory: crates/ravel-segment/fuzz
-        run: cargo +nightly fuzz run decode_catalog_v5 -- -max_total_time=60
-      - name: Fuzz sparse_probe
-        working-directory: crates/ravel-segment/fuzz
-        run: cargo +nightly fuzz run sparse_probe -- -max_total_time=60
-
-      # ravel-rspan: one target, its own detached fuzz workspace.
-      - name: Fuzz decode_rspan
-        working-directory: crates/ravel-rspan/fuzz
-        run: cargo +nightly fuzz run decode_rspan -- -max_total_time=60
+      # All six targets run in one step so a crash in one does not skip the
+      # rest: six separate steps would each carry the default success()
+      # condition, so the first red target would leave the other five
+      # unfuzzed that night. Each target's exit code is captured on the same
+      # line (never read from $? after an if/fi, which reports the if), no
+      # command is piped or chained past its status, and the step fails at
+      # the end naming every target that broke so the log does not have to be
+      # opened to learn which. The five ravel-segment targets share one
+      # detached fuzz workspace; decode_rspan has its own. Each run reuses the
+      # checked-in seed corpus under fuzz/corpus/<target>/.
+      - name: Fuzz all targets
+        run: |
+          failed=""
+          run_target() {
+            dir="$1"
+            target="$2"
+            echo "::group::fuzz $target"
+            code=0
+            ( cd "$dir" && cargo +nightly fuzz run "$target" -- -max_total_time=60 ) || code=$?
+            echo "::endgroup::"
+            if [ "$code" -ne 0 ]; then
+              echo "::error::fuzz target $target failed (exit $code)"
+              failed="$failed $target"
+            fi
+          }
+          run_target crates/ravel-segment/fuzz parse_footer
+          run_target crates/ravel-segment/fuzz decode_catalog_v4
+          run_target crates/ravel-segment/fuzz decode_catalog_matching_v4
+          run_target crates/ravel-segment/fuzz decode_catalog_v5
+          run_target crates/ravel-segment/fuzz sparse_probe
+          run_target crates/ravel-rspan/fuzz decode_rspan
+          if [ -n "$failed" ]; then
+            echo "Fuzz targets failed:$failed"
+            exit 1
+          fi
+          echo "All six fuzz targets passed."
 
       # Failure routing: a red run files a labelled tracking issue linking
       # this run, or comments on the existing open one so a recurring failure
