@@ -10,9 +10,10 @@ Target invariant: `RewriteOutputsAreInputsMinusErased`. TLC exit 12.
 Error: Invariant RewriteOutputsAreInputsMinusErased is violated.
 ```
 
-Trace: `PerformRewrite` materialises `rwA` from the raw inputs. With the switch
-on, `RewriteOutputContent` retains a record whose subject the applied erasure
-request removed, so the final `objContent["rwA"] = {rec1}` and `store["rwA"]` is
-present. The invariant reads the materialised output content and requires it to
-exclude every erased subject; because `rwA` still serves that subject the
-invariant fails at the `PerformRewrite` state.
+Trace: the rewrite pass (`StartRewrite` then `PublishRewrite`) materialises
+`rwA` from the raw inputs. With the switch on, `RecordSetContent` retains a
+record whose subject the applied erasure request removed, so the final
+`objContent["rwA"] = {rec1}` and `store["rwA"]` is present. The invariant reads
+the materialised output content and requires it to exclude every erased subject;
+because `rwA` still serves that subject the invariant fails at the
+`PublishRewrite` state.
