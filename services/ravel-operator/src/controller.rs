@@ -91,6 +91,25 @@ pub enum Error {
         reason: String,
     },
 
+    /// The operator is forbidden (HTTP 403) from reading a Secret the spec
+    /// references in its namespace. Under the per-namespace secrets grant
+    /// (ADR-0034 hardening amendment, issue #126) the operator watches
+    /// `RavelCluster` cluster-wide but is granted `secrets get` only in
+    /// namespaces where the `ravel-operator-secrets` RoleBinding is applied, so
+    /// a RavelCluster in an unbound namespace 403s here. Surfaced as a
+    /// `Degraded` status condition with reason `SecretsUnreadable`, naming the
+    /// namespace and Secret, so `kubectl describe` shows exactly which
+    /// RoleBinding is missing rather than a bare reconcile failure.
+    #[error("secret {name} in namespace {namespace} is not readable: {reason}")]
+    SecretsUnreadable {
+        /// The Secret the operator could not read.
+        name: String,
+        /// The namespace the read was attempted in (the RavelCluster's own).
+        namespace: String,
+        /// Why the read was refused, including which RoleBinding to apply.
+        reason: String,
+    },
+
     /// A Kubernetes API call failed.
     #[error("kube API error: {0}")]
     Kube(#[from] kube::Error),
@@ -187,7 +206,7 @@ async fn resolve_token_secret(
     let secret = api
         .get(&secret_ref.name)
         .await
-        .map_err(|err| secret_error(err, &secret_ref.name, "tenantTokensSecretRef"))?;
+        .map_err(|err| secret_error(err, &secret_ref.name, namespace, "tenantTokensSecretRef"))?;
     let resource_version = secret.resource_version();
     let mut token_values: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     if let Some(data) = &secret.data {
@@ -221,7 +240,7 @@ async fn secret_resource_version(
     let secret = api
         .get(name)
         .await
-        .map_err(|err| secret_error(err, name, field))?;
+        .map_err(|err| secret_error(err, name, namespace, field))?;
     Ok(secret.resource_version())
 }
 
@@ -285,13 +304,26 @@ async fn resolve_credential_resource_versions(
 }
 
 /// Map a Secret `get` error: a 404 becomes [`Error::SecretNotFound`] naming the
-/// Secret and the spec field that referenced it; anything else stays a
-/// [`Error::Kube`].
-fn secret_error(err: kube::Error, name: &str, field: &str) -> Error {
+/// Secret and the spec field that referenced it; a 403 becomes
+/// [`Error::SecretsUnreadable`] naming the namespace, Secret, and the
+/// RoleBinding to apply (the per-namespace secrets grant, issue #126); anything
+/// else stays a [`Error::Kube`].
+fn secret_error(err: kube::Error, name: &str, namespace: &str, field: &str) -> Error {
     if is_not_found(&err) {
         Error::SecretNotFound {
             name: name.to_string(),
             reason: format!("referenced by spec.{field} but absent from the namespace"),
+        }
+    } else if is_forbidden(&err) {
+        Error::SecretsUnreadable {
+            name: name.to_string(),
+            namespace: namespace.to_string(),
+            reason: format!(
+                "the operator's ServiceAccount is forbidden from reading it (referenced by \
+                 spec.{field}); bind the ravel-operator-secrets ClusterRole in namespace \
+                 {namespace} with a RoleBinding (see \
+                 deploy/k8s/operator/secrets-rolebinding.yaml)"
+            ),
         }
     } else {
         Error::Kube(err)
@@ -360,7 +392,7 @@ async fn resolve_deployment_key(
     let secret = api
         .get(&secret_ref.name)
         .await
-        .map_err(|err| secret_error(err, &secret_ref.name, "deploymentKeySecretRef"))?;
+        .map_err(|err| secret_error(err, &secret_ref.name, namespace, "deploymentKeySecretRef"))?;
     let resource_version = secret.resource_version();
     let raw = secret_value(&secret, DEPLOYMENT_KEY_SECRET_KEY).ok_or_else(|| {
         Error::InvalidSecretValue {
@@ -393,10 +425,14 @@ async fn resolve_s3_credentials(
     secret_ref: &LocalSecretRef,
 ) -> Result<(String, String), Error> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let secret = api
-        .get(&secret_ref.name)
-        .await
-        .map_err(|err| secret_error(err, &secret_ref.name, "storage.s3.credentialsSecretRef"))?;
+    let secret = api.get(&secret_ref.name).await.map_err(|err| {
+        secret_error(
+            err,
+            &secret_ref.name,
+            namespace,
+            "storage.s3.credentialsSecretRef",
+        )
+    })?;
     let field = |key: &str| -> Result<String, Error> {
         let raw = secret_value(&secret, key).ok_or_else(|| Error::InvalidSecretValue {
             name: secret_ref.name.clone(),
@@ -1458,6 +1494,14 @@ fn is_not_found(err: &kube::Error) -> bool {
     matches!(err, kube::Error::Api(response) if response.code == 404)
 }
 
+/// Whether a kube error is a 403 Forbidden. A Secret read that returns this is
+/// the missing-per-namespace-RoleBinding case (issue #126): the operator
+/// watches `RavelCluster` cluster-wide but holds `secrets get` only where the
+/// `ravel-operator-secrets` RoleBinding is applied.
+fn is_forbidden(err: &kube::Error) -> bool {
+    matches!(err, kube::Error::Api(response) if response.code == 403)
+}
+
 /// `<instance>-<component>`, matching [`crate::reconcile`]'s naming.
 fn child(instance: &str, component: &str) -> String {
     format!("{instance}-{component}")
@@ -1686,6 +1730,14 @@ fn degraded_reason(err: &Error) -> (String, String) {
         } => (
             "InvalidSecretValue".to_string(),
             format!("Secret \"{name}\" field \"{field}\": {reason}"),
+        ),
+        Error::SecretsUnreadable {
+            name,
+            namespace,
+            reason,
+        } => (
+            "SecretsUnreadable".to_string(),
+            format!("Secret \"{name}\" in namespace \"{namespace}\" is not readable: {reason}"),
         ),
         Error::Render(RenderError::RouterImageMissing) => {
             ("RouterImageMissing".to_string(), err.to_string())
@@ -1955,6 +2007,52 @@ mod tests {
         let (reason, message) = degraded_reason(&err);
         assert_eq!(reason, "SecretNotFound");
         assert!(message.contains("ravel-tokens"), "message names the Secret");
+    }
+
+    #[test]
+    fn forbidden_secret_read_surfaces_secrets_unreadable_condition() {
+        // A 403 on the namespaced Secret GET is the missing-per-namespace-
+        // RoleBinding case (issue #126, ADR-0034 hardening amendment): the
+        // operator watches RavelCluster cluster-wide but holds `secrets get`
+        // only where the ravel-operator-secrets RoleBinding is applied. It must
+        // map to a named SecretsUnreadable condition carrying the exact
+        // namespace and Secret, never a bare ReconcileError, so the missing
+        // binding is visible on the RavelCluster.
+        let err = kube::Error::Api(Box::new(kube::core::Status {
+            code: 403,
+            reason: "Forbidden".to_string(),
+            message: "secrets \"team-a-tokens\" is forbidden".to_string(),
+            ..Default::default()
+        }));
+        let mapped = secret_error(err, "team-a-tokens", "team-a", "tenantTokensSecretRef");
+        match &mapped {
+            Error::SecretsUnreadable {
+                name,
+                namespace,
+                reason,
+            } => {
+                assert_eq!(name, "team-a-tokens", "names the exact Secret");
+                assert_eq!(namespace, "team-a", "names the exact namespace");
+                assert!(
+                    reason.contains("secrets-rolebinding.yaml"),
+                    "reason points at the RoleBinding template: {reason}"
+                );
+            }
+            other => panic!("403 must map to SecretsUnreadable, got {other:?}"),
+        }
+        let (reason, message) = degraded_reason(&mapped);
+        assert_eq!(
+            reason, "SecretsUnreadable",
+            "condition reason is the named one"
+        );
+        assert!(
+            message.contains("team-a-tokens"),
+            "condition message names the Secret: {message}"
+        );
+        assert!(
+            message.contains("team-a"),
+            "condition message names the namespace: {message}"
+        );
     }
 
     #[test]

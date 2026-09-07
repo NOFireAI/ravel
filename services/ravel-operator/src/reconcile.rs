@@ -5079,13 +5079,16 @@ mod tests {
     }
 
     #[test]
-    fn rbac_manifest_carries_no_cluster_wide_secrets_rule() {
-        // Deliverable 5, manifest lint. A dependency-free text scan of the
-        // shipped rbac.yaml, run by the existing `cargo test -p ravel-operator`
-        // gate: the operator's ClusterRole must NOT grant `secrets`, and the
-        // read must instead come from a namespaced Role. It fails on the current
-        // rbac.yaml before the narrowing lands, which is exactly the
-        // prove-the-test demonstration.
+    fn rbac_manifest_never_grants_secrets_cluster_wide() {
+        // Issue #126 manifest lint. A dependency-free text scan of the shipped
+        // rbac.yaml, run by the existing `cargo test -p ravel-operator` gate.
+        // The operator must hold no standing cluster-wide Secret read: the
+        // cluster-wide ClusterRole (ravel-operator, the one the
+        // ClusterRoleBinding binds) grants no `secrets`, the secrets read lives
+        // in a separate ravel-operator-secrets ClusterRole, and NO
+        // ClusterRoleBinding may reference that secrets ClusterRole (a
+        // ClusterRoleBinding would make it cluster-wide; only RoleBindings, which
+        // are namespace-scoped, may bind it).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../deploy/k8s/operator/rbac.yaml");
         let manifest = std::fs::read_to_string(&path)
@@ -5093,28 +5096,54 @@ mod tests {
 
         // Split into YAML documents and classify each by its `kind:` line. A
         // ClusterRoleBinding also contains the text "ClusterRole", so match the
-        // kind line exactly rather than with a substring.
+        // kind line exactly rather than with a substring. `has_name` matches a
+        // metadata (or roleRef) name line exactly, so `ravel-operator` does not
+        // also match `ravel-operator-secrets`.
         let docs: Vec<&str> = manifest.split("\n---").collect();
         let kind_is =
             |doc: &str, kind: &str| doc.lines().any(|l| l.trim() == format!("kind: {kind}"));
+        let has_name =
+            |doc: &str, name: &str| doc.lines().any(|l| l.trim() == format!("name: {name}"));
 
-        let cluster_role = docs
+        // No ClusterRoleBinding may bind the secrets ClusterRole cluster-wide.
+        for doc in &docs {
+            if kind_is(doc, "ClusterRoleBinding") {
+                assert!(
+                    !doc.contains("ravel-operator-secrets"),
+                    "the secrets read must never be bound cluster-wide by a \
+                     ClusterRoleBinding; bind it per namespace with a RoleBinding"
+                );
+            }
+        }
+
+        // The cluster-wide operator ClusterRole grants no secrets.
+        let main_cluster_role = docs
             .iter()
-            .find(|d| kind_is(d, "ClusterRole"))
-            .expect("rbac.yaml defines a ClusterRole");
+            .find(|d| kind_is(d, "ClusterRole") && has_name(d, "ravel-operator"))
+            .expect("rbac.yaml defines the ravel-operator ClusterRole");
         assert!(
-            !cluster_role.contains("secrets"),
-            "the operator ClusterRole must not grant a cluster-wide secrets rule; \
-             narrow it to a namespaced Role"
+            !main_cluster_role.contains("secrets"),
+            "the cluster-wide ravel-operator ClusterRole must not grant a secrets rule"
         );
 
-        let secrets_role = docs
+        // The secrets read lives in its own ClusterRole, get only, bound per
+        // namespace by a RoleBinding (ravel-system ships one).
+        let secrets_cluster_role = docs
             .iter()
-            .find(|d| kind_is(d, "Role") && d.contains("secrets"))
-            .expect("a namespaced Role must grant the secrets read");
+            .find(|d| kind_is(d, "ClusterRole") && has_name(d, "ravel-operator-secrets"))
+            .expect("rbac.yaml defines the ravel-operator-secrets ClusterRole");
         assert!(
-            secrets_role.contains("verbs: [\"get\"]"),
-            "the namespaced secrets Role grants get only"
+            secrets_cluster_role.contains("secrets")
+                && secrets_cluster_role.contains("verbs: [\"get\"]"),
+            "the ravel-operator-secrets ClusterRole grants secrets get only"
+        );
+        let secrets_binding = docs
+            .iter()
+            .find(|d| kind_is(d, "RoleBinding") && d.contains("ravel-operator-secrets"))
+            .expect("a RoleBinding binds the secrets ClusterRole in a namespace");
+        assert!(
+            secrets_binding.contains("namespace: ravel-system"),
+            "the shipped secrets RoleBinding binds ravel-system, the operator's own namespace"
         );
     }
 }
