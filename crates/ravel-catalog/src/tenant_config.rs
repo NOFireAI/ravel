@@ -59,6 +59,15 @@ pub const TENANT_CONFIG_FORMAT_VERSION: u32 = 1;
 /// this reader accepts 2 fleet-wide.
 pub const TENANT_CONFIG_MAX_READ_VERSION: u32 = 2;
 
+/// Lowest record version a reader accepts: the supported read set is a closed
+/// interval `TENANT_CONFIG_MIN_READ_VERSION..=TENANT_CONFIG_MAX_READ_VERSION`, a
+/// set with a floor and not a ceiling. Version 0 is an unstamped record from a
+/// writer that never set `format_version`; admitting it would let a valid-shaped
+/// but unstamped record be applied by `read_config` and rewritten as version 1
+/// by the CAS `set_tenant_config` path, so it is refused with the same
+/// `UnsupportedVersion` error the ceiling uses (ADR-0066 decision 4).
+pub const TENANT_CONFIG_MIN_READ_VERSION: u32 = 1;
+
 /// Object key for a tenant's config record: `t/<hex>/config`. Tenant-scoped, not
 /// per-signal (ADR-0066 decision 6). Under the tenant's own prefix, alongside its
 /// per-signal `<sig>/prov` and tenant-scoped `enc` records, never a bucket-root
@@ -416,7 +425,9 @@ fn decode_record(
     key: &str,
     tenant_hash: &TenantHash,
 ) -> Result<TenantConfig, TenantConfigError> {
-    if record.format_version > TENANT_CONFIG_MAX_READ_VERSION {
+    if record.format_version < TENANT_CONFIG_MIN_READ_VERSION
+        || record.format_version > TENANT_CONFIG_MAX_READ_VERSION
+    {
         return Err(TenantConfigError::UnsupportedVersion {
             key: key.to_string(),
             got: record.format_version,
@@ -927,7 +938,7 @@ mod tests {
     /// A record past the supported read set (version 3, above
     /// TENANT_CONFIG_MAX_READ_VERSION) is refused rather than misread. Version 2
     /// is inside the set and accepted (see
-    /// reader_accepts_version_one_and_two_and_refuses_three).
+    /// reader_accepts_version_one_and_two_and_refuses_zero_and_three).
     #[tokio::test]
     async fn read_rejects_future_format_version() {
         let store = mem();
@@ -952,12 +963,14 @@ mod tests {
         assert!(matches!(err, TenantConfigError::UnsupportedVersion { .. }));
     }
 
-    /// The read-side supported set is {1, 2}: a version-1 and a version-2 record
-    /// both read back through `read_config`; a version-3 record is refused with a
-    /// typed UnsupportedVersion. Pins ADR-0066 decision 4 for the tenant-config
-    /// reader gate (decode_record).
+    /// The read-side supported set is exactly {1, 2}, a set with a floor and a
+    /// ceiling: a version-1 and a version-2 record both read back through
+    /// `read_config`; both a version-0 record (below the floor: an unstamped
+    /// record from a writer that never set format_version) and a version-3 record
+    /// (above the ceiling) are refused with a typed UnsupportedVersion. Pins
+    /// ADR-0066 decision 4 for the tenant-config reader gate (decode_record).
     #[tokio::test]
-    async fn reader_accepts_version_one_and_two_and_refuses_three() {
+    async fn reader_accepts_version_one_and_two_and_refuses_zero_and_three() {
         for version in [1u32, 2u32] {
             let store = mem();
             let mut record = build_record(
@@ -1002,6 +1015,32 @@ mod tests {
             .expect_err("version 3 must be refused");
         assert!(
             matches!(err, TenantConfigError::UnsupportedVersion { got: 3, .. }),
+            "got: {err}"
+        );
+
+        // Version 0 (below the floor: an unstamped record) is refused too. A
+        // supported set has a floor as well as a ceiling.
+        let store = mem();
+        let mut v0 = build_record(
+            &tenant(),
+            &TenantConfig::new(TenantLifecycleState::Active),
+            0,
+            0,
+        );
+        v0.format_version = 0;
+        store
+            .put(
+                &config_key(&tenant()),
+                v0.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed v0");
+        let err = read_config(store.as_ref(), &tenant())
+            .await
+            .expect_err("version 0 must be refused");
+        assert!(
+            matches!(err, TenantConfigError::UnsupportedVersion { got: 0, .. }),
             "got: {err}"
         );
     }

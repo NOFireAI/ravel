@@ -56,7 +56,8 @@ pub use key_epoch::{
 pub use metrics_meta::{
     DEFAULT_METRICS_META_ENTRY_CAP, MAX_METRICS_META_DECOMPRESSED_BYTES,
     METRICS_META_FORMAT_VERSION, MergeOutcome, MetricKind, MetricMetadataEntry, MetricsMetaDefect,
-    MetricsMetaError, merge_entries, metrics_meta_key, read_metrics_meta, write_metrics_meta,
+    MetricsMetaError, merge_entries, metrics_meta_key, read_metrics_meta,
+    read_metrics_meta_for_serve, write_metrics_meta,
 };
 pub use provisioning::{
     AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, FLUSH_BOUND_SLACK_HOURS, FloorDefect,

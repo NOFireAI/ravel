@@ -62,6 +62,15 @@ pub const PROVISIONING_FORMAT_VERSION: u32 = 1;
 /// 2 fleet-wide.
 pub const PROVISIONING_MAX_READ_VERSION: u32 = 2;
 
+/// Lowest record version a reader accepts: the supported read set is a closed
+/// interval `PROVISIONING_MIN_READ_VERSION..=PROVISIONING_MAX_READ_VERSION`, a
+/// set with a floor and not a ceiling. Version 0 is an unstamped record from a
+/// writer that never set `format_version`; admitting it would let a valid-shaped
+/// but unstamped record enter shard routing and be rewritten as version 1 by a
+/// CAS path, so it is refused with the same `UnsupportedVersion` error the
+/// ceiling uses (ADR-0066 decision 4).
+pub const PROVISIONING_MIN_READ_VERSION: u32 = 1;
+
 /// Object key for a (tenant, signal) provisioning record: `t/<hex>/<sig>/prov`.
 /// Under the tenant's own prefix, alongside its `l0/` and `c/` shard data, not
 /// a bucket-root `sys/` object (ADR-0050 section 5).
@@ -849,7 +858,9 @@ pub fn read_generations_checked(
     tenant_hash: &TenantHash,
     signal: Signal,
 ) -> Result<Vec<ShardGeneration>, ProvisioningError> {
-    if record.format_version > PROVISIONING_MAX_READ_VERSION {
+    if record.format_version < PROVISIONING_MIN_READ_VERSION
+        || record.format_version > PROVISIONING_MAX_READ_VERSION
+    {
         return Err(ProvisioningError::UnsupportedVersion {
             key: key.to_string(),
             got: record.format_version,
@@ -1121,7 +1132,9 @@ fn validate_record(
     signal: Signal,
     shard_count: u32,
 ) -> Result<(), ProvisioningError> {
-    if record.format_version > PROVISIONING_MAX_READ_VERSION {
+    if record.format_version < PROVISIONING_MIN_READ_VERSION
+        || record.format_version > PROVISIONING_MAX_READ_VERSION
+    {
         return Err(ProvisioningError::UnsupportedVersion {
             key: key.to_string(),
             got: record.format_version,
@@ -1631,7 +1644,9 @@ pub fn read_floors_checked(
     tenant_hash: &TenantHash,
     signal: Signal,
 ) -> Result<Vec<FormatFloor>, ProvisioningError> {
-    if record.format_version > PROVISIONING_MAX_READ_VERSION {
+    if record.format_version < PROVISIONING_MIN_READ_VERSION
+        || record.format_version > PROVISIONING_MAX_READ_VERSION
+    {
         return Err(ProvisioningError::UnsupportedVersion {
             key: key.to_string(),
             got: record.format_version,
@@ -2354,7 +2369,7 @@ pub(crate) mod tests {
         let mut record = build_record(&tenant(), Signal::Metrics, 4, 1_000);
         // A version past the supported read set (3, above PROVISIONING_MAX_READ_VERSION
         // = 2). Version 2 is now inside the read set and is accepted on the read
-        // path (see reader_accepts_version_one_and_two_and_refuses_three).
+        // path (see reader_accepts_version_one_and_two_and_refuses_zero_and_three).
         record.format_version = PROVISIONING_MAX_READ_VERSION + 1;
         store
             .put(&key, record.encode_to_vec().into(), PutOptions::default())
@@ -3305,7 +3320,7 @@ pub(crate) mod tests {
     /// (version 3, above PROVISIONING_MAX_READ_VERSION) before ever trusting its
     /// generation history, matching the guard [`validate_record`] applies on the
     /// [`validate_or_adopt`] path. Version 2 is inside the set and is accepted
-    /// (see reader_accepts_version_one_and_two_and_refuses_three).
+    /// (see reader_accepts_version_one_and_two_and_refuses_zero_and_three).
     #[test]
     fn read_generations_checked_rejects_future_format_version() {
         let record = sysproto::ProvisioningRecord {
@@ -4069,13 +4084,16 @@ pub(crate) mod tests {
         }
     }
 
-    /// The read-side supported set is {1, 2}: a version-1 and a version-2 record
-    /// are both accepted at every reader gate (validate_or_adopt's validate_record,
-    /// read_generations_checked, read_floors_checked), and a version-3 record is
-    /// refused at each with a typed UnsupportedVersion. Pins ADR-0066 decision 4's
-    /// "accepting {1, 2} and refusing 3" for the three provisioning reader sites.
+    /// The read-side supported set is exactly {1, 2}, a closed set with a floor
+    /// and a ceiling: a version-1 and a version-2 record are both accepted at
+    /// every reader gate (validate_or_adopt's validate_record,
+    /// read_generations_checked, read_floors_checked), while both a version-0
+    /// record (below the floor: an unstamped record from a writer that never set
+    /// format_version) and a version-3 record (above the ceiling) are refused at
+    /// each with a typed UnsupportedVersion. Pins ADR-0066 decision 4's supported
+    /// set for the three provisioning reader sites.
     #[tokio::test]
-    async fn reader_accepts_version_one_and_two_and_refuses_three() {
+    async fn reader_accepts_version_one_and_two_and_refuses_zero_and_three() {
         let key = provisioning_key(&tenant(), Signal::Metrics);
 
         for version in [1u32, 2u32] {
@@ -4143,6 +4161,48 @@ pub(crate) mod tests {
                 Err(ProvisioningError::UnsupportedVersion { got: 3, .. })
             ),
             "validate_record must refuse version 3"
+        );
+
+        // Version 0 (below the floor: an unstamped record from a writer that
+        // never set format_version) is refused at each gate. A supported set has
+        // a floor as well as a ceiling: admitting version 0 would let a
+        // valid-shaped but unstamped record enter shard routing and later be
+        // rewritten as version 1 by a CAS path.
+        let mut v0 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        v0.format_version = 0;
+        assert!(
+            matches!(
+                read_generations_checked(&v0, &key, &tenant(), Signal::Metrics),
+                Err(ProvisioningError::UnsupportedVersion { got: 0, .. })
+            ),
+            "read_generations_checked must refuse version 0"
+        );
+        assert!(
+            matches!(
+                read_floors_checked(&v0, &key, &tenant(), Signal::Metrics),
+                Err(ProvisioningError::UnsupportedVersion { got: 0, .. })
+            ),
+            "read_floors_checked must refuse version 0"
+        );
+        let store = mem();
+        store
+            .put(&key, v0.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed v0");
+        assert!(
+            matches!(
+                validate_or_adopt(
+                    store.as_ref(),
+                    &tenant(),
+                    Signal::Metrics,
+                    4,
+                    1_000,
+                    AbsentPolicy::CheckOnly,
+                )
+                .await,
+                Err(ProvisioningError::UnsupportedVersion { got: 0, .. })
+            ),
+            "validate_record must refuse version 0"
         );
     }
 
