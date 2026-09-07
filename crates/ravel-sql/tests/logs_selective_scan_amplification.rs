@@ -75,13 +75,18 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_logseg::{
+    AttrValue, ColumnSelection, LogRecord, Predicate, RlogConfig, RlogReader, RlogWriter,
+    stream_attrs_bytes,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{BlockRangeFetcher, CacheFetchError, LogSegmentFetcher, QueryPhase};
+use ravel_query::{
+    BlockRangeFetcher, CacheFetchError, LogQuery, LogSegmentFetcher, PhaseAccounting, QueryPhase,
+};
 use ravel_sql::{
     DeclaredColumn, DeclaredType, FIRST_DECLARED_COL, LOG_COL_TS, LogsTableProvider, has_word_udf,
 };
@@ -1693,4 +1698,199 @@ async fn carried_object_reopen_does_not_double_charge_reused_bytes() {
          pay for its own re-fetch instead of double-charging the same \
          buffer as reused a second time"
     );
+}
+
+// ---- issue #1401: decompressed-byte accounting follows the decode path -----
+//
+// The fixtures above use incompressible filler so every body page stays raw:
+// perfect for wire-byte proportionality, useless for decompressed bytes, which
+// only a zstd page produces. These tests use their own compressible-body
+// segment so each block's `body` page is stored COMP_ZSTD and decoding it
+// charges a nonzero, exactly-known decompressed length.
+
+/// A body zstd shrinks hard (one 12-byte phrase repeated), so its `body` page
+/// is stored COMP_ZSTD and decompresses to a nonzero, countable length.
+fn compressible_body(blk: usize) -> String {
+    format!("blk{blk} {}", "log message ".repeat(400))
+}
+
+fn compressible_record(blk: usize) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("svc".to_string()),
+    )];
+    let ts = blk as i64;
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: compressible_body(blk),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
+/// Blocks in the decompressed-accounting fixture: one record per block, distinct
+/// `ts_ns` per block, so a ts range prunes an exact block subset at the skip
+/// index (the ranged path then fetches only that subset).
+const DECOMP_BLOCKS: usize = 3;
+
+/// Build a single 3-block segment with compressible bodies and return its
+/// `SegmentRef` alongside the raw object, so a whole-object [`RlogReader`] can
+/// compute the exact decompressed reference each scan path must match.
+async fn write_compressible_segment(store: &dyn ObjectStoreBackend) -> (SegmentRef, Vec<u8>) {
+    let recs: Vec<LogRecord> = (0..DECOMP_BLOCKS).map(compressible_record).collect();
+    let mut w = RlogWriter::new(one_record_blocks(), identity(1));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let size = bytes.len() as u64;
+    let key = "logs/decompressed_seg.rlog".to_string();
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(&key, bytes::Bytes::from(bytes.clone()), PutOptions::default())
+        .await
+        .expect("put");
+    let seg = SegmentRef {
+        data_object_key: key,
+        object_size: size,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: (DECOMP_BLOCKS - 1) as i64,
+        ingest_hour_bucket: 0,
+        sample_count: recs.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash,
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: 1,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
+    };
+    (seg, bytes)
+}
+
+/// `ScanStats.decompressed_bytes` a whole-object [`RlogReader`] reports for a
+/// scan over the inclusive ts range `[lo, hi]`: the reference each fetcher scan
+/// path must match to the byte.
+fn reader_decompressed(obj: &[u8], lo: i64, hi: i64) -> u64 {
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(obj, &cfg).expect("open");
+    let mut scan = reader
+        .scan_blocks(
+            &Predicate::TsRange {
+                min_ns: lo,
+                max_ns: hi,
+            },
+            &[],
+            &ColumnSelection::all(),
+        )
+        .expect("scan");
+    while scan.next_block(obj).expect("next").is_some() {}
+    scan.stats().decompressed_bytes
+}
+
+/// A logs scan's `decompressed_bytes` counts exactly what the scan decoded, on
+/// both the ranged and the whole-object fetch paths, and lands in the scan
+/// phase. The whole-object statement decodes every block; the ranged statement
+/// is ts-pruned to block 0; the difference is exactly the pages of the blocks
+/// the ranged path skipped, which is the number that shows the counter follows
+/// the decode path and not the fetch (issue #1401).
+#[tokio::test]
+async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let (seg, obj) = write_compressible_segment(store.as_ref()).await;
+
+    // Reader references. A ts range matching no block decodes nothing, so it
+    // reports only the object's directory decompression (the open-time seed);
+    // each single-block scan is that seed plus that block's zstd page bytes.
+    let dirs = reader_decompressed(&obj, 1_000, 1_000);
+    let b0 = reader_decompressed(&obj, 0, 0) - dirs;
+    let b1 = reader_decompressed(&obj, 1, 1) - dirs;
+    let b2 = reader_decompressed(&obj, 2, 2) - dirs;
+    let all = reader_decompressed(&obj, i64::MIN, i64::MAX);
+    assert!(b0 > 0 && b1 > 0 && b2 > 0, "each block carries a zstd body page");
+    assert_eq!(
+        all,
+        dirs + b0 + b1 + b2,
+        "an all-blocks scan is the directories plus every block's pages"
+    );
+
+    // Ranged path: a ts-pruned statement decoding only block 0.
+    let ranged = fetcher(Arc::clone(&store), 1 << 20);
+    let phase_r = PhaseAccounting::new();
+    let mut rscan = ranged
+        .scan_accounted_with_tenant(
+            &seg,
+            TenantHash(TENANT),
+            &LogQuery::new(0, 0),
+            &ColumnSelection::all(),
+            phase_r.scan(),
+        )
+        .await
+        .expect("ranged scan")
+        .expect("segment is ts-relevant");
+    while rscan.next_block().expect("next").is_some() {}
+    drop(rscan);
+    let r = phase_r.snapshot();
+
+    // Whole-object path: a full-window statement reading the whole object in one
+    // GET and decoding every block.
+    let whole = fetcher(Arc::clone(&store), 1 << 20);
+    let phase_w = PhaseAccounting::new();
+    let mut wscan = whole
+        .scan_whole_accounted_with_tenant(
+            &seg,
+            TenantHash(TENANT),
+            &LogQuery::new(i64::MIN, i64::MAX),
+            &ColumnSelection::all(),
+            phase_w.scan(),
+        )
+        .await
+        .expect("whole scan")
+        .expect("segment is ts-relevant");
+    while wscan.next_block().expect("next").is_some() {}
+    drop(wscan);
+    let w = phase_w.snapshot();
+
+    // Each path charges exactly the reader reference for the sections it
+    // decompressed: directories plus the block pages it decoded.
+    assert_eq!(
+        r.scan.decompressed_bytes,
+        dirs + b0,
+        "the ranged path decoded only block 0"
+    );
+    assert_eq!(
+        w.scan.decompressed_bytes,
+        all,
+        "the whole-object path decoded every block"
+    );
+
+    // The whole-object figure exceeds the ranged figure by exactly the pages of
+    // the two blocks the ranged path pruned.
+    assert_eq!(
+        w.scan.decompressed_bytes - r.scan.decompressed_bytes,
+        b1 + b2,
+        "the difference is exactly the skipped blocks' decompressed pages"
+    );
+
+    // The figure lands in the scan phase and nowhere else: these funnels open
+    // the scan reader directly and never run a plan-phase survivor count.
+    for (name, snap) in [("ranged", &r), ("whole", &w)] {
+        assert_eq!(snap.resolve.decompressed_bytes, 0, "{name} resolve phase");
+        assert_eq!(snap.plan.decompressed_bytes, 0, "{name} plan phase");
+        assert_eq!(snap.probe.decompressed_bytes, 0, "{name} probe phase");
+        assert!(
+            snap.scan.decompressed_bytes > 0,
+            "{name} scan phase carries the decompressed bytes"
+        );
+    }
 }

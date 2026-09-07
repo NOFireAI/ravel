@@ -94,19 +94,24 @@ pub fn estimate_metrics_cost(snapshot: &Snapshot, catalog_requests: u64) -> Cost
 /// Cost estimate for a logs-target SQL query, given the pinned snapshot and
 /// the catalog term computed before `resolve` ran.
 ///
-/// The log fetch funnel (`LogSegmentFetcher::fetch_accounted`) issues
-/// exactly one GET per relevant segment and never decompresses on a
-/// separately-accounted path (it never calls `add_decompressed_bytes`), so
-/// both the request count and the byte sums here are exact bounds rather
-/// than padded guesses: no chase/retry safety factor applies because there
-/// is no chase/retry path to guard against.
+/// The log fetch funnel (`LogSegmentFetcher::fetch_accounted`) issues exactly
+/// one GET per relevant segment, so the request count and the store-byte sum
+/// here are exact bounds rather than padded guesses: no chase/retry safety
+/// factor applies because there is no chase/retry path to guard against. The
+/// funnel does now decompress on a separately-accounted path -- the scan reader
+/// calls `add_decompressed_bytes` for the directory sections it opens and the
+/// block pages it decodes (issue #1401) -- but that is an OBSERVED figure the
+/// scan reports after the fact, not part of this pre-execution bound: the
+/// estimate here carries no decompressed-byte term for logs (it passes `0`),
+/// because a logs scan's decompressed output depends on which blocks survive
+/// pruning, which this snapshot-only estimate does not compute.
 ///
 /// This serves the `alerts` and `audit` tables too (ADR-1101 decision 1), not
 /// only `logs`. An alert record and an audit record ride RLOG v1 verbatim, so
 /// their scans fetch through the same funnel with the same shape: one
-/// `fetch_accounted_with_tenant` per relevant segment, one GET each, no
-/// separately-accounted decompression. The estimate is therefore identical,
-/// and a renamed copy per table would only invite drift.
+/// `fetch_accounted_with_tenant` per relevant segment, one GET each, the same
+/// after-the-fact decompressed-byte accounting. The estimate is therefore
+/// identical, and a renamed copy per table would only invite drift.
 pub fn estimate_logs_cost(snapshot: &Snapshot, catalog_requests: u64) -> CostEstimate {
     let segments = snapshot.segments.len() as u64;
     let series: u64 = snapshot.segments.iter().map(|s| s.series_count).sum();
@@ -131,11 +136,14 @@ pub fn estimate_logs_cost(snapshot: &Snapshot, catalog_requests: u64) -> CostEst
 /// the catalog term computed before `resolve` ran.
 ///
 /// The span fetch funnel (`SpanSegmentFetcher::fetch_accounted`) issues
-/// exactly one GET per relevant segment and never decompresses on a
-/// separately-accounted path (it never calls `add_decompressed_bytes`), so
-/// both the request count and the byte sums here are exact bounds rather than
-/// padded guesses, exactly like [`estimate_logs_cost`]: no chase/retry safety
-/// factor applies because there is no chase/retry path to guard against.
+/// exactly one GET per relevant segment, so the request count and the
+/// store-byte sum here are exact bounds rather than padded guesses, exactly
+/// like [`estimate_logs_cost`]: no chase/retry safety factor applies because
+/// there is no chase/retry path to guard against. Like the logs estimate this
+/// carries no decompressed-byte term (it passes `0`); unlike the logs scan
+/// reader, the span (RSPAN) read path does not yet report decompressed bytes at
+/// all, so for spans the figure is simply absent rather than observed after the
+/// fact (issue #1401 instrumented the RLOG scan reader only).
 ///
 /// Reached from `executor::SqlExecutor::resolve` for a `TargetSignal::Spans`
 /// query (ADR-0045 decision 5), beside its `estimate_metrics_cost` and
