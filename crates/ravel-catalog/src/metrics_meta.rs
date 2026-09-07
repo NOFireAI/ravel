@@ -47,11 +47,29 @@ use ravel_proto::sys::v1 as sysproto;
 use ravel_types::TenantHash;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Format floor written into every metadata record this build emits, and the
-/// highest record version it understands. A record declaring a higher version is
-/// refused rather than misread under this layout, matching the `config` / `prov`
-/// / `enc` records' version guards.
+/// Format floor written into every metadata record this build emits: the writer,
+/// including the CAS-loser re-merge rewrite, stamps exactly this. It is also the
+/// highest version the read-merge-write rewrite can reproduce byte-for-byte, so
+/// [`read_metrics_meta`] (the read that feeds that rewrite) refuses any record
+/// declaring a version above it rather than let a whole-record re-encode strip a
+/// field it does not model (ADR-0066 decision 5).
 pub const METRICS_META_FORMAT_VERSION: u32 = 1;
+
+/// Highest record version the decode gate accepts: the supported read set is
+/// `1..=METRICS_META_MAX_READ_VERSION` (ADR-0066 decision 4). A record declaring
+/// a higher version is refused rather than misread under this layout, matching
+/// the `config` / `prov` / `enc` records' version guards.
+///
+/// This exceeds [`METRICS_META_FORMAT_VERSION`] on purpose: the decode gate
+/// accepts the next version before any writer emits it (readers-before-writers),
+/// so a future serve-only reader that models only the v1 fields reads a v2
+/// record's v1 fields rather than failing closed. Note that [`read_metrics_meta`]
+/// itself is stricter: because it returns the CAS version a caller writes back
+/// with, it doubles as the read for the CAS-loser re-merge rewrite and refuses a
+/// version above [`METRICS_META_FORMAT_VERSION`] (decision 5). The writer bump to
+/// 2 (R2) is a separate later change, sequenced after this decode gate accepts 2
+/// fleet-wide.
+pub const METRICS_META_MAX_READ_VERSION: u32 = 2;
 
 /// zstd level for the record body. 3 is the level
 /// [`crate::snapshot_format`] already uses for its compressed bodies and zstd's
@@ -220,9 +238,23 @@ pub enum MetricsMetaError {
     },
     #[error(
         "metadata record {key:?} declares format_version {got}, but this build only understands \
-         version {METRICS_META_FORMAT_VERSION}: refusing rather than misread a future record format"
+         versions 1..={METRICS_META_MAX_READ_VERSION}: refusing rather than misread a future record \
+         format"
     )]
     UnsupportedVersion { key: String, got: u32 },
+    /// [`read_metrics_meta`] read a record declaring a version this build's writer
+    /// cannot reproduce (> [`METRICS_META_FORMAT_VERSION`]). That read feeds the
+    /// CAS-loser re-merge, which re-encodes the whole record through this build's
+    /// field set, so a field a newer writer added would be silently dropped on the
+    /// write-back; the read is refused so the merge never runs and nothing is
+    /// stripped (ADR-0066 decision 5). The decode gate itself still accepts the
+    /// record up to [`METRICS_META_MAX_READ_VERSION`] for a read-only serve path.
+    #[error(
+        "metadata record {key:?} declares format_version {got}, newer than this build's writer \
+         version {METRICS_META_FORMAT_VERSION}: refusing to read it for a whole-record rewrite that \
+         would strip fields this build does not model (ADR-0066 decision 5)"
+    )]
+    RefusingToRewriteNewerRecord { key: String, got: u32 },
     /// The record records a different tenant than the key it was read under. It
     /// is another tenant's metadata misfiled here; serving it would leak one
     /// tenant's metric names to another, so it is refused (the
@@ -419,7 +451,7 @@ fn decode_record(
     key: &str,
     tenant_hash: &TenantHash,
 ) -> Result<Vec<MetricMetadataEntry>, MetricsMetaError> {
-    if record.format_version > METRICS_META_FORMAT_VERSION {
+    if record.format_version > METRICS_META_MAX_READ_VERSION {
         return Err(MetricsMetaError::UnsupportedVersion {
             key: key.to_string(),
             got: record.format_version,
@@ -522,12 +554,16 @@ fn decompress_body(key: &str, body: &[u8]) -> Result<Vec<u8>, MetricsMetaError> 
     Ok(out)
 }
 
-/// Decode a stored body into domain entries: decompress, prost-decode, validate.
+/// Decode a stored body into domain entries plus the record's declared
+/// `format_version`: decompress, prost-decode, validate. The version is returned
+/// alongside the entries so a rewrite caller can refuse a record newer than it
+/// can reproduce (ADR-0066 decision 5); the entry validation here accepts the
+/// full supported read set (up to [`METRICS_META_MAX_READ_VERSION`]).
 fn decode_body(
     body: &[u8],
     key: &str,
     tenant_hash: &TenantHash,
-) -> Result<Vec<MetricMetadataEntry>, MetricsMetaError> {
+) -> Result<(Vec<MetricMetadataEntry>, u32), MetricsMetaError> {
     let raw = decompress_body(key, body)?;
     let record = sysproto::MetricMetadataRecord::decode(raw.as_slice()).map_err(|source| {
         MetricsMetaError::Decode {
@@ -535,7 +571,9 @@ fn decode_body(
             source,
         }
     })?;
-    decode_record(&record, key, tenant_hash)
+    let format_version = record.format_version;
+    let entries = decode_record(&record, key, tenant_hash)?;
+    Ok((entries, format_version))
 }
 
 /// Refuse an entry set that would make a corrupt record before it is written. A
@@ -576,7 +614,20 @@ pub async fn read_metrics_meta(
     let key = metrics_meta_key(tenant_hash);
     match store.get(&key, GetRange::Full).await {
         Ok(outcome) => {
-            let entries = decode_body(outcome.data.as_ref(), &key, tenant_hash)?;
+            let (entries, format_version) = decode_body(outcome.data.as_ref(), &key, tenant_hash)?;
+            // Rewrite refusal (ADR-0066 decision 5): the returned version is what a
+            // caller CAS-writes back against after a re-merge, so this read feeds a
+            // whole-record rewrite. A record a newer writer wrote may carry a field
+            // this build does not model, which the re-encode would strip; refuse it
+            // here so the merge never runs. A read failure makes the sink drop the
+            // window (no write, no strip) and the serve path fall back to an empty
+            // record for one horizon, both fail-safe.
+            if format_version > METRICS_META_FORMAT_VERSION {
+                return Err(MetricsMetaError::RefusingToRewriteNewerRecord {
+                    key,
+                    got: format_version,
+                });
+            }
             Ok(Some((entries, outcome.version)))
         }
         Err(StoreError::NotFound) => Ok(None),
@@ -1176,31 +1227,86 @@ mod tests {
         assert_eq!(out.merged, out2.merged, "order-independent, byte-stable");
     }
 
-    /// A record declaring a future format_version is refused rather than misread
-    /// under this layout.
+    /// ADR-0066 R1: the writer still stamps 1 while the decode gate accepts
+    /// {1, 2}. A premature writer bump (R2) would flip these pins.
+    #[test]
+    fn writer_stamps_one_while_reader_accepts_two() {
+        let built = build_record(&tenant(), &[entry("a", MetricKind::Counter, "h", "", 1)]);
+        assert_eq!(built.format_version, 1, "writer stamps version 1 (R1)");
+        assert_eq!(METRICS_META_FORMAT_VERSION, 1);
+        assert_eq!(METRICS_META_MAX_READ_VERSION, 2);
+    }
+
+    /// Compress a record at an explicit `format_version` into a stored body,
+    /// bypassing the writer's version stamp, so a test can seed exactly the record
+    /// a newer or too-new writer would leave on disk.
+    fn body_at_version(version: u32, entries: &[MetricMetadataEntry]) -> Vec<u8> {
+        let mut record = build_record(&tenant(), entries);
+        record.format_version = version;
+        zstd::bulk::compress(&record.encode_to_vec(), ZSTD_LEVEL).expect("compress")
+    }
+
+    /// The decode gate's supported set is {1, 2}: a version-1 and a version-2 body
+    /// both decode through `decode_body`; a version-3 body is refused with a typed
+    /// UnsupportedVersion. Pins ADR-0066 decision 4 for the metrics-metadata reader
+    /// gate (decode_record, exercised through decode_body).
+    #[test]
+    fn reader_accepts_version_one_and_two_and_refuses_three() {
+        let key = metrics_meta_key(&tenant());
+        let entries = vec![entry("a", MetricKind::Counter, "h", "", 1)];
+
+        for version in [1u32, 2u32] {
+            let body = body_at_version(version, &entries);
+            let (decoded, fv) = decode_body(&body, &key, &tenant())
+                .unwrap_or_else(|e| panic!("version {version} must decode: {e}"));
+            assert_eq!(
+                decoded, entries,
+                "version {version} entries decode unchanged"
+            );
+            assert_eq!(fv, version, "decode reports the record's own version");
+        }
+
+        let body = body_at_version(3, &entries);
+        let err = decode_body(&body, &key, &tenant()).expect_err("version 3 must be refused");
+        assert!(
+            matches!(err, MetricsMetaError::UnsupportedVersion { got: 3, .. }),
+            "got: {err}"
+        );
+    }
+
+    /// The merge-and-rewrite equivalent of the tenant-config test: reading a
+    /// version-2 record for the CAS-loser re-merge is REFUSED, not decoded into
+    /// entries a version-1 writer would re-encode and strip. `read_metrics_meta`
+    /// returns the CAS version a caller writes back with, so it is the read that
+    /// feeds the rewrite; it refuses the newer record. The stored bytes must be
+    /// exactly unchanged (the read errored before any merge or write). Named per
+    /// ADR-0066 R1 (decision 5).
     #[tokio::test]
-    async fn read_rejects_future_format_version() {
+    async fn rewrite_refuses_a_version_two_record_from_a_version_one_writer() {
         let store = mem();
-        let mut record = build_record(&tenant(), &[entry("a", MetricKind::Counter, "h", "", 1)]);
-        record.format_version = METRICS_META_FORMAT_VERSION + 1;
-        let body = zstd::bulk::compress(&record.encode_to_vec(), ZSTD_LEVEL).expect("compress");
+        let key = metrics_meta_key(&tenant());
+        let seeded = body_at_version(2, &[entry("a", MetricKind::Counter, "h", "u", 1)]);
         store
-            .put(
-                &metrics_meta_key(&tenant()),
-                body.into(),
-                PutOptions::default(),
-            )
+            .put(&key, seeded.clone().into(), PutOptions::default())
             .await
-            .expect("seed future record");
+            .expect("seed a version-2 record");
+
         let err = read_metrics_meta(store.as_ref(), &tenant())
             .await
-            .expect_err("a future format_version must be refused");
+            .expect_err("reading a newer record for a rewrite must be refused");
         assert!(
             matches!(
                 err,
-                MetricsMetaError::UnsupportedVersion { got, .. } if got == METRICS_META_FORMAT_VERSION + 1
+                MetricsMetaError::RefusingToRewriteNewerRecord { got: 2, .. }
             ),
             "got: {err}"
+        );
+
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "the stored version-2 record must be byte-for-byte unchanged"
         );
     }
 
@@ -1466,8 +1572,9 @@ mod tests {
         fn encode_decode_round_trip_is_identity(entries in entries_strategy(24)) {
             let key = metrics_meta_key(&tenant());
             let body = encode_body(&tenant(), &entries, &key).expect("encode");
-            let decoded = decode_body(&body, &key, &tenant()).expect("decode");
+            let (decoded, format_version) = decode_body(&body, &key, &tenant()).expect("decode");
             prop_assert_eq!(decoded, entries);
+            prop_assert_eq!(format_version, METRICS_META_FORMAT_VERSION);
         }
 
         /// The merge is idempotent: applying the same incoming set to its own
