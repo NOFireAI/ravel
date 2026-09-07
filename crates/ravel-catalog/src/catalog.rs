@@ -1148,7 +1148,7 @@ impl Catalog {
         // Collect the idle tenants under the activity lock, then drop the lock
         // before touching the cache locks: never hold two cache-related locks
         // at once, so this can never deadlock against a concurrent resolve.
-        let idle: Vec<TenantHash> = {
+        let (idle, still_active): (Vec<TenantHash>, HashSet<TenantHash>) = {
             let mut activity = self.tenant_activity.lock();
             let idle: Vec<TenantHash> = activity
                 .iter()
@@ -1158,7 +1158,13 @@ impl Catalog {
             for tenant in &idle {
                 activity.remove(tenant);
             }
-            idle
+            // The tenants that survive this sweep. Anything keyed by a tenant
+            // NOT in this set is either idle (just removed) or was never
+            // stamped at all, which is what a tenant reaching only
+            // `load_column_stats` (no resolve) looks like; both are swept
+            // below.
+            let still_active: HashSet<TenantHash> = activity.keys().copied().collect();
+            (idle, still_active)
         };
         for tenant in &idle {
             self.cache.evict_tenant(tenant);
@@ -1174,14 +1180,17 @@ impl Catalog {
         {
             cache.evict_tenants(&idle);
         }
-        // Sweep the decode-refusal warn-once marks for the idle tenants, so a
-        // tenant that returns after eviction warns again (issue #1400). Keyed
-        // by (tenant, signal, key); drop every triple whose tenant went idle.
-        if !idle.is_empty() {
-            self.warned_decode_failures
-                .lock()
-                .retain(|(tenant, _, _)| !idle.contains(tenant));
-        }
+        // Sweep the decode-refusal warn-once marks (issue #1400). Keyed by
+        // (tenant, signal, key); keep only triples whose tenant is still in
+        // the activity map. That drops the idle tenants just removed AND any
+        // tenant that never resolved: `load_column_stats` does not stamp
+        // activity, so a caller that reaches it without a preceding resolve
+        // would otherwise leave its marks with no sweep able to select them.
+        // A swept tenant warns again on its next refusal. Runs on every call,
+        // not only when `idle` is non-empty, for the same reason.
+        self.warned_decode_failures
+            .lock()
+            .retain(|(tenant, _, _)| still_active.contains(tenant));
         idle.len()
     }
 
@@ -7733,11 +7742,43 @@ mod tests {
         assert!(first.is_none());
         assert_eq!(capture.count_containing(DECODE_REFUSAL_WARN), 1);
 
-        // Stamp the tenant's activity and sweep it as idle: the sweep drops the
-        // warn-once mark alongside the per-tenant caches.
-        catalog.tenant_activity.lock().insert(tenant(), 0);
+        // This tenant reached `load_column_stats` directly and never resolved,
+        // so it has NO activity record: the sweep must still clear its mark,
+        // because a never-stamped tenant is not "active". `evicted` is 0 (no
+        // idle tenant was removed); the mark is swept on the activity check.
+        // A resolved tenant's mark, by contrast, must survive: stamp an
+        // unrelated tenant as active first and check its mark is kept.
+        // A DIFFERENT tenant from the fixture's `tenant()` ([0xAB; 16]); the
+        // sweep is keyed by tenant, so an equal hash would stamp the tenant
+        // under test and void the never-resolved case.
+        let other = TenantHash([0x5Cu8; 16]);
+        assert_ne!(
+            other,
+            tenant(),
+            "the active control tenant must be distinct"
+        );
+        catalog.tenant_activity.lock().insert(other, 1_000);
+        catalog.warned_decode_failures.lock().insert((
+            other,
+            Signal::Logs,
+            "other-key".to_string(),
+        ));
         let evicted = catalog.evict_idle_tenants(1_000, 0);
-        assert_eq!(evicted, 1, "the stamped tenant is swept as idle");
+        assert_eq!(
+            evicted, 0,
+            "nothing was idle; the never-resolved tenant was never stamped"
+        );
+        {
+            let marks = catalog.warned_decode_failures.lock();
+            assert!(
+                !marks.iter().any(|(t, _, _)| *t == tenant()),
+                "the never-resolved tenant's mark is swept"
+            );
+            assert!(
+                marks.contains(&(other, Signal::Logs, "other-key".to_string())),
+                "an active tenant's mark survives the sweep"
+            );
+        }
 
         let second = catalog
             .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
