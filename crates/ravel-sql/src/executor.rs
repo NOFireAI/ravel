@@ -96,6 +96,7 @@ use ravel_memory::MemoryBudget;
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::{
     LogSegmentFetcher, QueryError, RequestBudgets, SegmentAdmission, SegmentFetcher, admit,
+    request_budget_exceeded,
 };
 use ravel_types::accounting::{CostEstimate, QueryAccounting, QueryAccountingSnapshot};
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
@@ -850,6 +851,18 @@ impl SqlExecutor {
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
         let (snapshot, admission, estimate) =
             self.resolve_admitted(tenant_hash, req, accounting).await?;
+        // Checked here too (mirrors `Self::run` above): `explain` resolves and
+        // plans a statement without ever reaching the segment-fetch loop in
+        // scan.rs, so a caller's lowered `max_s3_requests` (ADR-1374 decision
+        // 3) is only enforceable against the resolve's own catalog requests.
+        if let Some(QueryError::RequestBudgetExceeded { requests, max }) = request_budget_exceeded(
+            accounting.snapshot().total_s3_requests(),
+            self.effective_config(req.budgets.as_ref())
+                .engine
+                .max_s3_requests,
+        ) {
+            return Err(SqlError::RequestBudgetExceeded { requests, max });
+        }
         let segments_resolved = snapshot.segments.len();
 
         let planned = self
@@ -922,6 +935,22 @@ impl SqlExecutor {
             // never a discarded prior attempt's.
             live.install(&accounting);
             let (snapshot, estimate) = self.resolve(tenant_hash, req, &accounting).await?;
+            // Checked here, right after resolve returns, not only in the
+            // segment-fetch loop in scan.rs: a statement whose snapshot
+            // resolves to zero segments never reaches that loop, so a
+            // caller's lowered `max_s3_requests` (ADR-1374 decision 3) must
+            // still be enforced on the strength of the resolve's own
+            // catalog requests alone.
+            if let Some(QueryError::RequestBudgetExceeded { requests, max }) =
+                request_budget_exceeded(
+                    accounting.snapshot().total_s3_requests(),
+                    self.effective_config(req.budgets.as_ref())
+                        .engine
+                        .max_s3_requests,
+                )
+            {
+                return Err(SqlError::RequestBudgetExceeded { requests, max });
+            }
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
@@ -3296,6 +3325,96 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    fn empty_store() -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
+        Arc::new(InstrumentedStore::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty(),
+        )))
+    }
+
+    /// CodeRabbit finding on PR #1424 (comment 3952989200), SQL side: a
+    /// statement whose snapshot resolves to zero segments never reaches the
+    /// segment-fetch loop in scan.rs, so the incremental `max_s3_requests`
+    /// check there never runs. A caller-lowered budget of zero (ADR-1374
+    /// decision 3) must still be enforced right after resolve, on both the
+    /// `execute` and `explain` paths, and the server default ceiling must
+    /// not change behavior for the same fixture.
+    #[tokio::test]
+    async fn lowered_request_budget_is_enforced_after_resolve() {
+        let tenant_hash = TenantId::new("acme-sql-budget").hash();
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 60_000_000_000,
+        };
+        let sql = "SELECT ts, value FROM samples";
+        let budgets = Some(ravel_query::RequestBudgets {
+            max_store_requests: Some(ravel_query::RequestLimit::Bounded(0)),
+            ..Default::default()
+        });
+
+        // execute(): the attempt path in `run`.
+        let mut exec_req = sql_request(sql, window);
+        exec_req.budgets = budgets;
+        let executor = executor_over(empty_store());
+        let err = executor
+            .execute(tenant_hash, &exec_req)
+            .await
+            .expect_err("a zero store-request budget must trip even on an empty snapshot");
+        let SqlError::RequestBudgetExceeded { requests, max } = err else {
+            panic!("expected SqlError::RequestBudgetExceeded, got {err:?}");
+        };
+        assert_eq!(
+            max, 0,
+            "the caller's lowered ceiling must be reported exactly"
+        );
+        // Pinned: an empty-snapshot resolve against a fresh `MemoryStore`
+        // issues exactly 3 catalog requests, on both the execute and
+        // explain paths (both funnel through `resolve_admitted`).
+        assert_eq!(
+            requests, 3,
+            "the resolve's own catalog request count must be exact, not just nonzero"
+        );
+
+        // explain(): the same check in `explain_inner`, against a fresh
+        // store/executor so the two paths' resolves are not comparing a warm
+        // cache against a cold one.
+        let mut explain_req = sql_request(sql, window);
+        explain_req.budgets = budgets;
+        let explain_executor = executor_over(empty_store());
+        let explain_err = explain_executor
+            .explain(tenant_hash, &explain_req)
+            .await
+            .expect_err("explain must also trip on a zero store-request budget");
+        let SqlError::RequestBudgetExceeded {
+            requests: explain_requests,
+            max: explain_max,
+        } = explain_err
+        else {
+            panic!("expected SqlError::RequestBudgetExceeded, got {explain_err:?}");
+        };
+        assert_eq!(explain_max, 0);
+        assert_eq!(
+            explain_requests, 3,
+            "explain's resolve must issue the same exact catalog request count as execute's"
+        );
+
+        // Control: the server's default ceiling is far above any resolve
+        // cost, so the identical fixture succeeds under it, and the
+        // accounted request count is the same exact number both budgeted
+        // attempts tripped on.
+        let control_req = sql_request(sql, window);
+        let control_executor = executor_over(empty_store());
+        let outcome = control_executor
+            .execute(tenant_hash, &control_req)
+            .await
+            .expect("the server default ceiling must not trip on the resolve's own cost");
+        assert_eq!(
+            outcome.accounting.total_s3_requests(),
+            requests,
+            "the default-ceiling control must account the same resolve cost as the trip"
+        );
+    }
 
     fn not_found() -> SqlError {
         SqlError::Fetch(FetchError::Store {

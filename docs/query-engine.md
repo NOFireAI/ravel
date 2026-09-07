@@ -1049,7 +1049,10 @@ into a scoped copy of the engine configuration, so `segment_admission::admit`,
 lowered numbers through the same fields they already read. A tripped
 per-request budget is the same typed error as a tripped server ceiling
 (`TooManySegments`, `RequestBudgetExceeded`, `TooManyBytesScanned`, all HTTP
-422), never a truncated result.
+422), never a truncated result. The store-request budget is checked once
+right after catalog resolution and then again at every fetch boundary, so a
+resolve alone can trip a lowered budget even when the resolved snapshot has
+no segments left to fetch.
 
 On the PromQL side, `QueryEngine::instant_with_budgets`,
 `range_hist_with_budgets`, and `resolve_series_with_budgets` are the entry
