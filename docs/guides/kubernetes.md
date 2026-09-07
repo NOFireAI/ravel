@@ -293,10 +293,21 @@ For a `RavelCluster` named `dev`:
 | `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
 
 Maintain renders `RollingUpdate`, the same as gateway and query, and defaults
-to one replica but is not pinned there. Maintenance ownership is leased, not
-exclusive: each maintain process claims its own `(tenant, signal, shard)`
-units through a self-owned heartbeat key in object storage, with rendezvous
-hashing deciding which process owns which unit. A rolling restart can leave
+to one replica but is not pinned there. Maintenance ownership is heartbeat
+membership plus rendezvous hashing, deliberately not a lease: each maintain
+process overwrites a self-owned heartbeat key under
+`sys/maintain/workers/<process_id>` in object storage on a heartbeat
+interval, every process lists that prefix to compute the live set of workers
+whose heartbeat is recent enough, and all of them partition the
+`(tenant, signal, shard)` unit space over that live set by rendezvous
+(highest-random-weight) hashing. Nothing is renewed and nothing expires:
+once a heartbeat falls outside the staleness window its owner is treated as
+gone and its units are taken over on the next interval, and a process that
+comes back rejoins by writing its heartbeat again. The keyspace, the
+heartbeat interval, and the staleness window are specified in
+[catalog-and-mvcc.md](../catalog-and-mvcc.md#key-layout-all-under-one-bucket-root);
+the `LeaseCheck` trait in the codebase is an unrelated garbage-collection
+reader-protection gate and plays no part here. A rolling restart can leave
 an old and a new pod briefly claiming overlapping units at once. That only
 duplicates work. It does not corrupt committed state, so scaling
 `spec.maintain.replicas` above one is safe.
