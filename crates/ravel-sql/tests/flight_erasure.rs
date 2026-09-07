@@ -319,7 +319,7 @@ async fn distributed_slice_do_get_excludes_what_the_resolve_saw_pending() {
 
     let (service, executor) = build_shard_service(Arc::clone(&backend), &tenant).await;
 
-    let (snapshot, estimate) = executor
+    let (snapshot, estimate, _io_shape) = executor
         .resolve_snapshot(
             tenant.hash(),
             &util::request(QUERY),

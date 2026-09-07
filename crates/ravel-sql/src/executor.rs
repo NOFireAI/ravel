@@ -1158,8 +1158,8 @@ impl SqlExecutor {
     ///   permit pool across partitions.
     /// - `whole_object_threshold` has no single SQL-wide knob; it is read
     ///   per target signal: `self.fetcher` (metrics) and `self.log_fetcher`
-    ///   (logs/alerts/audit, sharing the RLOG funnel per ADR-1101 decision
-    ///   1) each expose their configured threshold directly.
+    ///   (logs/alerts/audit, sharing the RLOG funnel per ADR-1101 decision 1)
+    ///   each expose their configured threshold directly.
     ///   [`crate::spans_fetcher::SpanSegmentFetcher`] has no threshold
     ///   concept at all -- it always issues one unconditional whole-object
     ///   GET -- so spans report `u64::MAX` rather than reusing a
