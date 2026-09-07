@@ -234,24 +234,60 @@ the same pure render path as everything else in decision 3:
   second replica.
 - The operator renders one PodDisruptionBudget per tier
   (`maxUnavailable: 1`), applied and swept exactly like the Deployments,
-  so a node drain cannot take a whole tier down and a manual patch does
-  not survive a reconcile.
-- The cluster-wide `secrets` grant is removed. The operator reads only
-  the Secrets a RavelCluster references, in the RavelCluster's own
-  namespace, so the read is now a namespaced Role+RoleBinding in
-  `ravel-system`. The Secret names are user-chosen CRD fields, not a
-  fixed set, so `resourceNames` cannot enumerate them and a namespaced
-  Role is the tightest grant that still works. Running the operator over
-  RavelClusters in other namespaces needs one RoleBinding per namespace;
-  that is a follow-up.
+  so a manual patch does not survive a reconcile. The budget protects a
+  multi-replica tier during a voluntary disruption (a node drain): the
+  eviction of a second pod is blocked once it would breach
+  `maxUnavailable: 1`, so at least one replica keeps serving. A
+  single-replica tier (the maintain default) is not protected and can
+  still be drained to zero, which is intentional: `maxUnavailable: 1`
+  permits evicting the one pod, and the operator does not force two
+  replicas (the same reason the anti-affinity above is preferred, not
+  required).
+- The cluster-wide `secrets` grant is removed. The operator keeps its
+  cluster-wide `RavelCluster` watch (decision 3) and reads each object's
+  referenced Secrets in that object's own namespace, so `secrets get` is
+  granted per namespace, never cluster-wide. The rule lives in a
+  `ravel-operator-secrets` ClusterRole (a reusable definition that grants
+  nothing on its own) bound by a namespaced RoleBinding in each served
+  namespace; `ravel-system` ships bound, and
+  `deploy/k8s/operator/secrets-rolebinding.yaml` is the template for every
+  other namespace. A RoleBinding to a ClusterRole grants the rule only
+  within that RoleBinding's namespace, so this confers no cluster-wide
+  reach; a ClusterRoleBinding to it would, and the rbac lint asserts none
+  exists. The Secret names are user-chosen CRD fields, not a fixed set, so
+  `resourceNames` cannot enumerate them; a bare `secrets get` bound per
+  namespace is the tightest grant that still works.
+
+  Shipping the narrowing without the per-namespace binding was a
+  regression, not a follow-up (issue #126): before this change the operator
+  read Secrets for a RavelCluster in any namespace, and narrowing to a
+  Role in `ravel-system` alone silently 403'd every RavelCluster elsewhere.
+  Of the two remedies the finding offered, option (b) is taken here: keep
+  the cluster-wide watch and bind per namespace, rather than option (a),
+  restricting the watch to `ravel-system`. Option (b) preserves the
+  multi-namespace reconcile the controller already implements (`Api::all`
+  plus namespaced reads per object) and keeps the operator install guide's
+  "watches RavelCluster cluster-wide and manages Deployments and Services in
+  whatever namespace each RavelCluster lives in" true. Its cost is that a
+  served namespace now carries an out-of-band precondition (the
+  RoleBinding); so it does not fail silently, the reconciler maps a 403 on
+  Secret resolution to a `Degraded` condition with reason `SecretsUnreadable`
+  naming the namespace and Secret (`crate::controller::secret_error`),
+  rather than a bare reconcile failure.
 
 The container/pod SecurityContext, the PDB count, and the anti-affinity
 shape are asserted at render level in `reconcile.rs` tests; a manifest
 lint there (a text scan of `deploy/k8s/operator/rbac.yaml`, run by
-`cargo test -p ravel-operator`) asserts the ClusterRole grants no
-`secrets`. The runtime effect (a pod actually rejected for a missing
-capability, a drain actually blocked) is left to the k8s CI lane
-(decision 8).
+`cargo test -p ravel-operator`) asserts the cluster-wide ClusterRole
+grants no `secrets` and that the secrets read is bound only per namespace,
+and a `controller.rs` test asserts the 403-to-`SecretsUnreadable` mapping.
+The runtime behavior is left to the k8s CI lane (decision 8), and it is a
+runtime behavior, not an admission one: Kubernetes admits a hardened pod,
+and an operation that needs a dropped capability fails when it is attempted
+at runtime, exactly as a write under `readOnlyRootFilesystem` fails at
+runtime; nothing rejects the pod for the dropped capability. What the kind
+lane actually proves is that the hardened pods reach readiness and complete
+an OTLP round trip, not that a missing capability is rejected.
 
 ## Rejected alternatives
 
