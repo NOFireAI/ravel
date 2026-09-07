@@ -765,22 +765,33 @@ pub struct Cli {
     /// shed immediately, never queued: HTTP gets 429 with `Retry-After`,
     /// gRPC gets `RESOURCE_EXHAUSTED`. Unlike `--max-concurrent-queries`,
     /// this is never fleet-reconciled: each process enforces its own local
-    /// bound independently, since it exists to cap this process's own
-    /// worst-case buffered memory, not to shape aggregate fleet fan-out.
-    /// `0` disables the limit.
+    /// bound independently. It bounds request COUNT, so the transient
+    /// decode memory it caps is this ceiling times the largest per-request
+    /// decoded body: Remote Write's 64 MiB post-decompression cap, or
+    /// OTLP's 16 MiB (docs/ingest.md, "Worst-case resident memory", term
+    /// 2). It does not by itself bound the buffered ingest bytes those
+    /// requests then hold, nor the OTLP HTTP gzip inflate, which
+    /// `--max-ingest-buffer-bytes` charges. `0` disables the limit.
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
 
-    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1): a
-    /// ceiling on the sum of estimated buffered ingest bytes held
-    /// across every tenant and signal (metrics, logs, traces) at once. A
-    /// request whose estimated buffered bytes would push the gauge past this
-    /// ceiling is shed before any buffering -- HTTP 429 with `Retry-After`,
-    /// gRPC `RESOURCE_EXHAUSTED` -- so a burst of active tenants can no longer
-    /// grow resident memory without bound (the per-tenant buffer caps bound
-    /// each tenant, not their sum). Like `--max-inflight-ingest-requests` this
-    /// is a per-process local bound, never fleet-reconciled. Default 512 MiB;
-    /// `0` disables the ceiling (the gauge is still tracked for `/metrics`).
+    /// The process-wide ingest buffer byte budget (ADR-0069 decision 1,
+    /// amended by issue #1297): a ceiling on the sum of estimated buffered
+    /// ingest bytes held across every tenant and signal (metrics, logs,
+    /// traces) at once, plus the transient bytes an OTLP HTTP gzip request
+    /// inflates during decode -- those are charged against this same gauge as
+    /// they inflate, before any buffer is touched, so a decompression that
+    /// would cross the ceiling is shed mid-inflate instead of being allocated
+    /// in full. A request whose charge would push the gauge past this ceiling
+    /// is shed before any buffering -- HTTP 429 with `Retry-After`, gRPC
+    /// `RESOURCE_EXHAUSTED` -- so a burst of active tenants can no longer grow
+    /// resident memory without bound (the per-tenant buffer caps bound each
+    /// tenant, not their sum). It does NOT cover the identity-path decoded
+    /// body or the gRPC and Remote Write inflate; those stay bounded by
+    /// `--max-inflight-ingest-requests` (docs/ingest.md, "Worst-case resident
+    /// memory"). Like `--max-inflight-ingest-requests` this is a per-process
+    /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables the
+    /// ceiling (the gauge is still tracked for `/metrics`).
     #[arg(long = "max-ingest-buffer-bytes", default_value_t = 512 * 1024 * 1024)]
     pub max_ingest_buffer_bytes: u64,
 
@@ -4654,6 +4665,47 @@ mod tests {
     use super::*;
     use ravel_catalog::DeclaredTypedColumn;
     use ravel_ingest::{CountLimit, RateLimit};
+
+    /// Issue #1297: the two ingest memory flags must not document a memory
+    /// bound they do not deliver. A flag doc that mentions bounding memory has
+    /// to name the transient inflate/decompression term, so it cannot claim a
+    /// ceiling that silently excludes the gzip inflate the way both flags once
+    /// did. Rendered from clap's long help, the same surface `docs/reference/
+    /// ravel-server-flags.md` is generated from, so the assertion tracks what
+    /// an operator actually reads.
+    ///
+    /// Non-vacuity: drop the `post-decompression` / `inflate` wording from
+    /// either flag's doc comment and this fails, because the doc still speaks
+    /// of a memory bound with no inflate term to qualify it.
+    #[test]
+    fn ingest_flag_docs_do_not_claim_an_unbounded_memory_guarantee() {
+        use clap::CommandFactory;
+
+        let cmd = Cli::command();
+        let long_help = |id: &str| -> String {
+            let arg = cmd
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("flag {id} is defined on the command"));
+            arg.get_long_help()
+                .or_else(|| arg.get_help())
+                .map(|help| help.to_string())
+                .unwrap_or_default()
+                .to_lowercase()
+        };
+
+        for id in ["max_inflight_ingest_requests", "max_ingest_buffer_bytes"] {
+            let help = long_help(id);
+            assert!(!help.is_empty(), "flag {id} must carry help text");
+            if help.contains("memory") {
+                assert!(
+                    help.contains("inflat") || help.contains("decompress"),
+                    "flag {id} documents a memory bound but never names the \
+                     inflate/decompression term (issue #1297): {help}"
+                );
+            }
+        }
+    }
 
     /// `RemoteClusterConfig`'s `Debug` must never print the bearer credential:
     /// the config flows into startup logs and error contexts, and a derived
