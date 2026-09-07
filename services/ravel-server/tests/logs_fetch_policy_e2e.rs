@@ -254,6 +254,7 @@ async fn run(argv: &[&str]) -> Routed {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("sql state");
 

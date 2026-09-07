@@ -137,18 +137,25 @@ struct Harness {
     executor: Arc<SqlExecutor>,
 }
 
-fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) -> Harness {
+fn harness(
+    store: Arc<dyn ObjectStoreBackend>,
+    configured: HashSet<TenantHash>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
+) -> Harness {
     let query_accounting = Arc::new(QueryAccountingMetrics::new(configured));
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
-    let executor = Arc::new(SqlExecutor::new(
-        Arc::clone(&catalog),
-        SegmentFetcher::new(store.clone()),
-        LogSegmentFetcher::new(store.clone()),
-        ravel_sql::SpanSegmentFetcher::new(store.clone()),
-        SqlConfig::default(),
-        1 << 30,
-    ));
+    let executor = Arc::new(
+        SqlExecutor::new(
+            Arc::clone(&catalog),
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            ravel_sql::SpanSegmentFetcher::new(store.clone()),
+            SqlConfig::default(),
+            1 << 30,
+        )
+        .with_process_memory_budget(Arc::clone(&process_memory_budget)),
+    );
     let tokens: HashMap<String, TenantId> =
         HashMap::from([("acme-token".to_string(), TenantId::new("acme".to_string()))]);
 
@@ -204,6 +211,7 @@ fn harness(store: Arc<dyn ObjectStoreBackend>, configured: HashSet<TenantHash>) 
         cache: None,
         cache_max_bytes: 0,
         catalog_cache_max_bytes: 0,
+        process_memory_budget,
     });
 
     Harness {
@@ -264,7 +272,11 @@ async fn query_accounting_reaches_response_stats_and_metrics_endpoint() {
     let tenant = TenantId::new("acme".to_string());
     publish_segment(store.as_ref(), &tenant, &[(100, 1.0), (200, 2.5)]).await;
     // No tenant configured, so `acme` folds into `tenant_hash="other"`.
-    let h = harness(Arc::clone(&store), HashSet::new());
+    let h = harness(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+    );
 
     // Half one: the response carries a `stats` object with this query's
     // accounting and estimate beside its data.
@@ -327,7 +339,11 @@ async fn query_result_is_byte_identical_with_and_without_accounting() {
         &[(100, 1.0), (200, 2.5), (300, 4.0)],
     )
     .await;
-    let h = harness(Arc::clone(&store), HashSet::new());
+    let h = harness(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
+    );
 
     let query = "SELECT ts, value FROM samples ORDER BY ts";
 
@@ -359,5 +375,47 @@ async fn query_result_is_byte_identical_with_and_without_accounting() {
         serde_json::to_string(&handler_data).unwrap(),
         serde_json::to_string(&raw_data).unwrap(),
         "attaching accounting must not change the result payload"
+    );
+}
+
+/// ACCEPTANCE TEST (e): a query whose real execution outgrows the ADR-1170
+/// process-wide memory budget is refused typed (`ResourcesExhausted`, HTTP
+/// 422), never a panic, and the refusal rolls its charge back off the shared
+/// process counter so the very next query, through the SAME executor and the
+/// same tenant mutex, is still answered. This exercises the budget through
+/// the real HTTP handler and the real `SqlExecutor::new`/
+/// `with_process_memory_budget` wiring `crate::start` uses, not just the
+/// ravel-sql unit tests that drive `TenantDelegatingPool` directly.
+#[tokio::test]
+async fn a_query_over_the_process_budget_is_refused_and_the_process_keeps_serving() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let samples: Vec<(i64, f64)> = (0..4_000)
+        .map(|i| (i as i64 * 1_000_000, i as f64))
+        .collect();
+    publish_segment(store.as_ref(), &tenant, &samples).await;
+    let h = harness(
+        Arc::clone(&store),
+        HashSet::new(),
+        Arc::new(ravel_memory::MemoryBudget::new(1024)),
+    );
+
+    // A real sort over 4,000 rows outgrows a 1 KiB process budget: refused
+    // typed, not a panic and not a hang.
+    let (status, body) = post_sql(&h.sql, "SELECT ts, value FROM samples ORDER BY ts").await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a sort over 4,000 rows must outgrow a 1 KiB process budget: {body}"
+    );
+
+    // The refused charge rolled back off the shared process counter: a query
+    // cheap enough to need no real reservation still succeeds under the same
+    // tiny budget, proving the refusal did not wedge the executor.
+    let (status, body) = post_sql(&h.sql, "SELECT 1").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the process must keep answering after a refusal: {body}"
     );
 }

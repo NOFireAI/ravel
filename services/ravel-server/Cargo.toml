@@ -12,6 +12,9 @@ ravel-cache = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-maintain = { workspace = true }
+# ADR-1170 process-wide memory accountant: shared by MetricsState (every
+# build, unconditionally) and, when the `sql` feature is on, SqlExecutor.
+ravel-memory = { workspace = true }
 # Query-worker registration/liveness and rendezvous slice ownership for the
 # ADR-0071 distributed read fan-out: sys/query/workers heartbeats
 # (ravel_fleet::query_workers) and highest-random-weight slice ownership
