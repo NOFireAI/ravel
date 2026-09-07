@@ -230,6 +230,15 @@ pub struct SqlRequest {
     /// Per-request budgets for this statement, which can only LOWER the
     /// server's configured ceilings (ADR-1374 decision 3, prerequisite 1).
     /// `None` runs under the server config unchanged.
+    ///
+    /// Which knob binds depends on the table. Only the `samples` (metrics)
+    /// provider reads the effective `max_bytes_scanned` and
+    /// `max_store_requests` at scan time; the `logs`, `spans`, `alerts`, and
+    /// `audit` providers do not. For those four tables only `max_segments` is
+    /// lowered today, through the catalog resolve every table shares. A bytes
+    /// or request ceiling set for one of them is clamped and then never
+    /// consulted. That is a pre-existing gap in those providers, tracked as
+    /// issue #1409, not a property of the budgets themselves.
     pub budgets: Option<RequestBudgets>,
 }
 
@@ -4302,11 +4311,15 @@ mod tests {
     /// carries no time predicate, and the request window only bounded which
     /// segments were listed. `row_window` is what turns that window into a row
     /// filter, and the two executions below differ in nothing else.
+    ///
+    /// Each run gets its own executor over the one shared store, so both
+    /// resolve and fetch cold and their request counts are comparable: reusing
+    /// one executor would let the second run read the first's caches, and the
+    /// second run's lower count would say nothing about pruning.
     #[tokio::test]
     async fn row_window_excludes_rows_outside_range_inside_overlapping_segment() {
         let (store, tenant_hash, _data_key) =
             one_metrics_segment("row-window-1376", 1_000, FaultPlan::empty()).await;
-        let executor = executor_over(store);
 
         let window = TimeRange {
             start_ns: 200,
@@ -4314,10 +4327,12 @@ mod tests {
         };
         let base = samples_request("SELECT ts, value FROM samples", window);
 
-        let unfiltered = executor
+        let before = store.metrics().snapshot();
+        let unfiltered = executor_over(store.clone())
             .execute(tenant_hash, &base)
             .await
             .expect("execute without the row window");
+        let after_unfiltered = store.metrics().snapshot();
         assert_eq!(
             unfiltered.stats.segments, 1,
             "the fixture is one segment straddling the window"
@@ -4329,7 +4344,7 @@ mod tests {
         );
         assert_eq!(unfiltered.stats.window_predicate, None);
 
-        let filtered = executor
+        let filtered = executor_over(store.clone())
             .execute(
                 tenant_hash,
                 &SqlRequest {
@@ -4339,6 +4354,24 @@ mod tests {
             )
             .await
             .expect("execute with the row window");
+        let after_filtered = store.metrics().snapshot();
+
+        // The injected filter is pushed down like any predicate the statement
+        // itself carried, so pruning with the row window is a SUBSET of pruning
+        // without it: never more work, and sound either way because the
+        // provider reports `Inexact` and the filter is re-applied above the
+        // scan. Both counts are pinned exactly, so a run that started reading
+        // more (or that pruned an object it still needed) fails here rather
+        // than passing an inequality that holds for the wrong reason.
+        let unfiltered_gets = after_unfiltered.get.calls - before.get.calls;
+        let filtered_gets = after_filtered.get.calls - after_unfiltered.get.calls;
+        assert!(
+            filtered_gets <= unfiltered_gets,
+            "the row window must never make the run read more: \
+             {filtered_gets} > {unfiltered_gets}"
+        );
+        assert_eq!(unfiltered_gets, ROW_WINDOW_RUN_GETS);
+        assert_eq!(filtered_gets, ROW_WINDOW_RUN_GETS);
 
         // What was applied, before what it did: the reported text is the
         // display of the expression the rewrite built, not an independently
@@ -4371,6 +4404,15 @@ mod tests {
         assert_eq!(kept.last().copied(), Some(499), "end is exclusive");
         assert_eq!(kept, (200..500).collect::<Vec<i64>>());
     }
+
+    /// Every GET one whole `SELECT ts, value FROM samples` run issues against
+    /// the one-segment fixture from a cold executor: the resolve's
+    /// [`EXPLAIN_RESOLVE_GETS`] catalog reads plus the data object's own. The
+    /// same figure holds with and without the row window on this fixture, which
+    /// is the point: one segment overlaps the window, so the tightened pruning
+    /// the injected filter allows cannot drop it, and the run still reads it
+    /// whole and filters by row.
+    const ROW_WINDOW_RUN_GETS: u64 = 3;
 
     /// The exact predicate text a `[200, 500)` row window on `samples` reports,
     /// pinned so a change to the rendering (a dropped qualifier, a literal
