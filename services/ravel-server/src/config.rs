@@ -3351,10 +3351,21 @@ impl Cli {
             );
         }
 
-        if self.dev_insecure_tenant_header && !self.listen_http.ip().is_loopback() {
+        // The dev header resolver trusts an unauthenticated `x-ravel-tenant`
+        // header, and the single resolver chain it joins backs every public
+        // listener: HTTP, remote-write, OTLP gRPC, and Flight SQL (via the
+        // flight auth path). Guarding `--listen-http` alone left the flag
+        // reachable on a non-loopback `--listen-grpc`, forging tenant identity
+        // on the public gRPC/Flight surfaces (issue #1293). ADR-0009 promises
+        // refusal on any reachable port, so require both listeners loopback.
+        if self.dev_insecure_tenant_header
+            && (!self.listen_http.ip().is_loopback() || !self.listen_grpc.ip().is_loopback())
+        {
             anyhow::bail!(
-                "--dev-insecure-tenant-header refuses to enable unless --listen-http binds a \
-                 loopback address"
+                "--dev-insecure-tenant-header refuses to enable unless both --listen-http and \
+                 --listen-grpc bind loopback addresses: the dev header resolver trusts an \
+                 unauthenticated x-ravel-tenant header and backs every public listener (HTTP, \
+                 OTLP gRPC, and Flight SQL), not just HTTP"
             );
         }
 
@@ -3376,6 +3387,28 @@ impl Cli {
                 "--mtls-enabled requires --mtls-listener: the mTLS resolver is only installed on \
                  its own dedicated listener (ADR-0050 section 1), never on the public HTTP or \
                  gRPC/Flight listeners."
+            );
+        }
+
+        // Issue #94: the ADR-0071 fragment surface (the `SeriesFetch` service,
+        // its listener, and the coordinator fan-out) is constructed only by a
+        // query-serving process. `fragment_service` in lib.rs is gated on
+        // `matches!(config.mode, Mode::All | Mode::Query)`, so under gateway-only
+        // or maintain mode no fragment surface is ever built and no listener
+        // binds. Both `--distributed-query` and `--fragment-listener` are then
+        // silently inert. This is a diagnostic, not a security fix: refuse them
+        // so an operator cannot believe distribution is on when nothing serves
+        // it. The supported set is derived from that `Mode::All | Mode::Query`
+        // guard, not guessed.
+        if !matches!(self.mode, Mode::All | Mode::Query)
+            && (self.distributed_query || self.fragment_listener.is_some())
+        {
+            anyhow::bail!(
+                "--distributed-query and --fragment-listener are only supported under \
+                 --mode all or --mode query: the ADR-0071 fragment SeriesFetch surface is \
+                 constructed only by a query-serving process, so under --mode {:?} these flags \
+                 would be silently inert. Drop them, or run --mode all or --mode query.",
+                self.mode
             );
         }
 
@@ -7448,6 +7481,103 @@ mod tests {
         ])
         .validate()
         .expect("loopback --listen-http with the dev header is fine");
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_non_loopback_grpc_fails_validate() {
+        // --listen-http stays loopback; only --listen-grpc is public. The dev
+        // header resolver backs the gRPC/Flight listener too, so this must
+        // refuse startup even though HTTP alone was fine (issue #1293).
+        let err = cli(&[
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:4318",
+            "--listen-grpc",
+            "0.0.0.0:4317",
+        ])
+        .validate()
+        .expect_err("non-loopback --listen-grpc with the dev header must refuse startup");
+        assert!(
+            err.to_string().contains("--dev-insecure-tenant-header"),
+            "error names the flag: {err}"
+        );
+        assert!(
+            err.to_string().contains("--listen-grpc"),
+            "error names the gRPC listener: {err}"
+        );
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_loopback_grpc_validates() {
+        // Positive control so the grpc half of the guard cannot be vacuous:
+        // both listeners loopback validates.
+        cli(&[
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:4318",
+            "--listen-grpc",
+            "127.0.0.1:4317",
+        ])
+        .validate()
+        .expect("both listeners loopback with the dev header is fine");
+    }
+
+    #[test]
+    fn fragment_flags_under_gateway_mode_fail_validate() {
+        // Issue #94: fragment_service is built only under Mode::All | Mode::Query
+        // (lib.rs), so --distributed-query under gateway mode is silently inert.
+        // Refuse it, naming the supported modes.
+        let key = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
+        let err = cli(&[
+            "--mode",
+            "gateway",
+            "--distributed-query",
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8 path"),
+        ])
+        .validate()
+        .expect_err("--distributed-query under gateway mode must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--mode all") && msg.contains("--mode query"),
+            "error names the supported modes: {err}"
+        );
+    }
+
+    #[test]
+    fn fragment_listener_under_maintain_mode_fails_validate() {
+        // Same rule for --fragment-listener under a non-query-serving mode.
+        let err = cli(&[
+            "--mode",
+            "maintain",
+            "--fragment-listener",
+            "127.0.0.1:4319",
+        ])
+        .validate()
+        .expect_err("--fragment-listener under maintain mode must refuse startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--mode all") && msg.contains("--mode query"),
+            "error names the supported modes: {err}"
+        );
+    }
+
+    #[test]
+    fn distributed_query_under_query_mode_validates() {
+        // Positive control: under a fragment-serving mode the flag validates,
+        // so the #94 guard is not vacuously rejecting the flag everywhere.
+        let key = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(key.path(), format!("{}\n", "ab".repeat(32))).expect("write key");
+        cli(&[
+            "--mode",
+            "query",
+            "--distributed-query",
+            "--fragment-key-file",
+            key.path().to_str().expect("utf8 path"),
+        ])
+        .validate()
+        .expect("--distributed-query under query mode is fine");
     }
 
     #[test]
