@@ -96,7 +96,7 @@ provide it at the filesystem/volume layer (an encrypted volume mounted at
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--cache-max-bytes <n>` | fetcher cache derived: 80% of MemTotal; catalog byte cache derived: 5% of MemTotal (each `268435456`, 256 MiB, when memory cannot be read) | Maximum bytes the RAM tier holds. **Set**, it bounds **both** caches at that one value. **Unset**, the two derive independently: the fetcher cache at 80% of MemTotal (`25769803776` on the 30 GB reference host) and the catalog byte cache at 5% (`1610612736`), a smaller separate ceiling so the two LRU caches do not each claim 80% of RAM. Read once at startup; there is no live resize. |
+| `--cache-max-bytes <n>` | fetcher cache derived: 25% of the process memory budget; catalog byte cache derived: 5% of the same budget (each `268435456`, 256 MiB, when memory cannot be read) | Maximum bytes the RAM tier holds. **Set**, it bounds **both** caches at that one value. **Unset**, the two derive independently from the process memory budget (effective, cgroup-capped memory minus a fixed overhead reserve, not raw host memory): the fetcher cache at 25% (`7516192768` on the 30 GB reference host) and the catalog byte cache at 5% (`1503238553`), a smaller separate ceiling so the two LRU caches do not each claim a quarter of RAM. Startup refuses to start, rather than silently clamping, if an explicit value here pushes the two resolved caps above the process memory budget. Read once at startup; there is no live resize. |
 | `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by its own resolved RAM ceiling: the fetcher cache's disk tier by `--cache-max-bytes` or its derived 80% share, the catalog byte cache's by its own resolved value (the derived 5% share, or `--cache-max-bytes` when that flag is set explicitly). There is no separate disk-tier capacity flag. Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted (see "Two tiers" above). |
 | `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. |
 | `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole regardless of size; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free) this flag is **overridden**, and startup logs a WARN naming the value it overrode. |
@@ -111,8 +111,9 @@ ceiling is an upper bound on resident cache bytes, not memory claimed at
 startup. Because the two caches are independent and the SQL memory pools
 (`--sql-max-query-bytes`, `--sql-tenant-max-bytes`) are bounded separately
 again, the **sum of every ceiling can exceed physical RAM**: the fetcher cache
-(80% of MemTotal by default) plus the catalog byte cache (5%) plus the SQL
-pools is more than 100% of MemTotal on the reference host. That is deliberate.
+(25% of the process memory budget by default) plus the catalog byte cache
+(5%) plus the SQL pools is more than 100% of raw host memory on the
+reference host. That is deliberate.
 The caches only fill under a working set that touches that many distinct bytes,
 and the SQL pools abort a query rather than growing past their own ceiling, so
 the peaks do not coincide the way the arithmetic sum suggests. Size a host
