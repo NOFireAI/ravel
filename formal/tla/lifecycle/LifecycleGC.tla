@@ -221,10 +221,12 @@ VARIABLES
     dreqHorizon,      \* Nat: the .dreq horizon
     doneAt,           \* Nat: completion timestamp (0 when no .done)
     supersededAt,     \* [SupersededCandidates -> Nat]: per-object clock at which a
-                      \* publish superseded it (0 = not superseded). Per object, not
-                      \* one shared stamp: with two publishing passes a later
-                      \* supersession would otherwise retroactively re-open the
-                      \* protection window of an earlier, already legitimate delete.
+                      \* publish FIRST superseded it (0 = not superseded). Per
+                      \* object, not one shared stamp, and written once: with two
+                      \* publishing passes a later supersession would otherwise
+                      \* retroactively re-open the protection window of an earlier,
+                      \* already legitimate delete, and a re-stamp of an object
+                      \* already in `superseded` would push its own horizon forward.
     objContent,       \* [Objects -> SUBSET AllRecords]: served record identities
     variantKey,       \* [{"v1","v2"} -> key]: the names PublishRewrite assigned
     leaseOwner,       \* "none" | "A" | "B" | "C": who currently holds the bucket's
@@ -662,9 +664,17 @@ PublishRewrite(id) ==
              ELSE
                   /\ S!PutCreateIfAbsent(tgt, "dat")
                   /\ superseded' = superseded \cup rwInputs[id]
+                  \* The stamp is the FIRST supersession's clock. An input this
+                  \* publish resolved may already be superseded (a sibling
+                  \* identity published the same target and that target was then
+                  \* swept, so this pass's CreateIfAbsent succeeds a second
+                  \* time), and re-stamping it would move the protection horizon
+                  \* of an object whose supersession the catalog already
+                  \* recorded.
                   /\ supersededAt' = [i \in SupersededCandidates |->
-                                        IF i \in rwInputs[id] THEN clock
-                                                              ELSE supersededAt[i]]
+                                        IF i \in rwInputs[id] /\ i \notin superseded
+                                            THEN clock
+                                            ELSE supersededAt[i]]
                   /\ objContent' = [objContent EXCEPT ![tgt] = RecordSetContent(tgt)]
                   /\ variantKey' = [variantKey EXCEPT !["v1"] = RewriteKey(DescA),
                                                       !["v2"] = RewriteKey(DescB)]
@@ -754,8 +764,13 @@ PublishCompaction ==
     /\ S!PutCreateIfAbsent("cmpA", "dat")
     /\ cmpPhase' = "done"
     /\ superseded' = superseded \cup RawInputs
+    \* Same first-supersession rule as PublishRewrite: an input a rewrite
+    \* already superseded keeps that rewrite's clock, so this publish cannot
+    \* push the input's protection horizon forward.
     /\ supersededAt' = [i \in SupersededCandidates |->
-                          IF i \in RawInputs THEN clock ELSE supersededAt[i]]
+                          IF i \in RawInputs /\ i \notin superseded
+                              THEN clock
+                              ELSE supersededAt[i]]
     /\ objContent' = [objContent EXCEPT !["cmpA"] = RecordSetContent("cmpA")]
     /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
@@ -1155,9 +1170,13 @@ HeadNamedObjectNeverDeletedBySupersededSweep ==
 \* built on: the only writer of `objContent` for a raw input is `Init`, and no
 \* other action's UNCHANGED list omits it. If a future edit added a raw-input
 \* mutation, this is the invariant that would catch it, not
-\* `RewriteOutputsAreInputsMinusErased`, which only reads `objContent` for
-\* `rwA`. README.md's assumptions section explains why a replacement
-\* transition is out of scope rather than added.
+\* `RewriteOutputsAreInputsMinusErased`, which reads `objContent` for both
+\* rewrite outputs, `rwA` and `rwB`, and for their predecessors: the raw inputs
+\* under `rwA` and the compaction output under `rwB`. It constrains those
+\* outputs against whatever their predecessors currently hold, so it cannot
+\* pin that a raw input's own content never moved. README.md's assumptions
+\* section explains why a replacement transition is out of scope rather than
+\* added.
 RawInputContentAssumedImmutable ==
     \A o \in RawInputs : objContent[o] = InitContent(o)
 
@@ -1174,9 +1193,11 @@ RawInputContentAssumedImmutable ==
 \* first firing (superseded = {}): the implementation runs one rewrite per
 \* erasure request, not a loop that keeps re-deriving an already-produced
 \* rewrite output every time ordinary retention ages it out, so granting it
-\* unconditional fairness would force a livelock the implementation doesn't
-\* have (RetentionSweep deleting the rewrite output, a rewrite recreating it
-\* and re-stamping its inputs' horizon, forever deferring their own sweep).
+\* unconditional fairness would force a publish loop the implementation
+\* doesn't have: RetentionSweep deletes the rewrite output and a fair
+\* StartRewrite recreates it, without end. That loop no longer moves the
+\* inputs' protection horizon with it, since supersededAt keeps the first
+\* supersession's clock, but the loop itself is still not what the pass does.
 \* PublishRewrite and ExpireLease are treated differently: the publish IS fair
 \* (a pass that already listed does eventually ack, which is the whole reason
 \* the ack can land after the lease moved), while ExpireLease stays unfair

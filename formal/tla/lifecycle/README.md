@@ -287,12 +287,15 @@ eventually lapses, and nothing compels a compaction to run on any given bucket.
 scoped to its first firing rather than granted unconditionally: `RetentionSweep`
 ranges over `DataObjects`, which includes the rewrite output, so it can delete
 an already-produced rewrite output; an unconditionally fair `StartRewrite`
-would then be compelled to recreate it and re-stamp its inputs' horizon
-every time, perpetually resetting the horizon countdown for the very raw input
-`EventuallySwept` is waiting on. The implementation runs one rewrite per erasure
-request, not a loop that re-derives an already-produced output whenever ordinary
-retention ages it out, so unconditional fairness there would assert a guarantee
-the implementation doesn't make.
+would then be compelled to recreate it every time, an endless
+publish-and-delete loop. That loop no longer resets the horizon countdown for
+the raw input `EventuallySwept` is waiting on, because `supersededAt` now keeps
+the clock of the FIRST supersession and a republish over an already superseded
+input leaves it alone (`counterexamples/superseded-restamp-probe.md`); the loop
+itself is still not what the pass does. The implementation runs one rewrite per
+erasure request, not a loop that re-derives an already-produced output whenever
+ordinary retention ages it out, so unconditional fairness there would assert a
+guarantee the implementation doesn't make.
 
 The two publish steps are fair where their listing steps are not, and the
 asymmetry is deliberate. A pass that has already listed does finish: that is
