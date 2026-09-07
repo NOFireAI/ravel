@@ -15,6 +15,7 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{DeleteParams, Patch, PatchParams};
@@ -39,7 +40,8 @@ use crate::reconcile::{
     GcBootstrapGate, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
     WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON, desired_objects,
     grpcroute_api_resource, httproute_api_resource, possible_gateway_route_names,
-    possible_ingest_ingress_names, possible_router_object_names,
+    possible_ingest_ingress_names, possible_pod_disruption_budget_names,
+    possible_router_object_names,
 };
 
 /// Server-side-apply field manager name.
@@ -1181,6 +1183,28 @@ async fn reconcile_inner(
     query_svc.metadata.namespace = Some(namespace.to_string());
     query_svc.metadata.owner_references = owner.clone();
     apply(&services, &child(instance, "query"), &query_svc).await?;
+
+    // Pod disruption budgets (issue #126, deliverable 4): apply one per rendered
+    // tier, then delete every possible PDB name the render did not produce, so
+    // disabling `maintain` removes its PDB instead of orphaning one that guards a
+    // Deployment that no longer exists. Applied and swept here (owned like the
+    // Deployments, with the same field manager and owner references) so a manual
+    // patch does not survive a reconcile.
+    let disruption_budgets: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    let mut desired_pdb_names: BTreeSet<String> = BTreeSet::new();
+    for mut pdb in desired.pod_disruption_budgets {
+        let name = pdb.name_any();
+        pdb.metadata.namespace = Some(namespace.to_string());
+        pdb.metadata.owner_references = owner.clone();
+        apply(&disruption_budgets, &name, &pdb).await?;
+        desired_pdb_names.insert(name);
+    }
+    for name in possible_pod_disruption_budget_names(instance) {
+        if desired_pdb_names.contains(&name) {
+            continue;
+        }
+        delete_if_present(&disruption_budgets, &name).await?;
+    }
 
     // The three Deployments, in exactly the order `gc_bootstrap` names and no
     // other.
