@@ -2752,6 +2752,48 @@ its 16-block, 41-column fixture phase 1 decodes 3 pages per block against the
 single-phase plan's 39 over the same 16 blocks, and un-cached, a `k = 10`
 statement moves 103,606 bytes in 14 GETs against a single pass's 29,645 in 4.
 
+#### Bounded top-k grouped aggregation (issue #1402)
+
+`BoundedTopKAggregate` is a physical optimizer rule (installed by
+`build_session` when `SqlConfig::bounded_topk_max_limit` is `Some`) that stops
+a `GROUP BY <high-cardinality key> ... ORDER BY <aggregate> LIMIT k` from
+materialising one accumulator per distinct group to return `k` rows. It fires
+only when every one of these holds: the plan is a single-stream `SortExec` with
+a `fetch` at or below the configured limit, ordering by exactly one column;
+every node between that sort and the aggregate is a coalesce, a repartition, a
+cooperative wrapper, or a renaming projection (a `HAVING` filter refuses, since
+it decides which groups reach the sort); the aggregate has exactly one group
+key, no `FILTER` clause, and exactly one aggregate expression; that aggregate is
+`max` under a descending sort or `min` under an ascending one; and its input
+type is not floating point. Under those conditions the aggregate is rebuilt with
+DataFusion's `LimitOptions`, which executes it as a bounded priority map of `k`
+groups. Outside them the plan is byte-identical to the one the uninstalled rule
+produces, which `crates/ravel-sql/tests/bounded_topk_aggregate.rs` asserts for
+every conjunct by comparing the rendered physical plans rather than the answers.
+
+The rule is exact, and the gate is what makes it exact. A `max`/`min` group's
+result is the extreme of independently contributed row values, so the priority
+map drops a group only when its best value so far loses to the current k-th
+best, and that k-th best only tightens; a group whose true extreme beats the
+final k-th therefore beat every earlier threshold too, was admitted the moment
+that value arrived, and carries exactly that value. `count` and `sum` do NOT get
+this treatment even though they are monotone non-decreasing, because
+monotonicity makes a running value a *lower* bound on the final one and pruning
+needs an upper bound: `ORDER BY count(*) DESC LIMIT 1` over the row sequence
+`A, B, B, B` would evict `B` three times at a running count of 1 and answer `A`
+with 1 instead of `B` with 3. The float exclusion is the ADR-0023 total order:
+the priority map compares values itself and never constructs ravel's
+total-order min/max accumulator, so a float input routed through it would answer
+under DataFusion's ordering of `-0.0` and NaN payloads rather than ravel's.
+DataFusion's own `TopKAggregation` rule, which admits both of those shapes and
+defaults on, is turned off in `session_config` for exactly this reason.
+
+On the test fixture (200,000 distinct keys, `ORDER BY max(val) DESC LIMIT 10`)
+`peakIntermediateBytes` is 1,837,456 with the rule installed against 10,748,928
+without it. Across a tenfold increase in distinct keys the rule-off figure grows
+9.4x and the rule-on figure 1.75x, and the residual growth on the rule-on side
+is the scan's own batches rather than aggregate state.
+
 Both gaps ADR-0033 recorded are now closed. Both were deliberate, not
 oversights.
 
