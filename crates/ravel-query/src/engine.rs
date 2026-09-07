@@ -1290,6 +1290,17 @@ impl QueryEngine {
             )
             .await?;
 
+        // Checked here, right after the log lane's own resolve returns, for
+        // the same reason the metrics lane checks in `resolve_snapshot_with_retry`
+        // do: a log selector whose snapshot resolves to zero segments never
+        // reaches the incremental checks in the log fetch loop below.
+        if let Some(err) = segment_admission::request_budget_exceeded(
+            log_accounting.snapshot().pooled().total_s3_requests(),
+            self.config.max_s3_requests,
+        ) {
+            return Err(err);
+        }
+
         // ADR-1103 decision 4 step 4: a query with both a metrics and a log
         // selector must not spend two full `max_segments` budgets. Each
         // `resolve_bounded` call above already checked its OWN sealed-segment
@@ -1956,6 +1967,18 @@ impl QueryEngine {
                 first_accounting.resolve(),
             )
             .await?;
+        // Checked here, right after the resolve returns, not only at the
+        // segment-fetch boundaries below: a query whose snapshot resolves to
+        // zero segments never reaches those checks, so a caller with a
+        // lowered `max_s3_requests` (ADR-1374 decision 3) must still be
+        // stopped from completing on the strength of the resolve's own
+        // catalog requests alone.
+        if let Some(err) = segment_admission::request_budget_exceeded(
+            first_accounting.snapshot().pooled().total_s3_requests(),
+            self.config.max_s3_requests,
+        ) {
+            return Err(err);
+        }
         let first_estimate = estimate_cost(&first, fetch_multiplier, catalog_requests);
         let first_segments = first.segments.len() as u64;
         let first_pruned = first.segments_pruned;
@@ -1986,6 +2009,12 @@ impl QueryEngine {
                         second_accounting.resolve(),
                     )
                     .await?;
+                if let Some(err) = segment_admission::request_budget_exceeded(
+                    second_accounting.snapshot().pooled().total_s3_requests(),
+                    self.config.max_s3_requests,
+                ) {
+                    return Err(err);
+                }
                 let second_estimate = estimate_cost(&second, fetch_multiplier, catalog_requests);
                 let second_segments = second.segments.len() as u64;
                 let second_pruned = second.segments_pruned;
@@ -4790,6 +4819,78 @@ mod tests {
     use ravel_types::{Label, LabelSet, SeriesId};
 
     use super::*;
+
+    /// CodeRabbit finding on PR #1424 (comment 3952989200): a query whose
+    /// snapshot resolves to zero segments never enters the segment-fetch
+    /// loop, so the incremental `max_s3_requests` check there never runs. A
+    /// caller-lowered budget of zero (ADR-1374 decision 3) must still be
+    /// enforced on the strength of the resolve's own catalog requests, and
+    /// the server default ceiling (far above any resolve cost) must not
+    /// change behavior for the same fixture.
+    #[tokio::test]
+    async fn lowered_request_budget_is_enforced_after_resolve() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(&store),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+        let tenant_hash = ravel_types::TenantId::new("acme").hash();
+        // No segments are ever published to this store, so the window is
+        // arbitrary: the snapshot resolves empty regardless of its bounds.
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 60 * 1_000_000_000,
+        };
+        let now_ns = window.end_ns;
+        let deadline = Duration::from_secs(30);
+
+        let budgets = RequestBudgets {
+            max_store_requests: Some(RequestLimit::Bounded(0)),
+            ..Default::default()
+        };
+        let err = engine
+            .resolve_series_with_budgets(
+                tenant_hash,
+                &[],
+                window,
+                &[],
+                now_ns,
+                deadline,
+                Some(&budgets),
+            )
+            .await
+            .expect_err("a zero store-request budget must trip even on an empty snapshot");
+        let QueryError::RequestBudgetExceeded { requests, max } = err else {
+            panic!("expected QueryError::RequestBudgetExceeded, got {err:?}");
+        };
+        assert_eq!(
+            max, 0,
+            "the caller's lowered ceiling must be reported exactly"
+        );
+        // Pinned: an empty-snapshot resolve against a fresh `MemoryStore`
+        // issues exactly 3 catalog requests. A regression that changes the
+        // resolve's own request count is exactly what this bound catches.
+        assert_eq!(
+            requests, 3,
+            "the resolve's own catalog request count must be exact, not just nonzero"
+        );
+
+        // Control: the server's default ceiling is far above any resolve
+        // cost, so the identical fixture succeeds under it, and the
+        // accounted request count is the same exact number.
+        let (_series, stats) = engine
+            .resolve_series_with_budgets(tenant_hash, &[], window, &[], now_ns, deadline, None)
+            .await
+            .expect("the server default ceiling must not trip on the resolve's own cost");
+        assert_eq!(
+            stats.accounting.total_s3_requests(),
+            requests,
+            "the default-ceiling control must account the same resolve cost as the trip"
+        );
+    }
 
     /// Issue #529: the labels/series HTTP endpoints
     /// (`http/handlers.rs`'s `match[]` parameter) reach `parse_selector`
