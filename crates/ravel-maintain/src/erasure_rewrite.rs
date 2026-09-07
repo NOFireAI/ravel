@@ -76,7 +76,7 @@
 //! adopting its batching complexity too, which the scope reduction above
 //! deliberately avoids. Flagged here and in the task's final report.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
@@ -2020,6 +2020,49 @@ fn bucket_in_scope_at_ack(
         <= request
             .created_unix_ns
             .saturating_add(config.clock_skew_allowance_ns)
+}
+
+/// The ingest hour a unix-nanosecond instant falls in, matching
+/// [`Bucket::start_ns`]/[`Bucket::end_ns`] (`ingest_hour_bucket` is unix hours,
+/// covering `[hour * NS_PER_HOUR, (hour + 1) * NS_PER_HOUR)`). A negative or
+/// out-of-`u32`-range instant clamps rather than wrapping; neither occurs for a
+/// real acknowledgement, but the derivation must not silently produce a wrong
+/// hour if one ever did.
+fn ingest_hour_of(unix_ns: i64) -> u32 {
+    u32::try_from(unix_ns.max(0) / NS_PER_HOUR).unwrap_or(u32::MAX)
+}
+
+/// The distinct ingest hours open at the acknowledgements in `pending`: the hour
+/// each request's [`ErasureRequest::created_unix_ns`] falls in.
+///
+/// A pass discovers its buckets from the commit-prefix listing
+/// (`list_erasure_scan_hours` in the server driver), which cannot return an hour
+/// whose pre-acknowledgement flush has not published a commit record yet -- and
+/// "nothing committed yet" is exactly the state a flush still buffering at the
+/// ack leaves behind. That hour is nonetheless in the request's scope: it is
+/// unsealed until its seal bound ([`erasure_seal_wait_bound_ns`]) elapses,
+/// whether or not anything has been committed into it. A pass that examined only
+/// the listed hours would never see the bucket, complete the request, and leave
+/// the hour to seal carrying the subject's pre-ack records that no later pass
+/// revisits -- the resurrection ADR-0064 section 4 exists to prevent, reached by
+/// never discovering the bucket rather than by deferring an examined one. The
+/// driver unions these hours into every shard's discovered hours so the
+/// completion gate considers the bucket whether or not the listing returned it.
+///
+/// Locating the hour is a pure calendar computation, deliberately NOT a second
+/// scope judgment: whether the bucket puts records in a request's scope is
+/// decided in exactly one place, [`bucket_in_scope_at_ack`] inside
+/// [`bucket_erasure_completion`], run over this hour's bucket exactly as over a
+/// listed one. Because the ack falls inside its own hour, that gate always finds
+/// the derived bucket in scope, so discovery and the gate cannot disagree. A
+/// later hour that opened after the ack is neither derived here nor -- absent a
+/// commit record -- listed, so it never holds completion open; that is what
+/// keeps the wait bounded to the single hour open at the ack.
+pub fn ack_open_ingest_hours(pending: &[PendingErasureRequest]) -> BTreeSet<u32> {
+    pending
+        .iter()
+        .map(|entry| ingest_hour_of(entry.request.created_unix_ns))
+        .collect()
 }
 
 /// The longest a `.done` can wait on an unsealed in-scope bucket: ADR-0064

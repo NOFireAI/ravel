@@ -475,6 +475,20 @@ let a request complete while such a bucket was still open. Completion now
 blocks instead: no `.done` is written while any bucket that was in the
 request's scope at acknowledgement is unsealed.
 
+"In scope at acknowledgement" includes the hour open at the ack even before its
+first commit record is published. Bucket discovery is a listing of the
+commit-record prefix, and a flush still buffering at the ack has not published a
+commit record, so that hour has no entry in the listing yet -- "nothing
+committed yet" is exactly the state such a flush leaves behind. A pass that
+examined only the listed hours would never see the bucket, complete the request,
+and leave the hour to seal carrying the subject's pre-ack records that no later
+pass revisits: the same resurrection this amendment prevents, reached by never
+discovering the bucket rather than by deferring an examined one. The pass
+therefore derives the ack hour from the request's `created_unix_ns` and
+considers its bucket whether or not the listing returned it; the scope test that
+then judges the bucket is the same one it applies to a listed bucket, so the two
+paths cannot disagree about what "in scope" means.
+
 The two readings differ in outcome, not in wording. Deferral is a statement
 about which pass does the rewrite, and it holds only while a later pass will
 still run. A `.done` is what stops the request being pending, so completing on
