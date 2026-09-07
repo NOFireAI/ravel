@@ -158,6 +158,26 @@ jobs:
             --metric-type Gauge \
             --metrics 500
 
+      # telemetrygen also injects deterministic LOG records so the README's
+      # PromQL-over-logs block (`sum by (job) (count_over_time(ravel_log_lines
+      # [5m]))`) has a log source to match against the PUBLISHED image. The
+      # collector's own internal-logs export is not a CI-usable source (its
+      # record count and timing depend on log level), so this lane supplies its
+      # own the same way it supplies the `gen` metric series. The resource
+      # `service.name` becomes the `job` label the query groups by
+      # (crates/ravel-query/src/log_series.rs). Mirrors the metrics step above.
+      - name: Generate deterministic logs with telemetrygen
+        run: |
+          docker run --rm --network host \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            logs \
+            --otlp-http \
+            --otlp-endpoint 127.0.0.1:4318 \
+            --otlp-insecure \
+            --otlp-header 'Authorization="Bearer demo-token"' \
+            --otlp-attributes 'service.name="quickstart-logs"' \
+            --logs 500
+
       # The check itself: wait for a non-empty first query, then run every marked
       # README block and assert its declared outcome (not its exit code). This is
       # the whole point of the lane; a failure here is a README/published-image
