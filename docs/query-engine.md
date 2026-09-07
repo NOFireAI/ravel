@@ -1064,9 +1064,11 @@ those four tables, only `max_segments` is lowered today: it binds in
 `segment_admission::admit`, which runs on the catalog resolve every table
 shares, so a per-request `max_segments` does refuse an over-wide scan on any
 of them. A per-request bytes or request ceiling set alongside it is accepted
-and clamped, and then simply never consulted by those four scans. This is a
+and clamped, and then never consulted by those four scans. This is a
 pre-existing gap in the providers, not something the per-request budgets
-introduced; it is tracked as issue #1409 and is out of scope here.
+introduced; enforcing the lowered byte and store-request budgets on the
+`logs`, `spans`, `alerts`, and `audit` providers is tracked as follow-up
+work and is not implemented yet, and is out of scope here.
 
 ### The agent query knobs on `SqlRequest` (ADR-1374)
 
