@@ -18,9 +18,16 @@
 (*  * `head` is the set of data objects the current HEAD names as live parts.   *)
 (*    `headState` models the object read of the HEAD itself: present (gate      *)
 (*    reads membership), absent (gate clears), unreadable (whole pass blocked). *)
-(*  * `superseded` is the set of inputs a rewrite record has superseded         *)
+(*  * `superseded` is the set of inputs a published record set has superseded   *)
 (*    (crates/ravel-catalog resolve_rewrite_supersession); a superseded input   *)
 (*    is a physical-GC candidate but is HELD while HEAD still names it.          *)
+(*  * `leaseOwner`, `rwPhase`, `rwInputs` and `cmpPhase` are the maintenance     *)
+(*    passes' own bookkeeping: who holds the bucket's advisory lease, and how    *)
+(*    far each pass has got between listing the bucket and publishing its        *)
+(*    record. Every pass is two steps because the shipped passes are two object  *)
+(*    store round trips with no compare-and-swap between them; that is what      *)
+(*    makes a decision taken against a listing observable as stale by the time   *)
+(*    it is acted on (issues #1289 and #1221).                                   *)
 (*  * `heldBuckets` are the shards under a legal hold; a hold covers the         *)
 (*    l0/commit/l1 prefixes and NOT the del prefix (shard_hold_scopes), so only *)
 (*    data objects, never .dreq/.done/tombstone, are held.                      *)
@@ -74,10 +81,20 @@ CONSTANTS
                                 \* instead of dropping them (breaks the multiset rule)
     CompleteIgnoresServedSet,   \* completion skips the served-set check, marking
                                 \* .done while the current HEAD still serves the subject
-    HorizonGuardsPinnedQueries  \* base: a horizon-gated delete also respects an
+    HorizonGuardsPinnedQueries, \* base: a horizon-gated delete also respects an
                                 \* in-window pinned query. Candidate #1133 sets it
                                 \* FALSE to model the shipped delete, which gates on
                                 \* horizon AND head-empty but NOT on pinned queries.
+    CompactionIgnoresRewrite,   \* the compactor publishes a record set without
+                                \* checking the listing for a live rewrite record
+                                \* (drops the RewritePresent refusal, issue #1289)
+    SerializeCompactionAndRewrite \* base TRUE: the maintenance driver runs at most
+                                \* one of compaction and erasure rewrite over a
+                                \* bucket at a time, so neither pass can be between
+                                \* its listing and its publish while the other lists.
+                                \* FALSE models two workers that both believe they
+                                \* own the bucket (ADR-0065 membership overlap), the
+                                \* residual window cdce1722 documents as open.
 
 ASSUME ProtectionHorizon \in Nat /\ Grace \in Nat
 ASSUME MaxQueryDuration \in Nat /\ ClockSkew \in Nat
@@ -98,16 +115,34 @@ Subjects  == {"s1", "s2"}
 Requests  == {"r1"}
 
 \* Object identities (store keys).
+\* A record set is any object a reader can be resolved onto for the bucket: a
+\* rewrite output or a compaction output. Both are published under their own key
+\* class (erasure rewrite record vs compaction record), so the store cannot make
+\* one exclude the other; only a guard in the publishing pass can (issue #1289).
 RawInputs     == {"raw1"}                   \* L0 raw input in b1, serves subject s1
-RewriteOut    == {"rwA"}                    \* rewrite of {raw1} applying {r1}
-DataObjects   == RawInputs \cup RewriteOut
+RewriteOut    == {"rwA", "rwB"}             \* rwA rewrites {raw1}, rwB rewrites {cmpA}
+CompactOut    == {"cmpA"}                   \* compaction of the live L0 inputs
+RecordSets    == RewriteOut \cup CompactOut
+DataObjects   == RawInputs \cup RecordSets
 ControlObjects== {"tombB1", "dreqR1", "doneR1", "sysgc"}
 Objects       == DataObjects \cup ControlObjects
+
+\* The objects a later record set can supersede. A rewrite output is never itself
+\* superseded in this instance (rwB is the terminal set), so the superseded set
+\* and the horizon stamp range over the raw inputs and the compaction output.
+SupersededCandidates == RawInputs \cup CompactOut
+
+\* The two rewrite identities. Each is an independent worker attempt at the
+\* bucket's erasure rewrite; ADR-0065 grants ownership by rendezvous hash with no
+\* per-unit CAS lease and no fencing token, so a second identity can start after
+\* the first identity's lease expires and before the first identity's own publish
+\* (issue #1221). The pair is what makes that interleaving expressible at all.
+RewriteIds    == {"A", "B"}
 
 InitPresent   == RawInputs \cup {"sysgc"}
 
 \* --- Static object metadata --------------------------------------------------
-Bucket(o) == CASE o \in {"raw1","rwA","tombB1","dreqR1","doneR1"} -> "b1"
+Bucket(o) == CASE o \in {"raw1","rwA","rwB","cmpA","tombB1","dreqR1","doneR1"} -> "b1"
                [] OTHER -> "sys"
 
 \* The served records are modelled by identity, not by count: raw1 carries two
@@ -123,8 +158,19 @@ Bucket(o) == CASE o \in {"raw1","rwA","tombB1","dreqR1","doneR1"} -> "b1"
 AllRecords     == {"rec1", "rec2"}
 RecordSubject(r) == IF r = "rec1" THEN "s1" ELSE "s2"
 
-Predecessors(o) == IF o = "rwA" THEN RawInputs ELSE {}
-AppliedReqs(o)  == IF o = "rwA" THEN Requests ELSE {}
+\* rwA rewrites the raw L0 inputs; cmpA compacts the same raw L0 inputs; rwB
+\* rewrites the compaction output, which is the rewrite-of-a-derived-set case the
+\* single-identity model could not reach (REPORT.md section 10, issue #1221).
+Predecessors(o) == CASE o = "rwA"  -> RawInputs
+                     [] o = "rwB"  -> CompactOut
+                     [] o = "cmpA" -> RawInputs
+                     [] OTHER      -> {}
+
+\* A compaction applies no erasure request: it merges its inputs and drops
+\* nothing. That is the whole mechanism issue #1289 asks about -- a compaction
+\* record over inputs a rewrite deliberately emptied of a subject brings that
+\* subject back for any reader resolved onto the compaction output.
+AppliedReqs(o)  == IF o \in RewriteOut THEN Requests ELSE {}
 
 \* Subjects erased by a set of request ids (r1 erases s1, never s2).
 ErasedBy(reqs) == IF "r1" \in reqs THEN {"s1"} ELSE {}
@@ -137,7 +183,7 @@ InitContent(o) == IF o \in RawInputs THEN {"rec1", "rec2"} ELSE {}
 \* Rewrite descriptors for the identity-collision property: same input set, a
 \* different applied-request set. The shipped key binds the sorted applied ids
 \* (compute_rewrite_input_set_hash); the switch drops them so the two collide.
-\* PerformRewrite names its two output variants by RewriteKey and stores those
+\* PublishRewrite names its two output variants by RewriteKey and stores those
 \* names in `variantKey`; the invariant reads the stored names, not this operator
 \* (finding 4). RewriteKey itself is what the action USES to name an object.
 DescA == [inputs |-> RawInputs, reqs |-> {"r1"}]
@@ -145,7 +191,7 @@ DescB == [inputs |-> RawInputs, reqs |-> {}]
 RewriteKey(d) == IF RewriteIdentityOmitsRequests
                      THEN <<d.inputs>>
                      ELSE <<d.inputs, d.reqs>>
-\* The sentinel a variant name holds before PerformRewrite has assigned it.
+\* The sentinel a variant name holds before PublishRewrite has assigned it.
 UnnamedKey == <<>>
 
 \* Legal-hold coverage: a hold on a bucket covers its data objects (l0/commit/l1)
@@ -165,7 +211,8 @@ VARIABLES
     head,             \* SUBSET DataObjects: the HEAD's named live parts
     headState,        \* "present" | "absent" | "unreadable"  (the HEAD object read)
     clock,            \* Nat
-    superseded,       \* SUBSET RawInputs: inputs a rewrite has superseded
+    superseded,       \* SUBSET SupersededCandidates: inputs a published record set
+                      \* has superseded
     heldBuckets,      \* SUBSET Buckets under a legal hold
     refreshFailed,    \* BOOLEAN: this tick's legal-hold refresh failed
     query,            \* [active, needs: SUBSET DataObjects, deadline: Nat]
@@ -173,9 +220,22 @@ VARIABLES
     tombRetiredAt,    \* [Buckets -> Nat]: retired_at, 0 when no tombstone
     dreqHorizon,      \* Nat: the .dreq horizon
     doneAt,           \* Nat: completion timestamp (0 when no .done)
-    supersededAt,     \* Nat: clock at which the rewrite superseded its inputs (0 = none)
+    supersededAt,     \* [SupersededCandidates -> Nat]: per-object clock at which a
+                      \* publish superseded it (0 = not superseded). Per object, not
+                      \* one shared stamp: with two publishing passes a later
+                      \* supersession would otherwise retroactively re-open the
+                      \* protection window of an earlier, already legitimate delete.
     objContent,       \* [Objects -> SUBSET AllRecords]: served record identities
-    variantKey,       \* [{"v1","v2"} -> key]: the names PerformRewrite assigned
+    variantKey,       \* [{"v1","v2"} -> key]: the names PublishRewrite assigned
+    leaseOwner,       \* "none" | "A" | "B" | "C": who currently holds the bucket's
+                      \* maintenance lease ("C" is the compactor). Ownership is
+                      \* advisory: ADR-0065 has no fencing token, so a pass that
+                      \* already listed keeps running after the lease moves.
+    rwPhase,          \* [RewriteIds -> {"idle","listed","done"}]: how far each
+                      \* rewrite identity got. "listed" is the list-then-act window.
+    rwInputs,         \* [RewriteIds -> SUBSET SupersededCandidates]: the live input
+                      \* set each identity resolved at its listing step
+    cmpPhase,         \* "idle" | "listed" | "done": the compaction pass's own window
     sysgc,            \* [ph, mqd, grace, skew]
     lastGc            \* witness of the last GC deletion step
 
@@ -183,12 +243,19 @@ storeVars == <<store, lastModified, versionCounter, uploads, listState>>
 protoVars == <<head, headState, clock, superseded, heldBuckets,
                refreshFailed, query, erasureRequested, tombRetiredAt,
                dreqHorizon, doneAt, supersededAt, objContent, variantKey,
+               leaseOwner, rwPhase, rwInputs, cmpPhase,
                sysgc, lastGc>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           head, headState, clock, superseded, heldBuckets,
           refreshFailed, query, erasureRequested, tombRetiredAt,
           dreqHorizon, doneAt, supersededAt, objContent, variantKey,
+          leaseOwner, rwPhase, rwInputs, cmpPhase,
           sysgc, lastGc>>
+
+\* The maintenance-pass bookkeeping (who holds the lease, how far each pass got).
+\* Every action that is not a maintenance pass leaves all four alone, so it is
+\* worth a name rather than four entries on a dozen UNCHANGED lists.
+maintVars == <<leaseOwner, rwPhase, rwInputs, cmpPhase>>
 
 S == INSTANCE RavelObjectStore
        WITH Keys <- Objects, Content <- {"dat", "nc"}, NoContent <- "nc",
@@ -200,26 +267,29 @@ PresentObj(o) == store[o].present
 \* content (finding 3: serving is a fact about stored content, not a static CASE).
 ServesSubject(o, s) == \E r \in objContent[o] : RecordSubject(r) = s
 
-\* The record set the rewrite output should serve: its predecessors' records minus
-\* the records whose subject the applied requests erased. RewriteKeepsErasedRecords
-\* drops the minus (finding 3 behaviour mutant). Reads objContent, not InitContent,
-\* because resolve_live_inputs re-lists the bucket and reads current object bodies
-\* at rewrite time (issue #1122, finding 1). For a raw-input predecessor this read
-\* is not exercised in this model: raw inputs are immutable by system invariant
-\* (RawInputContentAssumedImmutable, README.md), so objContent[i] for i \in RawInputs
-\* always equals InitContent(i) and no reachable behaviour can tell the two reads
-\* apart. The current-state read matters for a predecessor that is itself a
-\* rewrite output, whose content PerformRewrite does write; this model has only
-\* one rewrite object (RewriteOut = {"rwA"}) and Predecessors("rwA") is fixed to
-\* RawInputs, so that rewrite-of-rewrite case is not reachable here either. Kept
-\* as objContent, not InitContent, so the operator states what resolve_live_inputs
-\* actually does rather than the narrower thing this finite model happens to be
-\* able to observe.
-RewriteOutputContent ==
-    LET inRecs == UNION { objContent[i] : i \in Predecessors("rwA") }
-    IN IF RewriteKeepsErasedRecords
+\* The record set a published output should serve: its predecessors' records minus
+\* the records whose subject its applied requests erased. A compaction applies no
+\* request, so its content is exactly the union of its inputs' records; a rewrite
+\* drops the erased ones. RewriteKeepsErasedRecords drops the minus for a rewrite
+\* output (finding 3 behaviour mutant) and leaves a compaction alone, because a
+\* compaction has no minus to drop.
+\*
+\* Reads objContent, not InitContent, because resolve_live_inputs re-lists the
+\* bucket and reads current object bodies at publish time (issue #1122, finding 1).
+\* For a raw-input predecessor this read is not exercised: raw inputs are immutable
+\* by system invariant (RawInputContentAssumedImmutable, README.md), so objContent[i]
+\* for i \in RawInputs always equals InitContent(i). The current-state read is what
+\* matters for a predecessor that is itself a published record set, whose content an
+\* earlier publish wrote. That case is now reachable: Predecessors("rwB") is the
+\* compaction output, so a StartCompaction/PublishCompaction pass followed by a
+\* rewrite over the resulting set exercises the read on a body no Init wrote. Before
+\* the compaction action existed, RewriteOut held one object whose predecessors were
+\* fixed to RawInputs and this read had no reachable witness (issue #1221).
+RecordSetContent(o) ==
+    LET inRecs == UNION { objContent[i] : i \in Predecessors(o) }
+    IN IF RewriteKeepsErasedRecords \/ AppliedReqs(o) = {}
            THEN inRecs
-           ELSE { r \in inRecs : RecordSubject(r) \notin ErasedBy(AppliedReqs("rwA")) }
+           ELSE { r \in inRecs : RecordSubject(r) \notin ErasedBy(AppliedReqs(o)) }
 
 \* State-space view: the invariants and every gate read object PRESENCE, never the
 \* store's version, content, upload or listing bookkeeping. Projecting those away
@@ -229,7 +299,8 @@ StoreView == [o \in Objects |-> store[o].present]
 View ==
     <<StoreView, head, headState, clock, superseded, heldBuckets, refreshFailed,
       query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt, supersededAt,
-      objContent, variantKey, sysgc, lastGc>>
+      objContent, variantKey, leaseOwner, rwPhase, rwInputs, cmpPhase,
+      sysgc, lastGc>>
 
 \* A delete decision needs a readable HEAD, present or absent: an absent HEAD
 \* names nothing, so the delete may proceed exactly as if EffectiveHead were
@@ -298,7 +369,7 @@ TypeOK ==
     /\ head \subseteq DataObjects
     /\ headState \in {"present","absent","unreadable"}
     /\ clock \in 0..MaxClock
-    /\ superseded \subseteq RawInputs
+    /\ superseded \subseteq SupersededCandidates
     /\ heldBuckets \subseteq Buckets
     /\ refreshFailed \in BOOLEAN
     /\ query \in [active: BOOLEAN, needs: SUBSET DataObjects, deadline: 0..(MaxClock + MaxQueryDuration)]
@@ -306,9 +377,13 @@ TypeOK ==
     /\ tombRetiredAt \in [Buckets -> 0..MaxClock]
     /\ dreqHorizon \in Nat
     /\ doneAt \in 0..MaxClock
-    /\ supersededAt \in 0..MaxClock
+    /\ supersededAt \in [SupersededCandidates -> 0..MaxClock]
     /\ objContent \in [Objects -> SUBSET AllRecords]
     /\ variantKey \in [{"v1","v2"} -> {UnnamedKey, RewriteKey(DescA), RewriteKey(DescB)}]
+    /\ leaseOwner \in {"none"} \cup RewriteIds \cup {"C"}
+    /\ rwPhase \in [RewriteIds -> {"idle","listed","done"}]
+    /\ rwInputs \in [RewriteIds -> SUBSET SupersededCandidates]
+    /\ cmpPhase \in {"idle","listed","done"}
     /\ sysgc \in [ph: Nat, mqd: Nat, grace: Nat, skew: Nat]
     /\ lastGc.rule \in {"none","superseded","retention","dreq","complete","tombstone"}
     /\ lastGc.deleted \subseteq Objects
@@ -343,9 +418,13 @@ Init ==
     /\ tombRetiredAt = [b \in Buckets |-> 0]
     /\ dreqHorizon = 0
     /\ doneAt = 0
-    /\ supersededAt = 0
+    /\ supersededAt = [i \in SupersededCandidates |-> 0]
     /\ objContent = [o \in Objects |-> InitContent(o)]
     /\ variantKey = [v \in {"v1","v2"} |-> UnnamedKey]
+    /\ leaseOwner = "none"
+    /\ rwPhase = [id \in RewriteIds |-> "idle"]
+    /\ rwInputs = [id \in RewriteIds |-> {}]
+    /\ cmpPhase = "idle"
     /\ sysgc = [ph |-> ProtectionHorizon,
                 mqd |-> MaxQueryDuration, grace |-> Grace, skew |-> ClockSkew]
     /\ lastGc = [rule |-> "none", deleted |-> {}, atClock |-> 0,
@@ -398,7 +477,8 @@ Tick ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 \* Pin an in-flight query at the current HEAD; its deadline is pin + mqd. It is
@@ -412,7 +492,8 @@ PinQuery ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 ExpireQuery ==
@@ -422,7 +503,8 @@ ExpireQuery ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 \* Place / release a legal hold on bucket b (its data prefixes).
@@ -432,7 +514,8 @@ PlaceHold(b) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 ReleaseHold(b) ==
@@ -441,7 +524,8 @@ ReleaseHold(b) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 \* The HEAD object read can fail (unreadable) or find the HEAD gone (absent).
@@ -461,7 +545,8 @@ SetHeadState(s) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 \* Toggle this tick's legal-hold refresh outcome.
@@ -472,7 +557,8 @@ SetRefresh(f) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 --------------------------------------------------------------------------------
@@ -488,67 +574,205 @@ RequestErasure ==
     /\ erasureRequested' = erasureRequested \cup {"s1"}
     /\ dreqHorizon' = clock + DreqHorizonDelta
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
-                   refreshFailed, query, tombRetiredAt, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   refreshFailed, query, tombRetiredAt, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
-\* Materialise the rewrite output rwA = inputs minus the erased subject and mark
-\* the inputs superseded (resolve_rewrite_supersession). The HEAD is NOT switched
+\* --- Live input resolution (resolve_live_inputs) ------------------------------
+\* The set a maintenance pass resolves for the bucket when it lists it: the live
+\* record sets if any have been published, otherwise the live raw L0 inputs. A
+\* superseded object is not live even when the object that superseded it has since
+\* been swept: supersession is recorded in the catalog, not implied by presence.
+LiveRecordSets == { o \in RecordSets : PresentObj(o) /\ o \notin superseded }
+
+LiveInputs ==
+    IF LiveRecordSets # {}
+        THEN LiveRecordSets
+        ELSE { o \in RawInputs : PresentObj(o) /\ o \notin superseded }
+
+\* The rewrite record key is content-addressed over the resolved input set and the
+\* sorted applied request ids (compute_rewrite_input_set_hash), so the key follows
+\* from the inputs, not from which worker resolved them. Two identities that
+\* resolved the same live input set therefore aim at the same key.
+TargetOf(ins) == IF ins = CompactOut THEN "rwB" ELSE "rwA"
+
+\* Materialise a rewrite output = inputs minus the erased subject and mark the
+\* inputs superseded (resolve_rewrite_supersession). The HEAD is NOT switched
 \* here; a later HeadAdvance drops the superseded inputs, so between the two the
 \* inputs are still HEAD-named and the superseded sweep must hold them.
 \*
-\* Gated on the erasure request already existing and on no prior supersession
-\* (finding 2, round four): erasure_rewrite.rs only rewrites a bucket for its
-\* pending_erasure_requests (.dreq present, no matching .done), and
-\* ErasureRewriteOutcome::AlreadyApplied skips a bucket already rewritten for
-\* every applicable pending request, so a second rewrite can't follow the
-\* first request's cleanup. Without these, the model could materialise rwA and
-\* supersede the raw inputs before any erasure request exists, an ordering the
-\* implementation never produces.
+\* Split into two steps (issue #1221). erasure_rewrite_bucket lists the bucket,
+\* decides against that listing, then publishes; the two are separate object-store
+\* round trips with no compare-and-swap between them, and ADR-0065 grants bucket
+\* ownership by rendezvous hash with no per-unit lease and no fencing token. So a
+\* second identity can list and publish inside the first identity's window, and the
+\* first identity's publish is NOT re-checked against the lease it no longer holds.
+\* The split is load-bearing: a single atomic action cannot express that
+\* interleaving, so the invariants below would hold over it vacuously.
 \*
-\* Two further gates (issue #1122, finding 1): ~PresentObj("doneR1") mirrors
-\* pending_erasure_requests filtering out any .dreq with a matching .done, so a
-\* completed erasure is never seen as still pending; RetireBucket followed by
-\* DropRetiredBucketFromHead can otherwise make CompleteErasure fire (writing
-\* doneR1) while superseded is still {}, leaving this action able to run after
-\* completion. The predecessor-presence conjunct mirrors resolve_live_inputs
-\* reading the bucket fresh at rewrite time; RetentionSweep can otherwise delete
-\* a raw input while dreqR1 is present and superseded = {}, letting this action
-\* derive rwA's content from an input that is no longer there.
-\*
-\* Fourth gate, ~PresentObj("tombB1") (issue #1122, round five's noted gap):
-\* erasure_rewrite_bucket reads list_bucket fresh and returns
-\* ErasureRewriteOutcome::Tombstoned whenever the listing's tombstone_key is
-\* present, refusing to rewrite at all. RetireBucket has no dependency on
-\* dreqR1, doneR1 or superseded, so tombB1 can be present while the other
-\* three conjuncts above all still pass; this gate is the only thing that
-\* excludes that state.
-PerformRewrite ==
-    /\ ~PresentObj("rwA")
+\* StartRewrite carries erasure_rewrite_bucket's front gates:
+\*  * PresentObj("dreqR1") /\ ~PresentObj("doneR1"): pending_erasure_requests
+\*    filters out any .dreq with a matching .done, so a completed erasure is never
+\*    seen as still pending (issue #1122, finding 1).
+\*  * ~PresentObj("tombB1"): ErasureRewriteOutcome::Tombstoned, read against a
+\*    fresh listing. RetireBucket has no dependency on dreqR1/doneR1/superseded, so
+\*    this gate is the only thing excluding a rewrite of a retired bucket.
+\*  * ~HeldInputServes: ErasureRewriteOutcome::Held (bucket_is_held).
+\*  * LiveInputs # {}: resolve_live_inputs found something to rewrite.
+\*  * no live input is itself a rewrite output: ErasureRewriteOutcome::AlreadyApplied,
+\*    which skips a bucket already rewritten for every applicable pending request.
+\*    This replaces the old `superseded = {}` conjunct, which also excluded a
+\*    rewrite of a compaction output that no rewrite had yet touched.
+StartRewrite(id) ==
+    /\ leaseOwner \in {"none", id}
+    /\ rwPhase[id] = "idle"
+    /\ (SerializeCompactionAndRewrite => cmpPhase # "listed")
     /\ PresentObj("dreqR1")
     /\ ~PresentObj("doneR1")
-    /\ superseded = {}
     /\ ~PresentObj("tombB1")
-    /\ \A i \in Predecessors("rwA") : PresentObj(i)
-    /\ S!PutOverwrite("rwA", "dat")
-    /\ superseded' = superseded \cup RawInputs
-    /\ supersededAt' = clock
-    /\ objContent' = [objContent EXCEPT !["rwA"] = RewriteOutputContent]
-    /\ variantKey' = [variantKey EXCEPT !["v1"] = RewriteKey(DescA),
-                                        !["v2"] = RewriteKey(DescB)]
-    /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
-                   erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc>>
+    /\ ~HeldInputServes("s1")
+    /\ LiveInputs # {}
+    /\ ~(\E o \in LiveInputs : o \in RewriteOut)
+    /\ leaseOwner' = id
+    /\ rwPhase' = [rwPhase EXCEPT ![id] = "listed"]
+    /\ rwInputs' = [rwInputs EXCEPT ![id] = LiveInputs]
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
+                   query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
+                   sysgc, supersededAt, objContent, variantKey, cmpPhase>>
     /\ NoGc
 
-\* Switch the HEAD onto the rewrite output, dropping the superseded raw inputs
-\* (a fold advancing). It may lag arbitrarily behind PerformRewrite.
+\* The publish. Deliberately unguarded by the lease: nothing between the listing
+\* and this write re-reads ownership, so this fires whatever leaseOwner now says.
+\* The one thing that does protect it is the store: the record is published
+\* CreateIfAbsent under a key derived from the resolved input set, so a sibling
+\* identity that resolved the SAME inputs converges onto the one object instead of
+\* publishing a second record set. That convergence is the reason the two-identity
+\* race is safe; it is a property of the content-addressed key and CreateIfAbsent,
+\* not of the lease.
+PublishRewrite(id) ==
+    /\ rwPhase[id] = "listed"
+    /\ rwPhase' = [rwPhase EXCEPT ![id] = "done"]
+    /\ LET tgt == TargetOf(rwInputs[id]) IN
+         IF PresentObj(tgt)
+             THEN \* Lost the CreateIfAbsent to a sibling that resolved the same
+                  \* inputs first. Its record already covers this pass's work.
+                  /\ UNCHANGED storeVars
+                  /\ UNCHANGED <<superseded, supersededAt, objContent, variantKey>>
+             ELSE
+                  /\ S!PutCreateIfAbsent(tgt, "dat")
+                  /\ superseded' = superseded \cup rwInputs[id]
+                  /\ supersededAt' = [i \in SupersededCandidates |->
+                                        IF i \in rwInputs[id] THEN clock
+                                                              ELSE supersededAt[i]]
+                  /\ objContent' = [objContent EXCEPT ![tgt] = RecordSetContent(tgt)]
+                  /\ variantKey' = [variantKey EXCEPT !["v1"] = RewriteKey(DescA),
+                                                      !["v2"] = RewriteKey(DescB)]
+    /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
+                   erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
+                   leaseOwner, rwInputs, cmpPhase>>
+    /\ NoGc
+
+\* The lease expires under a pass that has already listed. ADR-0065 decision 2:
+\* during a membership transition (bounded by 3*H plus one heartbeat) two workers
+\* may both believe they own a unit, and the enumerated concurrency-safe operations
+\* do not include the erasure rewrite, which landed with ADR-0064 afterwards. This
+\* action is what lets rwB start after rwA's lease has gone and before rwA acks.
+ExpireLease ==
+    /\ leaseOwner # "none"
+    /\ leaseOwner' = "none"
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
+                   query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
+                   sysgc, supersededAt, objContent, variantKey, rwPhase, rwInputs,
+                   cmpPhase>>
+    /\ NoGc
+
+\* --- Compaction actor (maintainer) --------------------------------------------
+\* Compaction publishes a new record set over a chosen subset of the bucket's live
+\* objects. Split into a listing step and a publish step for the same reason the
+\* rewrite is: compact_bucket_scoped lists the bucket, decides, then publishes,
+\* with no compare-and-swap in between.
+\*
+\* THE GUARD (issue #1289), from crates/ravel-maintain/src/compact.rs,
+\* fn compact_bucket_scoped, commit b997b7e1 "fix(maintain): refuse compaction of
+\* a bucket with a live rewrite":
+\*
+\*     if !listing.rewrite_record_keys.is_empty() {
+\*         return Ok(CompactionOutcome::RewritePresent);
+\*     }
+\*
+\* One bucket serves one record set. A live rewrite record already covers these
+\* inputs with records deliberately removed from its outputs, and a compaction
+\* record over the same inputs is not overlap-harmless against it: a snapshot
+\* including both resurrects the erased records (ADR-0064 decision 3 point 5).
+\* CompactionIgnoresRewrite drops the refusal; that is the negative control for
+\* AtMostOneLiveRecordSetServed.
+\*
+\* The scope of the guard is exactly what commit cdce1722 records: it is a
+\* list-time observation with no compare-and-swap, so it closes only the case
+\* where the rewrite record is already durable when the compactor lists the
+\* bucket. The concurrent case -- a rewrite that has listed but not yet published
+\* when the compactor lists -- is covered today only by the maintenance driver
+\* serialising the two passes per bucket, which is SerializeCompactionAndRewrite
+\* here. Setting that constant FALSE opens the residual window cdce1722 names as
+\* an open gap closable only by a compare-and-swap or a claim on the bucket.
+\*
+\* The other gates are compact_bucket_scoped's own, in its order: the tombstone
+\* gate, the already-compacted gate, then the minimum-inputs gate (there is one
+\* raw input in this instance, so "at least min_compaction_inputs live L0 commits"
+\* is "the raw input is present"). Note what the compactor CANNOT see: whether an
+\* input is superseded is a catalog fact, not a listing fact, so this action reads
+\* PresentObj, not membership of `superseded`. The rewrite record's presence is
+\* the compactor's only evidence that a supersession happened, which is why the
+\* guard above is load-bearing rather than redundant.
+StartCompaction ==
+    /\ leaseOwner \in {"none", "C"}
+    /\ cmpPhase = "idle"
+    /\ (SerializeCompactionAndRewrite => \A id \in RewriteIds : rwPhase[id] # "listed")
+    /\ ~PresentObj("tombB1")
+    /\ ~PresentObj("cmpA")
+    /\ (CompactionIgnoresRewrite \/ ~(\E w \in RewriteOut : PresentObj(w)))
+    /\ \E o \in RawInputs : PresentObj(o)
+    /\ leaseOwner' = "C"
+    /\ cmpPhase' = "listed"
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
+                   query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
+                   sysgc, supersededAt, objContent, variantKey, rwPhase, rwInputs>>
+    /\ NoGc
+
+\* The compaction publish, unguarded for the same reason PublishRewrite is: the
+\* decision was made against the listing and is not re-read. The record is written
+\* CreateIfAbsent (ADR-0018: compaction converges at CreateIfAbsent), but under the
+\* compaction key class, so it converges only with another compaction -- never with
+\* a rewrite record, which lands under its own key. Nothing in the store makes the
+\* two exclude each other.
+PublishCompaction ==
+    /\ cmpPhase = "listed"
+    /\ ~PresentObj("cmpA")
+    /\ S!PutCreateIfAbsent("cmpA", "dat")
+    /\ cmpPhase' = "done"
+    /\ superseded' = superseded \cup RawInputs
+    /\ supersededAt' = [i \in SupersededCandidates |->
+                          IF i \in RawInputs THEN clock ELSE supersededAt[i]]
+    /\ objContent' = [objContent EXCEPT !["cmpA"] = RecordSetContent("cmpA")]
+    /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
+                   erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
+                   variantKey, leaseOwner, rwPhase, rwInputs>>
+    /\ NoGc
+
+\* Switch the HEAD onto the live record sets, dropping the superseded objects (a
+\* fold advancing). It may lag arbitrarily behind the publish that superseded them.
 HeadAdvanceRewrite ==
-    /\ PresentObj("rwA")
-    /\ RawInputs \cap head # {}
-    /\ head' = (head \ RawInputs) \cup {"rwA"}
+    /\ LiveRecordSets # {}
+    /\ head \cap superseded # {}
+    /\ head' = (head \ superseded) \cup LiveRecordSets
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 \* Complete the erasure: write .done only when the served set no longer serves the
@@ -568,7 +792,8 @@ CompleteErasure ==
     /\ doneAt' = clock
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ CompletionWitness
 
 --------------------------------------------------------------------------------
@@ -582,7 +807,8 @@ RetireBucket ==
     /\ S!PutCreateIfAbsent("tombB1", "dat")
     /\ tombRetiredAt' = [tombRetiredAt EXCEPT !["b1"] = clock]
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
-                   refreshFailed, query, erasureRequested, dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   refreshFailed, query, erasureRequested, dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 \* Fold reconciles a retired bucket out of the HEAD; it may lag (a late fold) and
@@ -597,7 +823,8 @@ DropRetiredBucketFromHead ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
     /\ NoGc
 
 \* Retention physical sweep of one b1 data object. Gates on now >= retired_at +
@@ -631,7 +858,8 @@ RetentionSweep(o) ==
     /\ GcWitness("retention", {o})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
 
 \* Final tombstone delete (finding 3, round four): physical_sweep deletes the
 \* bucket's data, verifies via bucket_is_empty_but_tombstone that only the
@@ -652,7 +880,8 @@ SweepTombstone ==
     /\ GcWitness("tombstone", {"tombB1"})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
 
 --------------------------------------------------------------------------------
 \* Physical GC actor (maintainer): superseded-input sweep and .dreq sweep
@@ -675,14 +904,15 @@ SupersededSweep(o) ==
     /\ o \in superseded
     /\ PresentObj(o)
     /\ ~HeldObject(o, heldBuckets)
-    /\ (DeleteBeforeHorizon \/ clock >= supersededAt + sysgc.ph)
+    /\ (DeleteBeforeHorizon \/ clock >= supersededAt[o] + sysgc.ph)
     /\ QueryPermits(o)
     /\ SupersededGatePasses(o)
     /\ S!Delete(o)
     /\ GcWitness("superseded", {o})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
 
 \* .dreq sweep: delete the .dreq when a matching .done exists, its completed
 \* timestamp is non-zero, the horizon has passed, no reader (the current HEAD or
@@ -707,7 +937,8 @@ DreqSweep ==
     /\ GcWitness("dreq", {"dreqR1"})
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
-                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey>>
+                   dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
+                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
 
 --------------------------------------------------------------------------------
 Next ==
@@ -718,14 +949,18 @@ Next ==
     \/ \E s \in {"present","absent","unreadable"} : SetHeadState(s)
     \/ \E f \in BOOLEAN : SetRefresh(f)
     \/ RequestErasure
-    \/ PerformRewrite
+    \/ \E id \in RewriteIds : StartRewrite(id)
+    \/ \E id \in RewriteIds : PublishRewrite(id)
+    \/ ExpireLease
+    \/ StartCompaction
+    \/ PublishCompaction
     \/ HeadAdvanceRewrite
     \/ CompleteErasure
     \/ RetireBucket
     \/ DropRetiredBucketFromHead
     \/ \E o \in DataObjects : RetentionSweep(o)
     \/ SweepTombstone
-    \/ \E o \in RawInputs : SupersededSweep(o)
+    \/ \E o \in SupersededCandidates : SupersededSweep(o)
     \/ DreqSweep
 
 Spec == Init /\ [][Next]_vars
@@ -744,8 +979,12 @@ Terminal ==
 \* (its observed clock, its deleted set) against recorded state, never a switch:
 \*  1. A retention delete happened no earlier than retired_at + protection_horizon
 \*     (delete-before-horizon drops that gate, so this clause fires).
-\*  2. A superseded-input delete happened no earlier than supersededAt +
-\*     protection_horizon.
+\*  2. A superseded-input delete happened no earlier than THAT OBJECT's own
+\*     supersededAt plus protection_horizon. Per object, not against one shared
+\*     stamp: two publishing passes (a compaction and a rewrite over its output)
+\*     supersede different objects at different clocks, and a single stamp would
+\*     let the later supersession retroactively re-open the protection window of
+\*     an earlier delete that was legitimate when it ran.
 \*  3. A .dreq delete happened no earlier than its own horizon (dreqHorizon,
 \*     frozen once RequestErasure sets it, so reading it live is the same
 \*     per-step witness reasoning as tombRetiredAt/supersededAt above). Unlike
@@ -767,7 +1006,8 @@ NoDeleteInsideProtectionWindow ==
     /\ ( lastGc.rule = "retention" =>
              lastGc.atClock >= tombRetiredAt["b1"] + sysgc.ph )
     /\ ( lastGc.rule = "superseded" =>
-             lastGc.atClock >= supersededAt + sysgc.ph )
+             \A o \in lastGc.deleted :
+                 lastGc.atClock >= supersededAt[o] + sysgc.ph )
     /\ ( lastGc.rule = "dreq" =>
              lastGc.atClock >= dreqHorizon )
     /\ ( lastGc.rule \in HorizonGatedRules =>
@@ -811,12 +1051,43 @@ ErasedSubjectNeverServedAfterRequest ==
     \A s \in erasureRequested : ~ServedRead(s)
 
 \* A rewrite output serves exactly its inputs' subjects minus the erased ones.
+\* Quantified over both rewrite identities' outputs (issue #1221): rwA rewrites the
+\* raw L0 inputs, rwB rewrites the compaction output, so the second conjunct is a
+\* real claim about a rewrite whose predecessor is itself a published record set.
 RewriteOutputsAreInputsMinusErased ==
-    PresentObj("rwA") =>
-        \A s \in Subjects :
-            ServesSubject("rwA", s) <=>
-                ( (\E i \in Predecessors("rwA") : ServesSubject(i, s))
-                  /\ s \notin ErasedBy(AppliedReqs("rwA")) )
+    \A w \in RewriteOut :
+        PresentObj(w) =>
+            \A s \in Subjects :
+                ServesSubject(w, s) <=>
+                    ( (\E i \in Predecessors(w) : ServesSubject(i, s))
+                      /\ s \notin ErasedBy(AppliedReqs(w)) )
+
+\* At most one record set a reader can be served from references objects that a
+\* completed rewrite has already superseded (issue #1289).
+\*
+\* "A reader can be served from o" is o being a live record set: present in the
+\* store and not itself superseded, so a HEAD advance or a listing fallback can
+\* resolve onto it. "References objects a completed rewrite has superseded" is
+\* o's predecessors intersecting `superseded`, which is exactly the state a
+\* published record set leaves behind.
+\*
+\* Two such sets at once is the #1289 hazard: the erasure rewrite published rwA
+\* over raw1 with the erased records dropped and marked raw1 superseded, and a
+\* compaction that listed the bucket before that record was durable published cmpA
+\* over the same raw1 with nothing dropped. Both are live, both cover the same
+\* inputs, and a snapshot that resolves onto cmpA serves the records rwA removed.
+\* Neither the store nor the catalog excludes the pair: they land under different
+\* key classes, so each publish's CreateIfAbsent succeeds.
+\*
+\* The invariant is stated over the store and the supersession set, never over a
+\* switch and never over a flag an action sets to certify itself, so
+\* CompactionIgnoresRewrite falsifies it by changing the reachable behaviour.
+\* negative/compaction-ignores-rewrite.cfg is the proof that it can fire.
+AtMostOneLiveRecordSetServed ==
+    Cardinality({ o \in RecordSets :
+                    /\ PresentObj(o)
+                    /\ o \notin superseded
+                    /\ Predecessors(o) \cap superseded # {} }) <= 1
 
 \* Completion implies no pre-rewrite exposure: once .done exists, the current HEAD
 \* no longer serves the erased subject (the rewrite advanced HEAD off it). A pinned
@@ -858,11 +1129,11 @@ DreqSweepRespectsLegalHold ==
 
 \* Two rewrites over the same input set with different applied requests get
 \* different keys (the hash binds the sorted applied ids). Reads the names
-\* PerformRewrite actually stored (variantKey), not the RewriteKey operator, so the
+\* PublishRewrite actually stored (variantKey), not the RewriteKey operator, so the
 \* property observes what the write produced (finding 4). RewriteIdentityOmitsRequests
 \* drops the applied ids from the key, collapsing the two names.
 IdenticalInputSetsDoNotCollide ==
-    PresentObj("rwA") => variantKey["v1"] # variantKey["v2"]
+    (\E w \in RewriteOut : PresentObj(w)) => variantKey["v1"] # variantKey["v2"]
 
 \* An object a real HEAD read still names must be present: no sweep may delete a
 \* HEAD-named raw input. Reads the store presence against EffectiveHead, the same
@@ -874,7 +1145,7 @@ IdenticalInputSetsDoNotCollide ==
 \* shipped gate (or any reader) can ever know. SupersededSweepUngated still
 \* deletes an EffectiveHead-named input and fires this.
 HeadNamedObjectNeverDeletedBySupersededSweep ==
-    \A o \in RawInputs : o \in EffectiveHead => PresentObj(o)
+    \A o \in SupersededCandidates : o \in EffectiveHead => PresentObj(o)
 
 \* Environmental assumption, not a protocol property: a raw input's content
 \* never changes across a reachable behaviour. Data objects are immutable in
@@ -899,23 +1170,35 @@ RawInputContentAssumedImmutable ==
 \* SetRefresh stay unfair on purpose: nothing in the implementation guarantees
 \* a legal hold is released, a HEAD read recovers, or a refresh eventually
 \* succeeds, so a spec that assumed fairness there would assert a guarantee the
-\* implementation doesn't make. PerformRewrite's fairness is restricted to its
+\* implementation doesn't make. StartRewrite's fairness is restricted to its
 \* first firing (superseded = {}): the implementation runs one rewrite per
 \* erasure request, not a loop that keeps re-deriving an already-produced
 \* rewrite output every time ordinary retention ages it out, so granting it
 \* unconditional fairness would force a livelock the implementation doesn't
-\* have (RetentionSweep deleting the rewrite output, PerformRewrite recreating
-\* it and re-stamping the shared supersededAt, forever deferring the raw
-\* inputs' own sweep).
+\* have (RetentionSweep deleting the rewrite output, a rewrite recreating it
+\* and re-stamping its inputs' horizon, forever deferring their own sweep).
+\* PublishRewrite and ExpireLease are treated differently: the publish IS fair
+\* (a pass that already listed does eventually ack, which is the whole reason
+\* the ack can land after the lease moved), while ExpireLease stays unfair
+\* because nothing requires a lease to lapse.
+\* StartCompaction stays unfair for the same reason PlaceHold does: nothing
+\* guarantees a compaction ever runs on a bucket. PublishCompaction is fair
+\* because a pass that has already listed does finish; leaving it unfair would let
+\* a compaction sit in "listed" forever and, under
+\* SerializeCompactionAndRewrite, block every rewrite behind a stall the
+\* implementation does not have.
 FairSpec ==
     /\ Spec
-    /\ WF_vars(\E o \in RawInputs : SupersededSweep(o))  \* maintainer sweep tick
+    /\ WF_vars(\E o \in SupersededCandidates : SupersededSweep(o)) \* maintainer sweep tick
     /\ WF_vars(HeadAdvanceRewrite)                       \* folder watermark advance
     /\ WF_vars(\E o \in DataObjects : RetentionSweep(o)) \* maintainer retention tick
     /\ WF_vars(CompleteErasure)                          \* store completion
     /\ WF_vars(Tick)                                     \* clock advances
     /\ WF_vars(ExpireQuery)                              \* pinned queries expire
-    /\ WF_vars(PerformRewrite /\ superseded = {})        \* the first rewrite fires
+    /\ WF_vars(\E id \in RewriteIds :
+                 StartRewrite(id) /\ superseded = {})    \* the first rewrite lists
+    /\ WF_vars(\E id \in RewriteIds : PublishRewrite(id)) \* a listed rewrite acks
+    /\ WF_vars(PublishCompaction)                        \* a listed compaction acks
 
 \* Every superseded input that becomes deletable is eventually swept, once its
 \* own SupersededSweep guard (legal hold clear, horizon elapsed, no blocking
@@ -935,9 +1218,9 @@ FairSpec ==
 \* the antecedent stateable independently of whether o already happens to be
 \* gone, which is what makes the consequent a real claim.
 EventuallySwept ==
-    \A o \in RawInputs :
+    \A o \in SupersededCandidates :
         <>[](o \in superseded /\ ~HeldObject(o, heldBuckets)
-             /\ (DeleteBeforeHorizon \/ clock >= supersededAt + sysgc.ph)
+             /\ (DeleteBeforeHorizon \/ clock >= supersededAt[o] + sysgc.ph)
              /\ QueryPermits(o) /\ SupersededGatePasses(o) /\ HeadReadable
              /\ (RefreshFailureSweepsAnyway \/ ~refreshFailed)) ~>
             ~PresentObj(o)
