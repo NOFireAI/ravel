@@ -48,6 +48,20 @@
 //! per alert_id for one tenant", and the cost is bounded by the number of
 //! transitions, not by ingest volume, because a record is written only on a
 //! transition (ADR-0043 decision 4).
+//!
+//! # The state memo
+//!
+//! `Signal::Alerts` is never maintained (it is absent from
+//! `maintain::MAINTAINED_SIGNALS`), so that transition history only grows and a
+//! full fold every tick costs `2N` GETs for a cumulative transition count `N`,
+//! independent of the rule count actually needed. [`AlertEvaluator::fold_latest`]
+//! avoids that with a tenant-wide derived cache, the alert state memo
+//! ([`crate::alert_state_memo`], issue #1294): each tick seeds from the memo and
+//! folds only the ingest hours at or after its watermark. The memo is never
+//! source of truth (the transition records remain the only durable state,
+//! ADR-0040 decision 3); a lost, stale, or corrupt memo costs a full fold, never
+//! correctness, because the tail listing re-folds every hour that could hold a
+//! record written since the memo. Only the lease holder writes it.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -66,7 +80,9 @@ use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::{Clock, LOG_SEGMENT_FORMAT_VERSION};
 use ravel_logseg::{ObjectIdentity, Predicate, RlogConfig, RlogReader};
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
+use ravel_object_store::{
+    GetRange, ObjectMeta, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all,
+};
 use ravel_promql::Value as PromqlValue;
 use ravel_query::{Coverage, QueryEngine};
 use ravel_types::{Signal, TenantHash, TenantId};
@@ -76,6 +92,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::alert_sink::{AlertNotification, AlertSink, DEFAULT_SINK_TIMEOUT, deliver};
+use crate::alert_state_memo::{AlertStateMemo, read_alert_state_memo, write_alert_state_memo};
 
 /// Default `--alert-eval-interval-secs`: 60 seconds, Prometheus' own default
 /// rule-evaluation interval.
@@ -464,7 +481,25 @@ impl AlertEvaluator {
         let mut report = AlertEvalReport::default();
         let now_ns = self.clock.now_ns();
 
-        let mut latest = match self.load_latest_records().await {
+        // Read the derived state memo first, before the lease and unguarded: it
+        // is an advisory cache every replica reads, so each folds only the ingest
+        // hours since the memo instead of the whole history (issue #1294). A
+        // missing memo (cold start), a corrupt one, or an unsupported-version one
+        // is not an error here; it falls back to a full fold below, and the lease
+        // holder rewrites a valid memo at the end of the tick.
+        let memo = match read_alert_state_memo(self.store.as_ref(), &self.tenant).await {
+            Ok(memo) => memo,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %self.tenant.to_hex(),
+                    error = %err,
+                    "alert evaluation: alert state memo unreadable; folding full history this tick"
+                );
+                None
+            }
+        };
+
+        let mut latest = match self.fold_latest(memo.as_ref()).await {
             Ok(latest) => latest,
             Err(err) => {
                 tracing::warn!(
@@ -543,6 +578,33 @@ impl AlertEvaluator {
                 self.queue_repeat_if_due(rule, &latest, now_ns, &mut report);
             }
             self.rules = rules;
+
+            // Refresh the derived state memo from the just-folded latest state
+            // (issue #1294). Lease holder only, so there is a single writer per
+            // key; debounced so a tick that changed neither the watermark hour
+            // nor any record skips the write. The memo is advisory and
+            // reconstructible (ADR-0065 precedent): a failed write costs the next
+            // tick a full fold, never correctness.
+            let watermark_hour = hour_bucket(now_ns);
+            let unchanged = memo
+                .as_ref()
+                .is_some_and(|m| m.watermark_hour == watermark_hour && m.records == latest);
+            if !unchanged {
+                let refreshed = AlertStateMemo {
+                    watermark_hour,
+                    records: latest.clone(),
+                };
+                if let Err(err) =
+                    write_alert_state_memo(self.store.as_ref(), &self.tenant, &refreshed).await
+                {
+                    tracing::warn!(
+                        tenant = %self.tenant.to_hex(),
+                        error = %err,
+                        "alert evaluation: could not refresh the alert state memo; a full fold \
+                         recovers it next tick"
+                    );
+                }
+            }
         } else if !report.lease_unavailable {
             report.lease_not_held = true;
             tracing::debug!(
@@ -960,11 +1022,87 @@ impl AlertEvaluator {
     /// partial history would look like "this alert is not firing" and re-fire
     /// an alert that already is.
     async fn load_latest_records(&self) -> anyhow::Result<HashMap<AlertId, AlertRecord>> {
+        Ok(flatten_fold(self.full_fold().await?))
+    }
+
+    /// Fold the tenant's alert history to latest-per-`alert_id`, using `memo` as
+    /// a derived cache when one is present (issue #1294).
+    ///
+    /// With a memo, this seeds from its folded snapshot and then folds only the
+    /// commit records at or after `memo.watermark_hour`, so the per-tick cost is
+    /// bounded by the transitions written since the memo rather than by the
+    /// whole history. The tail listing is non-optional: it is what makes a stale
+    /// memo detectable rather than silently wrong, since any record written
+    /// since the memo is stamped at an ingest hour at or above its watermark and
+    /// is therefore re-listed here. Records below the watermark come only from
+    /// the memo, which is why an arbitrarily old still-`Firing` record survives a
+    /// tail that a bounded lookback would step past.
+    ///
+    /// With no memo (cold, absent, corrupt, or unsupported version) this is a
+    /// full fold, identical to [`Self::load_latest_records`].
+    async fn fold_latest(
+        &self,
+        memo: Option<&AlertStateMemo>,
+    ) -> anyhow::Result<HashMap<AlertId, AlertRecord>> {
+        let best = match memo {
+            Some(memo) => {
+                // Seed each memoized record at fold order `(ts_ns, 0, 0)` so any
+                // real commit the tail re-reads (order `(ts_ns, epoch, seq)` with
+                // a nonzero seq) wins the tie against its own memoized copy. The
+                // two are byte-identical, so the tie-break only decides which
+                // clone survives, never the folded state.
+                let mut best: HashMap<AlertId, ((i64, u64, u64), AlertRecord)> = memo
+                    .records
+                    .iter()
+                    .map(|(id, record)| (*id, ((record.ts_ns, 0, 0), record.clone())))
+                    .collect();
+                self.fold_tail(&mut best, memo.watermark_hour).await?;
+                best
+            }
+            // No memo: the cold path is a full fold, the same read
+            // `load_latest_records` performs.
+            None => return self.load_latest_records().await,
+        };
+        Ok(flatten_fold(best))
+    }
+
+    /// Full fold over the whole alert commit history, keyed by fold order.
+    async fn full_fold(&self) -> anyhow::Result<FoldedByOrder> {
         let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
         let entries = list_all(self.store.as_ref(), &prefix).await?;
+        let mut best = HashMap::new();
+        self.fold_commit_entries(entries, &mut best).await?;
+        Ok(best)
+    }
 
+    /// Fold the commit records at or after `watermark_hour` into `best`.
+    ///
+    /// One `start-after` LIST over the commit prefix, skipping every ingest hour
+    /// strictly below the watermark server-side, then a commit+data GET pair per
+    /// transition in that window. The watermark hour itself is included (its keys
+    /// sort after the bare `prefix + hour_string` cursor), so the hour a memo was
+    /// stamped in is always re-folded.
+    async fn fold_tail(&self, best: &mut FoldedByOrder, watermark_hour: u32) -> anyhow::Result<()> {
+        let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
+        let start_after = format!("{prefix}{}", keys::ingest_hour_string(watermark_hour));
+        let entries = list_all_after(self.store.as_ref(), &prefix, &start_after).await?;
+        self.fold_commit_entries(entries, best).await
+    }
+
+    /// Read each commit record in `entries` and the RLOG object it names, folding
+    /// every alert record into `best` by `(ts_ns, epoch, seq)`.
+    ///
+    /// Records are reached through commit records, never by listing data objects:
+    /// an object whose commit never landed is an abandoned write and must not
+    /// influence state. Any malformed entry aborts the whole read rather than
+    /// being skipped: a partial history would look like "this alert is not
+    /// firing" and re-fire an alert that already is.
+    async fn fold_commit_entries(
+        &self,
+        entries: Vec<ObjectMeta>,
+        best: &mut FoldedByOrder,
+    ) -> anyhow::Result<()> {
         let cfg = RlogConfig::default();
-        let mut best: HashMap<AlertId, ((i64, u64, u64), AlertRecord)> = HashMap::new();
         for meta in entries {
             let parsed = match keys::partition_bucket_entry(&meta.key)? {
                 keys::BucketEntry::CommitRecord(parsed) => parsed,
@@ -1008,10 +1146,7 @@ impl AlertEvaluator {
                 }
             }
         }
-        Ok(best
-            .into_iter()
-            .map(|(id, (_order, record))| (id, record))
-            .collect())
+        Ok(())
     }
 
     /// Attempt delivery of every undelivered notification to every sink,
@@ -1055,6 +1190,45 @@ impl AlertEvaluator {
             }
         }
     }
+}
+
+/// A fold in progress: the winning `(ts_ns, epoch, seq)` order and record for
+/// each `alert_id` seen so far.
+type FoldedByOrder = HashMap<AlertId, ((i64, u64, u64), AlertRecord)>;
+
+/// Drop the fold-order key, leaving the latest record per `alert_id`.
+fn flatten_fold(best: FoldedByOrder) -> HashMap<AlertId, AlertRecord> {
+    best.into_iter()
+        .map(|(id, (_order, record))| (id, record))
+        .collect()
+}
+
+/// Drain every page of a `start-after` listing, the [`list_all`] analogue for
+/// [`ObjectStoreBackend::list_after`]. Every returned key sorts strictly after
+/// `start_after`.
+async fn list_all_after(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    start_after: &str,
+) -> anyhow::Result<Vec<ObjectMeta>> {
+    let mut out: Vec<ObjectMeta> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut page_token = None;
+    loop {
+        let page = store
+            .list_after(prefix, Some(start_after), page_token)
+            .await?;
+        for meta in page.objects {
+            if seen.insert(meta.key.clone()) {
+                out.push(meta);
+            }
+        }
+        match page.next {
+            Some(next) => page_token = Some(next),
+            None => break,
+        }
+    }
+    Ok(out)
 }
 
 /// The hour bucket a commit record stamped at `now_ns` belongs to. A pre-epoch
@@ -1609,7 +1783,9 @@ mod tick_tests {
 
     use std::sync::atomic::{AtomicI64, Ordering};
 
+    use ravel_alerting::build_transition_record;
     use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_object_store::InstrumentedStore;
     use ravel_object_store::memory::MemoryStore;
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
@@ -2139,6 +2315,229 @@ mod tick_tests {
         assert_eq!(
             report.repeats_queued, 1,
             "at the 60s default cadence a repeat is due"
+        );
+    }
+
+    // --- Alert state memo (issue #1294) --------------------------------------
+    //
+    // These pin the fold's per-tick object-store cost. A counting store
+    // (`InstrumentedStore`) makes the request count an assertion, not a comment:
+    // the whole point of the memo is that a steady-state tick reads only the
+    // tail, not the whole history, so the number of GETs it issues is the claim.
+
+    /// Publish `records` as real alert transition objects, one commit + one data
+    /// object each, at the ingest hour of each record's own `ts_ns`. Distinct
+    /// writer seqs keep the commit keys from colliding, so `n` records yield `n`
+    /// commit records under the alerts prefix.
+    async fn seed_alert_history(evaluator: &AlertEvaluator, records: &[AlertRecord]) {
+        for (i, record) in records.iter().enumerate() {
+            let seq = 10_000 + i as u64;
+            let identity = ObjectIdentity {
+                tenant_hash: evaluator.tenant.0,
+                shard: ALERT_SHARD,
+                writer_id: evaluator.writer_id.into_bytes(),
+                writer_epoch: ALERT_WRITER_EPOCH,
+                writer_seq: seq,
+            };
+            let bytes =
+                ravel_alerting::encode_record_object(record, RlogConfig::default(), identity)
+                    .expect("encode alert record");
+            evaluator
+                .publish(bytes, seq, record.ts_ns)
+                .await
+                .expect("publish alert record");
+        }
+    }
+
+    /// A full fold reads exactly one commit GET and one data GET per transition
+    /// record, so its cost grows with the cumulative history `N`. This is the
+    /// baseline the memo removes.
+    #[tokio::test]
+    async fn a_full_fold_reads_two_gets_per_transition() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+
+        let n: u64 = 4;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| build_transition_record(&rule, AlertState::Firing, 0, NOW_NS + i as i64))
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        let before = metrics.snapshot();
+        let latest = ev.load_latest_records().await.expect("full fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(latest.len(), 1, "all transitions share one alert_id");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2 * n,
+            "a full fold reads one commit GET and one data GET per transition record"
+        );
+    }
+
+    /// The memo path folds only the ingest hours at or after the watermark. With
+    /// every seeded record below the watermark, a steady-state fold reads zero
+    /// commit/data GETs and issues exactly one tail LIST, yet still returns the
+    /// full folded state, including a `Firing` record that lives only in the memo
+    /// (the case a bounded newest-first lookback would lose).
+    #[tokio::test]
+    async fn the_memo_path_reads_only_hours_at_or_after_the_watermark() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Three transitions for one alert, all in ingest hour 0, last is Firing.
+        let n = 3;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| {
+                let state = if i + 1 == n {
+                    AlertState::Firing
+                } else {
+                    AlertState::Pending
+                };
+                build_transition_record(&rule, state, 0, NOW_NS)
+            })
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        // A memo whose watermark is hour 1, above every seeded record's hour 0.
+        let memo = AlertStateMemo {
+            watermark_hour: 1,
+            records: full.clone(),
+        };
+
+        let before = metrics.snapshot();
+        let via_memo = ev.fold_latest(Some(&memo)).await.expect("memo fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            via_memo, full,
+            "the memo path folds to the same latest state as a full fold"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "an hour-0 Firing below the watermark survives via the memo, not the tail"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            0,
+            "the memo path issues no commit or data GETs for hours below the watermark"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+    }
+
+    /// A transition written after the memo, at an hour at or above its
+    /// watermark, is folded in by the non-optional tail LIST: the memo path
+    /// matches a full fold rather than returning the stale memoized state.
+    #[tokio::test]
+    async fn a_transition_after_the_memo_is_caught_by_the_tail_list() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Memo snapshot: Firing as of hour 0, watermark hour 1. This record is
+        // never written to the store; it exists only in the memo.
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+        let mut memo_records = HashMap::new();
+        memo_records.insert(alert_id, firing);
+        let memo = AlertStateMemo {
+            watermark_hour: 1,
+            records: memo_records,
+        };
+
+        // A newer Resolved transition lands in hour 1, at the watermark.
+        let hour1_ts = NS_PER_HOUR + NOW_NS;
+        let resolved = build_transition_record(&rule, AlertState::Resolved, 0, hour1_ts);
+        seed_alert_history(&ev, &[resolved]).await;
+
+        let via_memo = ev.fold_latest(Some(&memo)).await.expect("memo fold");
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        assert_eq!(
+            via_memo, full,
+            "the tail list folds in the transition written after the memo"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Resolved),
+            "the memo path reflects the Resolved written after the memo, not the stale Firing"
+        );
+    }
+
+    /// The lease holder writes the state memo after a tick, stamping the current
+    /// hour as the watermark and recording every folded alert.
+    #[tokio::test]
+    async fn the_lease_holder_writes_the_state_memo() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the lease holder wrote a memo");
+        assert_eq!(
+            memo.watermark_hour,
+            hour_bucket(NOW_NS),
+            "the watermark is the tick's ingest hour"
+        );
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        assert_eq!(
+            memo.records.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the memo records the firing alert the tick just wrote"
+        );
+    }
+
+    /// A corrupt memo is not fatal: the tick falls back to a full fold, still
+    /// fires, and the lease holder overwrites the garbage with a valid memo.
+    #[tokio::test]
+    async fn a_corrupt_memo_is_ignored_and_rewritten() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        store
+            .put(
+                &crate::alert_state_memo::alert_state_memo_key(&tenant),
+                Bytes::from_static(b"not a memo"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put garbage memo");
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        assert_eq!(
+            ev.run_tick().await.records_written,
+            1,
+            "a corrupt memo falls back to a full fold, not a skipped tick"
+        );
+
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo now decodes")
+            .expect("memo present after rewrite");
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        assert_eq!(
+            memo.records.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the holder rewrote a valid memo over the garbage"
         );
     }
 }
