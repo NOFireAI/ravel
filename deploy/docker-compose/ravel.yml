@@ -106,13 +106,15 @@ services:
       RAVEL_S3_SECRET_KEY: ravel-dev-secret
 
   # The demo's data generator (ADR-0081 decision 3): a real OpenTelemetry
-  # Collector scraping host metrics and tailing its own log output, exporting
-  # both to Ravel over OTLP/HTTP, authenticating with the demo bearer token via
-  # the bearertokenauth extension. This exercises the same OTLP path a real
-  # user configures, and the first Grafana screen shows the reader's own
-  # machine. The tailed logs are what the README's PromQL-over-logs query
-  # (`ravel_log_lines`) reports on; without them the quickstart generates
-  # metrics only and that query returns empty (#1334).
+  # Collector scraping host metrics and exporting its own internal logs, both
+  # to Ravel over OTLP/HTTP with the demo bearer token. The metrics pipeline
+  # authenticates with the bearertokenauth extension; the internal-logs export
+  # (service.telemetry.logs) sets a plain Authorization header instead, because
+  # service.telemetry does not wire extensions. This exercises the same OTLP
+  # path a real user configures, and the first Grafana screen shows the
+  # reader's own machine. The internal logs give a plain `docker compose up` a
+  # log source for the README's PromQL-over-logs query (`ravel_log_lines`) when
+  # no telemetrygen is involved (#1334).
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     depends_on: [ravel-server]
