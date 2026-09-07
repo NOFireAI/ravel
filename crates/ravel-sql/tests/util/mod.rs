@@ -36,17 +36,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{Catalog, CatalogConfig, Snapshot};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{EngineConfig, LogSegmentFetcher, SegmentFetcher};
+use ravel_query::{CacheFetchError, EngineConfig, LogSegmentFetcher, SegmentFetcher};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_sql::{SqlConfig, SqlExecutor, SqlRequest};
 use ravel_types::{
     CommitToken, Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId, TimeRange,
+    logstream,
 };
 use uuid::Uuid;
 
@@ -201,6 +205,103 @@ pub async fn publish_segment(
     (token, data_key)
 }
 
+/// Publish `count` real RLOG objects, each its own `Signal::Logs` commit
+/// record, so a `logs`/`alerts`/`audit`-target query resolves `count`
+/// distinct segments (mirrors tests/query_accounting.rs's `publish_logs`,
+/// parameterized by segment index so each one gets a distinct writer_seq,
+/// content_hash, and ts window instead of a single fixed segment).
+pub async fn publish_logs_segments(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    count: usize,
+) {
+    const RECORDS_PER_SEGMENT: usize = 4;
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("io-shape-logs".to_string()),
+    )];
+    let stream_id = logstream::log_stream_id(&resource, "scope", "1.0", &[]);
+    let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
+
+    for seg in 0..count {
+        let writer_id = Uuid::from_u128(20_000 + seg as u128);
+        let mut writer = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant.hash().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq: seg as u64 + 1,
+            },
+        );
+        let base_ts = 1_000 + (seg as i64) * (RECORDS_PER_SEGMENT as i64);
+        for i in 0..RECORDS_PER_SEGMENT {
+            let ts_ns = base_ts + i as i64;
+            writer
+                .push(LogRecord {
+                    stream_id,
+                    stream_attrs: stream_attrs.clone(),
+                    ts_ns,
+                    observed_ts_ns: ts_ns,
+                    severity_num: 9,
+                    severity_text: "INFO".to_string(),
+                    body: format!("io-shape logs segment {seg} record {i}"),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: Vec::new(),
+                })
+                .expect("push log record");
+        }
+        let bytes = writer.finish().expect("finish rlog object");
+
+        let mut content_hash = [0u8; 32];
+        content_hash[0] = 100 + seg as u8;
+        let new_record = NewCommitRecord {
+            tenant_hash: tenant.hash(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seg as u64 + 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: RECORDS_PER_SEGMENT as u64,
+            series_count: 1,
+            min_event_ts_ns: base_ts,
+            max_event_ts_ns: base_ts + RECORDS_PER_SEGMENT as i64 - 1,
+            min_ingest_ts_ns: base_ts,
+            max_ingest_ts_ns: base_ts + RECORDS_PER_SEGMENT as i64 - 1,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            created_unix_ns: 10 + seg as i64,
+            ingest_hour_bucket: 0,
+        };
+        let rec = record::build(new_record).expect("valid logs commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("logs data key");
+        store
+            .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put rlog object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish logs commit record");
+    }
+}
+
+/// Build ADR-0046's RAM read cache (mirrors
+/// tests/logs_uncached_assignment.rs's `build_read_cache`): the whole budget
+/// as the per-entry cap so no small fixture object is rejected, one entry per
+/// 4 KiB of budget floored at 64.
+pub fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
+    let max_entries = (cache_bytes / 4096).max(64) as usize;
+    Arc::new(Cache::new(CacheLimits::new(
+        cache_bytes,
+        max_entries,
+        cache_bytes,
+    )))
+}
+
 /// A running stack: store, catalog, fetcher, and executor.
 pub struct Fixture {
     pub store: Arc<dyn ObjectStoreBackend>,
@@ -218,6 +319,28 @@ impl Fixture {
         config: SqlConfig,
         max_tenant_bytes: usize,
     ) -> Self {
+        Fixture::build_with_log_fetcher(
+            store.clone(),
+            tenants,
+            config,
+            max_tenant_bytes,
+            LogSegmentFetcher::new(store),
+        )
+        .await
+    }
+
+    /// Same as [`Fixture::build`], but with the caller's own
+    /// [`LogSegmentFetcher`] wired into the executor instead of a fresh
+    /// uncached one -- the only way to exercise the cache-wired logs scan
+    /// path (`LogSegmentFetcher::has_cache() == true`) through a real
+    /// `SqlExecutor`.
+    pub async fn build_with_log_fetcher(
+        store: Arc<dyn ObjectStoreBackend>,
+        tenants: &[(&TenantId, &[SegSpec])],
+        config: SqlConfig,
+        max_tenant_bytes: usize,
+        log_fetcher: LogSegmentFetcher,
+    ) -> Self {
         let mut data_keys: HashMap<String, Vec<String>> = HashMap::new();
         for (tenant, specs) in tenants {
             for (i, spec) in specs.iter().enumerate() {
@@ -234,7 +357,7 @@ impl Fixture {
         let executor = SqlExecutor::new(
             Arc::clone(&catalog),
             fetcher.clone(),
-            LogSegmentFetcher::new(Arc::clone(&store)),
+            log_fetcher,
             ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
             config,
             max_tenant_bytes,
