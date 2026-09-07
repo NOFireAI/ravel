@@ -1913,15 +1913,27 @@ pub const QUALIFY_COMPONENT: &str = "qualify";
 
 /// Annotation on the qualify Job carrying [`qualify_job_input_hash`], so a
 /// change to the inputs qualification proves against (bucket, region, endpoint,
-/// image, credentials Secret name) re-runs it and a no-op reconcile does not.
+/// image, credentials Secret name and its resourceVersion) re-runs it and a
+/// no-op reconcile does not.
 pub const QUALIFY_SPEC_HASH_ANNOTATION: &str = "ravel.nofire.ai/qualify-spec-hash";
 
-/// `backoffLimit` for the qualify Job: a few retries absorb a transient S3
-/// error (a backend still coming up) without spinning forever on a genuine
-/// qualification failure (a backend that fails conditional-create atomicity or
-/// list consistency). Four attempts, then the Job reports `Failed` and the
-/// controller surfaces it on the `StoreQualified` condition.
-pub const QUALIFY_JOB_BACKOFF_LIMIT: i32 = 4;
+/// `backoffLimit` for the qualify Job: one retry absorbs a transient S3 error
+/// (a backend still coming up) without spinning on a genuine qualification
+/// failure (a backend that fails conditional-create atomicity or list
+/// consistency). Two attempts total (the initial run plus one retry), then the
+/// Job reports `Failed` and the controller surfaces it on the `StoreQualified`
+/// condition.
+///
+/// Kept small deliberately: `activeDeadlineSeconds` is a Job-WIDE bound on the
+/// total active time across every retry (it takes precedence over
+/// `backoffLimit`), so the two knobs must be sized together. A larger retry
+/// count would either not fit under the deadline (a slow-but-healthy attempt
+/// plus a retry would trip `DeadlineExceeded` before the retry budget was
+/// spent) or force the deadline so high that a hung Job ran for many minutes
+/// before it was cut off. Two attempts is the value that lets one retry
+/// complete a full slow-but-healthy run within
+/// [`QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS`].
+pub const QUALIFY_JOB_BACKOFF_LIMIT: i32 = 1;
 
 /// `ttlSecondsAfterFinished` for the qualify Job: one hour, so a finished Job
 /// does not accumulate across reconciles or re-qualifications. The qualified
@@ -1929,32 +1941,42 @@ pub const QUALIFY_JOB_BACKOFF_LIMIT: i32 = 4;
 /// garbage-collected after success does not re-trigger qualification.
 pub const QUALIFY_JOB_TTL_SECONDS: i32 = 3600;
 
-/// `activeDeadlineSeconds` for the qualify Job: a wall-clock bound on a single
-/// attempt, so a qualify pod that hangs (an S3 endpoint that accepts the TCP
-/// connection and then never answers) becomes a `Failed` Job with reason
-/// `DeadlineExceeded` instead of running indefinitely. `backoffLimit` bounds
-/// only how many *failed* attempts run; it does nothing for one attempt that
-/// never terminates, which leaves `StoreQualified` stuck at `Pending` forever.
+/// `activeDeadlineSeconds` for the qualify Job: a wall-clock bound so a qualify
+/// pod that hangs (an S3 endpoint that accepts the TCP connection and then
+/// never answers) becomes a `Failed` Job with reason `DeadlineExceeded`
+/// instead of running indefinitely. `backoffLimit` bounds only how many
+/// *failed* attempts run; it does nothing for one attempt that never
+/// terminates, which leaves `StoreQualified` stuck at `Pending` forever.
 ///
-/// The value must clear a slow-but-healthy run with margin. `ravel store
-/// qualify` runs 28 sequential object operations against the bucket: probe
-/// create-if-absent (put, put, get = 3), probe CAS version (put, put, put,
-/// get = 4), probe read-after-write ([`super`]'s `CONSISTENCY_CYCLES` = 5
-/// put+get = 10), probe list-after-write (5 put+list = 10), and the final
-/// `sys/qualification` create-if-absent write (1); the two informational
-/// probes issue no request through the `ObjectStoreBackend` contract. Each
-/// operation's per-request ceiling is the S3 client's 20 s `request_timeout`
-/// (ravel-object-store `S3HttpConfig::default`), so a slow-but-healthy run
-/// whose every operation approaches that ceiling without retrying is bounded
-/// by 28 * 20 s = 560 s. 900 s adds a ~1.6x margin (340 s of slack) for pod
-/// scheduling, image pull, and the occasional single retry, while staying far
-/// below a hung endpoint's ~200 s-per-operation worst case (`retry_timeout`
-/// 180 s + `request_timeout` 20 s): a hang trips the deadline after roughly
-/// four stalled operations rather than exhausting all 28.
+/// This deadline is JOB-WIDE, not per-attempt: Kubernetes counts it against
+/// the Job's total active time summed across every retry, and it takes
+/// precedence over `backoffLimit` (whichever limit is hit first fails the
+/// Job). So the value must fit the intended retries end to end, not just one
+/// attempt, or a slow-but-healthy first attempt plus a retry would trip
+/// `DeadlineExceeded` before the retry budget ([`QUALIFY_JOB_BACKOFF_LIMIT`])
+/// was ever spent.
 ///
-/// Not part of [`qualify_job_input_hash`]: tuning this deadline must not
-/// re-run a qualification that already passed.
-pub const QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 900;
+/// Arithmetic. `ravel store qualify` runs 28 sequential object operations
+/// against the bucket: probe create-if-absent (put, put, get = 3), probe CAS
+/// version (put, put, put, get = 4), probe read-after-write ([`super`]'s
+/// `CONSISTENCY_CYCLES` = 5 put+get = 10), probe list-after-write (5 put+list
+/// = 10), and the final `sys/qualification` create-if-absent write (1); the two
+/// informational probes issue no request through the `ObjectStoreBackend`
+/// contract. Each operation's per-request ceiling is the S3 client's 20 s
+/// `request_timeout` (ravel-object-store `S3HttpConfig::default`), so one
+/// slow-but-healthy attempt whose every operation approaches that ceiling
+/// without retrying is bounded by 28 * 20 s = 560 s. Adding ~140 s per attempt
+/// for pod scheduling and image pull gives a 700 s per-attempt budget. With
+/// `QUALIFY_JOB_BACKOFF_LIMIT` = 1 the Job runs at most two attempts, so the
+/// Job-wide deadline is 2 * 700 s = 1400 s: a slow-but-healthy initial attempt
+/// AND a full retry both complete before it fires. A single hung attempt still
+/// terminates, at the 1400 s Job-wide bound rather than running forever
+/// (a hung endpoint stalls each operation at ~200 s = `retry_timeout` 180 s +
+/// `request_timeout` 20 s).
+///
+/// Not part of [`qualify_job_input_hash`]: tuning this deadline (or the backoff
+/// limit) must not re-run a qualification that already passed.
+pub const QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 1400;
 
 /// `StoreQualified` reason while the qualify Job is being created or is still
 /// running: serving is held until it reports success.
@@ -1978,16 +2000,35 @@ pub const STORE_QUALIFIED_MESSAGE: &str =
     "the object store passed ravel store qualify; serving Deployments may be created";
 
 /// A deterministic change-detection hash over the inputs store qualification
-/// proves against (issue #36): the bucket, region, endpoint, server image, and
-/// the credentials Secret name. When any of these changes the store the cluster
-/// would serve on is a different one, so qualification is re-run; an unrelated
-/// spec edit (a replica count, a fold interval) leaves this stable and does not
-/// re-qualify.
+/// proves against (issue #36): the bucket, region, endpoint, server image, the
+/// credentials Secret NAME, and that credentials Secret's `resourceVersion`.
+/// When any of these changes the store the cluster would serve on, or the
+/// credentials it would serve with, is different, so qualification is re-run; an
+/// unrelated spec edit (a replica count, a fold interval) leaves this stable and
+/// does not re-qualify.
+///
+/// The `resourceVersion` is what makes a fixed-name credential ROTATION
+/// re-qualify (finding, issue #36): rotating the Secret in place keeps its name
+/// but bumps its `resourceVersion`, so without it a rotation to credentials that
+/// no longer pass the object-store contract would skip qualification entirely
+/// once the prior Job had been TTL-garbage-collected. Only the `resourceVersion`
+/// (opaque API metadata) enters the hash, never any Secret DATA: the operator
+/// never reads the credential values here (it resolves only the
+/// `resourceVersion`, see `controller::resolve_credential_resource_versions`),
+/// and this value reaches neither the status nor a log line. The operator does
+/// not watch Secrets (the per-namespace `ravel-operator-secrets` RoleBinding
+/// grants `get` only, not `watch`), so a rotation is noticed on the next
+/// periodic requeue (`controller::RESYNC`, 300 s): that pass reads the new
+/// `resourceVersion`, this hash changes, and the gate recreates the Job. The
+/// bound on noticing a rotation is therefore one `RESYNC` interval.
 ///
 /// `DefaultHasher` (SipHash with fixed keys) is deterministic across processes,
 /// so an operator restart does not spuriously re-qualify. It is a change signal,
 /// not a security boundary, exactly like [`secrets_checksum`].
-pub fn qualify_job_input_hash(spec: &RavelClusterSpec) -> String {
+pub fn qualify_job_input_hash(
+    spec: &RavelClusterSpec,
+    credentials_resource_version: Option<&str>,
+) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     spec.storage.s3.bucket.hash(&mut hasher);
@@ -2004,6 +2045,7 @@ pub fn qualify_job_input_hash(spec: &RavelClusterSpec) -> String {
         .credentials_secret_ref
         .name
         .hash(&mut hasher);
+    credentials_resource_version.unwrap_or("").hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -2024,7 +2066,16 @@ pub fn qualify_job_input_hash(spec: &RavelClusterSpec) -> String {
 /// [`QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS`] so a hung attempt fails rather than
 /// runs forever, and [`QUALIFY_JOB_TTL_SECONDS`] so a finished Job does not
 /// accumulate.
-pub fn desired_qualify_job(spec: &RavelClusterSpec, instance: &str) -> Job {
+///
+/// `credentials_resource_version` is the shared credentials Secret's resolved
+/// `resourceVersion` (the controller reads it before the gate); it flows into
+/// [`qualify_job_input_hash`] so the recorded annotation matches the gate's
+/// desired hash and a fixed-name credential rotation re-qualifies.
+pub fn desired_qualify_job(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    credentials_resource_version: Option<&str>,
+) -> Job {
     let labels = labels(instance, QUALIFY_COMPONENT);
     let mut env = vec![
         EnvVar {
@@ -2071,7 +2122,7 @@ pub fn desired_qualify_job(spec: &RavelClusterSpec, instance: &str) -> Job {
             labels: Some(labels.clone()),
             annotations: Some(BTreeMap::from([(
                 QUALIFY_SPEC_HASH_ANNOTATION.to_string(),
-                qualify_job_input_hash(spec),
+                qualify_job_input_hash(spec, credentials_resource_version),
             )])),
             ..Default::default()
         },
@@ -5466,6 +5517,40 @@ mod tests {
         );
     }
 
+    /// Finding 1 verb sweep. Every operator write is server-side apply (a PATCH,
+    /// with `create` for objects that do not yet exist) or a delete, never a
+    /// PUT, so no rule grants the `update` verb. The `batch`/`jobs` rule is
+    /// exactly the verbs the reconcile loop calls: `create`/`patch` (apply),
+    /// `get` (observe the qualify Job), and `delete` (foreground recreate); it is
+    /// not watched by an informer, so no `list`/`watch`. A text scan so a rule
+    /// that reintroduces a dead verb fails the gate.
+    #[test]
+    fn rbac_grants_only_the_verbs_the_reconcile_loop_calls() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/k8s/operator/rbac.yaml");
+        let manifest = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        // No rule anywhere grants `update` (matched with its YAML quotes so the
+        // word "update" in a comment does not count).
+        assert!(
+            !manifest.contains("\"update\""),
+            "server-side apply is a PATCH, not a PUT: no rule may grant the update verb"
+        );
+
+        // The jobs rule grants exactly create/patch/get/delete.
+        let jobs_verbs = manifest
+            .lines()
+            .skip_while(|l| l.trim() != "resources: [\"jobs\"]")
+            .nth(1)
+            .map(str::trim)
+            .expect("rbac.yaml defines a batch/jobs rule with a verbs line");
+        assert_eq!(
+            jobs_verbs, "verbs: [\"create\", \"patch\", \"get\", \"delete\"]",
+            "the jobs rule grants only create/patch (apply), get (observe), and delete"
+        );
+    }
+
     /// A job condition of the given type/status, the shape
     /// [`qualify_job_phase`] reads.
     fn job_with_condition(type_: &str, status: &str, message: Option<&str>) -> Job {
@@ -5511,11 +5596,11 @@ mod tests {
     #[test]
     fn qualify_input_hash_tracks_exactly_the_qualified_inputs() {
         let spec = base_spec();
-        let base = qualify_job_input_hash(&spec);
+        let base = qualify_job_input_hash(&spec, Some("rv-1"));
         assert_eq!(
             base,
-            qualify_job_input_hash(&spec),
-            "the hash is deterministic for one spec"
+            qualify_job_input_hash(&spec, Some("rv-1")),
+            "the hash is deterministic for one spec and resourceVersion"
         );
 
         let mut bucket = spec.clone();
@@ -5537,10 +5622,19 @@ mod tests {
         ] {
             assert_ne!(
                 base,
-                qualify_job_input_hash(changed),
+                qualify_job_input_hash(changed, Some("rv-1")),
                 "a change to {label} re-triggers qualification"
             );
         }
+
+        // A fixed-name credential rotation (same Secret name, new
+        // resourceVersion) is a different credential and must re-trigger
+        // qualification, even though every spec field is unchanged.
+        assert_ne!(
+            base,
+            qualify_job_input_hash(&spec, Some("rv-2")),
+            "a new credentials resourceVersion (rotation in place) re-qualifies"
+        );
 
         // A field qualification does not depend on leaves the hash unchanged, so
         // an unrelated spec edit does not re-run qualification.
@@ -5548,7 +5642,7 @@ mod tests {
         replicas.gateway.replicas = spec.gateway.replicas + 5;
         assert_eq!(
             base,
-            qualify_job_input_hash(&replicas),
+            qualify_job_input_hash(&replicas, Some("rv-1")),
             "an unrelated spec edit (replica count) does not re-qualify"
         );
     }
@@ -5559,7 +5653,7 @@ mod tests {
     #[test]
     fn qualify_job_renders_a_one_shot_store_qualify() {
         let spec = base_spec();
-        let job = desired_qualify_job(&spec, "prod");
+        let job = desired_qualify_job(&spec, "prod", Some("rv-1"));
 
         assert_eq!(job.metadata.name.as_deref(), Some("prod-qualify"));
         assert_eq!(
@@ -5568,7 +5662,7 @@ mod tests {
                 .as_ref()
                 .and_then(|a| a.get(QUALIFY_SPEC_HASH_ANNOTATION))
                 .map(String::as_str),
-            Some(qualify_job_input_hash(&spec).as_str()),
+            Some(qualify_job_input_hash(&spec, Some("rv-1")).as_str()),
             "the annotation records the input hash so a change re-runs the Job"
         );
 
@@ -5672,17 +5766,35 @@ mod tests {
     #[test]
     fn qualify_job_bounds_a_hung_attempt() {
         let spec = base_spec();
-        let job = desired_qualify_job(&spec, "prod");
+        let job = desired_qualify_job(&spec, "prod", None);
         let job_spec = job.spec.as_ref().expect("qualify Job has a spec");
         assert_eq!(
             job_spec.active_deadline_seconds,
             Some(QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS),
-            "the qualify Job bounds a single attempt with activeDeadlineSeconds"
+            "the qualify Job bounds its total active time with activeDeadlineSeconds"
         );
         assert_eq!(
-            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS, 900,
-            "the chosen deadline is 900 s (28 sequential ops * 20 s request_timeout \
-             = 560 s slow-but-healthy, plus a ~1.6x margin)"
+            job_spec.backoff_limit,
+            Some(QUALIFY_JOB_BACKOFF_LIMIT),
+            "the qualify Job caps its retries with backoffLimit"
+        );
+        // activeDeadlineSeconds is Job-wide (summed across every retry) and takes
+        // precedence over backoffLimit, so the deadline must fit the intended
+        // attempts end to end: 700 s per attempt (560 s of ops + ~140 s pod
+        // scheduling/pull) * (backoffLimit + 1) attempts.
+        assert_eq!(
+            QUALIFY_JOB_BACKOFF_LIMIT, 1,
+            "one retry (two attempts total)"
+        );
+        assert_eq!(
+            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS, 1400,
+            "the Job-wide deadline is 1400 s = 700 s per attempt * 2 attempts, so a \
+             slow-but-healthy first attempt plus one full retry both fit before it fires"
+        );
+        assert_eq!(
+            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS,
+            700 * i64::from(QUALIFY_JOB_BACKOFF_LIMIT + 1),
+            "the deadline and the backoff limit are sized together"
         );
     }
 
@@ -5721,18 +5833,19 @@ mod tests {
         assert_eq!(decision, QualificationDecision::Failed(message));
     }
 
-    /// The `activeDeadlineSeconds` is a tuning knob, not a store-identity input:
-    /// [`qualify_job_input_hash`] covers exactly the five inputs qualification
-    /// proves against and never the deadline, so changing the deadline leaves the
-    /// hash equal and does not re-run a qualification that already passed.
+    /// The `activeDeadlineSeconds` and `backoffLimit` are tuning knobs, not
+    /// store-identity inputs: [`qualify_job_input_hash`] covers exactly the
+    /// bucket, region, endpoint, image, credentials Secret name, and credentials
+    /// `resourceVersion`, and never either knob, so tuning them leaves the hash
+    /// equal and does not re-run a qualification that already passed.
     #[test]
     fn the_deadline_is_not_part_of_the_qualified_input_hash() {
         use std::hash::{Hash, Hasher};
         let spec = base_spec();
 
-        // Recompute the hash over exactly the five qualified inputs, deliberately
-        // excluding the deadline. If the production hasher folded the deadline in,
-        // this reference would diverge and the assertion would fail.
+        // Recompute the hash over exactly the six qualified inputs, deliberately
+        // excluding both knobs. If the production hasher folded either in, this
+        // reference would diverge and the assertion would fail.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         spec.storage.s3.bucket.hash(&mut hasher);
         spec.storage.s3.region.hash(&mut hasher);
@@ -5748,13 +5861,14 @@ mod tests {
             .credentials_secret_ref
             .name
             .hash(&mut hasher);
+        "rv-1".hash(&mut hasher);
         let expected = format!("{:016x}", hasher.finish());
 
         assert_eq!(
-            qualify_job_input_hash(&spec),
+            qualify_job_input_hash(&spec, Some("rv-1")),
             expected,
-            "the qualified-input hash covers exactly the five store-identity inputs, never the \
-             deadline"
+            "the qualified-input hash covers exactly the six store-identity inputs, never the \
+             deadline or the backoff limit"
         );
     }
 
@@ -5838,6 +5952,61 @@ mod tests {
         assert_eq!(
             qualification_decision("new", Some("old"), &unannotated),
             QualificationDecision::Qualify { recreate: true },
+        );
+    }
+
+    /// Fixed-name credential rotation (issue #36): the credentials Secret keeps
+    /// its name but its content is rotated in place, so its `resourceVersion`
+    /// bumps. The qualified-input hash changes, so an already-qualified cluster
+    /// whose last Job succeeded is driven back to `Qualify { recreate: true }`
+    /// (the controller renders `StoreQualified=Pending` and recreates the Job).
+    /// The converse: an unchanged `resourceVersion` yields the same hash and
+    /// `Proceed`, so a steady-state reconcile never re-runs qualification.
+    #[test]
+    fn fixed_name_credential_rotation_re_qualifies() {
+        let spec = base_spec();
+        let before = qualify_job_input_hash(&spec, Some("rv-1"));
+        let after = qualify_job_input_hash(&spec, Some("rv-2"));
+        assert_ne!(
+            before, after,
+            "a rotated credentials Secret (new resourceVersion) is a new qualified input"
+        );
+
+        // Rotation: the durable qualified hash is the pre-rotation one, the
+        // desired hash is the post-rotation one, and the live Job (if not yet
+        // GC'd) still carries the pre-rotation hash and succeeded.
+        let rotated = qualification_decision(
+            &after,
+            Some(&before),
+            &QualifyJobObservation::Present {
+                spec_hash: Some(before.clone()),
+                phase: QualifyJobPhase::Succeeded,
+            },
+        );
+        assert_eq!(
+            rotated,
+            QualificationDecision::Qualify { recreate: true },
+            "a fixed-name rotation must recreate the Job and flip StoreQualified to Pending"
+        );
+        // Even after the prior Job's TTL GC (Absent) a rotation re-runs.
+        assert_eq!(
+            qualification_decision(&after, Some(&before), &QualifyJobObservation::Absent),
+            QualificationDecision::Qualify { recreate: false },
+            "a rotation after TTL GC creates a fresh Job"
+        );
+
+        // Converse: same resourceVersion, same hash, no re-run.
+        assert_eq!(
+            qualification_decision(
+                &before,
+                Some(&before),
+                &QualifyJobObservation::Present {
+                    spec_hash: Some(before.clone()),
+                    phase: QualifyJobPhase::Succeeded,
+                },
+            ),
+            QualificationDecision::Proceed,
+            "an unchanged resourceVersion must not re-run qualification"
         );
     }
 }
