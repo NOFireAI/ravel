@@ -239,9 +239,16 @@ record without the field.
 
 **R1 (this change, #1300).** The reader half, for the three records whose gates
 were permissive: `ProvisioningRecord`, `TenantConfigRecord`, `MetricMetadataRecord`
-now accept the read set {1, 2} and refuse 3, and their CAS rewrite paths refuse a
+now accept the read set exactly {1, 2} and their CAS rewrite paths refuse a
 record whose version exceeds what this build's writer stamps (still 1),
-preventing the strip before any version-2 writer exists. The two-release split is
+preventing the strip before any version-2 writer exists. The accepted set is a
+set with a floor, not a ceiling: each reader gate rejects a version below 1 with
+the same typed `UnsupportedVersion` error it uses for a version above 2. A
+version-0 record — a valid-shaped record from a writer that never stamped
+`format_version` — is therefore refused rather than admitted and later rewritten
+as version 1 by a CAS path; whether any pre-release binary ever wrote such a
+record into a live bucket is unknown, which is exactly why the gate is a set and
+not a ceiling. The two-release split is
 not optional: `ProvisioningRecord` is read on the ingest hot path by
 `GenerationSwitch`, which fails a flush CLOSED on a read failure, so a
 single-release reader-and-writer bump would be a fleet-wide ingest outage during
@@ -256,16 +263,22 @@ Until R2, a version-2 record cannot exist (every writer stamps 1), so R1's
 refusals only ever fire during a mixed-version window a future R2 rollout opens.
 
 **A note on `MetricMetadataRecord`'s serve path.** Its record is read by two
-callers through one function, `read_metrics_meta`: the ingest sink (which merges
-and CAS-writes it back — a rewrite) and the query `/api/v1/metadata` cache (a
-read-only serve). Because that function returns the CAS version a caller writes
-back with, R1 makes it refuse a version-2 record, which keeps the sink from
-stripping. The serve cache treats any read error as "serve an empty record for
-one horizon" (best-effort, logged), so on a version-2 record during an R2 rollout
-it degrades to empty metadata for a horizon rather than a hard failure — an
-accepted, bounded cost, and one that does not exist until R2. The decode gate
-itself (`decode_record`) accepts {1, 2}, so a future R2 serve-only reader that
-models the new field needs no gate change.
+callers with opposite obligations: the ingest sink merges and CAS-writes it back
+(a rewrite, which must stay strict) and the query `/api/v1/metadata` cache serves
+it read-only (which must not fail closed on a version it will never rewrite). R1
+splits the read accordingly rather than forcing both through one function.
+`read_metrics_meta` stays strict: it returns the CAS version a caller writes back
+with, so it refuses a version-2 record and keeps the sink from stripping.
+`read_metrics_meta_for_serve` is the read-only decoder for the cache; it applies
+the shared `decode_body` gate ({1, 2}) and does NOT apply the rewrite refusal, so
+a version-2 record's v1 fields are served rather than turned into an empty
+snapshot. The query metadata cache's fetch calls the serve reader. An earlier
+draft of this amendment accepted "serve an empty record for one horizon" on a
+version-2 record during an R2 rollout as a bounded cost; the split removes that
+degradation, so it is no longer a trade-off this ADR accepts. (The single
+background-refresh caller in that cache still uses the strict reader; widening it
+is follow-up work outside #1300's permitted scope and does not reintroduce the
+serve-empty horizon on the inline fetch path.)
 
 **The four never-audited records, reported not fixed here (their crates are in
 flight under other work):** `TenantRecoveryManifest` and `AdmissionUsageSnapshot`

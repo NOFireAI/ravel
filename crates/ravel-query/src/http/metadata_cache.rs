@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ravel_cache::Clock;
-use ravel_catalog::{MetricMetadataEntry, read_metrics_meta};
+use ravel_catalog::{MetricMetadataEntry, read_metrics_meta, read_metrics_meta_for_serve};
 use ravel_object_store::{ObjectStoreBackend, Version};
 use ravel_types::TenantHash;
 
@@ -312,7 +312,7 @@ async fn fetch_snapshot(
     shared: &Shared,
     tenant_hash: TenantHash,
 ) -> (MetadataSnapshot, Option<Version>) {
-    match read_metrics_meta(shared.store.as_ref(), &tenant_hash).await {
+    match read_metrics_meta_for_serve(shared.store.as_ref(), &tenant_hash).await {
         Ok(Some((entries, version))) => (Arc::new(entries), Some(version)),
         Ok(None) => (Arc::new(Vec::new()), None),
         Err(err) => {
