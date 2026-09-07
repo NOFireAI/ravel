@@ -135,3 +135,79 @@ which already builds and drops its own cap per flush -- a shard-lived (or
 longer) cap was considered and rejected there as an unbounded memory-growth
 vector, since `ExemplarCap`'s per-series map has no eviction. Nothing at the
 transport layer needs to, or should, outlive one request.
+
+## Amendment (2026-09-07): the OTLP HTTP gzip inflate is charged pre-inflate
+
+This amendment appends to decision 1; it moves the charge point for one
+transient and, in doing so, redefines what the gauge measures. Everything
+else above stands unchanged.
+
+### Context
+
+Decision 1 charges "at admission (after decode, before buffering)". That
+placement left the OTLP HTTP gzip decompression buffer outside the ceiling.
+`services/ravel-server/src/otlp_http.rs` takes the in-flight-request permit,
+then decompresses the body up to `MAX_DECOMPRESSED_OTLP_BODY_BYTES` (64 MiB),
+and only afterward does the router take the decision-1 charge. So
+`--max-inflight-ingest-requests` copies of a 64 MiB inflate -- 64 GiB at the
+default 1024 -- could exist at once before a single byte was charged. The
+`--max-ingest-buffer-bytes` flag and docs/ingest.md both claimed a bound that
+this transient escaped: the flag overclaimed (issue #1297).
+
+### Decision
+
+The gzip inflate path charges the process-wide `IngestByteBudget` for the
+bytes it decompresses, **before it finishes inflating**, incrementally as each
+chunk is produced. A decompression whose running total would cross the ceiling
+is shed mid-inflate (HTTP 429, gRPC `RESOURCE_EXHAUSTED`, the existing shed
+counter) rather than being allocated in full and charged afterward. The charge
+is held as an RAII guard through protobuf decode and normalize, and dropped
+once the router has taken its own decision-1 buffered charge, so the peak
+decode-time bytes are accounted for their whole lifetime.
+
+**What the gauge now means.** Before this amendment `ravel_ingest_buffer_bytes`
+measured buffered ingest state only. It now measures buffered state **plus the
+transient OTLP HTTP gzip decode state currently in flight**: for the window
+between a request starting to inflate and its router charge landing, both the
+decode charge and (once taken) the buffered charge are held, so the gauge can
+briefly exceed the buffered bytes alone. This is deliberate -- the ceiling
+bounds peak resident ingest memory, and the inflate buffer is part of that
+peak. The identity (uncompressed) path allocates no inflate buffer and takes no
+gateway charge; the OTLP gRPC and Remote Write decode paths are out of scope
+here and remain bounded by `--max-inflight-ingest-requests` alone.
+
+**Why the actual inflated length, charged incrementally.** Charging the 64 MiB
+cap up front would over-charge every well-compressing request and shed real
+traffic under a tight budget. Charging a compressed-size estimate would either
+over- or under-charge depending on the ratio. Charging each produced chunk
+makes the summed charge equal the actual decompressed length exactly: the
+over-charge bound for an admitted request is **zero**, and the peak *uncharged*
+allocation is at most one staging chunk (64 KiB). A shed request refunds every
+partial chunk on the spot.
+
+### Rejected alternatives
+
+- **Documentation only** (correct the flag docs, leave the resource
+  unbounded): rejected. It leaves 64 GiB of possible inflate outside the
+  ceiling and keeps the flags claiming a bound they do not enforce.
+- **Lower the `--max-inflight-ingest-requests` default**: rejected. It caps
+  concurrency for every caller to paper over an accounting gap, and the gap
+  (uncharged inflate) would still exist at the lower concurrency.
+- **Charge after inflate** (keep decision 1's point, add the decompressed size
+  once decode finishes): rejected. The peak *is* the inflate; charging after
+  it has already been allocated does not bound the transient this amendment
+  exists to bound.
+- **Reserve `max_inflight_requests x cap` statically**: rejected for the same
+  reason decision 1's own "Full static allocation" bullet rejects it -- it
+  wastes most of an 8 GB host or hard-caps tenancy, and the point of the global
+  gauge is to admit bursty requests opportunistically while keeping the sum
+  bounded.
+
+### Model (RUST_ONLY)
+
+The formal model is unaffected. Admission shedding happens strictly before
+`PinFlush`, and the model has no admission action, so a shed request mints no
+flush: there is no new transition, no new commit-protocol interleaving, and
+nothing for the TLA+ model to cover. This amendment changes only where in the
+Rust ingest path a byte is charged, not the durability or visibility state
+machine.
