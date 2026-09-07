@@ -1137,7 +1137,13 @@ async fn probe_lexicographic_listing_order(
         Ok(result) => result,
         Err(detail) => return ProbeResult::fail(property, detail),
     };
-    if let Some((before, after)) = first_order_violation(&delivered) {
+    // Deduplicate before checking order, never after: the contract lets a key
+    // appear more than once, so a compliant backend that re-delivers an
+    // already-delivered key at a page boundary produces a raw sequence that
+    // goes backwards. Deduplication keeps first-delivery order, so a real
+    // ordering violation still shows up in the distinct sequence.
+    let distinct = distinct_in_delivery_order(&delivered);
+    if let Some((before, after)) = first_order_violation(&distinct) {
         return ProbeResult::fail(
             property,
             format!(
@@ -1147,7 +1153,6 @@ async fn probe_lexicographic_listing_order(
             ),
         );
     }
-    let distinct = distinct_in_delivery_order(&delivered);
     if distinct != expected {
         return ProbeResult::fail(
             property,
@@ -1178,7 +1183,10 @@ async fn probe_lexicographic_listing_order(
             ),
         );
     }
-    if let Some((before, after)) = first_order_violation(&tail_delivered) {
+    // Same order as the full drain above, and for the same reason: the raw
+    // tail may repeat a key across a page boundary and stay compliant.
+    let distinct_tail = distinct_in_delivery_order(&tail_delivered);
+    if let Some((before, after)) = first_order_violation(&distinct_tail) {
         return ProbeResult::fail(
             property,
             format!(
@@ -1187,7 +1195,6 @@ async fn probe_lexicographic_listing_order(
             ),
         );
     }
-    let distinct_tail = distinct_in_delivery_order(&tail_delivered);
     if distinct_tail != expected_tail {
         return ProbeResult::fail(
             property,
@@ -1203,11 +1210,11 @@ async fn probe_lexicographic_listing_order(
     ProbeResult::pass(
         property,
         format!(
-            "{} keys written out of order were listed in lexicographic order, and \
-             start_after={marker} resumed at {} with exactly {} keys",
-            expected.len(),
+            "{} distinct keys written out of order were listed in lexicographic order, and \
+             start_after={marker} resumed at {} with exactly {} distinct keys",
+            distinct.len(),
             expected_tail[0],
-            expected_tail.len()
+            distinct_tail.len()
         ),
     )
 }
@@ -1373,7 +1380,7 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use parking_lot::Mutex;
 
@@ -2368,6 +2375,363 @@ mod tests {
             5,
             "5 distinct keys: {keys:?}"
         );
+    }
+
+    /// Which of the ordering probe's two listing passes a
+    /// [`PageBoundaryStore`] perturbs. The probe checks delivery order at two
+    /// sites, the full drain (`start_after: None`) and the `start_after`
+    /// tail, and a wrapper that perturbed both at once could not say which
+    /// site caught it.
+    #[derive(Clone, Copy)]
+    enum ListingPass {
+        Full,
+        Tail,
+    }
+
+    /// What a [`PageBoundaryStore`] does at a page boundary.
+    #[derive(Clone, Copy)]
+    enum PageBoundary {
+        /// Re-delivers the previous page's first key as the first entry of the
+        /// next page: `[a, b]` then `[a, c, d]`. This is a permitted delivery
+        /// (docs/object-store-contract.md: "a key MAY appear more than once
+        /// and callers MUST dedup by key") and loses no key, so the only
+        /// thing wrong with it is the raw delivery order.
+        ///
+        /// Re-delivering the page's own last key instead (`[a, b]` then
+        /// `[b, c]`) is permitted too, but its raw sequence never decreases,
+        /// so it cannot exercise an order check at all. The repeat has to be
+        /// of a key that sorts before the page boundary.
+        RepeatEarlierKey,
+        /// Holds each continued page's last key back and delivers it after the
+        /// next page's first key: `[a]` then `[c, b]`. Every key arrives
+        /// exactly once, so deduplication changes nothing and the distinct
+        /// sequence itself goes backwards: a real ordering violation.
+        SwapAcrossBoundary,
+    }
+
+    /// Wraps the pagination oracle (`MemoryStore::with_page_size(2)`) and
+    /// perturbs one of the ordering probe's two listing passes at every page
+    /// boundary. `list` is delegated untouched, so only the `list_after`
+    /// drains the ordering and cross-page probes use are affected.
+    struct PageBoundaryStore {
+        inner: MemoryStore,
+        boundary: PageBoundary,
+        pass: ListingPass,
+        /// Carried between pages of one drain: the key to re-deliver, or the
+        /// key held back. Keyed by prefix, so two listings cannot leak keys
+        /// into each other.
+        carry: Mutex<HashMap<String, ObjectMeta>>,
+    }
+
+    impl PageBoundaryStore {
+        /// Page size 2 over the ordering probe's five keys is three pages, so
+        /// there are two page boundaries to perturb.
+        fn new(boundary: PageBoundary, pass: ListingPass) -> Self {
+            PageBoundaryStore {
+                inner: MemoryStore::with_page_size(2),
+                boundary,
+                pass,
+                carry: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn perturbs(&self, start_after: Option<&str>) -> bool {
+            match self.pass {
+                ListingPass::Full => start_after.is_none(),
+                ListingPass::Tail => start_after.is_some(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for PageBoundaryStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let mut result = self.inner.list_after(prefix, start_after, page).await?;
+            if !self.perturbs(start_after) {
+                return Ok(result);
+            }
+            let carried = self.carry.lock().remove(prefix);
+            // Taken from this page before anything is carried in, so a repeat
+            // always names a key this page really delivered.
+            let held = match self.boundary {
+                PageBoundary::RepeatEarlierKey => result.objects.first().cloned(),
+                PageBoundary::SwapAcrossBoundary => {
+                    // Only a continued page can hand its last key to a later
+                    // page; holding one back on the final page would lose it.
+                    if result.next.is_some() && result.objects.len() >= 2 {
+                        result.objects.pop()
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(meta) = carried {
+                let at = match self.boundary {
+                    PageBoundary::RepeatEarlierKey => 0,
+                    // After this page's own first key, so the two distinct
+                    // keys arrive in the wrong order.
+                    PageBoundary::SwapAcrossBoundary => 1.min(result.objects.len()),
+                };
+                result.objects.insert(at, meta);
+            }
+            match held {
+                Some(meta) if result.next.is_some() => {
+                    self.carry.lock().insert(prefix.to_string(), meta);
+                }
+                // A drain that ended leaves no carry behind for the next one.
+                _ => {}
+            }
+            Ok(result)
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The ordering probe's pass detail for its five keys under
+    /// `sys/qualify/<run>/order/`, with the exact counts spelled out.
+    fn expected_order_pass_detail(list_prefix: &str) -> String {
+        format!(
+            "5 distinct keys written out of order were listed in lexicographic order, and \
+             start_after={list_prefix}b resumed at {list_prefix}c with exactly 3 distinct keys"
+        )
+    }
+
+    fn order_probe_result(report: &ConformanceReport) -> &ProbeResult {
+        report
+            .results
+            .iter()
+            .find(|r| r.property == Property::LexicographicListingOrder)
+            .expect("the ordering probe ran")
+    }
+
+    /// A backend that re-delivers an already-delivered key across a page
+    /// boundary is compliant (docs/object-store-contract.md: "a key MAY appear
+    /// more than once and callers MUST dedup by key"), so it must qualify. The
+    /// probe therefore has to deduplicate before it judges order: the raw
+    /// delivery sequence here goes backwards while the distinct one does not.
+    #[tokio::test]
+    async fn listing_order_probe_accepts_a_contract_permitted_cross_page_repeat() {
+        let store = PageBoundaryStore::new(PageBoundary::RepeatEarlierKey, ListingPass::Full);
+        let prefix = "sys/qualify/order-repeat-full/";
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(
+            report.passed(),
+            "a cross-page repeat is a permitted delivery, so every probe must pass, got: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let list_prefix = format!("{prefix}order/");
+        assert_eq!(
+            order_probe_result(&report).detail,
+            expected_order_pass_detail(&list_prefix)
+        );
+
+        // The repeat really fired, and on the pass under test: the raw
+        // sequence holds seven deliveries of five keys, and its first
+        // backwards step is the repeated key after a larger one.
+        let (delivered, pages) = drain_pages(&store, &list_prefix, None)
+            .await
+            .expect("draining the probe's own prefix");
+        assert_eq!(
+            delivered,
+            vec![
+                format!("{list_prefix}a"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}a"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}e"),
+            ]
+        );
+        assert_eq!(pages, 3, "5 keys at page size 2 is exactly 3 pages");
+        assert_eq!(
+            first_order_violation(&delivered)
+                .map(|(before, after)| (before.to_string(), after.to_string())),
+            Some((format!("{list_prefix}b"), format!("{list_prefix}a"))),
+            "the raw sequence goes backwards; only the deduplicated one does not"
+        );
+        assert_eq!(
+            distinct_in_delivery_order(&delivered),
+            vec![
+                format!("{list_prefix}a"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}e"),
+            ]
+        );
+    }
+
+    /// Deduplicating first must not weaken the check: a backend whose distinct
+    /// delivery sequence goes backwards still fails, on the ordering property
+    /// and with the ordering message, even though it loses no key and repeats
+    /// nothing.
+    #[tokio::test]
+    async fn listing_order_probe_still_rejects_backward_order_after_dedup() {
+        let store = PageBoundaryStore::new(PageBoundary::SwapAcrossBoundary, ListingPass::Full);
+        let prefix = "sys/qualify/order-swap-full/";
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(
+            failed,
+            vec![Property::LexicographicListingOrder],
+            "no key is lost or repeated here, so only the ordering property may fail"
+        );
+        let list_prefix = format!("{prefix}order/");
+        assert_eq!(
+            order_probe_result(&report).detail,
+            format!(
+                "listing {list_prefix} delivered {list_prefix}b after {list_prefix}c, which sorts \
+                 before it; this backend's listing is not in lexicographic key order, so a \
+                 continuation token does not name a position in the key space"
+            )
+        );
+
+        // Five keys, each delivered exactly once, in a swapped order: nothing
+        // for deduplication to collapse.
+        let (delivered, _pages) = drain_pages(&store, &list_prefix, None)
+            .await
+            .expect("draining the probe's own prefix");
+        assert_eq!(
+            delivered,
+            vec![
+                format!("{list_prefix}a"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}e"),
+                format!("{list_prefix}d"),
+            ]
+        );
+        assert_eq!(distinct_in_delivery_order(&delivered), delivered);
+    }
+
+    /// The `start_after` tail is the probe's second order check, so it needs
+    /// the same proof: a cross-page repeat confined to the tail listing is
+    /// permitted and must qualify.
+    #[tokio::test]
+    async fn list_after_tail_accepts_a_contract_permitted_cross_page_repeat() {
+        let store = PageBoundaryStore::new(PageBoundary::RepeatEarlierKey, ListingPass::Tail);
+        let prefix = "sys/qualify/order-repeat-tail/";
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(
+            report.passed(),
+            "a cross-page repeat in the tail listing is a permitted delivery, got: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let list_prefix = format!("{prefix}order/");
+        assert_eq!(
+            order_probe_result(&report).detail,
+            expected_order_pass_detail(&list_prefix)
+        );
+
+        // The repeat fired in the tail pass only: four deliveries of the three
+        // keys after the marker, going backwards once.
+        let marker = format!("{list_prefix}b");
+        let (tail_delivered, pages) = drain_pages(&store, &list_prefix, Some(&marker))
+            .await
+            .expect("draining the probe's own tail");
+        assert_eq!(
+            tail_delivered,
+            vec![
+                format!("{list_prefix}c"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}e"),
+            ]
+        );
+        assert_eq!(pages, 2, "3 keys at page size 2 is exactly 2 pages");
+        assert_eq!(
+            first_order_violation(&tail_delivered)
+                .map(|(before, after)| (before.to_string(), after.to_string())),
+            Some((format!("{list_prefix}d"), format!("{list_prefix}c")))
+        );
+        assert_eq!(
+            distinct_in_delivery_order(&tail_delivered),
+            vec![
+                format!("{list_prefix}c"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}e"),
+            ]
+        );
+        // The full drain was left alone, so this test's evidence is the tail.
+        let (delivered, _pages) = drain_pages(&store, &list_prefix, None)
+            .await
+            .expect("draining the probe's own prefix");
+        assert_eq!(delivered, distinct_in_delivery_order(&delivered));
+    }
+
+    /// The tail's order check keeps its teeth after deduplication too.
+    #[tokio::test]
+    async fn list_after_tail_still_rejects_backward_order_after_dedup() {
+        let store = PageBoundaryStore::new(PageBoundary::SwapAcrossBoundary, ListingPass::Tail);
+        let prefix = "sys/qualify/order-swap-tail/";
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(failed, vec![Property::LexicographicListingOrder]);
+        let list_prefix = format!("{prefix}order/");
+        assert_eq!(
+            order_probe_result(&report).detail,
+            format!(
+                "list_after({list_prefix}, start_after={list_prefix}b) delivered {list_prefix}d \
+                 after {list_prefix}e, which sorts before it"
+            )
+        );
+
+        let marker = format!("{list_prefix}b");
+        let (tail_delivered, _pages) = drain_pages(&store, &list_prefix, Some(&marker))
+            .await
+            .expect("draining the probe's own tail");
+        assert_eq!(
+            tail_delivered,
+            vec![
+                format!("{list_prefix}c"),
+                format!("{list_prefix}e"),
+                format!("{list_prefix}d"),
+            ]
+        );
+        assert_eq!(distinct_in_delivery_order(&tail_delivered), tail_delivered);
     }
 
     /// A delete fault must surface as a named, typed [`ProbeResult`] failure
