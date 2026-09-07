@@ -3,6 +3,7 @@
 
 pub mod admission_reconcile;
 pub mod alert_sink;
+pub mod alert_state_memo;
 pub mod alerting;
 pub mod analytics;
 pub mod bucket_protection;
