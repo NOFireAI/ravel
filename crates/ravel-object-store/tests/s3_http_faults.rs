@@ -124,6 +124,12 @@ enum Fault {
     /// so no retry layer covers this: it surfaces to the caller, and the
     /// contract requires it to surface as something retryable.
     DropMidResponse,
+    /// A 409 with an `<Error><Code>ConditionalRequestConflict</Code>` body, the
+    /// response S3 returns when two `If-None-Match: *` PUTs race the same key.
+    /// `object_store` 0.14 maps a raw 409 to `AlreadyExists` and does not retry
+    /// a create conflict, so the S3 adapter's HEAD disambiguation is what turns
+    /// an absent-key 409 into a retryable `Transient` (#1302).
+    ConditionalConflict,
 }
 
 /// One request as the server saw it: which operation, which key, when, which
@@ -571,6 +577,11 @@ async fn handle(
             "Access Denied by the fake endpoint.",
         ),
         Some(Fault::DropMidResponse) => drop_mid_response(&headers),
+        Some(Fault::ConditionalConflict) => error_response(
+            StatusCode::CONFLICT,
+            "ConditionalRequestConflict",
+            "The conditional request could not be satisfied.",
+        ),
         Some(Fault::Pass) | None => serve(&state, op, &key, &query, &headers, data),
     }
 }
@@ -1077,6 +1088,173 @@ async fn connection_dropped_mid_response_surfaces_retryable() {
             StoreError::Transient(_) | StoreError::Timeout | StoreError::Throttled { .. }
         ),
         "a dropped connection must classify as a transport failure, got {error:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Conditional-write 409 disambiguation (#1302)
+// ---------------------------------------------------------------------------
+
+/// The caller-side retry loop the contract names ("Ravel retries a transient
+/// conflict"): re-issue a `CreateIfAbsent` PUT while the store returns a
+/// retryable error, up to `max_attempts` total tries. Returns the final
+/// outcome and the number of PUT calls the loop made. `StoreError::is_retryable`
+/// is exactly what routes a `Transient` conditional-request conflict back here,
+/// so this stands in for the ingest flush loop and the commit publish path
+/// without pulling in either crate.
+async fn create_with_retry(
+    store: &S3Store,
+    key: &str,
+    bytes: &'static [u8],
+    max_attempts: u32,
+) -> (Result<(), StoreError>, u32) {
+    let opts = PutOptions::create_if_absent();
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match store
+            .put(key, Bytes::from_static(bytes), opts.clone())
+            .await
+        {
+            Ok(_) => return (Ok(()), attempts),
+            Err(e) if e.is_retryable() && attempts < max_attempts => continue,
+            Err(e) => return (Err(e), attempts),
+        }
+    }
+}
+
+/// A single 409 `ConditionalRequestConflict` on a `CreateIfAbsent` PUT to an
+/// absent key is a transient conflict the AWS PutObject spec says to retry, not
+/// a permanent `AlreadyExists`. The adapter's HEAD disambiguation sees the key
+/// absent and returns a retryable `Transient`, so the caller loop retries and
+/// the second PUT lands the object. The proof is on the server's view: exactly
+/// two PUTs (the 409 and the retry) and exactly one HEAD.
+///
+/// Before the fix, `object_store`'s raw-409-to-`AlreadyExists` mapping surfaced
+/// straight through `map_put_error` as `AlreadyExists`, which
+/// `create_with_retry` would not retry: the loop would stop at one PUT and the
+/// object would never be created.
+#[tokio::test]
+async fn single_409_on_create_if_absent_is_retried_and_the_put_returns_ok() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.script(Op::Put, [Fault::ConditionalConflict]);
+
+    let (result, attempts) =
+        create_with_retry(&store, "conflict/absent", b"created after one conflict", 5).await;
+    result.expect("an absent-key 409 must be retried to success");
+    assert_eq!(
+        attempts, 2,
+        "one conflict then one success is exactly two caller attempts"
+    );
+    assert_eq!(
+        fake.count(Op::Put),
+        2,
+        "exactly two PUTs reached the endpoint: the 409 and the retry"
+    );
+    assert_eq!(
+        fake.count(Op::Head),
+        1,
+        "exactly one HEAD disambiguated the single 409"
+    );
+    assert_eq!(
+        fake.object("conflict/absent").as_deref(),
+        Some(&b"created after one conflict"[..]),
+        "the retried PUT landed the caller's exact bytes"
+    );
+}
+
+/// A 409 on a key that really exists stays `AlreadyExists`: the HEAD finds the
+/// key present, so the adapter must not downgrade a genuine collision to a
+/// retryable `Transient`. This is the test that keeps the commit-path
+/// split-brain guard and the compaction vanished-part guard alive: both rely on
+/// a real already-exists surfacing as `AlreadyExists`. Exactly one HEAD, no
+/// second PUT, and the stored bytes are the winner's (the split-brain-detection
+/// input a caller would GET next is intact).
+///
+/// Before the fix this passed too (the mapper returned `AlreadyExists`
+/// directly); mapping `AlreadyExists` to `Transient` unconditionally — the
+/// tempting shortcut the fix deliberately avoids — makes this fail, because the
+/// present-key collision would then be retried forever instead of surfacing.
+#[tokio::test]
+async fn a_409_on_a_key_that_really_exists_stays_already_exists() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.seed("conflict/present", b"the winner's bytes");
+    fake.always(Op::Put, Fault::ConditionalConflict);
+
+    let (result, attempts) =
+        create_with_retry(&store, "conflict/present", b"the loser's bytes", 5).await;
+    let err = result.expect_err("a present-key 409 must surface, not retry to success");
+    assert!(
+        matches!(err, StoreError::AlreadyExists),
+        "a genuine already-exists must stay AlreadyExists, got {err:?}"
+    );
+    assert!(
+        !err.is_retryable(),
+        "AlreadyExists is a protocol signal, not a retryable error: {err:?}"
+    );
+    assert_eq!(
+        attempts, 1,
+        "AlreadyExists stops the caller loop after exactly one attempt"
+    );
+    assert_eq!(
+        fake.count(Op::Put),
+        1,
+        "no second PUT: a real collision is never retried"
+    );
+    assert_eq!(
+        fake.count(Op::Head),
+        1,
+        "exactly one HEAD confirmed the key present"
+    );
+    assert_eq!(
+        fake.object("conflict/present").as_deref(),
+        Some(&b"the winner's bytes"[..]),
+        "the winner's bytes are untouched, so a subsequent GET sees the collision"
+    );
+}
+
+/// An endpoint stuck returning 409 for an absent key exhausts the caller's
+/// retry budget and surfaces the last conflict as a retryable `Transient`, so
+/// the caller's own backoff can take over rather than a permanent
+/// `AlreadyExists` stranding the write. The attempt count is pinned exactly:
+/// one PUT and one disambiguating HEAD per attempt, and no object ever visible.
+#[tokio::test]
+async fn persistent_409_surfaces_transient_after_the_retry_budget() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.always(Op::Put, Fault::ConditionalConflict);
+
+    const MAX_ATTEMPTS: u32 = 4;
+    let (result, attempts) =
+        create_with_retry(&store, "conflict/persistent", b"never lands", MAX_ATTEMPTS).await;
+    let err = result.expect_err("a persistent 409 must exhaust the budget and fail");
+    assert!(
+        matches!(err, StoreError::Transient(_)),
+        "each absent-key 409 is a retryable Transient, got {err:?}"
+    );
+    assert!(
+        err.is_retryable(),
+        "the surfaced error must be retryable: {err:?}"
+    );
+    assert_eq!(
+        attempts, MAX_ATTEMPTS,
+        "the loop ran exactly its budget of attempts"
+    );
+    assert_eq!(
+        fake.count(Op::Put),
+        MAX_ATTEMPTS as usize,
+        "exactly one PUT per attempt reached the endpoint"
+    );
+    assert_eq!(
+        fake.count(Op::Head),
+        MAX_ATTEMPTS as usize,
+        "exactly one HEAD disambiguated each 409"
+    );
+    assert!(
+        fake.object("conflict/persistent").is_none(),
+        "no object ever became visible under a persistent conflict"
     );
 }
 
