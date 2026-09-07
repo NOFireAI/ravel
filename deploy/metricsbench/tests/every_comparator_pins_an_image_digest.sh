@@ -73,7 +73,7 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # Exact number of external `uses:` action references across every workflow and
 # composite action file. Update deliberately whenever a workflow gains,
 # loses, or repoints a `uses:` step.
-WORKFLOW_EXPECTED_ACTION_COUNT=89
+WORKFLOW_EXPECTED_ACTION_COUNT=92
 
 # A pinned image reference ends in `@sha256:` followed by exactly 64 hex
 # digits. Matching the bare substring `@sha256:` is not enough: `repo:tag@sha256:`
