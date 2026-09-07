@@ -334,6 +334,15 @@ Because the refusal alone cannot tell the two apart, the walk re-reads the
 bucket after a refusal and counts it only when a below-target record is still
 served raw.
 
+There is no command that forces the overlap to resolve. The block clears on its
+own when the loser-only inputs stop being served raw, which happens when a
+later authoritative compaction covers them or when retention ages them out.
+Until one of those occurs the floor stays where it is, which is the correct
+outcome rather than a fault: raising it would claim a format floor over an
+object the resolver still returns. The walk's output identifies the shard and
+ingest hour, so the affected bucket is known even though no command resolves
+the overlap for you.
+
 The re-audit's liveness definition excludes a bucket's pre-rewrite L0 commit
 records once an authoritative compaction or rewrite record supersedes them.
 Those records are dead, sweepable leftovers of a rewrite this same invocation may have
