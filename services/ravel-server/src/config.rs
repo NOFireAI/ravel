@@ -914,6 +914,32 @@ pub struct Cli {
     #[arg(long, value_name = "BYTES")]
     pub cache_max_bytes: Option<u64>,
 
+    /// The single UNCOMPRESSED-byte bound for column statistics (issue #1400),
+    /// a THIRD ceiling independent of `--cache-max-bytes`. One number governs
+    /// three things at once:
+    ///
+    /// - the reader: [`ravel_catalog::snapshot_format::decode_column_stats`]
+    ///   refuses a `.cstat` object whose declared `body_uncompressed_len`
+    ///   exceeds it (the hostile-size guard, ADR-0850 decision 2, now this bound
+    ///   instead of a fixed 256 MiB);
+    /// - the writer: the fold refuses to emit a `.cstat` body above it, so it
+    ///   never writes an object the reader would reject;
+    /// - the reuse cache: an object above it is served but not cached
+    ///   (`ravel_catalog_column_stats_cache_refusals_total` climbs).
+    ///
+    /// It bounds DECODED statistics, not raw object bytes, so `--cache-max-bytes`
+    /// does not couple to it: a single ClickBench-scale object is about 2 GB
+    /// uncompressed. When the reader refuses an object, it logs one WARN per
+    /// `(tenant, signal, key)` naming the object's `body_uncompressed_len` and
+    /// this bound; the query still runs by scanning. Read at startup only; there
+    /// is no live resize. Default when unset: derived,
+    /// [`COLUMN_STATS_MEMORY_PERCENT`] of MemTotal; reference host
+    /// (MemTotal 32,903,794,688): 2,303,265,628. Fallback when MemTotal is
+    /// unknown: [`ravel_catalog::DEFAULT_MAX_COLUMN_STATS_BYTES`]
+    /// (256 MiB).
+    #[arg(long, value_name = "BYTES")]
+    pub column_stats_max_bytes: Option<u64>,
+
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
     /// both the query fetcher cache (`store::build_cache`) and the catalog byte
@@ -1757,6 +1783,27 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// explicit `--cache-max-bytes` still bounds both caches at that one value.
 pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
 
+/// Share of `MemTotal` the derived `--column-stats-max-bytes` takes (issue
+/// #1400), a THIRD ceiling independent of [`CACHE_MEMORY_PERCENT`] and
+/// [`CATALOG_CACHE_MEMORY_PERCENT`]: those bound raw object bytes in two LRU
+/// byte caches, this one bounds DECODED column statistics and is the single
+/// number that governs the reader ceiling, the writer, and the reuse cache.
+///
+/// Sizing basis: a ClickBench `hits` tenant (104 typed columns over 703
+/// segments, about 9 KB of statistics per segment-column) produces a
+/// column-statistics object of 2,000,102,795 UNCOMPRESSED bytes
+/// (`ColumnStatsHeader.body_uncompressed_len`; ADR-0850 decision 3 makes a body
+/// this size the DESIGNED outcome of the cardinality ceiling, not a fold
+/// defect). The reader refuses a declared body above the bound, so the derived
+/// value must clear that figure on the 32,903,794,688-byte reference host. 7%
+/// is the smallest whole percent that does with margin: 2,303,265,628 bytes at
+/// that `MemTotal` (about 303 MB above the object), and 2,254,857,830 at the
+/// nominal 30 GiB spelling (32,212,254,720). It bounds decoded statistics for
+/// the tenants a process is actively querying, not a working set that grows
+/// with the corpus, so it stays well under the fetcher cache's 25% and the SQL
+/// pools' 25%/50%.
+pub const COLUMN_STATS_MEMORY_PERCENT: u64 = 7;
+
 /// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~8 GiB on the
 /// reference host).
 pub const SQL_QUERY_MEMORY_PERCENT: u64 = 25;
@@ -1812,6 +1859,8 @@ pub struct PerformanceFlags {
     pub max_segments: Option<usize>,
     /// `--cache-max-bytes`.
     pub cache_max_bytes: Option<u64>,
+    /// `--column-stats-max-bytes` (issue #1400).
+    pub column_stats_max_bytes: Option<u64>,
     /// `--sql-max-query-bytes`.
     pub sql_max_query_bytes: Option<usize>,
     /// `--sql-tenant-max-bytes`.
@@ -1854,6 +1903,15 @@ pub struct ResolvedPerformanceDefaults {
     /// [`Self::cache_max_bytes`]'s 25%; an explicit `--cache-max-bytes` sets
     /// both equal.
     pub catalog_cache_max_bytes: u64,
+    /// Reaches BOTH `CatalogConfig::column_stats_max_bytes` (the reader/writer
+    /// bound) and `CatalogConfig::column_stats_cache_max_bytes` (the reuse
+    /// cache budget), set to the same value by
+    /// `query::build_catalog_with_column_stats_budget` (issue #1400). A THIRD
+    /// ceiling independent of the two above: it bounds decoded column statistics
+    /// in UNCOMPRESSED bytes, not raw object bytes, and `--cache-max-bytes` does
+    /// not couple to it. Derived at [`COLUMN_STATS_MEMORY_PERCENT`], set
+    /// verbatim by `--column-stats-max-bytes`.
+    pub column_stats_max_bytes: u64,
     /// Reaches `SqlConfig::max_query_bytes`. Never above
     /// [`Self::sql_tenant_max_bytes`].
     pub sql_max_query_bytes: usize,
@@ -1890,6 +1948,7 @@ pub struct PerformanceSources {
     pub max_segments: &'static str,
     pub cache_max_bytes: &'static str,
     pub catalog_cache_max_bytes: &'static str,
+    pub column_stats_max_bytes: &'static str,
     pub sql_max_query_bytes: &'static str,
     pub sql_tenant_max_bytes: &'static str,
     pub query_deadline: &'static str,
@@ -2025,6 +2084,26 @@ pub fn resolve_performance_defaults(
             (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
         };
 
+    // A THIRD ceiling, on its own flag (issue #1400): the one number that bounds
+    // the column-statistics reader, writer, and reuse cache, in UNCOMPRESSED
+    // bytes. Not coupled to `--cache-max-bytes`, which bounds raw object bytes in
+    // the two LRU byte caches; one number cannot size both, because a single
+    // stats object runs to about 2 GB uncompressed on a wide-table tenant. The
+    // fallback is ravel-catalog's own compiled-in decode cap (256 MiB), not the
+    // byte caches' fallback.
+    let (column_stats_max_bytes, column_stats_source) =
+        match (flags.column_stats_max_bytes, host.mem_total_bytes) {
+            (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, Some(total)) => (
+                percent_of(total, COLUMN_STATS_MEMORY_PERCENT),
+                PERF_SOURCE_DERIVED,
+            ),
+            (None, None) => (
+                ravel_catalog::DEFAULT_MAX_COLUMN_STATS_BYTES,
+                PERF_SOURCE_FALLBACK,
+            ),
+        };
+
     let (sql_tenant_max_bytes, tenant_source) =
         match (flags.sql_tenant_max_bytes, host.mem_total_bytes) {
             (Some(n), _) => (n, PERF_SOURCE_FLAG),
@@ -2077,6 +2156,7 @@ pub fn resolve_performance_defaults(
         max_segments,
         cache_max_bytes,
         catalog_cache_max_bytes,
+        column_stats_max_bytes,
         sql_max_query_bytes,
         sql_tenant_max_bytes,
         query_deadline,
@@ -2088,6 +2168,7 @@ pub fn resolve_performance_defaults(
             max_segments: segments_source,
             cache_max_bytes: cache_source,
             catalog_cache_max_bytes: catalog_cache_source,
+            column_stats_max_bytes: column_stats_source,
             sql_max_query_bytes: query_bytes_source,
             sql_tenant_max_bytes: tenant_source,
             query_deadline: deadline_source,
@@ -2153,6 +2234,12 @@ impl ResolvedPerformanceDefaults {
             setting = "catalog_cache_max_bytes",
             value = self.catalog_cache_max_bytes,
             source = self.sources.catalog_cache_max_bytes,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "column_stats_max_bytes",
+            value = self.column_stats_max_bytes,
+            source = self.sources.column_stats_max_bytes,
             "performance default resolved"
         );
         // The only line that carries `clamped`: when it is true the value is
@@ -3673,6 +3760,7 @@ impl Cli {
             promql_fetch_fanout: self.promql_fetch_fanout,
             max_segments: self.max_segments,
             cache_max_bytes: self.cache_max_bytes,
+            column_stats_max_bytes: self.column_stats_max_bytes,
             sql_max_query_bytes: self.sql_max_query_bytes,
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
             query_deadline,

@@ -1022,6 +1022,7 @@ mod tests {
             3,
             vec![part_a.to_vec()],
             std::slice::from_ref(&seg),
+            u64::MAX,
         )
         .expect("v2 encodes");
         let limits = crate::snapshot_format::ColumnStatsLimits::default();

@@ -484,6 +484,7 @@ async fn main() -> anyhow::Result<()> {
         disable_cache: cli.disable_cache,
         cache_max_bytes: performance.cache_max_bytes,
         catalog_cache_max_bytes: performance.catalog_cache_max_bytes,
+        column_stats_max_bytes: performance.column_stats_max_bytes,
         cache_dir: cli.cache_dir.clone(),
         catalog_resolve_concurrency: cli.catalog_resolve_concurrency,
         ingest_concurrency_limit: cli

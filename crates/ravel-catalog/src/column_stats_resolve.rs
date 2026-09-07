@@ -131,6 +131,24 @@ pub(crate) struct ResolvedStatsRef {
     pub expected_part_blake3: Vec<[u8; 32]>,
 }
 
+/// The outcome of [`fetch_stats_object`], the second GET of the load. Splits
+/// the ordinary degrade-to-scan (`Absent`) from the one degrade the caller must
+/// report (`SizeRejected`, issue #1400) so a caller can warn once on the latter
+/// without inspecting error internals.
+pub(crate) enum FetchOutcome {
+    /// The object was fetched, verified, part-bound, and decoded.
+    Loaded(LoadedColumnStats),
+    /// A silent degrade: the GET failed, the blake3 or part binding did not
+    /// match, or the object was corrupt. The query scans; no WARN.
+    Absent,
+    /// The object declares a `body_uncompressed_len` above the configured reader
+    /// bound ([`ColumnStatsLimits::max_column_stats_bytes`]). It is well-formed
+    /// but too large to inflate, so the tenant has no usable statistics until
+    /// the bound is raised. The caller warns once per `(tenant, signal, key)`
+    /// and then scans.
+    SizeRejected { declared: u64, cap: u64 },
+}
+
 /// A genuinely unparseable HEAD, or an isolation breach, encountered while
 /// loading column statistics: the only conditions this path
 /// surfaces as an error rather than degrading to `Ok(None)`.
@@ -234,20 +252,29 @@ pub(crate) async fn fetch_stats_object(
     getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
     resolved: &ResolvedStatsRef,
-) -> Result<Option<LoadedColumnStats>, LoadColumnStatsError> {
+    limits: &ColumnStatsLimits,
+) -> Result<FetchOutcome, LoadColumnStatsError> {
     let data = match getter.accounted_get_full(&resolved.key).await {
         Ok(got) => got.data,
-        Err(_) => return Ok(None),
+        Err(_) => return Ok(FetchOutcome::Absent),
     };
     let digest = blake3::hash(&data);
     if *digest.as_bytes() != resolved.blake3 {
-        return Ok(None);
+        return Ok(FetchOutcome::Absent);
     }
 
-    let limits = ColumnStatsLimits::default();
-    let decoded = match decode_column_stats(&data, &limits) {
+    let decoded = match decode_column_stats(&data, limits) {
         Ok(decoded) => decoded,
-        Err(_) => return Ok(None),
+        // The size ceiling is the one decode failure the caller must SEE: the
+        // object exists and is well-formed but declares a body larger than the
+        // configured reader bound, so the tenant has never had statistics until
+        // the bound is raised (issue #1400). Surfaced distinctly so the caller
+        // warns once and then scans; every other decode failure (corruption) is
+        // the ordinary silent degrade.
+        Err(SnapshotFormatError::ColumnStatsDecompressedTooLarge { declared, cap }) => {
+            return Ok(FetchOutcome::SizeRejected { declared, cap });
+        }
+        Err(_) => return Ok(FetchOutcome::Absent),
     };
 
     if decoded.header.tenant_hash != tenant.0.to_vec() {
@@ -265,10 +292,10 @@ pub(crate) async fn fetch_stats_object(
         .map(|h| <[u8; 32]>::try_from(h.as_slice()))
         .collect();
     let Ok(actual_part_blake3) = actual_part_blake3 else {
-        return Ok(None);
+        return Ok(FetchOutcome::Absent);
     };
     if actual_part_blake3 != resolved.expected_part_blake3 {
-        return Ok(None);
+        return Ok(FetchOutcome::Absent);
     }
 
     let mut segments = HashMap::with_capacity(decoded.segments.len());
@@ -286,7 +313,7 @@ pub(crate) async fn fetch_stats_object(
         segments.insert(identity, segment);
     }
 
-    Ok(Some(LoadedColumnStats {
+    Ok(FetchOutcome::Loaded(LoadedColumnStats {
         segments,
         part_blake3: resolved.expected_part_blake3.clone(),
     }))

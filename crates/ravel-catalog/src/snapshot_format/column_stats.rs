@@ -63,13 +63,21 @@ pub struct DecodedColumnStats {
 /// the ADR-0942 dual-publish window keeps writing the v1 object byte-for-byte
 /// as before even after the write version moves to 2. The v2 (part-keyed)
 /// artifact is written by [`encode_column_stats_v2`].
+///
+/// `max_body_bytes` bounds the UNCOMPRESSED body (the length-delimited segment
+/// stream) and is checked before compression: an object whose body exceeds it
+/// is refused with [`SnapshotFormatError::ColumnStatsBodyTooLargeToEncode`]
+/// rather than written, because [`decode_column_stats`] rejects a declared body
+/// above the same bound and the object would be unreadable (issue #1400). Pass
+/// the same value the reader is configured with.
 pub fn encode_column_stats(
     tenant_hash: [u8; 16],
     signal: u32,
     part_blake3: Vec<Vec<u8>>,
     segments: &[ColumnStatsSegment],
+    max_body_bytes: u64,
 ) -> Result<Vec<u8>, SnapshotFormatError> {
-    encode_column_stats_versioned(1, tenant_hash, signal, part_blake3, segments)
+    encode_column_stats_versioned(1, tenant_hash, signal, part_blake3, segments, max_body_bytes)
 }
 
 /// Encodes a **v2** (ADR-0942, part-hash-keyed) column-statistics object, the
@@ -78,11 +86,15 @@ pub fn encode_column_stats(
 /// as 32 bytes; records are sorted and deduplicated by that hash, not the
 /// five-field identity tuple, so L0 and L1 parts are named uniformly and two L1
 /// parts of one bucket never collide. Stamps [`COLUMN_STATS_WRITE_VERSION`].
+///
+/// `max_body_bytes` bounds the uncompressed body exactly as in
+/// [`encode_column_stats`] (issue #1400).
 pub fn encode_column_stats_v2(
     tenant_hash: [u8; 16],
     signal: u32,
     part_blake3: Vec<Vec<u8>>,
     segments: &[ColumnStatsSegment],
+    max_body_bytes: u64,
 ) -> Result<Vec<u8>, SnapshotFormatError> {
     encode_column_stats_versioned(
         COLUMN_STATS_WRITE_VERSION,
@@ -90,6 +102,7 @@ pub fn encode_column_stats_v2(
         signal,
         part_blake3,
         segments,
+        max_body_bytes,
     )
 }
 
@@ -104,9 +117,17 @@ fn encode_column_stats_versioned(
     signal: u32,
     part_blake3: Vec<Vec<u8>>,
     segments: &[ColumnStatsSegment],
+    max_body_bytes: u64,
 ) -> Result<Vec<u8>, SnapshotFormatError> {
     validate_segments(segments, version)?;
-    frame_column_stats(version, tenant_hash, signal, part_blake3, segments)
+    frame_column_stats(
+        version,
+        tenant_hash,
+        signal,
+        part_blake3,
+        segments,
+        max_body_bytes,
+    )
 }
 
 /// Envelope framing with NO validation: the byte layout only. Split out of
@@ -121,12 +142,23 @@ fn frame_column_stats(
     signal: u32,
     part_blake3: Vec<Vec<u8>>,
     segments: &[ColumnStatsSegment],
+    max_body_bytes: u64,
 ) -> Result<Vec<u8>, SnapshotFormatError> {
     let mut segments_raw = Vec::new();
     for segment in segments {
         segments_raw.extend_from_slice(&segment.encode_length_delimited_to_vec());
     }
     let body_uncompressed_len = segments_raw.len() as u64;
+
+    // Refuse before compressing what the reader would refuse to inflate: the
+    // decode path rejects a declared body above the same bound, so an object
+    // larger than this would be written but never readable (issue #1400).
+    if body_uncompressed_len > max_body_bytes {
+        return Err(SnapshotFormatError::ColumnStatsBodyTooLargeToEncode {
+            body_bytes: body_uncompressed_len,
+            cap: max_body_bytes,
+        });
+    }
 
     let body = zstd::bulk::compress(&segments_raw, ZSTD_LEVEL)
         .map_err(|e| SnapshotFormatError::Compress(e.to_string()))?;
@@ -577,6 +609,56 @@ mod tests {
     use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry};
 
     use super::*;
+
+    // The issue #1400 uncompressed-body cap has its own dedicated tests below;
+    // every other test in this module encodes with no effective cap. These
+    // four helpers shadow the glob-imported writers so those tests read as
+    // before, while the cap tests call `super::encode_column_stats` directly
+    // with an explicit bound.
+    fn encode_column_stats(
+        tenant_hash: [u8; 16],
+        signal: u32,
+        part_blake3: Vec<Vec<u8>>,
+        segments: &[ColumnStatsSegment],
+    ) -> Result<Vec<u8>, SnapshotFormatError> {
+        super::encode_column_stats(tenant_hash, signal, part_blake3, segments, u64::MAX)
+    }
+
+    fn encode_column_stats_v2(
+        tenant_hash: [u8; 16],
+        signal: u32,
+        part_blake3: Vec<Vec<u8>>,
+        segments: &[ColumnStatsSegment],
+    ) -> Result<Vec<u8>, SnapshotFormatError> {
+        super::encode_column_stats_v2(tenant_hash, signal, part_blake3, segments, u64::MAX)
+    }
+
+    fn encode_column_stats_versioned(
+        version: u8,
+        tenant_hash: [u8; 16],
+        signal: u32,
+        part_blake3: Vec<Vec<u8>>,
+        segments: &[ColumnStatsSegment],
+    ) -> Result<Vec<u8>, SnapshotFormatError> {
+        super::encode_column_stats_versioned(
+            version,
+            tenant_hash,
+            signal,
+            part_blake3,
+            segments,
+            u64::MAX,
+        )
+    }
+
+    fn frame_column_stats(
+        version: u8,
+        tenant_hash: [u8; 16],
+        signal: u32,
+        part_blake3: Vec<Vec<u8>>,
+        segments: &[ColumnStatsSegment],
+    ) -> Result<Vec<u8>, SnapshotFormatError> {
+        super::frame_column_stats(version, tenant_hash, signal, part_blake3, segments, u64::MAX)
+    }
 
     fn i64_value(v: i64) -> ColumnValue {
         ColumnValue {
@@ -1263,5 +1345,48 @@ mod tests {
             err,
             SnapshotFormatError::ColumnStatsDecompressedTooLarge { .. }
         ));
+    }
+
+    /// Issue #1400: the writer refuses to encode an object whose uncompressed
+    /// body exceeds the configured bound, symmetric with the reader ceiling, so
+    /// the fold can never write an object no reader could inflate. One byte
+    /// below the body refuses; one byte at or above it succeeds. The exact
+    /// uncompressed body length is measured from the same length-delimited
+    /// encoding the writer uses, so the boundary is asserted to the byte, not a
+    /// band.
+    ///
+    /// Prove-the-test: delete the `body_uncompressed_len > max_body_bytes` guard
+    /// in `frame_column_stats` and the `expect_err` panics because the object
+    /// encodes anyway.
+    #[test]
+    fn writer_refuses_body_over_the_configured_cap() {
+        let segments = vec![segment(1, 0, 1), segment(1, 0, 2), segment(2, 0, 1)];
+        // The uncompressed body is the concatenated length-delimited segments,
+        // exactly what `frame_column_stats` measures before compressing.
+        let body_len: u64 = segments
+            .iter()
+            .map(|s| s.encode_length_delimited_to_vec().len() as u64)
+            .sum();
+
+        let err = super::encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &segments, body_len - 1)
+            .expect_err("a bound one byte below the body must refuse");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsBodyTooLargeToEncode {
+                body_bytes: body_len,
+                cap: body_len - 1,
+            }
+        );
+
+        // Exactly at the bound is allowed (`>` refuses, so `==` fits), and the
+        // object it produces decodes at the same bound.
+        let bytes = super::encode_column_stats([0x11; 16], 3, vec![vec![0x22; 32]], &segments, body_len)
+            .expect("a bound equal to the body must succeed");
+        let limits = ColumnStatsLimits {
+            max_column_stats_bytes: body_len,
+        };
+        let decoded = decode_column_stats(&bytes, &limits).expect("the object decodes at the same bound");
+        assert_eq!(decoded.header.body_uncompressed_len, body_len);
+        assert_eq!(decoded.segments, segments);
     }
 }

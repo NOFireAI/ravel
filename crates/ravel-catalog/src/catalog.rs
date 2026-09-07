@@ -443,6 +443,18 @@ pub struct Catalog {
     /// stats object with no reuse, matching the `byte_cache_max_bytes == 0`
     /// disabled sentinel.
     column_stats_cache: Option<ColumnStatsCache>,
+    /// Warn-once set for the column-statistics reader size ceiling (issue
+    /// #1400). When [`Catalog::load_column_stats`] refuses an object whose
+    /// declared `body_uncompressed_len` exceeds
+    /// [`CatalogConfig::column_stats_max_bytes`], it logs one WARN per
+    /// `(tenant, signal, object key)` rather than one per query: the condition
+    /// is permanent until the object or the bound changes, so a per-query WARN
+    /// would repeat for every eligible statement. Swept per idle tenant by
+    /// [`Catalog::evict_idle_tenants`], so a tenant that goes idle and comes
+    /// back warns again (its object may have changed). Independent of the
+    /// cache: the rejection happens at decode, before any insert, and must warn
+    /// even when the cache is disabled.
+    column_stats_size_warned: Mutex<HashSet<(TenantHash, Signal, String)>>,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -527,6 +539,7 @@ impl Catalog {
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
             column_stats_cache,
+            column_stats_size_warned: Mutex::new(HashSet::new()),
         })
     }
 
@@ -1021,16 +1034,73 @@ impl Catalog {
         if let Some(stats) = cache_hit {
             return Ok(Some(stats));
         }
-        let Some(loaded) =
-            column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await?
-        else {
-            return Ok(None);
+        let loaded = match column_stats_resolve::fetch_stats_object(
+            &getter,
+            tenant,
+            &resolved,
+            &self.column_stats_limits(),
+        )
+        .await?
+        {
+            column_stats_resolve::FetchOutcome::Loaded(loaded) => loaded,
+            column_stats_resolve::FetchOutcome::Absent => return Ok(None),
+            // The reader ceiling refused a well-formed object (issue #1400). The
+            // query still runs by scanning, but this is not the ordinary
+            // "no statistics built" degrade: the object exists and would be
+            // usable under a larger bound, so warn once per (tenant, signal,
+            // key) with the numbers an operator needs to raise the bound.
+            column_stats_resolve::FetchOutcome::SizeRejected { declared, cap } => {
+                self.warn_column_stats_size_rejected(tenant, signal, &resolved.key, declared, cap);
+                return Ok(None);
+            }
         };
         let stats = Arc::new(loaded);
         if let Some(cache) = self.column_stats_cache.as_ref() {
             cache.insert((*tenant, signal), resolved.blake3, Arc::clone(&stats));
         }
         Ok(Some(stats))
+    }
+
+    /// The decode-time reader bound (issue #1400): a declared
+    /// `body_uncompressed_len` above [`CatalogConfig::column_stats_max_bytes`]
+    /// is refused before decompression allocates. The same number the server
+    /// sets on [`CatalogConfig::column_stats_cache_max_bytes`] and passes to the
+    /// fold's writer, so the reader, the writer, and the cache share one bound.
+    fn column_stats_limits(&self) -> crate::snapshot_format::ColumnStatsLimits {
+        crate::snapshot_format::ColumnStatsLimits {
+            max_column_stats_bytes: self.config.column_stats_max_bytes,
+        }
+    }
+
+    /// Log one WARN per `(tenant, signal, key)` for a reader size-ceiling
+    /// rejection (issue #1400), then never again for that key until an idle
+    /// sweep drops the mark: the condition is permanent until the object or the
+    /// bound changes, so a per-query WARN would repeat for every statement.
+    fn warn_column_stats_size_rejected(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        key: &str,
+        declared: u64,
+        cap: u64,
+    ) {
+        let first = {
+            let mut warned = self.column_stats_size_warned.lock();
+            warned.insert((*tenant, signal, key.to_string()))
+        };
+        if first {
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                key = %key,
+                body_uncompressed_len = declared,
+                column_stats_max_bytes = cap,
+                "column-statistics object declares an uncompressed body larger than \
+                 --column-stats-max-bytes: it cannot be inflated, so the tenant has no \
+                 statistics and every eligible query scans. Raise --column-stats-max-bytes \
+                 above body_uncompressed_len."
+            );
+        }
     }
 
     /// Evict every per-tenant cache outer-map entry for tenants last touched
@@ -1082,6 +1152,13 @@ impl Catalog {
             .filter(|_| !idle.is_empty())
         {
             cache.evict_tenants(&idle);
+        }
+        // Drop each idle tenant's reader size-ceiling warn-once marks (issue
+        // #1400), so a tenant that goes idle and comes back warns again: its
+        // stats object may have been rebuilt or the bound raised in between.
+        if !idle.is_empty() {
+            let mut warned = self.column_stats_size_warned.lock();
+            warned.retain(|(tenant, _, _)| !idle.contains(tenant));
         }
         idle.len()
     }
@@ -7104,6 +7181,7 @@ mod tests {
             signal_num,
             vec![part_hash.to_vec()],
             &segments,
+            u64::MAX,
         )
         .expect("encode column stats");
         let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
@@ -7236,6 +7314,7 @@ mod tests {
             signal_num,
             vec![part_hash.to_vec()],
             &segments,
+            u64::MAX,
         )
         .expect("encode column stats");
         let stats_hash = *blake3::hash(&stats_bytes).as_bytes();

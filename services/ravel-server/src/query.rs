@@ -115,6 +115,49 @@ pub fn build_catalog(
     cache_dir: Option<PathBuf>,
     resolve_get_concurrency: Option<usize>,
 ) -> anyhow::Result<Arc<Catalog>> {
+    build_catalog_with_column_stats_budget(
+        store,
+        shard_count,
+        disable_cache,
+        cache_max_bytes,
+        ravel_catalog::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        cache_dir,
+        resolve_get_concurrency,
+    )
+}
+
+/// [`build_catalog`] plus the issue #1400 column-statistics bound, the form the
+/// server's own startup uses.
+///
+/// `column_stats_max_bytes` is the resolved `--column-stats-max-bytes`
+/// ([`crate::config::ResolvedPerformanceDefaults::column_stats_max_bytes`]). It
+/// is the SINGLE number that governs the column-statistics reader, writer, and
+/// reuse cache: this function sets BOTH
+/// [`CatalogConfig::column_stats_max_bytes`] (the reader ceiling
+/// `decode_column_stats` enforces and the writer bound the fold enforces) and
+/// [`CatalogConfig::column_stats_cache_max_bytes`] (the reuse cache budget) to
+/// it, so one derived value bounds all three. It is a THIRD ceiling, not a
+/// share of `cache_max_bytes`: that number bounds raw object bytes in two LRU
+/// byte caches, this one bounds DECODED per-segment statistics, in uncompressed
+/// bytes, and a single such object runs to about 2 GB on a wide-table tenant.
+///
+/// `--disable-cache` does NOT reach it: that flag turns off the ADR-0046 read
+/// caches, which hold raw object bytes; the statistics reader and its cache are
+/// governed by this bound alone.
+///
+/// [`build_catalog`] passes `ravel_catalog`'s compiled-in decode cap here (the
+/// same value `CatalogConfig::default()` carries), so the many test call sites
+/// that do not care are unaffected.
+#[allow(clippy::too_many_arguments)]
+pub fn build_catalog_with_column_stats_budget(
+    store: Arc<dyn ObjectStoreBackend>,
+    shard_count: u32,
+    disable_cache: bool,
+    cache_max_bytes: u64,
+    column_stats_max_bytes: u64,
+    cache_dir: Option<PathBuf>,
+    resolve_get_concurrency: Option<usize>,
+) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
     // --disable-cache into a `None` fetcher cache.
@@ -122,6 +165,11 @@ pub fn build_catalog(
     let mut catalog_config = CatalogConfig {
         shard_count,
         byte_cache_max_bytes,
+        // One number bounds the reader/writer and the cache (issue #1400): the
+        // cache admits what the reader can inflate, and neither exceeds the
+        // configured value.
+        column_stats_max_bytes,
+        column_stats_cache_max_bytes: column_stats_max_bytes,
         ..CatalogConfig::default()
     };
     // `None` leaves ravel-catalog's own default (currently 128) as the sole

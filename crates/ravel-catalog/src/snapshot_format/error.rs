@@ -189,6 +189,18 @@ pub enum SnapshotFormatError {
         "declared decompressed column-stats body length {declared} exceeds configured cap {cap}"
     )]
     ColumnStatsDecompressedTooLarge { declared: u64, cap: u64 },
+    /// The writer refused to encode a column-stats object whose uncompressed
+    /// body exceeds the configured bound (issue #1400). Symmetric with
+    /// [`Self::ColumnStatsDecompressedTooLarge`]: the reader rejects a declared
+    /// body above the same bound, so writing one would produce an object no
+    /// reader could inflate. Reported before compression, from the uncompressed
+    /// `segments` length, so the fold fails loudly instead of writing an
+    /// unreadable object or silently dropping statistics.
+    #[error(
+        "column-stats uncompressed body length {body_bytes} exceeds configured cap {cap}; \
+         refusing to write an object the reader would reject"
+    )]
+    ColumnStatsBodyTooLargeToEncode { body_bytes: u64, cap: u64 },
     #[error(
         "decompressed column-stats body length {actual} does not match header's declared {expected}"
     )]

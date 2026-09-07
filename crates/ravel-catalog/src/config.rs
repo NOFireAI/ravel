@@ -300,6 +300,28 @@ pub struct CatalogConfig {
     /// re-fetches the stats object with no reuse and no eviction accounting.
     /// Default [`DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES`].
     pub column_stats_cache_max_bytes: u64,
+    /// The single uncompressed-byte bound (issue #1400) that governs BOTH what
+    /// the reader will inflate and what the writer will emit for a `.cstat`
+    /// object:
+    ///
+    /// - the reader ([`crate::snapshot_format::decode_column_stats`], via
+    ///   [`crate::snapshot_format::ColumnStatsLimits::max_column_stats_bytes`])
+    ///   refuses a declared `body_uncompressed_len` above it, the hostile-size
+    ///   guard that keeps a corrupt or hostile size field from forcing an
+    ///   unbounded allocation (ADR-0850 decision 2);
+    /// - the writer ([`crate::snapshot_format::encode_column_stats`] and
+    ///   `encode_column_stats_v2`, called from the fold) refuses to emit a body
+    ///   above it, so a fold never writes an object the reader would reject.
+    ///
+    /// It is in UNCOMPRESSED bytes, the same kind as `body_uncompressed_len`.
+    /// The server sets this equal to
+    /// [`column_stats_cache_max_bytes`](Self::column_stats_cache_max_bytes) so
+    /// one derived number bounds the reader, the writer, and the cache; the two
+    /// fields are separate only so `0` can keep its "disable the cache" meaning
+    /// on [`column_stats_cache_max_bytes`](Self::column_stats_cache_max_bytes)
+    /// without also disabling every decode. Default
+    /// [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`].
+    pub column_stats_max_bytes: u64,
     /// Ceiling on the pre-execution catalog-request estimate (ADR-0044
     /// decision 3). A resolve whose
     /// estimate ([`Catalog::estimated_catalog_requests`](crate::Catalog::estimated_catalog_requests))
@@ -395,6 +417,7 @@ impl Default for CatalogConfig {
             byte_cache_max_entries: DEFAULT_BYTE_CACHE_MAX_ENTRIES,
             byte_cache_max_entry_bytes: DEFAULT_BYTE_CACHE_MAX_ENTRY_BYTES,
             column_stats_cache_max_bytes: DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
+            column_stats_max_bytes: snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
             max_catalog_list_requests: DEFAULT_MAX_CATALOG_LIST_REQUESTS,
             prefix_list_crossover_requests: DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
             snapshot_part_max_entries: DEFAULT_SNAPSHOT_PART_MAX_ENTRIES,

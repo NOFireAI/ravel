@@ -378,6 +378,16 @@ pub struct ServerConfig {
     /// fetcher cache; an explicit `--cache-max-bytes` sets both equal. Ignored
     /// when `disable_cache` is set.
     pub catalog_cache_max_bytes: u64,
+    /// The resolved single column-statistics bound
+    /// (`ResolvedPerformanceDefaults::column_stats_max_bytes`, issue #1400), a
+    /// THIRD ceiling in UNCOMPRESSED bytes independent of the two above: those
+    /// bound raw object bytes in the ADR-0046 LRU byte caches, this bounds
+    /// decoded per-segment column statistics. `main` fills it from the resolved
+    /// struct; [`start`] passes it to
+    /// [`query::build_catalog_with_column_stats_budget`], which sets it as BOTH
+    /// the reader/writer bound and the reuse cache budget. NOT affected by
+    /// `disable_cache`, which governs the ADR-0046 caches only.
+    pub column_stats_max_bytes: u64,
     /// `--cache-dir`: the ADR-0046 local-disk cache tier's directory (#97),
     /// `None` when the flag is unset. `main` sets it from `Cli::cache_dir`.
     /// When `Some` and `disable_cache` is off, [`query::build_catalog`] attaches
@@ -1024,11 +1034,12 @@ pub async fn start(
                 .merge(remote_write::router(mtls_rw_state));
         }
     }
-    let catalog = query::build_catalog(
+    let catalog = query::build_catalog_with_column_stats_budget(
         store.clone(),
         config.shard_count,
         config.disable_cache,
         config.catalog_cache_max_bytes,
+        config.column_stats_max_bytes,
         config.cache_dir.clone(),
         config.catalog_resolve_concurrency,
     )?;

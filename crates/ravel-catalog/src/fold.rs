@@ -1530,7 +1530,12 @@ impl Catalog {
                             match column_stats_build::decode_previous_column_stats(
                                 &got.data,
                                 &expected_part_blake3,
-                                &crate::snapshot_format::ColumnStatsLimits::default(),
+                                // The same bound the writer used (issue #1400):
+                                // this fold's baseline is the previous fold's own
+                                // object, which may run up to `column_stats_max_bytes`.
+                                &crate::snapshot_format::ColumnStatsLimits {
+                                    max_column_stats_bytes: self.config().column_stats_max_bytes,
+                                },
                             ) {
                                 Ok(segments) => segments
                                     .into_iter()
@@ -1618,6 +1623,7 @@ impl Catalog {
                     signal_num,
                     part_hashes.iter().map(|h| h.to_vec()).collect(),
                     &column_segments,
+                    self.config().column_stats_max_bytes,
                 ) {
                     Ok(stats_bytes) => {
                         let stats_crc = crc32c::crc32c(&stats_bytes);
@@ -1663,6 +1669,20 @@ impl Catalog {
                                 (false, 0, None)
                             }
                         }
+                    }
+                    Err(err @ snapshot_format::SnapshotFormatError::ColumnStatsBodyTooLargeToEncode { .. }) => {
+                        // The reader would reject this object at the same bound
+                        // (issue #1400), so writing it would leave the tenant
+                        // with an unreadable stats object; skipping it silently
+                        // would hide that the fold produced no statistics. Fail
+                        // the fold loudly with the size and the bound instead.
+                        tracing::error!(
+                            error = %err,
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            "column-stats body exceeds --column-stats-max-bytes; failing the fold rather than writing an object the reader would reject"
+                        );
+                        return Err(err.into());
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1800,6 +1820,7 @@ impl Catalog {
                         signal_num,
                         part_hashes.iter().map(|h| h.to_vec()).collect(),
                         &part_segments,
+                        self.config().column_stats_max_bytes,
                     ) {
                         Ok(stats_bytes) => {
                             let stats_crc = crc32c::crc32c(&stats_bytes);
@@ -1849,6 +1870,19 @@ impl Catalog {
                                     (false, 0, None)
                                 }
                             }
+                        }
+                        Err(err @ snapshot_format::SnapshotFormatError::ColumnStatsBodyTooLargeToEncode { .. }) => {
+                            // Symmetric with the v1 block above (issue #1400):
+                            // the reader would reject this object at the same
+                            // bound, so fail the fold with the size and bound
+                            // rather than write it or silently skip it.
+                            tracing::error!(
+                                error = %err,
+                                tenant = %tenant.to_hex(),
+                                signal = ?signal,
+                                "part-bound column-stats body exceeds --column-stats-max-bytes; failing the fold rather than writing an object the reader would reject"
+                            );
+                            return Err(err.into());
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -3426,6 +3460,7 @@ mod tests {
             signal::to_proto(Signal::Logs) as u32,
             Vec::new(),
             &sorted_only,
+            u64::MAX,
         )
         .expect_err("a repeated key is rejected for the whole artifact");
         assert!(
@@ -3451,6 +3486,7 @@ mod tests {
             signal::to_proto(Signal::Logs) as u32,
             Vec::new(),
             &segments,
+            u64::MAX,
         )
         .expect("encodes once the repeat is collapsed");
     }
@@ -3527,7 +3563,7 @@ mod tests {
         let part_blake3: Vec<Vec<u8>> = head.parts.iter().map(|p| p.blake3.clone()).collect();
         let signal_num = signal::to_proto(Signal::Logs) as u32;
         let expected_v1 =
-            snapshot_format::encode_column_stats(tenant().0, signal_num, part_blake3, &l0)
+            snapshot_format::encode_column_stats(tenant().0, signal_num, part_blake3, &l0, u64::MAX)
                 .expect("canonical v1 encodes");
 
         let got_v1 = store
@@ -3628,8 +3664,14 @@ mod tests {
                 ))
         });
         let v1 =
-            snapshot_format::encode_column_stats(tenant().0, signal_num, part_blake3.clone(), &l0)
-                .expect("reference v1 encodes");
+            snapshot_format::encode_column_stats(
+                tenant().0,
+                signal_num,
+                part_blake3.clone(),
+                &l0,
+                u64::MAX,
+            )
+            .expect("reference v1 encodes");
 
         // v2 pass: every entry, a SECOND fetch for each L0 one, writer_id
         // overwritten with the covered part's content hash, sorted and deduped.
@@ -3653,6 +3695,7 @@ mod tests {
             signal_num,
             part_blake3,
             &part_segments,
+            u64::MAX,
         )
         .expect("reference v2 encodes");
 

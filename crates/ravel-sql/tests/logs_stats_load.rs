@@ -164,8 +164,12 @@ async fn install_head_and_stats(store: &dyn ObjectStoreBackend, segments: &[Colu
     // object itself is never fetched by the load, so it is not written.
     let part_hash = *blake3::hash(b"part-0").as_bytes();
 
-    let stats_bytes = encode_column_stats(TENANT.0, signal_num, vec![part_hash.to_vec()], segments)
-        .expect("encode column stats");
+    // Issue #1400: the writer now takes the uncompressed-body cap the reader is
+    // configured with. This fixture is a handful of segments, far under any
+    // real bound, so `u64::MAX` keeps it unbounded.
+    let stats_bytes =
+        encode_column_stats(TENANT.0, signal_num, vec![part_hash.to_vec()], segments, u64::MAX)
+            .expect("encode column stats");
     let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
     let stats_key = format!("t/{}/catalog/l/cstat/one.cstat", TENANT.to_hex());
     store
