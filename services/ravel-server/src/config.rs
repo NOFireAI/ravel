@@ -1905,15 +1905,18 @@ pub struct ResolvedPerformanceDefaults {
     pub sql_tenant_max_bytes: usize,
     /// Reaches `EngineConfig::deadline`, and the `sys/gc` query validation.
     pub query_deadline: Duration,
-    /// The process-wide ceiling (ADR-1170 decision 3) that
-    /// [`Self::cache_max_bytes`] and [`Self::catalog_cache_max_bytes`] are now
-    /// carved from: cgroup-capped effective memory minus
-    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`], or `0` when memory is unknown (the
-    /// two caches then fall back to [`DEFAULT_CACHE_MAX_BYTES`] instead of
-    /// carving a meaningless budget). The shared remainder after both hard
-    /// caps (`Self::memory_remainder_bytes`) sizes the `MemoryBudget` handed
-    /// to the SQL/fetch accountant; the per-tenant SQL ceiling is the
-    /// fairness bound WITHIN that remainder, not a second separate budget.
+    /// The process-wide ceiling (ADR-1170 decision 3, amended by issue
+    /// #1255) that [`Self::cache_max_bytes`] and
+    /// [`Self::catalog_cache_max_bytes`] are now carved from: cgroup-capped
+    /// effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`], or
+    /// `u64::MAX` when memory is unknown (the two caches then fall back to
+    /// [`DEFAULT_CACHE_MAX_BYTES`] instead of carving a meaningless budget;
+    /// `u64::MAX` rather than `0` because an unmeasured host has no
+    /// trustworthy ceiling, not the tightest possible one). The shared
+    /// remainder after both hard caps (`Self::memory_remainder_bytes`) sizes
+    /// the `MemoryBudget` handed to the SQL/fetch accountant; the per-tenant
+    /// SQL ceiling is the fairness bound WITHIN that remainder, not a second
+    /// separate budget.
     pub memory_budget_bytes: u64,
     /// The overhead reserve subtracted from effective memory to produce
     /// [`Self::memory_budget_bytes`]. Always [`MEMORY_OVERHEAD_RESERVE_BYTES`]
@@ -1923,12 +1926,16 @@ pub struct ResolvedPerformanceDefaults {
     /// `cache_max_bytes + catalog_cache_max_bytes`: the two hard, non-shedding
     /// eviction caps carved from [`Self::memory_budget_bytes`]. Startup
     /// refuses (see `Cli::resolve_performance`) rather than clamps when this
-    /// exceeds the budget.
+    /// is at or above the budget (issue #1255: a shared remainder of `0` is
+    /// as unusable as a negative one, since a `MemoryBudget::new(0)` refuses
+    /// every real reservation).
     pub memory_hard_caps_bytes: u64,
     /// `memory_budget_bytes - memory_hard_caps_bytes`: what sizes the shared
-    /// `MemoryBudget` accountant SQL and fetch draw from. `0` (not negative;
-    /// a negative remainder is exactly the condition startup refuses) when
-    /// the hard caps are not below the budget.
+    /// `MemoryBudget` accountant SQL and fetch draw from. Always strictly
+    /// positive on a derived budget once past startup refusal (issue #1255);
+    /// `0` (not negative) remains the saturating floor for a fallback budget
+    /// whose hard caps happen to consume all of `u64::MAX`, which does not
+    /// occur with today's flat cache constants.
     pub memory_remainder_bytes: u64,
     /// Where each of the six above came from: [`PERF_SOURCE_FLAG`],
     /// [`PERF_SOURCE_DERIVED`], or [`PERF_SOURCE_FALLBACK`].
@@ -2011,9 +2018,10 @@ fn resolve_knob(
 ///
 /// - `fetch_concurrency`: `max(MIN_DERIVED_FETCH_CONCURRENCY,
 ///   FETCH_CONCURRENCY_PER_CORE * cores)`.
-/// - `memory_budget_bytes` (ADR-1170 decision 3): cgroup-capped effective
-///   memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`], or `0` when memory is
-///   unknown.
+/// - `memory_budget_bytes` (ADR-1170 decision 3, amended by issue #1255):
+///   cgroup-capped effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`],
+///   or `u64::MAX` when memory is unknown (no trustworthy ceiling can be
+///   derived, which is unlimited, not `0`).
 /// - `cache_max_bytes` (fetcher cache): [`CACHE_MEMORY_PERCENT`] of
 ///   `memory_budget_bytes`, else [`DEFAULT_CACHE_MAX_BYTES`].
 /// - `catalog_cache_max_bytes` (catalog byte cache): a SEPARATE ceiling,
@@ -2084,17 +2092,23 @@ pub fn resolve_performance_defaults(
         None => (DERIVED_MAX_SEGMENTS, PERF_SOURCE_DERIVED),
     };
 
-    // ADR-1170 decision 3: one process-wide memory_budget_bytes, cgroup-capped
-    // effective memory minus the overhead reserve, `0` (source `fallback`)
-    // when memory is unknown -- a percentage of an unknown total is not a
-    // number, so the two caches below fall back to a flat compiled-in
-    // constant rather than carving a budget that isn't one.
+    // ADR-1170 decision 3, amended by issue #1255: one process-wide
+    // memory_budget_bytes, cgroup-capped effective memory minus the overhead
+    // reserve, or `u64::MAX` (source `fallback`) when memory is unknown -- a
+    // percentage of an unknown total is not a number, so the two caches below
+    // fall back to a flat compiled-in constant rather than carving a budget
+    // that isn't one. `u64::MAX`, not `0`: "we could not measure the host"
+    // means no trustworthy ceiling can be derived, which is unlimited, not
+    // the tightest possible ceiling. A `0` budget here would starve the
+    // shared SQL/fetch `MemoryBudget` accountant (`memory_remainder_bytes`)
+    // down to `0`, refusing every real reservation on a process that
+    // otherwise looks healthy.
     let (memory_budget_bytes, memory_budget_source) = match host.mem_total_bytes {
         Some(total) => (
             total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES),
             PERF_SOURCE_DERIVED,
         ),
-        None => (0, PERF_SOURCE_FALLBACK),
+        None => (u64::MAX, PERF_SOURCE_FALLBACK),
     };
 
     let (cache_max_bytes, cache_source) = match (flags.cache_max_bytes, host.mem_total_bytes) {
@@ -2200,18 +2214,23 @@ pub fn resolve_performance_defaults(
     }
 }
 
-/// Startup refuses this flag combination (ADR-1170 decision 3): the fetcher
-/// and catalog byte caches' hard eviction caps together exceed
-/// `memory_budget_bytes`, so the derivation cannot carve a non-negative
-/// shared remainder for the SQL/fetch `MemoryBudget` accountant. Refused,
+/// Startup refuses this flag combination (ADR-1170 decision 3, amended by
+/// issue #1255): the fetcher and catalog byte caches' hard eviction caps
+/// together leave no strictly positive shared remainder of
+/// `memory_budget_bytes` for the SQL/fetch `MemoryBudget` accountant --
+/// caps at or above the budget, not only strictly above it. A remainder of
+/// exactly `0` builds a `MemoryBudget::new(0)`, which refuses every real
+/// reservation while `SELECT 1` (which reserves nothing) still answers, so
+/// the process looks healthy and fails every non-trivial query. Refused,
 /// never clamped: silently shrinking an operator-typed `--cache-max-bytes`
 /// would change the eviction behavior they asked for without telling them,
 /// and clamping toward whichever cache the code touched first would depend on
 /// carve order rather than on anything the operator chose.
 ///
 /// Only raised when the host's memory is known: with no host memory figure
-/// there is no budget to check hard caps against, and the two caches already
-/// fell back to a flat compiled-in default for exactly that reason (see
+/// there is no derived budget to check hard caps against
+/// (`memory_budget_bytes` is `u64::MAX`, and the two caches already fell
+/// back to a flat compiled-in default for exactly that reason -- see
 /// [`ResolvedPerformanceDefaults::check_memory_budget`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryBudgetExceeded {
@@ -2230,9 +2249,10 @@ impl std::fmt::Display for MemoryBudgetExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cache_max_bytes ({}) + catalog_cache_max_bytes ({}) = {} bytes exceeds \
-             memory_budget_bytes ({} bytes); lower --cache-max-bytes or raise the host's \
-             available memory",
+            "cache_max_bytes ({}) + catalog_cache_max_bytes ({}) = {} bytes leaves no \
+             strictly positive remainder of memory_budget_bytes ({} bytes) for the shared \
+             SQL/fetch memory budget; lower --cache-max-bytes or raise the host's available \
+             memory",
             self.cache_max_bytes,
             self.catalog_cache_max_bytes,
             self.hard_caps_total,
@@ -2244,22 +2264,24 @@ impl std::fmt::Display for MemoryBudgetExceeded {
 impl std::error::Error for MemoryBudgetExceeded {}
 
 impl ResolvedPerformanceDefaults {
-    /// Refuse a flag combination whose two hard cache caps together exceed
-    /// [`Self::memory_budget_bytes`] (ADR-1170 decision 3), rather than
-    /// silently clamping either cache or letting a negative remainder reach
-    /// the `MemoryBudget` accountant.
+    /// Refuse a flag combination whose two hard cache caps together leave no
+    /// strictly positive remainder of [`Self::memory_budget_bytes`]
+    /// (ADR-1170 decision 3, amended by issue #1255), rather than silently
+    /// clamping either cache or letting a zero or negative remainder reach
+    /// the `MemoryBudget` accountant: a `0` remainder builds
+    /// `MemoryBudget::new(0)`, which refuses every real reservation.
     ///
     /// A no-op when the host's memory is unknown
     /// (`sources.memory_budget_bytes == PERF_SOURCE_FALLBACK`): the budget is
-    /// then `0` by construction (there is nothing to derive it from), and
-    /// checking real cache ceilings against a `0` placeholder would refuse
-    /// every host whose `/proc/meminfo` cannot be read, including the
-    /// fallback caches' own compiled-in defaults.
+    /// then `u64::MAX` by construction (there is nothing to derive a real
+    /// ceiling from), so there is no meaningful budget to check the flat
+    /// fallback cache ceilings against, and the fallback remainder cannot be
+    /// `0` with today's compiled-in cache constants.
     pub fn check_memory_budget(&self) -> Result<(), MemoryBudgetExceeded> {
         if self.sources.memory_budget_bytes == PERF_SOURCE_FALLBACK {
             return Ok(());
         }
-        if self.memory_hard_caps_bytes > self.memory_budget_bytes {
+        if self.memory_hard_caps_bytes >= self.memory_budget_bytes {
             return Err(MemoryBudgetExceeded {
                 cache_max_bytes: self.cache_max_bytes,
                 catalog_cache_max_bytes: self.catalog_cache_max_bytes,
@@ -5921,6 +5943,59 @@ mod tests {
         assert_eq!(resolved.sources.fetch_concurrency, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.max_segments, DERIVED_MAX_SEGMENTS);
         assert_eq!(resolved.query_deadline, DERIVED_QUERY_DEADLINE);
+
+        // Issue #1255 finding 1, configuration 2: "we could not measure the
+        // host" must resolve to no derived ceiling (`u64::MAX`), not to `0`.
+        // A `0` process_memory_budget_bytes (main.rs) becomes
+        // `MemoryBudget::new(0)` (lib.rs), which refuses every real
+        // reservation on every non-Linux host unconditionally.
+        //
+        // Prove-the-test: this assertion fails against the pre-fix `None =>
+        // (0, PERF_SOURCE_FALLBACK)` arm in `resolve_performance_defaults`,
+        // reading `resolved.memory_budget_bytes == 0` against the expected
+        // `u64::MAX`.
+        assert_eq!(resolved.memory_budget_bytes, u64::MAX);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FALLBACK);
+        // The remainder that sizes the shared SQL/fetch `MemoryBudget` must
+        // not collapse to `0` just because the two flat-constant caches were
+        // subtracted from an unlimited budget.
+        assert_eq!(
+            resolved.memory_remainder_bytes,
+            u64::MAX - resolved.memory_hard_caps_bytes
+        );
+        assert_ne!(resolved.memory_remainder_bytes, 0);
+    }
+
+    /// Issue #1255 finding 1, configuration 1: a host whose measured memory is
+    /// at or below `MEMORY_OVERHEAD_RESERVE_BYTES` derives
+    /// `memory_budget_bytes == 0` (a real, DERIVED figure, not a fallback),
+    /// which then carves `memory_hard_caps_bytes == 0` too (0% of 0 is 0).
+    /// The pre-fix `>` comparison in `check_memory_budget` read `0 > 0 ==
+    /// false` and let the process start with an unusable `0/0/0` triple: it
+    /// looks healthy (`SELECT 1` reserves nothing) and then refuses every
+    /// real query permanently. Startup must refuse instead.
+    ///
+    /// Prove-the-test: this test fails against the pre-fix `>` comparison
+    /// (`resolve_performance` returns `Ok` instead of the expected
+    /// `MemoryBudgetExceeded`, so `expect_err` panics).
+    #[test]
+    fn host_at_or_below_the_overhead_reserve_refuses_to_start() {
+        let host = HostProfile::new(4, Some(MEMORY_OVERHEAD_RESERVE_BYTES));
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_DERIVED);
+        assert_eq!(resolved.memory_budget_bytes, 0);
+        assert_eq!(resolved.memory_hard_caps_bytes, 0);
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let err = cli
+            .resolve_performance(host)
+            .expect_err("a 0-byte derived budget must refuse to start, not silently run with a \
+                         0/0/0 memory-budget triple");
+        let exceeded = err
+            .downcast_ref::<MemoryBudgetExceeded>()
+            .expect("typed MemoryBudgetExceeded error");
+        assert_eq!(exceeded.hard_caps_total, 0);
+        assert_eq!(exceeded.memory_budget_bytes, 0);
     }
 
     /// An explicit flag wins over the derived value, one field at a time: each
@@ -6340,7 +6415,7 @@ mod tests {
     /// at that one value (the pre-#1141 coupling), so a value above half the
     /// reference host's 30,064,771,072-byte budget makes their sum exceed it.
     ///
-    /// Prove-the-test: replace `self.memory_hard_caps_bytes >
+    /// Prove-the-test: replace `self.memory_hard_caps_bytes >=
     /// self.memory_budget_bytes` in `check_memory_budget` with `false` and
     /// `expect_err` panics because `resolve_performance` returns `Ok` instead
     /// of the expected `MemoryBudgetExceeded`.
@@ -6368,24 +6443,45 @@ mod tests {
         assert!(message.contains("30064771072"));
     }
 
-    /// A flag combination the budget check does NOT refuse still resolves
-    /// normally: the refusal is exact ("hard caps > budget"), not a margin, so
-    /// hard caps exactly equal to the budget must still resolve `Ok`.
+    /// Issue #1255 finding 1, configuration 3: hard caps landing EXACTLY at
+    /// the memory budget must also refuse, not just caps strictly above it.
+    /// `memory_hard_caps_bytes == memory_budget_bytes` leaves a remainder of
+    /// exactly `0`, which builds `MemoryBudget::new(0)` downstream
+    /// (`lib.rs`'s `with_process_budget`): every real reservation is then
+    /// refused while `SELECT 1` (which reserves nothing) still answers, so
+    /// the server looks healthy and fails every non-trivial query
+    /// permanently. This exact input was previously asserted `Ok` by
+    /// `startup_accepts_hard_caps_exactly_at_the_memory_budget`, the test
+    /// this one replaces: that assertion encoded the bug as correct
+    /// behavior.
+    ///
+    /// Prove-the-test: this test fails against the pre-fix `>` comparison in
+    /// `check_memory_budget` (`resolve_performance` returns `Ok` instead of
+    /// the expected `MemoryBudgetExceeded`, so `expect_err` panics), which is
+    /// exactly the behavior the now-deleted `startup_accepts_...` test
+    /// pinned.
     #[test]
-    fn startup_accepts_hard_caps_exactly_at_the_memory_budget() {
+    fn startup_refuses_hard_caps_leaving_no_remainder() {
         let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
         let budget = resolved.memory_budget_bytes;
         let half = budget / 2;
+        assert_eq!(
+            half * 2,
+            budget,
+            "the reference host's budget must be even for `half` to land hard caps exactly \
+             at the budget"
+        );
 
         let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", &half.to_string()])
             .expect("flag parses");
-        let resolved = cli
+        let err = cli
             .resolve_performance(reference_host())
-            .expect("hard caps of exactly the budget must not be refused");
-        assert_eq!(
-            resolved.memory_hard_caps_bytes,
-            resolved.memory_budget_bytes
-        );
+            .expect_err("hard caps landing exactly at the budget must leave zero remainder");
+        let exceeded = err
+            .downcast_ref::<MemoryBudgetExceeded>()
+            .expect("typed MemoryBudgetExceeded error");
+        assert_eq!(exceeded.hard_caps_total, budget);
+        assert_eq!(exceeded.memory_budget_bytes, budget);
     }
 
     /// The four ADR-1170 decision 3/4 emit lines -- `memory_budget_bytes`,
