@@ -13,6 +13,7 @@ t/<tenant_hash>/m/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt       compac
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/rw.<input_set_hash16>.cmt       rewrite record (selective erasure; ADR-0064)
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/retire.tmb                      retention tombstone
 t/<tenant_hash>/m/maint/<shard>/cursor                                    advisory scan cursor
+t/<tenant_hash>/a/state/latest                                            derived alert-state memo (per-tenant, Overwrite, versioned body, advisory; ADR-1294)
 t/<tenant_hash>/<signal>/del/<request_id>.dreq                          erasure request (CreateIfAbsent, immutable; ADR-0064)
 t/<tenant_hash>/<signal>/del/<request_id>.done                          erasure completion (CreateIfAbsent, immutable, PII-free; ADR-0064)
 t/<tenant_hash>/<signal>/prov                                           shard_count provisioning record (write-once, additive; ADR-0050 §5)
@@ -160,6 +161,27 @@ existed, which is what keeps "no correctness-critical distributed locks" true.
 This is a claim, deliberately **not** a lease (`LeaseCheck` is the unrelated GC
 reader-protection gate) and **not** membership (that is the
 `sys/maintain/workers/` prefix above).
+
+`t/<tenant_hash>/a/state/latest` (ADR-1294, Proposed) is the alert evaluator's
+derived state memo, one object per tenant holding the folded latest record per
+`alert_id` plus the ingest hour it was stamped in. It is a derived cache of the
+`Signal::Alerts` fold (ADR-0040 decision 3), placed deliberately outside the
+`t/<tenant_hash>/a/c/` commit prefix so neither the evaluator's own fold nor the
+`alerts` SQL table's listing of commit records ever sees it. On each tick every
+replica GETs the memo and folds only the commit records at or after its stamped
+hour (one server-side `start-after` LIST plus a commit/data GET pair per
+transition in that window), instead of re-folding the whole ever-growing alert
+history; the lease holder then rewrites the memo with a plain `Overwrite`
+(single writer per key, debounced so an unchanged tick writes nothing). The body
+carries its own `format_version`, and a reader that finds the memo absent,
+undecodable, or of an unsupported version falls back to a full fold and rewrites
+a valid memo, so the memo is **advisory and reconstructible**: losing, staling,
+or corrupting it costs at most one tick's full fold, never a wrong alert state.
+The non-optional tail LIST is what keeps a stale memo from being trusted: a
+transition written after the memo lands at an hour at or above the watermark and
+is folded in. The `Signal::Alerts` records, the RLOG format, and every other key
+are untouched; this is a new derived-object prefix, no version bump, following
+the `sys/maintain/memo/` precedent above (ADR-0065 §3).
 
 `sys/qualification` and the `sys/qualify/` prefix (ADR-0050 §6) are
 additive root-level keys, outside any tenant's `t/<tenant_hash>/` space.
