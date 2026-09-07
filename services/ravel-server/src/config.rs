@@ -5987,10 +5987,10 @@ mod tests {
         assert_eq!(resolved.memory_hard_caps_bytes, 0);
 
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
-        let err = cli
-            .resolve_performance(host)
-            .expect_err("a 0-byte derived budget must refuse to start, not silently run with a \
-                         0/0/0 memory-budget triple");
+        let err = cli.resolve_performance(host).expect_err(
+            "a 0-byte derived budget must refuse to start, not silently run with a \
+                         0/0/0 memory-budget triple",
+        );
         let exceeded = err
             .downcast_ref::<MemoryBudgetExceeded>()
             .expect("typed MemoryBudgetExceeded error");

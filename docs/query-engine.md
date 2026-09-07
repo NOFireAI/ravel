@@ -712,10 +712,11 @@ runs under a finite one) minus a fixed 2 GiB overhead reserve for the
 allocator, thread stacks, and everything outside this accounting. It is
 `u64::MAX` (unlimited, source `fallback`) when memory cannot be read, never
 `0`: "we could not measure the host" means no trustworthy ceiling can be
-derived, which is unlimited, not the tightest possible ceiling (issue
-#1255). A `0` budget here would build a `MemoryBudget::new(0)` that refuses
-every real reservation while a no-op query still answers, so the process
-looks healthy and then fails every non-trivial query permanently.
+derived, which is unlimited, not the tightest possible ceiling (see
+ADR-1170's 2026-09-07 amendment). A `0` budget here would build a
+`MemoryBudget::new(0)` that refuses every real reservation while a no-op
+query still answers, so the process looks healthy and then fails every
+non-trivial query permanently.
 
 Two things are carved from `memory_budget_bytes`, not from raw effective
 memory: the fetcher (RSEG) read cache takes 25%, and the catalog byte cache
@@ -729,11 +730,11 @@ accountant, one instance per process, that the SQL executor's per-tenant
 memory accountants all reserve against. Startup **refuses** to start, rather
 than silently clamping, when the two resolved hard caps together leave no
 strictly positive remainder of `memory_budget_bytes` -- caps at or above the
-budget, not only strictly above it (issue #1255): a remainder of exactly `0`
-is exactly as unusable as a negative one, since it builds the same refuse-
-everything `MemoryBudget::new(0)`. A typed `MemoryBudgetExceeded` error names
-both figures so the fix (lower the flag, or raise the host's memory) is in
-the error message.
+budget, not only strictly above it (see ADR-1170's 2026-09-07 amendment): a
+remainder of exactly `0` is exactly as unusable as a negative one, since it
+builds the same refuse-everything `MemoryBudget::new(0)`. A typed
+`MemoryBudgetExceeded` error names both figures so the fix (lower the flag,
+or raise the host's memory) is in the error message.
 
 This derivation runs once, at process startup, from the host profile
 observed at that moment. There is no runtime re-derivation and no "grow"
