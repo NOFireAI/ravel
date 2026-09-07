@@ -1646,11 +1646,12 @@ async fn erasure_rewrite_pass(
     signal: Signal,
     scan_shards: u32,
     pending: &[PendingErasureRequest],
+    derived_hours: &std::collections::BTreeSet<u32>,
     memo: &mut MaintainMemo,
 ) -> ErasureRewritePass {
     let mut pass = ErasureRewritePass::default();
     for shard in 0..scan_shards {
-        let hours = match list_erasure_scan_hours(store, tenant, signal, shard).await {
+        let listed = match list_erasure_scan_hours(store, tenant, signal, shard).await {
             Ok(hours) => hours,
             Err(err) => {
                 tracing::warn!(
@@ -1665,58 +1666,82 @@ async fn erasure_rewrite_pass(
                 continue;
             }
         };
+        // Union the commit-prefix listing with `derived_hours`, the ingest
+        // hours open at each request's acknowledgement (issue #1290). A pre-ack
+        // flush that has not published a commit record yet leaves its hour out
+        // of the listing, so without this union the completion gate never sees
+        // the bucket the subject's pre-ack records will later seal into and the
+        // request completes while that bucket resurrects the subject. Whether
+        // the derived bucket puts records in a request's scope stays the single
+        // judgement inside `bucket_erasure_completion`; this only makes the
+        // bucket present for that gate to judge.
+        let listed: std::collections::BTreeSet<u32> = listed.into_iter().collect();
+        let mut hours = listed.clone();
+        hours.extend(derived_hours.iter().copied());
         for hour in hours {
             let bucket = Bucket::new(*tenant, signal, shard, hour);
-            match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
-                .await
-            {
-                Ok(ErasureRewriteOutcome::Rewritten { parts, publish }) => {
-                    pass.rewritten += 1;
-                    // An abandoned publish wrote no record, so this bucket
-                    // does not yet name the pending requests.
-                    if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
-                        pass.deferred = true;
+            // The rewrite runs only on hours the listing returned. A derived
+            // hour absent from the listing has no commit record for this shard,
+            // so there is nothing to rewrite; the completion gate below still
+            // examines it (it blocks while that bucket is unsealed and in
+            // scope, and passes once it seals empty). This also keeps the
+            // rewrite off an empty bucket, which `erasure_rewrite_bucket` does
+            // not currently accept for a windowless request (flagged in the
+            // task report). Once the derived hour's commit record lands it
+            // becomes a listed hour and the rewrite acts on it normally.
+            if listed.contains(&hour) {
+                match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
+                    .await
+                {
+                    Ok(ErasureRewriteOutcome::Rewritten { parts, publish }) => {
+                        pass.rewritten += 1;
+                        // An abandoned publish wrote no record, so this bucket
+                        // does not yet name the pending requests.
+                        if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
+                            pass.deferred = true;
+                        }
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            parts,
+                            publish = ?publish,
+                            "maintenance: erasure rewrite published for a bucket"
+                        );
                     }
-                    tracing::info!(
-                        tenant = %tenant.to_hex(),
-                        signal = ?signal,
-                        shard,
-                        hour,
-                        parts,
-                        publish = ?publish,
-                        "maintenance: erasure rewrite published for a bucket"
-                    );
-                }
-                Ok(ErasureRewriteOutcome::AlreadyApplied) => pass.already_applied += 1,
-                Ok(
-                    ErasureRewriteOutcome::NoApplicableRequests | ErasureRewriteOutcome::Tombstoned,
-                ) => pass.out_of_scope += 1,
-                Ok(ErasureRewriteOutcome::NotSealed) => pass.not_sealed += 1,
-                Ok(ErasureRewriteOutcome::Held) => {
-                    // ADR-0064 §6: a legal hold wins over erasure. The request
-                    // stays pending, query-time exclusion keeps hiding the
-                    // data, and the erasure clock is explicitly paused.
-                    pass.deferred = true;
-                    tracing::info!(
-                        tenant = %tenant.to_hex(),
-                        signal = ?signal,
-                        shard,
-                        hour,
-                        "maintenance: erasure rewrite skipped a bucket under legal hold; \
-                         the request stays pending until the hold clears"
-                    );
-                }
-                Err(err) => {
-                    pass.deferred = true;
-                    tracing::warn!(
-                        tenant = %tenant.to_hex(),
-                        signal = ?signal,
-                        shard,
-                        hour,
-                        error = %err,
-                        "maintenance: erasure rewrite of a bucket failed; no completion \
-                         written this tick, retried next tick"
-                    );
+                    Ok(ErasureRewriteOutcome::AlreadyApplied) => pass.already_applied += 1,
+                    Ok(
+                        ErasureRewriteOutcome::NoApplicableRequests
+                        | ErasureRewriteOutcome::Tombstoned,
+                    ) => pass.out_of_scope += 1,
+                    Ok(ErasureRewriteOutcome::NotSealed) => pass.not_sealed += 1,
+                    Ok(ErasureRewriteOutcome::Held) => {
+                        // ADR-0064 §6: a legal hold wins over erasure. The request
+                        // stays pending, query-time exclusion keeps hiding the
+                        // data, and the erasure clock is explicitly paused.
+                        pass.deferred = true;
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            "maintenance: erasure rewrite skipped a bucket under legal hold; \
+                             the request stays pending until the hold clears"
+                        );
+                    }
+                    Err(err) => {
+                        pass.deferred = true;
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            error = %err,
+                            "maintenance: erasure rewrite of a bucket failed; no completion \
+                             written this tick, retried next tick"
+                        );
+                    }
                 }
             }
 
@@ -1730,9 +1755,11 @@ async fn erasure_rewrite_pass(
             // `bucket_erasure_completion`), on a fresh listing that reflects any
             // rewrite just published, so a `.done` can never be written while a
             // resolvable snapshot still serves the subject. This runs for every
-            // bucket regardless of the rewrite outcome: a bucket the pass called
-            // `AlreadyApplied` or `NoApplicableRequests` off its one-hop view is
-            // exactly where the divergence hides.
+            // bucket regardless of the rewrite outcome, and for every derived
+            // hour whether or not the listing returned it (issue #1290): a
+            // bucket the pass called `AlreadyApplied` or `NoApplicableRequests`
+            // off its one-hop view, or a derived ack-open hour still unsealed,
+            // is exactly where completion must be withheld.
             match ravel_maintain::bucket_erasure_completion(
                 store, clock, compactor, hold, &bucket, pending,
             )
@@ -1867,16 +1894,17 @@ async fn write_erasure_completion(
 /// Blocking is the safe failure: a stuck-pending request retains its `.dreq`
 /// and query-time exclusion, where a false `.done` would resurrect the subject.
 ///
-/// **Known gap, matching ADR-0064 decision 3 point 1:** an unsealed bucket is
-/// deferred and excluded from scope, so a windowless request can complete
-/// while the current (still-open) ingest hour holds matching records that will
-/// only seal later -- by which time the request is no longer pending and no
-/// rewrite will revisit it. The ADR defines scope as sealed buckets and defers
-/// unsealed ones; blocking completion on them instead would mean a
-/// continuously-ingesting tenant never completes any request, so its `.dreq`
-/// (which holds the subject identifier) would be retained forever, which is
-/// the failure ADR-0064 decision 5 exists to prevent. Reported rather than
-/// silently resolved either way.
+/// **The ack-open ingest hour (issue #1290).** The hour open at a request's
+/// acknowledgement whose pre-ack flush has not published a commit record yet is
+/// absent from the commit-prefix listing, so discovery derives it from the
+/// request's timestamp ([`ravel_maintain::erasure_rewrite::ack_open_ingest_hours`])
+/// and unions it into every shard's listed hours. That derived bucket is
+/// unsealed at the ack, so [`ravel_maintain::bucket_erasure_completion`] blocks
+/// completion until it seals and a later pass rewrites it. Only the hour open at
+/// the ack is derived: a later hour that opened after the ack is out of the
+/// request's scope, so ingest that never stops does not stall completion, and
+/// the wait is bounded to
+/// [`ravel_maintain::erasure_rewrite::erasure_seal_wait_bound_ns`].
 #[allow(clippy::too_many_arguments)]
 async fn run_erasure_pass(
     store: &dyn ObjectStoreBackend,
@@ -1890,6 +1918,16 @@ async fn run_erasure_pass(
 ) {
     match pending_erasure_requests(store, tenant, signal).await {
         Ok(pending) if !pending.is_empty() => {
+            // Discovery unions the per-shard commit-prefix listing (inside
+            // `erasure_rewrite_pass`) with the ingest hours open at each
+            // request's acknowledgement (issue #1290): a pre-ack flush that has
+            // not published a commit record leaves its hour absent from the
+            // listing, so deriving it here is the only way the completion gate
+            // ever considers that bucket. This mirrors the crate-level test's
+            // `erasure_tick`. Scope stays one judgement in
+            // `bucket_erasure_completion`; this only decides the bucket is
+            // present for it to judge.
+            let derived_hours = ravel_maintain::erasure_rewrite::ack_open_ingest_hours(&pending);
             let pass = erasure_rewrite_pass(
                 store,
                 clock,
@@ -1899,6 +1937,7 @@ async fn run_erasure_pass(
                 signal,
                 scan_shards,
                 &pending,
+                &derived_hours,
                 memo,
             )
             .await;
@@ -2798,6 +2837,80 @@ mod tests {
             .expect("publish");
     }
 
+    /// Publish one metrics bucket holding the erasure subject and one bystander
+    /// into ingest hour `hour` (a single L0 input, samples timestamped inside
+    /// the hour). This models issue #1290's delayed pre-ack flush: the ack
+    /// hour's commit record only appears once this is called, so the
+    /// commit-prefix listing returns the hour to nobody before it.
+    async fn publish_erasable_bucket_at_hour(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        hour: u32,
+    ) {
+        let tenant_hash = tenant.hash();
+        let ts_ns = i64::from(hour) * TEST_NS_PER_HOUR + 1_000;
+        let mut series: Vec<SeriesInput> = [TEST_ERASED_SUBJECT, TEST_SURVIVING_SUBJECT]
+            .into_iter()
+            .map(|subject| {
+                let labels = subject_labels(subject);
+                SeriesInput {
+                    series_id: SeriesId::compute(tenant, "http_requests", &labels)
+                        .expect("series id"),
+                    labels,
+                    samples: vec![Sample { ts_ns, value: 1.0 }],
+                }
+            })
+            .collect();
+        series.sort_by_key(|s| s.series_id);
+
+        let writer_id = Uuid::from_u128(9_300 + u128::from(hour));
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: ts_ns,
+                max_ingest_ts_ns: ts_ns,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: ts_ns,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
     /// Publish one L0 commit holding only the erasure subject at
     /// `(Metrics, shard 0, hour 0)`, with the given `writer_seq`, and return its
     /// [`CompactionInputIdentity`]. Two of these seed a bucket with two distinct
@@ -3009,6 +3122,132 @@ mod tests {
         );
     }
 
+    /// Reachability through the SERVER's own pass (issue #1290). The previous
+    /// round proved the mechanism in the crate's `erasure_tick` mirror, but the
+    /// shipping driver `run_erasure_pass` still built its hour set from
+    /// `list_erasure_scan_hours` alone. This drives `run_erasure_pass` -- the
+    /// exact pattern `done_follows_the_catalog_resolver_not_the_one_hop_live_record`
+    /// uses -- to prove the driver now discovers the ack-open hour the listing
+    /// misses.
+    ///
+    /// Tick 1: the request is acknowledged while its ingest hour is open and
+    /// holds NO commit record (its pre-ack flush has not published yet). The
+    /// commit-prefix listing returns that hour to nobody, so only
+    /// `ack_open_ingest_hours` surfaces it; the derived bucket is unsealed, so
+    /// completion is blocked and no `.done` is written -- the request does not
+    /// complete. Tick 2: the delayed flush finally publishes its commit record
+    /// into that hour and the clock advances past the hour's seal bound, so it
+    /// is now listed and sealed; the rewrite drops the subject and the request
+    /// completes exactly once, the subject gone from the survivors.
+    ///
+    /// The flip that proves this test bites: replace
+    /// `ack_open_ingest_hours(&pending)` in `run_erasure_pass` with
+    /// `BTreeSet::new()` and tick 1 writes `.done` over an empty listing,
+    /// resurrecting the subject the delayed flush later seals into the hour.
+    #[tokio::test]
+    async fn run_erasure_pass_discovers_the_ack_open_hour_the_listing_misses() {
+        const ACK_HOUR: u32 = 10_000;
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let request_id = Uuid::from_u128(0x1290);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Tick 1: the ack hour is open and holds no commit record. The listing
+        // is empty; only the derived hour makes the unsealed bucket visible,
+        // and an unsealed in-scope bucket blocks completion.
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        assert_eq!(
+            rewrite_records_at_hour(&store, &tenant, ACK_HOUR)
+                .await
+                .len(),
+            0,
+            "the ack hour holds no commit record yet, so nothing is rewritten this tick"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "the ack-open hour is derived and unsealed, so completion is blocked and no .done \
+             is written -- without the driver's union this listing is empty and .done lands"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the request stays pending: its .dreq (carrying the subject) survives"
+        );
+
+        // The delayed pre-ack flush finally publishes its commit record into
+        // the ack hour, and the clock advances past that hour's seal bound.
+        publish_erasable_bucket_at_hour(&store, &tenant_id, ACK_HOUR).await;
+        let sealed_ns = i64::from(ACK_HOUR + 1) * TEST_NS_PER_HOUR + compactor.seal_margin_ns() + 1;
+        clock.set(sealed_ns);
+
+        // Tick 2: the hour is now listed and sealed; the rewrite drops the
+        // subject and the request completes exactly once.
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        let records = rewrite_records_at_hour(&store, &tenant, ACK_HOUR).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "the sealed ack bucket is rewritten exactly once"
+        );
+        assert_eq!(
+            records[0].drops.len(),
+            1,
+            "the rewrite applies exactly the one pending request"
+        );
+        assert_eq!(records[0].drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            records[0].drops[0].dropped_count, 1,
+            "exactly the subject's one sample is dropped"
+        );
+        assert_eq!(
+            rewritten_label_sets(&store, &records[0]).await,
+            vec![subject_labels(TEST_SURVIVING_SUBJECT)],
+            "the subject is gone from the survivors and the bystander is intact"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "every in-scope bucket now carries the request, so it completes exactly once"
+        );
+    }
+
     /// Submit one erasure request exactly as `ravel-cli erase submit` does: a
     /// validated `ErasureRequest` written `CreateIfAbsent` to its `.dreq` key.
     /// Returns the key.
@@ -3053,8 +3292,18 @@ mod tests {
         store: &dyn ObjectStoreBackend,
         tenant: &TenantHash,
     ) -> Vec<ravel_proto::commit::v1::RewriteRecord> {
-        let prefix =
-            keys::commit_shard_hour_prefix(tenant, Signal::Metrics, 0, 0).expect("bucket prefix");
+        rewrite_records_at_hour(store, tenant, 0).await
+    }
+
+    /// Every `RewriteRecord` present in `(tenant, Metrics, shard 0, hour)`,
+    /// decoded, in key order.
+    async fn rewrite_records_at_hour(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        hour: u32,
+    ) -> Vec<ravel_proto::commit::v1::RewriteRecord> {
+        let prefix = keys::commit_shard_hour_prefix(tenant, Signal::Metrics, 0, hour)
+            .expect("bucket prefix");
         let mut keys_found: Vec<String> = list_all(store, &prefix)
             .await
             .expect("list bucket")
@@ -3124,13 +3373,20 @@ mod tests {
 
         let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
         let request_id = Uuid::from_u128(0xE7A5);
+        // Acknowledge the request inside the data's own ingest hour (hour 0),
+        // which is long sealed at `TEST_ERASURE_NOW_NS` (hour 10_000). This
+        // keeps the ack-open hour from being an obstacle in its own right, so
+        // this test stays about the rewrite/complete/sweep arc; the ack-open
+        // hour that the listing misses is covered separately by
+        // `run_erasure_pass_discovers_the_ack_open_hour_the_listing_misses`.
+        let ack_ns = 1_000;
         let dreq_key = submit_erasure_request(
             &store,
             &tenant,
             Signal::Metrics,
             request_id,
             TEST_ERASED_SUBJECT,
-            TEST_ERASURE_NOW_NS,
+            ack_ns,
         )
         .await;
         let done_key =
