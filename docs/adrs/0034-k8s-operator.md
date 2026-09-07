@@ -212,6 +212,47 @@ exists for disk-hungry jobs.
    `services/*` in the doc map), an index entry in `docs/README.md`,
    and a README.md pointer.
 
+**Amendment (2026-09-07): pod and RBAC hardening are the operator's
+responsibility (issue #126).** The rendered objects this ADR describes
+shipped with no workload hardening, and the operator's ServiceAccount
+held a cluster-wide `secrets` read. Both are now the operator's job, in
+the same pure render path as everything else in decision 3:
+
+- Every rendered container carries a SecurityContext: `runAsNonRoot`,
+  `allowPrivilegeEscalation: false`, all Linux capabilities dropped, and
+  a read-only root filesystem. The read-only root is correct because
+  object storage is the only durable backend (no process writes local
+  disk on any path the operator renders): the sole opt-in local write is
+  the ADR-0046 disk cache, which the operator renders no `--cache-dir`
+  flag for, so every rendered container runs RAM-only. A future CRD field
+  that wires `--cache-dir` must add its own writable volume mount.
+- Every rendered PodSpec carries a pod SecurityContext (`runAsNonRoot`
+  and the `RuntimeDefault` seccomp profile) and preferred (soft), never
+  required, pod anti-affinity spreading a tier's replicas across nodes.
+  Preferred because a required rule would leave a single-node `kind`
+  cluster (the reference environment, decision 6) unable to schedule a
+  second replica.
+- The operator renders one PodDisruptionBudget per tier
+  (`maxUnavailable: 1`), applied and swept exactly like the Deployments,
+  so a node drain cannot take a whole tier down and a manual patch does
+  not survive a reconcile.
+- The cluster-wide `secrets` grant is removed. The operator reads only
+  the Secrets a RavelCluster references, in the RavelCluster's own
+  namespace, so the read is now a namespaced Role+RoleBinding in
+  `ravel-system`. The Secret names are user-chosen CRD fields, not a
+  fixed set, so `resourceNames` cannot enumerate them and a namespaced
+  Role is the tightest grant that still works. Running the operator over
+  RavelClusters in other namespaces needs one RoleBinding per namespace;
+  that is a follow-up.
+
+The container/pod SecurityContext, the PDB count, and the anti-affinity
+shape are asserted at render level in `reconcile.rs` tests; a manifest
+lint there (a text scan of `deploy/k8s/operator/rbac.yaml`, run by
+`cargo test -p ravel-operator`) asserts the ClusterRole grants no
+`secrets`. The runtime effect (a pod actually rejected for a missing
+capability, a drain actually blocked) is left to the k8s CI lane
+(decision 8).
+
 ## Rejected alternatives
 
 1. **Go operator (kubebuilder/controller-runtime).** The larger example
