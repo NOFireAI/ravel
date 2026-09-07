@@ -467,6 +467,37 @@ section are narrowed to state this proof explicitly. The two honest
 residuals are unchanged and already tracked: the out-of-window folded
 snapshot (§4 open item, above) and the query-audit keyspace (ADR-0062).
 
+## Amendment: completion waits for a bucket that was open at the acknowledgement
+
+2026-09-07. Section 3 point 1 defers an unsealed bucket to the next pass. The
+completion gate in section 4 read that deferral as an exclusion from scope and
+let a request complete while such a bucket was still open. Completion now
+blocks instead: no `.done` is written while any bucket that was in the
+request's scope at acknowledgement is unsealed.
+
+The two readings differ in outcome, not in wording. Deferral is a statement
+about which pass does the rewrite, and it holds only while a later pass will
+still run. A `.done` is what stops the request being pending, so completing on
+a deferred bucket turns "the next pass rewrites it" into "no pass rewrites
+it": the bucket seals carrying the subject's pre-ack records, nothing revisits
+it, and the records are served again as soon as the `.dreq` and its query-time
+exclusion filter are released under section 5.
+
+Blocking does not reintroduce the section 5 failure it was thought to. A
+request's scope is fixed at its acknowledgement (section 1), so a record
+ingested afterwards is not data the request can erase, and the bucket that
+receives it is not a bucket the request waits on. Only the bucket open at the
+acknowledgement can impose the wait, and it seals within `max_ingest_lag` plus
+one bucket span plus the seal margin (`max_flush_lifetime +
+clock_skew_allowance`): 4 h 5 min with defaults, far inside
+`erasure_rewrite_deadline`. A tenant that never stops ingesting therefore
+still completes, and its `.dreq` is still released on schedule; the wait ends
+on its own rather than on ingest stopping.
+
+Section 3 point 1 is unchanged: the rewrite pass still defers an unsealed
+bucket, and the data stays unreturnable through section 2 while it waits.
+docs/consistency-model.md's `.done` row carries the normative wording.
+
 ### 5. Erasing the erasure request itself
 
 The `.dreq` contains the subject identifier, so it must not outlive its

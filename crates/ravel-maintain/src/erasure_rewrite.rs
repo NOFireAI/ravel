@@ -101,7 +101,7 @@ use ravel_types::{LabelSet, Sample, Signal, TenantHash};
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, OUTPUT_FORMAT_VERSION};
 use crate::clock::Clock;
-use crate::config::CompactorConfig;
+use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
 use crate::read::{BucketListing, InputCatalog, RunPlan, SeriesPlan};
@@ -1979,6 +1979,11 @@ pub struct BucketErasureCompletion {
     /// the subject (a live raw L0 input, a live un-rewritten compaction part,
     /// or a live sibling rewrite whose `drops` do not name the request). Their
     /// `.done` must not be written.
+    ///
+    /// An unsealed bucket blocks every request whose scope covered it at
+    /// acknowledgement ([`bucket_in_scope_at_ack`]) without reading its
+    /// contents: the rewrite pass defers that bucket to a later pass, and
+    /// completion honors the deferral instead of overtaking it.
     pub blocked: HashSet<String>,
     /// The catalog view could not be established for a reason that must block
     /// completion for every pending request, not just the overlapping ones: the
@@ -1988,6 +1993,65 @@ pub struct BucketErasureCompletion {
     /// and defer it exactly as the rewrite pass defers its own failures.
     pub unresolved: bool,
 }
+
+/// Whether `bucket` could hold records that already existed when `request` was
+/// acknowledged, which is what puts it in the request's scope (ADR-0064
+/// decision 1: the `CreateIfAbsent` ack is when every bound starts, so a record
+/// ingested after the ack is not data the request can erase).
+///
+/// A bucket collects records by INGEST hour, so a bucket whose hour opened
+/// after the ack holds post-ack records only, however old their event times
+/// are. `clock_skew_allowance_ns` is the same margin the seal rule itself uses
+/// ([`CompactorConfig::seal_margin_ns`]): without it a record ingested just
+/// before the ack by a writer whose clock leads the pass's could land in the
+/// next hour bucket and read as out of scope.
+///
+/// Scope here is deliberately NOT narrowed by the predicate's event-time
+/// window, the way [`bucket_may_overlap`] narrows a sealed bucket's. An
+/// unsealed bucket has no complete event range to prune against yet, and a
+/// backfilled record carrying any event time can still be ingested into it. The
+/// cost of that conservatism is one seal ([`erasure_seal_wait_bound_ns`]).
+fn bucket_in_scope_at_ack(
+    bucket: &Bucket,
+    request: &ErasureRequest,
+    config: &CompactorConfig,
+) -> bool {
+    bucket.start_ns()
+        <= request
+            .created_unix_ns
+            .saturating_add(config.clock_skew_allowance_ns)
+}
+
+/// The longest a `.done` can wait on an unsealed in-scope bucket: ADR-0064
+/// decision 3 point 1's own bound, `max_ingest_lag` plus one bucket span, plus
+/// the seal margin the code actually applies (`max_flush_lifetime +
+/// clock_skew_allowance`, [`CompactorConfig::seal_margin_ns`]). With defaults
+/// that is 2 h + 1 h + 1 h + 5 min = 4 h 5 min.
+///
+/// Only the hour open at acknowledgement can impose this wait: a later hour is
+/// out of the request's scope ([`bucket_in_scope_at_ack`]), so ingest that
+/// never stops does not extend the bound. Numerically this is the same
+/// composition as [`CompactorConfig::retention_floor_ns`], which exists for the
+/// same reason (a bucket must not be acted on before it is guaranteed sealed);
+/// the crate's own test asserts the two agree.
+///
+/// `max_ingest_lag_ns` is the caller's (ravel-catalog's value, mirrored by
+/// [`crate::config::DEFAULT_MAX_INGEST_LAG_NS`]) exactly as
+/// `retention_floor_ns` takes it, because this crate deliberately holds no
+/// ravel-catalog dependency.
+pub fn erasure_seal_wait_bound_ns(config: &CompactorConfig, max_ingest_lag_ns: i64) -> i64 {
+    max_ingest_lag_ns
+        .saturating_add(NS_PER_HOUR)
+        .saturating_add(config.seal_margin_ns())
+}
+
+/// `erasure_rewrite_deadline` (ADR-0064 §4): a request pending longer than this
+/// raises an alarm. Stated here as the documented default because no knob or
+/// metric implements it yet, so this is the only place the value the deletion
+/// guarantees publish can be checked against
+/// [`erasure_seal_wait_bound_ns`] -- which it must exceed, or a completion wait
+/// that is working exactly as designed would alarm as a stuck request.
+pub const ERASURE_REWRITE_DEADLINE_NS: i64 = 72 * NS_PER_HOUR;
 
 /// Whether one bucket, resolved through the SAME supersession logic the query
 /// path uses, still serves any record that could contain the subject of any
@@ -2018,11 +2082,23 @@ pub struct BucketErasureCompletion {
 /// A request whose window overlaps nothing live here is not blocked. A `.done`
 /// is safe for a request only when NO in-scope bucket blocks it.
 ///
-/// The front gates (`is_sealed`, tombstone, legal hold) mirror
-/// [`erasure_rewrite_bucket`] so this reasons about exactly the buckets the
-/// rewrite pass treats as in scope: an unsealed bucket is out of scope
-/// (ADR-0064 decision 3 point 1, the documented completion gap); a tombstoned
-/// bucket serves nothing; a held bucket keeps every request pending.
+/// An unsealed bucket is handled before any of that, and it blocks rather than
+/// passes. ADR-0064 decision 3 point 1 defers an unsealed bucket to the NEXT
+/// pass, which is a deferral of the rewrite, not a licence to complete: a
+/// request marked `.done` is no longer pending, so no later pass revisits it,
+/// and the records the bucket seals with are served again the moment the
+/// `.dreq` is swept and the query-time filter stops applying. Completion
+/// therefore waits for the seal. The wait is bounded, and bounded is what makes
+/// it safe: a request's scope is fixed at acknowledgement, so a
+/// continuously-ingesting tenant opening new hours forever does not extend it
+/// -- the specific hour that was open at the ack seals within
+/// [`erasure_seal_wait_bound_ns`], and a later hour is out of scope
+/// ([`bucket_in_scope_at_ack`]). Decision 5's concern about a `.dreq` outliving
+/// its purpose is not engaged by a wait that ends on its own.
+///
+/// The remaining front gates (tombstone, legal hold) mirror
+/// [`erasure_rewrite_bucket`]: a tombstoned bucket serves nothing; a held
+/// bucket keeps every request pending.
 pub async fn bucket_erasure_completion(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -2035,12 +2111,21 @@ pub async fn bucket_erasure_completion(
     if pending.is_empty() {
         return Ok(out);
     }
-    // Unsealed: out of scope, exactly as `erasure_rewrite_bucket` defers it
-    // (ADR-0064 decision 3 point 1). Its data is already unreturnable via the
-    // query-time filter; blocking completion on it would let a continuously
-    // ingesting tenant never complete, retaining the `.dreq` (and its subject)
-    // forever, which is the failure ADR-0064 decision 5 exists to prevent.
+    // Unsealed: `erasure_rewrite_bucket` defers the REWRITE to a later pass
+    // (ADR-0064 decision 3 point 1), so completion must not run ahead of it.
+    // Every request whose scope covered this bucket at acknowledgement stays
+    // pending until the bucket seals and a later pass rewrites it. Nothing here
+    // reads the bucket: an unsealed bucket's listing is incomplete by
+    // construction (a flush open at the ack has up to `max_flush_lifetime` to
+    // publish its commit record), so "it currently serves nothing" is not a
+    // proof about the records it will seal with.
     if !bucket.is_sealed(clock.now_ns(), config) {
+        for pending_request in pending {
+            if bucket_in_scope_at_ack(bucket, &pending_request.request, config) {
+                out.blocked
+                    .insert(pending_request.request.request_id.clone());
+            }
+        }
         return Ok(out);
     }
     let listing = crate::read::list_bucket(store, bucket).await?;
