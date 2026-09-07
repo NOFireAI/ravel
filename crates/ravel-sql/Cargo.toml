@@ -166,6 +166,11 @@ flight-sql = [
 ]
 
 [dev-dependencies]
+# test-util for `#[tokio::test(start_paused = true)]`: the explain deadline
+# test holds a commit-record GET open and asserts the typed
+# `DeadlineExceeded`, which needs the runtime's injected clock rather than a
+# real 50 ms wait on a loaded machine. Same workspace pin, one added feature.
+tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
