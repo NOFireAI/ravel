@@ -401,9 +401,53 @@ fn every_role_has_kms_decrypt() {
     }
 }
 
+/// The two wildcard characters IAM resolves inside a `Resource` ARN: `*`
+/// matches any sequence, `?` matches exactly one character. Either one, in
+/// any segment of a KMS ARN, grants more keys than the ARN appears to name:
+/// `key/????????-????-????-????-????????????` covers every key whose id has
+/// the shape of a UUID, and a `?` or `*` in the region or account position
+/// widens the grant the same way.
+const IAM_WILDCARDS: [char; 2] = ['*', '?'];
+
+/// True when `resource` names more than the single key it appears to name.
+fn kms_resource_is_wildcarded(resource: &str) -> bool {
+    resource.contains(IAM_WILDCARDS)
+}
+
+/// The ARN shape a KMS `Resource` must have to pin one key: no IAM wildcard
+/// in any segment, and a key-id segment that cannot span a `/` (so an
+/// `alias/...` or a nested path cannot pose as a key id).
+fn kms_key_arn_pattern() -> regex::Regex {
+    regex::Regex::new(r"^arn:aws:kms:[^:*?/]+:[^:*?/]+:key/[^:*?/]+$").expect("valid regex")
+}
+
+/// The account-wide-grant half of the KMS resource guard, as one function so
+/// the regression fixtures below run the real assertion rather than a copy of
+/// its text.
+fn assert_kms_resource_is_not_account_wide(role: &str, sid: &str, resource: &str) {
+    assert!(
+        !kms_resource_is_wildcarded(resource),
+        "{role}: statement {sid:?} grants a kms: action on {resource:?}, which \
+         contains an IAM wildcard (`*` or `?`) and so covers keys beyond the one \
+         it appears to name"
+    );
+}
+
+/// The names-a-specific-key half of the KMS resource guard, likewise shared
+/// with the fixtures.
+fn assert_kms_resource_names_a_key_id(role: &str, sid: &str, resource: &str) {
+    assert!(
+        kms_key_arn_pattern().is_match(resource),
+        "{role}: statement {sid:?} resource {resource:?} does not name a \
+         specific key id (expected arn:aws:kms:<region>:<account>:key/<id>, \
+         with no `*` or `?` in any segment)"
+    );
+}
+
 /// Every statement whose `Action` grants any `kms:` action must not name a
-/// `Resource` that covers every key in the account/region: neither the bare
-/// wildcard `"*"` nor any ARN ending `:key/*`. Pinned as a negation (not an
+/// `Resource` that covers every key in the account/region: not the bare
+/// wildcard `"*"`, not an ARN ending `:key/*`, and not an ARN carrying an IAM
+/// wildcard character anywhere else either. Pinned as a negation (not an
 /// exact tenant-key ARN) so it survives an operator's post-substitution
 /// value. Widen any of the four templates' KMS `Resource` back to
 /// `arn:aws:kms:us-east-1:111122223333:key/*` and this test fails, naming
@@ -439,11 +483,7 @@ fn no_kms_statement_grants_every_key_in_the_region() {
                 }
             };
             for resource in &resources {
-                assert!(
-                    resource != "*" && !resource.ends_with(":key/*"),
-                    "{role}: statement {sid:?} grants a kms: action on {resource:?}, \
-                     which covers every key in the account/region"
-                );
+                assert_kms_resource_is_not_account_wide(role, sid, resource);
             }
         }
     }
@@ -452,11 +492,10 @@ fn no_kms_statement_grants_every_key_in_the_region() {
 /// Every statement whose `Action` grants any `kms:` action must name a
 /// `Resource` that pins a specific key id, so an operator cannot re-widen
 /// the grant to every key by substituting `arn:aws:kms:<region>:<account>:key/*`
-/// (or any other bare-wildcard variant) in place of the placeholder.
+/// (or any other wildcard variant, in the key id or in the region or account
+/// segment) in place of the placeholder.
 #[test]
 fn every_kms_statement_names_a_key_id() {
-    let key_arn_pattern =
-        regex::Regex::new(r"^arn:aws:kms:[^:]+:[^:]+:key/[^*]+$").expect("valid regex");
     for role in ALL_ROLES {
         let policy = load_policy(role);
         for stmt in policy.statements.as_array().unwrap() {
@@ -486,11 +525,7 @@ fn every_kms_statement_names_a_key_id() {
                 }
             };
             for resource in &resources {
-                assert!(
-                    key_arn_pattern.is_match(resource),
-                    "{role}: statement {sid:?} resource {resource:?} does not name a \
-                     specific key id (expected arn:aws:kms:<region>:<account>:key/<id>)"
-                );
+                assert_kms_resource_names_a_key_id(role, sid, resource);
             }
         }
     }
@@ -561,6 +596,109 @@ fn mixed_case_kms_action_is_not_a_bypass() {
          statement is selected -- a mixed-case action must not bypass the \
          no-account-wide-key assertion"
     );
+}
+
+/// Regression fixture for the single-character-wildcard hole: IAM resolves `?`
+/// inside a `Resource` ARN as exactly one character, so
+/// `key/????????-????-????-????-????????????` grants every key whose id has the
+/// shape of a UUID, and a `?` in the region or account segment widens the grant
+/// the same way. Both pre-fix predicates accepted those ARNs: the direct check
+/// tested only for the two literals `"*"` and a `:key/*` suffix, and the ARN
+/// regex excluded `*` from the key-id segment alone. The guards therefore ran
+/// and reported the templates scoped while an effectively account-wide grant sat
+/// unexamined.
+///
+/// Synthetic statements, not `deploy/iam/*.json`: a fixture read from the config
+/// directory passes for reasons unrelated to the matcher, and goes green the day
+/// someone edits the config. Each case asserts in both directions -- that the
+/// pre-fix predicates did NOT reject the resource (so the test cannot quietly
+/// become a tautology if the predicates are rewritten) and that the post-fix
+/// ones do.
+#[test]
+fn single_character_wildcard_in_kms_resource_is_not_a_bypass() {
+    // The pre-fix ARN shape check, kept verbatim so observation 1 below pins
+    // the hole rather than restating the fix.
+    let pre_fix_key_arn_pattern =
+        regex::Regex::new(r"^arn:aws:kms:[^:]+:[^:]+:key/[^*]+$").expect("valid regex");
+
+    let cases = [
+        (
+            "QuestionMarkKeyId",
+            "arn:aws:kms:us-east-1:111122223333:key/????????-????-????-????-????????????",
+        ),
+        (
+            "QuestionMarkRegionAndAccount",
+            "arn:aws:kms:us-east-?:11112222333?:key/abcd1234-5678-90ab-cdef-1234567890ab",
+        ),
+    ];
+
+    for (sid, resource) in cases {
+        let stmt = serde_json::json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": ["kms:Decrypt", "kms:Encrypt"],
+            "Resource": [resource],
+        });
+        let resources: Vec<String> = stmt["Resource"]
+            .as_array()
+            .expect("Resource is an array")
+            .iter()
+            .map(|v| v.as_str().expect("Resource entry is a string").to_string())
+            .collect();
+        assert_eq!(
+            resources.len(),
+            1,
+            "fixture invalid: expected exactly one resource for {sid}"
+        );
+        let resource = resources[0].as_str();
+
+        // Observation 1 (load-bearing): neither pre-fix predicate rejected this
+        // resource. If either one does, the fixture no longer proves the hole
+        // existed and must be rewritten rather than deleted.
+        let pre_fix_direct_rejects = resource == "*" || resource.ends_with(":key/*");
+        assert!(
+            !pre_fix_direct_rejects,
+            "fixture invalid: the pre-fix direct check was expected to accept \
+             {resource:?} -- if it rejects it, this fixture no longer proves the \
+             `?` hole existed"
+        );
+        assert!(
+            pre_fix_key_arn_pattern.is_match(resource),
+            "fixture invalid: the pre-fix ARN regex was expected to accept \
+             {resource:?} -- if it rejects it, this fixture no longer proves the \
+             `?` hole existed"
+        );
+
+        // Observation 2: both post-fix predicates reject it.
+        assert!(
+            kms_resource_is_wildcarded(resource),
+            "the post-fix direct check must treat {resource:?} as wildcarded"
+        );
+        assert!(
+            !kms_key_arn_pattern().is_match(resource),
+            "the post-fix ARN regex must reject {resource:?}"
+        );
+
+        // Observation 3: the real guards' own assertions fire on this statement.
+        // Run through catch_unwind so the panic is reported as a result here
+        // instead of aborting the binary.
+        let account_wide_guard = std::panic::catch_unwind(|| {
+            assert_kms_resource_is_not_account_wide("fixture", sid, resource)
+        });
+        assert!(
+            account_wide_guard.is_err(),
+            "no_kms_statement_grants_every_key_in_the_region's assertion must \
+             fire on {resource:?}"
+        );
+        let key_id_guard = std::panic::catch_unwind(|| {
+            assert_kms_resource_names_a_key_id("fixture", sid, resource)
+        });
+        assert!(
+            key_id_guard.is_err(),
+            "every_kms_statement_names_a_key_id's assertion must fire on \
+             {resource:?}"
+        );
+    }
 }
 
 #[test]
