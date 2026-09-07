@@ -150,14 +150,23 @@ trait honors cancellation by drop, so the query deadline (usually well under
   status in a crate-private type, and enables its own conflict retry only
   for the update / etag-match modes, never for create), so on
   `AlreadyExists` under `CreateIfAbsent` it issues one `HEAD` to
-  disambiguate: key **present** stays `AlreadyExists` (a real collision, so
-  the commit-path split-brain guard and the compaction vanished-part guard
-  still fire), key **absent** becomes a retryable `Transient` naming a
-  conditional-request conflict, which `StoreError::is_retryable` routes back
-  into the caller's existing retry loop. The mapping is safe by
-  construction: `Transient` is returned only when the key is absent, and a
-  genuine collision requires it to be present, so no real already-exists is
-  ever downgraded to a retry.
+  disambiguate, and the HEAD's own outcome decides which of four ways the
+  conflict resolves: key **present** stays `AlreadyExists` (a real
+  collision, so the commit-path split-brain guard and the compaction
+  vanished-part guard still fire); key **absent** becomes a retryable
+  `Transient` naming a conditional-request conflict, which
+  `StoreError::is_retryable` routes back into the caller's existing retry
+  loop; the HEAD itself failing retryably (`Throttled`, `Timeout`,
+  `Transient`) surfaces that error verbatim, because an inconclusive probe
+  determined nothing about the key, and a caller that read it as
+  `AlreadyExists` would stop retrying while nothing had been written; and
+  the HEAD failing terminally (`AccessDenied`, `PreconditionFailed`,
+  `Corrupted`, `InvalidRange`, `Permanent`) still resolves to
+  `AlreadyExists`, since retrying the probe cannot change a terminal
+  outcome. This cannot lose a genuine already-exists, only delay one: on
+  the retry the idempotent create conflicts again, and once a HEAD finally
+  succeeds a present key still yields `AlreadyExists`. The cost of an
+  inconclusive probe is one extra round trip, never a wrong answer.
 - Listing is paginated (S3 pages at 1000 keys). Cross-page guarantee: any
   key created before the first page request is returned; keys created
   during the scan may or may not appear; a key MAY appear more than once
