@@ -111,7 +111,10 @@ pub struct Cli {
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
-    /// Dev-only tenant resolution via the `x-ravel-tenant` header.
+    /// Dev-only tenant resolution via the `x-ravel-tenant` header. Refuses to
+    /// enable unless every bound listener (`--listen-http` and, when set,
+    /// `--listen-grpc`) is loopback: the dev header resolves an unauthenticated
+    /// routing key on every bound listener, not just HTTP.
     #[arg(long)]
     pub dev_insecure_tenant_header: bool,
 

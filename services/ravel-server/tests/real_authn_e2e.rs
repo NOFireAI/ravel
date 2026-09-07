@@ -225,16 +225,73 @@ async fn store_key_count(store: &MemoryStore) -> usize {
         .len()
 }
 
-/// With `--dev-insecure-tenant-header` OFF, an OTLP gRPC export carrying only
-/// the `x-ravel-tenant` header for a victim tenant (no bearer credential) is
-/// Unauthenticated on the public gRPC listener, and writes nothing durable.
-/// This exercises the running listener through `start()`, not the config-level
-/// `validate()` predicate: `main.rs` is the only caller of `Cli::validate` and
-/// `start()` never re-validates, so a config guard alone proves nothing about
-/// the listener (issue #1293).
-#[tokio::test]
-async fn forged_tenant_header_rejected_on_public_grpc_and_writes_nothing() {
+/// A minimal but non-empty OTLP metrics export: one resource, one gauge point
+/// under one series for `victim-tenant`. Sent with a real bearer this produces
+/// durable objects (the positive control below proves it); the negative test
+/// sends the exact same payload with only a forged `x-ravel-tenant` header, so
+/// its unchanged-key-count assertion measures a request the server would have
+/// written had it accepted it. An empty `resource_metrics` would make that
+/// assertion vacuous: an accepted-but-empty export writes nothing either, so
+/// before == after could not tell rejection from a no-op.
+fn victim_metrics_export_request()
+-> opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest {
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+    use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+    use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+    use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+    use opentelemetry_proto::tonic::metrics::v1::{
+        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+    };
+    use opentelemetry_proto::tonic::resource::v1::Resource;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let ts_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos() as u64;
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(AnyValueVariant::StringValue("authn-e2e".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: "authn_e2e_gauge".to_string(),
+                    data: Some(MetricData::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: ts_ns,
+                            value: Some(NumberValue::AsDouble(1.0)),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// Positive control for
+/// [`forged_tenant_header_rejected_on_public_grpc_and_writes_nothing`]: the
+/// same non-empty payload, exported with the victim tenant's real bearer
+/// token, must be accepted and write durable objects. Strict ingest (the
+/// default, no `x-ravel-ingest-mode` header) blocks the export until the
+/// flush's commit ack, so a completed `export` already guarantees the objects
+/// are on the store. Without this control the negative test's before/after
+/// assertion proves nothing: it could pass because the payload never writes
+/// anything, credential or not.
+#[tokio::test]
+async fn valid_bearer_metric_export_writes_durable_objects() {
     use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
 
     let (running, store) = start_returning_store(bearer_only_resolver(), None).await;
@@ -244,9 +301,67 @@ async fn forged_tenant_header_rejected_on_public_grpc_and_writes_nothing() {
     let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
         .await
         .expect("gRPC client connects");
-    let mut request = tonic::Request::new(ExportMetricsServiceRequest {
-        resource_metrics: Vec::new(),
-    });
+    let mut request = tonic::Request::new(victim_metrics_export_request());
+    request.metadata_mut().insert(
+        "authorization",
+        "Bearer victim-token".parse().expect("ascii metadata"),
+    );
+    client
+        .export(request)
+        .await
+        .expect("a valid bearer must authenticate and the export must be accepted");
+
+    let after = store_key_count(&store).await;
+    assert_eq!(
+        after - before,
+        DURABLE_OBJECTS_PER_METRIC_EXPORT,
+        "a valid non-empty metric export must write exactly \
+         {DURABLE_OBJECTS_PER_METRIC_EXPORT} durable object(s): store held {before} keys before \
+         and {after} after"
+    );
+
+    let metric_prefix = format!("t/{}/m/l0/", TenantId::new("victim-tenant").hash().to_hex());
+    let metric_objects = ravel_object_store::list_all(store.as_ref(), &metric_prefix)
+        .await
+        .expect("list metric data objects")
+        .len();
+    assert_eq!(
+        metric_objects, 1,
+        "the accepted export must land exactly one metric data object under {metric_prefix}"
+    );
+
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// The exact number of durable objects a single non-empty metric export writes
+/// through one shard's one flush: one data object, one commit record, one
+/// catalog manifest. Pinned so the negative test's before == after assertion
+/// is read against a payload known to move this count when accepted.
+const DURABLE_OBJECTS_PER_METRIC_EXPORT: usize = 3;
+
+/// With `--dev-insecure-tenant-header` OFF, an OTLP gRPC export carrying only
+/// the `x-ravel-tenant` header for a victim tenant (no bearer credential) is
+/// Unauthenticated on the public gRPC listener, and writes nothing durable.
+/// This exercises the running listener through `start()`, not the config-level
+/// `validate()` predicate: `main.rs` is the only caller of `Cli::validate` and
+/// `start()` never re-validates, so a config guard alone proves nothing about
+/// the listener (issue #1293).
+#[tokio::test]
+async fn forged_tenant_header_rejected_on_public_grpc_and_writes_nothing() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+
+    let (running, store) = start_returning_store(bearer_only_resolver(), None).await;
+    let before = store_key_count(&store).await;
+
+    let grpc_addr = running.grpc_addr.expect("gRPC listener binds in All mode");
+    let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+        .await
+        .expect("gRPC client connects");
+    // A non-empty payload, the same one the positive control proves DOES write
+    // durable objects with a real credential. With only the forged header the
+    // before == after assertion below now distinguishes rejection from an
+    // accepted no-op.
+    let mut request = tonic::Request::new(victim_metrics_export_request());
     request.metadata_mut().insert(
         DEV_TENANT_HEADER,
         "victim-tenant".parse().expect("ascii metadata"),
