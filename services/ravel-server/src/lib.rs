@@ -585,6 +585,7 @@ fn gateway_state(
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
     ingest_byte_metrics: &Arc<ingest_byte_metrics::IngestByteMetrics>,
+    ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
@@ -617,6 +618,7 @@ fn gateway_state(
             provisioning: provisioning.clone(),
         },
         admission: admission.clone(),
+        budget: ingest_buffer_budget.clone(),
         ingest_concurrency: ingest_concurrency.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
     })
@@ -982,6 +984,7 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &ingest_byte_metrics,
+            &ingest_buffer_budget,
             &metadata_sink,
         );
         http_router = http_router.merge(otlp_http::router(state));
@@ -1008,6 +1011,7 @@ pub async fn start(
                 &provisioning_writer,
                 &ingest_concurrency,
                 &ingest_byte_metrics,
+                &ingest_buffer_budget,
                 &metadata_sink,
             );
             let mtls_rw_state = remote_write_state(
@@ -1644,6 +1648,7 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &ingest_byte_metrics,
+            &ingest_buffer_budget,
             &metadata_sink,
         )),
         _ => None,
