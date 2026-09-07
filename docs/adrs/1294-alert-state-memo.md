@@ -138,7 +138,7 @@ flowchart TD
     latest --> lease{Hold tenant lease?}
     lease -->|no| done[Deliver queued notifications only]
     lease -->|yes| eval[Evaluate rules, write transitions]
-    eval --> write[Overwrite memo: watermark = current hour, records = latest]
+    eval --> write[Overwrite memo: watermark = seal-bound hour, records = latest]
     write --> done
 ```
 

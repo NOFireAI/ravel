@@ -2534,8 +2534,8 @@ mod tick_tests {
         );
     }
 
-    /// The lease holder writes the state memo after a tick, stamping the current
-    /// hour as the watermark and recording every folded alert.
+    /// The lease holder writes the state memo after a tick, stamping the
+    /// seal-bound hour as the watermark and recording every folded alert.
     #[tokio::test]
     async fn the_lease_holder_writes_the_state_memo() {
         let store = seeded_store().await;
