@@ -1921,6 +1921,29 @@ mod tests {
             "fixture must have at least one zstd directory"
         );
 
+        // Independent reference for the page total below (issue #1401 finding
+        // 4): every page PAGE_DIR lists, across every group and chunk, summed
+        // by its own `uncomp_len` when it is stored COMP_ZSTD and contributing
+        // nothing when it is raw -- read straight from the directory rather
+        // than through `decode_v4_block`'s own counters, and gated on each
+        // page's own `comp` field rather than assumed, so a charge that only
+        // covers the first page of each block (which would still clear a bare
+        // `> open_total` bound) is caught by the sum falling short.
+        let page_desc = *footer.section(kind::PAGE_DIR).expect("PAGE_DIR section");
+        let page_dir_raw = read_section(&obj, &page_desc, &cfg).expect("decode PAGE_DIR");
+        let page_dir = PageDir::decode(&page_dir_raw).expect("parse PAGE_DIR");
+        let mut page_total = 0u64;
+        for group in &page_dir.groups {
+            for chunk in &group.chunks {
+                for page in &chunk.pages {
+                    if page.comp == COMP_ZSTD {
+                        page_total += page.uncomp_len;
+                    }
+                }
+            }
+        }
+        assert!(page_total > 0, "fixture must decode at least one zstd page");
+
         let mut cursor = reader
             .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
             .expect("scan");
@@ -1928,9 +1951,11 @@ mod tests {
         assert_eq!(cursor.stats().decompressed_bytes, open_total);
         while cursor.next_block(&obj).expect("next").is_some() {}
         let total = cursor.stats().decompressed_bytes;
-        assert!(
-            total > open_total,
-            "draining blocks adds their decompressed page bytes on top of the open total"
+        assert_eq!(
+            total,
+            open_total + page_total,
+            "draining every block adds exactly the zstd pages PAGE_DIR lists, \
+             on top of the open total"
         );
 
         // A second, independent scan reports the identical figure: the seed is
