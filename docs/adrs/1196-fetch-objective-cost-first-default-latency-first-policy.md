@@ -58,10 +58,29 @@ which in practice means ranged reads for narrow projections. It is an intent, no
 a tuning constant: it says "spend requests to save wall time", and the engine
 decides how.
 
-The trade is stated in the flag's own documentation, not buried: **5.45x the GET
-requests** (570,752 against 104,780 over one pass) for **41% less cold time**.
-Intra-region transfer is free and requests are billed, so this is money for time
-at a rate the operator, not Ravel, should choose.
+The trade is stated in the flag's own documentation, not buried, and it is
+stated as a ratio measured at a named commit rather than as a property of the
+policy. Measured at `740f94b97`, 3 reps, reference corpus (#1185), 42-statement
+basis, true cold in the warm-up-empty state, at concurrency 256: **5.30x the GET
+requests** (570,752 against 107,781) for **52% less cold time** (235.7 s against
+493.0 s mean), with a per-rep range of 50.3% to 54.2%. Intra-region transfer is
+free and requests are billed, so this is money for time at a rate the operator,
+not Ravel, should choose.
+
+The Context table above records the original measurement: 5.45x for 41% less
+time, 570,752 against 104,780. That figure is not wrong about the run it
+describes; it predates #1271 and #835, which changed the stock arm on both sides
+of the ratio. The numerator is unchanged (570,752 in both, bit-identical across
+three reps), so only the cost-based denominator moved. Quote the commit whenever
+this ratio is quoted: the denominator is a property of the stock arm's code at a
+point in time, and it has moved twice already (issue #1316).
+
+A caveat that belongs with the number. The timing half carries real noise: on
+the measurement box, per-arm wall-clock spread across three reps was 6.7% to
+14.8%, and per-statement spread was wider still (median 10.8% to 16.4%). The
+request and byte counts are exact by comparison. So "52%" is a three-rep mean
+with a four-point range, not a constant, and a single-rep time delta below about
+15% on that host carries no information.
 
 **`latency-first` carries a memory precondition, and says so.** At the
 concurrency it needs to pay off, the ranged path is not currently survivable: one
@@ -113,8 +132,9 @@ and it does not make the resulting configuration safe.
   claim about a configuration that dies at statement 31.
 - Cost-regression bands move on the tuned lane only. `[data_gets]`
   (`crates/ravel-bench/cost_regression_bands.toml:38`, `kind = "exact"`) and the
-  two-sided `[modeled_request_cost]` (`:56-58`) both fail on a 5.45x request
-  change and must be re-banded per lane. `[bytes]` is one-sided and a reduction
+  two-sided `[modeled_request_cost]` (`:56-58`) both fail on a request change of
+  this policy's magnitude (measured between 5.3x and 5.5x across the runs to
+  date) and must be re-banded per lane. `[bytes]` is one-sided and a reduction
   passes it (`:6-10`), so it does not.
 - `[peak_memory]` is `expected = false` in that file, so the memory property this
   policy depends on has no gate today. It should become an emitted and enforced

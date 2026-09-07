@@ -6,6 +6,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **`latency-first`'s published trade is re-measured and now names the commit it
+  was taken on** (issue #1316). Over 3 reps on the reference corpus,
+  42-statement basis, true cold in the warm-up-empty state, at concurrency 256:
+  **5.30x the GET requests (570,752 against 107,781) for 52% less cold time
+  (235.7 s against 493.0 s mean), per-rep range 50.3% to 54.2%**. ADR-1196
+  records the commit and basis. The 0.14.0 entry below states 5.45x for 41%,
+  which is correct about the run it described but predates the changes to the
+  `cost-based` arm that form the ratio's denominator. The numerator (570,752)
+  is unchanged and was bit-identical across all three reps, so only the
+  denominator moved. The ratio is a measurement of two code paths at a point in
+  time, not a property of the policy. The timing half also carries more noise
+  than previously assumed (6.7% to 14.8% per-arm spread across reps on the
+  measurement host), so the figure is a mean with a range, not a constant.
+
 ## [0.14.0]
 
 ### Added
@@ -24,7 +40,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only once the operator raises concurrency explicitly to the measured
   configuration (`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`, 256), at
   a measured cost of about 5.45x the GET requests for about 41% less cold
-  time. Raising that concurrency also raises in-flight fetch memory, which
+  time (re-measured after this release as 5.30x for 52%; see the Unreleased
+  entry and issue #1316). Raising that concurrency also raises in-flight
+  fetch memory, which
   is not yet bounded by a process-wide budget (issues #1170, #1007); the
   flag's own documentation and a startup log line under `latency-first` make
   that precondition operator-visible.
