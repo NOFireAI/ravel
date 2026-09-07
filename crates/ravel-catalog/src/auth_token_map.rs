@@ -54,6 +54,24 @@ pub const AUTH_KEY: &str = "sys/auth";
 /// way under either version, as unmanaged -- and always writes 2.
 pub const AUTH_TOKEN_MAP_FORMAT_VERSION: u32 = 2;
 
+/// Highest map version a reader accepts: the supported read set is the closed
+/// interval `AUTH_TOKEN_MAP_MIN_READ_VERSION..=AUTH_TOKEN_MAP_MAX_READ_VERSION`
+/// (ADR-0066 decision 4), a set with a floor and a ceiling rather than a bare
+/// ceiling. A map declaring a higher version is refused rather than misread under
+/// this layout. Equals [`AUTH_TOKEN_MAP_FORMAT_VERSION`]: the writer already
+/// stamps 2 (the `managed_by` amendment shipped readers-before-writers), so the
+/// accepted set is exactly `{1, 2}`.
+pub const AUTH_TOKEN_MAP_MAX_READ_VERSION: u32 = 2;
+
+/// Lowest map version a reader accepts (ADR-0066 decision 4). Version 0 is an
+/// unstamped map from a writer that never set `format_version`; admitting it
+/// would let a valid-shaped but unstamped map be read and rewritten as a
+/// versioned map by a CAS-replace, so it is refused below the floor with the same
+/// typed [`AuthTokenMapError::UnsupportedVersion`] the ceiling uses. This closes
+/// the ceiling-only gate the ADR-0066 R1 amendment flagged for this record
+/// (#1300).
+pub const AUTH_TOKEN_MAP_MIN_READ_VERSION: u32 = 1;
+
 /// [`TokenEntry::managed_by`] value the operator's reconcile loop stamps on
 /// every entry it writes from a `tenantTokensSecretRef` Secret (ADR-0072
 /// decision 4 amendment). The operator's remove/replace pass touches
@@ -203,6 +221,39 @@ impl std::fmt::Display for AuthMapDefect {
     }
 }
 
+/// Remediation-aware message for [`AuthTokenMapError::UnsupportedVersion`]: a
+/// version below `floor` and one above `ceiling` are refused by the same gate but
+/// mean opposite things (ADR-0066 R2, #1300).
+fn unsupported_version_message(got: u32, floor: u32, ceiling: u32) -> String {
+    if got < floor {
+        format!(
+            "auth map {AUTH_KEY:?} declares format_version {got}, below the minimum {floor} this \
+             build reads: an unstamped or pre-versioning map; refusing rather than read it under \
+             the current layout"
+        )
+    } else {
+        format!(
+            "auth map {AUTH_KEY:?} declares format_version {got}, above the maximum {ceiling} this \
+             build reads: a map a newer build wrote; refusing rather than misread a future format"
+        )
+    }
+}
+
+/// The supported-set version gate [`decode_map`] applies: a map is accepted only
+/// when `floor <= got <= ceiling`, refused with the remediation-aware
+/// [`AuthTokenMapError::UnsupportedVersion`] otherwise. Bounds are parameters so a
+/// test can rebuild a narrower reader from this same gate (ADR-0066 R2, #1300).
+fn check_read_version(got: u32, floor: u32, ceiling: u32) -> Result<(), AuthTokenMapError> {
+    if got < floor || got > ceiling {
+        return Err(AuthTokenMapError::UnsupportedVersion {
+            got,
+            floor,
+            ceiling,
+        });
+    }
+    Ok(())
+}
+
 /// A typed auth-map failure. Every variant is fatal to the touch that raised it,
 /// the fail-closed-on-any-anomaly discipline the other durable-object modules
 /// follow. None warn and continue.
@@ -218,11 +269,14 @@ pub enum AuthTokenMapError {
         #[source]
         source: prost::DecodeError,
     },
-    #[error(
-        "auth map {AUTH_KEY:?} declares format_version {got}, but this build only understands \
-         version {AUTH_TOKEN_MAP_FORMAT_VERSION}: refusing rather than misread a future format"
-    )]
-    UnsupportedVersion { got: u32 },
+    /// A map's `format_version` fell outside the supported read set
+    /// `AUTH_TOKEN_MAP_MIN_READ_VERSION..=AUTH_TOKEN_MAP_MAX_READ_VERSION`.
+    /// `floor` and `ceiling` are the bounds the refusing gate applied, keeping the
+    /// two remediations distinct (ADR-0066 R2, #1300): a version below `floor` is
+    /// a legacy or unstamped map, a version above `ceiling` is a map a newer build
+    /// wrote.
+    #[error("{}", unsupported_version_message(*got, *floor, *ceiling))]
+    UnsupportedVersion { got: u32, floor: u32, ceiling: u32 },
     #[error("auth map {AUTH_KEY:?} is corrupt: {defect} (ADR-0066 decision 6)")]
     Corrupt { defect: AuthMapDefect },
     /// The stored map's `key_fingerprint` disagrees with the configured
@@ -280,11 +334,11 @@ fn decode_map(
     proto: &ProtoAuthTokenMap,
     deployment_key: &[u8; 32],
 ) -> Result<AuthTokenMap, AuthTokenMapError> {
-    if proto.format_version > AUTH_TOKEN_MAP_FORMAT_VERSION {
-        return Err(AuthTokenMapError::UnsupportedVersion {
-            got: proto.format_version,
-        });
-    }
+    check_read_version(
+        proto.format_version,
+        AUTH_TOKEN_MAP_MIN_READ_VERSION,
+        AUTH_TOKEN_MAP_MAX_READ_VERSION,
+    )?;
     if proto.key_fingerprint.len() != KEY_FINGERPRINT_LEN {
         return Err(AuthTokenMapError::Corrupt {
             defect: AuthMapDefect::BadFingerprintLength,
@@ -1138,12 +1192,12 @@ mod tests {
         );
     }
 
-    /// A future format_version is refused rather than misread.
-    #[tokio::test]
-    async fn read_rejects_future_format_version() {
-        let store = mem();
+    /// Seed a `sys/auth` object at an explicit `format_version`, bypassing the
+    /// writer's stamp, so a test can put exactly the map a newer or too-new writer
+    /// (or a pre-versioning writer that never stamped a version) would leave.
+    async fn seed_at_version(store: &dyn ObjectStoreBackend, version: u32) {
         let proto = ProtoAuthTokenMap {
-            format_version: AUTH_TOKEN_MAP_FORMAT_VERSION + 1,
+            format_version: version,
             key_fingerprint: key_fingerprint(KEY).to_vec(),
             entries: vec![],
             updated_unix_ns: 1,
@@ -1155,14 +1209,73 @@ mod tests {
                 PutOptions::default(),
             )
             .await
-            .expect("seed future");
+            .expect("seed map at version");
+    }
+
+    /// The supported read set is exactly {1, 2} (ADR-0066 decision 4): a version-1
+    /// and a version-2 map both read back, while a version-0 map (below the floor:
+    /// an unstamped map from a writer that never set format_version) is refused
+    /// below the floor and a version-3 map (above the ceiling) is refused above the
+    /// ceiling, each with the typed `UnsupportedVersion` carrying the exact
+    /// bound the gate applied. Closes the ceiling-only gate the R1 amendment
+    /// flagged for `sys/auth` (#1300).
+    #[tokio::test]
+    async fn reader_accepts_one_and_two_refuses_zero_and_three() {
+        for version in [
+            AUTH_TOKEN_MAP_MIN_READ_VERSION,
+            AUTH_TOKEN_MAP_MAX_READ_VERSION,
+        ] {
+            let store = mem();
+            seed_at_version(store.as_ref(), version).await;
+            let read = read_auth_map(store.as_ref(), KEY)
+                .await
+                .unwrap_or_else(|e| panic!("version {version} must read-accept: {e}"));
+            assert!(read.is_some(), "version {version} decodes to a map");
+        }
+
+        // Below the floor: version 0 is refused, and it is specifically the
+        // below-floor case (got < floor).
+        let store = mem();
+        seed_at_version(store.as_ref(), 0).await;
         let err = read_auth_map(store.as_ref(), KEY)
             .await
-            .expect_err("a future format_version must be refused");
+            .expect_err("version 0 must be refused below the floor");
         assert!(
-            matches!(err, AuthTokenMapError::UnsupportedVersion { .. }),
-            "got: {err}"
+            matches!(
+                err,
+                AuthTokenMapError::UnsupportedVersion {
+                    got: 0,
+                    floor: 1,
+                    ceiling: 2
+                }
+            ),
+            "expected the below-floor UnsupportedVersion, got: {err}"
         );
+        if let AuthTokenMapError::UnsupportedVersion { got, floor, .. } = err {
+            assert!(got < floor, "version 0 is below the floor");
+        }
+
+        // Above the ceiling: version 3 is refused, and it is specifically the
+        // above-ceiling case (got > ceiling).
+        let store = mem();
+        seed_at_version(store.as_ref(), AUTH_TOKEN_MAP_MAX_READ_VERSION + 1).await;
+        let err = read_auth_map(store.as_ref(), KEY)
+            .await
+            .expect_err("version 3 must be refused above the ceiling");
+        assert!(
+            matches!(
+                err,
+                AuthTokenMapError::UnsupportedVersion {
+                    got: 3,
+                    floor: 1,
+                    ceiling: 2
+                }
+            ),
+            "expected the above-ceiling UnsupportedVersion, got: {err}"
+        );
+        if let AuthTokenMapError::UnsupportedVersion { got, ceiling, .. } = err {
+            assert!(got > ceiling, "version 3 is above the ceiling");
+        }
     }
 
     /// A corrupt (undecodable) object body is a typed `Decode` error, never a

@@ -43,7 +43,14 @@ use ravel_types::TenantHash;
 /// this. It is also the highest version a rewrite can reproduce byte-for-byte, so
 /// a rewrite refuses any record declaring a version above it rather than strip a
 /// field it does not model (ADR-0066 decision 5).
-pub const TENANT_CONFIG_FORMAT_VERSION: u32 = 1;
+///
+/// Stamped 2 since the ADR-0066 R2 writer flip (#1300): the R1 reader that
+/// accepts the set {1, 2} shipped fleet-wide first, so from this build
+/// [`set_tenant_config`] stamps 2 on every record and a binary predating R1
+/// (which reads only {1}) refuses these records rather than rebuilding them at an
+/// older field set and stripping `typed_attr_columns` it does not model. Version
+/// 1 remains readable.
+pub const TENANT_CONFIG_FORMAT_VERSION: u32 = 2;
 
 /// Highest record version a reader accepts: the supported read set is
 /// `1..=TENANT_CONFIG_MAX_READ_VERSION` (ADR-0066 decision 4). A record declaring
@@ -55,8 +62,10 @@ pub const TENANT_CONFIG_FORMAT_VERSION: u32 = 1;
 /// binary reading a record a newer peer wrote does not fail closed. The lifecycle
 /// refresh loop reads this record on a bounded-staleness horizon; a single-release
 /// bump that refused the newer version would break that refresh across a rolling
-/// upgrade. The writer bump to 2 (R2) is a separate later change, sequenced after
-/// this reader accepts 2 fleet-wide.
+/// upgrade. Since the R2 writer flip (#1300) [`TENANT_CONFIG_FORMAT_VERSION`]
+/// equals this ceiling: the writer now stamps 2, so `MAX_READ` no longer runs
+/// ahead of the writer. The next additive change repeats the split, moving
+/// `MAX_READ` to 3 first.
 pub const TENANT_CONFIG_MAX_READ_VERSION: u32 = 2;
 
 /// Lowest record version a reader accepts: the supported read set is a closed
@@ -323,6 +332,48 @@ pub fn resolve_retention_window(
         .or(default_retention_ns)
 }
 
+/// Remediation-aware message for [`TenantConfigError::UnsupportedVersion`]: a
+/// version below `floor` and one above `ceiling` are refused by the same gate but
+/// mean opposite things (ADR-0066 R2, #1300).
+fn unsupported_version_message(key: &str, got: u32, floor: u32, ceiling: u32) -> String {
+    if got < floor {
+        format!(
+            "config record {key:?} declares format_version {got}, below the minimum {floor} this \
+             build reads: an unstamped or pre-versioning record; refusing rather than apply it \
+             under the current layout"
+        )
+    } else {
+        format!(
+            "config record {key:?} declares format_version {got}, above the maximum {ceiling} this \
+             build reads: a record a newer build wrote; refusing rather than misread a future \
+             record format"
+        )
+    }
+}
+
+/// The supported-set version gate shared by the read ([`decode_record`]) and the
+/// CAS-rewrite ([`set_tenant_config`]) paths: a record is accepted only when
+/// `floor <= got <= ceiling`, refused with the remediation-aware
+/// [`TenantConfigError::UnsupportedVersion`] otherwise. Bounds are parameters so
+/// a test can rebuild a pre-R1 `{1}`-only reader from this same gate (ADR-0066
+/// R2, #1300).
+fn check_read_version(
+    got: u32,
+    key: &str,
+    floor: u32,
+    ceiling: u32,
+) -> Result<(), TenantConfigError> {
+    if got < floor || got > ceiling {
+        return Err(TenantConfigError::UnsupportedVersion {
+            key: key.to_string(),
+            got,
+            floor,
+            ceiling,
+        });
+    }
+    Ok(())
+}
+
 /// A typed config-record failure. Every variant is fatal to the touch that
 /// raised it, the fail-closed-on-any-anomaly discipline `ProvisioningError` and
 /// `KeyEpochError` follow. None warn and continue.
@@ -340,12 +391,19 @@ pub enum TenantConfigError {
         #[source]
         source: prost::DecodeError,
     },
-    #[error(
-        "config record {key:?} declares format_version {got}, but this build only understands \
-         versions 1..={TENANT_CONFIG_MAX_READ_VERSION}: refusing rather than misread a future \
-         record format"
-    )]
-    UnsupportedVersion { key: String, got: u32 },
+    /// A record's `format_version` fell outside the supported read set
+    /// `TENANT_CONFIG_MIN_READ_VERSION..=TENANT_CONFIG_MAX_READ_VERSION`. `floor`
+    /// and `ceiling` are the bounds the refusing gate applied, keeping the two
+    /// remediations distinct (ADR-0066 R2, #1300): a version below `floor` is a
+    /// legacy or unstamped record, a version above `ceiling` is a record a newer
+    /// build wrote.
+    #[error("{}", unsupported_version_message(key, *got, *floor, *ceiling))]
+    UnsupportedVersion {
+        key: String,
+        got: u32,
+        floor: u32,
+        ceiling: u32,
+    },
     /// [`set_tenant_config`] read a record declaring a version this build's writer
     /// cannot reproduce (> [`TENANT_CONFIG_FORMAT_VERSION`]). The whole-record
     /// CAS-replace rebuilds the body from this build's field set, so a field a
@@ -425,14 +483,12 @@ fn decode_record(
     key: &str,
     tenant_hash: &TenantHash,
 ) -> Result<TenantConfig, TenantConfigError> {
-    if record.format_version < TENANT_CONFIG_MIN_READ_VERSION
-        || record.format_version > TENANT_CONFIG_MAX_READ_VERSION
-    {
-        return Err(TenantConfigError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_read_version(
+        record.format_version,
+        key,
+        TENANT_CONFIG_MIN_READ_VERSION,
+        TENANT_CONFIG_MAX_READ_VERSION,
+    )?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(TenantConfigError::CorruptRecord {
             key: key.to_string(),
@@ -1045,29 +1101,37 @@ mod tests {
         );
     }
 
-    /// A version-2 config record put through `set_tenant_config`'s whole-record
-    /// CAS-replace is REFUSED, not rebuilt at version 1: the rebuild names every
-    /// field explicitly and would drop any field a newer writer added. The stored
-    /// bytes must be exactly unchanged. Named per ADR-0066 R1 (decision 5).
+    /// A record newer than this build's writer can reproduce, put through
+    /// `set_tenant_config`'s whole-record CAS-replace, is REFUSED, not rebuilt at
+    /// the older field set. The stored bytes must be exactly unchanged. Since the
+    /// R2 writer flip (#1300) `set_tenant_config` decodes the existing record
+    /// through the supported-set gate FIRST, so a version above the read-set
+    /// ceiling (2) is refused with the above-ceiling `UnsupportedVersion` -- an
+    /// unreadable record is refused as unreadable, before the narrower
+    /// rewrite-refusal check it would once have hit. `RefusingToRewriteNewerRecord`
+    /// is dormant post-R2 (its "readable but not reproducible" domain is empty
+    /// while `MAX_READ` == the writer version) and fires again at the next additive
+    /// change, when `MAX_READ` moves ahead of the writer.
     #[tokio::test]
-    async fn set_tenant_config_refuses_a_version_two_record_from_a_version_one_writer() {
+    async fn set_tenant_config_refuses_a_record_newer_than_the_writer_can_reproduce() {
         let store = mem();
         let key = config_key(&tenant());
-        // A version-2 record on disk (as a newer writer would leave it).
+        // A record one past the read-set ceiling on disk (as a still-newer writer
+        // would leave it).
         let mut seeded_record = build_record(
             &tenant(),
             &TenantConfig::new(TenantLifecycleState::Suspended),
             1_000,
             1_000,
         );
-        seeded_record.format_version = 2;
+        seeded_record.format_version = TENANT_CONFIG_MAX_READ_VERSION + 1;
         let seeded = seeded_record.encode_to_vec();
         store
             .put(&key, seeded.clone().into(), PutOptions::default())
             .await
-            .expect("seed a version-2 config record");
+            .expect("seed a newer config record");
 
-        // A version-1 writer tries to overwrite it: refused, nothing written.
+        // This build's writer tries to overwrite it: refused, nothing written.
         let err = set_tenant_config(
             store.as_ref(),
             &tenant(),
@@ -1079,7 +1143,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TenantConfigError::RefusingToRewriteNewerRecord { got: 2, .. }
+                TenantConfigError::UnsupportedVersion { got, ceiling, .. }
+                    if got == TENANT_CONFIG_MAX_READ_VERSION + 1 && got > ceiling
             ),
             "got: {err}"
         );
@@ -1088,7 +1153,7 @@ mod tests {
         assert_eq!(
             after.as_ref(),
             seeded.as_slice(),
-            "the stored version-2 record must be byte-for-byte unchanged"
+            "the stored newer record must be byte-for-byte unchanged"
         );
     }
 
@@ -1143,20 +1208,22 @@ mod tests {
         );
     }
 
-    /// `TENANT_CONFIG_FORMAT_VERSION` is unchanged by the additive
-    /// `typed_attr_columns` field (ADR-0090: no bump for an additive field).
-    /// Pinned so a future accidental bump on this field's account fails loudly.
+    /// The writer stamps `TENANT_CONFIG_FORMAT_VERSION` = 2 since the ADR-0066 R2
+    /// flip (#1300), and readers accept the set {1, 2}. Pinned so a change to
+    /// either constant is a deliberate, reviewed move rather than an accident.
     #[test]
-    fn tenant_config_format_version_is_unchanged() {
+    fn tenant_config_writer_stamps_two_readers_accept_one_and_two() {
         assert_eq!(
-            TENANT_CONFIG_FORMAT_VERSION, 1,
-            "typed_attr_columns is additive; ADR-0090 forbids a format-version bump"
+            TENANT_CONFIG_FORMAT_VERSION, 2,
+            "ADR-0066 R2: the writer stamps version 2, a floor signal older binaries fail closed on"
         );
-        // ADR-0066 R1: the writer still stamps 1 while readers accept {1, 2}. A
-        // premature writer bump (R2) here would flip this pin.
+        assert_eq!(
+            TENANT_CONFIG_MIN_READ_VERSION, 1,
+            "readers still accept version 1 (ADR-0066 decision 4)"
+        );
         assert_eq!(
             TENANT_CONFIG_MAX_READ_VERSION, 2,
-            "readers accept versions 1 and 2 (ADR-0066 decision 4); writer stays at 1 until R2"
+            "readers accept versions 1 and 2 (ADR-0066 decision 4)"
         );
     }
 
@@ -1396,6 +1463,69 @@ mod tests {
                 .expect("read")
                 .is_none(),
             "an invalid declaration must not persist"
+        );
+    }
+
+    /// Issue #1300's own test (ADR-0066 R2): the current `set_tenant_config`
+    /// writer stamps `format_version` = 2 and carries `typed_attr_columns`
+    /// (field 12), a field the original version-1 writer never emitted; a binary
+    /// predating the R1 reader accepts only {1}, so rebuilding that reader from the
+    /// shared version gate at the pre-R1 bounds REFUSES the record with the
+    /// above-ceiling `UnsupportedVersion`, and the stored bytes stay byte-identical
+    /// because no rewrite runs. Prove-the-test flip: stamp `TENANT_CONFIG_FORMAT_VERSION`
+    /// back to 1 and the writer produces a version-1 record the {1}-reader accepts.
+    #[tokio::test]
+    async fn writer_stamps_two_and_a_pre_r1_reader_refuses_the_record() {
+        let store = mem();
+        let key = config_key(&tenant());
+        let mut cfg = TenantConfig::new(TenantLifecycleState::Active);
+        cfg.typed_attr_columns = Some(vec![DeclaredTypedColumn {
+            key: "http.status_code".into(),
+            ty: DeclaredColumnType::I64,
+        }]);
+        set_tenant_config(store.as_ref(), &tenant(), &cfg, 1_000)
+            .await
+            .expect("write the config record");
+
+        let raw = store.get(&key, GetRange::Full).await.expect("read").data;
+        let record = sysproto::TenantConfigRecord::decode(raw.as_ref()).expect("decode");
+        assert_eq!(
+            record.format_version, TENANT_CONFIG_FORMAT_VERSION,
+            "the current writer stamps version 2"
+        );
+        assert_eq!(record.format_version, 2, "exact wire version is 2");
+        assert!(
+            record.typed_attr_columns.is_some(),
+            "the record carries typed_attr_columns (field 12), a field a version-1 writer never \
+             emitted"
+        );
+
+        let err = check_read_version(record.format_version, &key, 1, 1)
+            .expect_err("a pre-R1 {1}-reader must refuse the version-2 record");
+        assert!(
+            matches!(
+                err,
+                TenantConfigError::UnsupportedVersion {
+                    got: 2,
+                    floor: 1,
+                    ceiling: 1,
+                    ..
+                }
+            ),
+            "expected the above-ceiling UnsupportedVersion, got: {err}"
+        );
+        if let TenantConfigError::UnsupportedVersion { got, ceiling, .. } = err {
+            assert!(
+                got > ceiling,
+                "the record is above the ceiling, not below the floor"
+            );
+        }
+
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            raw.as_ref(),
+            "a refused pre-R1 read writes nothing; the version-2 record is intact"
         );
     }
 }

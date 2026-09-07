@@ -57,10 +57,15 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         ("AdmissionUsageSnapshot", Immutable(&[1])),
         ("WorkerHeartbeat", Immutable(&[1])),
         // Read-modify-write under CAS. ProvisioningRecord / TenantConfigRecord /
-        // MetricMetadataRecord accept {1, 2} after ADR-0066 R1 (this change);
-        // AuthTokenMap already accepts {1, 2} (managed_by, ADR-0072 #897). The
-        // rest still accept {1}: their reader gates are unchanged here because
-        // their crates are in flight under other work (reported, not fixed).
+        // MetricMetadataRecord accept {1, 2}; since ADR-0066 R2 (#1300) their
+        // writers stamp 2 as well. AuthTokenMap accepts {1, 2} (managed_by,
+        // ADR-0072 #897) and R2 added its below-floor gate. KeyEpochRecord now
+        // carries a MIN/MAX supported-set gate too (R2, #1300) with the set {1}.
+        // GcConfig and CompactionClaim still carry a ceiling-only gate: their
+        // crates are in flight under other work (reported, not fixed). Each
+        // ravel-catalog slice below is re-derived from the reader's own MIN/MAX
+        // constants in `catalog_slices_match_reader_constants`, so widening a gate
+        // without updating the slice fails that test.
         ("ProvisioningRecord", CasMutable(&[1, 2])),
         ("TenantConfigRecord", CasMutable(&[1, 2])),
         ("MetricMetadataRecord", CasMutable(&[1, 2])),
@@ -157,13 +162,25 @@ fn classification_is_complete() {
         "classification_table() names messages not in sys.proto (renamed or removed?): {stale:?}"
     );
 
-    // Sanity: the eleven versioned messages ADR-0066 enumerates are all present,
-    // so a parser regression that silently found none is itself caught.
+    // The parsed message set matches the classification table exactly (the
+    // difference checks above already prove both inclusions; this pins the count
+    // so the two cannot both drift together). A non-empty floor is kept for the
+    // parser-regression case: a parser that silently found none, or far fewer than
+    // the versioned messages ADR-0066 enumerates, fails here rather than passing a
+    // vacuous scan.
+    assert!(
+        in_proto.len() >= 11,
+        "expected at least the 11 versioned sys.proto messages ADR-0066 decision 4 enumerates; \
+         found {}: {in_proto:?} (parser regression?)",
+        in_proto.len()
+    );
     assert_eq!(
         in_proto.len(),
-        11,
-        "expected 11 versioned sys.proto messages (ADR-0066 decision 4); found {}: {in_proto:?}",
-        in_proto.len()
+        classification_table().len(),
+        "every parsed versioned message is classified and vice versa; found {} in the proto, {} in \
+         the table",
+        in_proto.len(),
+        classification_table().len()
     );
 }
 
@@ -223,4 +240,70 @@ fn a_new_versioned_message_is_detected_as_unclassified() {
         in_proto.difference(&classified).next().is_some(),
         "an unclassified message must make the completeness difference non-empty"
     );
+}
+
+/// The supported read-version slice in the classification table for each record
+/// ravel-catalog owns is re-derived from that reader's own MIN/MAX constants, not
+/// pinned as a literal only here: a gate widened by moving a MAX (or MIN) constant
+/// without updating the table's slice fails this test (ADR-0066 R2, #1300,
+/// finding 3b). Records whose readers live in other crates (GcConfig,
+/// CompactionClaim, the write-once/overwrite markers) are not checked here because
+/// their constants are not importable from ravel-catalog.
+#[test]
+fn catalog_slices_match_reader_constants() {
+    use ravel_catalog::{
+        AUTH_TOKEN_MAP_MAX_READ_VERSION, AUTH_TOKEN_MAP_MIN_READ_VERSION,
+        KEY_EPOCH_MAX_READ_VERSION, KEY_EPOCH_MIN_READ_VERSION, METRICS_META_MAX_READ_VERSION,
+        METRICS_META_MIN_READ_VERSION, PROVISIONING_MAX_READ_VERSION,
+        PROVISIONING_MIN_READ_VERSION, TENANT_CONFIG_MAX_READ_VERSION,
+        TENANT_CONFIG_MIN_READ_VERSION,
+    };
+
+    // (message name, reader floor, reader ceiling) for every record ravel-catalog
+    // owns the reader gate for.
+    let derived: [(&str, u32, u32); 5] = [
+        (
+            "ProvisioningRecord",
+            PROVISIONING_MIN_READ_VERSION,
+            PROVISIONING_MAX_READ_VERSION,
+        ),
+        (
+            "TenantConfigRecord",
+            TENANT_CONFIG_MIN_READ_VERSION,
+            TENANT_CONFIG_MAX_READ_VERSION,
+        ),
+        (
+            "MetricMetadataRecord",
+            METRICS_META_MIN_READ_VERSION,
+            METRICS_META_MAX_READ_VERSION,
+        ),
+        (
+            "AuthTokenMap",
+            AUTH_TOKEN_MAP_MIN_READ_VERSION,
+            AUTH_TOKEN_MAP_MAX_READ_VERSION,
+        ),
+        (
+            "KeyEpochRecord",
+            KEY_EPOCH_MIN_READ_VERSION,
+            KEY_EPOCH_MAX_READ_VERSION,
+        ),
+    ];
+
+    let table = classification_table();
+    for (name, floor, ceiling) in derived {
+        let class = *table
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} must be in the classification table"));
+        let table_slice: &[u32] = match class {
+            Class::CasMutable(versions) | Class::Immutable(versions) => versions,
+        };
+        let expected: Vec<u32> = (floor..=ceiling).collect();
+        assert_eq!(
+            table_slice,
+            expected.as_slice(),
+            "{name}: the classification-table slice {table_slice:?} must equal the reader's \
+             {floor}..={ceiling} constants ({expected:?}); a widened gate without a table update \
+             lands here"
+        );
+    }
 }

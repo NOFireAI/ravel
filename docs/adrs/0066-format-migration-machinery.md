@@ -242,9 +242,13 @@ were permissive: `ProvisioningRecord`, `TenantConfigRecord`, `MetricMetadataReco
 now accept the read set exactly {1, 2} and their CAS rewrite paths refuse a
 record whose version exceeds what this build's writer stamps (still 1),
 preventing the strip before any version-2 writer exists. The accepted set is a
-set with a floor, not a ceiling: each reader gate rejects a version below 1 with
-the same typed `UnsupportedVersion` error it uses for a version above 2. A
-version-0 record — a valid-shaped record from a writer that never stamped
+set with a floor, not a ceiling: each reader gate rejects a version below the
+floor as well as one above the ceiling. Both refusals are the typed
+`UnsupportedVersion`, but R2 (#1300) carries the applied `floor` and `ceiling` on
+that error and branches its message, so a below-floor record ("a legacy or
+unstamped record") and an above-ceiling record ("a record a newer build wrote")
+give an operator distinct remediation instead of one "future record format" line.
+A version-0 record — a valid-shaped record from a writer that never stamped
 `format_version` — is therefore refused rather than admitted and later rewritten
 as version 1 by a CAS path; whether any pre-release binary ever wrote such a
 record into a live bucket is unknown, which is exactly why the gate is a set and
@@ -272,24 +276,28 @@ with, so it refuses a version-2 record and keeps the sink from stripping.
 `read_metrics_meta_for_serve` is the read-only decoder for the cache; it applies
 the shared `decode_body` gate ({1, 2}) and does NOT apply the rewrite refusal, so
 a version-2 record's v1 fields are served rather than turned into an empty
-snapshot. The query metadata cache's fetch calls the serve reader. An earlier
-draft of this amendment accepted "serve an empty record for one horizon" on a
-version-2 record during an R2 rollout as a bounded cost; the split removes that
-degradation, so it is no longer a trade-off this ADR accepts. (The single
-background-refresh caller in that cache still uses the strict reader; widening it
-is follow-up work outside #1300's permitted scope and does not reintroduce the
-serve-empty horizon on the inline fetch path.)
+snapshot. Both the query metadata cache's inline fetch AND its background refresh
+call the serve reader; the strict reader is used only by the ingest sink's
+CAS-loser re-merge, the one caller that re-encodes the record and would strip a
+field. An earlier draft of this amendment accepted "serve an empty record for one
+horizon" on a version-2 record during an R2 rollout as a bounded cost, and a
+later draft still routed the cache's background refresh through the strict reader;
+both are superseded -- the serve reader on every read path removes the serve-empty
+degradation on fills and refreshes alike, so it is no longer a trade-off this ADR
+accepts.
 
-**The four never-audited records, reported not fixed here (their crates are in
-flight under other work):** `TenantRecoveryManifest` and `AdmissionUsageSnapshot`
+**The remaining never-audited records, reported not fixed here (their crates are
+in flight under other work):** `TenantRecoveryManifest` and `AdmissionUsageSnapshot`
 are never-rewritten (write-once and sole-writer-overwrite respectively), so they
-carry no strip risk. `GcConfig` (ravel-maintain) and `KeyEpochRecord`
-(ravel-catalog `key_epoch`) ARE CAS-mutable and still carry the permissive reader
-gate; neither has an additive field shipped past version 1 today, so neither is a
-*live* strip instance, but both would be if an additive field lands before their
-gate is widened. `CompactionClaim` (ADR-1029) is likewise CAS-mutable with a
-permissive gate and no post-v1 additive field. These are flagged for their owning
-tasks; this change does not touch their gates.
+carry no strip risk. `GcConfig` (ravel-maintain) and `CompactionClaim` (ADR-1029)
+ARE CAS-mutable and still carry the permissive ceiling-only reader gate; neither
+has an additive field shipped past version 1 today, so neither is a *live* strip
+instance, but both would be if an additive field lands before their gate is
+widened. These are flagged for their owning tasks; this change does not touch
+their gates. (R2, #1300, closed the two ceiling-only gates that WERE in
+ravel-catalog: `KeyEpochRecord` and `AuthTokenMap` now carry a MIN/MAX
+supported-set gate with a floor, so a version-0 unstamped record is refused below
+the floor rather than admitted and later rewritten.)
 
 **Rejected R1 alternatives** (and why the reader-set-plus-rewrite-refusal shape
 won): an unknown-tail bytes field to carry unmodeled fields across a rewrite (its
@@ -299,3 +307,57 @@ gate (a durable read on every CAS path, and it cannot protect the first write
 after a bump); and prospective-only (bump only future writers), which leaves f6,
 f7, and f12 strippable by every already-deployed binary — the live half of the
 bug.
+
+## Amendment (R2, 2026-09-07, #1300): the writer flip and the last two floor gates
+
+R1 shipped the reader half. R2 completes the sequence.
+
+**The writer flip.** The three writers whose readers R1 taught to accept {1, 2}
+now stamp `format_version` = 2 on every record they write:
+`ProvisioningRecord` (`build_record`, and the `append_generation` /
+`raise_format_floor` CAS rewrites, which re-stamp a version-1 record to 2 on
+rewrite), `TenantConfigRecord` (`set_tenant_config`), and `MetricMetadataRecord`
+(`write_metrics_meta`). From this commit, a binary that predates R1 — one whose
+reader accepts only {1} — refuses these records outright rather than reading,
+re-encoding through its older field set, and CAS-writing back a record with
+`generations`/`format_floors`/`typed_attr_columns` stripped. That fail-closed
+refusal, not a silent strip, is the behaviour issue #1300 asks for. The sequence
+is safe because R1 (readers accept {1, 2}) rolled out fleet-wide first: every
+current reader accepts 2 before any writer stamps it (readers-before-writers,
+Decision 2). This is a version-stamp change — a record field, not a protocol
+step — and R1 already recorded the class, so RUST_ONLY: no proto field, key
+layout, or wire-format change rides with it (the proto message comments are
+updated to say version 2 is current and version 1 remains readable).
+
+The reader accepted set stays exactly {1, 2}; only the writer moved. Since
+`MAX_READ` now equals the writer version for these three, the R1
+serve-vs-strict divergence for `MetricMetadataRecord` (a version the serve reader
+accepts but the strict rewrite reader refuses) is dormant until the next additive
+change moves `MAX_READ` to 3 ahead of the writer, at which point the split
+protects the rewrite path again. `RefusingToRewriteNewerRecord` is likewise
+dormant for `TenantConfigRecord` and `MetricMetadataRecord` (whose decode gate
+runs before the rewrite-refusal check, so a record above the ceiling is refused as
+unreadable), and still reachable for `ProvisioningRecord` (whose rewrite paths
+check the raw version before the wider-read-set gate).
+
+**Deleting version-1 read support is a LATER change, not this one.** R2 does not
+narrow any reader. Retiring version 1 is legal only on evidence — the recorded
+per-(tenant, signal) format floors (Decision 3) must show no live version-1
+record remains — exactly the evidence-based retirement Decision 4's N/N-1 window
+requires; a floor citation, never a calendar.
+
+**The last two ceiling-only gates.** R1's classification flagged
+`KeyEpochRecord` and `AuthTokenMap` as CAS-mutable records still carrying a bare
+`format_version > CONSTANT` ceiling gate that admitted a version-0 unstamped
+record. R2 gives each a `MIN..=MAX` supported-set gate (`KeyEpochRecord` reads
+{1}, `AuthTokenMap` reads {1, 2}), so a version-0 record is refused below the
+floor rather than admitted and later rewritten as a versioned record by a CAS
+path. `GcConfig` and `CompactionClaim` remain ceiling-only and are reported for
+their owning crates, unchanged here.
+
+**The refusal message split.** Every one of these gates now carries the applied
+`floor` and `ceiling` on its typed `UnsupportedVersion` and branches its message:
+a below-floor version reads as "a legacy or unstamped record predating the
+versioned layout", an above-ceiling version as "a record a newer build wrote", so
+an operator gets the right remediation instead of the single "future record
+format" line R1 used for both ends.

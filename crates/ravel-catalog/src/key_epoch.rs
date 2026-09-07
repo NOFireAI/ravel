@@ -38,11 +38,30 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, Stor
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::TenantHash;
 
-/// Format floor written into every key-epoch record this build emits, and the
-/// highest record version it understands. A record declaring a higher version
-/// is refused rather than misread under this layout (ADR-0062 decision 1b),
-/// matching the `prov`/`sys/gc` records' version guards.
+/// Format floor written into every key-epoch record this build emits (the
+/// bootstrap create and every CAS-append rewrite stamp exactly this). A record
+/// declaring a version this build cannot reproduce byte-for-byte is refused by
+/// the CAS-rewrite path rather than rewritten whole (ADR-0062 decision 1b,
+/// ADR-0066 decision 5).
 pub const KEY_EPOCH_FORMAT_VERSION: u32 = 1;
+
+/// Highest record version a reader accepts: the supported read set is the closed
+/// interval `KEY_EPOCH_MIN_READ_VERSION..=KEY_EPOCH_MAX_READ_VERSION` (ADR-0066
+/// decision 4), a set with a floor and a ceiling rather than a bare ceiling. A
+/// record declaring a higher version is refused rather than misread under this
+/// layout. No additive field has shipped past version 1, so this equals
+/// [`KEY_EPOCH_FORMAT_VERSION`]; the next additive change moves this to 2 first,
+/// ships that reader fleet-wide, then flips the writer (readers-before-writers).
+pub const KEY_EPOCH_MAX_READ_VERSION: u32 = 1;
+
+/// Lowest record version a reader accepts (ADR-0066 decision 4). Version 0 is an
+/// unstamped record from a writer that never set `format_version`; admitting it
+/// would let a valid-shaped but unstamped record enter the epoch history and be
+/// rewritten as version 1 by the CAS-append path, so it is refused below the
+/// floor with the same typed [`KeyEpochError::UnsupportedVersion`] the ceiling
+/// uses. This closes the ceiling-only gate the ADR-0066 R1 amendment flagged for
+/// this record (#1300).
+pub const KEY_EPOCH_MIN_READ_VERSION: u32 = 1;
 
 /// Object key for a tenant's key-epoch record: `t/<hex>/enc`. Tenant-scoped,
 /// not per-signal, since a tenant's KMS key applies across every signal
@@ -50,6 +69,42 @@ pub const KEY_EPOCH_FORMAT_VERSION: u32 = 1;
 /// per-signal `<sig>/prov` records, never a bucket-root `sys/` object.
 pub fn enc_key(tenant_hash: &TenantHash) -> String {
     format!("t/{}/enc", tenant_hash.to_hex())
+}
+
+/// Remediation-aware message for [`KeyEpochError::UnsupportedVersion`]: a version
+/// below `floor` and one above `ceiling` are refused by the same gate but mean
+/// opposite things (ADR-0066 R2, #1300).
+fn unsupported_version_message(key: &str, got: u32, floor: u32, ceiling: u32) -> String {
+    if got < floor {
+        format!(
+            "key-epoch record {key:?} declares format_version {got}, below the minimum {floor} this \
+             build reads: an unstamped or pre-versioning record; refusing rather than read it under \
+             the current layout"
+        )
+    } else {
+        format!(
+            "key-epoch record {key:?} declares format_version {got}, above the maximum {ceiling} \
+             this build reads: a record a newer build wrote; refusing rather than misread a future \
+             record format"
+        )
+    }
+}
+
+/// The supported-set version gate [`read_epochs_checked`] applies before trusting
+/// a record it read directly: accepted only when `floor <= got <= ceiling`,
+/// refused with the remediation-aware [`KeyEpochError::UnsupportedVersion`]
+/// otherwise. Bounds are parameters so a test can rebuild a narrower reader from
+/// this same gate (ADR-0066 R2, #1300).
+fn check_read_version(got: u32, key: &str, floor: u32, ceiling: u32) -> Result<(), KeyEpochError> {
+    if got < floor || got > ceiling {
+        return Err(KeyEpochError::UnsupportedVersion {
+            key: key.to_string(),
+            got,
+            floor,
+            ceiling,
+        });
+    }
+    Ok(())
 }
 
 /// A typed key-epoch failure. Every variant is fatal to the touch that raised
@@ -69,11 +124,19 @@ pub enum KeyEpochError {
         #[source]
         source: prost::DecodeError,
     },
-    #[error(
-        "key-epoch record {key:?} declares format_version {got}, but this build only understands \
-         version {KEY_EPOCH_FORMAT_VERSION}: refusing rather than misread a future record format"
-    )]
-    UnsupportedVersion { key: String, got: u32 },
+    /// A record's `format_version` fell outside the supported read set
+    /// `KEY_EPOCH_MIN_READ_VERSION..=KEY_EPOCH_MAX_READ_VERSION`. `floor` and
+    /// `ceiling` are the bounds the refusing gate applied, keeping the two
+    /// remediations distinct (ADR-0066 R2, #1300): a version below `floor` is a
+    /// legacy or unstamped record, a version above `ceiling` is a record a newer
+    /// build wrote.
+    #[error("{}", unsupported_version_message(key, *got, *floor, *ceiling))]
+    UnsupportedVersion {
+        key: String,
+        got: u32,
+        floor: u32,
+        ceiling: u32,
+    },
     #[error(
         "key-epoch record {key:?} is misfiled: it records {field} {actual}, but the key it was \
          read under expects {expected}"
@@ -227,12 +290,12 @@ pub fn read_epochs_checked(
     key: &str,
     tenant_hash: &TenantHash,
 ) -> Result<Vec<KeyEpoch>, KeyEpochError> {
-    if record.format_version > KEY_EPOCH_FORMAT_VERSION {
-        return Err(KeyEpochError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_read_version(
+        record.format_version,
+        key,
+        KEY_EPOCH_MIN_READ_VERSION,
+        KEY_EPOCH_MAX_READ_VERSION,
+    )?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(KeyEpochError::CorruptRecord {
             key: key.to_string(),
@@ -788,13 +851,12 @@ mod tests {
         ));
     }
 
-    /// A future format_version is refused rather than misread under this
-    /// layout.
-    #[tokio::test]
-    async fn read_rejects_future_format_version() {
-        let store = mem();
+    /// Seed a key-epoch record at an explicit `format_version`, bypassing the
+    /// writer's stamp, so a test can put exactly the record a too-new writer (or a
+    /// pre-versioning writer that never stamped a version) would leave.
+    async fn seed_at_version(store: &dyn ObjectStoreBackend, version: u32) {
         let record = sysproto::KeyEpochRecord {
-            format_version: KEY_EPOCH_FORMAT_VERSION + 1,
+            format_version: version,
             tenant_hash: tenant().0.to_vec(),
             created_unix_ns: 0,
             epochs: vec![sysproto::KeyEpoch {
@@ -810,10 +872,68 @@ mod tests {
                 PutOptions::default(),
             )
             .await
-            .expect("put future record");
+            .expect("put record at version");
+    }
+
+    /// The supported read set is exactly {1} (ADR-0066 decision 4): version 1
+    /// reads back, while a version-0 record (below the floor: an unstamped record
+    /// from a writer that never set format_version) is refused below the floor and
+    /// a version-2 record (above the ceiling) is refused above the ceiling, each
+    /// with the typed `UnsupportedVersion` carrying the exact bound the gate
+    /// applied. Closes the ceiling-only gate the ADR-0066 R1 amendment flagged for
+    /// `t/<hash>/enc` (#1300).
+    #[tokio::test]
+    async fn reader_accepts_one_refuses_zero_and_two() {
+        // Version 1 (the whole set): accepted.
+        let store = mem();
+        seed_at_version(store.as_ref(), KEY_EPOCH_MIN_READ_VERSION).await;
+        let read = read_epochs_from_store(store.as_ref(), &tenant())
+            .await
+            .expect("version 1 must read-accept");
+        assert!(read.is_some(), "version 1 decodes to a history");
+
+        // Below the floor: version 0 is refused, specifically below-floor.
+        let store = mem();
+        seed_at_version(store.as_ref(), 0).await;
         let err = read_epochs_from_store(store.as_ref(), &tenant())
             .await
-            .expect_err("a future format_version must be refused");
-        assert!(matches!(err, KeyEpochError::UnsupportedVersion { .. }));
+            .expect_err("version 0 must be refused below the floor");
+        assert!(
+            matches!(
+                err,
+                KeyEpochError::UnsupportedVersion {
+                    got: 0,
+                    floor: 1,
+                    ceiling: 1,
+                    ..
+                }
+            ),
+            "expected the below-floor UnsupportedVersion, got: {err}"
+        );
+        if let KeyEpochError::UnsupportedVersion { got, floor, .. } = err {
+            assert!(got < floor, "version 0 is below the floor");
+        }
+
+        // Above the ceiling: version 2 is refused, specifically above-ceiling.
+        let store = mem();
+        seed_at_version(store.as_ref(), KEY_EPOCH_MAX_READ_VERSION + 1).await;
+        let err = read_epochs_from_store(store.as_ref(), &tenant())
+            .await
+            .expect_err("version 2 must be refused above the ceiling");
+        assert!(
+            matches!(
+                err,
+                KeyEpochError::UnsupportedVersion {
+                    got: 2,
+                    floor: 1,
+                    ceiling: 1,
+                    ..
+                }
+            ),
+            "expected the above-ceiling UnsupportedVersion, got: {err}"
+        );
+        if let KeyEpochError::UnsupportedVersion { got, ceiling, .. } = err {
+            assert!(got > ceiling, "version 2 is above the ceiling");
+        }
     }
 }
