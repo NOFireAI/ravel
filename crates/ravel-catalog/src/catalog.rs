@@ -443,6 +443,22 @@ pub struct Catalog {
     /// stats object with no reuse, matching the `byte_cache_max_bytes == 0`
     /// disabled sentinel.
     column_stats_cache: Option<ColumnStatsCache>,
+    /// `(tenant, signal, object key)` triples whose column-stats DECODE the
+    /// reader has already refused and logged (issue #1400). HEAD references the
+    /// object but its bytes will not open, so the same refusal recurs on every
+    /// eligible query for that HEAD; the WARN is emitted once per key, not once
+    /// per query. Swept per idle tenant in [`Catalog::evict_idle_tenants`]
+    /// alongside the per-tenant caches, so a tenant that returns after eviction
+    /// warns again, and a re-fold that publishes a NEW object key warns for the
+    /// new key while the old one ages out with its tenant. Bounded by the
+    /// (tenant, signal, key) triples the process has actually referenced;
+    /// unrelated to the reuse cache, which may be disabled.
+    warned_decode_failures: Mutex<HashSet<(TenantHash, Signal, String)>>,
+    /// Cumulative count of column-stats objects HEAD referenced that the reader
+    /// refused to DECODE (issue #1400), incremented on EVERY refusal whether or
+    /// not it logged, so a metric can show the condition persisting after the
+    /// single WARN. Surfaced by [`Catalog::column_stats_decode_refusals`].
+    column_stats_decode_refusals: AtomicU64,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -527,6 +543,8 @@ impl Catalog {
             provisioning_checked: Mutex::new(HashSet::new()),
             tenant_activity: Mutex::new(HashMap::new()),
             column_stats_cache,
+            warned_decode_failures: Mutex::new(HashSet::new()),
+            column_stats_decode_refusals: AtomicU64::new(0),
         })
     }
 
@@ -982,6 +1000,14 @@ impl Catalog {
     /// this as "zero columns configured means zero rows". See
     /// [`column_stats_resolve::load_column_stats`] for the full
     /// degrade-to-`Ok(None)` contract.
+    ///
+    /// The `Ok(None)` cases split into two kinds. A STORE READ that fails (no
+    /// HEAD, no stats object at the referenced key) is a legitimate "no
+    /// statistics" and stays silent. A DECODE that fails on an object HEAD
+    /// actually references is not: the fold wrote it and HEAD points at it, so a
+    /// reader that cannot open it emits one `tracing::warn!` per object key and
+    /// increments [`Catalog::column_stats_decode_refusals`] before degrading
+    /// (issue #1400). Only the decode case logs.
     pub async fn load_column_stats(
         &self,
         tenant: &TenantHash,
@@ -1021,16 +1047,81 @@ impl Catalog {
         if let Some(stats) = cache_hit {
             return Ok(Some(stats));
         }
-        let Some(loaded) =
-            column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await?
-        else {
-            return Ok(None);
-        };
+        let loaded =
+            match column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await? {
+                column_stats_resolve::FetchOutcome::Loaded(loaded) => loaded,
+                // Store read or stale binding: the ordinary "no statistics" case.
+                column_stats_resolve::FetchOutcome::Absent => return Ok(None),
+                // HEAD references an object the reader refused to decode: log once
+                // per key and count every occurrence, then scan (issue #1400).
+                column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
+                    self.note_column_stats_decode_refusal(tenant, signal, &resolved.key, &err);
+                    return Ok(None);
+                }
+            };
         let stats = Arc::new(loaded);
         if let Some(cache) = self.column_stats_cache.as_ref() {
             cache.insert((*tenant, signal), resolved.blake3, Arc::clone(&stats));
         }
         Ok(Some(stats))
+    }
+
+    /// Record a decode refusal on the column-stats object HEAD references for
+    /// `(tenant, signal)` at `key` (issue #1400): increment
+    /// [`Catalog::column_stats_decode_refusals`] unconditionally, then emit ONE
+    /// `tracing::warn!` the first time this exact `(tenant, signal, key)` is
+    /// seen. The warn-once set is consulted under its own lock; the WARN itself
+    /// is emitted after the lock is dropped, so a subscriber's unbounded work
+    /// never runs while the lock is held.
+    ///
+    /// The counter moves on every refusal so a metric shows the condition
+    /// persisting; the log fires once per key so a per-query failure does not
+    /// flood the log. A re-fold that publishes a new object key is a new key
+    /// and warns again; a tenant swept from the set by
+    /// [`Catalog::evict_idle_tenants`] warns again on its return.
+    fn note_column_stats_decode_refusal(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        key: &str,
+        err: &crate::snapshot_format::SnapshotFormatError,
+    ) {
+        self.column_stats_decode_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        let first = {
+            let mut warned = self.warned_decode_failures.lock();
+            warned.insert((*tenant, signal, key.to_string()))
+        };
+        if !first {
+            return;
+        }
+        match err {
+            crate::snapshot_format::SnapshotFormatError::ColumnStatsDecompressedTooLarge {
+                declared,
+                cap,
+            } => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %key,
+                    declared_uncompressed_bytes = *declared,
+                    cap_uncompressed_bytes = *cap,
+                    "HEAD references a column-statistics object the reader refused to decode: its \
+                     header declares more uncompressed bytes than the decode ceiling. The query \
+                     proceeds without column statistics and scans."
+                );
+            }
+            other => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %key,
+                    error = %other,
+                    "HEAD references a column-statistics object the reader refused to decode. The \
+                     query proceeds without column statistics and scans."
+                );
+            }
+        }
     }
 
     /// Evict every per-tenant cache outer-map entry for tenants last touched
@@ -1082,6 +1173,14 @@ impl Catalog {
             .filter(|_| !idle.is_empty())
         {
             cache.evict_tenants(&idle);
+        }
+        // Sweep the decode-refusal warn-once marks for the idle tenants, so a
+        // tenant that returns after eviction warns again (issue #1400). Keyed
+        // by (tenant, signal, key); drop every triple whose tenant went idle.
+        if !idle.is_empty() {
+            self.warned_decode_failures
+                .lock()
+                .retain(|(tenant, _, _)| !idle.contains(tenant));
         }
         idle.len()
     }
@@ -1143,6 +1242,22 @@ impl Catalog {
         self.column_stats_cache
             .as_ref()
             .map_or(0, ColumnStatsCache::refusals)
+    }
+
+    /// Cumulative column-statistics DECODE refusals (issue #1400): objects HEAD
+    /// referenced that the reader refused to decode (an oversized declared body,
+    /// corruption, a crc or header failure). Counted on every occurrence, so a
+    /// climbing value means a folded HEAD keeps pointing at an object the reader
+    /// cannot open and the tenant is running with NO column statistics; the
+    /// matching WARN (once per object key) names the tenant, signal, key, and
+    /// for the oversized case the declared and cap bytes. Distinct from
+    /// [`Catalog::column_stats_cache_refusals`], which counts a decodable object
+    /// too large for the reuse cache's byte budget. Unlike a bare `Ok(None)`
+    /// (no HEAD, no stats object), this never fires for legitimately absent
+    /// statistics. Independent of the reuse cache, so it counts even when that
+    /// cache is disabled. Exporting it on `/metrics` is the server's follow-up.
+    pub fn column_stats_decode_refusals(&self) -> u64 {
+        self.column_stats_decode_refusals.load(Ordering::Relaxed)
     }
 
     /// Bytes currently held by the column-statistics cache (issue #905), the
@@ -7301,6 +7416,427 @@ mod tests {
             Some(ravel_proto::catalog::v1::column_value::Kind::I64(v)) => *v,
             other => panic!("expected an I64 min, got {other:?}"),
         }
+    }
+
+    /// A well-framed **v1** column-statistics envelope whose header DECLARES
+    /// `declared_len` uncompressed body bytes over an empty body: the
+    /// small-object / large-declared-length shape issue #1400 describes. Every
+    /// framing invariant `decode_column_stats` checks before its size gate holds
+    /// (magic, version byte, reserved, header and body crc, tenant-hash length,
+    /// header/envelope version agreement), so decode reaches the
+    /// `body_uncompressed_len > cap` check and returns
+    /// `ColumnStatsDecompressedTooLarge` without inflating a 256 MiB body.
+    ///
+    /// Hand-framed rather than built through `encode_column_stats`, which
+    /// derives `body_uncompressed_len` from the actual segments and so can never
+    /// declare a length its body does not carry.
+    fn frame_oversized_cstat(
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        declared_len: u64,
+    ) -> Vec<u8> {
+        use crate::snapshot_format::{COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED, ZSTD_LEVEL};
+
+        let version: u8 = 1;
+        let body = zstd::bulk::compress(b"", ZSTD_LEVEL).expect("compress empty body");
+        let header = ravel_proto::catalog::v1::ColumnStatsHeader {
+            format_version: u32::from(version),
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal::to_proto(signal) as u32,
+            part_blake3: vec![part_hash.to_vec()],
+            segment_count: 0,
+            body_uncompressed_len: declared_len,
+        };
+        let header_bytes = header.encode_to_vec();
+        let header_len = header_bytes.len() as u32;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&COLUMN_STATS_MAGIC);
+        out.push(version);
+        out.extend_from_slice(&COLUMN_STATS_RESERVED);
+        out.extend_from_slice(&header_len.to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        let header_crc = crc32c::crc32c(&out);
+
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        let body_crc = crc32c::crc32c(&body);
+        out.extend_from_slice(&body_crc.to_le_bytes());
+        out.extend_from_slice(&header_crc.to_le_bytes());
+        out
+    }
+
+    /// Write a folded HEAD for `(tenant, signal)` whose `column_stats` ref points
+    /// at `stats_key`, holding the oversized-declared object
+    /// [`frame_oversized_cstat`] builds. HEAD's part set and the ref's blake3
+    /// bind correctly, so a load's blake3 gate passes and decode is what refuses
+    /// (issue #1400). No snapshot part object is written: this path never
+    /// fetches one.
+    async fn install_oversized_stats(
+        store: &MemoryStore,
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        stats_key: &str,
+        declared_len: u64,
+    ) {
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+        let stats_bytes = frame_oversized_cstat(tenant, signal, part_hash, declared_len);
+        let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
+        store
+            .put(
+                stats_key,
+                Bytes::from(stats_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put oversized stats");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 10,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: format!("t/{}/catalog/{prefix}/snap/empty.csnap", tenant.to_hex()),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsRef {
+                key: stats_key.to_string(),
+                blake3: stats_hash.to_vec(),
+                size: stats_bytes.len() as u64,
+                segment_count: 0,
+                part_blake3: vec![part_hash.to_vec()],
+            }),
+            column_stats_part: None,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant, signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+    }
+
+    /// The substring both decode-refusal WARN messages carry (issue #1400).
+    const DECODE_REFUSAL_WARN: &str = "the reader refused to decode";
+
+    /// A `tracing` layer that flattens every WARN event into one line -- message
+    /// first, then each field as `name=value` -- so a test can count WARN lines
+    /// and assert one carries the decimal figures a structured `u64` field
+    /// emitted.
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        lines: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WarnCapture {
+        fn lines(&self) -> Vec<String> {
+            self.lines.lock().clone()
+        }
+
+        fn count_containing(&self, needle: &str) -> usize {
+            self.lines
+                .lock()
+                .iter()
+                .filter(|line| line.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = LineVisitor::default();
+            event.record(&mut visitor);
+            self.lines.lock().push(visitor.finish());
+        }
+    }
+
+    #[derive(Default)]
+    struct LineVisitor {
+        message: String,
+        fields: Vec<String>,
+    }
+
+    impl LineVisitor {
+        fn finish(self) -> String {
+            let mut line = self.message;
+            for field in self.fields {
+                line.push(' ');
+                line.push_str(&field);
+            }
+            line
+        }
+    }
+
+    impl tracing::field::Visit for LineVisitor {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields.push(format!("{}={}", field.name(), value));
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields.push(format!("{}={:?}", field.name(), value));
+            }
+        }
+    }
+
+    /// The logs `.cstat` key [`install_oversized_stats`] uses for the default
+    /// [`tenant`], distinct across `name` so a re-fold's NEW key is a NEW object.
+    fn oversized_stats_key(name: &str) -> String {
+        format!(
+            "t/{}/catalog/{}/cstat/{name}.cstat",
+            tenant().to_hex(),
+            Signal::Logs.key_prefix()
+        )
+    }
+
+    /// Issue #1400, deliverables 1-3: a HEAD that references a column-stats
+    /// object whose header declares an uncompressed body over the 256 MiB decode
+    /// ceiling makes every load degrade to `Ok(None)`, logs the refusal exactly
+    /// ONCE across three loads, counts every one of the three, and names the
+    /// declared and cap bytes in the single WARN.
+    ///
+    /// Prove-the-test: the WARN and the count both flow from
+    /// `load_column_stats`'s `FetchOutcome::DecodeRefused` arm calling
+    /// `note_column_stats_decode_refusal`. Flip that arm to
+    /// `FetchOutcome::DecodeRefused(_) => return Ok(None)` (the pre-fix silent
+    /// degrade) and `count_containing` reads 0 against the expected 1 while
+    /// `column_stats_decode_refusals()` reads 0 against the expected 3.
+    #[tokio::test]
+    async fn column_stats_decode_refusal_warns_once_and_counts_each() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        let declared: u64 = 2_000_102_795;
+        let stats_key = oversized_stats_key("one");
+        install_oversized_stats(
+            &store,
+            tenant(),
+            Signal::Logs,
+            part_hash,
+            &stats_key,
+            declared,
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        for _ in 0..3 {
+            let got = catalog
+                .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+                .await
+                .expect("load ok");
+            assert!(got.is_none(), "a refused decode degrades to Ok(None)");
+        }
+
+        assert_eq!(
+            catalog.column_stats_decode_refusals(),
+            3,
+            "counted on every refusal, not once per key"
+        );
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            1,
+            "logged exactly once across three loads"
+        );
+
+        let cap = crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES;
+        let warn = capture
+            .lines()
+            .into_iter()
+            .find(|line| line.contains(DECODE_REFUSAL_WARN))
+            .expect("the one decode-refusal WARN");
+        assert!(
+            warn.contains(&declared.to_string()),
+            "WARN names the declared uncompressed bytes {declared}: {warn}"
+        );
+        assert!(
+            warn.contains(&cap.to_string()),
+            "WARN names the cap uncompressed bytes {cap}: {warn}"
+        );
+    }
+
+    /// Issue #1400, deliverable 2: after the idle-tenant sweep clears the
+    /// warn-once mark, the tenant's next refusal warns again. The tenant is new
+    /// state on its return and its operator must be able to see the condition
+    /// again.
+    #[tokio::test]
+    async fn column_stats_decode_refusal_warns_again_after_idle_eviction() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        let stats_key = oversized_stats_key("one");
+        install_oversized_stats(
+            &store,
+            tenant(),
+            Signal::Logs,
+            part_hash,
+            &stats_key,
+            2_000_102_795,
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let first = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok");
+        assert!(first.is_none());
+        assert_eq!(capture.count_containing(DECODE_REFUSAL_WARN), 1);
+
+        // Stamp the tenant's activity and sweep it as idle: the sweep drops the
+        // warn-once mark alongside the per-tenant caches.
+        catalog.tenant_activity.lock().insert(tenant(), 0);
+        let evicted = catalog.evict_idle_tenants(1_000, 0);
+        assert_eq!(evicted, 1, "the stamped tenant is swept as idle");
+
+        let second = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok");
+        assert!(second.is_none());
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            2,
+            "the returned tenant warns again after the sweep"
+        );
+        assert_eq!(catalog.column_stats_decode_refusals(), 2);
+    }
+
+    /// Issue #1400, deliverable 2: a re-fold that publishes a NEW object key for
+    /// the same `(tenant, signal)` warns independently of the old key's mark, so
+    /// a fresh bad object is never masked by an earlier one.
+    #[tokio::test]
+    async fn column_stats_decode_refusal_warns_per_object_key() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        install_oversized_stats(
+            &store,
+            tenant(),
+            Signal::Logs,
+            part_hash,
+            &oversized_stats_key("one"),
+            2_000_102_795,
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let first = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok");
+        assert!(first.is_none());
+        assert_eq!(capture.count_containing(DECODE_REFUSAL_WARN), 1);
+
+        // A re-fold publishes a HEAD pointing at a DIFFERENT key (a different
+        // declared length, so a different content hash too).
+        install_oversized_stats(
+            &store,
+            tenant(),
+            Signal::Logs,
+            part_hash,
+            &oversized_stats_key("two"),
+            3_000_000_000,
+        )
+        .await;
+
+        let second = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok");
+        assert!(second.is_none());
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            2,
+            "the new key warns even though the tenant/signal already warned"
+        );
+        assert_eq!(catalog.column_stats_decode_refusals(), 2);
+    }
+
+    /// Issue #1400: the store-read arm stays silent. A `(tenant, signal)` with NO
+    /// HEAD object returns `Ok(None)` with zero WARN lines and a flat
+    /// decode-refusal counter, proving the change did not turn "no statistics"
+    /// into noise.
+    #[tokio::test]
+    async fn absent_head_stays_silent_and_uncounted() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let got = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok");
+        assert!(got.is_none(), "no HEAD means no statistics");
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            0,
+            "an absent store object is not a decode refusal"
+        );
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
     }
 
     /// Issue #888, deliverable 2: two consecutive loads against an UNCHANGED
