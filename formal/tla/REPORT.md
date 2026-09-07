@@ -497,8 +497,9 @@ inferred by this report.
   reported five of commit's eleven negative controls and three of catalog's
   seven nonvacuity negative controls with no corresponding note under
   `counterexamples/`. Checked against the shipped tree: all eleven of
-  commit's `negative/*.cfg` files and all twenty-one of catalog's have a
-  matching note under their respective `counterexamples/` directories, one
+  commit's `negative/*.cfg` files and all twenty-one of catalog's
+  `negative/*.cfg` files have a matching note under their respective
+  `counterexamples/` directories, one
   per negative case as D6 calls for (section 6). No gap remains in either
   area.
 
