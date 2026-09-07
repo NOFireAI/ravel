@@ -61,7 +61,7 @@ jobs:
             -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
       - name: Wait for MinIO to be live
         run: |
           for _ in $(seq 1 30); do
@@ -76,7 +76,8 @@ jobs:
           exit 1
       - name: Create the MetricsBench bucket
         run: |
-          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+          docker run --rm --network host --entrypoint sh \
+            minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727 -c "
             mc alias set local http://localhost:9000 minioadmin minioadmin &&
             mc mb -p local/metricsbench"
       - name: Run the MetricsBench ci profile against MinIO
