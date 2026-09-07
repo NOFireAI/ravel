@@ -1279,6 +1279,43 @@ impl S3Store {
         }
     }
 
+    /// Disambiguate an `AlreadyExists` from a [`PutMode::CreateIfAbsent`] PUT
+    /// with one HEAD (docs/object-store-contract.md, "Semantics adapters MUST
+    /// honor").
+    ///
+    /// `object_store` 0.14 maps a raw 409 to `AlreadyExists` and enables
+    /// conflict retry only for the update / etag-match modes, never for create.
+    /// So a 409 `ConditionalRequestConflict` — which the AWS PutObject spec
+    /// says the client MUST retry — reaches this crate looking exactly like a
+    /// genuine already-exists. The HTTP status that would tell them apart lives
+    /// in `object_store`'s crate-private error type (the same reason
+    /// [`map_put_error`] is mode-aware rather than status-aware), so it is
+    /// unreachable here; one HEAD is the disambiguation:
+    ///
+    /// - **key present** → a real already-exists → [`StoreError::AlreadyExists`],
+    ///   exactly as before this method existed.
+    /// - **key absent** → the 409 could not have been a real collision → a
+    ///   transient conditional-request conflict → [`StoreError::Transient`],
+    ///   which [`StoreError::is_retryable`] routes back into the caller's
+    ///   existing retry loop (the ingest flush loop, the commit publish path).
+    ///
+    /// The split-brain guard on the commit path and the vanished-part guard on
+    /// the compaction path are preserved by construction: `Transient` is
+    /// returned only when the key is ABSENT, and a genuine collision requires
+    /// it to be PRESENT, so no real already-exists is ever downgraded to a
+    /// retry. A HEAD that itself fails cannot prove the key absent, so it falls
+    /// back to the safe `AlreadyExists` rather than inventing a retry.
+    async fn disambiguate_create_conflict(&self, key: &str) -> Result<PutOutcome, StoreError> {
+        match self.head(key).await {
+            Ok(_) => Err(StoreError::AlreadyExists),
+            Err(StoreError::NotFound) => Err(StoreError::Transient(format!(
+                "conditional-request conflict on create of {key}: 409 with the key \
+                 absent on HEAD, retryable per the AWS PutObject specification"
+            ))),
+            Err(_) => Err(StoreError::AlreadyExists),
+        }
+    }
+
     /// The [`MULTIPART_THRESHOLD`] path of [`ObjectStoreBackend::put`]: cut the
     /// buffer into [`MULTIPART_PART_SIZE`] parts, upload at most
     /// [`MULTIPART_UPLOAD_CONCURRENCY`] of them at a time, then complete. Any
@@ -1562,7 +1599,7 @@ impl ObjectStoreBackend for S3Store {
             };
             let path = path_of(key);
             let payload = PutPayload::from(data);
-            let result = self
+            let result = match self
                 .store
                 .put_opts(
                     &path,
@@ -1573,7 +1610,23 @@ impl ObjectStoreBackend for S3Store {
                     },
                 )
                 .await
-                .map_err(|e| map_put_error(e, &opts.mode))?;
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    let mapped = map_put_error(e, &opts.mode);
+                    // A `CreateIfAbsent` PUT that surfaced `AlreadyExists` may be
+                    // a genuine already-exists or a transient 409
+                    // `ConditionalRequestConflict` the AWS PutObject spec says
+                    // to retry; the HTTP status is unreachable here, so one HEAD
+                    // decides. See `disambiguate_create_conflict`.
+                    if matches!(mapped, StoreError::AlreadyExists)
+                        && matches!(opts.mode, PutMode::CreateIfAbsent)
+                    {
+                        return self.disambiguate_create_conflict(key).await;
+                    }
+                    return Err(mapped);
+                }
+            };
             outcome_of(key, result)
         })
         .await
