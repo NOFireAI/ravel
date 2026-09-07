@@ -10,7 +10,8 @@ Target invariant: `IdenticalInputSetsDoNotCollide`. TLC exit 12.
 Error: Invariant IdenticalInputSetsDoNotCollide is violated.
 ```
 
-Trace: `PerformRewrite` materialises `rwA`. With `rwA` present the invariant is
+Trace: the rewrite pass (`StartRewrite` then `PublishRewrite`) materialises
+`rwA`. With `rwA` present the invariant is
 evaluated: `Cardinality({RewriteKey(d) : d \in Materialized})` is less than
 `Cardinality(Materialized)` because two descriptors over the same inputs and
 different request sets collapse to one key, so the equality fails.
