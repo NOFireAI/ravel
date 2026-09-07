@@ -38,6 +38,7 @@ use crate::limiter::GetLimiter;
 use crate::log_fetcher::{DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogSegmentFetcher};
 use crate::log_series;
 use crate::phase_accounting::{PhaseAccounting, PhaseAccountingSnapshot};
+use crate::request_budgets::RequestBudgets;
 use crate::segment_admission;
 
 /// Which evaluation shape a prefetch is being computed for: an instant
@@ -476,6 +477,34 @@ impl QueryEngine {
         &self.config
     }
 
+    /// This engine scoped to one request's lowered budgets (ADR-1374
+    /// decision 3): the same catalog, fetchers, limiter, and fan-out
+    /// contexts, with `config`'s three budget fields replaced by
+    /// [`RequestBudgets::clamp`]'s output.
+    ///
+    /// Substituting the config rather than threading an extra parameter is
+    /// what makes every enforcement site read the effective budget without
+    /// each one having to consult a second value: `admit`, the three
+    /// bytes-scanned checks, and the request-budget check all already read
+    /// `self.config`. The clone is cheap and shares state by construction:
+    /// [`SegmentFetcher`] and [`LogSegmentFetcher`] both share their cache
+    /// and their [`GetLimiter`] across clones, so a scoped engine draws
+    /// permits from the same limiter and hits the same cache entries as the
+    /// engine it came from. It must stay that way; a fetcher clone that
+    /// forked its limiter would turn one query's budget scope into a second
+    /// concurrency allowance.
+    fn scoped_to(&self, budgets: &RequestBudgets) -> QueryEngine {
+        QueryEngine {
+            catalog: Arc::clone(&self.catalog),
+            fetcher: self.fetcher.clone(),
+            log_fetcher: self.log_fetcher.clone(),
+            get_limiter: Arc::clone(&self.get_limiter),
+            config: budgets.clamp(&self.config).applied_to(&self.config),
+            distributed: self.distributed.clone(),
+            federation: self.federation.clone(),
+        }
+    }
+
     /// The [`GetLimiter`] this engine's `fetcher` and `log_fetcher` currently
     /// share. Test-only: production code has no reason to reach behind the
     /// engine at its fetchers' shared limiter, only to replace it wholesale
@@ -551,6 +580,52 @@ impl QueryEngine {
         )
         .await;
         unify_deadline(outcome, deadline)
+    }
+
+    /// [`Self::instant_with_stats_annotated`] under one request's
+    /// caller-supplied budgets (ADR-1374 decision 3).
+    ///
+    /// `budgets` can only LOWER this engine's configured ceilings; see
+    /// [`RequestBudgets::clamp`]. `None` delegates to
+    /// [`Self::instant_with_stats_annotated`] unchanged, which is what every
+    /// HTTP handler passes: the agent surface (#1381) is the caller that
+    /// supplies budgets.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn instant_with_budgets(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        t_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+        budgets: Option<&RequestBudgets>,
+    ) -> Result<(Value, Annotations, QueryStats), QueryError> {
+        match budgets {
+            None => {
+                self.instant_with_stats_annotated(
+                    tenant_hash,
+                    query,
+                    t_ms,
+                    min_tokens,
+                    now_ns,
+                    deadline,
+                )
+                .await
+            }
+            Some(budgets) => {
+                self.scoped_to(budgets)
+                    .instant_with_stats_annotated(
+                        tenant_hash,
+                        query,
+                        t_ms,
+                        min_tokens,
+                        now_ns,
+                        deadline,
+                    )
+                    .await
+            }
+        }
     }
 
     async fn instant_inner(
@@ -705,6 +780,54 @@ impl QueryEngine {
         unify_deadline(outcome, deadline)
     }
 
+    /// [`Self::range_hist_with_stats_annotated`] under one request's
+    /// caller-supplied budgets (ADR-1374 decision 3). Same contract as
+    /// [`Self::instant_with_budgets`]: lowering only, and `None` is the
+    /// existing method unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn range_hist_with_budgets(
+        &self,
+        tenant_hash: TenantHash,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+        budgets: Option<&RequestBudgets>,
+    ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
+        match budgets {
+            None => {
+                self.range_hist_with_stats_annotated(
+                    tenant_hash,
+                    query,
+                    start_ms,
+                    end_ms,
+                    step_ms,
+                    min_tokens,
+                    now_ns,
+                    deadline,
+                )
+                .await
+            }
+            Some(budgets) => {
+                self.scoped_to(budgets)
+                    .range_hist_with_stats_annotated(
+                        tenant_hash,
+                        query,
+                        start_ms,
+                        end_ms,
+                        step_ms,
+                        min_tokens,
+                        now_ns,
+                        deadline,
+                    )
+                    .await
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn range_inner(
         &self,
@@ -785,6 +908,48 @@ impl QueryEngine {
         )
         .await
         .map_err(|_| QueryError::DeadlineExceeded { deadline })?
+    }
+
+    /// [`Self::resolve_series_with_stats`] under one request's
+    /// caller-supplied budgets (ADR-1374 decision 3). Same contract as
+    /// [`Self::instant_with_budgets`]: lowering only, and `None` is the
+    /// existing method unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_series_with_budgets(
+        &self,
+        tenant_hash: TenantHash,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+        budgets: Option<&RequestBudgets>,
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        match budgets {
+            None => {
+                self.resolve_series_with_stats(
+                    tenant_hash,
+                    matchers,
+                    window,
+                    min_tokens,
+                    now_ns,
+                    deadline,
+                )
+                .await
+            }
+            Some(budgets) => {
+                self.scoped_to(budgets)
+                    .resolve_series_with_stats(
+                        tenant_hash,
+                        matchers,
+                        window,
+                        min_tokens,
+                        now_ns,
+                        deadline,
+                    )
+                    .await
+            }
+        }
     }
 
     async fn resolve_series_inner(
