@@ -10,8 +10,12 @@
 //! Shape (ADR-0085 "Read path."):
 //!
 //! - **On demand.** A tenant nobody asks about costs zero requests. The first
-//!   request for a tenant does one [`read_metrics_meta`] GET, keeps the parsed
-//!   record (an absent record caches as an empty snapshot), and serves it.
+//!   request for a tenant does one [`read_metrics_meta_for_serve`] GET, keeps
+//!   the parsed record (an absent record caches as an empty snapshot), and
+//!   serves it. Both of this cache's reads, the inline miss fill and the
+//!   background refresh, go through that read-only reader: neither ever writes
+//!   the record back, so both accept the full supported read set rather than
+//!   the narrower set the CAS-loser rewrite in the ingest sink needs.
 //! - **Bounded staleness.** A request within the refresh horizon (default 60 s,
 //!   the same bounded-staleness horizon `config` and the lifecycle gate use) is
 //!   served from memory with no I/O. A request past the horizon is served from
@@ -38,7 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ravel_cache::Clock;
-use ravel_catalog::{MetricMetadataEntry, read_metrics_meta, read_metrics_meta_for_serve};
+use ravel_catalog::{MetricMetadataEntry, read_metrics_meta_for_serve};
 use ravel_object_store::{ObjectStoreBackend, Version};
 use ravel_types::TenantHash;
 
@@ -210,8 +214,8 @@ impl MetadataCache {
 
     /// Get the cached metadata snapshot for `tenant_hash`, filling on a miss.
     ///
-    /// - Miss: one [`read_metrics_meta`] GET inline; the parsed record (or an
-    ///   empty snapshot for an absent record) is stored and returned.
+    /// - Miss: one [`read_metrics_meta_for_serve`] GET inline; the parsed record
+    ///   (or an empty snapshot for an absent record) is stored and returned.
     /// - Hit within the horizon: the cached snapshot, no I/O.
     /// - Hit past the horizon: the cached snapshot returned immediately, plus at
     ///   most one background refresh GET (single-flight per tenant).
@@ -332,9 +336,15 @@ async fn fetch_snapshot(
 /// version, and `fetched_at_ns` advance; on error the stale snapshot stays and
 /// `refresh_errors` is incremented. Either way `refreshing` clears so a later
 /// past-horizon request can refresh again.
+///
+/// The read is [`read_metrics_meta_for_serve`], the same read-only reader the
+/// miss path uses. A refresh never writes the record back, so it must accept
+/// every version the decode gate accepts; the strict reader would reject a
+/// record upgraded to a version this build's writer cannot reproduce and leave
+/// the pre-upgrade snapshot in memory for the life of the process.
 fn spawn_refresh(shared: Arc<Shared>, tenant_hash: TenantHash) {
     tokio::spawn(async move {
-        let result = read_metrics_meta(shared.store.as_ref(), &tenant_hash).await;
+        let result = read_metrics_meta_for_serve(shared.store.as_ref(), &tenant_hash).await;
         let now = shared.clock.now_ns();
         let mut inner = shared.lock();
         let Some(entry) = inner.tenants.get_mut(&tenant_hash) else {
@@ -377,13 +387,15 @@ fn spawn_refresh(shared: Arc<Shared>, tenant_hash: TenantHash) {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use ravel_catalog::{MetricKind, write_metrics_meta};
+    use prost::Message;
+    use ravel_catalog::{MetricKind, metrics_meta_key, read_metrics_meta, write_metrics_meta};
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
         Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, PageToken,
         PutOptions, PutOutcome, StoreError,
     };
+    use ravel_proto::sys::v1 as sysproto;
     use std::sync::atomic::AtomicI64;
 
     /// A test clock the test advances by hand, so horizon and idle-eviction
@@ -492,6 +504,39 @@ mod tests {
             .expect("seed record");
     }
 
+    /// Store body for a record stamped at an explicit `format_version`, so a
+    /// test can seed exactly the record a newer writer leaves on disk. The
+    /// writer this build ships stamps 1 and offers no way to ask for another
+    /// version, so the frozen proto record is built here and compressed at the
+    /// same zstd level the writer uses.
+    fn body_at_version(version: u32, th: TenantHash, entries: &[MetricMetadataEntry]) -> Vec<u8> {
+        let record = sysproto::MetricMetadataRecord {
+            format_version: version,
+            entries: entries
+                .iter()
+                .map(|e| sysproto::MetricMetadataEntry {
+                    family_name: e.family_name.clone(),
+                    r#type: proto_kind(e.kind) as i32,
+                    help: e.help.clone(),
+                    unit: e.unit.clone(),
+                    updated_unix_ns: e.updated_unix_ns,
+                })
+                .collect(),
+            tenant_hash: th.0.to_vec(),
+        };
+        zstd::bulk::compress(&record.encode_to_vec(), 3).expect("compress the seeded record")
+    }
+
+    fn proto_kind(kind: MetricKind) -> sysproto::MetricMetadataType {
+        match kind {
+            MetricKind::Counter => sysproto::MetricMetadataType::Counter,
+            MetricKind::Gauge => sysproto::MetricMetadataType::Gauge,
+            MetricKind::Histogram => sysproto::MetricMetadataType::Histogram,
+            MetricKind::Summary => sysproto::MetricMetadataType::Summary,
+            MetricKind::Unknown => sysproto::MetricMetadataType::Unknown,
+        }
+    }
+
     /// Yield until the store's GET count reaches `target`, so a spawned refresh
     /// is observed to have run without any real sleep. Bounded so a bug fails
     /// the test instead of hanging.
@@ -506,6 +551,25 @@ mod tests {
             "store never reached {target} GETs (saw {})",
             store.get_count()
         );
+    }
+
+    /// Yield until the spawned refresh for `th` has written its result back and
+    /// cleared the single-flight flag, so the assertions that follow read a
+    /// settled entry. Clears on both the success and the error arm, so a
+    /// refresh that failed is observed as a stale snapshot rather than a hang.
+    async fn wait_for_refresh_to_settle(cache: &MetadataCache, th: TenantHash) {
+        for _ in 0..1000 {
+            {
+                let inner = cache.shared.lock();
+                match inner.tenants.get(&th) {
+                    Some(entry) if !entry.refreshing => return,
+                    None => return,
+                    Some(_) => {}
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the refresh for the tenant never cleared its single-flight flag");
     }
 
     async fn wait_for_refresh_errors(cache: &MetadataCache, target: u64) {
@@ -622,6 +686,103 @@ mod tests {
         let after = cache.get(th).await;
         assert_eq!(after.len(), 2, "the refresh brought in the new metric");
         assert!(after.iter().any(|e| e.family_name == "new_metric"));
+    }
+
+    /// A record upgraded from version 1 to version 2 under a running process
+    /// (the writer rollout: storage starts stamping a version this build's
+    /// writer cannot reproduce) must be picked up by the background refresh,
+    /// exactly as the inline miss fill picks it up. The refresh never writes the
+    /// record back, so it reads through the read-only serve reader; the strict
+    /// rewrite reader would refuse the upgraded record and its error arm would
+    /// pin the pre-upgrade snapshot in memory for the life of the process.
+    ///
+    /// prove-the-test: flipping `spawn_refresh` back to the strict
+    /// `read_metrics_meta` makes this fail on "the refresh serves the version-2
+    /// entries exactly" with the one-entry version-1 record on the left, and
+    /// counts one refresh error.
+    #[tokio::test]
+    async fn refresh_replaces_the_snapshot_when_the_record_is_upgraded_to_version_2() {
+        let mem: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let store = CountingStore::new(mem);
+        let th = tenant(0xE5);
+        seed(
+            store.as_ref(),
+            th,
+            &[entry("v1_metric", MetricKind::Counter, "old", "")],
+        )
+        .await;
+        let base = store.get_count();
+
+        let clock = TestClock::new(20_000);
+        let cache =
+            MetadataCache::new(store.clone(), MetadataCacheConfig::default(), clock.clone());
+
+        let seeded = vec![entry("v1_metric", MetricKind::Counter, "old", "")];
+        let filled = cache.get(th).await;
+        assert_eq!(
+            filled.as_slice(),
+            seeded.as_slice(),
+            "the version-1 record fills the cache"
+        );
+        assert_eq!(store.get_count() - base, 1, "the miss fill is one GET");
+
+        // Storage upgrades the record to version 2, with a new entry set.
+        let upgraded = vec![
+            entry("v1_metric", MetricKind::Counter, "old", ""),
+            entry("v2_metric", MetricKind::Gauge, "new", "bytes"),
+        ];
+        let put = store
+            .put(
+                &metrics_meta_key(&th),
+                body_at_version(2, th, &upgraded).into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("upgrade the record to version 2");
+
+        // Past the horizon: the stale version-1 record is served immediately and
+        // one background refresh runs.
+        clock.advance(Duration::from_secs(61));
+        let stale = cache.get(th).await;
+        assert_eq!(
+            stale.as_slice(),
+            seeded.as_slice(),
+            "the past-horizon request is served the stale record, never blocked on S3"
+        );
+        wait_for_refresh_to_settle(&cache, th).await;
+        assert_eq!(
+            store.get_count() - base,
+            2,
+            "the miss fill plus exactly one refresh GET"
+        );
+
+        // The refresh replaced the snapshot with the version-2 entry set, and
+        // recorded the version the upgraded record was read at.
+        let served = cache.get(th).await;
+        assert_eq!(
+            served.as_slice(),
+            upgraded.as_slice(),
+            "the refresh serves the version-2 entries exactly"
+        );
+        assert_eq!(
+            cache.counters().refresh_errors,
+            0,
+            "the version-2 record is not a refresh error"
+        );
+        let version = {
+            let inner = cache.shared.lock();
+            inner
+                .tenants
+                .get(&th)
+                .expect("the tenant is still cached")
+                .version
+                .clone()
+        };
+        assert_eq!(
+            version,
+            Some(put.version),
+            "the entry carries the upgraded record's store version"
+        );
     }
 
     #[tokio::test]
