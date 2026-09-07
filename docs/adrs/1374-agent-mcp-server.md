@@ -231,7 +231,7 @@ Every tool returns one envelope:
   "visibility": {"snapshot_id": "", "watermark_hour": "", "pinned": false, "min_commit_tokens_applied": []},
   "coverage": {"complete": true, "partial": false, "fragments": [], "unindexed_predicates": []},
   "accuracy": {"exact": true, "approximation": null, "lower_bound_count": false},
-  "presentation": {"max_rows": 200, "row_cap_hit": false, "bytes_cap_hit": false, "rows_omitted": 0, "cursor": null},
+  "presentation": {"max_rows": 200, "row_cap_hit": false, "bytes_cap_hit": false, "rows_omitted": 0, "cells_truncated": 0, "metadata_elided": 0, "cursor": null},
   "budget": {"effective": {}, "actual": {}, "estimate": {}, "estimate_is_upper_envelope": true},
   "evidence": [{"ref": "", "covers": "data.rows", "sha256": ""}],
   "warnings": [],
@@ -257,18 +257,39 @@ cursor points at the last kept row and the status is `ok_page`. The omitted
 rows are then reachable on the next page. When it has no total order, the
 status is `ok_bounded`.
 
+A page always keeps its first row when the query produced one. When the
+first row alone does not fit under the cap, the server keeps the row. It
+shortens each string cell of that row to at most 4 KiB and appends a
+trailing marker to each shortened cell. `presentation.cells_truncated`
+carries the count of shortened cells. The evidence hash covers the full
+canonical row, not the shortened one. So `data.rows` is never empty while `rows_omitted` is
+positive, and a cursor always has a last kept row. A test feeds a row with a
+64 KiB body under the floor cap and asserts one row, one truncated cell, and
+zero omitted rows.
+
 The fixed part of the envelope is bounded so that it always fits. The server
-floors `max_response_bytes` at 16 KiB: a caller value below the floor is
+floors `max_response_bytes` at 64 KiB: a caller value below the floor is
 raised to the floor, and the envelope says so. This floor is a minimum on
-the presentation cap and is not a raise of any query budget. The metadata
-lists are bounded by count: at most 16 `warnings`, 8 `next_steps`, and 16
-`evidence` entries, each with a bounded string length. A test serializes an
-envelope with zero rows and every metadata list at its maximum and asserts
-that it fits under 16 KiB. When the rendering still cannot fit, which the
-test makes impossible, the result is an `error` with class `internal`. The
-byte cap, the row cap, and analytic downsampling are three separate facts in
-the envelope. A downsampled analytic sets `exact: false` and names the
-method.
+the presentation cap and is not a raise of any query budget. Every
+variable-length field outside `data.rows` has a count bound and a string
+bound:
+
+- `data.columns`: at most 512 entries of 256 bytes each
+- `scope.predicates_applied` and `scope.order_by`: at most 16 entries of
+  512 bytes each
+- `visibility.min_commit_tokens_applied`: at most 64 entries
+- `coverage.fragments`: at most 64 entries
+- `coverage.unindexed_predicates`: at most 16 entries
+- `warnings`: at most 16 entries, `next_steps`: at most 8 entries,
+  `evidence`: at most 16 entries, each entry at most 512 bytes
+
+When a list exceeds its bound, the server keeps the first entries and sets
+`presentation.metadata_elided` to the number of dropped entries. A test
+serializes an
+envelope with zero rows and every field at its bound and asserts the exact
+size stays under 64 KiB. The byte cap, the row cap, and analytic
+downsampling are three separate facts in the envelope. A downsampled
+analytic sets `exact: false` and names the method.
 Missing coverage sets `complete: false` and names the reason. A budget
 failure or a deadline is an `error`. The server never returns a partial exact
 aggregate as `ok`. A `COUNT` over `logs` or `spans` sets
