@@ -137,7 +137,9 @@ pub struct Cli {
     pub maintain_tenants: Vec<String>,
 
     /// Dev-only tenant resolution via the `x-ravel-tenant` header. Refuses to
-    /// enable unless `--listen-http` binds a loopback address.
+    /// enable unless both `--listen-http` and `--listen-grpc` bind loopback
+    /// addresses: the dev header resolver backs every public listener (HTTP,
+    /// OTLP gRPC, and Flight SQL), not just HTTP.
     #[arg(long)]
     pub dev_insecure_tenant_header: bool,
 
