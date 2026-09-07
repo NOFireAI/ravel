@@ -276,6 +276,7 @@ fn sql_app(
         )),
         QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("build_sql_state");
     ravel_server::sql::router(state)
