@@ -98,7 +98,7 @@ name alone and you will see two shapes:
 | `page_fetch` | metric | `page_kind`, `series_count`, `s3_requests`, `s3_bytes` |
 | `page_fetch` | logs | `signal = "logs"`, `s3_requests`, `s3_bytes` |
 | `decode` | metric | `page_kind`, `series_count`, `decompressed_bytes` |
-| `decode` | logs | `signal = "logs"`, `blocks_scanned`, `blocks_total` |
+| `decode` | logs | `signal = "logs"`, `blocks_scanned`, `blocks_total`, `decompressed_bytes` |
 
 - The logs `page_fetch` records `s3_requests`/`s3_bytes` with the same meaning
   as the metric one (this call's own store-GET cost: one GET on the uncached or
@@ -106,15 +106,14 @@ name alone and you will see two shapes:
   `series_count`: RLOG has no scalar/histogram page kinds, and its unit of
   identity is the log stream, not the metric series, so neither field maps onto
   this path.
-- The logs `decode` records `blocks_scanned` and `blocks_total` rather than
-  `decompressed_bytes`. No decompressed-byte count is available here without a
-  structural change to the log segment reader, which counts blocks rather than
-  bytes and never sums its per-block decompression.
-  `blocks_scanned`/`blocks_total` are instead a real
-  pruning-effectiveness signal (how much of the object's block index the scan
-  had to touch after skip-index, POSTINGS, and bloom pruning), analogous to
-  `catalog_resolve`'s `segments_pruned` on the metric path, which is likewise a
-  pruning count and not a byte count.
+- The logs `decode` records `decompressed_bytes` with the same meaning as the
+  metric one: the uncompressed size zstd produced for this object, covering
+  its directory sections, any POSTINGS probe, and every decoded block page. It
+  also records `blocks_scanned`/`blocks_total`, a pruning-effectiveness signal
+  (how much of the object's block index the scan had to touch after
+  skip-index, POSTINGS, and bloom pruning), analogous to `catalog_resolve`'s
+  `segments_pruned` on the metric path, which is likewise a pruning count and
+  not a byte count.
 
 ## Turning them on
 

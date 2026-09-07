@@ -18,10 +18,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{
     AttrValue, ColumnSelection, FieldSel, FieldType, LogRecord, LogStreamId, Predicate, RlogConfig,
-    RlogWriter, stream_attrs_bytes,
+    RlogWriter, read_section, stream_attrs_bytes,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -520,6 +521,91 @@ async fn matching_streams_over_approximates_nested_map_values() {
         )
         .expect("resolve");
     assert!(none.is_empty(), "no stream carries service.name=absent");
+}
+
+/// The collecting funnel (`fetch_accounted`, the same `scan_bytes` drain the
+/// tenant-aware `fetch_accounted_with_tenant` uses for the alerts and audit
+/// scans) charges the decode's decompressed bytes to the handle it was given:
+/// what zstd produced opening the object's four directory sections plus every
+/// page of every block a ts-only query scans. Both halves are derived here
+/// from the footer and PAGE_DIR, not read back from the fetcher, so a funnel
+/// that charged one page per block, or the directories alone, fails.
+#[tokio::test]
+async fn fetch_accounted_charges_the_decode_decompression() {
+    let mem = MemoryStore::new();
+    // Bodies long and repetitive enough that each block's body page clears the
+    // page writer's 512-byte compression floor and zstd wins, so the fixture
+    // carries zstd pages for the oracle's page half to count. The tiny scalar
+    // columns stay raw and contribute nothing, which the per-page gate below
+    // mirrors.
+    let body = "request served from cache in 3ms; ".repeat(32);
+    let recs: Vec<LogRecord> = (100..=110).map(|ts| record("api", ts, &body)).collect();
+    let seg = write_object(&mem, "logs/acct.rlog", &recs).await;
+    let bytes = mem
+        .get("logs/acct.rlog", GetRange::Full)
+        .await
+        .expect("get")
+        .data;
+
+    let f = ravel_logseg::footer::open(&bytes).expect("open");
+    let mut expected = 0u64;
+    for k in [
+        ravel_logseg::footer::kind::STREAM_DIR,
+        ravel_logseg::footer::kind::FIELD_DIR,
+        ravel_logseg::footer::kind::SKIP_IDX,
+        ravel_logseg::footer::kind::PAGE_DIR,
+    ] {
+        let desc = *f.section(k).expect("section present");
+        if desc.comp == ravel_logseg::footer::COMP_ZSTD {
+            expected += desc.uncomp_len;
+        }
+    }
+    let page_dir_desc = *f
+        .section(ravel_logseg::footer::kind::PAGE_DIR)
+        .expect("PAGE_DIR present");
+    let page_dir_raw = read_section(&bytes, &page_dir_desc, &small_blocks()).expect("PAGE_DIR");
+    let page_dir = PageDir::decode(&page_dir_raw).expect("decode PAGE_DIR");
+    let mut page_total = 0u64;
+    for group in &page_dir.groups {
+        for chunk in &group.chunks {
+            for page in &chunk.pages {
+                if page.comp == ravel_logseg::footer::COMP_ZSTD {
+                    page_total += page.uncomp_len;
+                }
+            }
+        }
+    }
+    assert_ne!(
+        page_total, 0,
+        "fixture precondition: at least one zstd page, or the page half of the \
+         oracle proves nothing"
+    );
+    expected += page_total;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(mem);
+    let fetcher = LogSegmentFetcher::new(store);
+    let query = LogQuery::new(i64::MIN, i64::MAX);
+    let accounting = QueryAccounting::new();
+    let out = fetcher
+        .fetch_accounted(&seg, &query, &accounting)
+        .await
+        .expect("fetch")
+        .expect("in range");
+    assert_eq!(
+        out.records.len(),
+        recs.len(),
+        "a ts-only query scans and returns every record"
+    );
+    assert_eq!(
+        accounting.snapshot().decompressed_bytes,
+        expected,
+        "the collecting funnel charges exactly the four directory opens plus \
+         every decoded page"
+    );
+    assert_eq!(
+        out.stats.decompressed_bytes, expected,
+        "the returned scan stats carry the same figure"
+    );
 }
 
 #[tokio::test]
