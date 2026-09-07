@@ -139,8 +139,12 @@ The code is correct; this amendment makes the ADR match it.
   limit that bounds how much a single tenant can commit at once, is
   tracked as a separate follow-up. It is not a precondition
   for keeping joins enabled.
-- The behavior is demonstrated by
-  `crates/ravel-sql/tests/memory_ceiling_and_budget_errors.rs::grow_must_not_bypass_the_query_and_tenant_ceiling`,
-  kept `#[ignore]`d (`"grow-path memory-ceiling probe; not wired as a gate"`)
-  as documentation of the accepted best-effort behavior rather than as a
-  failing gate.
+- The gap is recorded, not demonstrated, by
+  `crates/ravel-sql/tests/memory_ceiling_and_budget_errors.rs::grow_must_not_bypass_the_query_and_tenant_ceiling`.
+  It asserts the invariant this path fails to hold: that after an infallible
+  `grow(4096)` neither the query nor the tenant reserved count exceeds the
+  1024 ceiling. That is exactly what the unconditional grow path violates
+  today, so the test would fail if run. It is kept `#[ignore]`d
+  (`"grow-path memory-ceiling probe; not wired as a gate"`) precisely for
+  that reason: it is a recorded violated invariant and a known gap, not a
+  demonstration of accepted behavior and not a failing gate.

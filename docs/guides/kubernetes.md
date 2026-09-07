@@ -515,6 +515,6 @@ The operator's design, its condition set and its reconcile model are
 [ADR-0034](../adrs/0034-k8s-operator.md). The per-mode storage credential
 roles are ADR-0055; the deployment key and `sys/auth` ownership are ADR-0072;
 per-tenant resharding is ADR-0052; ingest affinity and the Gateway API
-exposure are ADR-0076 decision 1 and ADR-0080. Leased, idempotent
-maintenance ownership, which is why maintain can run more than one replica,
-is ADR-0065.
+exposure are ADR-0076 decision 1 and ADR-0080. Idempotent maintenance
+ownership by heartbeat membership and rendezvous hashing, deliberately not a
+lease, which is why maintain can run more than one replica, is ADR-0065.
