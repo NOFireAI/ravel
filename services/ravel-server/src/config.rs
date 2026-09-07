@@ -1740,8 +1740,8 @@ pub const MIN_DERIVED_FETCH_CONCURRENCY: usize = 8;
 /// window used to sweep [`CACHE_MEMORY_PERCENT`], the reserve is the maximum
 /// over the window of `ravel_process_allocator_bytes{stat="resident"}` minus
 /// the unique tracked total (`cache_resident + sql_reserved + fetch_reserved
-/// - handoff_overlap`), plus a 25% margin, rounded up to the next 256 MiB; it
-/// must also exceed the fetch layer's `partitions x max batch bytes`
+/// minus handoff_overlap`), plus a 25% margin, rounded up to the next 256
+/// MiB; it must also exceed the fetch layer's `partitions x max batch bytes`
 /// exposure. That run is separate from, and frozen before, the acceptance
 /// runs the resulting figure gates, so the acceptance assertion is not
 /// circular.
@@ -6373,8 +6373,7 @@ mod tests {
     /// hard caps exactly equal to the budget must still resolve `Ok`.
     #[test]
     fn startup_accepts_hard_caps_exactly_at_the_memory_budget() {
-        let resolved =
-            resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
         let budget = resolved.memory_budget_bytes;
         let half = budget / 2;
 
@@ -6383,7 +6382,10 @@ mod tests {
         let resolved = cli
             .resolve_performance(reference_host())
             .expect("hard caps of exactly the budget must not be refused");
-        assert_eq!(resolved.memory_hard_caps_bytes, resolved.memory_budget_bytes);
+        assert_eq!(
+            resolved.memory_hard_caps_bytes,
+            resolved.memory_budget_bytes
+        );
     }
 
     /// The four ADR-1170 decision 3/4 emit lines -- `memory_budget_bytes`,

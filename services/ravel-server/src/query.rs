@@ -268,6 +268,14 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 /// built here so the caller owns the concrete overlay: `start` registers it with
 /// the idle-tenant sweep, and a test can build one with a short staleness
 /// horizon and still exercise this exact wiring.
+///
+/// `process_memory_budget` is the ADR-1170 decisions 1/3 process-wide
+/// accountant: the shared remainder left after both hard cache carves
+/// (`ResolvedPerformanceDefaults::memory_remainder_bytes`), installed on the
+/// executor via `SqlExecutor::with_process_memory_budget` so every tenant's
+/// SQL memory reservation counts against the SAME instance
+/// [`crate::lib`]'s `/metrics` gauges read, rather than an executor-private
+/// budget the exposition cannot see.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state(
@@ -283,6 +291,7 @@ pub fn build_sql_state(
     query_accounting: Arc<crate::metrics::QueryAccountingMetrics>,
     query_admission: Arc<QueryAdmissionController>,
     declared_columns: Option<Arc<dyn ravel_sql::DeclaredColumnSource>>,
+    process_memory_budget: Arc<ravel_memory::MemoryBudget>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -382,6 +391,7 @@ pub fn build_sql_state(
         Some(source) => executor.with_declared_column_source(source),
         None => executor,
     };
+    let executor = executor.with_process_memory_budget(process_memory_budget);
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -542,15 +552,18 @@ mod catalog_cache_tests {
     /// argument `crate::start` passes (`ServerConfig::catalog_cache_max_bytes`,
     /// which `main` fills from
     /// `ResolvedPerformanceDefaults::catalog_cache_max_bytes`). The catalog
-    /// cache is a SEPARATE ceiling from the fetcher cache: on the reference
-    /// profile it resolves to 5% of `MemTotal` (1,610,612,736) while the fetcher
-    /// cache `store::build_cache` bounds stays at 25% (8,053,063,680), so the
-    /// two independent LRU caches do not each claim the full share. An explicit
-    /// `--cache-max-bytes` sets both equal.
+    /// cache is a SEPARATE ceiling from the fetcher cache: both carve from
+    /// `memory_budget_bytes` (`MemTotal` minus
+    /// [`crate::config::MEMORY_OVERHEAD_RESERVE_BYTES`], ADR-1170 decision 3),
+    /// not from raw `MemTotal`. On the reference profile the 30,064,771,072
+    /// budget resolves to 5% for the catalog cache (1,503,238,553) while the
+    /// fetcher cache `store::build_cache` bounds stays at 25%
+    /// (7,516,192,768), so the two independent LRU caches do not each claim
+    /// the full share. An explicit `--cache-max-bytes` sets both equal.
     ///
     /// Prove-the-test: pass `resolved.cache_max_bytes` (the fetcher 25% number)
-    /// to `build_catalog` here and the first assertion reads 8,053,063,680
-    /// against the expected 1,610,612,736.
+    /// to `build_catalog` here and the first assertion reads 7,516,192,768
+    /// against the expected 1,503,238,553.
     #[test]
     fn the_derived_cache_max_bytes_reaches_the_catalog_byte_cache() {
         use clap::Parser;
@@ -562,8 +575,8 @@ mod catalog_cache_tests {
             .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
             .expect("performance defaults resolve");
         // The two caches derive to different ceilings on the same host.
-        assert_eq!(resolved.cache_max_bytes, 8_053_063_680);
-        assert_eq!(resolved.catalog_cache_max_bytes, 1_610_612_736);
+        assert_eq!(resolved.cache_max_bytes, 7_516_192_768);
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_503_238_553);
 
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let catalog = build_catalog(
@@ -577,9 +590,9 @@ mod catalog_cache_tests {
         .expect("catalog builds");
         assert_eq!(
             catalog.config().byte_cache_max_bytes,
-            1_610_612_736,
+            1_503_238_553,
             "the catalog byte cache must be bounded by the derived catalog ceiling (5% of \
-             MemTotal), not the fetcher cache's 25% and not the compiled-in 256 MiB"
+             memory_budget_bytes), not the fetcher cache's 25% and not the compiled-in 256 MiB"
         );
 
         // An explicit --cache-max-bytes couples both caches at that one value.
@@ -660,6 +673,7 @@ mod tests {
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .expect("sql state builds");
 
@@ -708,6 +722,7 @@ mod tests {
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .expect("sql state builds");
         assert_eq!(
@@ -758,6 +773,7 @@ mod tests {
             )),
             QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .expect("sql state builds")
     }
