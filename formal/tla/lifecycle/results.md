@@ -1,11 +1,15 @@
 # Lifecycle GC model-checking results
 
-Toolchain: tla2tools 1.7.4, TLC2 version 2.19 (rev 5a47802), OpenJDK 21. All
-runs below are the executor's; the exhaustive configuration was not run by the
-executor (see the last section). TLC checked this finite model under the bounds
-and assumptions in each `.cfg`. This model verifies the protocol design;
-implementation conformance is argued in `traceability.md` and asserted by the
-named Rust tests, not proved.
+Toolchain: tla2tools 1.7.4, TLC2 version 2.19 (rev 5a47802), OpenJDK 21. TLC
+checked this finite model under the bounds and assumptions in each `.cfg`. This
+model verifies the protocol design; implementation conformance is argued in
+`traceability.md` and asserted by the named Rust tests, not proved.
+
+This file is append-only by round: the sections below record what each round
+measured against the model as it stood at the end of that round, and earlier
+figures are not rewritten when a later round moves them. For the current
+figures, bounds, and invariant list, read the LAST round section and
+`bands.tsv`, which always carries the measured band for the model at HEAD.
 
 ## Smoke
 
@@ -126,7 +130,7 @@ flag the action sets to certify itself, and none reduces to a constant.
 - `ErasedSubjectNeverServedAfterRequest`: reads the store and HEAD via
   `ServedRead`, and `erasureRequested`.
 - `RewriteOutputsAreInputsMinusErased`: reads the materialised output content
-  `objContent["rwA"]` via `ServesSubject`.
+  `objContent[w]` for every `w \in RewriteOut` via `ServesSubject`.
 - `CompletionImpliesNoPreRewriteExposure`: reads the store (`PresentObj("doneR1")`)
   and the current HEAD content via `ServesNow`.
 - `CompletionRespectsLegalHold`: reads `lastGc.rule` and `lastGc.heldInputServed`,
@@ -139,9 +143,13 @@ flag the action sets to certify itself, and none reduces to a constant.
   the same per-step witness as `CompletionRespectsLegalHold`, set from
   `GcWitness("dreq", ...)` at `DreqSweep`'s own transition.
 - `IdenticalInputSetsDoNotCollide`: reads `variantKey`, which records the actual
-  names `PerformRewrite` stored for the two variants.
+  names `PublishRewrite` stored for the two variants.
 - `HeadNamedObjectNeverDeletedBySupersededSweep`: reads the current HEAD and the
-  store (`PresentObj`) over the raw inputs.
+  store (`PresentObj`) over the objects a supersession can name
+  (`SupersededCandidates`: the raw inputs and the compaction output).
+- `AtMostOneLiveRecordSetServed` (added in round eight): reads the store
+  (`PresentObj`), `superseded`, and the static `Predecessors` relation, counting
+  the live record sets whose inputs a completed rewrite already superseded.
 
 ## Candidate #1133: CONFIRMED unsafe
 
@@ -916,3 +924,201 @@ PASS (all seven controls VIOLATED as expected, unaffected since none
 targets raw-input content), traceability PASS (eighteen rows resolve, one
 new row for `RawInputContentAssumedImmutable`), exhaustive PASS
 (1340669/230815/22, inside band, unchanged, 30s), `check_docs.py` clean.
+
+## Round eight: compaction and a second rewrite identity (issues #1289, #1221)
+
+Both issues are edits to the same variables and actions, so they land together.
+
+Issue #1289 asks whether a compaction that starts while an erasure rewrite is
+in flight can publish a record set that still serves the pre-rewrite objects.
+Before this round the model could not answer: it had no compaction action at
+all, so every invariant about the interaction held vacuously. Issue #1221 is
+the same model's other blind spot: exactly one rewrite identity, so two
+rewrites racing across a lease expiry, which ADR-0065 permits, could not be
+expressed.
+
+### What the model gained
+
+- `StartCompaction` and `PublishCompaction`, split the same way the rewrite
+  pass is, because the shipped pass is a listing round trip and a publish round
+  trip with no compare-and-swap between them. `StartCompaction` carries the
+  guard the shipped Rust enforces, cited in a comment above the action:
+  `compact_bucket_scoped` in `crates/ravel-maintain/src/compact.rs` returns
+  `CompactionOutcome::RewritePresent` when its fresh listing holds any erasure
+  rewrite record (commit `b997b7e1`, scoped by `cdce1722`).
+- A second rewrite output object, `RewriteOut = {"rwA", "rwB"}`, and a second
+  rewrite identity, `RewriteIds = {"A", "B"}`, with `rwPhase` and `rwInputs`
+  indexed by identity. `TargetOf` maps a resolved input set to the output
+  object it addresses, which is how the content-addressed rewrite record key
+  behaves: two identities that resolved the same inputs converge on one object
+  under `CreateIfAbsent`.
+- `leaseOwner` and an `ExpireLease` environment action. Ownership is by
+  rendezvous hash with no per-unit CAS lease and no fencing token (ADR-0065
+  decision 2), so an expiry is something the environment does to a pass in
+  flight, not something the pass observes.
+- `supersededAt` changed from one scalar to a function over
+  `SupersededCandidates`. With two publishing passes, supersession happens at
+  two different clocks, and a shared scalar would let a later supersession
+  retroactively reopen an earlier delete's protection window.
+- One new invariant, `AtMostOneLiveRecordSetServed`: at every state, at most
+  one live record set references objects a completed rewrite has superseded.
+  This is ADR-0064 decision 3 point 5 stated over the store rather than over
+  the snapshot resolver.
+
+Invariant count is now sixteen; switch count ten, of which eight are negative
+controls.
+
+### Figures
+
+Every figure below is from a run recorded in this session. All lanes ran with
+`scripts/check-tla.sh`, which invokes TLC with `-workers auto` on this
+16-core host; the scratch probes ran with `-workers 2 -Xmx2g`.
+
+| config | spec | result | states generated | distinct | depth | wall |
+|---|---|---|---|---|---|---|
+| smoke.cfg | Spec | PASS, 16 invariants | 25339943 | 3773271 | 31 | 30s |
+| exhaustive.cfg | FairSpec | PASS, 16 invariants + 2 properties | 25339943 | 3773271 | 31 | 10min 22s |
+| negative/compaction-ignores-rewrite.cfg | Spec | VIOLATED as expected, exit 12 | 25156 | 8600 | 9 | 1s |
+
+`bands.tsv` is re-derived from those runs: both configs 3768700 to 3777900
+distinct, depth 31 exactly. The band width matches the margin the existing
+rows were cut with (about 0.12 percent either side of the observed distinct
+count, depth pinned).
+
+The two configs report identical figures because they explore the same state
+graph: fairness constrains which behaviours count, not which states are
+reachable, and after the bound change below they now share `MaxClock = 2`.
+What `exhaustive.cfg` still adds over `smoke.cfg` is the liveness lane, which
+`smoke.cfg` does not check at any bound: TLC reported `Checking 3 branches of
+temporal properties for the complete state space with 11319813 total distinct
+states`, finished in 1min 22s, with no violation, so `EventuallySwept` and
+`EventuallyCompleted` both hold at this bound with two identities and a
+compaction in the model.
+
+### Bound reduced
+
+`exhaustive.cfg` moved from `MaxClock = 3` to `MaxClock = 2`. Nothing else
+moved: object counts, rewrite rounds, the horizon constants and the invariant
+list are all unchanged, and `smoke.cfg` still checks `MaxClock = 2` as before.
+
+The reason is state-space growth, not a shortcut. At a fixed clock bound the
+new actions grow the reachable graph by roughly a factor of 75 (smoke went
+from 50102 to 3773271 distinct states). At `MaxClock = 3` the run was still
+growing past 31.4 million states generated and 6.5 million distinct after 14
+minutes with the queue rising rather than draining at depth 20, and TLC's
+temporal-property branch check alone had reached 82 seconds per pass; it would
+not have completed inside the 3600 second lane budget. At `MaxClock = 2` the
+graph completes: `0 states left on queue`, depth 31 for the complete search.
+
+Depth was not dropped to buy this. The reduced bound explores to depth 31,
+deeper than the depth 22 the previous round's `MaxClock = 3` run reached,
+because the new two-step passes and the lease expiry add steps to every
+behaviour.
+
+### The negative control (proof of the new invariant)
+
+`negative/compaction-ignores-rewrite.cfg` flips `CompactionIgnoresRewrite` to
+`TRUE`, dropping the listing guard and nothing else. It keeps
+`SerializeCompactionAndRewrite = TRUE`, so the control isolates the guard
+rather than also removing the driver's serialisation, and it carries the full
+sixteen-invariant list and `FullEnv = TRUE` per finding 5's convention.
+
+```text
+Error: Invariant AtMostOneLiveRecordSetServed is violated.
+```
+
+TLC exit 12, property `AtMostOneLiveRecordSetServed`, `25156 states generated,
+8600 distinct states found`, depth 9, 1s. `check-tla.sh` matched it against the
+`.expect` file and reported:
+
+```text
+check-tla: lifecycle negative compaction-ignores-rewrite: VIOLATED as expected (exit 12, AtMostOneLiveRecordSetServed)
+```
+
+The seven pre-existing controls still fire their own target and only their
+target under the new sixteen-invariant list; the whole lane reported `negative:
+all checks passed`. Full trace in
+`counterexamples/compaction-ignores-rewrite.md`. The harm the trace shows is
+not just a count: `objContent["rwA"] = {rec2}` after the rewrite drops the
+erased record, but the compaction output re-derives `objContent["cmpA"] =
+{rec1, rec2}` from the input the rewrite had superseded.
+
+### Two identities: the invariants hold
+
+Every pre-existing safety invariant was quantified over both rewrite outputs
+and both identities rather than rewritten, and all sixteen hold at
+`MaxClock = 2` under both `Spec` (3773271 distinct states) and `FairSpec`
+(same graph, plus both liveness properties). No invariant needed weakening,
+and there is no finding to report against the design on this axis.
+
+That is only meaningful if the new behaviours are reached. Three probes assert
+each is impossible and each is VIOLATED, so each is reachable
+(`counterexamples/two-rewrite-identities-probe.md`):
+
+- `ProbeNoTwoIdentitiesListed`, exit 12, depth 6. Trace `RequestErasure`,
+  `StartRewrite("A")`, `ExpireLease`, `StartRewrite("B")`: identity B takes a
+  listing after A's lease expires and before A has published anything, which
+  is exactly the race #1221 names.
+- `ProbeRwBUnreachable`, exit 12, depth 8: the second rewrite output is
+  materialised.
+- `ProbeNoRewriteOfCompaction`, exit 12, depth 8: a rewrite supersedes a
+  derived record set.
+
+The third also closes the gap round seven recorded and could not close. That
+round found `RecordSetContent`'s read of the live `objContent` unexercised
+because no action produced a second record set for a further rewrite to
+consume. `Predecessors("rwB") = CompactOut` and `objContent["cmpA"]` is written
+by `PublishCompaction`, so the current-state read is now load-bearing.
+
+### Finding: the shipped listing guard is not sufficient on its own
+
+Reported, not fixed: this change touches no Rust.
+
+`SerializeCompactionAndRewrite = TRUE` is not a negative control switch. It
+records an assumption about the maintenance driver: that it runs at most one of
+compaction and erasure rewrite over a bucket at a time. TLC shows the
+assumption is load-bearing rather than belt-and-braces. With the shipped
+listing guard left ON (`CompactionIgnoresRewrite = FALSE`) and only the
+serialisation removed:
+
+```text
+Error: Invariant AtMostOneLiveRecordSetServed is violated.
+```
+
+TLC exit 12, `18885 states generated, 6954 distinct states found`, depth 8, 1s.
+Trace: `RequestErasure`, `StartRewrite("A")`, `ExpireLease`,
+`StartCompaction`, `PublishRewrite("A")`, `PublishCompaction`. The compactor
+lists while the rewrite is in flight, so its listing legitimately holds no
+rewrite record and the guard has nothing to refuse on; the rewrite record
+becomes durable afterwards and the compactor publishes over the same
+now-superseded input.
+
+This is consistent with what `cdce1722` already says about the guard's scope (a
+list-time observation with no compare-and-swap, closing only the
+already-durable case) and it makes the consequence precise: for the concurrent
+case the safety comes from the driver, not from the store or the guard. If the
+driver ever runs the two passes concurrently over one bucket, a real fence is
+needed, either a compare-and-swap on a per-bucket lease or a compaction key a
+concurrent rewrite publish can invalidate. Recorded in
+`counterexamples/compaction-ignores-rewrite.md` under "What the guard does not
+cover".
+
+### Gates
+
+`scripts/check-tla.sh ci` (every area: smoke, negative controls, traceability)
+exit 0, `check-tla: ci: all checks passed`. `python3 scripts/check_docs.py`
+exit 0, `docs gate: clean.` Both run unpiped from the repository root with
+their own exit code read. In that run the lifecycle lane reported
+`smoke: PASS states=25339943 distinct=3773271 depth=31 32s`, all eight
+negative controls VIOLATED as expected, and `traceability: PASS (20 rows
+resolve)`. Traceability grew from eighteen rows to twenty, two new:
+`PublishRewrite (no lease fence)` and `StartCompaction (rewrite guard) /
+AtMostOneLiveRecordSetServed`.
+
+Every TLC log was read in full. No log in `.cache/tla/logs` contains a
+`Deadlock` line, and the only `Error:` lines are the eight expected
+negative-control violations; the smoke and exhaustive logs contain none.
+
+`exhaustive.cfg` is not in the `ci` lane (that lane is smoke, negative,
+traceability); it runs under `all`, and its figures above are from a direct
+`scripts/check-tla.sh exhaustive -a lifecycle` run.

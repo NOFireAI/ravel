@@ -10,7 +10,8 @@ Target invariant: `HeadNamedObjectNeverDeletedBySupersededSweep`. TLC exit 12.
 Error: Invariant HeadNamedObjectNeverDeletedBySupersededSweep is violated.
 ```
 
-Trace: `PerformRewrite` writes `rwA` and marks the raw inputs superseded without
+Trace: the rewrite pass (`StartRewrite` then `PublishRewrite`) writes `rwA` and
+marks the raw inputs superseded without
 advancing HEAD, so the inputs are still HEAD-named. `SupersededSweep` then
 deletes one such input. The witness records `rule |-> superseded` with
 `headNamed` non-empty, so the invariant (`headNamed = {}`) fails.

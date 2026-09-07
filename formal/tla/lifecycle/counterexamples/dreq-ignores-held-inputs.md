@@ -17,7 +17,8 @@ Error: Invariant DreqSweepRespectsLegalHold is violated.
 ```
 
 Trace: `RequestErasure` writes the `.dreq` and marks `s1` erased; `Tick`;
-`PerformRewrite`; `HeadAdvanceRewrite` switches HEAD to the rewrite output
+`StartRewrite` then `PublishRewrite`; `HeadAdvanceRewrite` switches HEAD to the
+rewrite output
 (so `raw1` is now superseded, off HEAD, and no longer reachable through any
 live or pinned read); `CompleteErasure` writes `.done` (legitimate: no hold
 exists yet); `PlaceHold` places a legal hold on `b1`, which still holds

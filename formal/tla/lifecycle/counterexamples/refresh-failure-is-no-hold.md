@@ -11,7 +11,8 @@ Error: Invariant RefreshFailureNeverSweeps is violated.
 ```
 
 Trace: `SetHeadState` then `SetRefresh(TRUE)` puts the refresh in the failed
-state; `PerformRewrite` marks the raw inputs superseded; `SupersededSweep`
+state; the rewrite pass (`StartRewrite` then `PublishRewrite`) marks the raw
+inputs superseded; `SupersededSweep`
 deletes one while `refreshFailed = TRUE`. The witness records a non-empty
 `deleted` with `refreshWasFailed |-> TRUE`, so the invariant
 (`deleted # {} => refreshWasFailed = FALSE`) fails.
