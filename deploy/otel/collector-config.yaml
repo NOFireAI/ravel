@@ -1,6 +1,9 @@
 # OpenTelemetry Collector config for the container-first quickstart
-# (ADR-0081 decision 3). Scrapes host metrics and exports them to ravel-server
-# over OTLP/HTTP, authenticating with the demo bearer token.
+# (ADR-0081 decision 3). Scrapes host metrics and tails the collector's own
+# log output, exporting both to ravel-server over OTLP/HTTP, authenticating
+# with the demo bearer token. This is what makes the README's PromQL-over-logs
+# example (`ravel_log_lines`) non-empty on a fresh `docker compose up`: there
+# is no other log source in the quickstart (issue #1334).
 #
 # SECURITY: `demo-token` is a fixed development credential, matching the
 # `--tenant-token demo-token=demo-tenant` ravel-server runs with in
@@ -26,13 +29,35 @@ receivers:
       memory:
       network:
 
+  # Tails the file the collector's own telemetry logs are mirrored to below
+  # (service.telemetry.logs.output_paths). It is the one log source every
+  # quickstart run has without a host mount or a second container: the
+  # collector always logs its own startup and scrape activity.
+  filelog:
+    include: [/tmp/otelcol-collector.log]
+    start_at: beginning
+
 processors:
   batch:
 
+  # Stamps a `service.name` resource attribute on the tailed log records.
+  # ravel-otlp turns `service.name` into the `job` label on ingest
+  # (crates/ravel-otlp/src/normalize.rs, mirrored for logs in
+  # crates/ravel-query/src/log_series.rs), which is what lets the README's
+  # `sum by (job) (count_over_time(ravel_log_lines[5m]))` group the result.
+  # filelog sets no service.name on its own, so without this the records
+  # would ingest with no `job` label and the query would still return empty.
+  resource:
+    attributes:
+      - key: service.name
+        value: otel-collector
+        action: upsert
+
 exporters:
-  # OTLP/HTTP posts to ravel-server's /v1/metrics (the exporter appends the
-  # signal path to this base). Protobuf encoding, which is what
-  # ExportMetricsServiceRequest::decode expects.
+  # OTLP/HTTP posts to ravel-server's /v1/metrics or /v1/logs (the exporter
+  # appends the signal path to this base). Protobuf encoding, which is what
+  # ExportMetricsServiceRequest::decode / ExportLogsServiceRequest::decode
+  # expect.
   otlphttp:
     endpoint: http://ravel-server:4318
     auth:
@@ -45,18 +70,27 @@ service:
       receivers: [hostmetrics]
       processors: [batch]
       exporters: [otlphttp]
-  # The collector's own delivery counters, on a Prometheus endpoint.
-  #
-  # This exists so that "is the collector actually delivering?" is a question
-  # with a numeric answer. It is the assertion CI needs (#209) and the first
-  # thing to read when the Grafana dashboard is empty: a non-zero
-  # `otelcol_exporter_send_failed_metric_points` says the collector is running
-  # and Ravel is refusing its exports, which is a different fault from the
-  # collector not scraping at all.
-  #
-  # The address must be 0.0.0.0, not the default localhost. localhost binds the
-  # container's own loopback, which no port mapping can reach.
+    logs:
+      receivers: [filelog]
+      processors: [resource, batch]
+      exporters: [otlphttp]
   telemetry:
+    logs:
+      # Mirrors the collector's own logs to a file in addition to stdout, so
+      # the filelog receiver above has something to tail. Plain text under
+      # /tmp needs no directory creation and no host mount.
+      output_paths: ["stdout", "/tmp/otelcol-collector.log"]
+    # The collector's own delivery counters, on a Prometheus endpoint.
+    #
+    # This exists so that "is the collector actually delivering?" is a
+    # question with a numeric answer. It is the assertion CI needs (#209) and
+    # the first thing to read when the Grafana dashboard is empty: a non-zero
+    # `otelcol_exporter_send_failed_metric_points` says the collector is
+    # running and Ravel is refusing its exports, which is a different fault
+    # from the collector not scraping at all.
+    #
+    # The address must be 0.0.0.0, not the default localhost. localhost binds
+    # the container's own loopback, which no port mapping can reach.
     metrics:
       readers:
         - pull:
