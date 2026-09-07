@@ -420,6 +420,22 @@ process-wide counter this amendment's gauges read; `SqlExecutor` and
 from `memory_remainder_bytes` (`main.rs:487`, `lib.rs:975-976`), so
 `component="sql"` reads real reservations, not a placeholder.
 
+One process-wide counter for every tenant means a cross-tenant cascade,
+which the accountant wiring above does not state on its own: once any one
+tenant's infallible `grow` (`reserve_unchecked`'s saturating add) pushes the
+shared counter above `limit`, every OTHER tenant's next `try_reserve(n > 0)`
+-- including a 1-byte one -- also fails, until the first tenant's `shrink`
+releases enough for the counter to fall back under `limit`. This follows
+directly from `reserve_unchecked` and `try_reserve`'s `reserved + n <= limit`
+comparison (`crates/ravel-memory/src/lib.rs`), and it is faithful to decision
+1 as designed, not a new defect introduced by landing it: decision 1
+deliberately made `grow` infallible and shared the counter process-wide, and
+a cascade is the necessary consequence of both choices together. A later
+acceptance run (M5) must count cascade-caused `try_grow` refusals separately
+from the breaching tenant's own `grow` overshoot: pooling the two into one
+error-rate figure hides whether a band was blown by one tenant's breach or
+by the cascade it triggered against every other tenant sharing the counter.
+
 Decision 2 has not landed: no site in `ravel-query` reserves fetch bytes
 against this budget, so `component="fetch"` always reads `0`. That is the one
 piece decisions 3 and 4 depend on without providing: the fetch-side kill this

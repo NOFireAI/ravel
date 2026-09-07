@@ -709,8 +709,13 @@ Prometheus-style error, never a partial silent result.
 startup: cgroup-capped effective memory (`/proc/meminfo`'s `MemTotal`, capped
 by the cgroup v2 `memory.max` or v1 `memory.limit_in_bytes` when the process
 runs under a finite one) minus a fixed 2 GiB overhead reserve for the
-allocator, thread stacks, and everything outside this accounting. It is `0`
-when memory cannot be read (source `fallback`), never negative.
+allocator, thread stacks, and everything outside this accounting. It is
+`u64::MAX` (unlimited, source `fallback`) when memory cannot be read, never
+`0`: "we could not measure the host" means no trustworthy ceiling can be
+derived, which is unlimited, not the tightest possible ceiling (issue
+#1255). A `0` budget here would build a `MemoryBudget::new(0)` that refuses
+every real reservation while a no-op query still answers, so the process
+looks healthy and then fails every non-trivial query permanently.
 
 Two things are carved from `memory_budget_bytes`, not from raw effective
 memory: the fetcher (RSEG) read cache takes 25%, and the catalog byte cache
@@ -722,10 +727,13 @@ after both carves (`memory_budget_bytes` minus the sum of the two resolved
 cache ceilings) sizes a single shared `ravel_memory::MemoryBudget`
 accountant, one instance per process, that the SQL executor's per-tenant
 memory accountants all reserve against. Startup **refuses** to start, rather
-than silently clamping, when an explicit `--cache-max-bytes` pushes the sum
-of the two resolved hard caps above `memory_budget_bytes`: a typed
-`MemoryBudgetExceeded` error names both figures so the fix (lower the flag,
-or raise the host's memory) is in the error message.
+than silently clamping, when the two resolved hard caps together leave no
+strictly positive remainder of `memory_budget_bytes` -- caps at or above the
+budget, not only strictly above it (issue #1255): a remainder of exactly `0`
+is exactly as unusable as a negative one, since it builds the same refuse-
+everything `MemoryBudget::new(0)`. A typed `MemoryBudgetExceeded` error names
+both figures so the fix (lower the flag, or raise the host's memory) is in
+the error message.
 
 This derivation runs once, at process startup, from the host profile
 observed at that moment. There is no runtime re-derivation and no "grow"
@@ -734,6 +742,16 @@ refused (`try_reserve` returns an error the caller must handle), never
 retried against a larger budget computed later. If the container's cgroup
 limit changes while the process is running, the process does not notice;
 only a restart re-derives the budget.
+
+The ceiling is process-wide, not per-tenant, so a breach cascades across
+tenants: once any one tenant's infallible `grow` (DataFusion's own memory
+pool, adapted onto the same counter) pushes the shared counter above the
+ceiling, every OTHER tenant's next reservation -- including a 1-byte one --
+is also refused, until the first tenant releases enough for the counter to
+fall back under the ceiling. This is faithful to the design (one shared
+counter, one infallible `grow` path), not a separate defect; see ADR-1170's
+2026-09-07 amendment for the full mechanism and its acceptance-measurement
+consequence.
 
 The `/metrics` endpoint exposes the budget's current state as three gauges,
 unconditionally in every mode: `ravel_memory_budget_bytes` (the resolved
