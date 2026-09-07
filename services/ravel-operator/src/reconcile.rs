@@ -1929,6 +1929,33 @@ pub const QUALIFY_JOB_BACKOFF_LIMIT: i32 = 4;
 /// garbage-collected after success does not re-trigger qualification.
 pub const QUALIFY_JOB_TTL_SECONDS: i32 = 3600;
 
+/// `activeDeadlineSeconds` for the qualify Job: a wall-clock bound on a single
+/// attempt, so a qualify pod that hangs (an S3 endpoint that accepts the TCP
+/// connection and then never answers) becomes a `Failed` Job with reason
+/// `DeadlineExceeded` instead of running indefinitely. `backoffLimit` bounds
+/// only how many *failed* attempts run; it does nothing for one attempt that
+/// never terminates, which leaves `StoreQualified` stuck at `Pending` forever.
+///
+/// The value must clear a slow-but-healthy run with margin. `ravel store
+/// qualify` runs 28 sequential object operations against the bucket: probe
+/// create-if-absent (put, put, get = 3), probe CAS version (put, put, put,
+/// get = 4), probe read-after-write ([`super`]'s `CONSISTENCY_CYCLES` = 5
+/// put+get = 10), probe list-after-write (5 put+list = 10), and the final
+/// `sys/qualification` create-if-absent write (1); the two informational
+/// probes issue no request through the `ObjectStoreBackend` contract. Each
+/// operation's per-request ceiling is the S3 client's 20 s `request_timeout`
+/// (ravel-object-store `S3HttpConfig::default`), so a slow-but-healthy run
+/// whose every operation approaches that ceiling without retrying is bounded
+/// by 28 * 20 s = 560 s. 900 s adds a ~1.6x margin (340 s of slack) for pod
+/// scheduling, image pull, and the occasional single retry, while staying far
+/// below a hung endpoint's ~200 s-per-operation worst case (`retry_timeout`
+/// 180 s + `request_timeout` 20 s): a hang trips the deadline after roughly
+/// four stalled operations rather than exhausting all 28.
+///
+/// Not part of [`qualify_job_input_hash`]: tuning this deadline must not
+/// re-run a qualification that already passed.
+pub const QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS: i64 = 900;
+
 /// `StoreQualified` reason while the qualify Job is being created or is still
 /// running: serving is held until it reports success.
 pub const STORE_QUALIFIED_PENDING_REASON: &str = "Pending";
@@ -1993,8 +2020,10 @@ pub fn qualify_job_input_hash(spec: &RavelClusterSpec) -> String {
 ///
 /// The Job carries [`QUALIFY_SPEC_HASH_ANNOTATION`] so the controller re-runs it
 /// when its inputs change and skips it when they do not, and sets
-/// `restartPolicy: Never`, a small [`QUALIFY_JOB_BACKOFF_LIMIT`], and
-/// [`QUALIFY_JOB_TTL_SECONDS`] so a finished Job does not accumulate.
+/// `restartPolicy: Never`, a small [`QUALIFY_JOB_BACKOFF_LIMIT`],
+/// [`QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS`] so a hung attempt fails rather than
+/// runs forever, and [`QUALIFY_JOB_TTL_SECONDS`] so a finished Job does not
+/// accumulate.
 pub fn desired_qualify_job(spec: &RavelClusterSpec, instance: &str) -> Job {
     let labels = labels(instance, QUALIFY_COMPONENT);
     let mut env = vec![
@@ -2048,6 +2077,7 @@ pub fn desired_qualify_job(spec: &RavelClusterSpec, instance: &str) -> Job {
         },
         spec: Some(JobSpec {
             backoff_limit: Some(QUALIFY_JOB_BACKOFF_LIMIT),
+            active_deadline_seconds: Some(QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS),
             ttl_seconds_after_finished: Some(QUALIFY_JOB_TTL_SECONDS),
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
@@ -2158,8 +2188,16 @@ pub fn qualification_decision(
 }
 
 /// The [`QualifyJobPhase`] a live Job reports, read from its status conditions:
-/// `Complete=True` is success, `Failed=True` is failure (its message carried
-/// through), anything else is still running.
+/// `Complete=True` is success, `Failed=True` is failure, anything else is still
+/// running.
+///
+/// A `Failed` condition's `reason` is prepended to its `message` (`"<reason>:
+/// <message>"`) so the `StoreQualified` condition names why the Job failed, not
+/// only the human message. This matters for a deadline-exceeded Job: the Job
+/// controller sets reason `DeadlineExceeded` with a generic message ("Job was
+/// active longer than specified deadline"), and the reason is the part an
+/// operator needs to see. When only one of reason/message is present that one
+/// is used verbatim; when neither is, a fixed fallback is.
 pub fn qualify_job_phase(job: &Job) -> QualifyJobPhase {
     let Some(conditions) = job.status.as_ref().and_then(|s| s.conditions.as_ref()) else {
         return QualifyJobPhase::Running;
@@ -2171,13 +2209,15 @@ pub fn qualify_job_phase(job: &Job) -> QualifyJobPhase {
         match c.type_.as_str() {
             "Complete" => return QualifyJobPhase::Succeeded,
             "Failed" => {
-                let message = c
-                    .message
-                    .clone()
-                    .filter(|m| !m.is_empty())
-                    .or_else(|| c.reason.clone())
-                    .unwrap_or_else(|| "the store qualification Job failed".to_string());
-                return QualifyJobPhase::Failed(message);
+                let reason = c.reason.clone().filter(|r| !r.is_empty());
+                let message = c.message.clone().filter(|m| !m.is_empty());
+                let text = match (reason, message) {
+                    (Some(reason), Some(message)) => format!("{reason}: {message}"),
+                    (Some(reason), None) => reason,
+                    (None, Some(message)) => message,
+                    (None, None) => "the store qualification Job failed".to_string(),
+                };
+                return QualifyJobPhase::Failed(text);
             }
             _ => {}
         }
@@ -5444,6 +5484,26 @@ mod tests {
         }
     }
 
+    /// A Job reporting `Failed=True` with the given `reason` and `message`, the
+    /// shape the Kubernetes Job controller sets when it fails a Job (a
+    /// deadline-exceeded Job carries reason `DeadlineExceeded`).
+    fn job_with_failed_reason(reason: &str, message: Option<&str>) -> Job {
+        use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+        Job {
+            status: Some(JobStatus {
+                conditions: Some(vec![JobCondition {
+                    type_: "Failed".to_string(),
+                    status: "True".to_string(),
+                    reason: Some(reason.to_string()),
+                    message: message.map(str::to_string),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     /// The input hash is stable for one spec and changes for each of the five
     /// inputs it covers, and only those. Pins the exact set of fields that
     /// re-trigger qualification (issue #36): a change to any of them is a
@@ -5602,6 +5662,99 @@ mod tests {
         assert_eq!(
             qualify_job_phase(&job_with_condition("Failed", "False", None)),
             QualifyJobPhase::Running
+        );
+    }
+
+    /// The rendered qualify Job sets `activeDeadlineSeconds` to the chosen value,
+    /// so a hung attempt (an endpoint that accepts the connection and never
+    /// answers) becomes a `Failed` Job rather than running forever. `backoffLimit`
+    /// bounds only failed attempts, not one attempt that never terminates.
+    #[test]
+    fn qualify_job_bounds_a_hung_attempt() {
+        let spec = base_spec();
+        let job = desired_qualify_job(&spec, "prod");
+        let job_spec = job.spec.as_ref().expect("qualify Job has a spec");
+        assert_eq!(
+            job_spec.active_deadline_seconds,
+            Some(QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS),
+            "the qualify Job bounds a single attempt with activeDeadlineSeconds"
+        );
+        assert_eq!(
+            QUALIFY_JOB_ACTIVE_DEADLINE_SECONDS, 900,
+            "the chosen deadline is 900 s (28 sequential ops * 20 s request_timeout \
+             = 560 s slow-but-healthy, plus a ~1.6x margin)"
+        );
+    }
+
+    /// A Job the Kubernetes Job controller failed for exceeding its
+    /// `activeDeadlineSeconds` reports `Failed=True` with reason
+    /// `DeadlineExceeded`. That reads as [`QualificationDecision::Failed`] (which
+    /// the controller renders as `StoreQualified=False`), and its message names
+    /// the reason exactly so an operator sees why qualification did not finish.
+    #[test]
+    fn a_deadline_exceeded_job_reads_as_failed_with_its_reason() {
+        let job = job_with_failed_reason(
+            "DeadlineExceeded",
+            Some("Job was active longer than specified deadline"),
+        );
+        let phase = qualify_job_phase(&job);
+        let message = match &phase {
+            QualifyJobPhase::Failed(message) => message.clone(),
+            other => panic!("a Failed=True Job reads as Failed, got {other:?}"),
+        };
+        assert!(
+            message.contains("DeadlineExceeded"),
+            "the failure message names the DeadlineExceeded reason exactly: {message:?}"
+        );
+
+        // The gate reports a Present Job for the current inputs in the Failed
+        // phase as Failed, carrying that message; the controller turns Failed
+        // into StoreQualified=False with STORE_QUALIFIED_FAILED_REASON.
+        let decision = qualification_decision(
+            "h",
+            None,
+            &QualifyJobObservation::Present {
+                spec_hash: Some("h".to_string()),
+                phase,
+            },
+        );
+        assert_eq!(decision, QualificationDecision::Failed(message));
+    }
+
+    /// The `activeDeadlineSeconds` is a tuning knob, not a store-identity input:
+    /// [`qualify_job_input_hash`] covers exactly the five inputs qualification
+    /// proves against and never the deadline, so changing the deadline leaves the
+    /// hash equal and does not re-run a qualification that already passed.
+    #[test]
+    fn the_deadline_is_not_part_of_the_qualified_input_hash() {
+        use std::hash::{Hash, Hasher};
+        let spec = base_spec();
+
+        // Recompute the hash over exactly the five qualified inputs, deliberately
+        // excluding the deadline. If the production hasher folded the deadline in,
+        // this reference would diverge and the assertion would fail.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        spec.storage.s3.bucket.hash(&mut hasher);
+        spec.storage.s3.region.hash(&mut hasher);
+        spec.storage
+            .s3
+            .endpoint
+            .as_deref()
+            .unwrap_or("")
+            .hash(&mut hasher);
+        spec.image.hash(&mut hasher);
+        spec.storage
+            .s3
+            .credentials_secret_ref
+            .name
+            .hash(&mut hasher);
+        let expected = format!("{:016x}", hasher.finish());
+
+        assert_eq!(
+            qualify_job_input_hash(&spec),
+            expected,
+            "the qualified-input hash covers exactly the five store-identity inputs, never the \
+             deadline"
         );
     }
 
