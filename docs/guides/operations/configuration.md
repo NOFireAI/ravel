@@ -379,7 +379,7 @@ to narrow.
 
 The matching role-side statement in each `deploy/iam/*.json` template holds a
 placeholder tenant key ARN that you must replace with your own (see
-[the shipped policy documents](#the-shipped-policy-documents)); scoped to real
+[the shipped policy documents](#the-shipped-policy-documents)), scoped to real
 keys rather than to every key. Replace it with the exact ARN configured with
 `--s3-kms-key`, if the deployment sets that flag, plus one exact ARN for every
 key in the `--tenant-kms-config` file. The two flags are independent: the
