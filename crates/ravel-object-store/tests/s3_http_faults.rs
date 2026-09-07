@@ -130,6 +130,15 @@ enum Fault {
     /// a create conflict, so the S3 adapter's HEAD disambiguation is what turns
     /// an absent-key 409 into a retryable `Transient` (#1302).
     ConditionalConflict,
+    /// A 200 HEAD whose `Last-Modified` cannot be parsed. The status line says
+    /// success, but `object_store` cannot turn the response into `ObjectMeta`,
+    /// so the HEAD determined nothing about whether the key is present. That
+    /// parse happens after `object_store`'s retry loop returns, so it is not
+    /// retried internally: exactly one HEAD reaches the endpoint, and the
+    /// adapter classifies it as a retryable `Transient`. This is the
+    /// inconclusive-probe case the create-conflict disambiguation must surface
+    /// as retryable rather than as a terminal `AlreadyExists` (#1302).
+    InconclusiveHead,
 }
 
 /// One request as the server saw it: which operation, which key, when, which
@@ -581,6 +590,18 @@ async fn handle(
             StatusCode::CONFLICT,
             "ConditionalRequestConflict",
             "The conditional request could not be satisfied.",
+        ),
+        Some(Fault::InconclusiveHead) => build(
+            StatusCode::OK,
+            vec![
+                (header::ETAG, "\"inconclusive\"".to_string()),
+                // An RFC2822 date object_store cannot parse: the 200 arrives
+                // but header_meta fails, so the probe yields no verdict about
+                // the key's presence.
+                (header::LAST_MODIFIED, "not-a-valid-date".to_string()),
+                (header::CONTENT_LENGTH, "7".to_string()),
+            ],
+            Body::empty(),
         ),
         Some(Fault::Pass) | None => serve(&state, op, &key, &query, &headers, data),
     }
@@ -1255,6 +1276,114 @@ async fn persistent_409_surfaces_transient_after_the_retry_budget() {
     assert!(
         fake.object("conflict/persistent").is_none(),
         "no object ever became visible under a persistent conflict"
+    );
+}
+
+/// A 409 whose disambiguating HEAD comes back inconclusive (a 200 the client
+/// cannot parse) must surface as a retryable `Transient`, not a terminal
+/// `AlreadyExists`: the probe determined nothing, so the key's state is
+/// unknown, and the PUT already failed leaving nothing written. The caller
+/// loop therefore retries rather than abandoning the write. Counts are pinned
+/// exactly: the inconclusive HEAD is not retried inside `object_store` (the
+/// header parse fails after its retry loop returns), so each attempt is
+/// exactly one PUT and one HEAD.
+///
+/// This is the discriminating test for the fix. With the pre-fix catch-all
+/// (`Err(_) => AlreadyExists`), the inconclusive HEAD's retryable error is
+/// swallowed into a terminal `AlreadyExists`: the loop stops after one attempt
+/// with a non-retryable error, so the `Transient`, the attempt count, and the
+/// HEAD count all change.
+#[tokio::test]
+async fn a_409_whose_head_probe_is_inconclusive_is_retried_as_transient() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.always(Op::Put, Fault::ConditionalConflict);
+    fake.always(Op::Head, Fault::InconclusiveHead);
+
+    const MAX_ATTEMPTS: u32 = 3;
+    let (result, attempts) = create_with_retry(
+        &store,
+        "conflict/inconclusive",
+        b"never lands",
+        MAX_ATTEMPTS,
+    )
+    .await;
+    let err = result.expect_err("an inconclusive HEAD must not resolve the conflict to success");
+    assert!(
+        matches!(err, StoreError::Transient(_)),
+        "an inconclusive probe leaves the key's state unknown, which is retryable Transient, \
+         got {err:?}"
+    );
+    assert!(
+        err.is_retryable(),
+        "the surfaced error must be retryable so the caller retries: {err:?}"
+    );
+    assert_eq!(
+        attempts, MAX_ATTEMPTS,
+        "a retryable disambiguation must keep the caller loop retrying to its budget"
+    );
+    assert_eq!(
+        fake.count(Op::Put),
+        MAX_ATTEMPTS as usize,
+        "exactly one PUT per attempt reached the endpoint"
+    );
+    assert_eq!(
+        fake.count(Op::Head),
+        MAX_ATTEMPTS as usize,
+        "exactly one HEAD per attempt: an inconclusive HEAD is not retried inside object_store"
+    );
+    assert!(
+        fake.object("conflict/inconclusive").is_none(),
+        "no object ever became visible: every PUT was refused"
+    );
+}
+
+/// A 409 whose disambiguating HEAD fails terminally (403 `AccessDenied`) stays
+/// `AlreadyExists`: retrying cannot make the probe conclusive, so the
+/// conservative terminal verdict is correct and the caller loop stops. The
+/// terminal HEAD is not retried inside `object_store` either, so the counts
+/// are exactly one PUT and one HEAD.
+///
+/// Unlike the inconclusive case above, this test also passes under the pre-fix
+/// catch-all, which likewise returned `AlreadyExists` for a non-`NotFound`
+/// HEAD error: it pins the terminal branch the fix deliberately keeps, so a
+/// future change that made a terminal HEAD failure retryable would fail here.
+#[tokio::test]
+async fn a_409_whose_head_probe_fails_terminally_stays_already_exists() {
+    let fake = FakeS3::start().await;
+    let store = fake.store();
+    fake.always(Op::Put, Fault::ConditionalConflict);
+    fake.always(Op::Head, Fault::AccessDenied);
+
+    let (result, attempts) =
+        create_with_retry(&store, "conflict/head-denied", b"the loser's bytes", 5).await;
+    let err = result.expect_err("a terminal HEAD failure must surface, not retry to success");
+    assert!(
+        matches!(err, StoreError::AlreadyExists),
+        "a terminal HEAD failure cannot make the probe conclusive, so the conservative \
+         AlreadyExists stands, got {err:?}"
+    );
+    assert!(
+        !err.is_retryable(),
+        "AlreadyExists is a protocol signal, not a retryable error: {err:?}"
+    );
+    assert_eq!(
+        attempts, 1,
+        "AlreadyExists stops the caller loop after exactly one attempt"
+    );
+    assert_eq!(
+        fake.count(Op::Put),
+        1,
+        "no second PUT: a terminal disambiguation is not retried"
+    );
+    assert_eq!(
+        fake.count(Op::Head),
+        1,
+        "exactly one HEAD: a 403 is not retried inside object_store"
+    );
+    assert!(
+        fake.object("conflict/head-denied").is_none(),
+        "no object ever became visible: the PUT was refused"
     );
 }
 
