@@ -16,7 +16,7 @@ const TOKEN: &str = "testtoken";
 
 /// Mirrors `health_endpoints.rs`'s helper: an in-process server backed by
 /// `MemoryStore`, parameterized by mode.
-async fn start_test_server(mode: Mode) -> ravel_server::Running {
+async fn start_test_server(mode: Mode, process_memory_budget_bytes: u64) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -58,7 +58,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         catalog_cache_max_bytes: 256 * 1024 * 1024,
-        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_bytes,
         cache_dir: None,
         catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
@@ -85,7 +85,7 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
 #[tokio::test]
 async fn metrics_served_in_every_mode() {
     for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
-        let running = start_test_server(mode).await;
+        let running = start_test_server(mode, u64::MAX).await;
         let base = format!("http://{}", running.http_addr);
         let client = reqwest::Client::new();
 
@@ -136,7 +136,7 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
         (Mode::Query, false),
         (Mode::Maintain, false),
     ] {
-        let running = start_test_server(mode).await;
+        let running = start_test_server(mode, u64::MAX).await;
         let base = format!("http://{}", running.http_addr);
         let client = reqwest::Client::new();
 
@@ -157,6 +157,48 @@ async fn metrics_ingest_family_present_only_in_ingest_modes() {
 
         running.shutdown().await.expect("graceful shutdown");
     }
+}
+
+/// ADR-1170 decision 4: the three process memory budget gauges must render
+/// with real values read from the same `MemoryBudget` the server was started
+/// with, not zeroed placeholders. `component="fetch"` reads `0` because
+/// decision 2 (fetch-layer reservation) has not landed upstream.
+#[tokio::test]
+async fn metrics_memory_budget_family_reflects_configured_budget() {
+    const BUDGET_BYTES: u64 = 123_456_789;
+    let running = start_test_server(Mode::All, BUDGET_BYTES).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let body = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+
+    assert!(
+        body.contains(&format!(
+            "ravel_memory_budget_bytes{{mode=\"all\"}} {BUDGET_BYTES}"
+        )),
+        "metrics body missing budget gauge at the configured value:\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"sql\"} 0"),
+        "metrics body missing sql reserved gauge:\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"fetch\"} 0"),
+        "metrics body missing fetch reserved gauge (must be 0 until decision 2 lands):\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_handoff_overlap_bytes{mode=\"all\"} 0"),
+        "metrics body missing handoff overlap gauge:\n{body}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
 }
 
 // --- ADR-0051 section 6: the /metrics admission family ---
