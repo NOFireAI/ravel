@@ -1267,12 +1267,16 @@ fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
 /// within budget, migrate re-audits fresh and raises the floor only if nothing
 /// below the target survives; if a straggler is found the floor is left
 /// untouched and this exits nonzero, reporting what it found. The re-audit
-/// already excludes a bucket's pre-rewrite commit records once that bucket
-/// carries a compaction/rewrite record (dead, sweepable leftovers of a
-/// rewrite this same invocation may have just performed, not stragglers),
-/// so a clean migration converges and raises the floor in one
-/// invocation -- no interleaved `sweep` required. A reported straggler is
-/// therefore genuine below-target live data still to migrate.
+/// excludes a bucket's pre-rewrite commit records once an AUTHORITATIVE
+/// compaction or rewrite record supersedes them (dead, sweepable leftovers of a
+/// rewrite this same invocation may have just performed, not stragglers). An
+/// input named only by a LOSING record of an overlap is not superseded: the
+/// resolver still serves it raw, so it stays counted. A clean migration
+/// therefore converges and raises the floor in one invocation, with no
+/// interleaved `sweep` required, but a below-target loser-only input is a
+/// straggler the walk cannot migrate, so that refusal is permanent until the
+/// overlap itself is resolved. `buckets_blocked` reports how many buckets are
+/// in that state.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -1332,6 +1336,7 @@ pub async fn migrate(
     println!("budget_records: {budget_records} (0 = unlimited)");
     println!("buckets_examined: {}", report.buckets_examined);
     println!("buckets_migrated: {}", report.buckets_migrated);
+    println!("buckets_blocked: {}", report.buckets_blocked);
     println!("records_migrated: {}", report.records_migrated);
     if let Some((shard, hour)) = report.cursor_advanced_to {
         println!("cursor_advanced_to: shard={shard} hour={hour}");
@@ -1364,8 +1369,14 @@ pub async fn migrate(
                  finishing and the floor raise, or is not yet migratable -- e.g. still \
                  unsealed). These are genuinely live: a bucket's own pre-rewrite commit records \
                  are already excluded from this count once that bucket has been migrated, so a \
-                 `sweep` will not make this converge. The floor was NOT raised; re-run migrate \
-                 once the stragglers are at or above the target."
+                 `sweep` will not make this converge. The floor was NOT raised.\n\n\
+                 Whether re-running helps depends on why they are below target. Data that is \
+                 merely not yet sealed migrates on a later run. But a below-target L0 that only \
+                 a LOSING compaction record names is served raw by the resolver and is not \
+                 migratable by the walk, so that straggler is permanent until the overlap \
+                 itself is resolved, and re-running will report the same count forever. \
+                 buckets_blocked above counts the buckets in that state: if it is non-zero, \
+                 re-running is not the remedy."
             )
         }
         None => {

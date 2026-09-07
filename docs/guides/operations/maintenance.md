@@ -307,8 +307,10 @@ ravel-cli maintain migrate --tenant <t> --signal <metrics|logs|spans> \
 target on-object format version. One invocation:
 
 1. walks buckets in shard and ingest-hour order from a durable cursor, rewriting
-   every sealed, un-tombstoned, not-yet-compacted bucket that still has an L0
-   commit record below the target version. This reuses the compaction rewrite
+   every sealed, un-tombstoned bucket that still has an L0 commit record below
+   the target version and served raw. A bucket that already carries a compaction
+   or rewrite record is visited too, because a record can leave an input served
+   raw. This reuses the compaction rewrite
    primitive, so the rewrite is bucket-atomic and produces a compaction record
    exactly as compaction does;
 2. stops early and persists the cursor once `--budget-records` is spent (`0`,
@@ -317,13 +319,17 @@ target on-object format version. One invocation:
    below the target.
 
 A refused raise, reported as "FOUND STRAGGLERS", means the fresh re-audit found
-genuine live data still below the target: a bucket too recently landed to be
-sealed and migrated yet, or data that arrived after the walk passed. Re-run
-`migrate`; that data migrates once it is sealed.
+genuine live data still below the target. Whether re-running helps depends on
+why. A bucket too recently landed to be sealed, or data that arrived after the
+walk passed, migrates on a later run. But an L0 input that only a losing
+compaction record names is served raw and the walk cannot migrate it, so that
+refusal is permanent until the overlap itself is resolved and re-running reports
+the same count forever. `buckets_blocked` in the report counts the buckets in
+that state; when it is non-zero, re-running is not the remedy.
 
-The re-audit's liveness definition already excludes a bucket's pre-rewrite L0
-commit records once that bucket carries a compaction or rewrite record. Those
-records are dead, sweepable leftovers of a rewrite this same invocation may have
+The re-audit's liveness definition excludes a bucket's pre-rewrite L0 commit
+records once an authoritative compaction or rewrite record supersedes them.
+Those records are dead, sweepable leftovers of a rewrite this same invocation may have
 just performed, not stragglers. Because of that, a clean migration converges and
 raises the floor in one invocation, and running `sweep` in between is never
 required for it to converge. The sweeper's superseded-input rule still deletes
