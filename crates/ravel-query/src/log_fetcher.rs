@@ -65,8 +65,8 @@ use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats}
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError, LogStreamId,
-    Predicate, RlogConfig, RlogReader, ScanStats, SuffixOutcome, decode_section, open_from_suffix,
-    read_section,
+    Predicate, RlogConfig, RlogReader, ScanStats, SuffixOutcome, decode_section,
+    decode_section_accounted, open_from_suffix, read_section,
 };
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
@@ -4183,7 +4183,13 @@ impl BlockRangeFetcher {
                 bytes
             }
         };
-        decode_section(&stored, desc, &self.cfg).map_err(|source| corrupt(key, source))
+        // A planning read decompresses this directory section to count survivors
+        // or resolve columns; charge what zstd produced to the phase handle this
+        // read belongs to (issue #1401), the same handle its GETs are charged
+        // against above. Separate from the scan's own directory decode in
+        // `RlogReader::new`, which the scan phase charges through `ScanStats`.
+        decode_section_accounted(&stored, desc, &self.cfg, accounting)
+            .map_err(|source| corrupt(key, source))
     }
 
     /// Read the footer, SKIP_IDX, and FIELD_DIR for one segment and decode all

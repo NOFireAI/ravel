@@ -1683,6 +1683,7 @@ mod tests {
     use super::*;
     use crate::record::LogRecord;
     use crate::writer::{ObjectIdentity, RlogWriter};
+    use ravel_types::accounting::QueryAccounting;
     use ravel_types::logstream::{AttrValue, LogStreamId};
 
     fn identity() -> ObjectIdentity {
@@ -1731,6 +1732,174 @@ mod tests {
             w.push(r).expect("push");
         }
         w.finish().expect("finish")
+    }
+
+    /// The on-object stored bytes of a section (`[offset, offset+len)`).
+    fn section_stored<'a>(obj: &'a [u8], desc: &SectionDesc) -> &'a [u8] {
+        let start = desc.offset as usize;
+        &obj[start..start + desc.len as usize]
+    }
+
+    /// An object wide enough that its directory sections clear the writer's
+    /// compression floor and are stored `COMP_ZSTD`, so decoding one produces
+    /// strictly more bytes than it read: 200 distinct streams (a distinct
+    /// `service.name` each) with repetitive bodies. Returned with its footer
+    /// so a test can read a section descriptor's `uncomp_len` back.
+    fn object_with_zstd_dirs() -> Vec<u8> {
+        let cfg = RlogConfig::default();
+        let mut recs = Vec::new();
+        for s in 0..200u8 {
+            recs.push(rec(s, i64::from(s), "hello world log body message repeated"));
+        }
+        build(cfg, recs)
+    }
+
+    /// A section descriptor of `kind`, asserted to be zstd-compressed so its
+    /// `uncomp_len` is the exact byte count one decode produces.
+    fn zstd_section(obj: &[u8], k: u32) -> SectionDesc {
+        let footer = open(obj).expect("open");
+        let desc = *footer.section(k).expect("section present");
+        assert_eq!(
+            desc.comp, COMP_ZSTD,
+            "fixture section {k} must be zstd-compressed for this test"
+        );
+        assert!(
+            desc.uncomp_len > desc.len,
+            "a zstd section decodes to strictly more than it stores"
+        );
+        desc
+    }
+
+    /// One `decode_section_accounted` charges exactly the section's `uncomp_len`
+    /// (the bytes zstd produced), and N calls charge exactly N times it. The
+    /// pre-fix `decode_section` charged nothing, so this reads 0 there; the
+    /// flipped line is the `add_decompressed_bytes` call in
+    /// `decode_section_accounted` (issue #1401).
+    #[test]
+    fn decode_section_accounted_charges_uncomp_len_per_read() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let desc = zstd_section(&obj, kind::STREAM_DIR);
+        let stored = section_stored(&obj, &desc);
+        let acct = QueryAccounting::new();
+
+        let raw = decode_section_accounted(stored, &desc, &cfg, &acct).expect("decode");
+        assert_eq!(raw.len() as u64, desc.uncomp_len, "decode produces uncomp_len");
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            desc.uncomp_len,
+            "one section read charges exactly the section's uncomp_len"
+        );
+
+        // Four more reads: the counter is exactly five times the section.
+        for _ in 0..4 {
+            decode_section_accounted(stored, &desc, &cfg, &acct).expect("decode");
+        }
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            desc.uncomp_len * 5,
+            "N reads charge exactly N times the section's uncomp_len"
+        );
+    }
+
+    /// Two sections of DIFFERENT uncompressed size sum to the byte, so a counter
+    /// that charged the wrong section, `desc.len` instead of `uncomp_len`, or
+    /// double-charged one would miss the exact total (issue #1401).
+    #[test]
+    fn decode_section_accounted_sums_two_distinct_sections() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let stream_desc = zstd_section(&obj, kind::STREAM_DIR);
+        let field_desc = zstd_section(&obj, kind::FIELD_DIR);
+        assert_ne!(
+            stream_desc.uncomp_len, field_desc.uncomp_len,
+            "the two sections must differ in uncompressed size for this test"
+        );
+        let acct = QueryAccounting::new();
+        decode_section_accounted(section_stored(&obj, &stream_desc), &stream_desc, &cfg, &acct)
+            .expect("decode stream_dir");
+        decode_section_accounted(section_stored(&obj, &field_desc), &field_desc, &cfg, &acct)
+            .expect("decode field_dir");
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            stream_desc.uncomp_len + field_desc.uncomp_len,
+            "two distinct sections sum to the byte"
+        );
+    }
+
+    /// A raw (`COMP_NONE`) section decodes without decompression, so it charges
+    /// nothing: the counter is bytes zstd PRODUCED, not bytes copied.
+    #[test]
+    fn decode_section_accounted_charges_nothing_for_raw_section() {
+        // A tiny object leaves its directory sections below the compression
+        // floor, so they are stored raw.
+        let obj = build(RlogConfig::default(), vec![rec(0, 1, "x")]);
+        let footer = open(&obj).expect("open");
+        let cfg = RlogConfig::default();
+        let acct = QueryAccounting::new();
+        let mut saw_raw = false;
+        for k in [kind::STREAM_DIR, kind::FIELD_DIR, kind::SKIP_IDX] {
+            let desc = *footer.section(k).expect("section");
+            if desc.comp == crate::footer::COMP_NONE {
+                saw_raw = true;
+                decode_section_accounted(section_stored(&obj, &desc), &desc, &cfg, &acct)
+                    .expect("decode raw");
+            }
+        }
+        assert!(saw_raw, "the tiny fixture must store some directory raw");
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            0,
+            "a raw section was copied, not decompressed, so it charges nothing"
+        );
+    }
+
+    /// A whole-object scan's `ScanStats.decompressed_bytes` is the object's
+    /// zstd directory total plus every zstd block page it decodes, and it grows
+    /// only as blocks are drained: opening the reader seeds the directory total,
+    /// each `next_block` adds that block's produced page bytes. A second scan of
+    /// the same reader reports the same figure, proving the seed is per-scan and
+    /// not accumulated across scans (issue #1401).
+    #[test]
+    fn scan_stats_decompressed_bytes_covers_open_and_pages() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // The seed equals the sum of the object's zstd directory sections.
+        let footer = open(&obj).expect("open");
+        let mut open_total = 0u64;
+        for k in [kind::STREAM_DIR, kind::FIELD_DIR, kind::SKIP_IDX, kind::PAGE_DIR] {
+            let desc = *footer.section(k).expect("section");
+            if desc.comp == COMP_ZSTD {
+                open_total += desc.uncomp_len;
+            }
+        }
+        assert!(open_total > 0, "fixture must have at least one zstd directory");
+
+        let mut cursor = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        // Before any block is decoded the figure is exactly the open-time total.
+        assert_eq!(cursor.stats().decompressed_bytes, open_total);
+        while cursor.next_block(&obj).expect("next").is_some() {}
+        let total = cursor.stats().decompressed_bytes;
+        assert!(
+            total > open_total,
+            "draining blocks adds their decompressed page bytes on top of the open total"
+        );
+
+        // A second, independent scan reports the identical figure: the seed is
+        // per-scan, not accumulated onto the reader.
+        let mut again = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        while again.next_block(&obj).expect("next").is_some() {}
+        assert_eq!(
+            again.stats().decompressed_bytes,
+            total,
+            "a re-scan of the same reader charges the same, not double"
+        );
     }
 
     /// A record carrying `cols` int columns and `cols` string columns, all

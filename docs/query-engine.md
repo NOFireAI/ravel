@@ -1702,6 +1702,21 @@ sequence issued (probe, directory sections, coalesced candidate-block
 ranges) and the bytes they moved, again zero when every extent was a cache
 hit.
 
+On the log-signal path `decompressed_bytes` is the bytes zstd produced on
+the RLOG scan and plan paths, both whole-object and ranged: the directory
+sections the scan reader opens (`RlogReader::new` over STREAM_DIR, FIELD_DIR,
+SKIP_IDX, PAGE_DIR) plus every block page the scan decodes, and, on the plan
+path, the SKIP_IDX/FIELD_DIR a selective query decompresses to count
+survivors. A section stored raw contributes nothing; a zstd one contributes
+its decompressed output's actual length. It is zero on a query that opens no
+RLOG section, and, unlike the wire-byte counters, it does not fall to zero on
+a warm cache: a scan served entirely from the fetcher cache still decompresses
+what it decodes, which is what makes this the figure that attributes a warm
+run's engine time. The scan reader's own decompression lands on the `scan`
+phase handle (folded once at scan exhaustion by `LogSegmentScan::finish`); a
+plan-phase survivor-count decode lands on the `plan` handle. Spans (RSPAN) do
+not yet report decompressed bytes.
+
 Span fields otherwise carry only bounded values: `tenant_hash` as a hex
 string, `object_size`, matcher/series counts, and fixed-set kind strings
 (`page_kind`, `eval_kind`), never query text, label values, object keys,
