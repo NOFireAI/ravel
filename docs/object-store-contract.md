@@ -571,11 +571,12 @@ common TLA model's `CreateIfAbsentWinnerUnique`,
 
 Because the delete probe deletes, the credential running `ravel-cli store
 qualify` needs delete permission on the scratch prefix
-`sys/qualify/<run-id>/**`, and only there. ADR-0055 §1's Admin row does not
-grant it yet ("Admin never deletes"), so a deployment that follows that
-table literally will see the delete probe fail with `AccessDenied` until the
-grant is added; that amendment is tracked separately and is not a defect in
-the backend under test.
+`sys/qualify/<run-id>/**`, and only there. The shipped Admin template
+(`deploy/iam/admin.json`, the `AdminQualifyDelete` statement) grants exactly
+this: `s3:DeleteObject` on `sys/qualify/*` and nowhere else, added by
+ADR-0055's amendment for this probe. A deployment using that template
+qualifies a fresh bucket with no manual policy edit, and Admin still holds no
+delete on tenant data or any protected key.
 
 ADR-0050 section 6 also names cross-page listing consistency and
 multipart-complete visibility as probes for this suite. Cross-page listing
