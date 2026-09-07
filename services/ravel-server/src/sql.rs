@@ -488,6 +488,12 @@ fn build_request(
         min_tokens,
         now_ns,
         deadline,
+        // The HTTP surface never opts into the MCP-only request knobs
+        // (#1376): no row window, no row cap, no per-request budgets, so
+        // the server ceilings alone govern an HTTP query.
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     })
 }
 

@@ -273,6 +273,9 @@ async fn run(argv: &[&str]) -> Routed {
                 min_tokens: Vec::new(),
                 now_ns: NOW_NS,
                 deadline: Duration::from_secs(120),
+                row_window: false,
+                max_rows: None,
+                budgets: None,
             },
         )
         .await

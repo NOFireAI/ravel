@@ -534,6 +534,9 @@ async fn post_compaction_bits(
                 min_tokens: vec![],
                 now_ns: seal_now_ns,
                 deadline: Duration::from_secs(30),
+                row_window: false,
+                max_rows: None,
+                budgets: None,
             },
         )
         .await

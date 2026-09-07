@@ -374,6 +374,9 @@ async fn json_egress_bytes(executor: &SqlExecutor, tenant: TenantHash) -> u64 {
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     };
     let outcome = executor.execute(tenant, &req).await.expect("execute query");
     let json = outcome.output.to_json().expect("encode json");
