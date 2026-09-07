@@ -1,9 +1,22 @@
 # OpenTelemetry Collector config for the container-first quickstart
-# (ADR-0081 decision 3). Scrapes host metrics and tails the collector's own
-# log output, exporting both to ravel-server over OTLP/HTTP, authenticating
-# with the demo bearer token. This is what makes the README's PromQL-over-logs
-# example (`ravel_log_lines`) non-empty on a fresh `docker compose up`: there
-# is no other log source in the quickstart (issue #1334).
+# (ADR-0081 decision 3). Scrapes host metrics and exports the collector's own
+# internal logs, both to ravel-server over OTLP/HTTP, authenticating with the
+# demo bearer token. The internal-logs export is what makes the README's
+# PromQL-over-logs example (`ravel_log_lines`) non-empty on a fresh
+# `docker compose up`: there is no other log source in the quickstart
+# (issue #1334).
+#
+# The upstream image (otel/opentelemetry-collector-contrib) is built FROM
+# scratch and runs as uid 10001: every directory shipped in it is owned by
+# root with mode 0755, and the quickstart mounts no writable volume. There is
+# no path in the container that uid 10001 can create a file in, including
+# /tmp, which does not exist in the image at all. A `filelog` receiver
+# tailing a file the collector writes itself therefore cannot work here at
+# any path; the collector's logger fails at startup trying to open the sink
+# ("failed to create logger: open sink ...: no such file or directory"),
+# which is why it never starts (issue #1336). Internal logs are exported
+# directly via OTLP instead (service.telemetry.logs.processors below), which
+# touches no filesystem.
 #
 # SECURITY: `demo-token` is a fixed development credential, matching the
 # `--tenant-token demo-token=demo-tenant` ravel-server runs with in
@@ -29,29 +42,8 @@ receivers:
       memory:
       network:
 
-  # Tails the file the collector's own telemetry logs are mirrored to below
-  # (service.telemetry.logs.output_paths). It is the one log source every
-  # quickstart run has without a host mount or a second container: the
-  # collector always logs its own startup and scrape activity.
-  filelog:
-    include: [/tmp/otelcol-collector.log]
-    start_at: beginning
-
 processors:
   batch:
-
-  # Stamps a `service.name` resource attribute on the tailed log records.
-  # ravel-otlp turns `service.name` into the `job` label on ingest
-  # (crates/ravel-otlp/src/normalize.rs, mirrored for logs in
-  # crates/ravel-query/src/log_series.rs), which is what lets the README's
-  # `sum by (job) (count_over_time(ravel_log_lines[5m]))` group the result.
-  # filelog sets no service.name on its own, so without this the records
-  # would ingest with no `job` label and the query would still return empty.
-  resource:
-    attributes:
-      - key: service.name
-        value: otel-collector
-        action: upsert
 
 exporters:
   # OTLP/HTTP posts to ravel-server's /v1/metrics or /v1/logs (the exporter
@@ -70,16 +62,30 @@ service:
       receivers: [hostmetrics]
       processors: [batch]
       exporters: [otlphttp]
-    logs:
-      receivers: [filelog]
-      processors: [resource, batch]
-      exporters: [otlphttp]
   telemetry:
     logs:
-      # Mirrors the collector's own logs to a file in addition to stdout, so
-      # the filelog receiver above has something to tail. Plain text under
-      # /tmp needs no directory creation and no host mount.
-      output_paths: ["stdout", "/tmp/otelcol-collector.log"]
+      output_paths: ["stdout"]
+      # Ships the collector's own internal logs to ravel-server over
+      # OTLP/HTTP, bypassing pipelines entirely (no filesystem involved, so
+      # this works regardless of what the container's writable paths are).
+      # The exported resource always carries `service.name: otelcol-contrib`,
+      # which ravel-otlp turns into the `job` label
+      # (crates/ravel-otlp/src/normalize.rs, mirrored for logs in
+      # crates/ravel-query/src/log_series.rs), so the README's
+      # `sum by (job) (count_over_time(ravel_log_lines[5m]))` groups the
+      # result without any extra resource-stamping processor.
+      #
+      # service.telemetry doesn't wire extensions, so the bearer token is a
+      # plain header here rather than the bearertokenauth extension the
+      # metrics pipeline exporter uses below.
+      processors:
+        - batch:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: http://ravel-server:4318
+                headers:
+                  Authorization: "Bearer demo-token"
     # The collector's own delivery counters, on a Prometheus endpoint.
     #
     # This exists so that "is the collector actually delivering?" is a
