@@ -101,7 +101,7 @@ A recorded floor F for family X asserts that no live object of family X below ve
 
 **Class B — derived catalog objects (.csnap, .npost, HEAD).** Rebuildable from commit records by construction; the fold rewrites them continuously. A version bump needs no migration tool: the upgraded fold emits the new version, supersession GCs the old parts, and dual-read is needed only across the rolling-upgrade window. Multi-part fold (ADR-0063) is exactly such a bump and is this rule's first consumer.
 
-**Class C — immutable metadata records (commit records, compaction records, tombstones, sys/* objects, idempotency markers).** Never rewritten; commit-record immutability is a repo invariant and migration machinery gets no exemption. Default evolution is additive protobuf change (frozen field numbers, new fields only — the ADR-0052 precedent, now normative). A genuinely incompatible change requires a new record kind under a new key suffix, dual-listed alongside the old kind until retention tombstones the old records' hour buckets; the reader-floor `format_version` these records already carry keeps an incompatible in-place edit detectable and refused.
+**Class C — immutable metadata records (commit records, compaction records, tombstones, sys/* objects, idempotency markers).** Never rewritten; commit-record immutability is a repo invariant and migration machinery gets no exemption. Default evolution is additive protobuf change (frozen field numbers, new fields only — the ADR-0052 precedent, now normative). A genuinely incompatible change requires a new record kind under a new key suffix, dual-listed alongside the old kind until retention tombstones the old records' hour buckets; the reader-floor `format_version` these records already carry keeps an incompatible in-place edit detectable and refused. **(Corrected by the R1 amendment below: "never rewritten" holds for the commit-family records and the write-once sys/* markers, NOT for the several sys/* records that ARE rewritten whole under CAS. For those, additive-only is unsafe without a version bump.)**
 
 **Class D — identity and domain-hash encodings (series-identity domain string, tenant-hash scheme, commit-token version).** Not migratable by generic machinery: a bump splits identity rather than failing a decode. The obligation here is containment, not migration: the active version is pinned per bucket in a durable control object — the `sys/tenancy` `TenantHashScheme` pattern, extended to record the series-identity domain and token version — and a process whose build disagrees refuses to start. An actual identity re-key is out of scope here; each such event is its own ADR (as the unkeyed-tenant-hash re-key already is).
 
@@ -178,3 +178,111 @@ existing one) addable without a proto change, matching the additive-evolution
 discipline the rest of this record follows. Decoding enforces `family` is
 non-empty and lowercase, fail-closed on either violation, so the field is not
 an unconstrained string in practice — see `ravel_catalog::provisioning::FloorDefect`.
+
+## Amendment (R1, #1300): the CAS-mutable sys/* records version on every additive change
+
+Decision 4's Class C filed every sys/* object as "never rewritten, so
+additive-only evolution is safe without a `format_version` bump." That premise
+is false for a subset of them, and the additive-only rule applied to that subset
+licenses a real data-loss bug: a lagging writer strips fields a newer writer
+added.
+
+**The mechanism.** Three sys/* records are rewritten WHOLE under CAS: a reader
+reads the record, this build re-encodes it through the field set THIS build
+knows, and writes it back. `prost` drops fields it does not know on decode, so a
+binary that predates an additive field re-emits the record without it. The
+existing reader gates were all the permissive `format_version > CONSTANT` form,
+so a lagging binary happily read a newer record, dropped the unknown field, and
+CAS-wrote the stripped record back. Three additive fields shipped this way with
+no version bump: `ProvisioningRecord.generations` (f6) and `format_floors` (f7),
+and `TenantConfigRecord.typed_attr_columns` (f12). The `generations` reasoning
+copied into the proto (from ADR-0052) proves only that an old *reader* reads a
+new record correctly; it never considered an old *writer* rewriting one.
+
+**Classification of every `format_version`-carrying sys/* message** (enforced by
+the enumeration test `crates/ravel-catalog/tests/sys_proto_format_version_classification.rs`,
+which fails if a new versioned message lands unclassified):
+
+| Message | Class | Writer / rewrite site | Read set today |
+|---|---|---|---|
+| `TenancyMarker` | never rewritten (write-once) | `sys/tenancy`, CreateIfAbsent | {1} |
+| `TenantRecoveryManifest` | never rewritten (write-once) | `sys/t/<h>`, CreateIfAbsent | {1} |
+| `AdmissionUsageSnapshot` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0057 snapshot, `PutMode::Overwrite` | {1} |
+| `WorkerHeartbeat` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0065 heartbeat, `PutMode::Overwrite` | {1} |
+| `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2}** |
+| `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2}** |
+| `MetricMetadataRecord` | **CAS-mutable** | ingest metadata sink read→`merge_entries`→write | **{1, 2}** |
+| `AuthTokenMap` | **CAS-mutable** | `sys/auth` CAS-replace | {1, 2} (already, managed_by) |
+| `GcConfig` | **CAS-mutable** | `ravel-maintain::gc_config::set_gc_config` | {1} |
+| `CompactionClaim` | **CAS-mutable** | ADR-1029 claim renew/steal/complete | {1} |
+| `KeyEpochRecord` | **CAS-mutable** | `ravel-catalog::key_epoch` append-epoch CAS | {1} |
+
+"Never rewritten" covers the write-once markers AND the sole-writer
+`PutMode::Overwrite` snapshots (`AdmissionUsageSnapshot`, `WorkerHeartbeat`): each
+of those is a fresh dump of the owning process's live state, never a
+read-modify-write of prior bytes, so no peer strips them. The CAS-mutable rows
+are the ones the false premise endangered.
+
+**The rule.** A CAS-mutable sys/* record bumps `format_version` on every additive
+change, sequenced readers-before-writers: the release that TEACHES readers to
+accept version N+1 ships and rolls out fully BEFORE any writer emits N+1, and a
+rewrite path refuses a record newer than the writer can reproduce byte-for-byte
+rather than strip it. This is exactly the precedent `AuthTokenMap` set for
+`managed_by` (ADR-0072 decision 4 amendment, #897): a purely additive `optional`
+field still bumped the map's `format_version` to 2 and required every
+`ravel-server` to understand 2 before any writer stamped it, precisely so a
+lagging reader fails closed instead of silently mishandling the record. The
+generalization here is that a CAS-mutable record must do this even though the
+field is additive, because the danger is not an old *reader* misreading the
+layout (additive fields are safe for that) but an old *writer* re-encoding the
+record without the field.
+
+**R1 (this change, #1300).** The reader half, for the three records whose gates
+were permissive: `ProvisioningRecord`, `TenantConfigRecord`, `MetricMetadataRecord`
+now accept the read set {1, 2} and refuse 3, and their CAS rewrite paths refuse a
+record whose version exceeds what this build's writer stamps (still 1),
+preventing the strip before any version-2 writer exists. The two-release split is
+not optional: `ProvisioningRecord` is read on the ingest hot path by
+`GenerationSwitch`, which fails a flush CLOSED on a read failure, so a
+single-release reader-and-writer bump would be a fleet-wide ingest outage during
+any rolling upgrade. R1 is the readers; **R2** (a later task, after this reader
+is fleet-wide) is the writer flip that stamps 2 with a new additive field and
+models it.
+
+**R2's obligation.** When R2 adds the version-2 field, it models that field in
+these readers and re-encoders, so a version-2 record is then read AND rewritten
+without loss — the read set stays {1, 2} but the rewrite paths stop refusing 2.
+Until R2, a version-2 record cannot exist (every writer stamps 1), so R1's
+refusals only ever fire during a mixed-version window a future R2 rollout opens.
+
+**A note on `MetricMetadataRecord`'s serve path.** Its record is read by two
+callers through one function, `read_metrics_meta`: the ingest sink (which merges
+and CAS-writes it back — a rewrite) and the query `/api/v1/metadata` cache (a
+read-only serve). Because that function returns the CAS version a caller writes
+back with, R1 makes it refuse a version-2 record, which keeps the sink from
+stripping. The serve cache treats any read error as "serve an empty record for
+one horizon" (best-effort, logged), so on a version-2 record during an R2 rollout
+it degrades to empty metadata for a horizon rather than a hard failure — an
+accepted, bounded cost, and one that does not exist until R2. The decode gate
+itself (`decode_record`) accepts {1, 2}, so a future R2 serve-only reader that
+models the new field needs no gate change.
+
+**The four never-audited records, reported not fixed here (their crates are in
+flight under other work):** `TenantRecoveryManifest` and `AdmissionUsageSnapshot`
+are never-rewritten (write-once and sole-writer-overwrite respectively), so they
+carry no strip risk. `GcConfig` (ravel-maintain) and `KeyEpochRecord`
+(ravel-catalog `key_epoch`) ARE CAS-mutable and still carry the permissive reader
+gate; neither has an additive field shipped past version 1 today, so neither is a
+*live* strip instance, but both would be if an additive field lands before their
+gate is widened. `CompactionClaim` (ADR-1029) is likewise CAS-mutable with a
+permissive gate and no post-v1 additive field. These are flagged for their owning
+tasks; this change does not touch their gates.
+
+**Rejected R1 alternatives** (and why the reader-set-plus-rewrite-refusal shape
+won): an unknown-tail bytes field to carry unmodeled fields across a rewrite (its
+own format decision, hand-rolled decoders for three messages, and a new field
+number on a frozen schema — a bigger change than the bug); a recorded-floor write
+gate (a durable read on every CAS path, and it cannot protect the first write
+after a bump); and prospective-only (bump only future writers), which leaves f6,
+f7, and f12 strippable by every already-deployed binary — the live half of the
+bug.
