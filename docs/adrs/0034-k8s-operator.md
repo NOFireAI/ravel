@@ -289,6 +289,57 @@ runtime; nothing rejects the pod for the dropped capability. What the kind
 lane actually proves is that the hardened pods reach readiness and complete
 an OTLP round trip, not that a missing capability is rejected.
 
+**Amendment (2026-09-07): the operator qualifies the object store before it
+serves (issue #36).** Every `ravel-server` mode refuses to start on a
+non-Memory store whose `sys/qualification` marker is absent (ADR-0050
+section 6, EC7), and that marker is only ever written by an explicit
+`ravel store qualify` run. The operator described in decision 3 never made
+that run, so a RavelCluster pointed at a backend that fails the object-store
+contract (docs/object-store-contract.md) came up as three tiers of pods all
+crash-looping on the same startup refusal, with the reason buried in pod
+logs rather than on `.status`. The kind lane papered over this with a
+hand-run qualification Job (scripts/kind-up.sh) that a real install had no
+equivalent of. Qualification is now the operator's job, in the same reconcile
+loop as everything else:
+
+- Before it creates any serving Deployment, the reconcile loop renders and
+  applies a one-shot Job named `<cluster>-qualify` in the cluster's
+  namespace, with the server image, credentials Secret, bucket, region, and
+  endpoint of the tiers it gates, running `ravel store qualify`. The
+  gateway, query, and maintain Deployments are created only once that Job
+  reports `Complete`. `restartPolicy: Never`, a small `backoffLimit`, and a
+  `ttlSecondsAfterFinished` keep a finished Job from accumulating.
+- A new `StoreQualified` status condition carries the gate's state with the
+  same shape as the other conditions (reasons `Pending` while the Job is
+  created or running, `Succeeded` once it completes, `Failed` when it
+  exhausts its `backoffLimit`, the last carrying the Job's terminal
+  message). On `Failed` no Deployment is created and the pass requeues on
+  the existing failure backoff rather than spinning.
+- The inputs qualification proves against (bucket, region, endpoint, image,
+  credentials Secret name) are hashed into a Job annotation and, on success,
+  into a durable `status.storeQualifiedHash`. A later pass whose inputs
+  still hash to the recorded value proceeds without re-running qualification
+  even after the Job's TTL garbage-collected it. When the inputs change, the
+  operator deletes the stale Job (its pod template is immutable), recreates
+  it, and flips `StoreQualified` back to `Pending`; a cluster that was
+  already serving keeps its existing Deployments up while the new inputs
+  qualify, rather than being torn down for a pending config edit.
+- Non-goal: qualification is not re-run on a schedule. It runs once per
+  distinct set of inputs and only re-runs when those inputs change. A
+  periodic re-qualification would add object-store traffic and a recurring
+  failure mode for no gain, since the contract a backend satisfies does not
+  lapse between config edits.
+
+Because the operator now qualifies, the kind lane's hand-run qualification
+Job is removed from scripts/kind-up.sh: it deploys through the operator, so
+the operator's Job is the single qualification and a second one would only
+duplicate it. The RBAC in deploy/k8s/operator/rbac.yaml gains a `batch`
+`jobs` rule (full lifecycle) for the Job the operator now owns. The gate
+decision and the Job renderer are pure functions in `reconcile.rs` with
+unit tests; the runtime behavior (the Job actually completing and the
+Deployments appearing only after) is left to the k8s CI lane (decision 8),
+unproven until that lane runs.
+
 ## Rejected alternatives
 
 1. **Go operator (kubebuilder/controller-runtime).** The larger example
