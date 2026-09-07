@@ -13,6 +13,11 @@
 #   - PodDisruptionBudgets (policy): full lifecycle, for the per-tier PDBs the
 #     operator renders (issue #126, ADR-0034 hardening amendment). Delete is what
 #     converges maintain's PDB away when maintain.enabled goes back to false.
+#   - Jobs (batch): full lifecycle, for the one-shot store-qualification Job the
+#     operator runs before it creates any serving Deployment (issue #36). Create
+#     to start it, get/list/watch to observe its terminal state, delete to
+#     recreate it when the qualified inputs change (its pod template is
+#     immutable) and to let its TTL-driven cleanup be operator-owned.
 #   - RavelCluster (and its status subresource): watch the spec, write status.
 #   - Secrets: get only, and NEVER granted by this cluster-wide ClusterRole
 #     (issue #126). The operator reads the credentials, tenant-token, and
@@ -87,6 +92,9 @@ rules:
     verbs: ["get", "update", "patch"]
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
+    verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
     verbs: ["create", "update", "patch", "get", "list", "watch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

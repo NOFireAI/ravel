@@ -605,6 +605,11 @@
                     "format": "int32",
                     "nullable": true,
                     "type": "integer"
+                  },
+                  "storeQualifiedHash": {
+                    "description": "The qualify-Job input hash (bucket, region, endpoint, image, credentials\nSecret name) that store qualification last succeeded against (issue #36).\nThe operator gates serving on `ravel store qualify` before it creates any\nDeployment; recording the qualified inputs here makes that gate durable:\na later pass whose inputs still hash to this value proceeds without\nre-running qualification even after the one-shot Job has been\nTTL-garbage-collected, and a pass whose inputs no longer match re-runs it\n(the `StoreQualified` condition flips back to `Pending`) without tearing\ndown the running Deployments. Absent until the first qualification\nsucceeds. Qualification is never re-run on a schedule; only an input\nchange re-triggers it.",
+                    "nullable": true,
+                    "type": "string"
                   }
                 },
                 "type": "object"
