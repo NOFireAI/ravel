@@ -204,6 +204,7 @@ flowchart TB
     AD -->|"CasVersion"| GC["sys/gc (set)"]
     AD -->|"CreateIfAbsent"| SYSW["sys/tenancy · sys/qualification (bootstrap)"]
     AD -->|"Put, append-only"| HOLD["u/** (legal hold)"]
+    AD -->|"Delete (scratch only)"| QSCR["sys/qualify/*\n(qualification scratch)"]
 
     subgraph deny["Deny s3:DeleteObject for every role"]
         SYS["sys/tenancy\nsys/qualification\nsys/gc"]
@@ -214,6 +215,7 @@ flowchart TB
 
     style MT fill:#fc9,stroke:#960,stroke-width:2px
     style DEL fill:#fc9,stroke:#960,stroke-width:2px
+    style QSCR fill:#fed,stroke:#960
     style deny fill:#efe,stroke:#3a3,stroke-width:2px
     style SYS fill:#dfd,stroke:#3a3
     style PROVD fill:#dfd,stroke:#3a3
@@ -234,7 +236,7 @@ loses capability, and deleting `sys/tenancy` to brick every
 process's fail-closed startup becomes unreachable regardless of which
 credential is compromised.
 
-### 2. Delete stays exclusively with Maintain
+### 2. Durable-data delete stays exclusively with Maintain
 
 No role other than Maintain's IAM policy grants `s3:DeleteObject` on tenant
 data or any protected key. Admin gains one narrow delete on the transient
