@@ -181,6 +181,9 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         spill: Some(SpillConfig {
             dir: spill_dir,
             max_bytes: scratch_bytes,
@@ -779,6 +782,9 @@ fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
         parallel_final_aggregation: true,
         skip_partial_aggregation: true,
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         spill,
     }
 }
@@ -930,6 +936,9 @@ async fn spill_off_reproduces_todays_refusal() {
         parallel_final_aggregation: false,
         skip_partial_aggregation: true,
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         spill: None,
     };
     assert_eq!(config.spill, None, "this case is the spill-off default");

@@ -821,6 +821,9 @@ async fn byte_budget_exceeded_returns_typed_error() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
     };
@@ -913,6 +916,9 @@ async fn high_cardinality_trips_query_pool_before_tenant() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
     };
@@ -973,6 +979,9 @@ async fn tenant_budget_trips_and_rolls_back_the_query_reservation() {
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
     };
@@ -1035,6 +1044,9 @@ async fn query_budget_reported_first_when_both_ceilings_are_equally_reachable() 
         // ADR-0774's rewrite is a `SqlConfig` field now; keep this
         // fixture's plan shape as it was by not installing the rule.
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
     };

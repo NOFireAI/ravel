@@ -489,6 +489,9 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         // Named explicitly rather than spread from the default so a new field
         // keeps failing this initializer closed.
         late_materialization_extra_columns: None,
+        // Issue #1402's rewrite is a `SqlConfig` field too; left on the shipped
+        // default, since none of these fixtures plans a grouped top-k.
+        bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         // ADR-0954: spill off, as on the shipped default.
         spill: None,
     };

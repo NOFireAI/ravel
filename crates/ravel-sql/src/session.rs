@@ -122,6 +122,7 @@ use url::Url;
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
 use crate::avg::sequential_avg_udaf;
+use crate::bounded_topk::BoundedTopKAggregate;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::late_materialization::TopKLateMaterialization;
@@ -561,6 +562,17 @@ pub fn session_config(
             .skip_partial_aggregation_probe_ratio_threshold = SKIP_PARTIAL_AGGREGATION_PROBE_RATIO;
     }
 
+    // Issue #1402. DataFusion's own `TopKAggregation` rule defaults ON
+    // (`enable_topk_aggregation`), and it admits two shapes ravel must not
+    // take: a float `min`/`max`, whose answer would come from the priority
+    // map's ordering instead of ADR-0023's total order, and an arbitrarily
+    // large `LIMIT`, where the bound is no longer worth its per-row
+    // comparison. It is turned off here for every query and
+    // `crate::BoundedTopKAggregate`, installed by `build_session`, re-admits
+    // exactly the vetted shape. Written as a typed field for the same reason
+    // the knobs above are.
+    session.options_mut().optimizer.enable_topk_aggregation = false;
+
     if repartition_free {
         // The `repartition_*` knobs above do not cover DataFusion's round-robin
         // fan-out, which `EnforceDistribution` inserts on its own whenever an
@@ -669,6 +681,16 @@ pub fn build_session(
     if let Some(extra_columns) = config.late_materialization_extra_columns {
         builder = builder
             .with_physical_optimizer_rule(Arc::new(TopKLateMaterialization::new(extra_columns)));
+    }
+    // Issue #1402: bound a grouped aggregate whose only consumer is a top-k
+    // sort. Appended after the default rules for the same reason the rules
+    // above are: the shape it matches is the partial/final aggregation split
+    // `EnforceDistribution` chose, under the `SortExec` fetch DataFusion's
+    // limit pushdown produced. `None` does not install it at all, which is the
+    // operator opt-out and the "before" side of the regression fixture.
+    if let Some(max_limit) = config.bounded_topk_max_limit {
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(BoundedTopKAggregate::new(max_limit)));
     }
     let state = builder.build();
     let mut ctx = SessionContext::new_with_state(state);
@@ -936,6 +958,24 @@ mod tests {
         assert!(!options.optimizer.repartition_sorts);
         assert!(!options.optimizer.repartition_windows);
         assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// Issue #1402: DataFusion's own ungated top-k aggregation rule is off in
+    /// every session, whatever the other per-query inputs say. It defaults ON
+    /// upstream, so this is the assertion that a DataFusion upgrade cannot
+    /// quietly restore it: `crate::BoundedTopKAggregate` is the only path to a
+    /// bounded grouped aggregate here, and it is the only one whose gate has
+    /// been argued.
+    #[test]
+    fn datafusion_topk_aggregation_is_off_in_every_session() {
+        for exact_typed in [false, true] {
+            let config =
+                session_config(&SqlConfig::default(), exact_typed, SpillDecision::Disabled);
+            assert!(
+                !config.options().optimizer.enable_topk_aggregation,
+                "exact_typed_aggregates={exact_typed}"
+            );
+        }
     }
 
     /// ADR-0094 decision 2: `exact_typed_aggregates = true` flips ONLY

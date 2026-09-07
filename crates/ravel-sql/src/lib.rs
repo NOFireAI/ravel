@@ -45,6 +45,7 @@ mod audit_pushdown;
 mod audit_scan;
 mod audit_schema;
 mod avg;
+mod bounded_topk;
 mod config;
 pub mod conformance;
 mod cost;
@@ -101,11 +102,12 @@ pub use audit_pushdown::{AuditPushdown, extract_audit};
 pub use audit_schema::{
     AUDIT_COL_ATTRS, AUDIT_COL_BODY, AUDIT_COL_SEVERITY_TEXT, AUDIT_COL_TS, audit_schema,
 };
+pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
 pub use config::{
-    DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS, DEFAULT_MAX_QUERY_BYTES, ENV_SPILL_DIR,
-    ENV_SPILL_MAX_BYTES, GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
-    GROUP_VALUES_UNDERCOUNT_FACTOR, SpillConfig, SpillConfigError, SqlConfig,
-    compensated_group_values_ceiling,
+    DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,
+    DEFAULT_MAX_QUERY_BYTES, ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES, GROUP_VALUES_CEILING_COMPENSATION,
+    GROUP_VALUES_RESIZE_TRANSIENT_FACTOR, GROUP_VALUES_UNDERCOUNT_FACTOR, SpillConfig,
+    SpillConfigError, SqlConfig, compensated_group_values_ceiling,
 };
 pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
 #[cfg(feature = "flight-sql")]
