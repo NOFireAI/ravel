@@ -428,9 +428,13 @@ impl SqlError {
             SqlError::ColumnStats(_) => MSG_CORRUPT.to_string(),
             SqlError::Fetch(fetch) => match fetch {
                 FetchError::Corrupt { .. } => MSG_CORRUPT.to_string(),
-                FetchError::Store { .. } | FetchError::EtagChanged { .. } => {
-                    MSG_UNAVAILABLE.to_string()
-                }
+                // A memory-budget refusal carries only byte counts (no object
+                // key or tenant identity); redacted to the transient message
+                // like a storage fault, since retrying under less pressure can
+                // succeed.
+                FetchError::Store { .. }
+                | FetchError::EtagChanged { .. }
+                | FetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::LogFetch(fetch) => match fetch {
                 // A carry paired with the wrong segment is an integrity
@@ -440,9 +444,9 @@ impl SqlError {
                 LogFetchError::Corrupt { .. } | LogFetchError::CarryMismatch { .. } => {
                     MSG_CORRUPT.to_string()
                 }
-                LogFetchError::Store { .. } | LogFetchError::EtagChanged { .. } => {
-                    MSG_UNAVAILABLE.to_string()
-                }
+                LogFetchError::Store { .. }
+                | LogFetchError::EtagChanged { .. }
+                | LogFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::SpanFetch(fetch) => match fetch {
                 // A cross-tenant object is an integrity violation of the fetched
@@ -451,7 +455,8 @@ impl SqlError {
                 SpanFetchError::Corrupt { .. } | SpanFetchError::TenantMismatch { .. } => {
                     MSG_CORRUPT.to_string()
                 }
-                SpanFetchError::Store { .. } => MSG_UNAVAILABLE.to_string(),
+                SpanFetchError::Store { .. }
+                | SpanFetchError::FetchMemoryExhausted { .. } => MSG_UNAVAILABLE.to_string(),
             },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
             SqlError::SnapshotInvalidated => MSG_UNAVAILABLE.to_string(),

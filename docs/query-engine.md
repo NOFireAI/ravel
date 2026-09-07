@@ -628,6 +628,64 @@ conservatively (256 KiB: above the four fixed 64 KiB suffix/gap probes, far
 below any real compacted sparse L1 segment) rather than fit to a measured point.
 The within-segment GET/byte model is the `selective_read_accounting` bench.
 
+## Fetch-layer memory reservations
+
+The fetch layer reserves the bytes a GET will materialize on a shared
+`MemoryBudget` (crate `ravel-memory`) before it issues the GET, and owns that
+reservation for as long as the fetched buffer lives. `QueryEngine` holds one
+`Arc<MemoryBudget>` and, through `QueryEngine::with_memory_budget`, wires it to
+the two fetchers it owns: the RSEG metrics fetcher (`fetcher`) and the RLOG log
+fetcher (`log_fetcher`), exactly as it shares one `GetLimiter`. Two fetch paths
+draw on their own default budget, not this shared one, and so are not yet
+bounded by a finite process budget:
+
+- **RSPAN.** `QueryEngine` owns no span fetcher, so `with_memory_budget` reaches
+  none; each `SpanSegmentFetcher` reserves against its own
+  `MemoryBudget::unlimited()`.
+- **The SQL query path.** `build_sql_state` (`services/ravel-server/src/query.rs`)
+  constructs its metrics, logs, and span fetchers with `with_get_limiter` but
+  not `with_memory_budget`, so they reserve against their default unlimited
+  budgets too.
+
+The default is `MemoryBudget::unlimited()`, and no server task installs a finite
+budget yet, so the accounting is inert everywhere today. Wiring a finite,
+process-shared budget into both the PromQL `AppState` builder and `build_sql_state`
+(the seam `with_memory_budget` exists for) is the follow-up that makes it
+enforcing; until then the reservations below run but never refuse.
+
+Reservation sites, each taken **before** its GET, with the guard's lifetime
+tied to the buffer it accounts for:
+
+- **RSEG range fetch** (`SegmentFetcher::ensure_ranges`): the sum of the
+  coalesced run lengths, reserved once ahead of the concurrent GETs. The guard
+  is held by the `FetchedRegions` the runs fill, so it releases when those
+  region bytes drop.
+- **RLOG block-range fetch** (`BlockRangeFetcher`): the object size at the
+  `ObjectAssembler` that reassembles a covering read (the guard travels with
+  the assembled `Bytes`), and the summed range lengths ahead of the concurrent
+  GETs in `fetch_blocks` and `fetch_chunk_ranges`.
+- **RLOG / RSPAN whole-object fetch** (`whole_object_bytes`, and the RSPAN
+  `fetch`): the object size, with the guard attached to the returned `Bytes`.
+
+The guard is never released because a GET completed; it releases only when the
+buffer it accounts for drops.
+
+**Handoff.** When a fetched buffer is admitted to the read cache -- a consumer
+with its own byte ledger -- the reservation is marked handed off
+(`Reservation::mark_handed_off`) rather than released, so the transient overlap
+(both ledgers holding the same bytes) stays visible until this guard drops.
+Buffers returned across the crate boundary to a consumer that reserves under its
+own ledger (the SQL scan's `try_grow`) instead carry their guard inside the
+returned `Bytes`; that guard releases when the consumer drops the bytes, so the
+fetch reservation and the consumer's reservation coexist for the buffer's life
+with no double-free.
+
+**Refusal.** When the budget cannot cover a reservation the fetch fails with a
+typed `FetchMemoryExhausted { requested, reserved, limit }` (on each fetcher's
+error enum), mapped onto the query error path. The refusal carries only byte
+counts -- never an object key or tenant identity -- and is never a smaller fetch
+or a partial result: zero GETs are issued and the budget is left unchanged.
+
 ## Endpoints (Prometheus compatibility subset)
 
 - `POST/GET /api/v1/query` (params: query, time, timeout) instant.

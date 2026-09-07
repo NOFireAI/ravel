@@ -55,8 +55,8 @@ use crate::distrib::{
 use crate::engine::merge_soa_runs;
 use crate::erasure::{ErasurePredicate, is_erased_span};
 use crate::fetcher::SegmentFetcher;
-use crate::log_fetcher::{LogQuery, LogSegmentFetcher};
-use crate::span_fetcher::{SpanRow, SpanSegmentFetcher};
+use crate::log_fetcher::{LogFetchError, LogQuery, LogSegmentFetcher};
+use crate::span_fetcher::{SpanFetchError, SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -5041,4 +5041,108 @@ fn duplicate_partial_series_id_is_a_hard_error() {
             "expected DuplicatePushdownSeries, got {err:?}"
         );
     });
+}
+
+/// The coordinator reconstructs a worker's memory refusal by parsing the
+/// figures back out of the gRPC status message, because today's `Status`
+/// carries only a code and a message: `parse_fetch_memory_exhausted` is the
+/// exact inverse of `FetchMemoryExhausted`'s `Display`. That is a stopgap, not
+/// a constraint -- the proto evolves additively, so three `uint64` fields would
+/// carry the figures and delete this coupling. Three independently-editable
+/// `#[error(..)]` strings render that variant -- `FetchError` (series fold,
+/// `distrib/mod.rs:355`), `LogFetchError` (log fold, `:529`), and
+/// `SpanFetchError` (span fold, `:682`) -- and nothing but this test keeps them
+/// textually identical to each other and to the parser. This pins all three:
+/// a reword of any one of them, alone, fails the corresponding `assert_eq`
+/// below rather than silently degrading that fold's coordinator-side
+/// reconstruction to a generic `Distrib`.
+#[test]
+fn fetch_memory_exhausted_message_round_trips() {
+    let original = crate::fetcher::FetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of FetchError::FetchMemoryExhausted {rendered:?}"
+    );
+
+    let original = LogFetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of LogFetchError::FetchMemoryExhausted {rendered:?}"
+    );
+
+    let original = SpanFetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    };
+    let rendered = original.to_string();
+    assert_eq!(
+        super::parse_fetch_memory_exhausted(&rendered),
+        Some((4_194_304, 268_435_456, 268_500_000)),
+        "parser must invert the Display of SpanFetchError::FetchMemoryExhausted {rendered:?}"
+    );
+
+    // A message that is not this error's Display parses to None, so the fold
+    // falls back to a generic Distrib rather than fabricating figures.
+    assert_eq!(
+        super::parse_fetch_memory_exhausted("slice tripped its budget: something else"),
+        None,
+        "an unrelated message must not parse as a memory refusal"
+    );
+}
+
+/// The coordinator's `BudgetExceeded` fold surfaces a fetch-layer memory refusal
+/// as the typed `Fetch(FetchMemoryExhausted)` -- the same error the local path
+/// raises -- when the folded bytes-scanned total is under the query's cap (so
+/// the trip is memory, not bytes). Replacing the `parse_fetch_memory_exhausted`
+/// branch in `budget_exceeded_error` with the `Distrib` fallback makes the
+/// `matches!` below fail. When the folded total is at or over the bytes cap, the
+/// same helper yields the bytes-scanned error instead, proving the
+/// disambiguation.
+#[test]
+fn budget_exceeded_fold_renders_memory_refusal_typed() {
+    let msg = crate::fetcher::FetchError::FetchMemoryExhausted {
+        requested: 4_194_304,
+        reserved: 268_435_456,
+        limit: 268_500_000,
+    }
+    .to_string();
+
+    // Folded bytes under the cap: the trip is a memory refusal, surfaced typed.
+    let err =
+        super::budget_exceeded_error(1_000, crate::config::ByteLimit::Bounded(1_000_000), &msg);
+    assert!(
+        matches!(
+            err,
+            crate::error::QueryError::Fetch(crate::fetcher::FetchError::FetchMemoryExhausted {
+                requested: 4_194_304,
+                reserved: 268_435_456,
+                limit: 268_500_000,
+            })
+        ),
+        "a memory refusal under the bytes cap must fold to a typed FetchMemoryExhausted, got {err:?}"
+    );
+
+    // Folded bytes at or over the cap: the bytes-scanned trip dominates.
+    let err = super::budget_exceeded_error(
+        2_000_000,
+        crate::config::ByteLimit::Bounded(1_000_000),
+        &msg,
+    );
+    assert!(
+        matches!(err, crate::error::QueryError::TooManyBytesScanned { .. }),
+        "a folded total over the bytes cap must fold to TooManyBytesScanned, got {err:?}"
+    );
 }

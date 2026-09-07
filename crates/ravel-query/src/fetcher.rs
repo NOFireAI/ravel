@@ -167,6 +167,19 @@ pub enum FetchError {
     },
     #[error("etag changed between reads of segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
+    /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
+    /// reservation for the bytes this GET would materialize. Carries only the
+    /// three accounting figures, never an object key or tenant value: the
+    /// refusal is a resource condition, not data corruption, and its message
+    /// must not leak which object or tenant provoked it.
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    FetchMemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
 }
 
 /// The error channel for a cache-routed GET's `get_or_fetch` closure
@@ -497,11 +510,23 @@ impl FetchStats {
 #[derive(Default)]
 struct FetchedRegions {
     buffers: Vec<(u64, Bytes)>,
+    /// Fetch-layer byte reservations (ADR-1170 decision 2) covering the GETs
+    /// that filled `buffers`. Owned here so a reservation lives exactly as long
+    /// as the fetched regions it accounts for: dropping this `FetchedRegions`
+    /// releases them. The reservation guards the coalesced run lengths reserved
+    /// once before the `join_all` in `ensure_ranges`, never a per-GET or
+    /// request-scoped claim.
+    reservations: Vec<ravel_memory::Reservation>,
 }
 
 impl FetchedRegions {
     fn insert(&mut self, start: u64, bytes: Bytes) {
         self.buffers.push((start, bytes));
+    }
+
+    /// Takes ownership of a reservation so it lives as long as these regions.
+    fn hold_reservation(&mut self, reservation: ravel_memory::Reservation) {
+        self.reservations.push(reservation);
     }
 
     fn covers(&self, start: u64, end: u64) -> bool {
@@ -611,6 +636,16 @@ pub struct SegmentFetcher {
     /// materializations. Shared across clones (an `Arc`), never reset, read the
     /// same way as [`suffix_fallbacks`](Self::suffix_fallbacks).
     label_sets_materialized: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). Every GET
+    /// this fetcher issues reserves the bytes it will materialize against this
+    /// budget before the GET, and the reservation is owned for the fetched
+    /// buffer's lifetime. Shared across clones and, via
+    /// [`Self::with_memory_budget`], across every other fetcher and engine
+    /// holding the same `Arc`, exactly like [`get_limiter`](Self::get_limiter).
+    /// The default is [`MemoryBudget::unlimited`], which never refuses, so a
+    /// fetcher built with plain `new` behaves as it did before this budget
+    /// existed.
+    memory_budget: std::sync::Arc<ravel_memory::MemoryBudget>,
 }
 
 impl SegmentFetcher {
@@ -627,6 +662,7 @@ impl SegmentFetcher {
             cache: None,
             suffix_fallbacks: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             label_sets_materialized: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            memory_budget: std::sync::Arc::new(ravel_memory::MemoryBudget::unlimited()),
         }
     }
 
@@ -734,6 +770,42 @@ impl SegmentFetcher {
     #[cfg(test)]
     pub(crate) fn get_limiter_for_test(&self) -> &std::sync::Arc<crate::GetLimiter> {
         &self.get_limiter
+    }
+
+    /// Wires this fetcher to a caller-owned [`ravel_memory::MemoryBudget`]
+    /// (ADR-1170 decision 2), so the bytes it reserves before each GET draw
+    /// from the same budget as every other fetcher (and, via
+    /// [`crate::QueryEngine::with_memory_budget`], every other engine) holding
+    /// the same `Arc`. Mirrors [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(
+        mut self,
+        budget: std::sync::Arc<ravel_memory::MemoryBudget>,
+    ) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// This fetcher's current memory budget, for a test to `Arc::ptr_eq`
+    /// against another fetcher's or an engine's, proving they share one budget
+    /// rather than each holding an equal-but-distinct one.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &std::sync::Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a GET, mapping a
+    /// refusal to the typed [`FetchError::FetchMemoryExhausted`]. The returned
+    /// guard is owned for the fetched buffer's lifetime; it is never released
+    /// because a GET completed (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, FetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| FetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
     }
 
     /// One store GET, bounded by the shared in-flight limiter. The permit
@@ -1054,20 +1126,30 @@ impl SegmentFetcher {
         // shared semaphore inside `guarded_get` bounds the actual in-flight
         // GETs; `join_all` preserves input order, so the resulting
         // `regions` insert order is identical to the old sequential loop.
-        let gets = join_all(coalesce_ranges(missing, self.coalesce_gap).into_iter().map(
-            |(start, end)| async move {
-                let (got, got_cost) = self
-                    .guarded_get(
-                        seg_ref,
-                        tenant_hash,
-                        GetRange::Range(start, end),
-                        Some(suffix_etag),
-                        accounting,
-                    )
-                    .await?;
-                Ok::<(u64, Bytes, GetCost), FetchError>((start, got.data, got_cost))
-            },
-        ))
+        let runs = coalesce_ranges(missing, self.coalesce_gap);
+        // Reserve the memory the coalesced runs will materialize before the
+        // `join_all` issues a single GET (ADR-1170 decision 2): a refusal
+        // fails the whole fetch typed, with zero GETs issued, never a smaller
+        // fetch. The guard is owned by `regions`, so it lives exactly as long
+        // as the bytes it accounts for and releases on their drop, never
+        // because the GETs completed.
+        let reserved: u64 = runs
+            .iter()
+            .map(|(start, end)| end.saturating_sub(*start))
+            .fold(0u64, u64::saturating_add);
+        regions.hold_reservation(self.reserve_fetch(reserved)?);
+        let gets = join_all(runs.into_iter().map(|(start, end)| async move {
+            let (got, got_cost) = self
+                .guarded_get(
+                    seg_ref,
+                    tenant_hash,
+                    GetRange::Range(start, end),
+                    Some(suffix_etag),
+                    accounting,
+                )
+                .await?;
+            Ok::<(u64, Bytes, GetCost), FetchError>((start, got.data, got_cost))
+        }))
         .await;
         // Each coalesced GET reports its own store-vs-cache cost, so a range
         // served from a warm cache adds nothing here while a store GET adds one
@@ -3947,6 +4029,65 @@ mod tests {
     // fetcher's whole multi-GET plan reduces to these two helpers, so they are
     // pinned directly here (the end-to-end path is exercised in
     // tests/fetch_multi_get.rs).
+
+    /// Deliverable 2 (RSEG): the byte reservation `ensure_ranges` takes for its
+    /// coalesced runs is owned by the `FetchedRegions` it fills, so the budget
+    /// stays reserved for exactly the run-length sum while those regions are
+    /// held and returns to zero the moment they drop, never released because the
+    /// GET completed.
+    ///
+    /// Non-vacuity: dropping the
+    /// `regions.hold_reservation(self.reserve_fetch(reserved)?)` line in
+    /// `ensure_ranges` releases the guard at the end of the call, so `reserved()`
+    /// reads 0 while the regions are still held and the first assertion fails.
+    #[tokio::test]
+    async fn rseg_range_reservation_is_owned_by_the_filled_regions() {
+        let (store, tenant_hash, seg_ref) = write_test_segment().await;
+        let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(1 << 20));
+        // whole_object_threshold(0) plus a short suffix keep the first GET a
+        // footer tail read, so the front byte range below is genuinely missing
+        // and reaches the `ensure_ranges` reservation site rather than being
+        // served from an already-whole-object buffer.
+        let fetcher = SegmentFetcher::new(backend)
+            .with_whole_object_threshold(0)
+            .with_suffix_len(16)
+            .with_memory_budget(budget.clone());
+        let accounting = QueryAccounting::new();
+        let (_footer, _total, suffix_etag, mut regions) = fetcher
+            .open_segment(tenant_hash, &seg_ref, &accounting)
+            .await
+            .expect("open segment");
+
+        const RUN: u64 = 64;
+        assert!(
+            !regions.covers(0, RUN),
+            "the front of the object must not be covered by the footer tail read"
+        );
+        assert_eq!(budget.reserved(), 0, "open_segment reserves nothing");
+        fetcher
+            .ensure_ranges(
+                &seg_ref,
+                tenant_hash,
+                &suffix_etag,
+                &[(0, RUN)],
+                &mut regions,
+                &accounting,
+            )
+            .await
+            .expect("ensure_ranges");
+        assert_eq!(
+            budget.reserved(),
+            RUN,
+            "the reservation equals the coalesced run-length sum while the regions are held"
+        );
+        drop(regions);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation releases when the FetchedRegions buffer drops"
+        );
+    }
 
     #[test]
     fn coalesce_merges_within_gap_and_splits_beyond() {

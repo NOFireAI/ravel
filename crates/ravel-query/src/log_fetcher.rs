@@ -54,6 +54,7 @@ use crate::config::EngineConfigError;
 use crate::erasure::ErasurePredicate;
 use crate::fetcher::ReadCache;
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
+use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, SingleFlightError, Source};
 use ravel_catalog::SegmentRef;
@@ -510,6 +511,20 @@ pub enum LogFetchError {
     /// (ADR-0107 decision 1).
     #[error("etag changed between reads of log segment {key}: store returned inconsistent data")]
     EtagChanged { key: String },
+    /// The fetch-layer memory budget (ADR-1170 decision 2) refused the
+    /// reservation for the bytes this GET would materialize. Carries only the
+    /// three accounting figures, never an object key or tenant value: the
+    /// refusal is a resource condition, not corruption, and must not leak which
+    /// object or tenant provoked it. Mirrors
+    /// [`crate::FetchError::FetchMemoryExhausted`].
+    #[error(
+        "fetch memory exhausted: requested {requested} bytes, {reserved} of {limit} byte budget already reserved"
+    )]
+    FetchMemoryExhausted {
+        requested: u64,
+        reserved: u64,
+        limit: u64,
+    },
     /// A [`CarriedWholeObject`] produced by one `plan_segment` read was supplied
     /// to a read of a different object, or of the same object under a different
     /// tenant. The carry short-circuits the fetch, so decoding it would answer
@@ -575,22 +590,35 @@ pub struct LogSegmentFetcher {
     /// fetcher's ranged GETs accumulate into one set of totals. Read through
     /// [`phase_wire_byte_counter`](Self::phase_wire_byte_counter).
     wire_bytes: PhaseWireByteCounter,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). This
+    /// fetcher's own whole-object GETs (`fetch_accounted` and
+    /// `whole_object_bytes`) reserve the object's size against it before the
+    /// GET and own the reservation for the fetched buffer's lifetime;
+    /// `block_range` reserves its own ranged reads against the same budget,
+    /// which every builder below keeps in sync (like `wire_bytes` and
+    /// `get_limiter`). Default [`ravel_memory::MemoryBudget::unlimited`], so a
+    /// fetcher built with plain `new` never refuses.
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 impl LogSegmentFetcher {
     pub fn new(store: Arc<dyn ObjectStoreBackend>) -> Self {
         let wire_bytes = PhaseWireByteCounter::new();
+        let memory_budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
         LogSegmentFetcher {
             store: store.clone(),
             cfg: RlogConfig::default(),
             cache: None,
             block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
-            block_range: BlockRangeFetcher::new(store).with_wire_byte_counter(wire_bytes.clone()),
+            block_range: BlockRangeFetcher::new(store)
+                .with_wire_byte_counter(wire_bytes.clone())
+                .with_memory_budget(memory_budget.clone()),
             get_limiter: Arc::new(crate::GetLimiter::new_unchecked(
                 DEFAULT_LOG_MAX_CONCURRENT_GETS,
             )),
             probe_misses: ProbeMissCounter::new(),
             wire_bytes,
+            memory_budget,
         }
     }
 
@@ -704,6 +732,47 @@ impl LogSegmentFetcher {
         self
     }
 
+    /// Wires this fetcher's OWN whole-object GETs and the block-range path to
+    /// the same caller-owned [`ravel_memory::MemoryBudget`] (ADR-1170 decision
+    /// 2), so both funnels reserve against the same budget as every other
+    /// fetcher (and, via [`crate::QueryEngine::with_memory_budget`], every other
+    /// engine) holding the same `Arc`. Mirrors [`Self::with_get_limiter`].
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = Arc::clone(&budget);
+        self.block_range = self.block_range.with_memory_budget(budget);
+        self
+    }
+
+    /// This fetcher's own memory budget (bounds `fetch_accounted` and
+    /// `whole_object_bytes`), for a test to `Arc::ptr_eq` against another
+    /// fetcher's or an engine's, proving they share one budget. See
+    /// [`Self::block_range_memory_budget_for_test`] for the block-range path's.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// The block-range path's current memory budget, for the same `Arc::ptr_eq`
+    /// purpose as [`Self::memory_budget_for_test`].
+    #[cfg(test)]
+    pub(crate) fn block_range_memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        self.block_range.memory_budget_for_test()
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a whole-object
+    /// GET, mapping a refusal to [`LogFetchError::FetchMemoryExhausted`]. The
+    /// guard is owned for the fetched buffer's lifetime (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, LogFetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| LogFetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
+    }
+
     /// This fetcher's own limiter (bounds `fetch_accounted` and
     /// `whole_object_bytes`), for a test to `Arc::ptr_eq` against another
     /// fetcher's or an engine's, proving two fetchers actually share one
@@ -782,7 +851,8 @@ impl LogSegmentFetcher {
     pub fn with_block_range(mut self, block_range: BlockRangeFetcher) -> Self {
         self.block_range = block_range
             .with_wire_byte_counter(self.wire_bytes.clone())
-            .with_get_limiter(Arc::clone(&self.get_limiter));
+            .with_get_limiter(Arc::clone(&self.get_limiter))
+            .with_memory_budget(Arc::clone(&self.memory_budget));
         self
     }
 
@@ -1028,6 +1098,12 @@ impl LogSegmentFetcher {
             // `scan_accounted_with_tenant` and `_subset`, and the alerts and
             // audit scans use `fetch_accounted_with_tenant`; each carries its
             // own copy of these spans over its own (cache-aware) GET path.
+            // Reserve the whole object's bytes before the GET (ADR-1170
+            // decision 2): a refusal fails this fetch typed with zero GETs
+            // issued. Held to the end of this block, so it covers the decode
+            // that reads `got.data`; released when this fully-decoded funnel
+            // returns its owned records.
+            let _reservation = self.reserve_fetch(seg_ref.object_size)?;
             let fetch_span = tracing::debug_span!(
                 "page_fetch",
                 signal = "logs",
@@ -2132,6 +2208,12 @@ impl LogSegmentFetcher {
             s3_bytes = tracing::field::Empty,
         );
 
+        // Reserve the whole object's bytes before the direct whole-object GET
+        // (ADR-1170 decision 2), so a refusal fails typed with zero GETs. The
+        // guard travels with the returned `Bytes` (below), owned for the
+        // fetched buffer's lifetime rather than released when the GET completes.
+        let reservation = self.reserve_fetch(seg_ref.object_size)?;
+
         let Some(cache) = &self.cache else {
             let got = async {
                 // Held across the GET only: dropped when this inner block
@@ -2162,7 +2244,7 @@ impl LogSegmentFetcher {
             self.wire_bytes.record(phase, got.data.len() as u64);
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
-            return Ok(got.data);
+            return Ok(attach_reservation(got.data, reservation));
         };
 
         let cache_key = CacheKey::new(tenant_hash.0, seg_ref.content_hash, 0, seg_ref.object_size);
@@ -2195,6 +2277,7 @@ impl LogSegmentFetcher {
         // verifies nothing, so those arms are unreachable here rather than
         // wrong.
         .map_err(|err| from_cache_error(key, err))?;
+        let mut reservation = reservation;
         match source {
             Source::Cache => {
                 accounting.record_cache_hit();
@@ -2202,6 +2285,14 @@ impl LogSegmentFetcher {
                 // Served from cache: no S3 GET on this call.
                 fetch_span.record("s3_requests", 0u64);
                 fetch_span.record("s3_bytes", 0u64);
+                // The returned `Bytes` is a clone of the cache entry's, so the
+                // same allocation is under the cache's byte ledger AND this
+                // fetch guard for as long as the caller holds it. That is the
+                // two-ledger overlap decision 2's handoff rule describes, and
+                // it is no less real for arriving by a hit than by an insert:
+                // leaving it unmarked understates `handoff_overlap` by every
+                // cache hit, which is what makes the `unique` term inexact.
+                reservation.mark_handed_off();
             }
             // A miss issues one store GET for the resulting bytes. A
             // single-flight follower that rode another caller's GET is the
@@ -2212,9 +2303,15 @@ impl LogSegmentFetcher {
                 accounting.record_cache_miss();
                 fetch_span.record("s3_requests", 1u64);
                 fetch_span.record("s3_bytes", bytes.len() as u64);
+                // The fetched buffer was just admitted to the read cache, which
+                // has its own byte ledger (ADR-1170 decision 2's handoff rule):
+                // mark this reservation handed off so the transient overlap is
+                // visible while both this returned buffer and the cache entry
+                // hold the same bytes. The overlap clears when this guard drops.
+                reservation.mark_handed_off();
             }
         }
-        Ok(bytes)
+        Ok(attach_reservation(bytes, reservation))
     }
 
     /// Runs [`scan_bytes`](Self::scan_bytes) inside the log path's `decode`
@@ -3190,13 +3287,42 @@ impl Drop for AssemblyBuffer {
 struct ObjectAssembler {
     buf: AssemblyBuffer,
     placed: Vec<(u64, u64)>,
+    /// The fetch-layer memory reservation (ADR-1170 decision 2) covering the
+    /// object this assembler materializes. Reserved once, before the assembler
+    /// issues any GET, for the whole object size. Handed to
+    /// [`into_bytes`](Self::into_bytes) so it travels with the returned `Bytes`
+    /// and releases exactly when the reader drops them, never when the
+    /// assembling GETs completed. `None` only on paths built with an unlimited
+    /// budget's guard omitted, which the constructors never do in production.
+    reservation: Option<ravel_memory::Reservation>,
+}
+
+/// Owns an [`AssemblyBuffer`] together with the fetch-layer reservation for the
+/// object it holds, so [`Bytes::from_owner`] can attach the reservation guard
+/// to the assembled `Bytes` (ADR-1170 decision 2): the guard is released when
+/// the last `Bytes` clone is dropped. `AsRef<[u8]>` forwards to the buffer, so
+/// the returned `Bytes` view the assembled object exactly as before.
+struct AssembledBytes {
+    buf: AssemblyBuffer,
+    _reservation: Option<ravel_memory::Reservation>,
+}
+
+impl AsRef<[u8]> for AssembledBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.buf.as_ref()
+    }
 }
 
 impl ObjectAssembler {
-    fn new(pool: &Arc<AssemblyBufferPool>, total_size: usize) -> Self {
+    fn new(
+        pool: &Arc<AssemblyBufferPool>,
+        total_size: usize,
+        reservation: Option<ravel_memory::Reservation>,
+    ) -> Self {
         ObjectAssembler {
             buf: pool.acquire(total_size),
             placed: Vec::new(),
+            reservation,
         }
     }
 
@@ -3242,7 +3368,10 @@ impl ObjectAssembler {
     }
 
     fn into_bytes(self) -> Bytes {
-        Bytes::from_owner(self.buf)
+        Bytes::from_owner(AssembledBytes {
+            buf: self.buf,
+            _reservation: self.reservation,
+        })
     }
 }
 
@@ -3360,6 +3489,12 @@ pub struct BlockRangeFetcher {
     /// the owning [`LogSegmentFetcher`], which sets its own counter here so one
     /// execution's whole-object and ranged reads land in the same totals.
     wire_bytes: PhaseWireByteCounter,
+    /// The process-wide fetch memory budget (ADR-1170 decision 2). Every ranged
+    /// read reserves against it before its GETs: the whole object size once,
+    /// held by the [`ObjectAssembler`] for the assembled buffer's lifetime, plus
+    /// the transient summed run length before each `join_all`. Default unlimited
+    /// (never refuses); [`Self::with_memory_budget`] wires the shared one.
+    memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 impl BlockRangeFetcher {
@@ -3380,7 +3515,38 @@ impl BlockRangeFetcher {
             )),
             assembly_pool: Arc::new(AssemblyBufferPool::default()),
             wire_bytes: PhaseWireByteCounter::new(),
+            memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         }
+    }
+
+    /// Wires this fetcher's ranged reads to a caller-owned
+    /// [`ravel_memory::MemoryBudget`] (ADR-1170 decision 2), so they reserve
+    /// against the same budget as the owning [`LogSegmentFetcher`]'s
+    /// whole-object funnel and every other fetcher holding the same `Arc`.
+    #[must_use]
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = budget;
+        self
+    }
+
+    /// This fetcher's current memory budget, for a test to `Arc::ptr_eq` the
+    /// way [`Self::get_limiter_for_test`] serves the limiter.
+    #[cfg(test)]
+    pub(crate) fn memory_budget_for_test(&self) -> &Arc<ravel_memory::MemoryBudget> {
+        &self.memory_budget
+    }
+
+    /// Reserves `n` bytes against this fetcher's budget before a ranged read,
+    /// mapping a refusal to [`LogFetchError::FetchMemoryExhausted`]. The guard
+    /// is owned for the covered buffer's lifetime (ADR-1170 decision 2).
+    fn reserve_fetch(&self, n: u64) -> Result<ravel_memory::Reservation, LogFetchError> {
+        self.memory_budget
+            .reserve(n)
+            .map_err(|e| LogFetchError::FetchMemoryExhausted {
+                requested: e.requested,
+                reserved: e.reserved,
+                limit: e.limit,
+            })
     }
 
     /// Records this fetcher's WIRE bytes into `counter` instead of its own
@@ -3593,6 +3759,23 @@ impl BlockRangeFetcher {
         pin: &EtagPin,
         accounting: &QueryAccounting,
     ) -> Result<(Bytes, u64, u64), LogFetchError> {
+        // Reserve the covering read's whole extent before any GET (ADR-1170
+        // decision 2): a refusal fails typed with zero GETs. The guard travels
+        // with the returned `Bytes` -- attached directly in the single-GET
+        // branch, or carried by the `ObjectAssembler` in the segmented branch --
+        // so it releases when the reader drops the assembled buffer.
+        //
+        // This always reserves fresh, and a coverage crossover holding a live
+        // assembler for the same object drops it first rather than handing its
+        // guard across. Accepting a caller's live reservation would mean
+        // proving, at every such call site, that no borrow into the assembler's
+        // buffer survives the await, and a caller that got that wrong would
+        // leave the buffer resident under no ledger, which is the gap decision 2
+        // forbids. The cost of reserving fresh is that a saturated budget can
+        // hand the freed extent to another task in between, turning a fetch that
+        // a handover would have completed into a typed refusal. That is
+        // fail-closed and allowed.
+        let reservation = self.reserve_fetch(total_size)?;
         if total_size <= self.max_fetch_run_bytes {
             let (bytes, live) = self
                 .cached_extent(
@@ -3610,12 +3793,16 @@ impl BlockRangeFetcher {
                 self.observe_fetch_run(total_size);
             }
             let live_bytes = if live { total_size } else { 0 };
-            return Ok((bytes, u64::from(live), live_bytes));
+            return Ok((
+                attach_reservation(bytes, reservation),
+                u64::from(live),
+                live_bytes,
+            ));
         }
 
         let key = seg_ref.data_object_key.as_str();
         let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
-        let mut asm = ObjectAssembler::new(&self.assembly_pool, total);
+        let mut asm = ObjectAssembler::new(&self.assembly_pool, total, Some(reservation));
         let mut live_gets = 0u64;
         // Wire bytes actually moved: a sub-range served from cache moves none,
         // so `bytes.len()` (the whole object) must never be charged as fetched
@@ -4460,7 +4647,14 @@ impl BlockRangeFetcher {
         // footer parsed at wrong absolute offsets is a `Corrupt`.
         let total_size = seg_ref.object_size;
         let total = usize::try_from(total_size).map_err(|_| corrupt_range(key))?;
-        let mut asm = ObjectAssembler::new(&self.assembly_pool, total);
+        // Reserve the object-sized assembly buffer before any block GET
+        // (ADR-1170 decision 2): the pooled buffer is object-sized regardless of
+        // how few blocks the pruned read places into it, so the object size is
+        // the memory this read holds. The guard is owned by the assembler and
+        // travels with its `into_bytes` result, releasing when the reader drops
+        // the assembled buffer. A refusal fails typed with zero GETs.
+        let reservation = self.reserve_fetch(total_size)?;
+        let mut asm = ObjectAssembler::new(&self.assembly_pool, total, Some(reservation));
 
         // Footer: reused from the plan phase when carried (deliverable 2), else
         // read via the etag-establishing suffix probe. The probe is a suffix GET
@@ -4674,6 +4868,14 @@ impl BlockRangeFetcher {
         let candidate_bytes: u64 = extents.iter().map(|e| e.len).sum();
         let coverage = candidate_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
+            // `extents` is already owned (resolved above from the decoded skip
+            // index, not borrowed from `asm`), so the assembler holds no live
+            // borrow here. Drop it -- releasing both its object-sized buffer
+            // and its reservation guard -- BEFORE the covering GET reserves
+            // fresh (ADR-1170 decision 2): the object is materialized once, so
+            // only one object-sized reservation is ever live, never the
+            // assembler's plus a second one for the covering read.
+            drop(asm);
             // Keyed and single-flighted like every other GET here, on the same
             // `(0, object_size)` key the whole-object funnel uses: without that,
             // N partitions all crossing over would issue N whole-object GETs,
@@ -4980,6 +5182,13 @@ impl BlockRangeFetcher {
         let wanted_bytes: u64 = wanted.iter().map(|e| e.len).sum();
         let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
         if coverage >= self.coverage_threshold {
+            // `wanted` is already owned (resolved above from the decoded skip
+            // index and page directory, not borrowed from `asm`), so dropping
+            // the assembler here is safe, as the version-3 coverage crossover
+            // does: it releases the buffer and its reservation guard BEFORE
+            // the covering GET reserves fresh, so only one object-sized
+            // reservation is ever live (ADR-1170 decision 2).
+            drop(asm);
             // Bounded by the fetch bound (ADR-0996 decision 2), like the
             // version-3 coverage crossover above.
             let (bytes, live_gets, live_bytes) = self
@@ -5122,6 +5331,14 @@ impl BlockRangeFetcher {
             // `asm` at the right offsets already.
             .filter(|r| !asm.covers(r.abs_start, r.abs_end()))
             .collect();
+        // Reserve the transient wire buffers the coalesced runs materialize
+        // before `join_all` issues a GET (ADR-1170 decision 2): a refusal fails
+        // typed with zero GETs. Held to the end of this call, covering the
+        // per-run buffers until each is copied into `asm` (whose object-sized
+        // reservation, taken at construction, is the durable one). A transient
+        // peak, released when this call returns.
+        let reserved: u64 = runs.iter().map(|r| r.len).fold(0u64, u64::saturating_add);
+        let _reservation = self.reserve_fetch(reserved)?;
         let outcomes = futures::future::join_all(runs.iter().map(|run| async move {
             let (bytes, live) = self
                 .cached_extent(
@@ -5473,6 +5690,13 @@ impl BlockRangeFetcher {
         // the runs in series made `get_limiter` inert: a sequential loop never
         // has more than one GET in flight to bound.
         let runs = coalesce_extents(&missing, self.effective_coalesce_gap());
+        // Reserve the transient wire buffers the coalesced runs materialize
+        // before `join_all` issues a GET (ADR-1170 decision 2): a refusal fails
+        // typed with zero GETs. Held to the end of this call, until each run's
+        // blocks are copied into `asm` (whose object-sized reservation is the
+        // durable one). A transient peak, released when this call returns.
+        let reserved: u64 = runs.iter().map(|r| r.len).fold(0u64, u64::saturating_add);
+        let _reservation = self.reserve_fetch(reserved)?;
         let outcomes = futures::future::join_all(runs.iter().map(|run| {
             let blocks: Vec<BlockExtent> = missing
                 .iter()
@@ -5778,6 +6002,17 @@ fn to_cache_error(err: LogFetchError) -> crate::fetcher::CacheFetchError {
             key,
             message: source.to_string(),
         },
+        // Unreachable in practice: every fetch-memory reservation (ADR-1170
+        // decision 2) is taken BEFORE the `get_or_fetch` closure this channel
+        // carries, so a refusal fails the caller before any cache single-flight
+        // begins and never travels to a follower. Mapped to a transient store
+        // error so the exhaustive match holds without inventing a cache-channel
+        // variant for a class that cannot arrive here.
+        LogFetchError::FetchMemoryExhausted { .. } => {
+            crate::fetcher::CacheFetchError::Store(Arc::new(StoreError::Transient(
+                "fetch memory exhausted inside cache single-flight (unreachable)".to_string(),
+            )))
+        }
         // A carry mismatch is refused before any fetch, so it never reaches a
         // single-flight waiter today. Preserved as hard corruption rather than
         // flattened, so it stays in its class if a carry ever fronts the cache.
@@ -6978,6 +7213,364 @@ mod whole_object_get_limiter_tests {
             .expect("fetch b found the segment relevant");
         assert_eq!(a.records.len(), 1);
         assert_eq!(b.records.len(), 1);
+    }
+
+    /// Deliverable 4 (RLOG whole-object): a budget too small for one object's
+    /// bytes refuses the fetch with a typed `FetchMemoryExhausted` carrying the
+    /// requested/reserved/limit counts, BEFORE any GET reaches the store, and
+    /// leaves the budget with nothing reserved.
+    ///
+    /// Non-vacuity: replacing `self.reserve_fetch(seg_ref.object_size)?` in
+    /// `whole_object_bytes` with an infallible reserve lets the GET fire and the
+    /// fetch succeed, so the `FetchMemoryExhausted` match and the zero-GET
+    /// assertion below both fail.
+    #[tokio::test]
+    async fn whole_object_budget_refusal_issues_zero_gets() {
+        use ravel_object_store::InstrumentedStore;
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let memory = MemoryStore::new();
+        memory
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        let instrumented = Arc::new(InstrumentedStore::new(memory));
+        let metrics = instrumented.metrics();
+        let backend: Arc<dyn ObjectStoreBackend> = instrumented;
+
+        // One byte short of a single object: the reservation cannot be granted.
+        let limit = size - 1;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = LogSegmentFetcher::new(backend).with_memory_budget(budget.clone());
+
+        let err = fetcher
+            .whole_object_bytes(
+                &seg_ref(size),
+                TENANT,
+                QueryPhase::Plan,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect_err("a budget below one object's size must refuse the fetch");
+        match err {
+            LogFetchError::FetchMemoryExhausted {
+                requested,
+                reserved,
+                limit: reported_limit,
+            } => {
+                assert_eq!(requested, size, "the refusal names the object's byte size");
+                assert_eq!(reserved, 0, "nothing else was reserved on this budget");
+                assert_eq!(reported_limit, limit, "the refusal names the budget limit");
+            }
+            other => panic!("expected FetchMemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            metrics.snapshot().get.calls,
+            0,
+            "a budget refusal issues zero GETs: the reservation precedes the GET"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a refused reservation leaves nothing reserved"
+        );
+    }
+
+    /// Deliverable 4 (concurrent cap): four distinct objects fetched
+    /// concurrently through one fetcher whose shared `MemoryBudget` holds
+    /// exactly three objects' worth of bytes admit exactly three; the fourth
+    /// refuses typed. Every admitted buffer carries its guard, so the budget
+    /// stays at three reservations until the buffers drop, then returns to zero.
+    ///
+    /// Non-vacuity: an infallible reserve in `whole_object_bytes` admits all
+    /// four, so the `succeeded == 3` / `refused == 1` assertions fail.
+    #[tokio::test]
+    async fn four_concurrent_whole_object_fetches_admit_three_under_a_three_object_budget() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let memory = MemoryStore::new();
+        let keys = ["t/c0.rlog", "t/c1.rlog", "t/c2.rlog", "t/c3.rlog"];
+        for k in keys {
+            memory
+                .put(k, Bytes::from(bytes.clone()), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(memory);
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(size * 3));
+        let fetcher = Arc::new(LogSegmentFetcher::new(backend).with_memory_budget(budget.clone()));
+
+        let hashes = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]];
+        let results = futures::future::join_all(keys.iter().zip(hashes).map(|(k, h)| {
+            let fetcher = fetcher.clone();
+            let seg = seg_ref_with(k, h, size);
+            async move {
+                fetcher
+                    .whole_object_bytes(&seg, TENANT, QueryPhase::Plan, &QueryAccounting::new())
+                    .await
+            }
+        }))
+        .await;
+
+        let succeeded = results.iter().filter(|r| r.is_ok()).count();
+        let refused = results
+            .iter()
+            .filter(|r| matches!(r, Err(LogFetchError::FetchMemoryExhausted { .. })))
+            .count();
+        assert_eq!(
+            succeeded, 3,
+            "a three-object budget admits exactly three of four concurrent fetches"
+        );
+        assert_eq!(
+            refused, 1,
+            "the fourth fetch refuses with the typed budget error"
+        );
+        assert_eq!(
+            budget.reserved(),
+            size * 3,
+            "the three admitted buffers hold their reservations while alive"
+        );
+        drop(results);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "dropping every buffer returns the budget to zero"
+        );
+    }
+
+    /// Deliverable 3 (handoff): a whole-object fetch that admits its buffer to
+    /// the read cache marks the reservation handed off, so the budget reports
+    /// the transient overlap (both the returned buffer and the cache entry hold
+    /// the same bytes) while the buffer is held, and clears it on drop.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call on the
+    /// `Source::Upstream` arm of `whole_object_bytes` leaves `handoff_overlap()`
+    /// at 0 while the buffer is held, so the first assertion fails.
+    #[tokio::test]
+    async fn cache_insert_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        let buf = fetcher
+            .whole_object_bytes(
+                &seg_ref(size),
+                TENANT,
+                QueryPhase::Plan,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("whole_object_bytes");
+        assert_eq!(buf.len() as u64, size);
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "the cache insert marks the fetched buffer handed off while both ledgers hold it"
+        );
+        drop(buf);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "the reservation releases with the buffer"
+        );
+    }
+
+    /// The same overlap on a cache HIT, which is the case the first version of
+    /// this work left unmarked. The returned `Bytes` clones the cache entry's
+    /// allocation, so the cache cap and the fetch guard both cover it for as
+    /// long as the caller holds it, exactly as after an insert. Leaving a hit
+    /// unmarked understates `handoff_overlap` by every hit, and it is that
+    /// undercount which makes decision 3's `unique` term inexact and its
+    /// derived reserve undersized.
+    ///
+    /// Non-vacuity: dropping the `reservation.mark_handed_off()` call on the
+    /// `Source::Cache` arm leaves `handoff_overlap()` at 0 on the second fetch
+    /// while its buffer is held, so the hit assertion fails while the insert
+    /// assertion above still passes.
+    #[tokio::test]
+    async fn cache_hit_marks_the_reservation_handed_off() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let backend: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(16 * 1024 * 1024));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_cache(cache)
+            .with_memory_budget(budget.clone());
+
+        // First fetch admits the object and is the insert case; drop it so the
+        // only overlap the second fetch can report is its own.
+        let first = fetcher
+            .whole_object_bytes(
+                &seg_ref(size),
+                TENANT,
+                QueryPhase::Plan,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("first whole_object_bytes");
+        drop(first);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the insert's overlap clears before the hit is measured"
+        );
+
+        let accounting = QueryAccounting::new();
+        let hit = fetcher
+            .whole_object_bytes(&seg_ref(size), TENANT, QueryPhase::Plan, &accounting)
+            .await
+            .expect("second whole_object_bytes");
+        assert_eq!(
+            accounting.snapshot().cache_hits,
+            1,
+            "the second fetch is served from the cache, not the store"
+        );
+        assert_eq!(
+            budget.handoff_overlap(),
+            size,
+            "a cache hit holds the same bytes under the cache cap and this guard"
+        );
+        drop(hit);
+        assert_eq!(
+            budget.handoff_overlap(),
+            0,
+            "the overlap clears when the buffer drops"
+        );
+        assert_eq!(budget.reserved(), 0, "the reservation releases with it");
+    }
+
+    /// A block-range read that crosses over to a covering whole-object read
+    /// (ADR-0107 decision 1) holds exactly one object-sized reservation AT ANY
+    /// INSTANT, never two at once. The coverage crossover drops the assembler
+    /// -- releasing both its pooled buffer and its reservation guard -- before
+    /// the covering GET reserves fresh (ADR-1170 decision 2): the object is
+    /// materialized once, so the real peak is one object width, not two.
+    ///
+    /// `with_block_range_threshold(0)` routes the object to the block-range path
+    /// and sets that path's own whole-object crossover to zero, so the object is
+    /// above it and the read skips the pre-probe crossover and reaches the
+    /// coverage crossover (a predicate-free, all-columns read makes every block a
+    /// candidate, so coverage is ~1.0, past the 0.75 default).
+    ///
+    /// Sampling `budget.reserved()` only after the fetch completes (as an
+    /// earlier version of this test did) cannot tell a true peak of one object
+    /// apart from a peak of two that happens to collapse back to one by the
+    /// time the fetch returns -- both end at `size` and drop to `0`. This test
+    /// instead holds the covering GET in flight with a `FaultStore` gate and
+    /// samples the budget from the outside while it is genuinely still
+    /// pending. This fixture's object is small enough that
+    /// `effective_suffix_len` covers the whole object in the initial suffix
+    /// probe, so the only two live `Op::Get` calls this fetch issues are: (1)
+    /// that probe, and (2) the covering GET itself. `Occurrence::Nth(2)` holds
+    /// exactly the second.
+    ///
+    /// Non-vacuity: removing the `drop(asm)` line immediately before the
+    /// `covering_read` call at the version-4 coverage crossover (the dispatch
+    /// takes that branch because `RlogWriter` always emits `PAGE_DIR`, not
+    /// because of the stamped `segment_format_version`, which it never reads)
+    /// restores the shape ADR-1170 decision 2 forbids: the assembler stays
+    /// alive holding its own reservation for the rest of the function while
+    /// `covering_read` reserves a second, independent one for the same object.
+    /// The budget below is sized for two objects specifically so this second
+    /// reservation still succeeds instead of failing closed -- with that
+    /// single line removed, `budget.reserved()` while the covering GET is
+    /// held reads `2 * size`, not `size`, and the in-flight assertion below
+    /// panics on the mismatch (confirmed by making exactly that edit and
+    /// observing the panic before reverting it).
+    ///
+    /// The version-3 crossover applies the identical `drop(asm)` fix at the
+    /// same line shape, but is not covered by a fixture here: `seg_ref_with`
+    /// stamps `segment_format_version = footer::VERSION` (4), `RlogWriter`
+    /// always emits `PAGE_DIR`, and the dispatch in `fetch_object_with_footer`
+    /// takes the version-4 branch whenever `PAGE_DIR` is present, so no object
+    /// built through the production writer ever reaches the version-3 branch.
+    /// Hand-crafting a footer without `PAGE_DIR` to reach it would mean
+    /// bypassing `RlogWriter` entirely, which is out of scope for this crate.
+    #[tokio::test]
+    async fn coverage_crossover_reserves_the_object_once() {
+        let bytes = build_object();
+        let size = bytes.len() as u64;
+        let store = store_with_object(bytes).await;
+        let fault = Arc::new(FaultStore::new(store, FaultPlan::default()));
+        // The covering GET is the second live `Get` this fetch issues (see
+        // doc comment above): hold exactly that one.
+        let gate = fault.hold(Op::Get, Some(KEY.to_string()), Occurrence::Nth(2));
+        let backend: Arc<dyn ObjectStoreBackend> = fault;
+        // Room for TWO objects, not one: the in-flight sample below must be
+        // able to observe a peak of two live reservations if the code regresses
+        // to that shape, rather than have the fetch fail closed with
+        // `FetchMemoryExhausted` before the covering GET is even attempted
+        // (which would still prove a regression, just not the specific peak).
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(size * 2));
+        let fetcher = LogSegmentFetcher::new(backend)
+            .with_block_range_threshold(0)
+            .with_memory_budget(budget.clone());
+
+        let task = tokio::spawn(async move {
+            fetcher
+                .scan_accounted_with_tenant(
+                    &seg_ref(size),
+                    TENANT,
+                    &LogQuery::new(i64::MIN, i64::MAX),
+                    &ColumnSelection::all(),
+                    &QueryAccounting::new(),
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), gate.wait_until_held(1))
+            .await
+            .expect("the covering GET reaches the gate within 30 s");
+        assert_eq!(
+            budget.reserved(),
+            size,
+            "exactly one object-sized reservation is live while the covering \
+             GET is in flight -- the assembler already dropped its own before \
+             this GET reserved fresh, so the peak is one object, not two"
+        );
+        for id in gate.held() {
+            assert!(gate.release(id), "held id must release");
+        }
+
+        let scan = task
+            .await
+            .expect("join")
+            .expect("a crossover fetch of one object must fit a one-object budget")
+            .expect("the segment is relevant to a full-window query");
+
+        assert_eq!(
+            budget.reserved(),
+            size,
+            "the object is reserved exactly once across the coverage crossover, \
+             never twice"
+        );
+        drop(scan);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "dropping the scan releases the single reservation"
+        );
     }
 }
 
@@ -8676,7 +9269,7 @@ mod assembly_buffer_tests {
     fn three_reads_allocate_and_zero_one_object_sized_buffer() {
         let pool = pool();
         for _ in 0..3 {
-            let asm = ObjectAssembler::new(&pool, 4096);
+            let asm = ObjectAssembler::new(&pool, 4096, None);
             drop(asm);
         }
         assert_eq!(
@@ -8695,9 +9288,9 @@ mod assembly_buffer_tests {
     #[test]
     fn a_pooled_buffer_zeroes_only_what_it_grows_by() {
         let pool = pool();
-        drop(ObjectAssembler::new(&pool, 4096));
-        drop(ObjectAssembler::new(&pool, 6144));
-        drop(ObjectAssembler::new(&pool, 1024));
+        drop(ObjectAssembler::new(&pool, 4096, None));
+        drop(ObjectAssembler::new(&pool, 6144, None));
+        drop(ObjectAssembler::new(&pool, 1024, None));
         assert_eq!(
             pool.stats(),
             AssemblyBufferStats {
@@ -8714,8 +9307,8 @@ mod assembly_buffer_tests {
     #[test]
     fn a_reused_buffer_is_truncated_to_the_current_objects_length() {
         let pool = pool();
-        drop(ObjectAssembler::new(&pool, 4096));
-        let asm = ObjectAssembler::new(&pool, 1024);
+        drop(ObjectAssembler::new(&pool, 4096, None));
+        let asm = ObjectAssembler::new(&pool, 1024, None);
         assert_eq!(asm.buf.as_slice().len(), 1024);
         assert_eq!(asm.into_bytes().len(), 1024);
     }
@@ -8731,7 +9324,7 @@ mod assembly_buffer_tests {
     #[test]
     fn slice_refuses_any_range_no_fetch_placed() {
         let pool = pool();
-        let mut asm = ObjectAssembler::new(&pool, 64);
+        let mut asm = ObjectAssembler::new(&pool, 64, None);
         asm.place("k", 8, &[0xABu8; 8]).expect("place");
 
         assert_eq!(asm.slice("k", 8, 8).expect("placed range"), &[0xABu8; 8]);
@@ -8766,11 +9359,11 @@ mod assembly_buffer_tests {
     #[test]
     fn a_reused_buffer_refuses_the_previous_objects_bytes() {
         let pool = pool();
-        let mut first = ObjectAssembler::new(&pool, 64);
+        let mut first = ObjectAssembler::new(&pool, 64, None);
         first.place("a", 8, &[0xABu8; 8]).expect("place");
         drop(first);
 
-        let second = ObjectAssembler::new(&pool, 64);
+        let second = ObjectAssembler::new(&pool, 64, None);
         assert_eq!(pool.stats().reused, 1, "the same buffer came back");
         assert_eq!(
             second.buf.as_slice().get(8..16),
@@ -8788,11 +9381,11 @@ mod assembly_buffer_tests {
     #[test]
     fn a_buffer_returns_to_the_pool_only_after_its_bytes_are_dropped() {
         let pool = pool();
-        let mut asm = ObjectAssembler::new(&pool, 64);
+        let mut asm = ObjectAssembler::new(&pool, 64, None);
         asm.place("a", 0, &[0xCDu8; 64]).expect("place");
         let held = asm.into_bytes();
 
-        let concurrent = ObjectAssembler::new(&pool, 64);
+        let concurrent = ObjectAssembler::new(&pool, 64, None);
         assert_eq!(
             pool.stats(),
             AssemblyBufferStats {
@@ -8806,7 +9399,7 @@ mod assembly_buffer_tests {
         drop(concurrent);
         drop(held);
 
-        drop(ObjectAssembler::new(&pool, 64));
+        drop(ObjectAssembler::new(&pool, 64, None));
         assert_eq!(pool.stats().reused, 1, "both buffers are back");
     }
 
@@ -8817,7 +9410,7 @@ mod assembly_buffer_tests {
     fn the_idle_set_is_bounded_by_count() {
         let pool = pool();
         let live: Vec<ObjectAssembler> = (0..MAX_IDLE_ASSEMBLY_BUFFERS + 2)
-            .map(|_| ObjectAssembler::new(&pool, 64))
+            .map(|_| ObjectAssembler::new(&pool, 64, None))
             .collect();
         assert_eq!(
             pool.stats().allocated,
@@ -8839,8 +9432,8 @@ mod assembly_buffer_tests {
             max_idle_bytes: 3072,
             ..AssemblyBufferPool::default()
         });
-        let a = ObjectAssembler::new(&pool, 2048);
-        let b = ObjectAssembler::new(&pool, 2048);
+        let a = ObjectAssembler::new(&pool, 2048, None);
+        let b = ObjectAssembler::new(&pool, 2048, None);
         drop(a);
         drop(b);
         {
@@ -8855,7 +9448,7 @@ mod assembly_buffer_tests {
 
         // Takes the one idle buffer, grows it past the budget, and is therefore
         // not taken back.
-        drop(ObjectAssembler::new(&pool, 4096));
+        drop(ObjectAssembler::new(&pool, 4096, None));
         let idle = pool.idle.lock().expect("idle");
         assert!(
             idle.bufs.is_empty(),

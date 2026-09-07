@@ -1026,6 +1026,19 @@ fn map_fetch_error(err: FetchError) -> (pb::status::Code, String) {
         FetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         FetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         FetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        // A memory-budget refusal is terminal for this slice, never
+        // `Unavailable`. On this codebase `Unavailable` is the re-dispatch class:
+        // the coordinator's `try_remote` quarantines the refusing worker and
+        // re-runs the slice on the next rendezvous worker, then on the
+        // coordinator itself (`services/ravel-server/src/distrib.rs`), so a
+        // refusal mapped to `Unavailable` would drain healthy workers into
+        // quarantine and then perform the refused allocation on the very node the
+        // budget exists to protect. `BudgetExceeded` is `Attempt::Keep` (terminal,
+        // no re-dispatch, no local fallback), so the refusal sheds load instead of
+        // amplifying it. The message carries only byte counts.
+        FetchError::FetchMemoryExhausted { .. } => {
+            (pb::status::Code::BudgetExceeded, err.to_string())
+        }
     }
 }
 
@@ -1045,6 +1058,10 @@ fn map_log_fetch_error(err: LogFetchError) -> (pb::status::Code, String) {
         LogFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         LogFetchError::EtagChanged { .. } => (pb::status::Code::Corrupt, err.to_string()),
         LogFetchError::CarryMismatch { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        // Terminal, not `Unavailable`: see the rationale on [`map_fetch_error`].
+        LogFetchError::FetchMemoryExhausted { .. } => {
+            (pb::status::Code::BudgetExceeded, err.to_string())
+        }
     }
 }
 
@@ -1063,5 +1080,9 @@ fn map_span_fetch_error(err: SpanFetchError) -> (pb::status::Code, String) {
         SpanFetchError::Store { .. } => (pb::status::Code::Unavailable, err.to_string()),
         SpanFetchError::Corrupt { .. } => (pb::status::Code::Corrupt, err.to_string()),
         SpanFetchError::TenantMismatch { .. } => (pb::status::Code::Corrupt, err.to_string()),
+        // Terminal, not `Unavailable`: see the rationale on [`map_fetch_error`].
+        SpanFetchError::FetchMemoryExhausted { .. } => {
+            (pb::status::Code::BudgetExceeded, err.to_string())
+        }
     }
 }
