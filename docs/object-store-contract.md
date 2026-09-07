@@ -142,7 +142,22 @@ trait honors cancellation by drop, so the query deadline (usually well under
   and MinIO (the memory oracle alone cannot catch a uniform mapping).
 - Concurrent conditional writes racing the same key may surface as a
   transient conflict; after retry the loser must land on
-  `AlreadyExists`/`PreconditionFailed` per mode.
+  `AlreadyExists`/`PreconditionFailed` per mode. A raced `CreateIfAbsent`
+  is the load-bearing case: AWS PutObject documents a 409
+  `ConditionalRequestConflict` that the client MUST retry, distinct from a
+  genuine already-exists. The S3 adapter cannot see the HTTP status
+  (`object_store` 0.14 maps every raw 409 to `AlreadyExists`, keeps the
+  status in a crate-private type, and enables its own conflict retry only
+  for the update / etag-match modes, never for create), so on
+  `AlreadyExists` under `CreateIfAbsent` it issues one `HEAD` to
+  disambiguate: key **present** stays `AlreadyExists` (a real collision, so
+  the commit-path split-brain guard and the compaction vanished-part guard
+  still fire), key **absent** becomes a retryable `Transient` naming a
+  conditional-request conflict, which `StoreError::is_retryable` routes back
+  into the caller's existing retry loop. The mapping is safe by
+  construction: `Transient` is returned only when the key is absent, and a
+  genuine collision requires it to be present, so no real already-exists is
+  ever downgraded to a retry.
 - Listing is paginated (S3 pages at 1000 keys). Cross-page guarantee: any
   key created before the first page request is returned; keys created
   during the scan may or may not appear; a key MAY appear more than once
