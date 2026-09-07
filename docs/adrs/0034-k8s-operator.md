@@ -307,14 +307,37 @@ loop as everything else:
   namespace, with the server image, credentials Secret, bucket, region, and
   endpoint of the tiers it gates, running `ravel store qualify`. The
   gateway, query, and maintain Deployments are created only once that Job
-  reports `Complete`. `restartPolicy: Never`, a small `backoffLimit`, and a
-  `ttlSecondsAfterFinished` keep a finished Job from accumulating.
+  reports `Complete`. `restartPolicy: Never`, a small `backoffLimit`, an
+  `activeDeadlineSeconds`, and a `ttlSecondsAfterFinished` keep a finished
+  Job from accumulating.
+- The Job sets `activeDeadlineSeconds` because `backoffLimit` bounds only how
+  many *failed* attempts run, not one attempt that never terminates: a
+  qualify pod against an S3 endpoint that accepts the connection and then
+  never answers would otherwise run indefinitely, leaving `StoreQualified`
+  stuck at `Pending` with no Deployment ever created. The deadline is 900 s,
+  derived from what `ravel store qualify` does: it runs 28 sequential object
+  operations (create-if-absent probe 3, CAS-version probe 4, read-after-write
+  probe 10 = 5 cycles of put+get, list-after-write probe 10 = 5 cycles of
+  put+list, and the final `sys/qualification` write 1; the two informational
+  probes issue no request through the object-store contract). Each operation's
+  per-request ceiling is the S3 client's 20 s `request_timeout`, so a
+  slow-but-healthy run whose every operation nears that ceiling without
+  retrying is bounded by 28 * 20 s = 560 s. 900 s adds a ~1.6x margin (340 s)
+  for pod scheduling, image pull, and the odd single retry, while staying far
+  below a hung endpoint's ~200 s-per-operation worst case (`retry_timeout`
+  180 s + `request_timeout` 20 s), so a hang trips the deadline after roughly
+  four stalled operations. The deadline is a tuning knob, deliberately not
+  part of the qualified-input hash: changing it must not re-run a
+  qualification that already passed.
 - A new `StoreQualified` status condition carries the gate's state with the
   same shape as the other conditions (reasons `Pending` while the Job is
-  created or running, `Succeeded` once it completes, `Failed` when it
-  exhausts its `backoffLimit`, the last carrying the Job's terminal
-  message). On `Failed` no Deployment is created and the pass requeues on
-  the existing failure backoff rather than spinning.
+  created or running, `Succeeded` once it completes, `Failed` when it fails,
+  the last carrying the Job's terminal reason and message). A Job that fails
+  by exhausting its `backoffLimit` and one the Job controller fails for
+  exceeding `activeDeadlineSeconds` (reason `DeadlineExceeded`) both read as
+  `Failed`, with the reason named in the message so an operator sees why. On
+  `Failed` no Deployment is created and the pass requeues on the existing
+  failure backoff rather than spinning.
 - The inputs qualification proves against (bucket, region, endpoint, image,
   credentials Secret name) are hashed into a Job annotation and, on success,
   into a durable `status.storeQualifiedHash`. A later pass whose inputs
