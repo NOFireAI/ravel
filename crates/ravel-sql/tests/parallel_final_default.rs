@@ -357,6 +357,9 @@ fn request(sql: &str) -> SqlRequest {
         min_tokens: Vec::new(),
         now_ns: 1_000_000,
         deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     }
 }
 

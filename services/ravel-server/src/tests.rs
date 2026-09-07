@@ -347,6 +347,9 @@ async fn query_result_is_byte_identical_with_and_without_accounting() {
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     };
     let outcome = h
         .executor

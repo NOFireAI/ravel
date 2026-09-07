@@ -458,6 +458,9 @@ async fn run_combo(
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline,
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     };
 
     // Observe the physical plan this combination actually produces, before the
@@ -1095,6 +1098,9 @@ async fn run_distinct_combo(
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline,
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     };
     let start = Instant::now();
     let outcome = match executor.execute(tenant_hash, &request).await {

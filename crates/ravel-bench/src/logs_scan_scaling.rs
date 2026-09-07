@@ -726,6 +726,9 @@ async fn run_combo(
         min_tokens: Vec::new(),
         now_ns: NOW_NS,
         deadline,
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     };
 
     // Observe the physical plan's scan fan-out before the timed runs. Planning

@@ -1011,6 +1011,95 @@ output size: every matched series in every matched segment is still fully
 fetched and SoA-decoded before the merge runs, so peak fetch/decode memory
 scales with the query's matched input, not with `max_samples`.
 
+## Per-request budgets (ADR-1374)
+
+Every budget above is a server ceiling, configured once at startup and the
+same for every request. A caller that knows its own query is cheap, or that
+wants a cheap query to fail fast rather than run long, can tighten those
+ceilings for one request through `ravel_query::RequestBudgets`:
+
+```rust
+pub struct RequestBudgets {
+    pub max_bytes_scanned: Option<ByteLimit>,
+    pub max_store_requests: Option<RequestLimit>,
+    pub max_segments: Option<usize>,
+}
+```
+
+`RequestBudgets::clamp(&EngineConfig)` returns the `EffectiveBudgets` a
+request actually runs under. It can only lower: a value above the server
+ceiling yields the ceiling, `Unlimited` cannot lift a bounded ceiling, and
+`None` (for one field or for the whole struct) yields the ceiling unchanged.
+This is the same rule the `timeout` parameter already follows for the wall
+deadline, and it is what makes the budgets safe to accept from a request
+body: the worst a caller can do to the server is ask for less.
+
+`max_store_requests` is the wire name for the ceiling
+`EngineConfig::max_s3_requests` holds. The two names differ deliberately.
+The config field keeps its name because renaming a frozen operator-facing
+knob is a breaking change with no benefit; the wire name drops the `s3`
+because a caller of a request API is not addressing a specific object-store
+implementation, and the field name is a contract a client can hard-code. A
+serde test pins the three serialized names, so a rename fails there rather
+than at a client.
+
+Enforcement adds no new check. The three effective values are substituted
+into a scoped copy of the engine configuration, so `segment_admission::admit`,
+`request_budget_exceeded`, and the three bytes-scanned check sites read the
+lowered numbers through the same fields they already read. A tripped
+per-request budget is the same typed error as a tripped server ceiling
+(`TooManySegments`, `RequestBudgetExceeded`, `TooManyBytesScanned`, all HTTP
+422), never a truncated result.
+
+On the PromQL side, `QueryEngine::instant_with_budgets`,
+`range_hist_with_budgets`, and `resolve_series_with_budgets` are the entry
+points that take `Option<&RequestBudgets>`; passing `None` is exactly the
+pre-existing method. On the SQL side, `SqlRequest::budgets` carries them.
+
+### The agent query knobs on `SqlRequest` (ADR-1374)
+
+Three request fields exist for a caller that composes SQL on someone else's
+behalf. All three default to the values that reproduce the shipped behavior,
+and the HTTP surface (`ravel-server`'s `build_request`) sets exactly those
+defaults, so an HTTP query is unaffected by any of them.
+
+`row_window: bool` applies the request's own time window as a row filter,
+not only as the segment-listing bound. Segment pruning is widen-only, so a
+segment overlapping the window contributes every row it holds; a statement
+that carries no time predicate of its own therefore returns rows outside the
+window the caller asked for. With `row_window` set, the executor inserts
+`<ts_col> >= window.start_ns AND <ts_col> < window.end_ns` directly above
+each table scan in the unoptimized logical plan, on that table's event-time
+column: `ts` for `samples` and `logs`, `start_ts` for `spans`, `ts_ns` for
+`alerts` and `audit`. The rewrite happens before optimization, where the
+scan carries no projection, so the column is always in scope, and `Filter`
+preserves the schema, so the result schema is unchanged. The optimizer then
+pushes the predicate down normally, so the `Inexact` widen-only pushdown
+contract is untouched and pruning is unaffected. The rewrite runs inside the
+attempt, so it survives the snapshot retry. The applied predicate text is
+reported as `SqlStats::window_predicate`.
+
+`max_rows: Option<usize>` stops the stream once `max_rows + 1` rows have
+been emitted. The extra row is deliberate: it is what distinguishes "this is
+the whole result" from "this result was cut", reported as
+`SqlStats::row_cap_hit`. The service layer above trims it. Stopping early
+drops the inner stream on the existing cancellation path, so memory
+reservations release exactly as they do at a normal end of stream.
+
+`SqlExecutor::explain` validates, resolves, admits, computes the effective
+schema (declared typed columns included), runs the cost estimator, and
+renders the physical plan, without opening a single data object. It reports
+the target table, that schema, the resolved/admitted/recent-exempt segment
+counts, the `CostEstimate`, the row-window predicate it would apply, and the
+plan text. Where the estimator cannot bound a component for the target it
+names that component in `unbounded_components` rather than reporting a
+structural zero a caller would read as a real estimate of zero:
+`estimated_decompressed_bytes` is unbounded for the RLOG- and RSPAN-backed
+tables, whose funnels never call the decompressor the metrics estimate
+counts. The plan is physical, not logical, because the shapes worth linting
+(which columns a TopK's input scan decodes, whether a repartition fans the
+final aggregate out) exist only after physical planning.
+
 ## Intra-cluster read fan-out (ADR-0071)
 
 Within one cluster, a read can be spread across peer query nodes so more than

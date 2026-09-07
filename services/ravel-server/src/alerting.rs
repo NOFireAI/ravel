@@ -896,6 +896,9 @@ impl AlertEvaluator {
             min_tokens: Vec::new(),
             now_ns,
             deadline: self.query_deadline,
+            row_window: false,
+            max_rows: None,
+            budgets: None,
         };
         let outcome = executor.execute(self.tenant, &request).await?;
         Ok(QueryResultSummary::RowCount(
