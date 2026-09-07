@@ -4084,11 +4084,34 @@ impl<'d, 'a> DeclaredPlan<'d, 'a> {
         self.cursors.len() == 1 && self.matching_idx == Some(0)
     }
 
-    /// Whether the record sets the key in any of its FIELD_DIR columns at
-    /// surviving row `i`. Only consulted in the multi-column case; the fused case
-    /// gets the same answer from the single matching read.
-    fn record_sets_key(&self, i: usize) -> bool {
-        self.cursors.iter().any(|c| c.present_at(i))
+    /// The index into [`Self::cols`]/[`Self::cursors`] of the record's WINNING
+    /// occurrence of the key at surviving row `i`, or `None` when the record does
+    /// not set the key at all.
+    ///
+    /// A record that carries one name in several FIELD_DIR columns (a name
+    /// written as both a string and an integer splits into two columns) resolves
+    /// to one value, and which one is fixed by docs/log-segment-format.md
+    /// ("Within the record layer"): `rebuild_record` lays a record's columnar
+    /// occurrences out ascending by FIELD_DIR type byte and `merged_attrs` folds
+    /// that list last-wins, so the occurrence with the highest type byte wins.
+    /// The `attrs_raw` overflow tier, which beats every columnar occurrence,
+    /// cannot appear here: a block carrying an `attrs_raw` page falls the whole
+    /// segment back to the row path before the fast path builds a column.
+    ///
+    /// `max_by_key` returns the LAST maximum, which is the tie-break the same
+    /// paragraph pins; the type byte is read from [`Self::cols`] rather than
+    /// from FIELD_DIR position, so the answer does not depend on the directory's
+    /// sort order.
+    ///
+    /// Only consulted in the multi-column case; the fused case gets the same
+    /// answer from the single matching read.
+    fn winning_idx(&self, i: usize) -> Option<usize> {
+        self.cursors
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.present_at(i))
+            .max_by_key(|(k, _)| self.cols[*k].ty.to_u8())
+            .map(|(k, _)| k)
     }
 }
 
@@ -4140,12 +4163,13 @@ fn resource_attrs<'c>(
 /// `stream_ref`, so it is memoized per `stream_ref`: its scan and the one clone
 /// of its result run once per distinct stream in the block, not once per row.
 ///
-/// The precedence is unchanged (ADR-0090 decision 7): the record's own value
-/// wins if it sets the key in any FIELD_DIR column; a record that sets the key at
-/// a different type yields NULL and does NOT consult the fallback; only a record
-/// that does not set the key at all reads the resource/scope value. The
-/// `single_matching` fast path still treats a `Str` cell that is not valid UTF-8
-/// as absent, falling through to the fallback.
+/// The precedence is ADR-0090 decision 7: the record's own value wins if it sets
+/// the key in any FIELD_DIR column; a record whose winning occurrence
+/// ([`DeclaredPlan::winning_idx`]) is at a different type yields NULL and does
+/// NOT consult the fallback; only a record that does not set the key at all
+/// reads the resource/scope value. The `single_matching` fast path still treats
+/// a `Str` cell that is not valid UTF-8 as absent, falling through to the
+/// fallback.
 struct DeclaredResolver<'p, 'd, 'a> {
     plan: &'p DeclaredPlan<'d, 'a>,
     /// [`DeclaredPlan::single_matching`], resolved once for the block.
@@ -4193,11 +4217,13 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
     }
 
     /// The merged value of the declared key at surviving row `i`. Returns the
-    /// record-column value when the record sets the key at the declared type;
-    /// `None` when the record sets it at a different type (wrong variant, NULL by
-    /// ADR-0090 decision 7). Only when the record does not set the key at all is
-    /// the resource/scope fallback consulted, whose variant the caller checks
-    /// against the declared type.
+    /// record-column value when the record's WINNING occurrence of the key
+    /// ([`DeclaredPlan::winning_idx`]) is at the declared type; `None` when that
+    /// winner is at a different type (wrong variant, NULL by ADR-0090 decision
+    /// 7), including the case where the record also has a declared-type cell at
+    /// this row that the winner shadows. Only when the record does not set the
+    /// key at all is the resource/scope fallback consulted, whose variant the
+    /// caller checks against the declared type.
     fn merged_value(
         &mut self,
         view: &ColumnarBlockView<'_>,
@@ -4213,11 +4239,17 @@ impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
             if let Some(v) = self.matching_cursor.and_then(|c| c.value_at(i)) {
                 return Ok(Some(v));
             }
-        } else if self.plan.record_sets_key(i) {
-            // Record wins. Its value is the declared-type column's cell, or NULL
-            // when the record set the key only in a different-typed column
-            // (ADR-0090 decision 7); either way the fallback is not consulted.
-            return Ok(self.matching_cursor.and_then(|c| c.value_at(i)));
+        } else if let Some(win) = self.plan.winning_idx(i) {
+            // Record wins. Its value is the cell of the occurrence that wins the
+            // record layer's last-occurrence-wins order
+            // ([`DeclaredPlan::winning_idx`]), or NULL when that winner is of a
+            // type other than the declared one (ADR-0090 decision 7); either way
+            // the fallback is not consulted.
+            return Ok(if Some(win) == self.plan.matching_idx {
+                self.plan.cursors[win].value_at(i)
+            } else {
+                None
+            });
         }
         let Some(stream_ref) = view.stream_ref(i) else {
             return Ok(None);
@@ -4342,13 +4374,17 @@ fn build_declared_str_columnar(
                 })?;
                 let mut keys: Vec<Option<i32>> = Vec::with_capacity(n);
                 for i in start..end {
-                    if plan.record_sets_key(i) {
-                        // Record wins. `id_at` is `Some` only when the record's
-                        // `Str` column has a value at this row; `None` (record set
-                        // the key in another-typed column) is a NULL cell. An `id`
-                        // pointing at a non-UTF-8 (NULL) dictionary value also reads
-                        // NULL, matching the UTF-8 rule on the `Str` cursor.
-                        match col.id_at(i) {
+                    if let Some(win) = plan.winning_idx(i) {
+                        // Record wins. Its value is the winning occurrence's cell
+                        // ([`DeclaredPlan::winning_idx`]); a winner in another-typed
+                        // column of the same key is a NULL cell, even when this row
+                        // also has a `Str` cell the winner shadows. An `id` pointing
+                        // at a non-UTF-8 (NULL) dictionary value also reads NULL,
+                        // matching the UTF-8 rule on the `Str` cursor.
+                        match (Some(win) == plan.matching_idx)
+                            .then(|| col.id_at(i))
+                            .flatten()
+                        {
                             Some(id) => keys.push(Some(i32::try_from(id).map_err(|_| {
                                 DataFusionError::Internal(
                                     "declared Str dictionary id exceeds i32".into(),
@@ -4404,10 +4440,14 @@ fn build_declared_str_columnar(
                         }
                         // A `None` here (absent, or not UTF-8) falls through to
                         // the fallback, matching the row path.
-                    } else if plan.record_sets_key(i) {
-                        // Record wins: its declared-type `Str` cell, or NULL when
-                        // it set the key only in a different-typed column.
-                        match matching_str.and_then(|c| c.str_at(i)) {
+                    } else if let Some(win) = plan.winning_idx(i) {
+                        // Record wins: the winning occurrence's `Str` cell, or NULL
+                        // when that winner sits in a different-typed column of the
+                        // same key ([`DeclaredPlan::winning_idx`]).
+                        match (Some(win) == plan.matching_idx)
+                            .then(|| matching_str.and_then(|c| c.str_at(i)))
+                            .flatten()
+                        {
                             Some(s) => {
                                 values.append_value(s);
                                 keys.push(Some(next));
@@ -4929,7 +4969,7 @@ mod cstat_reconcile_tests {
 #[allow(clippy::expect_used)]
 mod columnar_lookup_tests {
     use super::*;
-    use datafusion::arrow::array::{Array, Int64Array};
+    use datafusion::arrow::array::{Array, BinaryArray, BooleanArray, Int64Array};
     use ravel_logseg::record::stream_attrs_bytes;
     use ravel_logseg::{
         ColumnSelection, LogRecord, ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter,
@@ -5409,6 +5449,268 @@ mod columnar_lookup_tests {
             "one scan per distinct stream across BOTH chunks; a per-chunk \
              resolver would read 6"
         );
+    }
+
+    /// One declared column's cells rendered to a form the two paths can be
+    /// compared in: `None` for NULL, otherwise the value's text (lowercase hex
+    /// for `bytes`). `Str` is a `Dictionary(Int32, Utf8)` on both paths, so its
+    /// keys are resolved through the dictionary values here rather than
+    /// compared as ids: the two paths build different dictionaries for the same
+    /// logical column and only the logical values must match.
+    fn declared_cells(arr: &ArrayRef, ty: DeclaredType) -> Vec<Option<String>> {
+        match ty {
+            DeclaredType::Str => {
+                let d = arr
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<Int32Type>>()
+                    .expect("declared Str dictionary array");
+                let values = d
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("Utf8 dictionary values");
+                (0..d.len())
+                    .map(|i| {
+                        if d.is_null(i) {
+                            return None;
+                        }
+                        let k = usize::try_from(d.keys().value(i)).expect("non-negative key");
+                        (!values.is_null(k)).then(|| values.value(k).to_string())
+                    })
+                    .collect()
+            }
+            DeclaredType::I64 => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("declared I64 array");
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+                    .collect()
+            }
+            DeclaredType::Bool => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<BooleanArray>()
+                    .expect("declared Bool array");
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+                    .collect()
+            }
+            DeclaredType::Bytes => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .expect("declared Bytes array");
+                (0..a.len())
+                    .map(|i| (!a.is_null(i)).then(|| hex::encode(a.value(i))))
+                    .collect()
+            }
+        }
+    }
+
+    /// Issue #1182, the reader half: a record carrying one attribute name more
+    /// than once resolves that name to ONE value, and both reader paths must
+    /// pick the same one.
+    ///
+    /// The rule is docs/log-segment-format.md, "Within the record layer": the
+    /// record's columnar occurrences ascending by FIELD_DIR type byte
+    /// (str=1 i64=2 f64=3 bool=4 bytes=5), then its `attrs_raw` overflow
+    /// occurrences ascending by canonical encoded value bytes, last entry wins.
+    /// It is NOT the record's write order, which the on-disk format does not
+    /// preserve. So among the columnar occurrences the HIGHEST type byte wins,
+    /// and the two records below that carry the same pair in opposite write
+    /// orders resolve identically.
+    ///
+    /// Every row is asserted against a literal expected value for each of the
+    /// four declarable types, so a drift names both the consumer and the type.
+    /// The two consumers this can reach in-crate are the row path
+    /// (`declared_column_array` over `merged_attrs` + `find_attr`, already
+    /// correct before #1182) and the columnar fast path
+    /// (`DeclaredResolver::merged_value` + `build_declared_str_columnar`, which
+    /// was first-occurrence-per-(name, type)-wins). The other two consumers of
+    /// the same rule live in crates this one does not depend on and pin the
+    /// SAME table of records and expectations:
+    /// `ravel_ingest::log_declared_stats::tests::duplicate_key_stamp_follows_the_readers_rule`
+    /// and `ravel_maintain::rlog::tests::duplicate_key_stamp_follows_the_readers_rule`.
+    ///
+    /// Prove-the-test: restoring `merged_value`'s `record_sets_key` arm
+    /// (`return Ok(self.matching_cursor.and_then(|c| c.value_at(i)))`) makes the
+    /// declared I64 column read 9 at ts 102 and 1 at ts 103 where the row path
+    /// reads NULL; restoring either `record_sets_key` arm of
+    /// `build_declared_str_columnar` makes the declared Str column read "x" at
+    /// ts 100 and 101 where the row path reads NULL.
+    #[test]
+    fn a_duplicate_key_resolves_last_occurrence_wins_on_both_reader_paths() {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 16,
+            ..RlogConfig::default()
+        };
+        let res = [("svc", AttrValue::Str("a".into()))];
+        let records = vec![
+            // I64 written first, Str second: i64 (2) > str (1), so `k` is 5 and
+            // a declared Str column reads NULL, not "x".
+            rec(
+                1,
+                100,
+                &res,
+                &[("k", AttrValue::I64(5)), ("k", AttrValue::Str("x".into()))],
+            ),
+            // The same pair in the opposite write order: same winner.
+            rec(
+                1,
+                101,
+                &res,
+                &[("k", AttrValue::Str("x".into())), ("k", AttrValue::I64(5))],
+            ),
+            // bool (4) > i64 (2): a declared I64 column reads NULL, not 9.
+            rec(
+                1,
+                102,
+                &res,
+                &[("k", AttrValue::Bool(true)), ("k", AttrValue::I64(9))],
+            ),
+            // bytes (5) beats every other type.
+            rec(
+                1,
+                103,
+                &res,
+                &[
+                    ("k", AttrValue::I64(1)),
+                    ("k", AttrValue::Bytes(vec![0xab])),
+                ],
+            ),
+            // A single occurrence resolves to itself: the Str column is not
+            // simply always NULL, and the I64 column is not simply always set.
+            rec(1, 104, &res, &[("k", AttrValue::Str("y".into()))]),
+        ];
+        // The merged view every consumer must agree on, per record, keyed by ts.
+        let want_merged: Vec<(i64, AttrValue)> = vec![
+            (100, AttrValue::I64(5)),
+            (101, AttrValue::I64(5)),
+            (102, AttrValue::Bool(true)),
+            (103, AttrValue::Bytes(vec![0xab])),
+            (104, AttrValue::Str("y".into())),
+        ];
+        // The same view projected onto each declarable type: a value of another
+        // variant is NULL, never a cast (ADR-0090 decision 7).
+        let want_str = [None, None, None, None, Some("y".to_string())];
+        let want_i64 = [
+            Some("5".to_string()),
+            Some("5".to_string()),
+            None,
+            None,
+            None,
+        ];
+        let want_bool = [None, None, Some("true".to_string()), None, None];
+        let want_bytes = [None, None, None, Some("ab".to_string()), None];
+
+        // Row path (consumer 1, correct before #1182): decode the block's
+        // records, merge, build.
+        let mut obj = Vec::new();
+        let reader = write_and_scan(&records, &cfg, &mut obj);
+        let mut scan = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let block = scan.next_block(&obj).expect("row exit").expect("one block");
+        assert!(
+            scan.next_block(&obj).expect("row exit").is_none(),
+            "the input fits one block"
+        );
+        let merged: Vec<Vec<(String, AttrValue)>> = block
+            .iter()
+            .map(|r| merged_attrs(r).expect("merge"))
+            .collect();
+        // Consumer 1, field by field: `merged_attrs` + `find_attr` resolve the
+        // winner the format doc pins, for the record with that ts.
+        assert_eq!(block.len(), want_merged.len(), "every record survives");
+        for (r, row) in block.iter().zip(merged.iter()) {
+            let (_, want) = want_merged
+                .iter()
+                .find(|(ts, _)| *ts == r.ts_ns)
+                .expect("a record per expected ts");
+            assert_eq!(
+                find_attr(row, "k"),
+                Some(want),
+                "row path merged view at ts {}",
+                r.ts_ns
+            );
+        }
+
+        // Columnar fast path (consumer 2) over the same object.
+        let mut obj2 = Vec::new();
+        let reader2 = write_and_scan(&records, &cfg, &mut obj2);
+        let mut scan2 = reader2
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan2
+            .next_block_columnar(&obj2)
+            .expect("columnar exit")
+            .expect("one block");
+        assert!(
+            !view.has_attrs_raw_page(),
+            "no occurrence overflows, so the columnar path is what a scan takes \
+             here rather than falling back to the row path"
+        );
+        let rows = view.surviving_count();
+        assert_eq!(rows, records.len(), "all records survive in one block");
+
+        for (ty, want) in [
+            (DeclaredType::Str, &want_str),
+            (DeclaredType::I64, &want_i64),
+            (DeclaredType::Bool, &want_bool),
+            (DeclaredType::Bytes, &want_bytes),
+        ] {
+            let dc = DeclaredColumn::new("k", ty);
+            let plan = DeclaredPlan::build(&view, &dc);
+            assert!(
+                !plan.single_matching(),
+                "{ty:?}: `k` has a Str, I64, Bool and Bytes FIELD_DIR column, so \
+                 the multi-column precedence arm is what runs"
+            );
+            let mut cache = HashMap::new();
+            let col = declared_cells(
+                &build_declared_columnar_array(
+                    &view,
+                    &mut DeclaredResolver::new(&plan),
+                    0,
+                    rows,
+                    &mut cache,
+                )
+                .expect("columnar array"),
+                ty,
+            );
+            let row = declared_cells(&declared_column_array(&dc, &merged), ty);
+
+            // Consumer 1 against its literal expectation, in block order.
+            for (i, r) in block.iter().enumerate() {
+                let k = want_merged
+                    .iter()
+                    .position(|(ts, _)| *ts == r.ts_ns)
+                    .expect("a record per expected ts");
+                assert_eq!(
+                    row[i], want[k],
+                    "{ty:?}: row path at ts {} (block position {i})",
+                    r.ts_ns
+                );
+            }
+            // Consumer 2 against consumer 1, cell by cell. Both paths read the
+            // block's surviving rows in the same order, so this compares the
+            // same record on both sides.
+            assert_eq!(
+                col.len(),
+                row.len(),
+                "{ty:?}: the two paths build the same row count"
+            );
+            for i in 0..row.len() {
+                assert_eq!(
+                    col[i], row[i],
+                    "{ty:?}: columnar path disagrees with the row path at block \
+                     position {i}"
+                );
+            }
+        }
     }
 }
 
