@@ -1,10 +1,13 @@
 # OpenTelemetry Collector config for the container-first quickstart
 # (ADR-0081 decision 3). Scrapes host metrics and exports the collector's own
 # internal logs, both to ravel-server over OTLP/HTTP, authenticating with the
-# demo bearer token. The internal-logs export is what makes the README's
-# PromQL-over-logs example (`ravel_log_lines`) non-empty on a fresh
-# `docker compose up`: there is no other log source in the quickstart
-# (issue #1334).
+# demo bearer token. The internal-logs export gives a reader who runs a plain
+# `docker compose up` a log source, so the README's PromQL-over-logs example
+# (`ravel_log_lines`) has records to match when no telemetrygen is involved
+# (issue #1334). CI's quickstart lanes do not rely on this export: they inject
+# their own deterministic log records with `telemetrygen logs`, the same way
+# they inject the `gen` metric series, so the README assertion does not depend
+# on the collector's log level or emit timing.
 #
 # The upstream image (otel/opentelemetry-collector-contrib) is built FROM
 # scratch and runs as uid 10001: every directory shipped in it is owned by
@@ -71,9 +74,9 @@ service:
       # The exported resource always carries `service.name: otelcol-contrib`,
       # which ravel-otlp turns into the `job` label
       # (crates/ravel-otlp/src/normalize.rs, mirrored for logs in
-      # crates/ravel-query/src/log_series.rs), so the README's
-      # `sum by (job) (count_over_time(ravel_log_lines[5m]))` groups the
-      # result without any extra resource-stamping processor.
+      # crates/ravel-query/src/log_series.rs), so a
+      # `sum by (job) (count_over_time(ravel_log_lines[5m]))` query groups
+      # these records without any extra resource-stamping processor.
       #
       # service.telemetry doesn't wire extensions, so the bearer token is a
       # plain header here rather than the bearertokenauth extension the
