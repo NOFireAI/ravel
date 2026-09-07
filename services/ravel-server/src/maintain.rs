@@ -85,15 +85,17 @@ use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
 use ravel_maintain::worker_set::{DEFAULT_UNIT_CONCURRENCY, run_bounded};
 use ravel_maintain::{
-    Bucket, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureRewriteOutcome,
-    LeaseCheck, LegalHoldCheck, MaintainError, PendingErasureRequest, QUERY_AUDIT_SHARD,
-    RetentionConfig, WorkerSet, erasure_rewrite_bucket, pending_erasure_requests,
-    read_all_memo_snapshots, scan_and_compact, sweep_audit_retention, sweep_erasure_requests,
-    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned, sweep_unreferenced_catalog_objects,
-    write_memo_snapshot,
+    AppliedBucketDrop, Bucket, Clock, CompactorConfig, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+    ErasureRewriteOutcome, LeaseCheck, LegalHoldCheck, MaintainError, PendingErasureRequest,
+    QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, erasure_rewrite_bucket,
+    pending_erasure_requests, read_all_memo_snapshots, scan_and_compact, sweep_audit_retention,
+    sweep_erasure_requests, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned,
+    sweep_unreferenced_catalog_objects, write_memo_snapshot,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
-use ravel_proto::commit::v1::{ErasureCompletion, ErasureDeferralCause, ErasureRequest};
+use ravel_proto::commit::v1::{
+    ErasureBucketDrop, ErasureCompletion, ErasureDeferralCause, ErasureRequest,
+};
 use ravel_types::{Signal, TenantHash};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -1619,6 +1621,20 @@ struct ErasureRewritePass {
     /// `.done` is withheld even when `deferred` is false: completion follows the
     /// resolver the query path trusts, not the pass's own live-record hop.
     catalog_blocked: std::collections::HashSet<String>,
+    /// Per request, the buckets this pass rewrote for it and what each rewrite
+    /// dropped there, in bucket order (shard ascending, then ingest hour
+    /// ascending). This is what the request's `.done` records in its
+    /// `bucket_drops`.
+    bucket_drops: std::collections::BTreeMap<String, Vec<AppliedBucketDrop>>,
+    /// `request_id`s whose `bucket_drops` above is NOT the complete set of
+    /// buckets that applied the request, because some in-scope bucket was
+    /// `AlreadyApplied`: an earlier pass rewrote it, and the count that pass
+    /// dropped there is not restatable from the live record (a later
+    /// generation's `drops` carry `dropped_count: 0` for a request an earlier
+    /// generation already erased). Such a request's completion is written with
+    /// no bucket list at all rather than a partial one, which is what keeps the
+    /// erasure-request sweep's truncated-bucket clause whole-signal for it.
+    drops_incomplete: std::collections::HashSet<String>,
 }
 
 /// Rewrite every bucket of one `(tenant, signal)` against `pending`
@@ -1635,7 +1651,14 @@ struct ErasureRewritePass {
 /// guard and is deliberately counted, not re-driven: a bucket whose live
 /// record already names every overlapping request must not republish, or every
 /// tick would land a fresh no-op rewrite superseding the last one and churn
-/// generations forever.
+/// generations forever. It does mark the requests it skipped for in
+/// `drops_incomplete`: their applied-bucket set spans more than this pass, so
+/// this pass cannot state it.
+///
+/// Every rewritten bucket's per-request dropped counts are collected into
+/// `bucket_drops`, which is what each request's `.done` then records. Only a
+/// rewrite contributes: a bucket the pass skipped erased nothing this pass and
+/// so names no count of its own.
 #[allow(clippy::too_many_arguments)]
 async fn erasure_rewrite_pass(
     store: &dyn ObjectStoreBackend,
@@ -1670,12 +1693,22 @@ async fn erasure_rewrite_pass(
             match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
                 .await
             {
-                Ok(ErasureRewriteOutcome::Rewritten { parts, publish }) => {
+                Ok(ErasureRewriteOutcome::Rewritten {
+                    parts,
+                    publish,
+                    drops,
+                }) => {
                     pass.rewritten += 1;
                     // An abandoned publish wrote no record, so this bucket
                     // does not yet name the pending requests.
                     if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
                         pass.deferred = true;
+                    }
+                    for drop in drops {
+                        pass.bucket_drops
+                            .entry(drop.request_id.clone())
+                            .or_default()
+                            .push(drop);
                     }
                     tracing::info!(
                         tenant = %tenant.to_hex(),
@@ -1687,7 +1720,10 @@ async fn erasure_rewrite_pass(
                         "maintenance: erasure rewrite published for a bucket"
                     );
                 }
-                Ok(ErasureRewriteOutcome::AlreadyApplied) => pass.already_applied += 1,
+                Ok(ErasureRewriteOutcome::AlreadyApplied { request_ids }) => {
+                    pass.already_applied += 1;
+                    pass.drops_incomplete.extend(request_ids);
+                }
                 Ok(
                     ErasureRewriteOutcome::NoApplicableRequests | ErasureRewriteOutcome::Tombstoned,
                 ) => pass.out_of_scope += 1,
@@ -1763,6 +1799,13 @@ async fn erasure_rewrite_pass(
             }
         }
     }
+    // Bucket order, stated rather than inherited: the scan already visits
+    // shards and hours ascending, and a completion record's bucket list is
+    // permanent audit evidence that should not change shape if that ever
+    // changes.
+    for drops in pass.bucket_drops.values_mut() {
+        drops.sort_by_key(|d| (d.shard, d.ingest_hour_bucket));
+    }
     pass
 }
 
@@ -1777,19 +1820,27 @@ async fn erasure_rewrite_pass(
 /// identifier, which is the entire reason `.dreq` and `.done` are separate
 /// objects.
 ///
-/// `bucket_drops` is left empty: the authoritative per-bucket dropped counts
-/// are durable in each bucket's own `RewriteRecord.drops`, and
-/// `ErasureRewriteOutcome` does not surface them to a driver (the live-record
-/// resolution that would read them back is private to ravel-maintain).
-/// Fabricating zeroes here would put wrong counts in a permanent audit record,
-/// so the field stays empty until ravel-maintain returns real ones; flagged as
-/// a follow-up.
+/// `bucket_drops` carries `drops`: one entry per bucket this pass rewrote for
+/// the request, with the exact row, log record, or span count that rewrite
+/// removed there (zero included -- the bucket was applied). The counts come
+/// back from `erasure_rewrite_bucket` as [`AppliedBucketDrop`]s, which is the
+/// same data each bucket's own `RewriteRecord.drops` holds durably, so nothing
+/// here is inferred or fabricated.
+///
+/// An empty `drops` writes no bucket list. That is the honest encoding of two
+/// different situations, and callers downstream must treat it as "this record
+/// states no bucket scope", never as "the request touched no bucket": a
+/// completion written for a request every in-scope bucket had `AlreadyApplied`
+/// (an earlier pass did the erasing, and its counts are not restatable from
+/// the live record), and a completion written before this field was populated
+/// at all.
 async fn write_erasure_completion(
     store: &dyn ObjectStoreBackend,
     now_ns: i64,
     tenant: &TenantHash,
     signal: Signal,
     request: &ErasureRequest,
+    drops: &[AppliedBucketDrop],
 ) -> Result<bool, MaintainError> {
     let completion = ErasureCompletion {
         format_version: ravel_commit::erasure::FORMAT_VERSION,
@@ -1797,7 +1848,15 @@ async fn write_erasure_completion(
         signal: ravel_commit::signal::to_proto(signal) as i32,
         request_id: request.request_id.clone(),
         predicate_hash: erasure_predicate_hash(request).to_vec(),
-        bucket_drops: Vec::new(),
+        bucket_drops: drops
+            .iter()
+            .map(|d| ErasureBucketDrop {
+                signal: ravel_commit::signal::to_proto(d.signal) as i32,
+                shard: d.shard,
+                ingest_hour_bucket: d.ingest_hour_bucket,
+                dropped_count: d.dropped_count,
+            })
+            .collect(),
         requested_unix_ns: request.created_unix_ns,
         // A completion can never precede its own request in the durable
         // record (the codec rejects that pair outright), so a backwards or
@@ -1912,6 +1971,8 @@ async fn run_erasure_pass(
                 not_sealed = pass.not_sealed,
                 deferred = pass.deferred,
                 catalog_blocked = pass.catalog_blocked.len(),
+                requests_with_bucket_drops = pass.bucket_drops.len(),
+                drops_incomplete = pass.drops_incomplete.len(),
                 "maintenance: erasure rewrite pass complete"
             );
 
@@ -1946,12 +2007,25 @@ async fn run_erasure_pass(
                         );
                         continue;
                     }
+                    // A partial bucket list would be read as this request's
+                    // complete applied-bucket set by the erasure-request
+                    // sweep, so a request some bucket only had
+                    // `AlreadyApplied` for records no list at all.
+                    let drops: &[AppliedBucketDrop] =
+                        if pass.drops_incomplete.contains(&entry.request.request_id) {
+                            &[]
+                        } else {
+                            pass.bucket_drops
+                                .get(&entry.request.request_id)
+                                .map_or(&[], Vec::as_slice)
+                        };
                     match write_erasure_completion(
                         store,
                         clock.now_ns(),
                         tenant,
                         signal,
                         &entry.request,
+                        drops,
                     )
                     .await
                     {
@@ -2732,25 +2806,46 @@ mod tests {
     /// compaction pass leaves the live record set as raw L0 and the erasure
     /// rewrite is what acts on it.
     async fn publish_erasable_bucket(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+        publish_erasable_bucket_at(store, tenant, 0, 1).await;
+    }
+
+    /// The same sealed metrics bucket as [`publish_erasable_bucket`], at
+    /// ingest hour `hour`, with `subject_samples` samples on the subject's
+    /// series (the bystander always keeps exactly one). Two buckets published
+    /// with different `subject_samples` give a rewrite pass two distinct exact
+    /// dropped counts to report.
+    async fn publish_erasable_bucket_at(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        hour: u32,
+        subject_samples: u64,
+    ) {
         let tenant_hash = tenant.hash();
         let mut series: Vec<SeriesInput> = [TEST_ERASED_SUBJECT, TEST_SURVIVING_SUBJECT]
             .into_iter()
             .map(|subject| {
                 let labels = subject_labels(subject);
+                let sample_count = if subject == TEST_ERASED_SUBJECT {
+                    subject_samples
+                } else {
+                    1
+                };
                 SeriesInput {
                     series_id: SeriesId::compute(tenant, "http_requests", &labels)
                         .expect("series id"),
                     labels,
-                    samples: vec![Sample {
-                        ts_ns: 1_000,
-                        value: 1.0,
-                    }],
+                    samples: (0..sample_count)
+                        .map(|i| Sample {
+                            ts_ns: 1_000 + i as i64,
+                            value: 1.0,
+                        })
+                        .collect(),
                 }
             })
             .collect();
         series.sort_by_key(|s| s.series_id);
 
-        let writer_id = Uuid::from_u128(9_100);
+        let writer_id = Uuid::from_u128(9_100 + u128::from(hour));
         let written = SegmentWriter::write(
             series,
             SegmentIdentity {
@@ -2783,8 +2878,10 @@ mod tests {
             min_ingest_ts_ns: written.summary.min_event_ts_ns,
             max_ingest_ts_ns: written.summary.max_event_ts_ns,
             segment_format_version: 1,
-            created_unix_ns: 10,
-            ingest_hour_bucket: 0,
+            // The record's creation time has to sit inside the ingest hour it
+            // declares (`IngestHourInconsistent` rejects any other pair).
+            created_unix_ns: i64::from(hour) * TEST_NS_PER_HOUR + 10,
+            ingest_hour_bucket: hour,
         })
         .expect("valid commit record");
 
@@ -3006,6 +3103,88 @@ mod tests {
         assert!(
             store.get(&dreq_key, GetRange::Full).await.is_ok(),
             "the .dreq (which carries the subject) must survive: the erasure is not complete"
+        );
+    }
+
+    /// A completion record carries the per-bucket dropped counts its documented
+    /// shape describes: one entry per bucket the pass rewrote for the request,
+    /// in bucket order, each with that bucket's exact count.
+    ///
+    /// Two sealed buckets hold the subject in the same shard, one sample in
+    /// ingest hour 0 and two in ingest hour 1. One `run_erasure_pass` rewrites
+    /// both and completes the request, so the `.done` it writes must name
+    /// exactly those two buckets with counts 1 and 2 -- not an empty list, and
+    /// not one entry per pass.
+    ///
+    /// The flip that proves this test bites: write `bucket_drops: Vec::new()`
+    /// in `write_erasure_completion` and the exact-list assertion below fails
+    /// with an empty list.
+    #[tokio::test]
+    async fn done_records_the_per_bucket_dropped_counts_of_every_rewritten_bucket() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // One sample of the subject in hour 0, two in hour 1: distinct exact
+        // counts, so a list that mixed the buckets up would fail below.
+        publish_erasable_bucket_at(&store, &tenant_id, 0, 1).await;
+        publish_erasable_bucket_at(&store, &tenant_id, 1, 2).await;
+
+        let request_id = Uuid::from_u128(0x1104);
+        submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+        )
+        .await;
+
+        let got = store
+            .get(&done_key, GetRange::Full)
+            .await
+            .expect("the pass rewrote both buckets, so the .done must be written");
+        let completion =
+            ravel_commit::erasure::decode_completion(&got.data).expect("decode completion");
+        let metrics_proto = ravel_commit::signal::to_proto(Signal::Metrics) as i32;
+        assert_eq!(
+            completion.bucket_drops,
+            vec![
+                ErasureBucketDrop {
+                    signal: metrics_proto,
+                    shard: 0,
+                    ingest_hour_bucket: 0,
+                    dropped_count: 1,
+                },
+                ErasureBucketDrop {
+                    signal: metrics_proto,
+                    shard: 0,
+                    ingest_hour_bucket: 1,
+                    dropped_count: 2,
+                },
+            ],
+            "the completion must carry one drop per rewritten bucket, in bucket order, with \
+             each bucket's exact dropped sample count"
         );
     }
 

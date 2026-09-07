@@ -527,7 +527,10 @@ async fn referenced_l0_identities(
 /// supersession chain it could not walk to the end (a generation's record was
 /// already gone). The requests the missing generation applied are not
 /// discoverable from any surviving record, so the erasure-request sweep holds
-/// every `.dreq` that could name such a bucket.
+/// every `.dreq` whose completion record names such a bucket among the buckets
+/// its rewrite applied in, plus every `.dreq` whose completion names no bucket
+/// at all (the completion states no scope, so any truncated bucket in the
+/// signal could be one of its own).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HeldBucket {
     pub shard: u32,
@@ -546,8 +549,11 @@ pub struct HeldBucket {
 /// erasure-request sweep consumes: this pass is the only component that
 /// already knows, per chain group, both which erasure requests the group's
 /// generations applied and whether the group was held. Publishing that here
-/// is what lets rule 6 decide without a walk of its own, and without depending
-/// on a completion record's optional per-bucket drop list.
+/// is what lets rule 6 decide without a walk of its own. Neither field depends
+/// on a completion record: `held_request_ids` alone decides a hold, and
+/// `held_truncated_buckets` is the fallback for the requests no surviving
+/// record names, which rule 6 then matches against each candidate
+/// completion's own bucket list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersededSweepOutcome {
     /// Superseded commit, compaction, and rewrite records deleted (or, under
@@ -614,10 +620,12 @@ impl SupersededSweepOutcome {
 /// This is the whole input to the erasure-request guard. Rule 6 asks no
 /// question of its own about supersession chains: rule 2 already walked them,
 /// already gated them, and already knows which requests the objects it held
-/// predate. A completion record's `bucket_drops` plays no part in it at all,
-/// neither to decide a hold nor to narrow which buckets are observed: the
-/// field is optional on the wire, and a list that is present but partial is
-/// indistinguishable from a complete one.
+/// predate. `request_ids` decides a hold on its own. `truncated_buckets` is
+/// matched against the candidate `.dreq`'s completion record, whose bucket
+/// list states which buckets that request's rewrite applied in; a completion
+/// with no bucket list states no scope and is held by any truncated bucket in
+/// the signal. Which buckets are *observed* is never narrowed by a completion:
+/// the observation covers the whole signal either way.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SupersededHolds {
     /// [`SupersededSweepOutcome::held_request_ids`], unioned across shards.
@@ -2222,7 +2230,9 @@ pub struct ErasureRequestSweepOutcome {
 ///   2 fills while it gates: `request_ids` when a held group names the request,
 ///   and `truncated_buckets` when a held group's chain could not be walked to
 ///   the end, in which case the requests the missing generation applied are
-///   named by no surviving record and the bucket stands in for them. This
+///   named by no surviving record and the bucket stands in for them -- for the
+///   requests whose own completion record names that bucket, and for every
+///   request whose completion names no bucket at all. This
 ///   costs no LIST and no GET of its own beyond rule 2's own pass. The holds
 ///   cover every supersession chain in the signal, not only the ones old
 ///   enough to delete: an object's age says nothing about whether a snapshot
@@ -2231,12 +2241,17 @@ pub struct ErasureRequestSweepOutcome {
 /// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
 ///   request exactly as it pins any other object.
 ///
-/// A completion's `bucket_drops` is informational only. No part of this rule
-/// reads it: not the hold decision, and not the scope of the observation the
-/// six-argument entry runs. The field is optional on the wire, is written
-/// empty by the production writer, and a writer that does populate it is not
-/// obliged to enumerate every bucket it touched, so a present list can be
-/// partial. Any truncated bucket in the signal therefore holds any candidate.
+/// A completion's `bucket_drops` scopes the truncated-bucket clause, and
+/// nothing else. It never decides a hold on its own, never overrides
+/// `request_ids`, and never narrows the scope of the observation the
+/// six-argument entry runs (that pass still covers the whole signal). The
+/// server's rewrite pass writes an entry per bucket it applied the request in,
+/// or writes no entries at all when it cannot state that set completely, so a
+/// non-empty list is the request's full applied-bucket set and an empty one is
+/// no statement: a candidate whose completion carries no entries keeps the
+/// original whole-signal behaviour and is held by any truncated bucket in the
+/// signal. Completions written before the field was populated read as exactly
+/// that case.
 ///
 /// A completion whose `completed_unix_ns` is zero is treated fail-safe as "not
 /// yet a valid horizon anchor" and its `.dreq` is kept: a zero anchor would
@@ -2345,7 +2360,7 @@ async fn sweep_erasure_requests_inner(
     // Split the requests into the ones this pass could delete and the ones a
     // cheaper condition already keeps, before any hold is observed: an
     // ordinary pass has no candidate and does no further work.
-    let mut candidates: Vec<(&Uuid, &String)> = Vec::new();
+    let mut candidates: Vec<(&Uuid, &String, &ErasureCompletion)> = Vec::new();
     let mut kept = 0usize;
     for (request_id, dreq_key) in &dreq_keys {
         let Some(completion) = completions.get(request_id) else {
@@ -2368,7 +2383,7 @@ async fn sweep_erasure_requests_inner(
             kept += 1;
             continue;
         }
-        candidates.push((request_id, dreq_key));
+        candidates.push((request_id, dreq_key, completion));
     }
 
     if candidates.is_empty() {
@@ -2391,21 +2406,15 @@ async fn sweep_erasure_requests_inner(
 
     let mut deleted = 0usize;
     let mut held_by_superseded_inputs = 0usize;
-    for (request_id, dreq_key) in candidates {
+    for (request_id, dreq_key, completion) in candidates {
         // The horizon has elapsed, but rule 2 may have held an object one of
         // this request's rewrites superseded: an input the live HEAD still
         // names, one under an unreadable snapshot part, or a chain a legal
         // hold over the data prefixes touches. A snapshot can still resolve
         // such an object, so the filter stays.
-        // A held chain rule 2 could not walk to the end names requests no
-        // surviving record does, so any such bucket stands in for them. The
-        // completion's own `bucket_drops` are not consulted: the field is
-        // optional on the wire, a production writer leaves it empty, and
-        // nothing forces a writer that does fill it to enumerate every bucket
-        // it touched. Narrowing on a list that may be partial would release a
-        // filter over a bucket the request did touch.
         let request_id_s = request_id.to_string();
-        let held = holds.request_ids.contains(&request_id_s) || !holds.truncated_buckets.is_empty();
+        let held = holds.request_ids.contains(&request_id_s)
+            || truncated_hold_applies(completion, &holds.truncated_buckets);
         if held {
             tracing::warn!(
                 tenant_hash = %tenant.to_hex(),
@@ -2434,17 +2443,53 @@ async fn sweep_erasure_requests_inner(
     })
 }
 
+/// Whether rule 2's truncated-bucket fallback holds this candidate `.dreq`.
+///
+/// A held chain rule 2 could not walk to the end applied requests no surviving
+/// record names, so the bucket stands in for them. Which requests it stands in
+/// for is read off each candidate's own completion record: an entry in
+/// `bucket_drops` is a durable statement that this request's rewrite applied
+/// in that bucket, and a truncated bucket the list does not name cannot be one
+/// this request's rewrite superseded anything in. Matching on `(shard, ingest
+/// hour)` alone is exact here because both sides are already scoped to one
+/// signal: the sweep runs per `(tenant, signal)`, and a completion's entries
+/// must all carry the completion's own signal (`validate_completion`).
+///
+/// An empty `bucket_drops` is not a statement that the request touched no
+/// bucket, it is the absence of any statement -- a completion written before
+/// the field was populated, or one whose pass could not state the complete
+/// set. Such a candidate keeps the original whole-signal behaviour: any
+/// truncated bucket in the signal holds it.
+fn truncated_hold_applies(
+    completion: &ErasureCompletion,
+    truncated: &BTreeSet<HeldBucket>,
+) -> bool {
+    if truncated.is_empty() {
+        return false;
+    }
+    if completion.bucket_drops.is_empty() {
+        return true;
+    }
+    completion.bucket_drops.iter().any(|d| {
+        truncated.contains(&HeldBucket {
+            shard: d.shard,
+            ingest_hour_bucket: d.ingest_hour_bucket,
+        })
+    })
+}
+
 /// Observe what rule 2 holds, without deleting anything, for a rule-6 caller
 /// that has no [`SupersededHolds`] of its own.
 ///
 /// The observation always covers the whole signal: the commit keyspace is
 /// listed once to enumerate its shards, and every shard is observed across
-/// every hour. It is never narrowed by a candidate completion's `bucket_drops`.
-/// That field is optional on the wire and nothing makes a writer that fills it
-/// enumerate every bucket it touched, so a partial list would silently exclude
-/// the bucket whose chain holds the request. Shard enumeration is one LIST for
-/// the pass, and a shard with no commit key holds nothing, so the whole-signal
-/// scope costs listing, never correctness.
+/// every hour. It is never narrowed by a candidate completion's `bucket_drops`,
+/// which scopes only which candidates a truncated bucket then holds
+/// ([`truncated_hold_applies`]): observing fewer shards would drop
+/// `held_request_ids` entries too, and that set is what holds a request whose
+/// chain rule 2 *could* walk. Shard enumeration is one LIST for the pass, and
+/// a shard with no commit key holds nothing, so the whole-signal scope costs
+/// listing, never correctness.
 ///
 /// The pass runs only when there is a `.dreq` past its horizon to decide about.
 async fn observe_superseded_holds(
