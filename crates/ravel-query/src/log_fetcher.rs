@@ -65,8 +65,8 @@ use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats}
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError, LogStreamId,
-    Predicate, RlogConfig, RlogReader, ScanStats, SuffixOutcome, decode_section,
-    decode_section_accounted, open_from_suffix, read_section,
+    Predicate, RlogConfig, RlogReader, ScanStats, SuffixOutcome, decode_section_accounted,
+    open_from_suffix, read_section_accounted,
 };
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
@@ -939,12 +939,17 @@ impl LogSegmentFetcher {
     /// limitation in its user-facing query semantics. Silently inheriting this
     /// over-approximation into a user-facing query would violate the "exact
     /// semantics by default, approximation is opt-in and visible" invariant.
+    ///
+    /// `accounting` receives the STREAM_DIR decompression this decode performs
+    /// (issue #1401 finding 3); `bytes` is assumed already fetched and its wire
+    /// bytes already charged by the caller.
     pub fn matching_streams(
         &self,
         bytes: &[u8],
         filters: &[StreamAttrEquals],
+        accounting: &QueryAccounting,
     ) -> Result<Vec<LogStreamId>, LogSegError> {
-        let dir = self.decode_stream_dir(bytes)?;
+        let dir = self.decode_stream_dir(bytes, accounting)?;
         let needles: Vec<Vec<u8>> = filters.iter().map(stream_attr_needle).collect();
         let mut out = Vec::new();
         for entry in dir.entries() {
@@ -1073,7 +1078,7 @@ impl LogSegmentFetcher {
             // This funnel issues exactly one whole-object GET per call.
             fetch_span.record("s3_requests", 1u64);
             fetch_span.record("s3_bytes", got.data.len() as u64);
-            self.decode_spanned(key, &got.data, query)
+            self.decode_spanned(key, &got.data, query, accounting)
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -1138,7 +1143,7 @@ impl LogSegmentFetcher {
             else {
                 return Ok(None);
             };
-            self.decode_spanned(&seg_ref.data_object_key, &bytes, query)
+            self.decode_spanned(&seg_ref.data_object_key, &bytes, query, accounting)
         }
         .await;
         caller_accounting.merge_snapshot(&phase.snapshot().pooled());
@@ -1209,7 +1214,7 @@ impl LogSegmentFetcher {
         };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns))?;
+        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns, accounting))?;
         Ok(Some(LogSegmentScan {
             bytes,
             scan,
@@ -1264,7 +1269,7 @@ impl LogSegmentFetcher {
             .await?;
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns))?;
+        let scan = span.in_scope(|| self.open_scan(key, &bytes, query, columns, accounting))?;
         Ok(Some(LogSegmentScan {
             bytes,
             scan,
@@ -1480,7 +1485,7 @@ impl LogSegmentFetcher {
             };
             let key = &seg_ref.data_object_key;
             let span = decode_span();
-            let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all))?;
+            let scan = span.in_scope(|| self.open_scan(key, &bytes, query, &all, accounting))?;
             // This fallback read fetched blocks iff `tenant_bytes` resolved at
             // least one (ranged path) or read the whole object (`None`, every
             // block present). A ranged read that pruned every block resolved zero
@@ -1857,7 +1862,8 @@ impl LogSegmentFetcher {
         };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let scan = span.in_scope(|| self.open_scan_subset(key, &bytes, query, columns, indices))?;
+        let scan = span
+            .in_scope(|| self.open_scan_subset(key, &bytes, query, columns, indices, accounting))?;
         Ok(Some(LogSegmentScan {
             bytes,
             scan,
@@ -2253,9 +2259,10 @@ impl LogSegmentFetcher {
         key: &str,
         bytes: &Bytes,
         query: &LogQuery,
+        accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
         let span = decode_span();
-        let out = span.in_scope(|| self.scan_bytes(key, bytes, query))?;
+        let out = span.in_scope(|| self.scan_bytes(key, bytes, query, accounting))?;
         if let Some(output) = &out {
             span.record("blocks_scanned", output.stats.blocks_scanned);
             span.record("blocks_total", output.stats.blocks_total);
@@ -2272,8 +2279,9 @@ impl LogSegmentFetcher {
         key: &str,
         bytes: &Bytes,
         query: &LogQuery,
+        accounting: &QueryAccounting,
     ) -> Result<Option<LogFetchOutput>, LogFetchError> {
-        let mut scan = self.open_scan(key, bytes, query, &ColumnSelection::all())?;
+        let mut scan = self.open_scan(key, bytes, query, &ColumnSelection::all(), accounting)?;
         let mut records = Vec::new();
         loop {
             let block = scan.next_block(bytes).map_err(|s| corrupt(key, s))?;
@@ -2310,8 +2318,9 @@ impl LogSegmentFetcher {
         bytes: &Bytes,
         query: &LogQuery,
         columns: &ColumnSelection,
+        accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
-        let pred = self.combined_predicate(key, bytes, query)?;
+        let pred = self.combined_predicate(key, bytes, query, accounting)?;
         let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
         // `prune` is passed as the reader's prune-only channel, never folded
         // into `pred`: an arm there would become an exact per-row filter and
@@ -2337,8 +2346,9 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         indices: &[usize],
+        accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
-        let pred = self.combined_predicate(key, bytes, query)?;
+        let pred = self.combined_predicate(key, bytes, query, accounting)?;
         let reader = RlogReader::new(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
         reader
             .scan_blocks_subset(&pred, &query.prune, columns, indices)
@@ -2355,12 +2365,13 @@ impl LogSegmentFetcher {
         key: &str,
         bytes: &Bytes,
         query: &LogQuery,
+        accounting: &QueryAccounting,
     ) -> Result<Predicate, LogFetchError> {
         let stream_ids = if query.stream_attrs.is_empty() {
             None
         } else {
             Some(
-                self.matching_streams(bytes, &query.stream_attrs)
+                self.matching_streams(bytes, &query.stream_attrs, accounting)
                     .map_err(|source| corrupt(key, source))?,
             )
         };
@@ -2477,7 +2488,7 @@ impl LogSegmentFetcher {
             match footer.section(kind::STREAM_DIR).copied() {
                 None => None,
                 Some(desc) => {
-                    let raw = read_section(&bytes, &desc, &self.cfg)
+                    let raw = read_section_accounted(&bytes, &desc, &self.cfg, accounting)
                         .map_err(|source| corrupt(key, source))?;
                     Some(
                         StreamDir::decode(&raw, MAX_STREAMS)
@@ -2498,12 +2509,21 @@ impl LogSegmentFetcher {
     /// descriptor, using the crate's public whole-section reader.
     /// This does not go through [`RlogReader`], which decodes STREAM_DIR
     /// internally but exposes no accessor for it.
-    fn decode_stream_dir(&self, bytes: &[u8]) -> Result<StreamDir, LogSegError> {
+    ///
+    /// Charges the bytes zstd produced to `accounting` (issue #1401 finding 3):
+    /// `bytes` was already fetched by the caller, so this is the one
+    /// in-memory decompression this method itself performs, and it lands
+    /// under whichever phase handle the caller is threading.
+    fn decode_stream_dir(
+        &self,
+        bytes: &[u8],
+        accounting: &QueryAccounting,
+    ) -> Result<StreamDir, LogSegError> {
         let footer = footer::open(bytes)?;
         let desc = footer
             .section(kind::STREAM_DIR)
             .ok_or_else(|| LogSegError::Corrupted("missing STREAM_DIR section".into()))?;
-        let raw = read_section(bytes, desc, &self.cfg)?;
+        let raw = read_section_accounted(bytes, desc, &self.cfg, accounting)?;
         StreamDir::decode(&raw, MAX_STREAMS)
     }
 }
@@ -4627,8 +4647,11 @@ impl BlockRangeFetcher {
         .await?;
 
         // Decode the skip index (now resident) and resolve the candidate blocks.
+        // A ranged read of this shape, so charged to whichever phase handle the
+        // caller passed in (issue #1401 finding 3): `decode_section_accounted`
+        // has no phase tag of its own, only the handle it is given.
         let skip_stored = asm.slice(key, skip_desc.offset, skip_desc.len)?;
-        let skip_raw = decode_section(skip_stored, skip_desc, &self.cfg)
+        let skip_raw = decode_section_accounted(skip_stored, skip_desc, &self.cfg, accounting)
             .map_err(|source| corrupt(key, source))?;
         let skip =
             SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
@@ -4932,10 +4955,10 @@ impl BlockRangeFetcher {
             &mut stats,
         )
         .await?;
-        let skip_raw = self.placed_section_raw(key, &asm, &skip_desc)?;
+        let skip_raw = self.placed_section_raw(key, &asm, &skip_desc, accounting)?;
         let skip =
             SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
-        let page_raw = self.placed_section_raw(key, &asm, &page_desc)?;
+        let page_raw = self.placed_section_raw(key, &asm, &page_desc, accounting)?;
         let page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
         page_dir
             .validate_extents(blocks_desc.len)
@@ -5216,15 +5239,20 @@ impl BlockRangeFetcher {
     }
 
     /// Decode one whole-compressed section out of the assembled buffer, where an
-    /// earlier `place_*` call already put its stored bytes.
+    /// earlier `place_*` call already put its stored bytes. Charges the bytes
+    /// zstd produced to `accounting` (issue #1401 finding 3): a ranged read's
+    /// SKIP_IDX and PAGE_DIR decode, so its callers pass the same handle their
+    /// GETs are charged against.
     fn placed_section_raw(
         &self,
         key: &str,
         asm: &ObjectAssembler,
         desc: &SectionDesc,
+        accounting: &QueryAccounting,
     ) -> Result<Vec<u8>, LogFetchError> {
         let stored = asm.slice(key, desc.offset, desc.len)?;
-        decode_section(stored, desc, &self.cfg).map_err(|source| corrupt(key, source))
+        decode_section_accounted(stored, desc, &self.cfg, accounting)
+            .map_err(|source| corrupt(key, source))
     }
 
     /// Resolve each candidate block index (from `skip.candidate_blocks`) to its
@@ -5379,8 +5407,8 @@ impl BlockRangeFetcher {
         )
         .await?;
         let stored = asm.slice(key, desc.offset, desc.len)?;
-        let raw =
-            decode_section(stored, &desc, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let raw = decode_section_accounted(stored, &desc, &self.cfg, accounting)
+            .map_err(|source| corrupt(key, source))?;
         FieldDir::decode(&raw, MAX_FIELDS).map_err(|source| corrupt(key, source))
     }
 
@@ -7902,6 +7930,22 @@ mod fetch_stream_dir_tests {
         let total = bytes.len() as u64;
         let seg = seg_ref(total, &records);
 
+        // Independent ground truth for the decompressed-byte pins below (issue
+        // #1401 finding 3): STREAM_DIR is a whole-read directory section, always
+        // stored COMP_ZSTD, so its uncomp_len is the exact bytes one decode of it
+        // produces, read straight from the footer rather than through either
+        // branch under test.
+        let stream_desc = *footer::open(&bytes)
+            .expect("open")
+            .section(kind::STREAM_DIR)
+            .expect("STREAM_DIR present");
+        assert_eq!(
+            stream_desc.comp,
+            footer::COMP_ZSTD,
+            "fixture STREAM_DIR must be zstd for this test"
+        );
+        let expected = stream_desc.uncomp_len;
+
         let below_store = store_with_object(bytes.clone()).await;
         let below = LogSegmentFetcher::new(below_store);
         assert!(
@@ -7914,6 +7958,11 @@ mod fetch_stream_dir_tests {
             .await
             .expect("fetch_stream_dir (below threshold)")
             .expect("STREAM_DIR present");
+        assert_eq!(
+            below_acc.snapshot().decompressed_bytes,
+            expected,
+            "below-threshold branch charges exactly STREAM_DIR's zstd uncomp_len"
+        );
 
         let above_store = store_with_object(bytes).await;
         let above = fetcher_above_threshold(above_store);
@@ -7923,6 +7972,11 @@ mod fetch_stream_dir_tests {
             .await
             .expect("fetch_stream_dir (above threshold)")
             .expect("STREAM_DIR present");
+        assert_eq!(
+            above_acc.snapshot().decompressed_bytes,
+            expected,
+            "above-threshold branch charges exactly STREAM_DIR's zstd uncomp_len"
+        );
 
         below_entries.sort_by_key(|(id, _)| *id);
         above_entries.sort_by_key(|(id, _)| *id);

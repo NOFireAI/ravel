@@ -1329,6 +1329,27 @@ pub fn read_section(
     desc: &SectionDesc,
     cfg: &RlogConfig,
 ) -> Result<Vec<u8>, LogSegError> {
+    decode_section(section_slice(bytes, desc)?, desc, cfg)
+}
+
+/// [`read_section`], additionally charging the bytes zstd produced to
+/// `accounting` (issue #1401 finding 3), the same way
+/// [`decode_section_accounted`] does for a caller that has already sliced the
+/// section's stored bytes out of an assembled buffer.
+pub fn read_section_accounted(
+    bytes: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+    accounting: &ravel_types::accounting::QueryAccounting,
+) -> Result<Vec<u8>, LogSegError> {
+    decode_section_accounted(section_slice(bytes, desc)?, desc, cfg, accounting)
+}
+
+/// The section's stored bytes, sliced out of a whole-object buffer at
+/// `[desc.offset, desc.offset + desc.len)`. Shared by [`read_section`] and
+/// [`read_section_accounted`], which differ only in whether the decode that
+/// follows charges `decompressed_bytes`.
+fn section_slice<'b>(bytes: &'b [u8], desc: &SectionDesc) -> Result<&'b [u8], LogSegError> {
     let start = usize::try_from(desc.offset)
         .map_err(|_| LogSegError::Corrupted("section offset range".into()))?;
     let len = usize::try_from(desc.len)
@@ -1336,10 +1357,9 @@ pub fn read_section(
     let end = start
         .checked_add(len)
         .ok_or_else(|| LogSegError::Corrupted("section range overflow".into()))?;
-    let stored = bytes
+    bytes
         .get(start..end)
-        .ok_or_else(|| LogSegError::Corrupted("section out of bounds".into()))?;
-    decode_section(stored, desc, cfg)
+        .ok_or_else(|| LogSegError::Corrupted("section out of bounds".into()))
 }
 
 /// The crc-and-decompress half of [`read_section`], taking a section's stored

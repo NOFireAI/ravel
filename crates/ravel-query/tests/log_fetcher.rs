@@ -483,6 +483,7 @@ async fn matching_streams_over_approximates_nested_map_values() {
 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let fetcher = LogSegmentFetcher::new(store);
+    let accounting = QueryAccounting::new();
     let mut matched = fetcher
         .matching_streams(
             &bytes,
@@ -490,6 +491,7 @@ async fn matching_streams_over_approximates_nested_map_values() {
                 "service.name",
                 AttrValue::Str("api".into()),
             )],
+            &accounting,
         )
         .expect("resolve");
     matched.sort();
@@ -514,6 +516,7 @@ async fn matching_streams_over_approximates_nested_map_values() {
                 "service.name",
                 AttrValue::Str("absent".into()),
             )],
+            &accounting,
         )
         .expect("resolve");
     assert!(none.is_empty(), "no stream carries service.name=absent");
@@ -533,6 +536,22 @@ async fn matching_streams_resolves_ids_from_stream_dir() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let fetcher = LogSegmentFetcher::new(store);
 
+    // Independent ground truth for the decompressed-byte pin below (issue
+    // #1401 finding 3): STREAM_DIR is a whole-read directory section, always
+    // stored COMP_ZSTD, so its uncomp_len is the exact bytes one decode of it
+    // produces, read from the footer rather than through `matching_streams`
+    // itself.
+    let stream_desc = *ravel_logseg::footer::open(&bytes)
+        .expect("open")
+        .section(ravel_logseg::footer::kind::STREAM_DIR)
+        .expect("STREAM_DIR present");
+    assert_eq!(
+        stream_desc.comp,
+        ravel_logseg::footer::COMP_ZSTD,
+        "fixture STREAM_DIR must be zstd for this test"
+    );
+
+    let accounting = QueryAccounting::new();
     let (api_id, _) = stream("api");
     let matched = fetcher
         .matching_streams(
@@ -541,9 +560,15 @@ async fn matching_streams_resolves_ids_from_stream_dir() {
                 "service.name",
                 AttrValue::Str("api".into()),
             )],
+            &accounting,
         )
         .expect("resolve");
     assert_eq!(matched, vec![api_id], "only the api stream matches");
+    assert_eq!(
+        accounting.snapshot().decompressed_bytes,
+        stream_desc.uncomp_len,
+        "matching_streams's STREAM_DIR decode charges exactly its zstd uncomp_len"
+    );
 
     // A value present in no stream resolves to the empty set.
     let none = fetcher
@@ -553,6 +578,7 @@ async fn matching_streams_resolves_ids_from_stream_dir() {
                 "service.name",
                 AttrValue::Str("absent".into()),
             )],
+            &accounting,
         )
         .expect("resolve");
     assert!(none.is_empty(), "no stream carries service.name=absent");
