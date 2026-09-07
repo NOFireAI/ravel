@@ -227,6 +227,7 @@ async fn cache_enabled_config_attaches_cache_to_the_log_path() {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         None,
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("sql state");
     // Freeze the clock so the epoch-start window resolves to an ordinary
