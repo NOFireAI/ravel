@@ -1740,32 +1740,33 @@ mod tests {
         &obj[start..start + desc.len as usize]
     }
 
-    /// An object wide enough that its directory sections clear the writer's
-    /// compression floor and are stored `COMP_ZSTD`, so decoding one produces
+    /// An object whose directory sections AND block pages clear the writer's
+    /// compression floor and are stored `COMP_ZSTD`, so decoding either produces
     /// strictly more bytes than it read: 200 distinct streams (a distinct
-    /// `service.name` each) with repetitive bodies. Returned with its footer
-    /// so a test can read a section descriptor's `uncomp_len` back.
+    /// `service.name` each), each with a long, highly compressible body so its
+    /// `body` page is well over the 512-byte page floor and zstd-encoded.
     fn object_with_zstd_dirs() -> Vec<u8> {
         let cfg = RlogConfig::default();
+        let body = "log message body ".repeat(200);
         let mut recs = Vec::new();
         for s in 0..200u8 {
-            recs.push(rec(s, i64::from(s), "hello world log body message repeated"));
+            recs.push(rec(s, i64::from(s), &body));
         }
         build(cfg, recs)
     }
 
     /// A section descriptor of `kind`, asserted to be zstd-compressed so its
-    /// `uncomp_len` is the exact byte count one decode produces.
+    /// `uncomp_len` is the exact byte count one decode produces. (The writer
+    /// stores every whole-read directory section `COMP_ZSTD` unconditionally, so
+    /// this holds for any object; `uncomp_len` may be below `len` for a tiny
+    /// section zstd could not shrink, which does not change what one decode
+    /// produces.)
     fn zstd_section(obj: &[u8], k: u32) -> SectionDesc {
         let footer = open(obj).expect("open");
         let desc = *footer.section(k).expect("section present");
         assert_eq!(
             desc.comp, COMP_ZSTD,
             "fixture section {k} must be zstd-compressed for this test"
-        );
-        assert!(
-            desc.uncomp_len > desc.len,
-            "a zstd section decodes to strictly more than it stores"
         );
         desc
     }
@@ -1828,25 +1829,25 @@ mod tests {
     }
 
     /// A raw (`COMP_NONE`) section decodes without decompression, so it charges
-    /// nothing: the counter is bytes zstd PRODUCED, not bytes copied.
+    /// nothing: the counter is bytes zstd PRODUCED, not bytes copied. The writer
+    /// always zstd-compresses whole-read sections, so this synthesizes a raw
+    /// section descriptor (the shape `decode_section`'s `COMP_NONE` branch and a
+    /// ranged reader over an uncompressed section both accept).
     #[test]
     fn decode_section_accounted_charges_nothing_for_raw_section() {
-        // A tiny object leaves its directory sections below the compression
-        // floor, so they are stored raw.
-        let obj = build(RlogConfig::default(), vec![rec(0, 1, "x")]);
-        let footer = open(&obj).expect("open");
         let cfg = RlogConfig::default();
+        let payload = b"an uncompressed section body".to_vec();
+        let desc = SectionDesc {
+            kind: kind::STREAM_DIR,
+            offset: 0,
+            len: payload.len() as u64,
+            crc32c: crc32c::crc32c(&payload),
+            comp: crate::footer::COMP_NONE,
+            uncomp_len: payload.len() as u64,
+        };
         let acct = QueryAccounting::new();
-        let mut saw_raw = false;
-        for k in [kind::STREAM_DIR, kind::FIELD_DIR, kind::SKIP_IDX] {
-            let desc = *footer.section(k).expect("section");
-            if desc.comp == crate::footer::COMP_NONE {
-                saw_raw = true;
-                decode_section_accounted(section_stored(&obj, &desc), &desc, &cfg, &acct)
-                    .expect("decode raw");
-            }
-        }
-        assert!(saw_raw, "the tiny fixture must store some directory raw");
+        let raw = decode_section_accounted(&payload, &desc, &cfg, &acct).expect("decode raw");
+        assert_eq!(raw, payload, "a raw section decodes to its own bytes");
         assert_eq!(
             acct.snapshot().decompressed_bytes,
             0,
