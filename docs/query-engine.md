@@ -1056,6 +1056,18 @@ On the PromQL side, `QueryEngine::instant_with_budgets`,
 points that take `Option<&RequestBudgets>`; passing `None` is exactly the
 pre-existing method. On the SQL side, `SqlRequest::budgets` carries them.
 
+Enforcement on the SQL side is not yet uniform across the five tables, and a
+caller has to know which knob binds where. Only the `samples` (metrics)
+provider reads the effective `max_bytes_scanned` and `max_store_requests` at
+scan time; the `logs`, `spans`, `alerts`, and `audit` providers do not. For
+those four tables, only `max_segments` is lowered today: it binds in
+`segment_admission::admit`, which runs on the catalog resolve every table
+shares, so a per-request `max_segments` does refuse an over-wide scan on any
+of them. A per-request bytes or request ceiling set alongside it is accepted
+and clamped, and then simply never consulted by those four scans. This is a
+pre-existing gap in the providers, not something the per-request budgets
+introduced; it is tracked as issue #1409 and is out of scope here.
+
 ### The agent query knobs on `SqlRequest` (ADR-1374)
 
 Three request fields exist for a caller that composes SQL on someone else's
@@ -1073,11 +1085,37 @@ each table scan in the unoptimized logical plan, on that table's event-time
 column: `ts` for `samples` and `logs`, `start_ts` for `spans`, `ts_ns` for
 `alerts` and `audit`. The rewrite happens before optimization, where the
 scan carries no projection, so the column is always in scope, and `Filter`
-preserves the schema, so the result schema is unchanged. The optimizer then
-pushes the predicate down normally, so the `Inexact` widen-only pushdown
-contract is untouched and pruning is unaffected. The rewrite runs inside the
-attempt, so it survives the snapshot retry. The applied predicate text is
-reported as `SqlStats::window_predicate`.
+preserves the schema, so the result schema is unchanged. The rewrite runs
+inside the attempt, so it survives the snapshot retry.
+
+The two bounds the one `window` drives are deliberately different.
+`ravel_types::TimeRange` is **closed**, `[start_ns, end_ns]`, and that is the
+bound `Catalog::resolve` prunes segments on; a listing bound may only widen,
+so an inclusive end can never drop a segment that holds a matching row. The
+row window is **half-open**, `[start_ns, end_ns)`, per ADR-1374 decision 4,
+because a row bound must be exact and adjacent windows must not both claim
+the instant on their shared edge. One consequence follows directly and is
+not a defect: a request whose `start_ns` equals its `end_ns` lists the
+segments covering that instant and, under `row_window`, returns zero rows.
+
+The traversal that plants the filter descends into subqueries embedded in
+expressions (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`) as
+well as into plan children, so every `TableScan` in the statement is
+filtered, including the scans of CTEs, set operations, self-joins, and a
+`WHERE` clause's own `SELECT`. Filtering only the outer scan would answer
+`SELECT ... WHERE value > (SELECT avg(value) FROM samples)` from an average
+over rows the caller excluded.
+
+The optimizer then pushes the injected predicate down exactly as it pushes
+one the statement itself carried, so **pruning tightens**: the provider is
+offered a filter it would not otherwise have seen, and it may skip segments
+and blocks the bare statement would have read. That is sound rather than a
+correctness risk because every provider reports `Inexact` for the filters it
+accepts, so DataFusion re-applies the predicate above the scan; a segment
+straddling the window is still read whole and cut by row. `SqlStats::
+window_predicate` reports the applied predicate as the display of the
+expression that was actually planted, so the reported text cannot describe a
+different filter than the one that ran.
 
 `max_rows: Option<usize>` stops the stream once `max_rows + 1` rows have
 been emitted. The extra row is deliberate: it is what distinguishes "this is
