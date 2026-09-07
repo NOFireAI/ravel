@@ -802,6 +802,11 @@ impl SqlExecutor {
 
     /// [`Self::explain`] with a caller-owned [`QueryAccounting`], so the
     /// resolve's own store spend is attributable.
+    ///
+    /// Bounded by [`SqlRequest::deadline`] exactly as [`Self::execute_accounted`]
+    /// is. Explain issues no data GET, but it does issue the resolve's catalog
+    /// LISTs and GETs, and a store that stops answering would otherwise hang
+    /// this call for as long as the transport allowed.
     pub async fn explain_accounted(
         &self,
         tenant_hash: TenantHash,
@@ -809,8 +814,29 @@ impl SqlExecutor {
         accounting: &QueryAccounting,
     ) -> Result<ExplainReport, SqlError> {
         // Same order as `execute`: the security gate first, so a rejected
-        // statement costs no catalog LIST here either.
+        // statement costs no catalog LIST here either, and it runs outside the
+        // timeout because a rejection is not a thing that can time out.
         validate(&req.sql)?;
+
+        let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
+        tokio::time::timeout(
+            req.deadline,
+            self.explain_inner(tenant_hash, req, accounting),
+        )
+        .await
+        .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
+    }
+
+    /// The resolve-and-plan body behind [`Self::explain_accounted`], minus
+    /// validation and the deadline. Separate so the timeout wraps exactly the
+    /// work that can block, matching how [`Self::run`] sits under
+    /// [`Self::execute_accounted`].
+    async fn explain_inner(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        accounting: &QueryAccounting,
+    ) -> Result<ExplainReport, SqlError> {
         let target = Self::target_signal(&req.sql)?;
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
         let (snapshot, admission, estimate) =
@@ -4523,6 +4549,62 @@ mod tests {
     /// here, rather than becoming a larger number nobody compares.
     const EXPLAIN_RESOLVE_LISTS: u64 = 2;
     const EXPLAIN_RESOLVE_GETS: u64 = 2;
+
+    /// Finding 2. `explain` never opens a data object, but it does issue the
+    /// resolve's catalog reads, so it needs the same wall bound `execute` has.
+    /// A hold gate on the first commit-record GET stops the resolve inside the
+    /// call and never yields (a `MemoryStore` answers every read, so nothing
+    /// else here is slow), and the clock is the runtime's injected one: the
+    /// test parks, tokio advances to the timer, and no wall time passes.
+    #[tokio::test(start_paused = true)]
+    async fn explain_honors_the_request_deadline() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("explain-deadline-1376", 1_000, FaultPlan::empty()).await;
+        let held = store
+            .inner()
+            .hold(Op::Get, Some(".cmt".to_string()), Occurrence::Nth(1));
+        let executor = executor_over(store);
+
+        let request = samples_request(
+            "SELECT ts, value FROM samples",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+        );
+        let request = SqlRequest {
+            deadline: Duration::from_millis(50),
+            ..request
+        };
+
+        // The outer guard is 1200x the request deadline and exists only so a
+        // regression that drops the wrapper fails here instead of hanging the
+        // suite. Under the paused clock both are virtual: the runtime advances
+        // to the earliest timer, which is the 50 ms one whenever it is armed.
+        let err = tokio::time::timeout(
+            Duration::from_secs(60),
+            executor.explain(tenant_hash, &request),
+        )
+        .await
+        .expect("explain must return under its own deadline rather than run unbounded")
+        .expect_err("the held commit-record GET must trip the deadline");
+        assert!(
+            matches!(err, SqlError::DeadlineExceeded { millis: 50 }),
+            "explain must report the typed deadline error: {err:?}"
+        );
+
+        // Non-vacuity: the gate matched exactly one call, and it is the
+        // commit-record GET, so the deadline tripped on the resolve being held
+        // and not on some unrelated stall.
+        let details = held.held_details();
+        assert_eq!(details.len(), 1, "the gate held exactly one call");
+        assert_eq!(details[0].1, Op::Get);
+        assert!(
+            details[0].2.ends_with(".cmt"),
+            "the held call is the commit-record GET: {}",
+            details[0].2
+        );
+    }
 
     /// Prerequisite 4. The cap stops the stream at `max_rows + 1` rows: the
     /// extra row is the evidence that more existed, reported as `row_cap_hit`.
