@@ -1292,19 +1292,42 @@ impl S3Store {
     /// [`map_put_error`] is mode-aware rather than status-aware), so it is
     /// unreachable here; one HEAD is the disambiguation:
     ///
-    /// - **key present** → a real already-exists → [`StoreError::AlreadyExists`],
-    ///   exactly as before this method existed.
-    /// - **key absent** → the 409 could not have been a real collision → a
-    ///   transient conditional-request conflict → [`StoreError::Transient`],
-    ///   which [`StoreError::is_retryable`] routes back into the caller's
-    ///   existing retry loop (the ingest flush loop, the commit publish path).
+    /// - **key present** (`Ok`) → a real already-exists →
+    ///   [`StoreError::AlreadyExists`], exactly as before this method existed.
+    /// - **key absent** (`NotFound`) → the 409 could not have been a real
+    ///   collision → a transient conditional-request conflict →
+    ///   [`StoreError::Transient`], which [`StoreError::is_retryable`] routes
+    ///   back into the caller's existing retry loop (the ingest flush loop, the
+    ///   commit publish path).
+    /// - **HEAD itself failed retryably** (`Throttled`/`Timeout`/`Transient`) →
+    ///   the probe determined nothing, so the key's state is unknown. The
+    ///   result is that same retryable error, surfaced verbatim. Returning a
+    ///   terminal `AlreadyExists` here would be wrong, not merely
+    ///   conservative: the PUT already failed so nothing was written, and
+    ///   `AlreadyExists` is not retryable, so the caller would stop and treat a
+    ///   race it did not lose as lost, sending the commit publish path into
+    ///   `resolve_already_exists` to read back a winner that may not exist. A
+    ///   retryable answer cannot lose a genuine already-exists: on the retry
+    ///   the PUT conflicts again, and once a HEAD finally succeeds a present
+    ///   key still yields `AlreadyExists`, so a real collision is delayed,
+    ///   never downgraded. An inconclusive probe that keeps failing instead
+    ///   exhausts the retry budget and surfaces a retryable error, the correct
+    ///   report for a state nobody could determine.
+    /// - **HEAD itself failed terminally** (`AccessDenied`, `Permanent`, and
+    ///   the other non-retryable classes) → retrying cannot make the probe
+    ///   conclusive, so the outcome cannot improve; fall back to the
+    ///   conservative `AlreadyExists`.
     ///
     /// The split-brain guard on the commit path and the vanished-part guard on
-    /// the compaction path are preserved by construction: `Transient` is
-    /// returned only when the key is ABSENT, and a genuine collision requires
-    /// it to be PRESENT, so no real already-exists is ever downgraded to a
-    /// retry. A HEAD that itself fails cannot prove the key absent, so it falls
-    /// back to the safe `AlreadyExists` rather than inventing a retry.
+    /// the compaction path are preserved by construction: a retryable result
+    /// is returned only when the key is ABSENT or the probe was inconclusive,
+    /// and a genuine collision requires the key PRESENT, so no real
+    /// already-exists is ever downgraded to a retry.
+    ///
+    /// The arms enumerate every [`StoreError`] variant rather than leaning on a
+    /// catch-all in either direction: a catch-all that mapped every non-absent
+    /// HEAD error to `AlreadyExists` is what turned an inconclusive probe into
+    /// a terminal verdict in the first place.
     async fn disambiguate_create_conflict(&self, key: &str) -> Result<PutOutcome, StoreError> {
         match self.head(key).await {
             Ok(_) => Err(StoreError::AlreadyExists),
@@ -1312,7 +1335,17 @@ impl S3Store {
                 "conditional-request conflict on create of {key}: 409 with the key \
                  absent on HEAD, retryable per the AWS PutObject specification"
             ))),
-            Err(_) => Err(StoreError::AlreadyExists),
+            Err(
+                e @ (StoreError::Throttled { .. } | StoreError::Timeout | StoreError::Transient(_)),
+            ) => Err(e),
+            Err(
+                StoreError::AccessDenied(_)
+                | StoreError::PreconditionFailed
+                | StoreError::Corrupted(_)
+                | StoreError::InvalidRange(_)
+                | StoreError::Permanent(_)
+                | StoreError::AlreadyExists,
+            ) => Err(StoreError::AlreadyExists),
         }
     }
 
