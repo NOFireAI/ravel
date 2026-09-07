@@ -180,19 +180,32 @@ ErasedBy(reqs) == IF "r1" \in reqs THEN {"s1"} ELSE {}
 \* records until an action writes it.
 InitContent(o) == IF o \in RawInputs THEN {"rec1", "rec2"} ELSE {}
 
-\* Rewrite descriptors for the identity-collision property: same input set, a
-\* different applied-request set. The shipped key binds the sorted applied ids
-\* (compute_rewrite_input_set_hash); the switch drops them so the two collide.
-\* PublishRewrite names its two output variants by RewriteKey and stores those
-\* names in `variantKey`; the invariant reads the stored names, not this operator
+\* Rewrite descriptors for the identity-collision property: one resolved input
+\* set, a different applied-request set. The shipped key binds the sorted applied
+\* ids (compute_rewrite_input_set_hash); the switch drops them so the two collide.
+\* The input set is the one the publishing identity resolved at its listing step,
+\* not a fixed RawInputs: a publish that targets rwB resolved CompactOut, so its
+\* stored names must be CompactOut-derived. Pinning both variants to RawInputs
+\* would let IdenticalInputSetsDoNotCollide read names that no longer describe the
+\* publish that wrote them (finding, #1289). PublishRewrite names its two output
+\* variants by RewriteKey over these descriptors and stores the names in
+\* `variantKey`; the invariant reads the stored names, not this operator
 \* (finding 4). RewriteKey itself is what the action USES to name an object.
-DescA == [inputs |-> RawInputs, reqs |-> {"r1"}]
-DescB == [inputs |-> RawInputs, reqs |-> {}]
+VariantDescA(ins) == [inputs |-> ins, reqs |-> {"r1"}]
+VariantDescB(ins) == [inputs |-> ins, reqs |-> {}]
 RewriteKey(d) == IF RewriteIdentityOmitsRequests
                      THEN <<d.inputs>>
                      ELSE <<d.inputs, d.reqs>>
 \* The sentinel a variant name holds before PublishRewrite has assigned it.
 UnnamedKey == <<>>
+\* The names variantKey can hold: the sentinel, plus a key generated from either
+\* resolvable input set (RawInputs for rwA, CompactOut for rwB) under either
+\* applied-request set. TypeOK ranges over all of them so a CompactOut-derived
+\* name is well typed.
+VariantKeyRange ==
+    {UnnamedKey}
+      \cup { RewriteKey(VariantDescA(ins)) : ins \in {RawInputs, CompactOut} }
+      \cup { RewriteKey(VariantDescB(ins)) : ins \in {RawInputs, CompactOut} }
 
 \* Legal-hold coverage: a hold on a bucket covers its data objects (l0/commit/l1)
 \* but never the del prefix (.dreq/.done/tombstone) or sys.
@@ -381,7 +394,7 @@ TypeOK ==
     /\ doneAt \in 0..MaxClock
     /\ supersededAt \in [SupersededCandidates -> 0..MaxClock]
     /\ objContent \in [Objects -> SUBSET AllRecords]
-    /\ variantKey \in [{"v1","v2"} -> {UnnamedKey, RewriteKey(DescA), RewriteKey(DescB)}]
+    /\ variantKey \in [{"v1","v2"} -> VariantKeyRange]
     /\ leaseOwner \in {"none"} \cup RewriteIds \cup {"C"}
     /\ rwPhase \in [RewriteIds -> {"idle","listed","done"}]
     /\ rwInputs \in [RewriteIds -> SUBSET SupersededCandidates]
@@ -676,8 +689,13 @@ PublishRewrite(id) ==
                                             THEN clock
                                             ELSE supersededAt[i]]
                   /\ objContent' = [objContent EXCEPT ![tgt] = RecordSetContent(tgt)]
-                  /\ variantKey' = [variantKey EXCEPT !["v1"] = RewriteKey(DescA),
-                                                      !["v2"] = RewriteKey(DescB)]
+                  \* Name the two variants from the input set THIS publish
+                  \* resolved (rwInputs[id]), so a publish that resolved
+                  \* CompactOut stamps CompactOut-derived names, never rwA's
+                  \* RawInputs names (finding, #1289).
+                  /\ variantKey' = [variantKey EXCEPT
+                                        !["v1"] = RewriteKey(VariantDescA(rwInputs[id])),
+                                        !["v2"] = RewriteKey(VariantDescB(rwInputs[id]))]
     /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
                    leaseOwner, rwInputs, cmpPhase>>
