@@ -1294,8 +1294,22 @@ impl QueryEngine {
         // the same reason the metrics lane checks in `resolve_snapshot_with_retry`
         // do: a log selector whose snapshot resolves to zero segments never
         // reaches the incremental checks in the log fetch loop below.
+        //
+        // Combined with the metrics lane's own already-spent total
+        // (`stats.phase_accounting`, populated by `prefetch_metric_plans`
+        // above), not the log lane's total alone: the two lanes share ONE
+        // query-wide `max_s3_requests` ceiling (the same reasoning
+        // `requests_remaining` below applies to the log fetch loop itself),
+        // so a metrics lane that already spent most of the budget must not
+        // let the log lane's resolve alone re-check against the whole
+        // ceiling as if the metrics spend never happened.
+        let combined_requests_so_far = stats
+            .phase_accounting
+            .pooled()
+            .total_s3_requests()
+            .saturating_add(log_accounting.snapshot().pooled().total_s3_requests());
         if let Some(err) = segment_admission::request_budget_exceeded(
-            log_accounting.snapshot().pooled().total_s3_requests(),
+            combined_requests_so_far,
             self.config.max_s3_requests,
         ) {
             return Err(err);
@@ -4889,6 +4903,102 @@ mod tests {
             stats.accounting.total_s3_requests(),
             requests,
             "the default-ceiling control must account the same resolve cost as the trip"
+        );
+    }
+
+    /// Round 2, CodeRabbit finding on PR #1424: the log lane's post-resolve
+    /// budget check added in `prefetch` (see
+    /// `lowered_request_budget_is_enforced_after_resolve` above) compared
+    /// only the log lane's OWN resolve cost against the ceiling, ignoring
+    /// whatever the metrics lane had already spent. A mixed metrics+logs
+    /// query must be checked against the COMBINED total right after the log
+    /// lane's resolve, the same way the log fetch loop's own incremental
+    /// checks already account for the metrics lane's prior spend
+    /// (`requests_remaining` below in `prefetch`).
+    #[tokio::test]
+    async fn mixed_metrics_and_log_lanes_share_the_request_budget_after_resolve() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(&store),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+        let tenant_hash = ravel_types::TenantId::new("acme-mixed").hash();
+        let now_ns = 60 * 1_000_000_000;
+        let t_ms = now_ns / 1_000_000;
+        let deadline = Duration::from_secs(30);
+        // `or` is PromQL's set operator (tolerates label-set mismatch,
+        // matching `two_log_selectors_share_one_request_budget` in
+        // tests/log_series_engine.rs): the metrics lane ("m") and the log
+        // lane (`ravel_log_lines`) both resolve empty snapshots against this
+        // fresh, unpublished store.
+        let query = r#"m or count_over_time(ravel_log_lines{job="x"}[1h])"#;
+
+        // Pinned: the metrics lane alone spends exactly 3 catalog requests
+        // resolving an empty snapshot (the same fixed cost
+        // `lowered_request_budget_is_enforced_after_resolve` pins for a lone
+        // empty-snapshot resolve), and the log lane spends exactly 3 more.
+        const METRICS_LANE_REQUESTS: u64 = 3;
+        const LOG_LANE_REQUESTS: u64 = 3;
+
+        let budgets = RequestBudgets {
+            max_store_requests: Some(RequestLimit::Bounded(METRICS_LANE_REQUESTS)),
+            ..Default::default()
+        };
+        let err = engine
+            .instant_with_budgets(
+                tenant_hash,
+                query,
+                t_ms,
+                &[],
+                now_ns,
+                deadline,
+                Some(&budgets),
+            )
+            .await
+            .expect_err(
+                "a budget sized for the metrics lane alone must still trip once the log \
+                 lane's own resolve is added",
+            );
+        let QueryError::RequestBudgetExceeded { requests, max } = err else {
+            panic!("expected QueryError::RequestBudgetExceeded, got {err:?}");
+        };
+        assert_eq!(
+            max, METRICS_LANE_REQUESTS,
+            "the caller's lowered ceiling must be reported exactly"
+        );
+        assert_eq!(
+            requests,
+            METRICS_LANE_REQUESTS + LOG_LANE_REQUESTS,
+            "the trip must report the COMBINED total, not the log lane's total alone"
+        );
+
+        // Control: a budget sized for both lanes' combined resolve cost
+        // succeeds, and accounts the same combined total the trip reported.
+        let combined_budgets = RequestBudgets {
+            max_store_requests: Some(RequestLimit::Bounded(
+                METRICS_LANE_REQUESTS + LOG_LANE_REQUESTS,
+            )),
+            ..Default::default()
+        };
+        let (_value, _annotations, stats) = engine
+            .instant_with_budgets(
+                tenant_hash,
+                query,
+                t_ms,
+                &[],
+                now_ns,
+                deadline,
+                Some(&combined_budgets),
+            )
+            .await
+            .expect("a budget sized for the combined resolve cost must succeed");
+        assert_eq!(
+            stats.accounting.total_s3_requests(),
+            METRICS_LANE_REQUESTS + LOG_LANE_REQUESTS,
+            "the combined-budget control must account the same combined resolve cost as the trip"
         );
     }
 
