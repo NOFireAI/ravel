@@ -4608,6 +4608,7 @@ dependencies = [
  "ravel-ingest",
  "ravel-logseg",
  "ravel-maintain",
+ "ravel-memory",
  "ravel-object-store",
  "ravel-otlp",
  "ravel-proto",
