@@ -140,8 +140,9 @@ observe.
 
 Eight boolean CONSTANTS gate the model's guards; all are at their shipped value
 in `smoke.cfg` and `exhaustive.cfg`. Each `negative/*.cfg` flips exactly one,
-runs with `FullEnv = TRUE` and the full fourteen-invariant list from
-`smoke.cfg` (finding 5), and names the single invariant it must break, so a
+runs with `FullEnv = TRUE` and all fifteen INVARIANT lines (TypeOK plus
+fourteen named) from `smoke.cfg` (finding 5), and names the single invariant
+it must break, so a
 guard silently deleted from the spec fails a control rather than passing
 unnoticed under a reduction that happened to dodge the other invariants. There
 are seven controls, one per `negative/*.cfg`; each has a note under
