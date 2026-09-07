@@ -510,15 +510,24 @@ async fn export_metrics(
         Err(IngestRequestError::Write(WriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
-        Err(err @ IngestRequestError::Write(_)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        // Retryable at the client: the same replica or a healthy one can
+        // succeed on the identical request later.
+        Err(IngestRequestError::Write(write_err)) if write_err.is_retryable() => {
+            (StatusCode::SERVICE_UNAVAILABLE, write_err.to_string()).into_response()
+        }
+        // Not retryable: the input itself cannot be accepted (e.g. a
+        // series value-kind mismatch), so 400 rather than the 503 that would
+        // tell a well-behaved exporter to retry forever.
+        Err(IngestRequestError::Write(write_err)) => {
+            (StatusCode::BAD_REQUEST, write_err.to_string()).into_response()
         }
     }
 }
 
 /// `POST /v1/logs`. Same shape as [`export_metrics`], down to the status
-/// codes: 401 for an unresolvable tenant, 400 for an undecodable body, 503
-/// for a write the log pipeline could not accept.
+/// codes: 401 for an unresolvable tenant, 400 for an undecodable body or a
+/// non-retryable write the log pipeline rejected, 503 for a retryable write
+/// failure.
 async fn export_logs(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -584,15 +593,24 @@ async fn export_logs(
         Err(LogIngestRequestError::Write(LogWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
-        Err(err @ LogIngestRequestError::Write(_)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        // Retryable at the client: the same replica or a healthy one can
+        // succeed on the identical request later.
+        Err(LogIngestRequestError::Write(write_err)) if write_err.is_retryable() => {
+            (StatusCode::SERVICE_UNAVAILABLE, write_err.to_string()).into_response()
+        }
+        // Not retryable: the input itself cannot be accepted, so 400 rather
+        // than the 503 that would tell a well-behaved exporter to retry
+        // forever.
+        Err(LogIngestRequestError::Write(write_err)) => {
+            (StatusCode::BAD_REQUEST, write_err.to_string()).into_response()
         }
     }
 }
 
 /// `POST /v1/traces`. Same shape as [`export_metrics`] and [`export_logs`],
 /// down to the status codes: 401 for an unresolvable tenant, 400 for an
-/// undecodable body, 503 for a write the span pipeline could not accept.
+/// undecodable body or a non-retryable write the span pipeline rejected, 503
+/// for a retryable write failure.
 async fn export_traces(
     State(state): State<Arc<GatewayState>>,
     headers: HeaderMap,
@@ -657,29 +675,41 @@ async fn export_traces(
         Err(SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
-        Err(err @ SpanIngestRequestError::Write(_)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        // Retryable at the client: the same replica or a healthy one can
+        // succeed on the identical request later.
+        Err(SpanIngestRequestError::Write(write_err)) if write_err.is_retryable() => {
+            (StatusCode::SERVICE_UNAVAILABLE, write_err.to_string()).into_response()
+        }
+        // Not retryable: the input itself cannot be accepted, so 400 rather
+        // than the 503 that would tell a well-behaved exporter to retry
+        // forever.
+        Err(SpanIngestRequestError::Write(write_err)) => {
+            (StatusCode::BAD_REQUEST, write_err.to_string()).into_response()
         }
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Write as _;
 
     use flate2::Compression;
     use flate2::write::GzEncoder;
+    use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
     use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
     use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
     use opentelemetry_proto::tonic::metrics::v1::{
-        Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        AggregationTemporality, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Metric,
+        NumberDataPoint, ResourceMetrics, ScopeMetrics,
     };
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use ravel_ingest::{
-        AdmissionController, AdmissionLimits, IngestConfig, IngestRouter, LogIngestRouter,
-        RateLimit, SpanIngestRouter, SystemClock,
+        AdmissionController, AdmissionLimits, IngestByteBudget, IngestByteBudgetLimit,
+        IngestConfig, IngestRouter, LogIngestRouter, RateLimit, SpanIngestRouter, SystemClock,
     };
     use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_otlp::{IngestLimits, LogIngestLimits, SpanIngestLimits};
     use ravel_query::http::AuthError;
@@ -700,28 +730,41 @@ mod tests {
         }
     }
 
-    /// A `GatewayState` over `MemoryStore`, whose admission controller carries
-    /// `limits` as its per-tenant defaults (so the fixed tenant gets them). The
-    /// metrics, log, and span routers are all real, so a handler runs the full
+    /// A `GatewayState` over `store`, whose admission controller carries
+    /// `limits` as its per-tenant defaults (so the fixed tenant gets them), and
+    /// whose metrics, log, and span routers all share `budget` as their ingest
+    /// buffer byte budget. The routers are all real, so a handler runs the full
     /// ingest path and returns the same status a client would see.
-    fn state_with_limits(limits: AdmissionLimits) -> Arc<GatewayState> {
-        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let metrics_router = Arc::new(IngestRouter::new(
-            IngestConfig::default(),
-            store.clone(),
-            Signal::Metrics,
-            Arc::new(SystemClock),
-        ));
-        let log_router = Arc::new(LogIngestRouter::new(
-            IngestConfig::default(),
-            store.clone(),
-            Arc::new(SystemClock),
-        ));
-        let span_router = Arc::new(SpanIngestRouter::new(
-            IngestConfig::default(),
-            store.clone(),
-            Arc::new(SystemClock),
-        ));
+    fn state_with_store_and_budget(
+        store: Arc<dyn ObjectStoreBackend>,
+        limits: AdmissionLimits,
+        budget: Arc<IngestByteBudget>,
+    ) -> Arc<GatewayState> {
+        let metrics_router = Arc::new(
+            IngestRouter::new(
+                IngestConfig::default(),
+                store.clone(),
+                Signal::Metrics,
+                Arc::new(SystemClock),
+            )
+            .with_budget(budget.clone()),
+        );
+        let log_router = Arc::new(
+            LogIngestRouter::new(
+                IngestConfig::default(),
+                store.clone(),
+                Arc::new(SystemClock),
+            )
+            .with_budget(budget.clone()),
+        );
+        let span_router = Arc::new(
+            SpanIngestRouter::new(
+                IngestConfig::default(),
+                store.clone(),
+                Arc::new(SystemClock),
+            )
+            .with_budget(budget),
+        );
         let admission = Arc::new(AdmissionController::new(Arc::new(SystemClock), limits));
         Arc::new(GatewayState {
             tenant_resolver: Arc::new(FixedTenantResolver(TenantId::new(TENANT))),
@@ -760,6 +803,43 @@ mod tests {
         })
     }
 
+    /// A `GatewayState` over `MemoryStore`, whose admission controller carries
+    /// `limits` as its per-tenant defaults and whose routers share an
+    /// unlimited ingest buffer budget (today's default).
+    ///
+    /// `pub(crate)`: reused by `otlp_grpc`'s test module, so the gRPC
+    /// permanent-write-error status test exercises the same fixture as the
+    /// HTTP one instead of a second hand-built `GatewayState`.
+    pub(crate) fn state_with_limits(limits: AdmissionLimits) -> Arc<GatewayState> {
+        state_with_store_and_budget(
+            Arc::new(MemoryStore::new()),
+            limits,
+            IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+        )
+    }
+
+    /// A `GatewayState` over `store`, with default admission limits and an
+    /// unlimited ingest buffer budget: for tests that fault-inject the store
+    /// rather than the admission or budget layers.
+    fn state_with_store(store: Arc<dyn ObjectStoreBackend>) -> Arc<GatewayState> {
+        state_with_store_and_budget(
+            store,
+            AdmissionLimits::default(),
+            IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+        )
+    }
+
+    /// A `GatewayState` over `MemoryStore`, with default admission limits and
+    /// an ingest buffer budget of zero: any write charges it and is shed
+    /// before touching a shard.
+    fn state_with_zero_budget() -> Arc<GatewayState> {
+        state_with_store_and_budget(
+            Arc::new(MemoryStore::new()),
+            AdmissionLimits::default(),
+            IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(0)),
+        )
+    }
+
     /// A metrics export that compresses well: `points` copies of one gauge data
     /// point, so the decompressed protobuf is many times the gzip size. The
     /// distinction matters for the charging tests, which assert the byte rate is
@@ -778,6 +858,95 @@ mod tests {
                     metrics: vec![Metric {
                         name: "requests_total".to_string(),
                         data: Some(MetricData::Gauge(Gauge { data_points })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// A metrics export carrying two metrics of the same name and empty
+    /// attributes, so they share one `series_id`: one a scalar `Gauge` point,
+    /// the other a native (`ExponentialHistogram`) point. `ingest.rs`'s
+    /// `handle_export` routes both points through one
+    /// `write_values_with_exemplars` call, so `shard.rs`'s `merge` sees both
+    /// claims for the same series in one batch and returns
+    /// `WriteError::SeriesValueKindMismatch` -- a non-retryable, permanent
+    /// rejection of the input itself.
+    ///
+    /// `pub(crate)`: reused by `otlp_grpc`'s test module (see
+    /// `state_with_limits`).
+    pub(crate) fn value_kind_mismatch_request() -> ExportMetricsServiceRequest {
+        let ts = now_ns() as u64;
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![
+                        Metric {
+                            name: "conflicting_series".to_string(),
+                            data: Some(MetricData::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    time_unix_nano: ts,
+                                    value: Some(NumberValue::AsDouble(1.0)),
+                                    ..Default::default()
+                                }],
+                            })),
+                            ..Default::default()
+                        },
+                        Metric {
+                            name: "conflicting_series".to_string(),
+                            data: Some(MetricData::ExponentialHistogram(ExponentialHistogram {
+                                data_points: vec![ExponentialHistogramDataPoint {
+                                    time_unix_nano: ts,
+                                    ..Default::default()
+                                }],
+                                aggregation_temporality: AggregationTemporality::Cumulative as i32,
+                            })),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// One minimal, valid log export: a single record, so a handler exercises
+    /// the full decode-and-write path without tripping any admission or
+    /// decode rejection ahead of the write itself.
+    fn minimal_log_request() -> ExportLogsServiceRequest {
+        ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: now_ns() as u64,
+                        severity_number: 9,
+                        severity_text: "INFO".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// One minimal, valid trace export: a single span, so a handler exercises
+    /// the full decode-and-write path without tripping any admission or
+    /// decode rejection ahead of the write itself.
+    fn minimal_trace_request() -> ExportTraceServiceRequest {
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: vec![7u8; 16],
+                        span_id: vec![3u8; 8],
+                        name: "span".to_string(),
+                        start_time_unix_nano: now_ns() as u64,
+                        end_time_unix_nano: now_ns() as u64,
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -1047,6 +1216,105 @@ mod tests {
         assert_eq!(
             usage.bytes_admitted_total, 0,
             "nothing is admitted and no tokens are consumed on the pre-check rejection"
+        );
+    }
+
+    /// A permanent, non-retryable write rejection (`WriteError::SeriesValueKindMismatch`)
+    /// must be 400, not the 503 a retryable failure gets: a well-behaved
+    /// exporter that retries only on 503/429 would otherwise retry a request
+    /// that can never succeed.
+    ///
+    /// Non-vacuity: change `export_metrics`'s final `Err(IngestRequestError::Write(write_err))`
+    /// arm back to `(StatusCode::SERVICE_UNAVAILABLE, ...)` and this fails,
+    /// observing 503 where 400 is asserted.
+    #[tokio::test]
+    async fn series_value_kind_mismatch_returns_400_not_503() {
+        let state = state_with_limits(AdmissionLimits::default());
+        let encoded = value_kind_mismatch_request().encode_to_vec();
+
+        let response = export_metrics(State(state), HeaderMap::new(), Bytes::from(encoded)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a series value-kind mismatch is a permanent, non-retryable rejection"
+        );
+    }
+
+    /// A retryable write failure (`WriteError::Abandoned`, from a store that
+    /// permanently fails every `Put`) must still be 503: the reorder that
+    /// added the 400 arm must not swallow the retryable arm ahead of it.
+    ///
+    /// Non-vacuity: delete the `if write_err.is_retryable()` guard's arm (or
+    /// reorder it after the bare `Write(write_err)` arm) and this fails,
+    /// observing 400 where 503 is asserted.
+    #[tokio::test]
+    async fn a_retryable_write_error_still_returns_503() {
+        let plan = FaultPlan::empty().with_rule(Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("boom".to_string()),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let state = state_with_store(store);
+        let encoded = compressible_request(10).encode_to_vec();
+
+        let response = export_metrics(State(state), HeaderMap::new(), Bytes::from(encoded)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an abandoned flush is retryable at the client"
+        );
+    }
+
+    /// The dedicated buffer-budget-shed 429 arm must survive the reorder that
+    /// added the retryable-vs-permanent split below it, for all three
+    /// signals: it is easy to accidentally fold into the new
+    /// `is_retryable()` guard (`BufferBudgetExceeded` is itself retryable),
+    /// which would still return 503 instead of the 429 backpressure signal
+    /// clients are meant to see.
+    ///
+    /// Non-vacuity: delete a handler's dedicated
+    /// `Write(*WriteError::BufferBudgetExceeded)` arm (letting it fall
+    /// through to the `is_retryable()` arm) and that handler's assertion
+    /// fails, observing 503 where 429 is asserted.
+    #[tokio::test]
+    async fn buffer_budget_shed_still_returns_429() {
+        let state = state_with_zero_budget();
+
+        let metrics_response = export_metrics(
+            State(state.clone()),
+            HeaderMap::new(),
+            Bytes::from(compressible_request(1).encode_to_vec()),
+        )
+        .await;
+        assert_eq!(
+            metrics_response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a zero metrics buffer budget must shed as 429, not 503"
+        );
+
+        let logs_response = export_logs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Bytes::from(minimal_log_request().encode_to_vec()),
+        )
+        .await;
+        assert_eq!(
+            logs_response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a zero log buffer budget must shed as 429, not 503"
+        );
+
+        let traces_response = export_traces(
+            State(state),
+            HeaderMap::new(),
+            Bytes::from(minimal_trace_request().encode_to_vec()),
+        )
+        .await;
+        assert_eq!(
+            traces_response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a zero span buffer budget must shed as 429, not 503"
         );
     }
 }
