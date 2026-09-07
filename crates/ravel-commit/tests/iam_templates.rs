@@ -332,59 +332,31 @@ fn require_bucket_relative_delete_resource(role: &str, sid: &str, resource: &str
         })
 }
 
-/// Resource key patterns (bucket prefix stripped) from every `Allow`
-/// statement whose `Action` is delete-capable (see `action_is_delete_capable`).
-/// The `DenyDeleteProtected` block names delete actions too, but it is a `Deny`:
-/// it withdraws capability rather than granting it (and an explicit IAM `Deny`
-/// always wins), so it is excluded here. This returns the delete capability a
-/// role actually holds; a delete-capable Allow whose Resource is not
-/// bucket-relative fails the test rather than being dropped.
-fn allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
+/// Resource key patterns (bucket prefix stripped) from every statement whose
+/// `Effect` is `effect` and whose `Action` is delete-capable (see
+/// `action_is_delete_capable`).
+///
+/// One function for both effects, because the two sides differ only in which
+/// `Effect` they select. The Resource-shape panic, the `Sid` fallback, and the
+/// bucket-relative requirement have to be identical on both, and a rule
+/// tightened on one copy and not the other is the failure this file keeps
+/// repeating.
+///
+/// `"Allow"` returns the delete capability a role actually holds. The
+/// `DenyDeleteProtected` block names delete actions too, but it withdraws
+/// capability rather than granting it (and an explicit IAM `Deny` always wins),
+/// so it is selected separately by `"Deny"`, which returns the keys that block
+/// protects (ADR-0055 §3). Either way a delete-capable statement whose Resource
+/// is not bucket-relative fails the test rather than being dropped: a Deny
+/// naming a delete on `"*"` would deny the qualification probe's own delete and
+/// one on another bucket protects nothing here.
+fn delete_key_patterns(policy: &Policy, effect: &str) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy.statements.as_array().unwrap() {
-        let is_allow = stmt["Effect"]
+        let has_effect = stmt["Effect"]
             .as_str()
-            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
-        if !is_allow {
-            continue;
-        }
-        let grants_delete = statement_actions(stmt)
-            .iter()
-            .any(|a| action_is_delete_capable(a));
-        if !grants_delete {
-            continue;
-        }
-        let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
-        let resources = match &stmt["Resource"] {
-            serde_json::Value::Array(a) => a.clone(),
-            v @ serde_json::Value::String(_) => vec![v.clone()],
-            other => panic!(
-                "{}/{sid}: delete-capable Allow has a Resource that is neither a \
-                 string nor an array: {other:?}",
-                policy.role
-            ),
-        };
-        for r in resources {
-            let r = r.as_str().expect("Resource entry is a string");
-            out.push(require_bucket_relative_delete_resource(policy.role, sid, r));
-        }
-    }
-    out
-}
-
-/// Resource key patterns (bucket prefix stripped) from every `Deny` statement
-/// whose `Action` is delete-capable --- the `DenyDeleteProtected` block
-/// (ADR-0055 §3). Same delete-capability predicate and same bucket-relative
-/// requirement as the Allow side: a Deny naming a delete on `"*"` would deny
-/// the qualification probe's own delete (Deny wins over Allow) and one on
-/// another bucket protects nothing here, so neither is silently dropped.
-fn deny_delete_key_patterns(policy: &Policy) -> Vec<String> {
-    let mut out = Vec::new();
-    for stmt in policy.statements.as_array().unwrap() {
-        let is_deny = stmt["Effect"]
-            .as_str()
-            .is_some_and(|e| e.eq_ignore_ascii_case("Deny"));
-        if !is_deny {
+            .is_some_and(|e| e.eq_ignore_ascii_case(effect));
+        if !has_effect {
             continue;
         }
         let touches_delete = statement_actions(stmt)
@@ -398,7 +370,7 @@ fn deny_delete_key_patterns(policy: &Policy) -> Vec<String> {
             serde_json::Value::Array(a) => a.clone(),
             v @ serde_json::Value::String(_) => vec![v.clone()],
             other => panic!(
-                "{}/{sid}: delete-capable Deny has a Resource that is neither a \
+                "{}/{sid}: delete-capable {effect} has a Resource that is neither a \
                  string nor an array: {other:?}",
                 policy.role
             ),
@@ -595,23 +567,15 @@ fn admin_has_no_kms_generate_data_key() {
     );
 }
 
-/// Admin's only `s3:DeleteObject` grant is the transient conformance scratch
-/// prefix `sys/qualify/*`, so `ravel-cli store qualify` can run ADR-0050's
-/// delete-visibility probe (which deletes a key under `sys/qualify/<run-id>/`)
-/// on a fresh bucket without failing closed. Admin holds no delete on tenant
-/// data (`t/**`) or on any key the same policy's `DenyDeleteProtected` block
-/// covers, so ADR-0055's property "Admin never deletes tenant data or a
-/// protected key" still holds. Widen the grant beyond that one prefix, or drop
-/// it so qualification fails the delete probe, and this test fails.
 /// The delete-grant guard's body, factored out so the regression fixtures run
 /// the real assertion on synthetic policies rather than a re-typed copy of it
 /// (the same pattern the KMS `assert_kms_resource_*` helpers use). The delete
 /// set is derived first, so a delete-capable Allow that is out-of-bucket or
-/// wildcard-actioned fails inside `allow_delete_key_patterns` before any
+/// wildcard-actioned fails inside `delete_key_patterns` before any
 /// protected-block check, and a synthetic fixture need not carry a Deny block
 /// to make the guard fire for the right reason.
 fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
-    let deletes = allow_delete_key_patterns(policy);
+    let deletes = delete_key_patterns(policy, "Allow");
     assert_eq!(
         deletes,
         vec!["sys/qualify/*".to_string()],
@@ -638,7 +602,7 @@ fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
     // ...and it must not cover any key the same policy denies delete on. Each
     // DenyDeleteProtected pattern is instantiated into a concrete key (every
     // `*` becomes a literal segment) and the grant glob must not match it.
-    let protected = deny_delete_key_patterns(policy);
+    let protected = delete_key_patterns(policy, "Deny");
     assert!(
         !protected.is_empty(),
         "{}: DenyDeleteProtected names no delete-protected keys -- the \
@@ -658,13 +622,21 @@ fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
     }
 }
 
+/// Admin's only `s3:DeleteObject` grant is the transient conformance scratch
+/// prefix `sys/qualify/*`, so `ravel-cli store qualify` can run ADR-0050's
+/// delete-visibility probe (which deletes a key under `sys/qualify/<run-id>/`)
+/// on a fresh bucket without failing closed. Admin holds no delete on tenant
+/// data (`t/**`) or on any key the same policy's `DenyDeleteProtected` block
+/// covers, so ADR-0055's property "Admin never deletes tenant data or a
+/// protected key" still holds. Widen the grant beyond that one prefix, or drop
+/// it so qualification fails the delete probe, and this test fails.
 #[test]
 fn admin_delete_grant_is_qualify_scratch_only() {
     let policy = load_policy("admin");
     assert_admin_delete_grant_is_scratch_only(&policy);
 }
 
-/// The pre-fix `allow_delete_key_patterns`, kept verbatim so the fixture below
+/// The pre-fix Allow side of `delete_key_patterns`, kept verbatim so the fixture below
 /// pins the two holes existed independent of the fixed code: delete capability
 /// recognized only by an exact `s3:DeleteObject` match, and any resource not
 /// under the bucket prefix silently dropped (`if let Some(..)` with no `else`).
@@ -703,7 +675,7 @@ fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
 /// guard recognized a delete grant only by an exact `s3:DeleteObject` match and
 /// silently dropped any resource not under the bucket prefix. So a statement
 /// granting `s3:*`/`s3:Delete*`/`*` on any resource, or `s3:DeleteObject` on
-/// `"*"` or a different bucket, was invisible to it: `allow_delete_key_patterns`
+/// `"*"` or a different bucket, was invisible to it: the delete-pattern helper
 /// returned an empty set and the assertion "Admin's only delete Allow is
 /// sys/qualify/*" passed while a delete-everywhere grant sat unexamined.
 ///
@@ -778,7 +750,7 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
         let pre_fix = pre_fix_allow_delete_key_patterns(&policy);
         assert!(
             pre_fix.is_empty(),
-            "fixture {sid} invalid: the pre-fix allow_delete_key_patterns was \
+            "fixture {sid} invalid: pre_fix_allow_delete_key_patterns was \
              expected to return no delete entry (hiding the grant); returned \
              {pre_fix:?}"
         );
@@ -799,7 +771,7 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
         );
 
         // Observation 2: the real guard fires on the synthetic policy --- either
-        // panicking inside allow_delete_key_patterns on an out-of-bucket
+        // panicking inside delete_key_patterns on an out-of-bucket
         // resource, or failing the scratch-only assert_eq on a non-scratch key.
         // catch_unwind so the panic is reported as a result here.
         let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
