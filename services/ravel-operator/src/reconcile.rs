@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
+use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Affinity, Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
     KeyToPath, PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec,
@@ -1904,6 +1905,284 @@ pub fn gc_bootstrap_plan(spec: &RavelClusterSpec) -> GcBootstrapPlan {
         gate,
         maintain_enabled: spec.maintain.enabled,
     }
+}
+
+/// Component suffix of the one-shot store-qualification Job (issue #36): its
+/// child name is `<cluster>-qualify`.
+pub const QUALIFY_COMPONENT: &str = "qualify";
+
+/// Annotation on the qualify Job carrying [`qualify_job_input_hash`], so a
+/// change to the inputs qualification proves against (bucket, region, endpoint,
+/// image, credentials Secret name) re-runs it and a no-op reconcile does not.
+pub const QUALIFY_SPEC_HASH_ANNOTATION: &str = "ravel.nofire.ai/qualify-spec-hash";
+
+/// `backoffLimit` for the qualify Job: a few retries absorb a transient S3
+/// error (a backend still coming up) without spinning forever on a genuine
+/// qualification failure (a backend that fails conditional-create atomicity or
+/// list consistency). Four attempts, then the Job reports `Failed` and the
+/// controller surfaces it on the `StoreQualified` condition.
+pub const QUALIFY_JOB_BACKOFF_LIMIT: i32 = 4;
+
+/// `ttlSecondsAfterFinished` for the qualify Job: one hour, so a finished Job
+/// does not accumulate across reconciles or re-qualifications. The qualified
+/// state itself is durable in `status.storeQualifiedHash`, so a Job
+/// garbage-collected after success does not re-trigger qualification.
+pub const QUALIFY_JOB_TTL_SECONDS: i32 = 3600;
+
+/// `StoreQualified` reason while the qualify Job is being created or is still
+/// running: serving is held until it reports success.
+pub const STORE_QUALIFIED_PENDING_REASON: &str = "Pending";
+
+/// `StoreQualified` reason once the store has been qualified for the current
+/// inputs; serving proceeds.
+pub const STORE_QUALIFIED_SUCCEEDED_REASON: &str = "Succeeded";
+
+/// `StoreQualified` reason when the qualify Job exhausted its `backoffLimit`
+/// without succeeding; serving stays held and the pass requeues on backoff.
+pub const STORE_QUALIFIED_FAILED_REASON: &str = "Failed";
+
+/// Message paired with [`STORE_QUALIFIED_PENDING_REASON`].
+pub const STORE_QUALIFYING_MESSAGE: &str = "running store qualification (ravel store qualify) against the cluster's bucket; the \
+     gateway, query, and maintain Deployments are held until it succeeds so the cluster never \
+     serves on a backend that fails the object-store contract (docs/object-store-contract.md)";
+
+/// Message paired with [`STORE_QUALIFIED_SUCCEEDED_REASON`].
+pub const STORE_QUALIFIED_MESSAGE: &str =
+    "the object store passed ravel store qualify; serving Deployments may be created";
+
+/// A deterministic change-detection hash over the inputs store qualification
+/// proves against (issue #36): the bucket, region, endpoint, server image, and
+/// the credentials Secret name. When any of these changes the store the cluster
+/// would serve on is a different one, so qualification is re-run; an unrelated
+/// spec edit (a replica count, a fold interval) leaves this stable and does not
+/// re-qualify.
+///
+/// `DefaultHasher` (SipHash with fixed keys) is deterministic across processes,
+/// so an operator restart does not spuriously re-qualify. It is a change signal,
+/// not a security boundary, exactly like [`secrets_checksum`].
+pub fn qualify_job_input_hash(spec: &RavelClusterSpec) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    spec.storage.s3.bucket.hash(&mut hasher);
+    spec.storage.s3.region.hash(&mut hasher);
+    spec.storage
+        .s3
+        .endpoint
+        .as_deref()
+        .unwrap_or("")
+        .hash(&mut hasher);
+    spec.image.hash(&mut hasher);
+    spec.storage
+        .s3
+        .credentials_secret_ref
+        .name
+        .hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// The one-shot store-qualification Job for a cluster (issue #36).
+///
+/// Runs `ravel store qualify` (the same `ravel-cli` binary the server image
+/// ships) against the cluster's bucket before any serving Deployment is created,
+/// so a backend that fails the object-store contract is caught at deploy time
+/// rather than crash-looping every server pod on a fresh bucket. Image and
+/// credentials mirror the server Deployment's shared
+/// `storage.s3.credentialsSecretRef`; the bucket, region, and endpoint reach
+/// `ravel-cli` through the same `RAVEL_S3_*` env vars it reads (clap `env`), the
+/// exact shape the kind lane's hand-run Job used.
+///
+/// The Job carries [`QUALIFY_SPEC_HASH_ANNOTATION`] so the controller re-runs it
+/// when its inputs change and skips it when they do not, and sets
+/// `restartPolicy: Never`, a small [`QUALIFY_JOB_BACKOFF_LIMIT`], and
+/// [`QUALIFY_JOB_TTL_SECONDS`] so a finished Job does not accumulate.
+pub fn desired_qualify_job(spec: &RavelClusterSpec, instance: &str) -> Job {
+    let labels = labels(instance, QUALIFY_COMPONENT);
+    let mut env = vec![
+        EnvVar {
+            name: "RAVEL_S3_BUCKET".to_string(),
+            value: Some(spec.storage.s3.bucket.clone()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "RAVEL_S3_REGION".to_string(),
+            value: Some(spec.storage.s3.region.clone()),
+            ..Default::default()
+        },
+    ];
+    if let Some(endpoint) = &spec.storage.s3.endpoint {
+        env.push(EnvVar {
+            name: "RAVEL_S3_ENDPOINT".to_string(),
+            value: Some(endpoint.clone()),
+            ..Default::default()
+        });
+    }
+    // Credentials mirror the server Deployment exactly: sourced from the shared
+    // credentials Secret via secretKeyRef, never literal values.
+    env.extend(s3_credential_env(spec, None));
+
+    let container = Container {
+        name: "qualify".to_string(),
+        image: Some(spec.image.clone()),
+        image_pull_policy: spec.image_pull_policy.clone(),
+        command: Some(vec!["/usr/local/bin/ravel-cli".to_string()]),
+        args: Some(vec![
+            "--store".to_string(),
+            "s3".to_string(),
+            "store".to_string(),
+            "qualify".to_string(),
+        ]),
+        env: Some(env),
+        security_context: Some(container_security_context()),
+        ..Default::default()
+    };
+
+    Job {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, QUALIFY_COMPONENT)),
+            labels: Some(labels.clone()),
+            annotations: Some(BTreeMap::from([(
+                QUALIFY_SPEC_HASH_ANNOTATION.to_string(),
+                qualify_job_input_hash(spec),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(JobSpec {
+            backoff_limit: Some(QUALIFY_JOB_BACKOFF_LIMIT),
+            ttl_seconds_after_finished: Some(QUALIFY_JOB_TTL_SECONDS),
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    restart_policy: Some("Never".to_string()),
+                    containers: vec![container],
+                    security_context: Some(pod_security_context()),
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        status: None,
+    }
+}
+
+/// The terminal state of the live qualify Job this reconcile pass observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualifyJobPhase {
+    /// Neither `Complete` nor `Failed` reported yet.
+    Running,
+    /// The Job reported `Complete=True`.
+    Succeeded,
+    /// The Job reported `Failed=True` (its `backoffLimit` was exhausted). Carries
+    /// the Job's terminal condition message for the `StoreQualified` condition.
+    Failed(String),
+}
+
+/// What the controller observed about the live qualify Job for a cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualifyJobObservation {
+    /// No qualify Job exists (a fresh cluster, or one whose finished Job has been
+    /// TTL-garbage-collected).
+    Absent,
+    /// A qualify Job exists. `spec_hash` is its [`QUALIFY_SPEC_HASH_ANNOTATION`]
+    /// value (`None` if the annotation is missing), `phase` its terminal state.
+    Present {
+        /// The Job's recorded input hash, or `None` when the annotation is
+        /// absent.
+        spec_hash: Option<String>,
+        /// The Job's terminal state this pass.
+        phase: QualifyJobPhase,
+    },
+}
+
+/// The gate decision one reconcile pass takes on store qualification (issue #36).
+///
+/// [`crate::controller`] acts on exactly this, so a test asserting on a decision
+/// here is asserting on the operator's real gating behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QualificationDecision {
+    /// The store is qualified for the current inputs: create the serving
+    /// Deployments. No qualify-Job write this pass.
+    Proceed,
+    /// (Re)run qualification and hold the serving Deployments. `recreate` is
+    /// true when a Job for stale inputs must be deleted first (a config edit
+    /// landed); the controller deletes it and lets the next pass create a fresh
+    /// one. False when no Job exists and one must be created now.
+    Qualify {
+        /// Whether a stale Job must be deleted before a fresh one is created.
+        recreate: bool,
+    },
+    /// The qualify Job is still running: hold the serving Deployments, no write.
+    Waiting,
+    /// The qualify Job failed: hold the serving Deployments and requeue on
+    /// backoff. Carries the Job's terminal message.
+    Failed(String),
+}
+
+/// Decide the qualification gate for a pass, purely from the desired input hash,
+/// the durably-recorded qualified hash (`status.storeQualifiedHash`), and the
+/// live Job observation.
+///
+/// A recorded qualified hash equal to the desired one short-circuits to
+/// [`QualificationDecision::Proceed`]: qualification already passed for these
+/// inputs and is never re-run on a schedule, so the Job's absence (after TTL GC)
+/// is not a reason to re-qualify. Otherwise the decision follows the live Job:
+/// absent means create one; a Job for a different (or missing) hash means a
+/// config edit landed and the stale Job is recreated; a Job for the current hash
+/// reports the qualification's progress.
+pub fn qualification_decision(
+    desired_hash: &str,
+    qualified_hash: Option<&str>,
+    observation: &QualifyJobObservation,
+) -> QualificationDecision {
+    if qualified_hash == Some(desired_hash) {
+        return QualificationDecision::Proceed;
+    }
+    match observation {
+        QualifyJobObservation::Absent => QualificationDecision::Qualify { recreate: false },
+        QualifyJobObservation::Present { spec_hash, phase } => {
+            if spec_hash.as_deref() != Some(desired_hash) {
+                QualificationDecision::Qualify { recreate: true }
+            } else {
+                match phase {
+                    QualifyJobPhase::Running => QualificationDecision::Waiting,
+                    QualifyJobPhase::Succeeded => QualificationDecision::Proceed,
+                    QualifyJobPhase::Failed(message) => {
+                        QualificationDecision::Failed(message.clone())
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The [`QualifyJobPhase`] a live Job reports, read from its status conditions:
+/// `Complete=True` is success, `Failed=True` is failure (its message carried
+/// through), anything else is still running.
+pub fn qualify_job_phase(job: &Job) -> QualifyJobPhase {
+    let Some(conditions) = job.status.as_ref().and_then(|s| s.conditions.as_ref()) else {
+        return QualifyJobPhase::Running;
+    };
+    for c in conditions {
+        if c.status != "True" {
+            continue;
+        }
+        match c.type_.as_str() {
+            "Complete" => return QualifyJobPhase::Succeeded,
+            "Failed" => {
+                let message = c
+                    .message
+                    .clone()
+                    .filter(|m| !m.is_empty())
+                    .or_else(|| c.reason.clone())
+                    .unwrap_or_else(|| "the store qualification Job failed".to_string());
+                return QualifyJobPhase::Failed(message);
+            }
+            _ => {}
+        }
+    }
+    QualifyJobPhase::Running
 }
 
 /// A tier's PodDisruptionBudget (issue #126, deliverable 4), capping how many of
@@ -5144,6 +5423,268 @@ mod tests {
         assert!(
             secrets_binding.contains("namespace: ravel-system"),
             "the shipped secrets RoleBinding binds ravel-system, the operator's own namespace"
+        );
+    }
+
+    /// A job condition of the given type/status, the shape
+    /// [`qualify_job_phase`] reads.
+    fn job_with_condition(type_: &str, status: &str, message: Option<&str>) -> Job {
+        use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+        Job {
+            status: Some(JobStatus {
+                conditions: Some(vec![JobCondition {
+                    type_: type_.to_string(),
+                    status: status.to_string(),
+                    message: message.map(str::to_string),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The input hash is stable for one spec and changes for each of the five
+    /// inputs it covers, and only those. Pins the exact set of fields that
+    /// re-trigger qualification (issue #36): a change to any of them is a
+    /// different store to prove, an unrelated change is not.
+    #[test]
+    fn qualify_input_hash_tracks_exactly_the_qualified_inputs() {
+        let spec = base_spec();
+        let base = qualify_job_input_hash(&spec);
+        assert_eq!(
+            base,
+            qualify_job_input_hash(&spec),
+            "the hash is deterministic for one spec"
+        );
+
+        let mut bucket = spec.clone();
+        bucket.storage.s3.bucket = "other-bucket".to_string();
+        let mut region = spec.clone();
+        region.storage.s3.region = "us-east-1".to_string();
+        let mut endpoint = spec.clone();
+        endpoint.storage.s3.endpoint = Some("http://other:9000".to_string());
+        let mut image = spec.clone();
+        image.image = "registry.example/ravel:v2".to_string();
+        let mut creds = spec.clone();
+        creds.storage.s3.credentials_secret_ref.name = "other-s3".to_string();
+        for (label, changed) in [
+            ("bucket", &bucket),
+            ("region", &region),
+            ("endpoint", &endpoint),
+            ("image", &image),
+            ("credentials secret", &creds),
+        ] {
+            assert_ne!(
+                base,
+                qualify_job_input_hash(changed),
+                "a change to {label} re-triggers qualification"
+            );
+        }
+
+        // A field qualification does not depend on leaves the hash unchanged, so
+        // an unrelated spec edit does not re-run qualification.
+        let mut replicas = spec.clone();
+        replicas.gateway.replicas = spec.gateway.replicas + 5;
+        assert_eq!(
+            base,
+            qualify_job_input_hash(&replicas),
+            "an unrelated spec edit (replica count) does not re-qualify"
+        );
+    }
+
+    /// The rendered qualify Job: name, image, command/args, credentials, the
+    /// spec-hash annotation, and the one-shot execution shape. Exact values, so
+    /// the Job the operator applies is pinned (issue #36).
+    #[test]
+    fn qualify_job_renders_a_one_shot_store_qualify() {
+        let spec = base_spec();
+        let job = desired_qualify_job(&spec, "prod");
+
+        assert_eq!(job.metadata.name.as_deref(), Some("prod-qualify"));
+        assert_eq!(
+            job.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(QUALIFY_SPEC_HASH_ANNOTATION))
+                .map(String::as_str),
+            Some(qualify_job_input_hash(&spec).as_str()),
+            "the annotation records the input hash so a change re-runs the Job"
+        );
+
+        let job_spec = job.spec.as_ref().expect("qualify Job has a spec");
+        assert_eq!(job_spec.backoff_limit, Some(QUALIFY_JOB_BACKOFF_LIMIT));
+        assert_eq!(
+            job_spec.ttl_seconds_after_finished,
+            Some(QUALIFY_JOB_TTL_SECONDS)
+        );
+        let pod = job_spec
+            .template
+            .spec
+            .as_ref()
+            .expect("qualify Job has a pod spec");
+        assert_eq!(pod.restart_policy.as_deref(), Some("Never"));
+        assert_eq!(pod.containers.len(), 1, "one qualify container");
+        let container = &pod.containers[0];
+        assert_eq!(
+            container.image.as_deref(),
+            Some("registry.example/ravel:v1")
+        );
+        assert_eq!(
+            container.command.as_deref(),
+            Some(["/usr/local/bin/ravel-cli".to_string()].as_slice())
+        );
+        assert_eq!(
+            container.args.as_deref(),
+            Some(
+                [
+                    "--store".to_string(),
+                    "s3".to_string(),
+                    "store".to_string(),
+                    "qualify".to_string(),
+                ]
+                .as_slice()
+            )
+        );
+        let env = container.env.as_ref().expect("qualify container has env");
+        let env_value = |name: &str| {
+            env.iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.value.clone())
+        };
+        assert_eq!(env_value("RAVEL_S3_BUCKET").as_deref(), Some("ravel-data"));
+        assert_eq!(env_value("RAVEL_S3_REGION").as_deref(), Some("eu-west-1"));
+        assert_eq!(
+            env_value("RAVEL_S3_ENDPOINT").as_deref(),
+            Some("http://minio:9000")
+        );
+        // Credentials come from the shared Secret via secretKeyRef, never a
+        // literal value in the pod spec.
+        let access = env
+            .iter()
+            .find(|e| e.name == "RAVEL_S3_ACCESS_KEY")
+            .expect("access key env present");
+        assert!(access.value.is_none(), "the access key is never a literal");
+        assert_eq!(
+            access
+                .value_from
+                .as_ref()
+                .and_then(|s| s.secret_key_ref.as_ref())
+                .map(|r| (r.name.as_str(), r.key.as_str())),
+            Some(("ravel-s3", S3_ACCESS_KEY_ID_KEY)),
+        );
+    }
+
+    /// `qualify_job_phase` reads the Job's terminal condition: `Complete=True`
+    /// is success, `Failed=True` carries its message, nothing terminal is still
+    /// running.
+    #[test]
+    fn qualify_job_phase_reads_the_terminal_condition() {
+        assert_eq!(
+            qualify_job_phase(&Job::default()),
+            QualifyJobPhase::Running,
+            "a Job with no status is still running"
+        );
+        assert_eq!(
+            qualify_job_phase(&job_with_condition("Complete", "True", None)),
+            QualifyJobPhase::Succeeded
+        );
+        assert_eq!(
+            qualify_job_phase(&job_with_condition(
+                "Failed",
+                "True",
+                Some("backend rejected CAS")
+            )),
+            QualifyJobPhase::Failed("backend rejected CAS".to_string()),
+            "the failure carries the Job's own terminal message"
+        );
+        // A condition that is not True does not count as terminal.
+        assert_eq!(
+            qualify_job_phase(&job_with_condition("Failed", "False", None)),
+            QualifyJobPhase::Running
+        );
+    }
+
+    /// A cluster already qualified for the current inputs proceeds without
+    /// re-running qualification, whatever the live Job says -- even absent
+    /// (TTL-garbage-collected). This is what keeps qualification from re-running
+    /// on a schedule.
+    #[test]
+    fn qualified_inputs_proceed_without_rerunning() {
+        let hash = "abc123".to_string();
+        for observation in [
+            QualifyJobObservation::Absent,
+            QualifyJobObservation::Present {
+                spec_hash: Some(hash.clone()),
+                phase: QualifyJobPhase::Succeeded,
+            },
+        ] {
+            assert_eq!(
+                qualification_decision(&hash, Some(&hash), &observation),
+                QualificationDecision::Proceed,
+                "recorded qualified inputs short-circuit to Proceed"
+            );
+        }
+    }
+
+    /// A fresh cluster (nothing qualified, no Job) creates the qualify Job
+    /// without recreating anything, and holds serving until it completes.
+    #[test]
+    fn fresh_cluster_creates_the_qualify_job() {
+        assert_eq!(
+            qualification_decision("h", None, &QualifyJobObservation::Absent),
+            QualificationDecision::Qualify { recreate: false },
+        );
+    }
+
+    /// A running Job for the current inputs holds serving; a completed one lets
+    /// it proceed; a failed one surfaces the Job's message and stays held.
+    #[test]
+    fn matching_job_reports_its_progress() {
+        let present = |phase| QualifyJobObservation::Present {
+            spec_hash: Some("h".to_string()),
+            phase,
+        };
+        assert_eq!(
+            qualification_decision("h", None, &present(QualifyJobPhase::Running)),
+            QualificationDecision::Waiting,
+        );
+        assert_eq!(
+            qualification_decision("h", None, &present(QualifyJobPhase::Succeeded)),
+            QualificationDecision::Proceed,
+        );
+        assert_eq!(
+            qualification_decision(
+                "h",
+                None,
+                &present(QualifyJobPhase::Failed("boom".to_string()))
+            ),
+            QualificationDecision::Failed("boom".to_string()),
+        );
+    }
+
+    /// When the inputs change on an already-qualified cluster, a Job for the old
+    /// inputs (or one missing the annotation) is recreated, not read as the
+    /// current one. The old qualified hash does not short-circuit because it no
+    /// longer equals the desired hash.
+    #[test]
+    fn changed_inputs_recreate_a_stale_job() {
+        let stale = QualifyJobObservation::Present {
+            spec_hash: Some("old".to_string()),
+            phase: QualifyJobPhase::Succeeded,
+        };
+        assert_eq!(
+            qualification_decision("new", Some("old"), &stale),
+            QualificationDecision::Qualify { recreate: true },
+        );
+        // A Job with no recorded hash is also stale against any desired hash.
+        let unannotated = QualifyJobObservation::Present {
+            spec_hash: None,
+            phase: QualifyJobPhase::Succeeded,
+        };
+        assert_eq!(
+            qualification_decision("new", Some("old"), &unannotated),
+            QualificationDecision::Qualify { recreate: true },
         );
     }
 }

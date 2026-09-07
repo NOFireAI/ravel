@@ -195,7 +195,17 @@ encryption headers.
 Startup on any non-memory store is also gated on a durable qualification
 record: a deployment runs `ravel-cli store qualify` once before its first
 server starts, which proves the backend honours the semantics the commit
-protocol depends on before any data rides on them. The capability table, the
+protocol depends on before any data rides on them. On Kubernetes the
+operator makes that run itself: before it creates any serving Deployment for
+a `RavelCluster`, it applies a one-shot `<cluster>-qualify` Job running
+`ravel store qualify` against that cluster's bucket and gates the gateway,
+query, and maintain Deployments on the Job completing, so a cluster never
+comes up as three tiers crash-looping on a backend that fails the contract.
+It records the qualified inputs (bucket, region, endpoint, image,
+credentials Secret) in a `StoreQualified` status condition and a durable
+`status.storeQualifiedHash`, re-runs qualification only when those inputs
+change (never on a schedule), and leaves a running cluster's Deployments up
+while re-qualifying (ADR-0034). The capability table, the
 qualification suite, and the retry and timeout contract are in
 [docs/object-store-contract.md](object-store-contract.md).
 
