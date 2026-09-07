@@ -1148,7 +1148,10 @@ impl Catalog {
         // Collect the idle tenants under the activity lock, then drop the lock
         // before touching the cache locks: never hold two cache-related locks
         // at once, so this can never deadlock against a concurrent resolve.
-        let (idle, still_active): (Vec<TenantHash>, HashSet<TenantHash>) = {
+        // The one lock nested inside it is the warn-once marks lock, whose
+        // only other holder (`note_column_stats_decode_refusal`) takes no
+        // other lock, so activity-then-marks is the only order that exists.
+        let idle: Vec<TenantHash> = {
             let mut activity = self.tenant_activity.lock();
             let idle: Vec<TenantHash> = activity
                 .iter()
@@ -1158,13 +1161,22 @@ impl Catalog {
             for tenant in &idle {
                 activity.remove(tenant);
             }
-            // The tenants that survive this sweep. Anything keyed by a tenant
-            // NOT in this set is either idle (just removed) or was never
-            // stamped at all, which is what a tenant reaching only
-            // `load_column_stats` (no resolve) looks like; both are swept
-            // below.
-            let still_active: HashSet<TenantHash> = activity.keys().copied().collect();
-            (idle, still_active)
+            // Sweep the decode-refusal warn-once marks (issue #1400) while the
+            // activity lock is still held, against the live map: a resolve
+            // that stamps a tenant waits for this lock, so its mark can never
+            // land between a snapshot and the sweep and be swept as stale.
+            // Keyed by (tenant, signal, key); keep only triples whose tenant
+            // is still stamped. That drops the idle tenants just removed AND
+            // any tenant that never resolved: `load_column_stats` does not
+            // stamp activity, so a caller that reaches it without a preceding
+            // resolve would otherwise leave its marks with no sweep able to
+            // select them. A swept tenant warns again on its next refusal.
+            // Runs on every call, not only when `idle` is non-empty, for the
+            // same reason.
+            self.warned_decode_failures
+                .lock()
+                .retain(|(tenant, _, _)| activity.contains_key(tenant));
+            idle
         };
         for tenant in &idle {
             self.cache.evict_tenant(tenant);
@@ -1180,17 +1192,6 @@ impl Catalog {
         {
             cache.evict_tenants(&idle);
         }
-        // Sweep the decode-refusal warn-once marks (issue #1400). Keyed by
-        // (tenant, signal, key); keep only triples whose tenant is still in
-        // the activity map. That drops the idle tenants just removed AND any
-        // tenant that never resolved: `load_column_stats` does not stamp
-        // activity, so a caller that reaches it without a preceding resolve
-        // would otherwise leave its marks with no sweep able to select them.
-        // A swept tenant warns again on its next refusal. Runs on every call,
-        // not only when `idle` is non-empty, for the same reason.
-        self.warned_decode_failures
-            .lock()
-            .retain(|(tenant, _, _)| still_active.contains(tenant));
         idle.len()
     }
 
