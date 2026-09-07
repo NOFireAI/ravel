@@ -371,13 +371,18 @@ impl<'a> RlogReader<'a> {
                             let mut postings_arms = content_arms;
                             postings_arms.extend(prune_arms);
                             for (cid, term) in &postings_arms {
-                                match section.probe(*cid, term) {
-                                    Ok(Some(blocks)) => {
+                                match section.probe_accounted(*cid, term) {
+                                    Ok((Some(blocks), decompressed)) => {
+                                        stats.decompressed_bytes =
+                                            stats.decompressed_bytes.saturating_add(decompressed);
                                         let allowed: std::collections::HashSet<usize> =
                                             blocks.iter().map(|&b| b as usize).collect();
                                         candidates.retain(|b| allowed.contains(b));
                                     }
-                                    Ok(None) => {}
+                                    Ok((None, decompressed)) => {
+                                        stats.decompressed_bytes =
+                                            stats.decompressed_bytes.saturating_add(decompressed);
+                                    }
                                     Err(_) => stats.postings_degraded = true,
                                 }
                             }
@@ -1045,8 +1050,9 @@ pub(crate) fn decode_v4_block(
         // (equal to `uncomp_len` for a valid page, which `read_page` already
         // checked). A raw page was copied, not decompressed (issue #1401).
         if p.desc.comp == crate::page::COMP_ZSTD {
-            counters.decompressed_bytes =
-                counters.decompressed_bytes.saturating_add(produced.len() as u64);
+            counters.decompressed_bytes = counters
+                .decompressed_bytes
+                .saturating_add(produced.len() as u64);
         }
         page_bytes.push(Some(produced));
         counters.decoded += 1;
@@ -1785,7 +1791,11 @@ mod tests {
         let acct = QueryAccounting::new();
 
         let raw = decode_section_accounted(stored, &desc, &cfg, &acct).expect("decode");
-        assert_eq!(raw.len() as u64, desc.uncomp_len, "decode produces uncomp_len");
+        assert_eq!(
+            raw.len() as u64,
+            desc.uncomp_len,
+            "decode produces uncomp_len"
+        );
         assert_eq!(
             acct.snapshot().decompressed_bytes,
             desc.uncomp_len,
@@ -1817,8 +1827,13 @@ mod tests {
             "the two sections must differ in uncompressed size for this test"
         );
         let acct = QueryAccounting::new();
-        decode_section_accounted(section_stored(&obj, &stream_desc), &stream_desc, &cfg, &acct)
-            .expect("decode stream_dir");
+        decode_section_accounted(
+            section_stored(&obj, &stream_desc),
+            &stream_desc,
+            &cfg,
+            &acct,
+        )
+        .expect("decode stream_dir");
         decode_section_accounted(section_stored(&obj, &field_desc), &field_desc, &cfg, &acct)
             .expect("decode field_dir");
         assert_eq!(
@@ -1870,13 +1885,21 @@ mod tests {
         // The seed equals the sum of the object's zstd directory sections.
         let footer = open(&obj).expect("open");
         let mut open_total = 0u64;
-        for k in [kind::STREAM_DIR, kind::FIELD_DIR, kind::SKIP_IDX, kind::PAGE_DIR] {
+        for k in [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ] {
             let desc = *footer.section(k).expect("section");
             if desc.comp == COMP_ZSTD {
                 open_total += desc.uncomp_len;
             }
         }
-        assert!(open_total > 0, "fixture must have at least one zstd directory");
+        assert!(
+            open_total > 0,
+            "fixture must have at least one zstd directory"
+        );
 
         let mut cursor = reader
             .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
@@ -2668,6 +2691,69 @@ mod tests {
         assert_eq!(stats.blocks_after_postings, 4);
         assert_eq!(stats.blocks_scanned, 4);
         assert!(!stats.postings_degraded);
+    }
+
+    /// A postings-eligible prune arm decompresses one POSTINGS term block
+    /// (`PostingsSection::probe_accounted`), and that block's bytes must land
+    /// in `ScanStats.decompressed_bytes` alongside the open-time directory
+    /// total: before this fix nothing on the postings path charged
+    /// `decompressed_bytes` at all (issue #1401 finding 1). Three distinct
+    /// `svc` values fit inside one `DEFAULT_STRIDE` (128) term block, so the
+    /// section holds exactly one postings term block and
+    /// `total_block_uncompressed_len` names its exact byte count independent
+    /// of `probe_accounted`'s own block selection. Read right after
+    /// `scan_blocks` returns, before any block page is decoded, so no page
+    /// bytes are in the figure to account for.
+    #[test]
+    fn scan_blocks_charges_postings_probe_decompression() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let footer = open(&obj).expect("open");
+        let mut open_total = 0u64;
+        for k in [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ] {
+            let desc = *footer.section(k).expect("section");
+            if desc.comp == COMP_ZSTD {
+                open_total += desc.uncomp_len;
+            }
+        }
+
+        let postings_bytes = postings_bytes_of(&obj);
+        let section = PostingsSection::parse(&postings_bytes).expect("parse postings");
+        let postings_total = section.total_block_uncompressed_len();
+        assert!(
+            postings_total > 0,
+            "fixture must produce at least one postings term block"
+        );
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str("s0".into()),
+        }];
+        let cursor = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &prune, &ColumnSelection::all())
+            .expect("scan");
+
+        assert_eq!(
+            cursor.stats().decompressed_bytes,
+            open_total + postings_total,
+            "scan_blocks charges the postings probe's decompressed term block \
+             on top of the open-time directory total"
+        );
     }
 
     /// An attribute the POSTINGS index does not cover prunes nothing. `region`
