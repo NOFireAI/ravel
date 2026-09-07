@@ -182,7 +182,19 @@ pub fn decode(bytes: &[u8]) -> Result<AlertStateMemo, MemoError> {
     let mut records = HashMap::with_capacity(wire.records.len());
     for wire_record in wire.records {
         let (alert_id, record) = wire_record.into_record()?;
-        records.insert(alert_id, record);
+        // A well-formed memo holds one record per alert_id (the fold's output is
+        // keyed by alert_id). A body that repeats an alert_id is ambiguous: a
+        // silent last-wins insert would let a stale duplicate seed the state for
+        // an hour below the watermark, which the tail never re-reads, so the
+        // evaluator would serve wrong state instead of falling back to a full
+        // fold. Refuse it as a decode error, the same non-fatal path a truncated
+        // or bad-version memo takes: the caller rescans and rewrites a clean memo.
+        if records.insert(alert_id, record).is_some() {
+            return Err(MemoError::Decode(format!(
+                "duplicate alert_id {} in memo",
+                alert_id.to_hex()
+            )));
+        }
     }
     Ok(AlertStateMemo {
         watermark_hour: wire.watermark_hour,
@@ -299,6 +311,21 @@ mod tests {
             matches!(err, MemoError::UnsupportedVersion { found: 2 }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn a_duplicate_alert_id_is_a_decode_error() {
+        // A body that is otherwise well-formed but carries the same alert_id
+        // twice. A last-wins insert would silently drop one record and could
+        // seed stale below-watermark state; the reader must refuse it so the
+        // caller falls back to a full fold instead.
+        let bytes = br#"{"format_version":1,"watermark_hour":1,"records":[
+            {"alert_id":"11111111111111111111111111111111","rule_id":"r","state":"firing",
+             "generation":0,"ts_ns":1,"labels":[],"annotations":[],"body":"b"},
+            {"alert_id":"11111111111111111111111111111111","rule_id":"r","state":"resolved",
+             "generation":1,"ts_ns":2,"labels":[],"annotations":[],"body":"b"}]}"#;
+        let err = decode(bytes).expect_err("duplicate alert_id rejected");
+        assert!(matches!(err, MemoError::Decode(_)), "got {err:?}");
     }
 
     #[test]
