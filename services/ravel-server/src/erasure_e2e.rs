@@ -820,6 +820,7 @@ mod logs {
                 ravel_query::QueryConcurrencyLimit::Unlimited,
             ),
             None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
         )
         .expect("sql state");
         sql_state.clock = Arc::new(FixedQueryClock);
