@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
@@ -37,11 +38,14 @@ use crate::crd::{
 use crate::reconcile::{
     DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_STALL_AFTER,
     GC_BOOTSTRAP_STALLED_REASON, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE, GC_BOOTSTRAP_UNAVAILABLE_REASON,
-    GcBootstrapGate, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
-    WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON, desired_objects,
-    grpcroute_api_resource, httproute_api_resource, possible_gateway_route_names,
-    possible_ingest_ingress_names, possible_pod_disruption_budget_names,
-    possible_router_object_names,
+    GcBootstrapGate, QUALIFY_COMPONENT, QUALIFY_SPEC_HASH_ANNOTATION, QualificationDecision,
+    QualifyJobObservation, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
+    STORE_QUALIFIED_FAILED_REASON, STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON,
+    STORE_QUALIFIED_SUCCEEDED_REASON, STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
+    WAITING_FOR_GC_BOOTSTRAP_REASON, desired_objects, desired_qualify_job, grpcroute_api_resource,
+    httproute_api_resource, possible_gateway_route_names, possible_ingest_ingress_names,
+    possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
+    qualify_job_input_hash, qualify_job_phase,
 };
 
 /// Server-side-apply field manager name.
@@ -952,6 +956,14 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                 .status
                 .as_ref()
                 .and_then(|status| status.gc_bootstrap_waiting_since.clone());
+            // The qualified-inputs hash is owned by the qualification gate, not
+            // this error path: carry the persisted value through unchanged so a
+            // transient error after a cluster is already qualified does not drop
+            // the record and re-trigger qualification on the next pass.
+            let store_qualified_hash = obj
+                .status
+                .as_ref()
+                .and_then(|status| status.store_qualified_hash.clone());
             if let Err(status_err) = write_degraded_status(
                 client,
                 &namespace,
@@ -960,6 +972,7 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                 &reason,
                 &message,
                 waiting_since,
+                store_qualified_hash,
                 extra_conditions,
             )
             .await
@@ -981,6 +994,121 @@ async fn reconcile_inner(
     instance: &str,
     mut extra_conditions: Vec<Condition>,
 ) -> Result<Action, Error> {
+    // Store qualification gate (issue #36). Before anything that would read or
+    // write the object store is created -- the sys/auth token map, the ingest
+    // router, and above all the serving Deployments -- prove the store passes
+    // `ravel store qualify`. A cluster brought up on a backend that fails the
+    // object-store contract (docs/object-store-contract.md) would otherwise
+    // crash-loop every server pod with an opaque runtime error; here it fails
+    // once, visibly, on a one-shot Job, and the `StoreQualified` condition says
+    // why. Qualification is proven for the current inputs and never re-run on a
+    // schedule: a durable `status.storeQualifiedHash` records the inputs it last
+    // passed against, so a finished Job garbage-collected by its TTL does not
+    // re-trigger it (ADR-0034).
+    let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+    let qualify_name = child(instance, QUALIFY_COMPONENT);
+    let desired_hash = qualify_job_input_hash(&obj.spec);
+    let qualified_hash = obj
+        .status
+        .as_ref()
+        .and_then(|status| status.store_qualified_hash.clone());
+    let observation = observe_qualify_job(&jobs, &qualify_name).await?;
+    let decision = qualification_decision(&desired_hash, qualified_hash.as_deref(), &observation);
+
+    // The hash to persist on THIS pass's status: the current inputs once
+    // qualification proceeds, otherwise the last-qualified value unchanged (kept
+    // so an in-flight re-qualification does not drop the record and, with it, the
+    // gate that keeps existing Deployments up while the new inputs qualify).
+    let store_qualified_hash = match &decision {
+        QualificationDecision::Proceed => {
+            extra_conditions.push(condition(
+                "StoreQualified",
+                true,
+                obj.metadata.generation,
+                STORE_QUALIFIED_SUCCEEDED_REASON,
+                STORE_QUALIFIED_MESSAGE,
+            ));
+            Some(desired_hash.clone())
+        }
+        _ => {
+            // Not qualified for the current inputs: create or recreate the Job,
+            // record a `StoreQualified` condition, and return WITHOUT touching
+            // any Deployment. A fresh cluster gets none; a running cluster
+            // re-qualifying after a config edit keeps the ones it has (this pass
+            // never reaches the Deployment apply/sweep below), so a pending
+            // config change does not tear a serving cluster down.
+            let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
+            let (store_qualified_condition, action) = match &decision {
+                QualificationDecision::Qualify { recreate } => {
+                    if *recreate {
+                        // The Job's inputs changed; its pod template is immutable,
+                        // so delete the stale Job (its pods with it) and let the
+                        // next pass observe it absent and create a fresh one.
+                        delete_if_present(&jobs, &qualify_name).await?;
+                    } else {
+                        let mut job = desired_qualify_job(&obj.spec, instance);
+                        job.metadata.namespace = Some(namespace.to_string());
+                        job.metadata.owner_references = owner;
+                        apply(&jobs, &qualify_name, &job).await?;
+                    }
+                    (
+                        condition(
+                            "StoreQualified",
+                            false,
+                            obj.metadata.generation,
+                            STORE_QUALIFIED_PENDING_REASON,
+                            STORE_QUALIFYING_MESSAGE,
+                        ),
+                        Action::requeue(BOOTSTRAP_POLL),
+                    )
+                }
+                QualificationDecision::Waiting => (
+                    condition(
+                        "StoreQualified",
+                        false,
+                        obj.metadata.generation,
+                        STORE_QUALIFIED_PENDING_REASON,
+                        STORE_QUALIFYING_MESSAGE,
+                    ),
+                    Action::requeue(BOOTSTRAP_POLL),
+                ),
+                QualificationDecision::Failed(message) => (
+                    condition(
+                        "StoreQualified",
+                        false,
+                        obj.metadata.generation,
+                        STORE_QUALIFIED_FAILED_REASON,
+                        message,
+                    ),
+                    Action::requeue(RETRY),
+                ),
+                QualificationDecision::Proceed => unreachable!("Proceed handled above"),
+            };
+            extra_conditions.push(store_qualified_condition);
+
+            // Report the readiness a prior pass recorded, so a cluster already
+            // serving through a re-qualification keeps `Available=True` instead of
+            // flipping to "waiting for tiers" on every poll while the new inputs
+            // qualify. A fresh cluster has none of these and reports Available=False.
+            let prior = obj.status.as_ref();
+            write_status(
+                client,
+                namespace,
+                instance,
+                obj.metadata.generation,
+                prior.and_then(|s| s.gateway_ready_replicas),
+                prior.and_then(|s| s.query_ready_replicas),
+                prior.and_then(|s| s.maintain_ready_replicas),
+                None,
+                prior.and_then(|s| s.gc_bootstrap_waiting_since.clone()),
+                qualified_hash,
+                extra_conditions,
+            )
+            .await?;
+            return Ok(action);
+        }
+    };
+
     let token_secret = resolve_token_secret(
         client,
         namespace,
@@ -1385,6 +1513,7 @@ async fn reconcile_inner(
         maintain_ready,
         available_hold.as_ref().map(|(r, m)| (*r, m.as_str())),
         gc_bootstrap_waiting_since,
+        store_qualified_hash,
         extra_conditions,
     )
     .await?;
@@ -1469,6 +1598,29 @@ async fn live_deployment_exists(api: &Api<Deployment>, name: &str) -> Result<boo
     match api.get(name).await {
         Ok(_) => Ok(true),
         Err(err) if is_not_found(&err) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Observe the live qualify Job for a cluster (issue #36): its recorded input
+/// hash (the [`QUALIFY_SPEC_HASH_ANNOTATION`] value, `None` when the annotation
+/// is missing) and its terminal phase, or [`QualifyJobObservation::Absent`] when
+/// no Job exists (a fresh cluster, or one whose finished Job has been
+/// TTL-garbage-collected). A not-found is `Absent`; any other error propagates.
+async fn observe_qualify_job(jobs: &Api<Job>, name: &str) -> Result<QualifyJobObservation, Error> {
+    match jobs.get(name).await {
+        Ok(job) => {
+            let spec_hash = job
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(QUALIFY_SPEC_HASH_ANNOTATION).cloned());
+            Ok(QualifyJobObservation::Present {
+                spec_hash,
+                phase: qualify_job_phase(&job),
+            })
+        }
+        Err(err) if is_not_found(&err) => Ok(QualifyJobObservation::Absent),
         Err(err) => Err(err.into()),
     }
 }
@@ -1580,6 +1732,7 @@ fn build_status(
     maintain_ready: Option<i32>,
     unavailable_reason: Option<(&str, &str)>,
     gc_bootstrap_waiting_since: Option<String>,
+    store_qualified_hash: Option<String>,
     extra_conditions: Vec<Condition>,
 ) -> RavelClusterStatus {
     let available = gateway_ready.unwrap_or(0) > 0 && query_ready.unwrap_or(0) > 0;
@@ -1610,6 +1763,7 @@ fn build_status(
         query_ready_replicas: query_ready,
         maintain_ready_replicas: maintain_ready,
         gc_bootstrap_waiting_since,
+        store_qualified_hash,
         conditions,
     }
 }
@@ -1625,6 +1779,7 @@ fn build_degraded_status(
     reason: &str,
     message: &str,
     gc_bootstrap_waiting_since: Option<String>,
+    store_qualified_hash: Option<String>,
     extra_conditions: Vec<Condition>,
 ) -> RavelClusterStatus {
     let mut conditions = vec![
@@ -1638,6 +1793,7 @@ fn build_degraded_status(
         query_ready_replicas: None,
         maintain_ready_replicas: None,
         gc_bootstrap_waiting_since,
+        store_qualified_hash,
         conditions,
     }
 }
@@ -1658,6 +1814,7 @@ async fn write_status(
     maintain_ready: Option<i32>,
     unavailable_reason: Option<(&str, &str)>,
     gc_bootstrap_waiting_since: Option<String>,
+    store_qualified_hash: Option<String>,
     extra_conditions: Vec<Condition>,
 ) -> Result<(), Error> {
     let status = build_status(
@@ -1667,6 +1824,7 @@ async fn write_status(
         maintain_ready,
         unavailable_reason,
         gc_bootstrap_waiting_since,
+        store_qualified_hash,
         extra_conditions,
     );
     patch_status(client, namespace, instance, &status).await
@@ -1688,6 +1846,7 @@ async fn write_degraded_status(
     reason: &str,
     message: &str,
     gc_bootstrap_waiting_since: Option<String>,
+    store_qualified_hash: Option<String>,
     extra_conditions: Vec<Condition>,
 ) -> Result<(), Error> {
     let status = build_degraded_status(
@@ -1695,6 +1854,7 @@ async fn write_degraded_status(
         reason,
         message,
         gc_bootstrap_waiting_since,
+        store_qualified_hash,
         extra_conditions,
     );
     patch_status(client, namespace, instance, &status).await
@@ -2134,6 +2294,7 @@ mod tests {
             Some(1),
             None,
             None,
+            None,
             extra.clone(),
         );
         assert_eq!(
@@ -2152,8 +2313,14 @@ mod tests {
             deprecated.message
         );
 
-        let degraded =
-            build_degraded_status(Some(7), "SecretNotFound", "no such Secret", None, extra);
+        let degraded = build_degraded_status(
+            Some(7),
+            "SecretNotFound",
+            "no such Secret",
+            None,
+            None,
+            extra,
+        );
         assert_eq!(
             condition_types(&degraded.conditions),
             vec!["Degraded", "Available", "IngestAffinityBackendDeprecated"]
@@ -2209,9 +2376,19 @@ mod tests {
                 "no spec-derived condition, got {:?}",
                 condition_types(&extra)
             );
-            let ok = build_status(Some(2), Some(1), Some(1), None, None, None, extra.clone());
+            let ok = build_status(
+                Some(2),
+                Some(1),
+                Some(1),
+                None,
+                None,
+                None,
+                None,
+                extra.clone(),
+            );
             assert_eq!(condition_types(&ok.conditions), vec!["Available"]);
-            let degraded = build_degraded_status(Some(2), "ReconcileError", "boom", None, extra);
+            let degraded =
+                build_degraded_status(Some(2), "ReconcileError", "boom", None, None, extra);
             assert_eq!(
                 condition_types(&degraded.conditions),
                 vec!["Degraded", "Available"]
@@ -2229,6 +2406,7 @@ mod tests {
             "SecretNotFound",
             "no such Secret",
             Some(since.clone()),
+            None,
             Vec::new(),
         );
         assert_eq!(
@@ -2236,7 +2414,8 @@ mod tests {
             Some(since.as_str()),
             "a transient error must leave the stall clock where it was"
         );
-        let cleared = build_degraded_status(Some(3), "ReconcileError", "boom", None, Vec::new());
+        let cleared =
+            build_degraded_status(Some(3), "ReconcileError", "boom", None, None, Vec::new());
         assert_eq!(cleared.gc_bootstrap_waiting_since, None);
     }
 
@@ -2258,6 +2437,7 @@ mod tests {
                 WAITING_FOR_GC_BOOTSTRAP_REASON,
                 WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
             )),
+            None,
             None,
             vec![condition(
                 "Degraded",
@@ -2292,6 +2472,7 @@ mod tests {
                 GC_BOOTSTRAP_UNAVAILABLE_MESSAGE,
             )),
             None,
+            None,
             vec![condition(
                 "Degraded",
                 true,
@@ -2318,6 +2499,7 @@ mod tests {
                 WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
             )),
             None,
+            None,
             Vec::new(),
         );
         let available = find(&ready.conditions, "Available");
@@ -2334,11 +2516,49 @@ mod tests {
     /// effect, where the old plan withheld the tiers and nothing ever unblocked.
     #[test]
     fn gc_bootstrap_unavailable_clears_once_the_request_serving_tiers_report_ready() {
-        let running = build_status(Some(9), Some(1), Some(1), None, None, None, Vec::new());
+        let running = build_status(
+            Some(9),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
         assert_eq!(condition_types(&running.conditions), vec!["Available"]);
         let available = find(&running.conditions, "Available");
         assert_eq!(available.status, "True");
         assert_eq!(available.reason, "MinimumReplicasAvailable");
+    }
+
+    /// The durable qualified-inputs hash (issue #36) is written into the status
+    /// by both builders, so the qualification gate survives the Job's TTL-GC and
+    /// an operator restart. A dropped field here would silently re-run
+    /// qualification on the next pass.
+    #[test]
+    fn status_builders_carry_the_store_qualified_hash() {
+        let ok = build_status(
+            Some(1),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+            Some("qhash".to_string()),
+            Vec::new(),
+        );
+        assert_eq!(ok.store_qualified_hash.as_deref(), Some("qhash"));
+
+        let degraded = build_degraded_status(
+            Some(1),
+            "ReconcileError",
+            "boom",
+            None,
+            Some("qhash".to_string()),
+            Vec::new(),
+        );
+        assert_eq!(degraded.store_qualified_hash.as_deref(), Some("qhash"));
     }
 
     /// The stall threshold as a signed second count, the unit
@@ -2484,7 +2704,16 @@ mod tests {
         );
         // reconcile therefore builds the status with no wait timestamp and no
         // stall condition.
-        let status = build_status(Some(2), Some(1), Some(1), Some(1), None, None, Vec::new());
+        let status = build_status(
+            Some(2),
+            Some(1),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
         assert_eq!(
             status.gc_bootstrap_waiting_since, None,
             "the timestamp is cleared once not waiting"
