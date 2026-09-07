@@ -17,14 +17,16 @@
 
 mod common;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use common::*;
 use prost::Message;
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::{erasure, record, signal};
 use ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
-use ravel_maintain::erasure_rewrite::{ERASURE_REWRITE_DEADLINE_NS, erasure_seal_wait_bound_ns};
+use ravel_maintain::erasure_rewrite::{
+    ERASURE_REWRITE_DEADLINE_NS, ack_open_ingest_hours, erasure_seal_wait_bound_ns,
+};
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, ErasureRewriteOutcome, FixedClock, LeaseCheck,
     LegalHoldCheck, MaintainMemo, NoLeases, PendingErasureRequest, PublishOutcome, RetentionConfig,
@@ -981,7 +983,15 @@ async fn erasure_tick(store: &dyn ObjectStoreBackend, now_ns: i64) -> ErasureTic
         return tick;
     }
 
-    for hour in scan_hours(store, SHARD).await {
+    // Discovery is the commit-prefix listing UNIONED with the hours open at
+    // each pending request's acknowledgement (issue #1290). The listing misses
+    // an ack hour whose pre-ack flush has not committed yet; deriving it here is
+    // how the completion gate gets to consider that bucket at all. One rule for
+    // "in scope" stays in `bucket_erasure_completion`; this only decides the
+    // bucket is present for it to judge. The server driver unions the same way.
+    let mut hours: BTreeSet<u32> = scan_hours(store, SHARD).await.into_iter().collect();
+    hours.extend(ack_open_ingest_hours(&pending));
+    for hour in hours {
         let b = bucket_at(hour);
         match erasure_rewrite_bucket(store, &clock, &config, &NoLeases, &b, &pending, &mut memo)
             .await
@@ -1410,5 +1420,248 @@ async fn a_bounded_completion_wait_stays_inside_the_erasure_rewrite_deadline() {
         bound < ERASURE_REWRITE_DEADLINE_NS,
         "the worst-case seal wait {bound} must stay inside the {ERASURE_REWRITE_DEADLINE_NS} \
          deadline, or a request that is merely waiting would alarm as stuck"
+    );
+}
+
+// --- Issue #1290, second path: the ack hour is not in the listing yet ---------
+//
+// The tests above build the open bucket WITH a commit record already published,
+// so the commit-prefix listing discovers it and the completion gate is handed
+// it. This half covers the hour whose pre-acknowledgement flush has NOT
+// committed yet: it has no entry in the listing, so a pass that examined only
+// the listed hours would never see it, complete the request, and leave the hour
+// to seal carrying the subject's pre-ack records that no later pass revisits --
+// the same resurrection ADR-0064 section 4 prevents, reached by never
+// discovering the bucket instead of by deferring an examined one.
+
+/// A request acknowledged while its own ingest hour is open completes NOTHING
+/// while that hour is still unlisted -- no commit record has been published into
+/// it yet, so the commit-prefix listing does not return it, yet it is in scope.
+/// The pass derives the ack hour from the request and considers its bucket
+/// anyway, so completion waits instead of writing a `.done` over an hour that
+/// will later seal carrying the subject.
+///
+/// This is the scenario the previous round's tests lacked: they seeded the open
+/// hour's commit record up front, so the listing discovered it. Here the hour is
+/// empty in the listing at the tick.
+///
+/// Flip-line proof: make `ack_open_ingest_hours` return `BTreeSet::new()`
+/// (the pre-#1290 behaviour, where discovery was the listing alone). The
+/// derived hour is then never unioned in, `erasure_tick` examines no bucket,
+/// nothing blocks the request, and the `.done` lands at the acknowledgement --
+/// failing `done_written == 0` and the pending-count assertion below.
+#[tokio::test]
+async fn completion_waits_for_an_undiscovered_bucket_open_at_the_acknowledgement() {
+    let store = MemoryStore::new();
+    let ack = ack_inside_hour();
+    let pending = seed_dreq_at(&store, 0x1294, "victim", ack).await;
+    let request_id = pending.request.request_id.clone();
+
+    // The premise: the commit-prefix listing returns nothing for this shard --
+    // the ack hour's flush has not committed -- yet the request derives it.
+    assert_eq!(
+        scan_hours(&store, SHARD).await,
+        Vec::<u32>::new(),
+        "no commit record exists, so the listing discovers no hour"
+    );
+    assert_eq!(
+        ack_open_ingest_hours(std::slice::from_ref(&pending)),
+        BTreeSet::from([HOUR]),
+        "the request derives its own still-open ingest hour"
+    );
+
+    let tick = erasure_tick(&store, ack).await;
+    assert_eq!(
+        tick.not_sealed, 1,
+        "the derived bucket is the only one examined, and it is unsealed"
+    );
+    assert_eq!(
+        tick.blocked,
+        HashSet::from([request_id]),
+        "the undiscovered open bucket blocks exactly the request whose scope covered it"
+    );
+    assert_eq!(tick.done_written, 0, "no completion is written this tick");
+    assert_eq!(
+        done_keys(&store).await,
+        Vec::<String>::new(),
+        "no .done object exists"
+    );
+    assert_eq!(
+        del_object_keys(&store).await,
+        vec![pending.request_key.clone()],
+        "the erasure prefix holds the .dreq and nothing else"
+    );
+    assert_eq!(
+        pending_erasure_requests(&store, &tenant_hash(), Signal::Metrics)
+            .await
+            .expect("list pending")
+            .len(),
+        1,
+        "the request is still pending, so a later pass revisits it"
+    );
+}
+
+/// The undiscovered open hour later receives its pre-ack commit record, then
+/// seals: a pass rewrites it and the request completes exactly once, with the
+/// subject gone from that hour. This is the full arc the fix protects -- the
+/// request stayed pending across the gap precisely so this rewrite could run.
+///
+/// Flip-line proof: same flipped line as
+/// [`completion_waits_for_an_undiscovered_bucket_open_at_the_acknowledgement`]
+/// (`ack_open_ingest_hours` returning empty). The acknowledgement tick then
+/// writes the `.done` while the hour is empty and unlisted, so the request is no
+/// longer pending when its commit lands; the `done_keys` assertion after the
+/// first tick fails, and the subject the second tick proves gone would instead
+/// be resurrected.
+#[tokio::test]
+async fn completion_lands_once_the_undiscovered_open_hour_commits_and_seals() {
+    let store = MemoryStore::new();
+    let ack = ack_inside_hour();
+    let pending = seed_dreq_at(&store, 0x1295, "victim", ack).await;
+    let request_id = pending.request.request_id.clone();
+
+    // First tick, before any commit exists: the request stays pending.
+    let first = erasure_tick(&store, ack).await;
+    assert_eq!(
+        first.done_written, 0,
+        "nothing completes over an unlisted hour"
+    );
+    assert_eq!(
+        done_keys(&store).await,
+        Vec::<String>::new(),
+        "no .done before the hour's commit even exists"
+    );
+
+    // The pre-ack flush finally publishes its commit record into the ack hour.
+    for spec in metrics_specs() {
+        seed_input(&store, &spec).await;
+    }
+    assert_eq!(
+        scan_hours(&store, SHARD).await,
+        vec![HOUR],
+        "the committed hour is now discoverable from the listing"
+    );
+
+    // At the seal the rewrite lands and the request completes.
+    let seal_ns = hour_seals_at();
+    let sealed = erasure_tick(&store, seal_ns).await;
+    assert!(
+        sealed.blocked.is_empty(),
+        "a sealed and rewritten bucket blocks nothing, got {:?}",
+        sealed.blocked
+    );
+    assert_eq!(sealed.done_written, 1, "the request completes at the seal");
+    let done_key = keys::erasure_completion_key(
+        &tenant_hash(),
+        Signal::Metrics,
+        Uuid::parse_str(&request_id).expect("request uuid"),
+    )
+    .expect("done key");
+    assert_eq!(
+        done_keys(&store).await,
+        vec![done_key.clone()],
+        "exactly one .done, for exactly this request"
+    );
+    let mut expected_prefix_keys = vec![done_key, pending.request_key.clone()];
+    expected_prefix_keys.sort();
+    assert_eq!(
+        del_object_keys(&store).await,
+        expected_prefix_keys,
+        "the erasure prefix holds the .dreq and its .done, nothing more"
+    );
+
+    // The rewritten bucket serves exactly the survivors, sample for sample.
+    let rewrite_key = find_record_key(&store, true).await;
+    let parts = rewrite_part_keys(&store, &rewrite_key).await;
+    assert_eq!(parts.len(), 1, "one rewrite output part, got {parts:?}");
+    let served = object_samples(&store, &parts[0]).await;
+    let keep = raw_series("keep", &[("k", "a")], &[]);
+    let victim = raw_series("victim", &[("k", "b")], &[]);
+    assert_eq!(
+        served,
+        BTreeMap::from([(
+            keep.0.0,
+            vec![(1_000, 1.0f64.to_bits()), (2_000, 2.0f64.to_bits())]
+        )]),
+        "the rewrite output serves exactly the surviving records"
+    );
+    assert!(
+        !served.contains_key(&victim.0.0),
+        "the erased subject is gone from the hour that was open at the ack"
+    );
+
+    // A later pass is a no-op: the request is complete, not re-completed.
+    let again = erasure_tick(&store, seal_ns + NS_PER_HOUR).await;
+    assert_eq!(
+        again.done_written, 0,
+        "a completed request is no longer pending"
+    );
+}
+
+/// The derivation reaches exactly the hour open at the acknowledgement, never a
+/// later one. A hour that opened AFTER the ack -- and holds no commit record --
+/// is neither derived nor listed, so it does not hold completion open, and the
+/// ack hour completes on schedule. This is what keeps the wait bounded to the
+/// single open hour in the derived path, the same bound the sealed-listing tests
+/// pin for the listed path.
+///
+/// Flip-line proof: change `ingest_hour_of` to add one hour (`... + 1`), or make
+/// `ack_open_ingest_hours` also yield `hour + 1`. The derived set becomes
+/// `{HOUR + 1}`, failing the `== {HOUR}` assertion, and the still-open post-ack
+/// hour would then hold completion open past its bound.
+#[tokio::test]
+async fn a_post_ack_hour_with_no_commit_is_never_derived_and_holds_nothing() {
+    let store = MemoryStore::new();
+    for spec in metrics_specs() {
+        seed_input(&store, &spec).await;
+    }
+    let ack = ack_inside_hour();
+    let pending = seed_dreq_at(&store, 0x1296, "victim", ack).await;
+
+    // The derived open-hour set is exactly the ack's own hour.
+    let derived = ack_open_ingest_hours(std::slice::from_ref(&pending));
+    assert_eq!(
+        derived,
+        BTreeSet::from([HOUR]),
+        "only the ack hour is derived"
+    );
+    assert!(
+        !derived.contains(&(HOUR + 1)),
+        "a hour that opens after the ack is never derived"
+    );
+
+    // The gate over that later, still-open, uncommitted hour blocks nothing: it
+    // is out of scope, so it does not hold completion open.
+    let later = bucket_at(HOUR + 1);
+    let seal_ns = hour_seals_at();
+    assert!(
+        !later.is_sealed(seal_ns, &cfg()),
+        "the post-ack hour is still open when the ack hour seals"
+    );
+    let completion = bucket_erasure_completion(
+        &store,
+        &FixedClock::new(seal_ns),
+        &cfg(),
+        &NoLeases,
+        &later,
+        std::slice::from_ref(&pending),
+    )
+    .await
+    .expect("completion gate over the post-ack bucket");
+    assert!(
+        completion.blocked.is_empty(),
+        "a hour that opened after the ack holds nothing in scope, got {:?}",
+        completion.blocked
+    );
+
+    // The ack hour seals and the request completes; nothing was written into
+    // the post-ack hour.
+    let tick = erasure_tick(&store, seal_ns).await;
+    assert_eq!(tick.done_written, 1, "the ack hour completes on schedule");
+    assert_eq!(done_keys(&store).await.len(), 1, "exactly one .done");
+    let (commits, rewrites) = bucket_record_keys(&store, &later).await;
+    assert!(
+        commits.is_empty() && rewrites == 0,
+        "the post-ack hour is untouched, got commits {commits:?} rewrites {rewrites}"
     );
 }
