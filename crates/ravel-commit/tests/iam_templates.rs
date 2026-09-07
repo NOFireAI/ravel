@@ -401,6 +401,168 @@ fn every_role_has_kms_decrypt() {
     }
 }
 
+/// Every statement whose `Action` grants any `kms:` action must not name a
+/// `Resource` that covers every key in the account/region: neither the bare
+/// wildcard `"*"` nor any ARN ending `:key/*`. Pinned as a negation (not an
+/// exact tenant-key ARN) so it survives an operator's post-substitution
+/// value. Widen any of the four templates' KMS `Resource` back to
+/// `arn:aws:kms:us-east-1:111122223333:key/*` and this test fails, naming
+/// the role and the statement `Sid`.
+#[test]
+fn no_kms_statement_grants_every_key_in_the_region() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        for stmt in policy.statements.as_array().unwrap() {
+            let actions: Vec<String> = match &stmt["Action"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                _ => continue,
+            };
+            if !actions
+                .iter()
+                .any(|a| a.to_ascii_lowercase().starts_with("kms:"))
+            {
+                continue;
+            }
+            let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
+            let resources: Vec<String> = match &stmt["Resource"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .map(|v| v.as_str().expect("Resource entry is a string").to_string())
+                    .collect(),
+                other => {
+                    panic!("{role}/{sid}: Resource is neither a string nor an array: {other:?}")
+                }
+            };
+            for resource in &resources {
+                assert!(
+                    resource != "*" && !resource.ends_with(":key/*"),
+                    "{role}: statement {sid:?} grants a kms: action on {resource:?}, \
+                     which covers every key in the account/region"
+                );
+            }
+        }
+    }
+}
+
+/// Every statement whose `Action` grants any `kms:` action must name a
+/// `Resource` that pins a specific key id, so an operator cannot re-widen
+/// the grant to every key by substituting `arn:aws:kms:<region>:<account>:key/*`
+/// (or any other bare-wildcard variant) in place of the placeholder.
+#[test]
+fn every_kms_statement_names_a_key_id() {
+    let key_arn_pattern =
+        regex::Regex::new(r"^arn:aws:kms:[^:]+:[^:]+:key/[^*]+$").expect("valid regex");
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        for stmt in policy.statements.as_array().unwrap() {
+            let actions: Vec<String> = match &stmt["Action"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                _ => continue,
+            };
+            if !actions
+                .iter()
+                .any(|a| a.to_ascii_lowercase().starts_with("kms:"))
+            {
+                continue;
+            }
+            let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
+            let resources: Vec<String> = match &stmt["Resource"] {
+                serde_json::Value::String(s) => vec![s.clone()],
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .map(|v| v.as_str().expect("Resource entry is a string").to_string())
+                    .collect(),
+                other => {
+                    panic!("{role}/{sid}: Resource is neither a string nor an array: {other:?}")
+                }
+            };
+            for resource in &resources {
+                assert!(
+                    key_arn_pattern.is_match(resource),
+                    "{role}: statement {sid:?} resource {resource:?} does not name a \
+                     specific key id (expected arn:aws:kms:<region>:<account>:key/<id>)"
+                );
+            }
+        }
+    }
+}
+
+/// Regression fixture for the case-sensitivity fix above: `KMS:Decrypt` (or any
+/// other capitalization) on `"Resource": "*"` is exactly as fully-permissive as
+/// `kms:Decrypt`, and the case-sensitive `starts_with("kms:")` selection both
+/// guards above used to run would silently skip it -- reporting the templates
+/// safe while a fully-permissive statement sat unexamined. This is not a real
+/// shipped template; it is a synthetic statement built to prove the matcher
+/// itself, independent of what `deploy/iam/*.json` currently contains.
+#[test]
+fn mixed_case_kms_action_is_not_a_bypass() {
+    let stmt = serde_json::json!({
+        "Sid": "MixedCaseFullyPermissive",
+        "Effect": "Allow",
+        "Action": "KMS:Decrypt",
+        "Resource": "*"
+    });
+    let actions: Vec<String> = match &stmt["Action"] {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => vec![],
+    };
+
+    // Observation 1: the pre-fix selection (case-sensitive) misses the
+    // mixed-case action entirely, exactly the hole this test guards against.
+    let selected_before_fix = actions.iter().any(|a| a.starts_with("kms:"));
+    assert!(
+        !selected_before_fix,
+        "fixture invalid: the pre-fix case-sensitive matcher was expected to \
+         miss \"KMS:Decrypt\" -- if it didn't, this fixture no longer proves \
+         the hole existed"
+    );
+
+    // Observation 2: the post-fix selection (lowercased) catches it.
+    let selected_after_fix = actions
+        .iter()
+        .any(|a| a.to_ascii_lowercase().starts_with("kms:"));
+    assert!(
+        selected_after_fix,
+        "fixture invalid: the post-fix matcher should select \"KMS:Decrypt\""
+    );
+
+    // With the statement selected, the real guard's own assertion (resource
+    // != "*" && !resource.ends_with(":key/*")) must now fire on this
+    // fixture's "Resource": "*". Run it through catch_unwind so this test
+    // reports the panic as an assertion result instead of aborting the binary.
+    let resource = stmt["Resource"]
+        .as_str()
+        .expect("Resource is a string")
+        .to_string();
+    let sid = stmt["Sid"].clone();
+    let guard_result = std::panic::catch_unwind(|| {
+        assert!(
+            resource != "*" && !resource.ends_with(":key/*"),
+            "statement {sid:?} grants a kms: action on {resource:?}, which \
+             covers every key in the account/region"
+        );
+    });
+    assert!(
+        guard_result.is_err(),
+        "the guard must reject \"KMS:Decrypt\" on Resource \"*\" once the \
+         statement is selected -- a mixed-case action must not bypass the \
+         no-account-wide-key assertion"
+    );
+}
+
 #[test]
 fn discovery_prefix_admitted_for_every_discovering_role() {
     for role in ROLES_WITH_DISCOVERY {
