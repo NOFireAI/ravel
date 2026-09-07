@@ -319,11 +319,16 @@ is a convenience that builds a private limiter for callers outside an engine
 (the benches). The knob ADR-1195 left for this ADR to name is
 `--store-get-concurrency`.
 
-Two things this amendment does not change. The RLOG whole-object funnel
-(`fetch_accounted` and `whole_object_bytes`) still issues GETs without a
-permit; the ADR-1195 follow-up closes that. And sharing one limiter across
+One thing this amendment does not change: sharing one limiter across
 `ravel-server`'s engines and standalone fetchers lands with the server half of
 ADR-1195; until then the pool is per engine.
+
+The RLOG whole-object funnel (`fetch_accounted` and `whole_object_bytes`) was
+still unpermitted at the time this amendment was written; the ADR-1195
+follow-up has since closed that. Every RLOG GET, whole-object or ranged,
+now takes a permit from the fetcher's `GetLimiter`, and inside `ravel-server`
+that limiter is the one process-wide pool described above
+(`docs/query-engine.md`, "GET concurrency (ADR-1195)").
 
 ## Amendment 2026-08-26 (issue #693 part 3): a footer carried from the plan phase establishes the etag pin on the first data GET
 
