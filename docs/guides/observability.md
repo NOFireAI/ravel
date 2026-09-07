@@ -230,6 +230,15 @@ Labels: `mode`.
 | `ravel_catalog_interlock_violations_total` | Unlisted L0 commit records observed postdating a compaction record in their bucket. |
 | `ravel_catalog_compaction_input_set_conflicts_total` | Buckets observed holding two compaction records with different input_set_hash. |
 | `ravel_catalog_isolation_breach_total` | Hard-failed queries from a HEAD or postings tenant_hash mismatch or an out-of-prefix listing result. |
+| `ravel_catalog_column_stats_cache_refusals_total` | Column-statistics objects served but not cached because one object alone exceeds the whole `--column-stats-cache-max-bytes` budget, so every eligible statement re-downloads it. |
+| `ravel_catalog_column_stats_cache_evictions_total` | Column-statistics cache entries dropped to keep the held bytes within that budget. |
+| `ravel_catalog_column_stats_cache_held_bytes` | Decoded column-statistics bytes the reuse cache currently holds (a gauge). |
+
+A climbing refusal count means the budget is below a single tenant's statistics
+object; a climbing eviction count means it is below the working set of tenants
+this process serves. The first is fixed by raising the flag above the object
+size a refusal's warning names, the second by raising it to hold more tenants at
+once.
 
 The first two counters tally an anomaly the query resolves past. Each
 `ravel_catalog_isolation_breach_total` increment is a query that failed with

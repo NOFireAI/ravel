@@ -912,6 +912,28 @@ pub struct Cli {
     #[arg(long, value_name = "BYTES")]
     pub cache_max_bytes: Option<u64>,
 
+    /// Maximum resident bytes for the column-statistics reuse cache
+    /// (`ravel_catalog::CatalogConfig::column_stats_cache_max_bytes`), the
+    /// per-`(tenant, signal)` cache of decoded `.cstat` objects that fronts the
+    /// stats-object GET on every eligible SQL statement (ADR-0850). A THIRD
+    /// ceiling, independent of `--cache-max-bytes`: it bounds decoded
+    /// statistics, not raw object bytes, and an object larger than the whole
+    /// budget is served but never cached, so a wide-table tenant re-downloads
+    /// it on every query (`ravel_catalog_column_stats_cache_refusals_total`
+    /// climbs and a WARN names the object's size). `0` disables the cache
+    /// entirely. Read at startup only; there is no live resize. Default when
+    /// unset: derived, 2% of MemTotal; reference host (16 cores, 30 GiB):
+    /// 644,245,094. Fallback when MemTotal is unknown: 64 MiB.
+    ///
+    /// Omitted, the value is DERIVED from the host
+    /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
+    /// [`COLUMN_STATS_CACHE_MEMORY_PERCENT`] of `MemTotal` (capped by the
+    /// cgroup memory limit in a container), or
+    /// [`ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES`] (64 MiB) when
+    /// memory cannot be read.
+    #[arg(long, value_name = "BYTES")]
+    pub column_stats_cache_max_bytes: Option<u64>,
+
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
     /// both the query fetcher cache (`store::build_cache`) and the catalog byte
@@ -1755,6 +1777,28 @@ pub const CACHE_MEMORY_PERCENT: u64 = 25;
 /// explicit `--cache-max-bytes` still bounds both caches at that one value.
 pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
 
+/// Share of `MemTotal` the derived `--column-stats-cache-max-bytes` takes, a
+/// THIRD ceiling independent of [`CACHE_MEMORY_PERCENT`] and
+/// [`CATALOG_CACHE_MEMORY_PERCENT`].
+///
+/// Sizing basis: a ClickBench `hits` tenant (about 100 typed columns over 2,617
+/// segments) produced a 500,526,582-byte column-statistics object, and a single
+/// object above the whole budget is refused outright and re-downloaded on every
+/// eligible statement, so the derived budget must clear that figure on the
+/// 30 GiB reference host. 2% is the smallest whole percent that does:
+/// 644,245,094 bytes at the reference `MemTotal` of 32,212,254,720, and
+/// 658,075,893 at the 32,903,794,688 that host's `/proc/meminfo` actually
+/// reports. Both clear 500,526,582 with room for one more such tenant's object
+/// after an in-place replacement, while staying small next to the fetcher
+/// cache's 25% and the SQL pools' 25%/50%: this cache holds decoded statistics
+/// for the tenants a process is actively querying, not a working set that grows
+/// with the corpus.
+///
+/// A budget below one object's size is not silent: the refusal counter climbs
+/// and `ravel_catalog` logs one WARN per `(tenant, signal)` naming the object's
+/// bytes and this budget.
+pub const COLUMN_STATS_CACHE_MEMORY_PERCENT: u64 = 2;
+
 /// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~8 GiB on the
 /// reference host).
 pub const SQL_QUERY_MEMORY_PERCENT: u64 = 25;
@@ -1810,6 +1854,8 @@ pub struct PerformanceFlags {
     pub max_segments: Option<usize>,
     /// `--cache-max-bytes`.
     pub cache_max_bytes: Option<u64>,
+    /// `--column-stats-cache-max-bytes`.
+    pub column_stats_cache_max_bytes: Option<u64>,
     /// `--sql-max-query-bytes`.
     pub sql_max_query_bytes: Option<usize>,
     /// `--sql-tenant-max-bytes`.
@@ -1852,6 +1898,13 @@ pub struct ResolvedPerformanceDefaults {
     /// [`Self::cache_max_bytes`]'s 25%; an explicit `--cache-max-bytes` sets
     /// both equal.
     pub catalog_cache_max_bytes: u64,
+    /// Reaches `CatalogConfig::column_stats_cache_max_bytes`
+    /// (`query::build_catalog`), a THIRD ceiling independent of the two above:
+    /// it bounds decoded ADR-0850 column statistics, not raw object bytes, and
+    /// `--cache-max-bytes` does not couple to it. Derived at
+    /// [`COLUMN_STATS_CACHE_MEMORY_PERCENT`], set verbatim by
+    /// `--column-stats-cache-max-bytes`.
+    pub column_stats_cache_max_bytes: u64,
     /// Reaches `SqlConfig::max_query_bytes`. Never above
     /// [`Self::sql_tenant_max_bytes`].
     pub sql_max_query_bytes: usize,
@@ -1888,6 +1941,7 @@ pub struct PerformanceSources {
     pub max_segments: &'static str,
     pub cache_max_bytes: &'static str,
     pub catalog_cache_max_bytes: &'static str,
+    pub column_stats_cache_max_bytes: &'static str,
     pub sql_max_query_bytes: &'static str,
     pub sql_tenant_max_bytes: &'static str,
     pub query_deadline: &'static str,
@@ -1945,6 +1999,12 @@ fn resolve_knob(
 ///   [`CATALOG_CACHE_MEMORY_PERCENT`] of `MemTotal`, else
 ///   [`DEFAULT_CACHE_MAX_BYTES`]. An explicit `--cache-max-bytes` sets it equal
 ///   to `cache_max_bytes`, preserving the pre-#1141 single-number coupling.
+/// - `column_stats_cache_max_bytes` (ADR-0850 column-statistics reuse cache): a
+///   THIRD ceiling from its own `--column-stats-cache-max-bytes`,
+///   [`COLUMN_STATS_CACHE_MEMORY_PERCENT`] of `MemTotal`, else
+///   [`ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES`]. NOT coupled to
+///   `--cache-max-bytes`: that flag bounds raw object bytes in two LRU byte
+///   caches, this one bounds decoded statistics in a third.
 /// - `sql_max_query_bytes`: [`SQL_QUERY_MEMORY_PERCENT`] of `MemTotal`, else
 ///   [`DEFAULT_SQL_MAX_QUERY_BYTES`].
 /// - `sql_tenant_max_bytes`: [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, else
@@ -2023,6 +2083,23 @@ pub fn resolve_performance_defaults(
             (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
         };
 
+    // A THIRD ceiling, on its own flag: `--cache-max-bytes` bounds raw object
+    // bytes in the two LRU byte caches, this one bounds decoded ADR-0850
+    // statistics, and one number cannot size both (a single stats object can
+    // exceed half a gigabyte on a wide-table tenant).
+    let (column_stats_cache_max_bytes, column_stats_cache_source) =
+        match (flags.column_stats_cache_max_bytes, host.mem_total_bytes) {
+            (Some(n), _) => (n, PERF_SOURCE_FLAG),
+            (None, Some(total)) => (
+                percent_of(total, COLUMN_STATS_CACHE_MEMORY_PERCENT),
+                PERF_SOURCE_DERIVED,
+            ),
+            (None, None) => (
+                ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
+                PERF_SOURCE_FALLBACK,
+            ),
+        };
+
     let (sql_tenant_max_bytes, tenant_source) =
         match (flags.sql_tenant_max_bytes, host.mem_total_bytes) {
             (Some(n), _) => (n, PERF_SOURCE_FLAG),
@@ -2075,6 +2152,7 @@ pub fn resolve_performance_defaults(
         max_segments,
         cache_max_bytes,
         catalog_cache_max_bytes,
+        column_stats_cache_max_bytes,
         sql_max_query_bytes,
         sql_tenant_max_bytes,
         query_deadline,
@@ -2086,6 +2164,7 @@ pub fn resolve_performance_defaults(
             max_segments: segments_source,
             cache_max_bytes: cache_source,
             catalog_cache_max_bytes: catalog_cache_source,
+            column_stats_cache_max_bytes: column_stats_cache_source,
             sql_max_query_bytes: query_bytes_source,
             sql_tenant_max_bytes: tenant_source,
             query_deadline: deadline_source,
@@ -2151,6 +2230,12 @@ impl ResolvedPerformanceDefaults {
             setting = "catalog_cache_max_bytes",
             value = self.catalog_cache_max_bytes,
             source = self.sources.catalog_cache_max_bytes,
+            "performance default resolved"
+        );
+        tracing::info!(
+            setting = "column_stats_cache_max_bytes",
+            value = self.column_stats_cache_max_bytes,
+            source = self.sources.column_stats_cache_max_bytes,
             "performance default resolved"
         );
         // The only line that carries `clamped`: when it is true the value is
@@ -3638,6 +3723,7 @@ impl Cli {
             promql_fetch_fanout: self.promql_fetch_fanout,
             max_segments: self.max_segments,
             cache_max_bytes: self.cache_max_bytes,
+            column_stats_cache_max_bytes: self.column_stats_cache_max_bytes,
             sql_max_query_bytes: self.sql_max_query_bytes,
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
             query_deadline,
@@ -5464,6 +5550,11 @@ mod tests {
         // ceiling from the fetcher cache's 25%, so the pair does not commit
         // 50% of RAM.
         assert_eq!(resolved.catalog_cache_max_bytes, 1_610_612_736);
+        // A third independent ceiling, at its own 2% share.
+        assert_eq!(
+            resolved.column_stats_cache_max_bytes,
+            REFERENCE_COLUMN_STATS_CACHE_MAX_BYTES
+        );
         assert_eq!(resolved.sql_max_query_bytes, 8_053_063_680);
         assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
         assert_eq!(resolved.max_segments, 1_000_000);
@@ -5478,12 +5569,128 @@ mod tests {
             resolved.sources.catalog_cache_max_bytes,
             PERF_SOURCE_DERIVED
         );
+        assert_eq!(
+            resolved.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_DERIVED
+        );
         assert_eq!(resolved.sources.sql_max_query_bytes, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.sources.max_segments, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.sources.query_deadline, PERF_SOURCE_DERIVED);
         assert!(!resolved.sql_max_query_bytes_clamped);
         assert!(!resolved.sql_tenant_max_bytes_raised);
+    }
+
+    /// Issue #1400: the derived column-statistics cache budget on the reference
+    /// host is an exact integer, and it clears the largest stats object that
+    /// host has actually produced. The `>=` half is the point of the whole
+    /// derivation: a budget under one object's size caches nothing for that
+    /// tenant, and the 64 MiB compiled-in default is 7.8 times too small for
+    /// the ClickBench `hits` object.
+    ///
+    /// Both `MemTotal` spellings of the same box are pinned: the nominal 30 GiB
+    /// and the number its `/proc/meminfo` reports. A rule stated as "about
+    /// 600 MB" would be a different rule, so neither is a range.
+    ///
+    /// Prove-the-test: flip `COLUMN_STATS_CACHE_MEMORY_PERCENT` from 2 to 1 and
+    /// the meminfo assertion reads 329,037,946 against the expected
+    /// 658,075,893, and the `>=` assertion fails against 500,526,582.
+    #[test]
+    fn reference_host_column_stats_budget_fits_the_clickbench_stats_object() {
+        let meminfo_host = HostProfile::new(REFERENCE_CORES, Some(REFERENCE_MEMINFO_MEM_BYTES));
+        let resolved = resolve_performance_defaults(meminfo_host, PerformanceFlags::default());
+
+        assert_eq!(
+            resolved.column_stats_cache_max_bytes, 658_075_893,
+            "2% of 32,903,794,688, truncated"
+        );
+        assert!(
+            resolved.column_stats_cache_max_bytes >= CLICKBENCH_HITS_STATS_OBJECT_BYTES,
+            "the derived budget ({}) must admit the 500,526,582-byte ClickBench hits stats \
+             object, or every eligible statement re-downloads it",
+            resolved.column_stats_cache_max_bytes
+        );
+        assert_eq!(
+            resolved.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_DERIVED
+        );
+
+        // The nominal 30 GiB spelling of the same host resolves its own exact
+        // integer, and clears the same object.
+        let nominal = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(
+            nominal.column_stats_cache_max_bytes, 644_245_094,
+            "2% of 32,212,254,720, truncated"
+        );
+        assert!(nominal.column_stats_cache_max_bytes >= CLICKBENCH_HITS_STATS_OBJECT_BYTES);
+
+        // The compiled-in default this replaces could not hold the object: the
+        // derivation is what makes the second call cheap, not the crate default.
+        let crate_default = ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES;
+        assert!(
+            crate_default < CLICKBENCH_HITS_STATS_OBJECT_BYTES,
+            "the 64 MiB crate default ({crate_default}) is below one such object, which is why \
+             the budget is derived"
+        );
+    }
+
+    /// Issue #1400: `--column-stats-cache-max-bytes` wins verbatim over the
+    /// derivation, and `--cache-max-bytes` does NOT reach it. The two byte
+    /// caches share one flag; this third ceiling bounds decoded statistics and
+    /// has its own, so an operator raising the read cache cannot silently
+    /// resize the statistics cache too.
+    ///
+    /// Prove-the-test: make the derivation read `flags.cache_max_bytes` (the
+    /// copy-paste the `catalog_cache_max_bytes` arm invites) and the
+    /// independence assertion reads 4,096 against the expected 644,245,094.
+    #[test]
+    fn column_stats_budget_takes_its_own_flag_only() {
+        let explicit = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                column_stats_cache_max_bytes: Some(1_234_567_890),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(explicit.column_stats_cache_max_bytes, 1_234_567_890);
+        assert_eq!(
+            explicit.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_FLAG
+        );
+        // The other two ceilings are untouched by this flag.
+        assert_eq!(explicit.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES);
+        assert_eq!(explicit.catalog_cache_max_bytes, 1_610_612_736);
+
+        let cache_flag_only = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                cache_max_bytes: Some(4096),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(
+            cache_flag_only.column_stats_cache_max_bytes, REFERENCE_COLUMN_STATS_CACHE_MAX_BYTES,
+            "--cache-max-bytes bounds the two byte caches, never this one"
+        );
+        assert_eq!(
+            cache_flag_only.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_DERIVED
+        );
+
+        // `0` is the disabled sentinel and survives the resolution verbatim: an
+        // operator who typed it must not get the derived budget back.
+        let disabled = resolve_performance_defaults(
+            reference_host(),
+            PerformanceFlags {
+                column_stats_cache_max_bytes: Some(0),
+                ..PerformanceFlags::default()
+            },
+        );
+        assert_eq!(disabled.column_stats_cache_max_bytes, 0);
+        assert_eq!(
+            disabled.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_FLAG
+        );
     }
 
     /// A smaller host gets proportional, safe values from the same rules: 4
@@ -5506,6 +5713,10 @@ mod tests {
         assert_eq!(resolved.cache_max_bytes, 2_147_483_648);
         // Catalog cache is 5% of the same 8 GiB, truncated.
         assert_eq!(resolved.catalog_cache_max_bytes, 429_496_729);
+        // 2% of the same 8 GiB, truncated. Below one ClickBench-scale stats
+        // object: an 8 GiB host cannot cache one, and says so through the
+        // refusal counter and its WARN rather than pretending otherwise.
+        assert_eq!(resolved.column_stats_cache_max_bytes, 171_798_691);
         assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
         assert_eq!(resolved.sql_tenant_max_bytes, 4_294_967_296);
         // The two host-independent rules do not shrink with the host: a
@@ -5544,6 +5755,17 @@ mod tests {
         assert_eq!(resolved.catalog_cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
         assert_eq!(
             resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_FALLBACK
+        );
+        // The column-statistics budget falls back to ravel-catalog's own
+        // compiled-in constant, not to the read caches' 256 MiB.
+        assert_eq!(
+            resolved.column_stats_cache_max_bytes,
+            ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES
+        );
+        assert_eq!(resolved.column_stats_cache_max_bytes, 64 * 1024 * 1024);
+        assert_eq!(
+            resolved.sources.column_stats_cache_max_bytes,
             PERF_SOURCE_FALLBACK
         );
         assert_eq!(resolved.sql_max_query_bytes, DEFAULT_SQL_MAX_QUERY_BYTES);
@@ -6027,6 +6249,19 @@ mod tests {
     const REFERENCE_CACHE_MAX_BYTES: u64 = 8_053_063_680;
     const REFERENCE_SQL_MAX_QUERY_BYTES: usize = 8_053_063_680;
     const REFERENCE_SQL_TENANT_MAX_BYTES: usize = 16_106_127_360;
+    /// [`COLUMN_STATS_CACHE_MEMORY_PERCENT`] of [`REFERENCE_MEM_BYTES`],
+    /// truncated: 32,212,254,720 * 2 / 100.
+    const REFERENCE_COLUMN_STATS_CACHE_MAX_BYTES: u64 = 644_245_094;
+    /// The `MemTotal` the 30 GiB reference host's `/proc/meminfo` actually
+    /// reports (32,132,612 kB). [`REFERENCE_MEM_BYTES`] is the nominal 30 GiB;
+    /// this is the number a derivation running on that box sees, and the one
+    /// the column-statistics budget is sized against.
+    const REFERENCE_MEMINFO_MEM_BYTES: u64 = 32_903_794_688;
+    /// The largest column-statistics object measured on the ClickBench `hits`
+    /// tenant (about 100 typed columns over 2,617 segments). The derived budget
+    /// must exceed this, or the object is refused and re-downloaded on every
+    /// eligible statement.
+    const CLICKBENCH_HITS_STATS_OBJECT_BYTES: u64 = 500_526_582;
 
     /// The reference [`HostProfile`], injected.
     fn reference_host() -> HostProfile {

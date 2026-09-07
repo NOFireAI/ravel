@@ -1364,6 +1364,21 @@ pub struct CatalogCountersSnapshot {
     /// tenant_hash mismatch or an out-of-prefix listing result. Unlike the
     /// two counters above, each of these also failed its query.
     pub isolation_breaches: u64,
+    /// ADR-0850 column-statistics cache: objects refused outright because one
+    /// alone exceeds the whole `--column-stats-cache-max-bytes` budget. Each
+    /// refusal means the object is served but never cached, so every eligible
+    /// statement re-downloads it. Distinct from an eviction below: the fix is
+    /// raising the budget above a single object, not above the working set.
+    pub column_stats_cache_refusals: u64,
+    /// ADR-0850 column-statistics cache: entries the byte budget dropped to
+    /// stay within it. A climbing value means the budget is below the working
+    /// set of tenants this process serves.
+    pub column_stats_cache_evictions: u64,
+    /// ADR-0850 column-statistics cache: bytes currently held. A GAUGE, not a
+    /// counter (it falls on an eviction or an idle-tenant sweep), rendered
+    /// without a `_total` suffix for that reason; it rides in this snapshot
+    /// because it is read from the same `Catalog` at the same scrape.
+    pub column_stats_cache_held_bytes: u64,
 }
 
 fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCountersSnapshot) {
@@ -1404,6 +1419,46 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_isolation_breach_total",
         &[Label::Mode(mode)],
         snapshot.isolation_breaches,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_column_stats_cache_refusals_total",
+        "Column-statistics objects served but not cached because one object alone exceeds the whole --column-stats-cache-max-bytes budget, so every eligible statement re-downloads it (ADR-0850).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_cache_refusals_total",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_cache_refusals,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_column_stats_cache_evictions_total",
+        "Column-statistics cache entries dropped to keep the held bytes within --column-stats-cache-max-bytes (ADR-0850).",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_cache_evictions_total",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_cache_evictions,
+    );
+
+    // A gauge: it falls on an eviction or an idle-tenant sweep, so no `_total`.
+    write_header(
+        out,
+        "ravel_catalog_column_stats_cache_held_bytes",
+        "Decoded column-statistics bytes currently held by the reuse cache, bounded by --column-stats-cache-max-bytes (ADR-0850).",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_cache_held_bytes",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_cache_held_bytes,
     );
 }
 
@@ -3867,6 +3922,9 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         interlock_violations: state.catalog.interlock_violations(),
         compaction_input_set_conflicts: state.catalog.compaction_input_set_conflicts(),
         isolation_breaches: state.catalog.isolation_breaches(),
+        column_stats_cache_refusals: state.catalog.column_stats_cache_refusals(),
+        column_stats_cache_evictions: state.catalog.column_stats_cache_evictions(),
+        column_stats_cache_held_bytes: state.catalog.column_stats_cache_held_bytes(),
     };
 
     let maintain_snapshot =
@@ -4506,6 +4564,7 @@ mod tests {
             interlock_violations: 1,
             compaction_input_set_conflicts: 2,
             isolation_breaches: 3,
+            ..Default::default()
         };
         let body = render(
             Mode::Gateway,
@@ -5052,6 +5111,7 @@ mod tests {
             interlock_violations: 0,
             compaction_input_set_conflicts: 0,
             isolation_breaches: 5,
+            ..Default::default()
         };
         let body = render(
             Mode::Gateway,
@@ -5086,6 +5146,68 @@ mod tests {
             body.contains("ravel_catalog_isolation_breach_total{mode=\"gateway\"} 5"),
             "isolation-breach counter must render its current value:\n{body}"
         );
+    }
+
+    /// Issue #1400: the column-statistics cache's two counters and its
+    /// held-bytes gauge render with their exact values and their declared
+    /// types. Exact samples, not substring presence of the family name: a
+    /// renderer that emitted the header and no sample would pass that.
+    ///
+    /// Prove-the-test: source `column_stats_cache_held_bytes` from
+    /// `column_stats_cache_evictions()` in `metrics_handler` (the copy-paste
+    /// the three adjacent accessors invite) and the gauge assertion reads 4
+    /// against the expected 1,048,576.
+    #[test]
+    fn column_stats_cache_counters_render_at_metrics() {
+        let catalog = CatalogCountersSnapshot {
+            column_stats_cache_refusals: 7,
+            column_stats_cache_evictions: 4,
+            column_stats_cache_held_bytes: 1_048_576,
+            ..Default::default()
+        };
+        let body = render(
+            Mode::Query,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+        );
+
+        for expected in [
+            "ravel_catalog_column_stats_cache_refusals_total{mode=\"query\"} 7",
+            "ravel_catalog_column_stats_cache_evictions_total{mode=\"query\"} 4",
+            "ravel_catalog_column_stats_cache_held_bytes{mode=\"query\"} 1048576",
+            "# TYPE ravel_catalog_column_stats_cache_refusals_total counter",
+            "# TYPE ravel_catalog_column_stats_cache_evictions_total counter",
+            // A gauge: held bytes fall on an eviction or an idle-tenant sweep.
+            "# TYPE ravel_catalog_column_stats_cache_held_bytes gauge",
+        ] {
+            assert!(
+                body.contains(expected),
+                "missing {expected} from the exposition:\n{body}"
+            );
+        }
     }
 
     #[test]

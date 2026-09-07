@@ -197,6 +197,12 @@ struct ColumnStatsCacheState {
     /// Monotonic access counter; the next recency stamp. Incremented on every
     /// lookup and insert so `last_used` totally orders the entries by recency.
     tick: u64,
+    /// Keys whose refusal has already been logged. A refused object is refused
+    /// again on every eligible query until the budget or the object changes, so
+    /// the WARN is emitted once per key rather than once per query.
+    /// [`ColumnStatsCache::evict_tenants`] clears a tenant's marks with its
+    /// entries, so a tenant that comes back after an idle sweep warns again.
+    warned_refusals: HashSet<(TenantHash, Signal)>,
 }
 
 impl ColumnStatsCache {
@@ -207,6 +213,7 @@ impl ColumnStatsCache {
                 entries: HashMap::new(),
                 held_bytes: 0,
                 tick: 0,
+                warned_refusals: HashSet::new(),
             }),
             evictions: AtomicU64::new(0),
             refusals: AtomicU64::new(0),
@@ -240,6 +247,13 @@ impl ColumnStatsCache {
     /// existing entry for `key`. An object larger than the whole budget is not
     /// cached (a `refusals` bump); it is still returned to the caller by
     /// `load_column_stats`, so refusing to cache never changes an answer.
+    ///
+    /// A refusal also emits one WARN per `key`, naming the object's bytes and
+    /// the budget: it is the only signal an operator gets that a wide-table
+    /// tenant is re-downloading its whole stats object on every query, and the
+    /// fix (raise the budget) needs both numbers. Once per key, not once per
+    /// call, because the condition holds for every query until the budget or
+    /// the object changes.
     fn insert(
         &self,
         key: (TenantHash, Signal),
@@ -262,6 +276,21 @@ impl ColumnStatsCache {
         // nothing. The caller still gets the object; it is just not cached.
         if bytes > self.max_bytes {
             self.refusals.fetch_add(1, Ordering::Relaxed);
+            let first_refusal = state.warned_refusals.insert(key);
+            // Log outside the state lock: a subscriber's work is unbounded and
+            // every `get`/`insert` on any tenant contends on this one mutex.
+            drop(state);
+            if first_refusal {
+                tracing::warn!(
+                    tenant = %key.0.to_hex(),
+                    signal = ?key.1,
+                    heap_bytes = bytes,
+                    budget_bytes = self.max_bytes,
+                    "column-statistics object exceeds the whole cache budget: it is served but \
+                     never cached, so every eligible query re-fetches it. Raise \
+                     --column-stats-cache-max-bytes above the object's heap_bytes."
+                );
+            }
             return;
         }
 
@@ -300,6 +329,10 @@ impl ColumnStatsCache {
     /// Drop every entry whose tenant is in `idle`, refunding its bytes. Called
     /// from [`Catalog::evict_idle_tenants`] alongside the other per-tenant
     /// caches; an idle-tenant drop is not counted as a budget eviction.
+    ///
+    /// The refusal warn-once marks are swept with the entries: a tenant that
+    /// went idle and came back is new state, and its operator has to be able to
+    /// see the refusal again.
     fn evict_tenants(&self, idle: &[TenantHash]) {
         let mut state = self.state.lock();
         let mut freed = 0u64;
@@ -312,6 +345,9 @@ impl ColumnStatsCache {
             }
         });
         state.held_bytes = state.held_bytes.saturating_sub(freed);
+        state
+            .warned_refusals
+            .retain(|(tenant, _)| !idle.contains(tenant));
     }
 
     fn evictions(&self) -> u64 {
@@ -1138,7 +1174,10 @@ impl Catalog {
     /// object alone exceeds the whole byte budget, so no eviction could make
     /// room and the object was served but not cached. Distinct from an
     /// eviction: it means the budget is below a SINGLE object's size, not merely
-    /// below the working set. `0` when the cache is disabled.
+    /// below the working set. `0` when the cache is disabled. Each distinct
+    /// `(tenant, signal)` that hits this also logs one WARN naming the object's
+    /// bytes and the budget, so the number to raise the budget to is in the log
+    /// rather than only in this counter's rate.
     pub fn column_stats_cache_refusals(&self) -> u64 {
         self.column_stats_cache
             .as_ref()
@@ -7186,6 +7225,14 @@ mod tests {
         );
     }
 
+    /// The exact wire size of each object [`install_stats`] wrote, so a test can
+    /// assert the bytes a load transfers to the byte rather than to a band.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct InstalledStatsSizes {
+        head_bytes: u64,
+        stats_bytes: u64,
+    }
+
     /// Write a folded HEAD plus its `.cstat` object for `tenant`/`signal`, whose
     /// one segment carries a single I64 `status` column with the exact value
     /// `value` (min == max == `value`, one non-null row). `part_hash` binds the
@@ -7193,14 +7240,15 @@ mod tests {
     /// calls keeps the part binding fixed so a re-resolve is driven purely by
     /// the stats object's content hash changing with `value`. The object keys
     /// are namespaced by tenant hex and signal prefix so distinct
-    /// `(tenant, signal)` installs never collide in one store.
+    /// `(tenant, signal)` installs never collide in one store. Returns each
+    /// written object's exact size.
     async fn install_stats(
         store: &MemoryStore,
         tenant: TenantHash,
         signal: Signal,
         part_hash: [u8; 32],
         value: i64,
-    ) {
+    ) -> InstalledStatsSizes {
         let signal_num = signal::to_proto(signal) as u32;
         let prefix = signal.key_prefix();
 
@@ -7277,6 +7325,10 @@ mod tests {
             column_stats_part: None,
         };
         let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        let sizes = InstalledStatsSizes {
+            head_bytes: head_bytes.len() as u64,
+            stats_bytes: stats_bytes.len() as u64,
+        };
         store
             .put(
                 &crate::fold::head_object_key(&tenant, signal),
@@ -7285,12 +7337,17 @@ mod tests {
             )
             .await
             .expect("put head");
+        sizes
     }
 
     /// [`install_stats`] for the default [`tenant`] on `Signal::Logs`, the
     /// fixture the issue #888 reuse tests were written against.
-    async fn install_logs_stats(store: &MemoryStore, part_hash: [u8; 32], value: i64) {
-        install_stats(store, tenant(), Signal::Logs, part_hash, value).await;
+    async fn install_logs_stats(
+        store: &MemoryStore,
+        part_hash: [u8; 32],
+        value: i64,
+    ) -> InstalledStatsSizes {
+        install_stats(store, tenant(), Signal::Logs, part_hash, value).await
     }
 
     /// The exact I64 `status` value carried by the one segment of a loaded
@@ -7630,5 +7687,366 @@ mod tests {
             "the covered part set is unchanged by eviction"
         );
         assert_eq!(loaded_value(&reloaded_a), 42, "and carry tenant A's value");
+    }
+
+    /// Every WARN message a test-scoped subscriber saw, for the refusal
+    /// warn-once assertions. Message text only: the fields ride on the same
+    /// event and the tests match on the message.
+    #[derive(Clone, Default)]
+    struct WarnCapture {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WarnCapture {
+        /// How many captured WARNs carry `needle` in their message.
+        fn count_containing(&self, needle: &str) -> usize {
+            self.messages
+                .lock()
+                .iter()
+                .filter(|message| message.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = MessageVisitor(None);
+            event.record(&mut visitor);
+            if let Some(message) = visitor.0 {
+                self.messages.lock().push(message);
+            }
+        }
+    }
+
+    struct MessageVisitor(Option<String>);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    /// The substring every refusal WARN carries, matched by the warn-once tests.
+    const REFUSAL_WARN: &str = "column-statistics object exceeds the whole cache budget";
+
+    /// Load `tenant`'s logs statistics once through a cache-disabled catalog, to
+    /// learn the exact `heap_bytes` a budget has to clear. Charges nothing to
+    /// any counter the caller then asserts on: the returned catalog is dropped.
+    async fn measure_stats_heap_bytes(store: Arc<MemoryStore>, tenant: &TenantHash) -> u64 {
+        let disabled = Catalog::new(
+            store,
+            CatalogConfig {
+                shard_count: 8,
+                column_stats_cache_max_bytes: 0,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+        disabled
+            .load_column_stats(tenant, Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok")
+            .expect("stats present")
+            .heap_bytes()
+    }
+
+    /// Issue #1400, the claim the budget exists to make true: with a budget that
+    /// ADMITS the object, the second `load_column_stats` against an unchanged
+    /// folded HEAD costs exactly ONE GET (the HEAD) and moves ZERO stats-object
+    /// bytes. Exact counts and exact bytes, both sides: the fixture's own
+    /// object sizes, so "zero stats bytes" is the arithmetic difference between
+    /// the two calls, not an inference.
+    ///
+    /// Prove-the-test: this is `load_column_stats`'s cache-hit early return
+    /// (`if let Some(stats) = cache_hit { return Ok(Some(stats)); }`). Set the
+    /// budget below `heap_bytes` -- which is what the pre-#1400 64 MiB default
+    /// does on a real wide-table tenant, whose object runs to 500 MB -- and
+    /// `insert` refuses, the second call misses, and the GET assertion reads 2
+    /// against the expected 1 while the byte assertion reads
+    /// `head_bytes + stats_bytes` against the expected `head_bytes`. The
+    /// companion test below pins exactly that failing shape.
+    #[tokio::test]
+    async fn second_load_costs_one_get_and_zero_stats_bytes_when_the_object_fits() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        let sizes = install_logs_stats(&store, part_hash, 42).await;
+        let heap_bytes = measure_stats_heap_bytes(store.clone(), &tenant()).await;
+
+        // Exactly the object's own weight: the boundary the admission rule
+        // allows (`bytes > max_bytes` refuses, so `bytes == max_bytes` fits).
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 8,
+                column_stats_cache_max_bytes: heap_bytes,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+
+        let acc1 = QueryAccounting::new();
+        let first = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc1)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        let snap1 = acc1.snapshot();
+        assert_eq!(
+            snap1.s3_requests(AccountedOp::Get),
+            2,
+            "the first load pays the HEAD GET and the stats-object GET"
+        );
+        assert_eq!(
+            snap1.s3_bytes(AccountedOp::Get),
+            sizes.head_bytes + sizes.stats_bytes,
+            "and transfers both objects in full"
+        );
+
+        let acc2 = QueryAccounting::new();
+        let second = catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc2)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        let snap2 = acc2.snapshot();
+        assert_eq!(
+            snap2.s3_requests(AccountedOp::Get),
+            1,
+            "the second load reads only HEAD: the stats object is served from cache"
+        );
+        assert_eq!(
+            snap2.s3_bytes(AccountedOp::Get),
+            sizes.head_bytes,
+            "and moves the HEAD's bytes only"
+        );
+        assert_eq!(
+            snap1.s3_bytes(AccountedOp::Get) - snap2.s3_bytes(AccountedOp::Get),
+            sizes.stats_bytes,
+            "the whole difference between the two calls is the stats object, so the second \
+             call moved zero of its bytes"
+        );
+
+        assert_eq!(
+            catalog.column_stats_cache_refusals(),
+            0,
+            "an object at the budget is admitted, never refused"
+        );
+        assert_eq!(catalog.column_stats_cache_evictions(), 0);
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            heap_bytes,
+            "the cache holds exactly the one object's bytes"
+        );
+        assert_eq!(loaded_value(&first), 42);
+        assert_eq!(
+            loaded_value(&second),
+            42,
+            "the cached object is the same one"
+        );
+    }
+
+    /// Issue #1400, the failing side of the same claim: one byte under the
+    /// object's weight and NOTHING is cached, so the second load pays both GETs
+    /// and both objects' bytes again, and the refusal counter reads the number
+    /// of loads. This is the shape a real wide-table tenant had under the
+    /// pre-#1400 compiled-in 64 MiB budget.
+    ///
+    /// Prove-the-test: drop the `bytes > self.max_bytes` guard in
+    /// `ColumnStatsCache::insert` and the object is admitted anyway, so the
+    /// second call's GET assertion reads 1 against the expected 2 and
+    /// `refusals()` reads 0 against the expected 1.
+    #[tokio::test]
+    async fn second_load_repays_both_gets_when_the_object_exceeds_the_budget() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        let sizes = install_logs_stats(&store, part_hash, 42).await;
+        let heap_bytes = measure_stats_heap_bytes(store.clone(), &tenant()).await;
+
+        // One byte under the object: no eviction can ever make room.
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 8,
+                column_stats_cache_max_bytes: heap_bytes - 1,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+
+        let acc1 = QueryAccounting::new();
+        catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc1)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(acc1.snapshot().s3_requests(AccountedOp::Get), 2);
+        assert_eq!(
+            acc1.snapshot().s3_bytes(AccountedOp::Get),
+            sizes.head_bytes + sizes.stats_bytes
+        );
+        assert_eq!(
+            catalog.column_stats_cache_refusals(),
+            1,
+            "the first load's object is refused"
+        );
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            0,
+            "a refused object is served but never held"
+        );
+
+        let acc2 = QueryAccounting::new();
+        catalog
+            .load_column_stats(&tenant(), Signal::Logs, &acc2)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            acc2.snapshot().s3_requests(AccountedOp::Get),
+            2,
+            "nothing was cached, so the second load re-fetches the stats object"
+        );
+        assert_eq!(
+            acc2.snapshot().s3_bytes(AccountedOp::Get),
+            sizes.head_bytes + sizes.stats_bytes,
+            "and pays the whole object's bytes a second time"
+        );
+        assert_eq!(
+            catalog.column_stats_cache_refusals(),
+            2,
+            "one refusal per load: the condition is permanent until the budget changes"
+        );
+        assert_eq!(
+            catalog.column_stats_cache_evictions(),
+            0,
+            "a refusal is not an eviction"
+        );
+    }
+
+    /// Issue #1400 deliverable 3: a refusal is a permanent condition until the
+    /// budget changes, so it logs ONCE per `(tenant, signal)`, not once per
+    /// query. Three consecutive loads against an over-budget object emit one
+    /// WARN while the refusal counter reads 3.
+    ///
+    /// Prove-the-test: drop the `state.warned_refusals.insert(key)` guard in
+    /// `ColumnStatsCache::insert` and the first assertion reads 3 against the
+    /// expected 1.
+    #[tokio::test]
+    async fn refused_column_stats_warns_once_per_tenant_signal() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        install_logs_stats(&store, part_hash, 42).await;
+        let heap_bytes = measure_stats_heap_bytes(store.clone(), &tenant()).await;
+
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 8,
+                column_stats_cache_max_bytes: heap_bytes - 1,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        for _ in 0..3 {
+            catalog
+                .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+                .await
+                .expect("load ok")
+                .expect("stats present");
+        }
+        assert_eq!(
+            catalog.column_stats_cache_refusals(),
+            3,
+            "every load is refused: the counter is per-load, unlike the log"
+        );
+        assert_eq!(
+            capture.count_containing(REFUSAL_WARN),
+            1,
+            "the refusal warns once, not once per query"
+        );
+    }
+
+    /// Issue #1400 deliverable 3, the other half: the warn-once mark is swept
+    /// with the tenant, so a tenant that went idle and came back warns again.
+    /// Without the sweep an operator who fixed nothing would see the condition
+    /// reported once per process lifetime.
+    ///
+    /// Prove-the-test: drop the `state.warned_refusals.retain(...)` line from
+    /// `ColumnStatsCache::evict_tenants` and the post-sweep assertion reads 1
+    /// against the expected 2.
+    #[tokio::test]
+    async fn refusal_warn_repeats_after_the_idle_tenant_sweep() {
+        let store = Arc::new(MemoryStore::new());
+        let part_hash = *blake3::hash(b"part-0").as_bytes();
+        install_logs_stats(&store, part_hash, 42).await;
+        let heap_bytes = measure_stats_heap_bytes(store.clone(), &tenant()).await;
+
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 8,
+                column_stats_cache_max_bytes: heap_bytes - 1,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        // A resolve stamps the tenant's last-touch, which is what
+        // `evict_idle_tenants` sweeps on; `load_column_stats` does not.
+        let t0 = 500_000 * NS_PER_HOUR;
+        let ttl_ns = 100 * NS_PER_HOUR;
+        let range = TimeRange {
+            start_ns: t0 - 1_000,
+            end_ns: t0,
+        };
+        catalog
+            .resolve(&tenant(), Signal::Logs, range, &[], t0)
+            .await
+            .expect("resolve stamps the tenant's activity");
+
+        catalog
+            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(capture.count_containing(REFUSAL_WARN), 1);
+
+        let evicted = catalog.evict_idle_tenants(t0 + ttl_ns + 1, ttl_ns);
+        assert_eq!(evicted, 1, "the sweep found the idle tenant");
+
+        catalog
+            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            capture.count_containing(REFUSAL_WARN),
+            2,
+            "the sweep dropped the warn-once mark with the tenant's state"
+        );
     }
 }

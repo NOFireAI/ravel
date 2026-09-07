@@ -503,6 +503,27 @@ SQL memory pools may exceed physical RAM by design (the caches fill only under a
 working set that large, and a SQL query aborts rather than growing past its own
 pool). `--disable-cache` turns both off and holds no read-cache memory.
 
+A third cache sits beside those two and is bounded separately by
+`--column-stats-cache-max-bytes`: the column-statistics reuse cache, which holds
+the decoded per-segment statistics for each tenant and signal so a repeated
+query against an unchanged folded snapshot reads the snapshot head and nothing
+else. It bounds decoded statistics rather than raw object bytes, so
+`--cache-max-bytes` does not size it and `--disable-cache` does not turn it off;
+unset, it derives to 2% of MemTotal (`644245094` on the 30 GB reference host),
+and `0` disables it. A single statistics object grows with a tenant's declared
+typed columns times its live segments and can reach hundreds of megabytes on a
+wide table, which is what the budget has to clear. When one object is larger
+than the whole budget it is **refused**: the query still gets correct
+statistics, but the object is never cached, so every eligible statement
+downloads it again. A refusal increments
+`ravel_catalog_column_stats_cache_refusals_total` and logs one warning per
+tenant and signal naming the object's size and the budget; raise the flag above
+that size. Evictions
+(`ravel_catalog_column_stats_cache_evictions_total`) mean something different:
+the budget is below the working set of tenants this process serves, not below
+one object. `ravel_catalog_column_stats_cache_held_bytes` reports what the cache
+currently holds.
+
 The disk tier is disposable by design. The directory is created lazily on first
 admission and is never required to exist. A missing, full or corrupt cache
 directory degrades to a store read, never to a query error, so a node whose
@@ -1028,9 +1049,11 @@ A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
 `--sql-partition-count`, or `--promql-fetch-fanout` is a startup error naming
 that flag, raised before any fetcher, engine, or SQL session exists.
 
-Two more settings are derived the same way: `--cache-max-bytes` (fetcher cache
+Three more settings are derived the same way: `--cache-max-bytes` (fetcher cache
 80% of MemTotal, catalog byte cache a separate 5% ceiling, 256 MiB each if
-memory is unknown; an explicit flag bounds both at that one value) and
+memory is unknown; an explicit flag bounds both at that one value),
+`--column-stats-cache-max-bytes` (2% of MemTotal, 64 MiB if memory is unknown;
+its own flag, uncoupled from `--cache-max-bytes`) and
 `--gc-max-query-duration` (11 minutes). Memory is read from `/proc/meminfo`'s
 `MemTotal` on Linux and is "unknown" everywhere else; cores come from the
 process's available parallelism, floored at 1. Percentages truncate.
@@ -1057,6 +1080,7 @@ INFO performance default resolved setting="promql_fetch_fanout" value=32 source=
 INFO performance default resolved setting="max_segments" value=1000000 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
 INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"
+INFO performance default resolved setting="column_stats_cache_max_bytes" value=644245094 source="derived"
 INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived"
 INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived"
 INFO performance default resolved setting="gc_max_query_duration" value=660 source="derived"

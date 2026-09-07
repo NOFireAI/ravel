@@ -71,6 +71,7 @@ fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
         disable_cache: false,
         cache_max_bytes: 256 * 1024 * 1024,
         catalog_cache_max_bytes: 256 * 1024 * 1024,
+        column_stats_cache_max_bytes: 64 * 1024 * 1024,
         cache_dir: None,
         catalog_resolve_concurrency: None,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,

@@ -115,6 +115,49 @@ pub fn build_catalog(
     cache_dir: Option<PathBuf>,
     resolve_get_concurrency: Option<usize>,
 ) -> anyhow::Result<Arc<Catalog>> {
+    build_catalog_with_column_stats_budget(
+        store,
+        shard_count,
+        disable_cache,
+        cache_max_bytes,
+        ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
+        cache_dir,
+        resolve_get_concurrency,
+    )
+}
+
+/// [`build_catalog`] plus the ADR-0850 column-statistics cache budget, the
+/// form the server's own startup uses.
+///
+/// `column_stats_cache_max_bytes` is the resolved
+/// `--column-stats-cache-max-bytes`
+/// ([`crate::config::ResolvedPerformanceDefaults::column_stats_cache_max_bytes`]).
+/// It is a THIRD ceiling, not a share of `cache_max_bytes`: that number bounds
+/// raw object bytes in two LRU byte caches, this one bounds decoded per-segment
+/// statistics in the cache that fronts `Catalog::load_column_stats`. A single
+/// such object runs to hundreds of megabytes on a wide-table tenant, so a
+/// budget below it means every eligible statement re-downloads the object;
+/// `ravel_catalog_column_stats_cache_refusals_total` and a per-`(tenant,
+/// signal)` WARN report that. `0` disables the cache.
+///
+/// `--disable-cache` does NOT reach it: that flag turns off the ADR-0046 read
+/// caches, which hold raw object bytes; this cache holds decoded statistics on
+/// the query path and is governed by its own budget alone.
+///
+/// [`build_catalog`] keeps `ravel_catalog`'s compiled-in default here, which is
+/// what the crate's own `CatalogConfig::default()` would have produced anyway,
+/// so the many test call sites that do not care about this budget are
+/// unaffected.
+#[allow(clippy::too_many_arguments)]
+pub fn build_catalog_with_column_stats_budget(
+    store: Arc<dyn ObjectStoreBackend>,
+    shard_count: u32,
+    disable_cache: bool,
+    cache_max_bytes: u64,
+    column_stats_cache_max_bytes: u64,
+    cache_dir: Option<PathBuf>,
+    resolve_get_concurrency: Option<usize>,
+) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
     // --disable-cache into a `None` fetcher cache.
@@ -122,6 +165,7 @@ pub fn build_catalog(
     let mut catalog_config = CatalogConfig {
         shard_count,
         byte_cache_max_bytes,
+        column_stats_cache_max_bytes,
         ..CatalogConfig::default()
     };
     // `None` leaves ravel-catalog's own default (currently 128) as the sole
@@ -476,6 +520,78 @@ mod catalog_cache_tests {
             catalog.config().byte_cache_max_bytes,
             0,
             "the disabled catalog config carries the byte-cache disable sentinel"
+        );
+    }
+
+    /// Issue #1400 reachability: the derived
+    /// `--column-stats-cache-max-bytes` is the number
+    /// `CatalogConfig::column_stats_cache_max_bytes` carries, through the same
+    /// argument `crate::start` passes
+    /// (`ServerConfig::column_stats_cache_max_bytes`, which `main` fills from
+    /// `ResolvedPerformanceDefaults::column_stats_cache_max_bytes`). It is a
+    /// THIRD ceiling: neither `--cache-max-bytes` nor `--disable-cache` moves
+    /// it, since it bounds decoded statistics rather than raw object bytes.
+    ///
+    /// Prove-the-test: revert the `column_stats_cache_max_bytes` field in
+    /// `build_catalog_with_column_stats_budget`'s `CatalogConfig` literal to
+    /// the `..CatalogConfig::default()` fallthrough and the first assertion
+    /// reads 67,108,864 against the expected 644,245,094.
+    #[test]
+    fn the_derived_column_stats_budget_reaches_the_catalog_config() {
+        use clap::Parser;
+
+        use crate::config::HostProfile;
+
+        let cli = crate::Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let resolved = cli
+            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .expect("performance defaults resolve");
+        assert_eq!(resolved.column_stats_cache_max_bytes, 644_245_094);
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog_with_column_stats_budget(
+            store,
+            1,
+            cli.disable_cache,
+            resolved.catalog_cache_max_bytes,
+            resolved.column_stats_cache_max_bytes,
+            cli.cache_dir.clone(),
+            None,
+        )
+        .expect("catalog builds");
+        assert_eq!(
+            catalog.config().column_stats_cache_max_bytes,
+            644_245_094,
+            "the column-statistics cache must be bounded by the derived 2% of MemTotal, not the \
+             compiled-in 64 MiB"
+        );
+
+        // `--disable-cache` governs the ADR-0046 byte caches only: the
+        // statistics cache keeps its own budget, and a deployment that turns
+        // the read caches off does not silently start re-downloading a
+        // half-gigabyte statistics object on every statement.
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let disabled = build_catalog_with_column_stats_budget(
+            store,
+            1,
+            true,
+            resolved.catalog_cache_max_bytes,
+            resolved.column_stats_cache_max_bytes,
+            None,
+            None,
+        )
+        .expect("catalog builds");
+        assert_eq!(disabled.config().byte_cache_max_bytes, 0);
+        assert_eq!(disabled.config().column_stats_cache_max_bytes, 644_245_094);
+
+        // The six-argument `build_catalog` keeps ravel-catalog's own default,
+        // which is what its `..CatalogConfig::default()` produced before this
+        // budget was threaded through.
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let defaulted = build_catalog(store, 1, false, 4096, None, None).expect("catalog builds");
+        assert_eq!(
+            defaulted.config().column_stats_cache_max_bytes,
+            ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES
         );
     }
 
