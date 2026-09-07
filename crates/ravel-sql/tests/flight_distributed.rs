@@ -933,7 +933,7 @@ async fn multi_endpoint_tickets_partition_pinned_snapshot() {
     let (service, executor, tenant) = service_over_two_shards().await;
 
     // The whole pinned segment set, resolved once as the source of truth.
-    let (snapshot, estimate) = executor
+    let (snapshot, estimate, _io_shape) = executor
         .resolve_snapshot(tenant.hash(), &request(SQL), &QueryAccounting::new())
         .await
         .expect("resolve");
@@ -1067,7 +1067,7 @@ async fn single_client_endpoint_even_when_distributed() {
     // one slice. So the single client endpoint is the deliberate contract, not
     // an artifact of a snapshot that happens not to distribute. Those slices are
     // the INTERNAL coordinator-to-worker plan, never endpoints.
-    let (snapshot, estimate) = executor
+    let (snapshot, estimate, _io_shape) = executor
         .resolve_snapshot(tenant.hash(), &request(SQL), &QueryAccounting::new())
         .await
         .expect("resolve");
