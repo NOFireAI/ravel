@@ -175,15 +175,23 @@ access key that role's deployment uses.
 The KMS statement's `Resource` value is a JSON array, shipped with exactly one
 entry: the placeholder `arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID`.
 That single-entry array is correct as shipped only for a deployment with one
-KMS key. `--tenant-kms-config` routes different tenants to different keys (see
+KMS key. Two independent flags put keys in play (see
 [Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms)), and each
-role's policy must authorize every key its own writes and reads can reach:
-for each key you configure in the tenant-KMS file, add its exact ARN as its own
-entry in that array, rather than replacing the single placeholder with your
-one key and calling it done. A configured tenant key missing from the array
+role's policy must authorize every key its own writes and reads can reach, so
+that array needs an exact ARN for each of:
+
+- the key configured with `--s3-kms-key`, if the deployment sets it. It is
+  applied to the default store, so it encrypts every PUT the process makes that
+  no per-tenant key overrides. Omit it and Gateway, Query and Maintain PUTs fail
+  with `AccessDenied`, and reads of objects already written under it fail KMS
+  decryption for every role including Admin.
+- every key configured in the `--tenant-kms-config` file, one entry each.
+
+Add each ARN as its own entry, rather than replacing the single placeholder with
+your one key and calling it done. A configured key missing from the array
 does not fail at startup: the process starts normally, and the gap surfaces
-only when a request first routes to that key, as `AccessDenied` on that KMS
-call, at runtime rather than at deploy time.
+only when a request first uses that key, as `AccessDenied` on that KMS call, at
+runtime rather than at deploy time.
 
 Three facts about those documents are worth knowing before you edit them.
 
@@ -371,8 +379,13 @@ to narrow.
 
 The matching role-side statement in each `deploy/iam/*.json` template holds a
 placeholder tenant key ARN that you must replace with your own (see
-[the shipped policy documents](#the-shipped-policy-documents)); scoped to a
-real tenant key rather than to every key:
+[the shipped policy documents](#the-shipped-policy-documents)); scoped to real
+keys rather than to every key. Replace it with the exact ARN configured with
+`--s3-kms-key`, if the deployment sets that flag, plus one exact ARN for every
+key in the `--tenant-kms-config` file. The two flags are independent: the
+`--s3-kms-key` ARN covers every PUT that no per-tenant key overrides, and its
+absence from a role's array fails that role's PUTs, and every role's reads of
+objects written under it, with `AccessDenied`. With the keys in place:
 
 - Gateway and Maintain write tenant data through the routing store and read some
   of what they write, so they hold encrypt, generate-data-key and decrypt.
