@@ -537,7 +537,19 @@ async fn raw_served_commit_keys(
     let mut compaction_records: Vec<(String, CompactionRecord)> =
         Vec::with_capacity(listing.compaction_record_keys.len());
     for key in &listing.compaction_record_keys {
-        let got = store.get(key, GetRange::Full).await?;
+        // Retention can delete a record between the listing and this read.
+        // Propagating NotFound would abort the whole walk before the cursor
+        // advances, losing a long migration's progress to an unrelated
+        // concurrent pass; the rest of this crate already treats a vanished
+        // object as absent rather than as an error. Skipping is also the
+        // fail-safe direction here: a record that is gone supersedes nothing,
+        // so its inputs stay counted as served raw and the floor raise is
+        // refused rather than wrongly allowed.
+        let got = match store.get(key, GetRange::Full).await {
+            Ok(got) => got,
+            Err(ravel_object_store::StoreError::NotFound) => continue,
+            Err(err) => return Err(err.into()),
+        };
         let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
             MaintainError::Invariant(format!(
                 "compaction record {key} is corrupt during the migrate walk: {err}"
@@ -564,7 +576,12 @@ async fn raw_served_commit_keys(
     // point 5 keeps one record set per bucket), so its whole input list
     // supersedes, exactly as the re-audit treats it.
     for key in &listing.rewrite_record_keys {
-        let got = store.get(key, GetRange::Full).await?;
+        // Same race and same reasoning as the compaction records above.
+        let got = match store.get(key, GetRange::Full).await {
+            Ok(got) => got,
+            Err(ravel_object_store::StoreError::NotFound) => continue,
+            Err(err) => return Err(err.into()),
+        };
         let rec = RewriteRecord::decode(got.data.as_ref()).map_err(|err| {
             MaintainError::Invariant(format!(
                 "rewrite record {key} is corrupt during the migrate walk: {err}"
@@ -1926,6 +1943,50 @@ mod tests {
     /// loser-only case fails with `l0_below == 1`: input 3 is excluded on the
     /// strength of a record whose parts nothing serves, and `migrate_family`
     /// raises the format floor over an object the resolver still returns raw.
+    /// A record listed and then deleted before it is read must not abort the
+    /// walk. Retention can remove a compaction record between the listing and
+    /// the read, and propagating `NotFound` would fail `migrate_family` before
+    /// the cursor advances, losing a long migration's progress to an unrelated
+    /// concurrent pass.
+    ///
+    /// The stale listing IS the race: it still names a key whose object is
+    /// gone, which is exactly the state the walk holds when retention runs
+    /// underneath it.
+    ///
+    /// Prove-the-test: restore `store.get(key, GetRange::Full).await?` in
+    /// `raw_served_commit_keys` and this returns `Err(NotFound)` instead of a
+    /// served set. The assertion on the result also pins the fail-safe
+    /// direction: a vanished record supersedes nothing, so its inputs come
+    /// back as served raw rather than being silently excluded.
+    #[tokio::test]
+    async fn a_record_deleted_after_the_listing_does_not_abort_the_walk() {
+        let store = MemoryStore::new();
+        seed_overlapping_records(&store, &[1, 2, 4]).await;
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
+        let listing = list_bucket(&store, &bucket).await.expect("list bucket");
+        assert_eq!(
+            listing.compaction_record_keys.len(),
+            2,
+            "the fixture must carry both overlapping records, or this proves nothing"
+        );
+
+        // Retention removes one of them while the walk still holds the listing.
+        for key in &listing.compaction_record_keys {
+            store.delete(key).await.expect("delete record");
+        }
+
+        let served = raw_served_commit_keys(&store, &bucket, &listing)
+            .await
+            .expect("a vanished record must not abort the walk");
+        assert_eq!(
+            served.len(),
+            4,
+            "with both records gone nothing supersedes, so all four inputs are served \
+             raw: the conservative direction, which refuses a floor raise rather than \
+             raising it over an object that is still served"
+        );
+    }
+
     #[tokio::test]
     async fn a_loser_only_l0_input_still_counts_below_the_target() {
         // Winner names {1, 2, 4}; input 3 is named by the loser alone.
