@@ -669,6 +669,12 @@ accepts 5.45x the GET requests (570,752 vs 104,780) for 41% less cold
 wall-clock (285.8 s vs 486.0 s) than the `cost-based` default at this
 profile and concurrency.
 
+Those figures are the measurement this amendment was written against and are
+left as the record of it. They predate #1271 and #835, which both changed the
+`cost-based` arm, so the denominator has moved since. The current measured
+ratio, with its commit and basis, lives in ADR-1196's Decision section; take
+it from there rather than from this paragraph (issue #1316).
+
 The extra in-flight fetch memory a raised GET concurrency implies is
 unbounded today; ADR-1170's process-wide memory budget, once it lands,
 will bound it. This amendment implements no such bound: ADR-1196 makes

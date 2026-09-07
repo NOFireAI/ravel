@@ -78,8 +78,9 @@ pub enum LogsFetchPolicyArg {
     #[default]
     CostBased,
     /// Resolves the byte quantities exactly as `byte-minimal` does (issue
-    /// #1196): an intent, not a tuning constant. Trades about 5.45x the GET
-    /// requests for about 41% less cold wall-clock on the reference corpus,
+    /// #1196): an intent, not a tuning constant. Measured at `740f94b97` over
+    /// 3 reps, it traded 5.30x the GET requests for 52% less cold wall-clock
+    /// (per-rep range 50.3% to 54.2%) on the reference corpus,
     /// at a raised object-store GET concurrency the operator sets explicitly
     /// (this policy carries no concurrency default of its own). In-flight
     /// fetch memory at that concurrency is not yet bounded by a process-wide
@@ -629,8 +630,9 @@ pub struct Cli {
     ///
     /// `latency-first` is an intent, not a tuning constant: it says spend
     /// requests to save wall time, and carries no concurrency default of its
-    /// own. On the reference corpus it trades 5.45x the GET requests for 41%
-    /// less cold wall-clock than `cost-based`, at
+    /// own. Measured at `740f94b97` over 3 reps on the reference corpus it
+    /// traded 5.30x the GET requests for 52% less cold wall-clock than
+    /// `cost-based` (per-rep range 50.3% to 54.2%), at
     /// [`ravel_query::LATENCY_FIRST_MEASURED_CONCURRENCY`] (256) -- set
     /// explicitly with `--fetch-concurrency` or with `--store-get-concurrency`
     /// plus `--sql-partition-count`, since both the GET permits and the SQL

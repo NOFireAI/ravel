@@ -174,10 +174,12 @@ pub enum LogsFetchPolicy {
     /// threshold EXACTLY as [`Self::ByteMinimal`] (ADR-0904's ranged behaviour).
     /// It is an intent, not a tuning constant: it says "spend requests to save
     /// wall time", and the engine decides how; it carries no concurrency
-    /// default of its own (ADR-1196). Measured on the reference corpus (#1185,
-    /// 42 statements, true cold) at [`LATENCY_FIRST_MEASURED_CONCURRENCY`]:
-    /// 5.45x the GET requests (570,752 vs 104,780) for 41% less cold
-    /// wall-clock (285.8s vs 486.0s) against the `cost-based` default at
+    /// default of its own (ADR-1196). The trade is a ratio measured at a named
+    /// commit, not a property of the policy. At `740f94b97`, on the reference
+    /// corpus (#1185, 42 statements, true cold, warm-up-empty) over 3 reps at
+    /// [`LATENCY_FIRST_MEASURED_CONCURRENCY`]: 5.30x the GET requests (570,752
+    /// vs 107,781) for 52% less cold wall-clock (235.7s vs 493.0s mean), with a
+    /// per-rep range of 50.3% to 54.2%. Against the `cost-based` default at
     /// `s3-intra-region-2026` prices, where free transfer and retrieval
     /// saturate the cost-based rate to whole-object reads. Cost-first stays
     /// the default because it is right for the bill; this is an operator
@@ -190,7 +192,7 @@ pub enum LogsFetchPolicy {
 }
 
 /// The process-wide object-store GET concurrency
-/// [`LogsFetchPolicy::LatencyFirst`]'s 41%-less-cold-time measurement ran at
+/// [`LogsFetchPolicy::LatencyFirst`]'s cold-time measurement ran at
 /// (issue #1196): a documentation constant only, naming the concurrency
 /// `--fetch-concurrency 256` set for the GET permits, the SQL partition
 /// count, and the PromQL fan-out together. `latency-first` resolves no
