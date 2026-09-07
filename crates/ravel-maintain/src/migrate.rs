@@ -533,11 +533,14 @@ pub async fn count_below_target(
 ///
 /// Permanence needs BOTH halves and neither implies the other:
 ///
-/// - a record still present to cause the refusal. If retention removed every
-///   record in the meantime, [`raw_served_commit_keys`] short-circuits and
-///   returns every commit as served raw, which is indistinguishable from the
-///   overlap case by inputs alone -- yet that bucket migrates on the next run,
-///   because the rewrite finds nothing to refuse on;
+/// - a record actually READ, not merely listed. If retention removed every
+///   record in the meantime, `raw_served_commit_keys` returns every commit as
+///   served raw, which is indistinguishable from the overlap case by inputs
+///   alone -- yet that bucket migrates on the next run, because the rewrite
+///   finds nothing to refuse on. A listing does not settle this: a record can
+///   go between the list and the GET, and the helper skips a vanished record
+///   rather than failing the walk, so `records_read` is the only honest
+///   evidence that a refusal cause survived;
 /// - an input that record leaves served raw and below the target. A bucket
 ///   whose records supersede everything is refused for reasons that do not
 ///   block the floor.
@@ -548,28 +551,46 @@ async fn refusal_is_permanent(
     target_version: u32,
 ) -> Result<bool> {
     let fresh = list_bucket(store, bucket).await?;
-    if fresh.compaction_record_keys.is_empty() && fresh.rewrite_record_keys.is_empty() {
+    let served = raw_served_commit_keys(store, bucket, &fresh).await?;
+    if served.records_read == 0 {
         return Ok(false);
     }
-    let served = raw_served_commit_keys(store, bucket, &fresh).await?;
     Ok(
-        load_inputs(store, bucket, &served, config.input_read_concurrency)
+        load_inputs(store, bucket, &served.keys, config.input_read_concurrency)
             .await?
             .iter()
             .any(|i| i.record.segment_format_version < target_version),
     )
 }
 
+/// What [`raw_served_commit_keys`] resolved, plus how many records it actually
+/// READ.
+///
+/// The read count is not a statistic. A listing is not evidence that a record
+/// still exists: retention can delete one between the list and the GET, and
+/// this helper skips a vanished record rather than failing the walk. So a
+/// caller asking "is a record still here to refuse the next rewrite" must ask
+/// this, not the listing it passed in.
+#[derive(Debug)]
+struct RawServed {
+    keys: Vec<String>,
+    records_read: usize,
+}
+
 async fn raw_served_commit_keys(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
     listing: &BucketListing,
-) -> Result<Vec<String>> {
+) -> Result<RawServed> {
     use prost::Message;
 
     if listing.compaction_record_keys.is_empty() && listing.rewrite_record_keys.is_empty() {
-        return Ok(listing.commit_keys.clone());
+        return Ok(RawServed {
+            keys: listing.commit_keys.clone(),
+            records_read: 0,
+        });
     }
+    let mut records_read = 0usize;
 
     let mut compaction_records: Vec<(String, CompactionRecord)> =
         Vec::with_capacity(listing.compaction_record_keys.len());
@@ -592,6 +613,7 @@ async fn raw_served_commit_keys(
                 "compaction record {key} is corrupt during the migrate walk: {err}"
             ))
         })?;
+        records_read += 1;
         compaction_records.push((key.clone(), rec));
     }
 
@@ -624,6 +646,7 @@ async fn raw_served_commit_keys(
                 "rewrite record {key} is corrupt during the migrate walk: {err}"
             ))
         })?;
+        records_read += 1;
         superseded.extend(superseded_input_commit_keys(
             &bucket.tenant_hash,
             bucket.signal,
@@ -632,12 +655,15 @@ async fn raw_served_commit_keys(
         )?);
     }
 
-    Ok(listing
-        .commit_keys
-        .iter()
-        .filter(|key| !superseded.contains(*key))
-        .cloned()
-        .collect())
+    Ok(RawServed {
+        keys: listing
+            .commit_keys
+            .iter()
+            .filter(|key| !superseded.contains(*key))
+            .cloned()
+            .collect(),
+        records_read,
+    })
 }
 
 /// Migrate one `(tenant, signal, family)` toward `target_version`, resuming from
@@ -731,7 +757,8 @@ pub async fn migrate_family(
             {
                 let served = raw_served_commit_keys(store, &bucket, &listing).await?;
                 let inputs =
-                    load_inputs(store, &bucket, &served, config.input_read_concurrency).await?;
+                    load_inputs(store, &bucket, &served.keys, config.input_read_concurrency)
+                        .await?;
                 let l0_below = inputs
                     .iter()
                     .filter(|i| i.record.segment_format_version < target_version)
@@ -2047,11 +2074,18 @@ mod tests {
             .await
             .expect("a vanished record must not abort the walk");
         assert_eq!(
-            served.len(),
+            served.keys.len(),
             4,
             "with both records gone nothing supersedes, so all four inputs are served \
              raw: the conservative direction, which refuses a floor raise rather than \
              raising it over an object that is still served"
+        );
+        assert_eq!(
+            served.records_read, 0,
+            "the listing still NAMES two records, so a caller trusting the listing would \
+             conclude a refusal cause survives. Only the read count distinguishes a record \
+             that is there from one that was there when we listed, which is why \
+             refusal_is_permanent asks this rather than the listing it passed in"
         );
     }
 
@@ -2080,7 +2114,7 @@ mod tests {
         )
         .expect("commit key");
         assert_eq!(
-            served,
+            served.keys,
             vec![expected_raw],
             "exactly the loser-only input is left served raw: the winner's three inputs \
              are inside its parts, and the loser's parts are served from nowhere"
@@ -2109,7 +2143,7 @@ mod tests {
             .await
             .expect("raw-served set");
         assert!(
-            served.is_empty(),
+            served.keys.is_empty(),
             "the winner names every input of the bucket, so nothing is served raw: {served:?}"
         );
 
