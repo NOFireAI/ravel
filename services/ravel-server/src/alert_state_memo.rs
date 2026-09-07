@@ -75,11 +75,15 @@ pub enum MemoError {
 /// memo was stamped.
 #[derive(Debug, Clone)]
 pub struct AlertStateMemo {
-    /// `hour_bucket(now_ns)` at the moment this memo was written. Every alert
+    /// The seal-bound hour (`seal_bound_hour(now_ns)`) at the moment this memo
+    /// was written, never the writer's own current-tick hour. Every alert
     /// record whose ingest hour is strictly below this is fully represented in
     /// `records`; the reader re-lists hours at or after it to fold in anything
-    /// newer. Never above the writer's own tick hour, so no writer ever stamps
-    /// a watermark past a record it has not folded.
+    /// newer. The seal bound holds the watermark back to the newest hour no
+    /// overlapping prior lease holder can still write into (never past
+    /// `now_ns - (lease_ttl + query_deadline)`), so a late transition an
+    /// expired-but-still-finishing holder publishes after this holder's tail
+    /// LIST still lands at or above the watermark and stays inside the tail.
     pub watermark_hour: u32,
     /// Latest record per `alert_id` as of `watermark_hour`.
     pub records: HashMap<AlertId, AlertRecord>,
