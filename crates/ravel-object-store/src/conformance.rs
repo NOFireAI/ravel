@@ -791,6 +791,60 @@ async fn probe_consistent_list_after_write(
 /// luck is less likely to serialize eight.
 const CONCURRENT_CREATE_WRITERS: usize = 8;
 
+/// The one key [`probe_concurrent_create_if_absent`] races, under the run's
+/// scratch prefix. Named so a test fixture that has to recognize the raced key
+/// shares this definition instead of retyping the literal.
+const CONCURRENT_CREATE_KEY_SUFFIX: &str = "cas/concurrent-create";
+
+/// Total `CreateIfAbsent` attempts one racing writer gets before the probe
+/// gives up on it: the concurrent put itself plus up to three retries.
+///
+/// docs/object-store-contract.md ("Semantics adapters MUST honor") lets a
+/// conditional write that races another writer for the same absent key surface
+/// as a retryable transient conflict; the loser only reaches `AlreadyExists`
+/// once it retries against a key that is by then present. `S3Store` produces
+/// exactly that: its HEAD disambiguation of a 409 returns a retryable error
+/// while the key still looks absent. So a losing writer's first answer is not
+/// required to be `AlreadyExists`, and classifying it as a qualification
+/// failure would report a conformant backend as broken.
+///
+/// Small and fixed rather than a backoff schedule: each retry re-races a key
+/// that is already present on any backend whose conditional create is atomic,
+/// so one retry is normally enough, and a backend that still cannot answer
+/// after this many is reported as unable to settle rather than retried
+/// indefinitely inside a qualification run.
+const CONCURRENT_CREATE_MAX_ATTEMPTS: usize = 4;
+
+/// Drive one racing writer's `CreateIfAbsent` outcome to a terminal one by
+/// retrying the identical put while the outcome is retryable, for at most
+/// [`CONCURRENT_CREATE_MAX_ATTEMPTS`] attempts in total (`first` is attempt 1).
+///
+/// Retryability comes from [`StoreError::is_retryable`], the same predicate
+/// every production retry loop turns on, rather than a list restated here that
+/// a new retryable variant would silently fall out of.
+///
+/// The returned outcome is `Ok` (this writer won), `Err(AlreadyExists)` (it
+/// lost), a terminal error, or -- when the bound ran out -- still a retryable
+/// error, which the caller reports as a failure rather than as a loss.
+async fn settle_racing_create(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    payload: &Bytes,
+    first: Result<crate::PutOutcome, StoreError>,
+) -> Result<crate::PutOutcome, StoreError> {
+    let mut outcome = first;
+    for _ in 1..CONCURRENT_CREATE_MAX_ATTEMPTS {
+        match &outcome {
+            Err(err) if err.is_retryable() => {}
+            _ => break,
+        }
+        outcome = store
+            .put(key, payload.clone(), PutOptions::create_if_absent())
+            .await;
+    }
+    outcome
+}
+
 /// The single-winner probe ADR-0050 section 6 calls for: `CreateIfAbsent`
 /// under *concurrent* same-key writers, not two sequential puts.
 ///
@@ -798,6 +852,16 @@ const CONCURRENT_CREATE_WRITERS: usize = 8;
 /// create is checked and applied non-atomically, because the second put starts
 /// long after the first one finished. Here every writer's request is in flight
 /// at once, so a read-then-write implementation has a window to lose in.
+///
+/// A losing writer is not required to answer `AlreadyExists` on its first
+/// attempt. The contract lets a conditional write racing another writer for the
+/// same absent key surface as a retryable transient conflict, so each writer's
+/// outcome is driven to a terminal one by [`settle_racing_create`], bounded by
+/// [`CONCURRENT_CREATE_MAX_ATTEMPTS`], before anything is counted. Only then do
+/// the counts mean what the property says: exactly one `Ok`, exactly
+/// `CONCURRENT_CREATE_WRITERS - 1` `AlreadyExists`, and the survivor holding the
+/// winner's bytes. A writer still retryable at the bound is reported as a
+/// failure naming that bound, never counted as a loser.
 ///
 /// The requests are concurrent futures on one task, not spawned tasks: the
 /// suite holds `&dyn ObjectStoreBackend`, which cannot be moved into a
@@ -811,7 +875,7 @@ async fn probe_concurrent_create_if_absent(
     prefix: &str,
 ) -> ProbeResult {
     let property = Property::ConcurrentCreateIfAbsentSingleWinner;
-    let key = format!("{prefix}cas/concurrent-create");
+    let key = format!("{prefix}{CONCURRENT_CREATE_KEY_SUFFIX}");
 
     // Distinct payloads: whichever writer wins, its bytes are identifiable, so
     // "the survivor is the winner's object" is checkable rather than assumed.
@@ -833,21 +897,38 @@ async fn probe_concurrent_create_if_absent(
 
     let mut winners: Vec<usize> = Vec::new();
     let mut losers = 0usize;
+    let mut unsettled: Vec<String> = Vec::new();
     let mut unexpected: Vec<String> = Vec::new();
     for (i, outcome) in outcomes {
-        match outcome {
+        match settle_racing_create(store, &key, &payloads[i], outcome).await {
             Ok(_) => winners.push(i),
             Err(StoreError::AlreadyExists) => losers += 1,
+            Err(err) if err.is_retryable() => unsettled.push(format!("writer-{i}: {err}")),
             Err(other) => unexpected.push(format!("writer-{i}: {other}")),
         }
     }
 
+    if !unsettled.is_empty() {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "{} of {CONCURRENT_CREATE_WRITERS} concurrent CreateIfAbsent writers still \
+                 returned a retryable error after {CONCURRENT_CREATE_MAX_ATTEMPTS} attempts \
+                 each: {} (docs/object-store-contract.md allows a racing conditional write to \
+                 surface as a retryable transient conflict, but a retry against the by-then \
+                 present key must settle on AlreadyExists); this backend never settled, so its \
+                 single-winner property could not be evaluated",
+                unsettled.len(),
+                unsettled.join(", ")
+            ),
+        );
+    }
     if !unexpected.is_empty() {
         return ProbeResult::fail(
             property,
             format!(
                 "{} of {CONCURRENT_CREATE_WRITERS} concurrent CreateIfAbsent writers failed with \
-                 something other than AlreadyExists: {} \
+                 a terminal error other than AlreadyExists: {} \
                  (docs/object-store-contract.md: conditional-put failure mapping)",
                 unexpected.len(),
                 unexpected.join(", ")
@@ -966,6 +1047,18 @@ fn first_order_violation(delivered: &[String]) -> Option<(&str, &str)> {
 /// Written in this order, so a backend that simply echoes insertion order
 /// fails the probe instead of passing it by accident.
 const ORDER_PROBE_SUFFIXES: [&str; 5] = ["d", "a", "e", "c", "b"];
+
+/// [`probe_lexicographic_listing_order`] indexes `expected[1]` for the
+/// `start_after` marker, `expected[2..]` for the tail it must return, and
+/// `expected_tail[0]` in its pass detail, so the constant above and that probe
+/// are coupled. Reducing it below three entries would otherwise turn a
+/// qualification run against a live bucket into a panic; here it fails the
+/// build instead.
+const _: () = assert!(
+    ORDER_PROBE_SUFFIXES.len() >= 3,
+    "probe_lexicographic_listing_order needs at least three keys: one before the start_after \
+     marker, the marker, and a non-empty tail after it"
+);
 
 /// Lexicographic listing order and `start_after` resumption.
 ///
@@ -1846,6 +1939,192 @@ mod tests {
             ),
             "the pass detail must name the exact counts: {}",
             race.detail
+        );
+    }
+
+    /// Wraps `MemoryStore` and reports a losing racer of the concurrent-create
+    /// probe's key as a retryable [`StoreError::Transient`] instead of
+    /// `AlreadyExists`. `once()` serves exactly one `Transient` per losing
+    /// payload and then lets the real `AlreadyExists` through, which is the
+    /// shape `S3Store` produces when its HEAD disambiguation of a 409 finds the
+    /// key still absent; `forever()` never settles.
+    ///
+    /// The deflection is scoped to the one key the suite actually races: the
+    /// contract permits a retryable answer only for a conditional write racing
+    /// another writer, so a sequential second create on a present key must
+    /// still be `AlreadyExists` on its first attempt, and every other probe
+    /// sees the untouched oracle.
+    struct TransientLoserStore {
+        inner: MemoryStore,
+        forever: bool,
+        state: Mutex<TransientLoserState>,
+    }
+
+    #[derive(Default)]
+    struct TransientLoserState {
+        /// Payloads already answered with one `Transient`.
+        deflected: HashSet<Bytes>,
+        /// Every `Transient` served, so a test can pin how many attempts the
+        /// probe actually paid for rather than assuming the retry ran.
+        served: usize,
+    }
+
+    impl TransientLoserStore {
+        fn once() -> Self {
+            TransientLoserStore {
+                inner: MemoryStore::new(),
+                forever: false,
+                state: Mutex::new(TransientLoserState::default()),
+            }
+        }
+
+        fn forever() -> Self {
+            TransientLoserStore {
+                inner: MemoryStore::new(),
+                forever: true,
+                state: Mutex::new(TransientLoserState::default()),
+            }
+        }
+
+        fn transients_served(&self) -> usize {
+            self.state.lock().served
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for TransientLoserStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            let racing_create = matches!(opts.mode, PutMode::CreateIfAbsent)
+                && key.ends_with(CONCURRENT_CREATE_KEY_SUFFIX);
+            let outcome = self.inner.put(key, data.clone(), opts).await;
+            if !racing_create || !matches!(outcome, Err(StoreError::AlreadyExists)) {
+                return outcome;
+            }
+            let mut state = self.state.lock();
+            if !self.forever && !state.deflected.insert(data) {
+                return outcome;
+            }
+            state.served += 1;
+            Err(StoreError::Transient(
+                "conditional request conflict while the key still looked absent".to_string(),
+            ))
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A losing racer whose first answer is one retryable error is conformant
+    /// (docs/object-store-contract.md: a concurrent conditional write MAY
+    /// surface as a retryable transient conflict, and the loser lands on
+    /// `AlreadyExists` after a retry), so the probe must retry it and still
+    /// certify the single-winner property with the exact counts.
+    ///
+    /// Counterpart of `PutCreateIfAbsent / CreateIfAbsentWinnerUnique` composed
+    /// with `TransientFailure / TransientLeavesNothing`
+    /// (formal/tla/common/traceability.md): the transient answer applies
+    /// nothing and the caller retries the identical operation, after which the
+    /// winner is still unique.
+    #[tokio::test]
+    async fn losing_racer_transient_once_is_retried_and_the_probe_still_passes() {
+        let store = TransientLoserStore::once();
+        let report = run_conformance_suite(&store, "sys/qualify/transient-once/").await;
+        assert!(
+            report.passed(),
+            "a backend whose losing racers are retryable exactly once is conformant, got \
+             failures: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let race = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::ConcurrentCreateIfAbsentSingleWinner)
+            .expect("the concurrent create probe ran");
+        assert!(
+            race.detail.contains(
+                "exactly 1 of 8 concurrent CreateIfAbsent writers won, the other 7 were rejected"
+            ),
+            "the pass detail must still name the exact counts: {}",
+            race.detail
+        );
+        assert_eq!(
+            store.transients_served(),
+            CONCURRENT_CREATE_WRITERS - 1,
+            "every loser must have been served its one Transient, so the pass above was \
+             reached through the retry and not by the fixture never firing"
+        );
+    }
+
+    /// A losing racer that stays retryable forever never demonstrates the
+    /// single-winner property, so the probe must fail naming its attempt bound
+    /// rather than pass on an unsettled outcome.
+    ///
+    /// Counterpart of `PutCreateIfAbsent / CreateIfAbsentWinnerUnique`
+    /// (formal/tla/common/traceability.md): the model's create resolves to a
+    /// winner or an `AlreadyExists` loser, and a backend that resolves to
+    /// neither has not been shown to satisfy it.
+    #[tokio::test]
+    async fn losing_racer_transient_forever_fails_the_probe_naming_the_attempt_bound() {
+        let store = TransientLoserStore::forever();
+        let report = run_conformance_suite(&store, "sys/qualify/transient-forever/").await;
+        assert!(!report.passed(), "an unsettled racer must not qualify");
+        let failed: HashSet<&'static str> = report.failures().map(|r| r.property.name()).collect();
+        assert_eq!(
+            failed,
+            HashSet::from([Property::ConcurrentCreateIfAbsentSingleWinner.name()]),
+            "only the concurrent-create property is affected: {failed:?}"
+        );
+        let race = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::ConcurrentCreateIfAbsentSingleWinner)
+            .expect("the concurrent create probe ran");
+        assert!(
+            race.detail
+                .contains(&format!("after {CONCURRENT_CREATE_MAX_ATTEMPTS} attempts")),
+            "the failure must name the attempt bound: {}",
+            race.detail
+        );
+        assert!(
+            race.detail.contains("single-winner property"),
+            "the failure must name the invariant it could not evaluate: {}",
+            race.detail
+        );
+        assert_eq!(
+            store.transients_served(),
+            (CONCURRENT_CREATE_WRITERS - 1) * CONCURRENT_CREATE_MAX_ATTEMPTS,
+            "each of the {} losers must have been retried up to the bound",
+            CONCURRENT_CREATE_WRITERS - 1
         );
     }
 
