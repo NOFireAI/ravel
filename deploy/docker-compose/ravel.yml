@@ -106,10 +106,13 @@ services:
       RAVEL_S3_SECRET_KEY: ravel-dev-secret
 
   # The demo's data generator (ADR-0081 decision 3): a real OpenTelemetry
-  # Collector scraping host metrics and exporting them to Ravel over OTLP/HTTP,
-  # authenticating with the demo bearer token via the bearertokenauth extension.
-  # This exercises the same OTLP path a real user configures, and the first
-  # Grafana screen shows the reader's own machine.
+  # Collector scraping host metrics and tailing its own log output, exporting
+  # both to Ravel over OTLP/HTTP, authenticating with the demo bearer token via
+  # the bearertokenauth extension. This exercises the same OTLP path a real
+  # user configures, and the first Grafana screen shows the reader's own
+  # machine. The tailed logs are what the README's PromQL-over-logs query
+  # (`ravel_log_lines`) reports on; without them the quickstart generates
+  # metrics only and that query returns empty (#1334).
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
     depends_on: [ravel-server]
