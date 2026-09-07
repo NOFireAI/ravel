@@ -119,3 +119,64 @@ async fn service_batches_matches_the_busiest_partition_s_segment_count() {
         "7 segments over 3 partitions: the busiest partition holds ceil(7/3) = 3"
     );
 }
+
+/// `shared_get_permits` must be the real, resolved
+/// `EngineConfig::store_get_concurrency` -- the size of the one `GetLimiter`
+/// the server shares across every fetcher it builds -- not `u64::MAX`
+/// (issue #1250 review fix, finding 1). `u64::MAX` silently drops the
+/// concurrency clamp whenever the configured GET permits are fewer than the
+/// configured partitions, which is exactly the case this fixture sets up:
+/// `sql_partition_count = 8`, `store_get_concurrency = 3`.
+///
+/// This fixture publishes 8 segments with `partitions = min(8, 8) = 8`, so
+/// `segments_per_plan = ceil(8/8) = 1`, one wave (`distinct_plans ==
+/// outer_fanout == 8`), `active = 8`.
+///
+/// Under the WRONG `u64::MAX` model: `capacity = min(1 * 8, u64::MAX) = 8`,
+/// `service_batches = ceil(1 * 8 / 8) = 1`.
+///
+/// Under the FIXED model: `capacity = min(1 * 8, 3) = 3`,
+/// `service_batches = ceil(1 * 8 / 3) = 3`.
+///
+/// Flip-line proof: with `shared_get_permits` reverted to `u64::MAX`, this
+/// assertion (`3`) fails and reads `1` instead.
+#[tokio::test]
+async fn shared_get_permits_reflects_store_get_concurrency_not_u64_max() {
+    const TARGET_PARTITIONS: usize = 8;
+    const STORE_GET_CONCURRENCY: usize = 3;
+    let tenant = tenant_id("io-shape-shared-get-permits");
+    let specs = vec![
+        segment(1, "m0"),
+        segment(2, "m1"),
+        segment(3, "m2"),
+        segment(4, "m3"),
+        segment(5, "m4"),
+        segment(6, "m5"),
+        segment(7, "m6"),
+        segment(8, "m7"),
+    ];
+    let config = SqlConfig {
+        engine: EngineConfig {
+            sql_partition_count: Some(TARGET_PARTITIONS),
+            store_get_concurrency: Some(STORE_GET_CONCURRENCY),
+            ..EngineConfig::default()
+        },
+        ..SqlConfig::default()
+    };
+    let store: std::sync::Arc<dyn ravel_object_store::ObjectStoreBackend> =
+        std::sync::Arc::new(ravel_object_store::memory::MemoryStore::new());
+    let fixture = Fixture::build(store, &[(&tenant, &specs)], config, 1 << 30).await;
+
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &request("SELECT ts, value FROM samples"))
+        .await
+        .expect("multi-segment query");
+
+    assert_eq!(outcome.stats.segments, 8, "sanity: all 8 resolve");
+    assert_eq!(
+        outcome.stats.io_shape.service_batches, 3,
+        "8 segments, 8 partitions, but only 3 shared GET permits: \
+         ceil(8/min(8,3)) = 3, not the u64::MAX model's ceil(8/8) = 1"
+    );
+}
