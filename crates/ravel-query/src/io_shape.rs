@@ -160,7 +160,7 @@
 //! recording sequences and assert on the resulting [`IoShapeCounts`], with no
 //! dependency on a live catalog or object store.
 
-use ravel_catalog::SegmentOrigin;
+use ravel_catalog::{SegmentOrigin, Snapshot};
 
 /// Coarse pre-execution classification of a query's expected access pattern,
 /// decided once, before any segment is opened.
@@ -370,18 +370,121 @@ pub fn service_batches_over_plan_waves(
     fanout: u64,
     shared_permits: u64,
 ) -> u32 {
-    let fanout = fanout.max(1);
+    // PromQL's engine has one fan-out knob per level (`promql_fetch_fanout`),
+    // reused for both the OUTER admission width and the INNER per-plan
+    // concurrency (see the module docs' `service_batches` entry). That is the
+    // single-fanout special case of the two-width model below.
+    service_batches_over_plan_waves_with_fanouts(
+        segments,
+        distinct_plans,
+        fanout,
+        fanout,
+        shared_permits,
+    )
+}
+
+/// [`service_batches_over_plan_waves`], generalized to a caller whose OUTER
+/// admission width (how many plans run at once) and INNER per-plan
+/// concurrency (how many of one plan's segments fetch at once) are two
+/// genuinely different numbers, rather than the one `promql_fetch_fanout`
+/// PromQL's engine reuses for both. `ravel-sql`'s `SqlExecutor` is exactly
+/// such a caller: `outer_fanout` is the effective DataFusion partition count
+/// (`target_partitions`, clamped to the segment count), all of which run
+/// concurrently with no shared limiter admitting them in waves, while
+/// `inner_fanout` is 1, because each partition's own segments fetch strictly
+/// sequentially (`RsegScanExec::prepare_partition`'s per-partition loop is
+/// genuinely sequential, `crates/ravel-sql/src/scan.rs`). Passing
+/// `outer_fanout == inner_fanout == fanout` reduces this exactly to
+/// [`service_batches_over_plan_waves`]'s own formula, which is how that
+/// function is now implemented.
+///
+/// `waves = ceil(distinct_plans / outer_fanout)`. For 0-based wave `w`,
+/// `active_w = min(outer_fanout, distinct_plans - w * outer_fanout)` plans
+/// are admitted, `capacity_w = min(inner_fanout * active_w, shared_permits)`
+/// is that wave's binding concurrency (each admitted plan contributes up to
+/// `inner_fanout` concurrent requests, not `outer_fanout`), and `batches_w =
+/// service_batches(segments * active_w, capacity_w)` is that wave's own
+/// serial round count. `outer_fanout` and `distinct_plans` are each clamped
+/// to at least 1, matching [`service_batches`]'s own concurrency clamp.
+pub fn service_batches_over_plan_waves_with_fanouts(
+    segments: u64,
+    distinct_plans: u64,
+    outer_fanout: u64,
+    inner_fanout: u64,
+    shared_permits: u64,
+) -> u32 {
+    let outer_fanout = outer_fanout.max(1);
     let distinct_plans = distinct_plans.max(1);
-    let waves = distinct_plans.div_ceil(fanout);
+    let waves = distinct_plans.div_ceil(outer_fanout);
     let mut total: u64 = 0;
     for w in 0..waves {
-        let admitted_before = w.saturating_mul(fanout);
-        let active = fanout.min(distinct_plans.saturating_sub(admitted_before));
-        let capacity = fanout.saturating_mul(active).min(shared_permits);
+        let admitted_before = w.saturating_mul(outer_fanout);
+        let active = outer_fanout.min(distinct_plans.saturating_sub(admitted_before));
+        let capacity = inner_fanout.saturating_mul(active).min(shared_permits);
         let batches = service_batches(segments.saturating_mul(active), capacity);
         total = total.saturating_add(u64::from(batches));
     }
     total.min(u64::from(u32::MAX)) as u32
+}
+
+/// Assembles a complete [`QueryIoShape`] from fully explicit primitives, with
+/// no dependency on `ravel-query`'s own `PhaseAccounting` (`engine.rs`'s
+/// private `io_shape_for_resolve` wraps this, extracting
+/// `resolve_list_requests` from its `&PhaseAccounting` before calling
+/// through) and no assumption that one fan-out width serves both the OUTER
+/// and INNER levels of `service_batches_over_plan_waves_with_fanouts`
+/// (issue #1250: `ravel-sql`'s DataFusion partition fan-out and per-partition
+/// sequential fetch need two independent widths, which the PromQL-shaped
+/// `io_shape_for_resolve` cannot express without pulling in a
+/// `PhaseAccounting`-shaped argument it has no equivalent of).
+///
+/// `metadata_only` and `whole_object_threshold` behave exactly as in
+/// `io_shape_for_resolve`. `segments` is the segment count the
+/// `service_batches` model should charge per admitted plan (for `ravel-sql`,
+/// the busiest DataFusion partition's segment count, not the query's total);
+/// `distinct_plans`, `outer_fanout`, and `inner_fanout` feed
+/// [`service_batches_over_plan_waves_with_fanouts`] directly.
+/// `resolve_list_requests` and `unfolded_segments_resolved` are each computed
+/// by the caller from its own resolve step (a `QueryAccountingSnapshot` LIST
+/// count and [`count_unfolded_segments`] respectively), since neither type is
+/// shared between the PromQL and SQL resolve paths.
+#[allow(clippy::too_many_arguments)]
+pub fn io_shape_for_resolve_with_fanouts(
+    snapshot: &Snapshot,
+    metadata_only: bool,
+    whole_object_threshold: u64,
+    segments: u64,
+    distinct_plans: u64,
+    outer_fanout: u64,
+    inner_fanout: u64,
+    shared_get_permits: u64,
+    resolve_list_requests: u64,
+    unfolded_segments_resolved: u64,
+) -> QueryIoShape {
+    let mut counts = IoShapeCounts::default();
+    let depth = snapshot
+        .segments
+        .iter()
+        .map(|seg| depth_for_object(seg.object_size, whole_object_threshold))
+        .max()
+        .unwrap_or(0);
+    counts.record_dependency_chain(depth);
+    counts.record_service_batches(service_batches_over_plan_waves_with_fanouts(
+        segments,
+        distinct_plans,
+        outer_fanout,
+        inner_fanout,
+        shared_get_permits,
+    ));
+    counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
+    let plan_class = if metadata_only {
+        PlanClass::MetadataOnly
+    } else if snapshot.segments_pruned > 0 {
+        PlanClass::SelectiveIndexed
+    } else {
+        PlanClass::ExhaustiveScan
+    };
+    counts.into_shape(unfolded_segments_resolved, plan_class)
 }
 
 /// Accumulates the three fan-out-shaped `QueryIoShape` fields
@@ -654,6 +757,63 @@ mod tests {
             count_unfolded_segments(&origins.origins),
             4,
             "4 segments (1 L0 + 3 L1 parts) from only 2 underlying commit/compaction records"
+        );
+    }
+
+    /// [`service_batches_over_plan_waves`] must keep computing exactly what
+    /// it did before it became a thin wrapper around
+    /// [`service_batches_over_plan_waves_with_fanouts`]: passing the same
+    /// `fanout` value for both the two-width function's `outer_fanout` and
+    /// `inner_fanout` must reproduce the single-fanout formula's answer on
+    /// the module docs' own worked examples. Flip the wrapper to pass `1` as
+    /// `inner_fanout` instead of `fanout` to watch this fail.
+    #[test]
+    fn single_fanout_wrapper_matches_the_two_width_formula() {
+        // 18 distinct plans of 1 segment each, outer fan-out 17, 16 shared
+        // permits (the module docs' reviewer's case): wave 0 admits 17 plans
+        // (capacity min(17*17,16)=16, batches ceil(17/16)=2), wave 1 admits
+        // the last plan (capacity min(17*1,16)=16, batches 1): total 3.
+        assert_eq!(service_batches_over_plan_waves(1, 18, 17, 16), 3);
+        assert_eq!(
+            service_batches_over_plan_waves_with_fanouts(1, 18, 17, 17, 16),
+            3
+        );
+        // 64 segments, fanout 8, 2 distinct plans, 16 permits: one wave,
+        // active 2, capacity min(16,16)=16, batches ceil(128/16)=8.
+        assert_eq!(service_batches_over_plan_waves(64, 2, 8, 16), 8);
+        assert_eq!(
+            service_batches_over_plan_waves_with_fanouts(64, 2, 8, 8, 16),
+            8
+        );
+    }
+
+    /// The shape `ravel-sql`'s executor actually needs: `inner_fanout == 1`
+    /// because a DataFusion partition's segments fetch strictly sequentially
+    /// (`RsegScanExec::prepare_partition`), while `outer_fanout ==
+    /// distinct_plans` because every partition runs concurrently with no
+    /// shared limiter admitting them in waves. With `shared_permits` set to
+    /// `u64::MAX` (no `GetLimiter` on the SQL path), this must reduce to
+    /// exactly the busiest partition's own segment count: one wave, capacity
+    /// `1 * active` always covers `segments * active` with `active` full
+    /// batches of size `segments`, i.e. `segments` batches, unaffected by how
+    /// many partitions there are. Flip `inner_fanout` to `outer_fanout` (the
+    /// single-fanout model) to watch this fail: it would instead report
+    /// `ceil(segments / distinct_plans)`, undercounting the real sequential
+    /// depth of the busiest partition.
+    #[test]
+    fn two_width_formula_models_sql_s_sequential_per_partition_fetch() {
+        let segments_per_partition = 5;
+        let distinct_partitions = 3;
+        assert_eq!(
+            service_batches_over_plan_waves_with_fanouts(
+                segments_per_partition,
+                distinct_partitions,
+                distinct_partitions,
+                1,
+                u64::MAX,
+            ),
+            5,
+            "with no shared limiter, the busiest partition's sequential depth is the batch count"
         );
     }
 
