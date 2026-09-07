@@ -182,10 +182,14 @@ The `tools/list` result for the nine tools must serialize in less than
 
 ### D3. Engine and server prerequisites
 
-1. `RequestBudgets` in `ravel-query`: `max_bytes_scanned`, `max_s3_requests`,
-   and `max_segments`, each optional. `clamp` can only lower a ceiling. The
-   admission and scan checks read the clamped value. PromQL entry points take
-   `Option<RequestBudgets>`. `None` keeps the current behavior.
+1. `RequestBudgets` in `ravel-query`: `max_bytes_scanned`,
+   `max_store_requests`, and `max_segments`, each optional. The name
+   `max_store_requests` is the one canonical name on the wire, in the tool
+   schemas, and in the envelope. It maps to the existing
+   `EngineConfig::max_s3_requests` ceiling, which keeps its name. A schema
+   test asserts the serialized field name. `clamp` can only lower a ceiling.
+   The admission and scan checks read the clamped value. PromQL entry points
+   take `Option<RequestBudgets>`. `None` keeps the current behavior.
 2. `SqlRequest::row_window`, default `false`. When `true`, each table
    provider applies `ts_col >= start AND ts_col < end` above the scan. The
    column is `ts` for `samples` and `logs`, `start_ts` for `spans`, and
@@ -198,7 +202,13 @@ The `tools/list` result for the nine tools must serialize in less than
    outcome reports `row_cap_hit`.
 5. A query service layer in `services/ravel-server/src/service/`. Analytics
    and exemplars gain an admission permit. PromQL gains cost on cancel.
-   `labels` and `label_values` gain the audit seam.
+   `labels` and `label_values` gain the audit seam. The service layer
+   finalizes usage before it maps any outcome to an error. The outcomes are
+   an audit failure, a partial-result refusal, an evaluation failure, a
+   deadline, and a cancellation. A drop guard in the pattern of
+   `sql.rs::CostGuard` records the spend on every path. As a result, the
+   D6 usage figures and the D7 cancelled-spend figure are never omitted.
+   One test per path asserts the recorded figures.
 6. `AuditPipeline::spawn` in `lib.rs::start` for query modes. Flags
    `--audit-mode required|best-effort` (default `required`) and
    `--audit-text`. This closes #1187. MCP tool calls submit
@@ -231,18 +241,32 @@ query with zero matches is `ok`. A query whose `LIMIT` the data did not fill
 is `ok`. `ok_bounded` means that the row cap stopped the result, more rows
 exist, and no cursor exists because the statement has no total order.
 `ok_page` means that the row cap stopped the result and a cursor exists.
-`bytes_cap_hit` reports a shortened rendering and is separate from the row
-cap. A downsampled analytic sets `exact: false` and names the method.
+
+`max_response_bytes` bounds the serialized `structuredContent`, that is, the
+whole envelope as JSON. When the envelope exceeds the cap, the server drops
+rows from the end of `data.rows` until the envelope fits. `data.row_count`
+keeps the count of rows that the query produced. `presentation.bytes_cap_hit`
+becomes `true` and `presentation.rows_omitted` carries the number of dropped
+rows. The text block is rendered from the truncated `data`, so the two
+representations never differ. When the statement has a total order, the
+cursor points at the last kept row, so the omitted rows are reachable on the
+next page. When it has no total order, the status is `ok_bounded`. The byte
+cap, the row cap, and analytic downsampling are three separate facts in the
+envelope. A downsampled analytic sets `exact: false` and names the method.
 Missing coverage sets `complete: false` and names the reason. A budget
 failure or a deadline is an `error`. The server never returns a partial exact
 aggregate as `ok`. A `COUNT` over `logs` or `spans` sets
 `lower_bound_count: true`, because ingest is at-least-once.
 
-Time. Every data tool requires `time_range`. An absent range is a
-`missing_argument` failure. There is no default window. Inputs are RFC 3339
-strings or integer nanoseconds as strings. Intervals are half-open. Outputs
-carry timestamps as nanosecond strings. The `scope` block reports the 5 m
-metric lookback and the step alignment.
+Time. Every data tool requires a time input. There is no default window.
+Inputs are RFC 3339 strings or integer nanoseconds as strings. Range tools
+take `time_range`, a half-open interval. `ravel_query_promql` has two modes.
+Range mode takes `time_range` and `step`. Instant mode takes
+`evaluation_time`, one instant, and no `time_range`. A request with both
+fields, or with neither, is an `invalid_argument` failure. A test covers
+both modes. An absent time input on any other data tool is a
+`missing_argument` failure. Outputs carry timestamps as nanosecond strings.
+The `scope` block reports the 5 m metric lookback and the step alignment.
 
 Precision. Integers and timestamps are JSON strings, because nanosecond epochs
 exceed 2^53. Floats keep `NaN`, `+Inf`, and `-Inf` as strings. Finite floats
@@ -280,9 +304,19 @@ routing as the option for a load balancer.
 `ravel_query_sql` mints a cursor only when the `ORDER BY`, plus a
 deterministic tiebreak that the tool appends, is a total order over the
 projection. `ravel_search_logs` orders by
-`(ts, observed_ts, trace_id, span_id, body_hash)`, because `logs` has no
-unique key, and it reports remaining ties as possible duplicates.
-`ravel_get_trace` orders by `(start_ts, span_id)`.
+`(ts, observed_ts, trace_id, span_id, body_hash)`. That tuple is not unique,
+because `logs` has no row identity and ingest is at-least-once. A strict
+keyset predicate would skip an equal row on the next page. So a page never
+ends inside a group of equal tuples. The tool fetches `k + 1` rows. When
+the last kept tuple equals the first omitted tuple, the tool drops that
+whole equal group from the page. The cursor then points at the last
+complete group.
+If no complete group fits in the page, the status is `ok_bounded` with no
+cursor and a `next_steps` entry that says to narrow `time_range`. The same
+rule applies to `ravel_query_sql` when its appended tiebreak is not unique.
+`ravel_get_trace` orders by `(start_ts, span_id)`. A test paginates a
+fixture with equal tuples across a page boundary and asserts that every row
+appears exactly once.
 
 An evidence reference is a token of the same family. It adds the sha256 of
 the canonical row bytes. Redemption re-executes against the pin while the pin
@@ -323,12 +357,18 @@ bundle id is not trustworthy.
   default profile has read tools only. The fold route, ingest, erasure,
   legal holds, retention, alert rules, and maintenance are not reachable
   through MCP. An operator profile needs a principal model and its own ADR.
-- Transport: `POST /mcp` only. The server validates `MCP-Protocol-Version`,
-  `Mcp-Method`, and `Mcp-Name`. It validates `Origin` against
+- Transport: `POST /mcp` only. The server validates `Origin` against
   `--mcp-allowed-origins` and answers 403 on a mismatch. The body cap is
   1 MiB. Each tool call takes one admission permit. The deadline is clamped.
-  Legacy clients use the in-memory session manager of `rmcp`, and each
-  request re-authenticates. An `initialize` without a credential is refused.
+  Header validation is per revision. For a `2026-07-28` request, the server
+  requires `MCP-Protocol-Version`, `Mcp-Method`, and `Mcp-Name`, and answers
+  400 on a mismatch with the body. For a `2025-11-25` request, the server
+  requires neither `Mcp-Method` nor `Mcp-Name`, accepts `initialize`, and
+  handles `Mcp-Session-Id` with the in-memory session manager of `rmcp`.
+  Each legacy request re-authenticates. An `initialize` without a
+  credential is refused. One test sends a `2025-11-25` `initialize` and one
+  test sends a `2026-07-28` `tools/call`, and each asserts its own header
+  rule.
 - Phase 1 uses the bearer chain. Phase 2 serves the RFC 9728 document when
   an OIDC resolver is configured, after a check that `OidcResolver` validates
   the audience claim.
@@ -394,7 +434,13 @@ asserts snapshot identity per page.
 
 ### D9. Packaging and rollout
 
-The cargo feature `mcp` implies `sql`. The published image builds
+The cargo feature `mcp` implies `sql`. The cursor codec of D5 reuses the
+Flight pin codec (`flight_ticket.rs`, `TicketKey`), which `ravel-sql` gates
+behind `flight-sql` today. `ravel-sql` gains a smaller feature, `pin-codec`,
+that carries only that module and no `arrow-flight` dependency. Both
+`flight-sql` and `mcp` enable `pin-codec`. A CI build check compiles
+`ravel-server` with `sql,mcp` and without `flight-sql`, so an `mcp` build
+never depends on Flight. The published image builds
 `sql,flight-sql,otap,mcp`. The operator needs no new Service port. The flag
 `--mcp` is off by default. `--mcp-allowed-origins` is required when `--mcp`
 is set on a non-loopback listener, or startup fails. The server serves
@@ -443,7 +489,6 @@ the catalog by a drift test, a README section, the `/mcp` row in
   - resources and prompts stay minimal
   - audit records carry `query.language = mcp:<tool>`
 - Recorded uncertainties:
-  - if `flight_ticket.rs` compiles without the `flight-sql` feature
   - if `OidcResolver` checks the `aud` claim
   - the `rmcp` attribute syntax for output schemas
   - the exact `tools/list` byte figure. The first serialization sets it and
