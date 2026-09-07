@@ -1952,27 +1952,60 @@ A SQL statement's `stats.io` is the same `QueryIoShape` type and the same
 resolve site (`crates/ravel-sql/src/executor.rs`) rather than left as a
 placeholder. `unfoldedSegmentsResolved` and the resolve's own `dependencyDepth`
 inputs are read directly off that resolve, exactly as the PromQL lane reads
-them. `serviceBatches` differs because `ravel-sql` has no `GetLimiter` and no
-outer/inner `buffer_unordered` nesting: `crates/ravel-sql/src/scan.rs`'s
-`RsegScanExec` assigns segments to partitions round-robin and fetches each
-partition's own segments strictly sequentially, so the wave-synchronous model
-above collapses to a single wave:
+them.
 
-- The outer fan-out width is DataFusion's `target_partitions`
-  (`EngineConfig::sql_partition_count`, read through the SQL statement's own
-  `SqlConfig.engine`), clamped to the resolved segment count the same way
-  `RsegScanExec` clamps its own partition count.
-- The inner fan-out is always `1`: a partition's segments are fetched one
-  after another, never concurrently, so the busiest partition's own segment
-  count (`total_segments.div_ceil(partitions)`) is the whole per-partition
-  depth.
-- `sharedGetPermits` is always `u64::MAX`: nothing in `ravel-sql` shares a GET
-  permit pool across partitions the way ADR-1195's limiter does for PromQL.
+`sharedGetPermits` is the real, resolved `EngineConfig::store_get_concurrency`
+(the same source `sql_partition_count` reads), because `ravel-sql` does share
+a GET permit pool across partitions: `services/ravel-server/src/lib.rs` builds
+one `Arc<GetLimiter>` (ADR-1195) shared process-wide across every fetcher it
+constructs, including all three of the SQL executor's fetchers, not only
+PromQL's.
 
-With those three inputs, the model reduces to `ceil(total_segments /
-partitions)`: the busiest partition's segment count is the whole story, since
-there is no shared pool to bind concurrency below the partition count and no
-second fan-out level to add rounds.
+The outer/inner fan-out shape splits by target signal, because
+`metrics`/`spans` and `logs`/`alerts`/`audit` are scanned by different
+executors with different partition-assignment rules:
+
+- **`metrics` and `spans`**: `crates/ravel-sql/src/scan.rs`'s `RsegScanExec`
+  assigns segments to partitions round-robin and fetches each partition's own
+  segments strictly sequentially, so the wave-synchronous model above
+  collapses to a single wave. The outer fan-out width is DataFusion's
+  `target_partitions` (`EngineConfig::sql_partition_count`), clamped to the
+  resolved segment count the same way `RsegScanExec` clamps its own partition
+  count; the inner fan-out is always `1`, so the busiest partition's own
+  segment count (`total_segments.div_ceil(partitions)`) is the whole
+  per-partition depth. With `sharedGetPermits` folded in, the model is
+  `ceil(total_segments.div_ceil(partitions) * partitions /
+  min(partitions, sharedGetPermits))`.
+- **`logs`, `alerts`, and `audit`** (`crates/ravel-sql/src/logs_scan.rs`'s
+  `LogsScanExec`): the shape depends on `LogSegmentFetcher::has_cache()`,
+  because the cache changes how blocks are assigned to partitions, not just
+  whether a re-fetch is free.
+  - Uncached: segment-granular, matching `RsegScanExec` above (the outer
+    fan-out is `target_partitions` clamped to the segment count, one
+    partition per segment).
+  - Cached: intra-segment block striping spreads a single segment's blocks
+    across `min(target_partitions, total_block_count)` partitions, so a
+    partition can open every segment rather than one partition per segment.
+    The outer fan-out is therefore `target_partitions`, unclamped by segment
+    count. `SegmentRef` carries no block-count field, so `total_block_count`
+    is not resolvable at `io_shape_for_resolve`'s resolve-time call site
+    without extra I/O; the model instead upper-bounds a partition's segment
+    count at `total_segments` (a legitimate bound: there are only that many
+    segments to open at all). This is a documented over-estimate of
+    `serviceBatches` whenever a segment's blocks do not actually reach every
+    partition.
+
+  Both cases add a **plan-phase** term the scan-phase model above does not
+  capture: `LogsScanExec::compute_plan_counts` runs one plan probe per
+  relevant segment at `buffer_unordered(target_partitions)` before any scan
+  partition drains, contributing
+  `ceil(total_segments / min(target_partitions, sharedGetPermits))`
+  `serviceBatches` on top of the scan-phase figure, added rather than
+  maxed (the two phases run strictly serially, matching the federated-lane
+  ADD rule above). This plan-phase probe is skipped entirely by a
+  predicate-free whole-segment fast path, but predicate information is not
+  available at `io_shape_for_resolve`'s resolve-time call site, so the model
+  charges the plan phase unconditionally -- another documented over-estimate.
 
 `dependencyDepth`'s `whole_object_threshold` has no single SQL-wide knob
 either; it is read per target signal, matching whichever fetcher that
@@ -1981,6 +2014,10 @@ for `metrics`, the log fetcher's block-range threshold for `logs`, `alerts`,
 and `audit` (they share the RLOG funnel, ADR-1101 decision 1), and `u64::MAX`
 for `spans`, because the span fetcher always issues one unconditional
 whole-object GET and has no threshold concept to report.
+
+`metadataOnly` is always `false`: no SQL statement plans a metadata-only
+class today (unlike PromQL's labels/label-values lane), not because one was
+considered here and ruled out.
 
 `stats.io` carries no object keys, field values, predicates, or index
 terms: every figure is a structural count.
