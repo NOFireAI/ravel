@@ -44,6 +44,12 @@ UNATTENDED TASK: never ask for confirmation or approval; when your work
 passes the gates, commit it and end with a report. Committing
 (git commit -s) is part of the deliverable.
 
+COMMIT EARLY: `git commit -s` the first state that compiles, before you
+go on to the rest. Never put any command in the background and never end
+your turn waiting for one. Nothing will wake you -- your turn ending ends
+the task, and anything uncommitted is lost with no result ref. A slow cold
+build here is expected; wait for it in the foreground.
+
 Implement <issue ref> for the Ravel project: <one sentence>. Work ONLY
 inside <crates/dirs>.
 
@@ -125,9 +131,34 @@ orders the work commit-first:
 A kill during step 3 then costs a re-run of the gates, not a re-run of
 the whole task. Two tasks in that window were lost the other way round.
 
-Never tell an executor to start a long gate in the background and wait
-for a notification: the task ends when the agent's turn ends, and a task
-that ended waiting for a background test run pushed nothing.
+Every spec must forbid the executor from backgrounding ANY command and
+must name the consequence, because an executor that only reads "never
+background a gate" will reason its way around it correctly and still die.
+
+An earlier version of this section said exactly that, and a task was lost
+to the gap: 3h29m, 205 turns and $18.29 on a Pi-class ARM host, with zero
+`git commit` calls anywhere in its transcript. It backgrounded a plain
+`cargo check` as a diagnostic, not one of the four named gates, wrote
+"letting it run in the background, waiting for that now instead of polling
+further", and ended its turn. Nothing resumed it: the fleet harness has no
+notification that wakes an executor's own turn the way it wakes an
+orchestrator's. It sat until something outside killed it at the 3.5h mark.
+`git ls-remote` showed only the `start` ref -- no checkpoint, no result, no
+rescue bundle, nothing to recover.
+
+So state it as an absolute and give the reason, in the spec itself:
+
+> Never put any command in the background and never end your turn waiting
+> for one. Nothing will wake you: your turn ending ends the task, and
+> anything not committed is lost with no result ref. A slow cold build on a
+> Pi-class executor is expected -- wait for it in the foreground.
+
+Pair it with an explicit COMMIT EARLY instruction rather than relying on
+the ordering above being followed: the first state that compiles gets
+committed immediately, before any further deliverable. On a host where a
+single cold `cargo check` can run for hours, "commit after step 1" and
+"commit the moment anything works" are different instructions, and only
+the second survives a kill mid-build.
 
 ## Executor test scope
 
