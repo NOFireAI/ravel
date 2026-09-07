@@ -38,37 +38,46 @@ use ravel_object_store::{
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
 
-/// Format floor written into every provisioning record this build emits: every
-/// writer, including the CAS rewrite paths ([`append_generation`],
+/// Format version written into every provisioning record this build emits:
+/// every writer, including the CAS rewrite paths ([`append_generation`],
 /// [`raise_format_floor`]), stamps exactly this. It is also the highest version
 /// a rewrite path can reproduce byte-for-byte, so a rewrite refuses any record
 /// declaring a version above it rather than strip a field it does not model
 /// (ADR-0066 decision 5).
-pub const PROVISIONING_FORMAT_VERSION: u32 = 1;
+///
+/// ADR-0066 R2 raised this from 1 to 2, the writer half of the
+/// readers-before-writers sequence R1 opened. Version 2 carries the same field
+/// set as version 1; the bump is a floor signal, so a binary predating R1 --
+/// whose gate ceiling is 1 -- refuses these records instead of rewriting them
+/// whole and stripping the additive fields it does not model. That fail-closed
+/// refusal is the point (issue #1300), and it is safe only because R1's reader
+/// accepts 2 fleet-wide already.
+pub const PROVISIONING_FORMAT_VERSION: u32 = 2;
 
 /// Highest record version a reader accepts: the supported read set is
-/// `1..=PROVISIONING_MAX_READ_VERSION` (ADR-0066 decision 4). A record declaring
-/// a higher version is refused rather than misread under this layout, matching
-/// the `sys/tenancy` marker's version guard.
+/// `PROVISIONING_MIN_READ_VERSION..=PROVISIONING_MAX_READ_VERSION` (ADR-0066
+/// decision 4). A record declaring a higher version is refused rather than
+/// misread under this layout, matching the `sys/tenancy` marker's version guard.
 ///
-/// This exceeds [`PROVISIONING_FORMAT_VERSION`] on purpose: readers accept the
-/// next version before any writer emits it (readers-before-writers), so a
-/// lagging binary meeting a record a newer peer wrote halts nowhere on the read
-/// path. This record is read on the ingest hot path by `GenerationSwitch`, which
-/// fails a flush closed on a read failure, so a single-release bump that refused
-/// the newer version would be a fleet-wide ingest outage during any rolling
-/// upgrade; the two-release readers-then-writers split avoids it. The writer
-/// bump to 2 (R2) is a separate later change, sequenced after this reader accepts
-/// 2 fleet-wide.
+/// R1 raised this to 2 one release ahead of the writer (readers-before-writers),
+/// so a lagging binary meeting a record a newer peer wrote halted nowhere on the
+/// read path. This record is read on the ingest hot path by `GenerationSwitch`,
+/// which fails a flush closed on a read failure, so a single-release bump that
+/// refused the newer version would have been a fleet-wide ingest outage during
+/// any rolling upgrade. R2 flipped the writer into that already-accepted
+/// ceiling, so the read set is unchanged here and now ends exactly at what the
+/// writer stamps. A future additive field repeats the sequence: raise this
+/// ceiling first, ship it, then raise the writer.
 pub const PROVISIONING_MAX_READ_VERSION: u32 = 2;
 
 /// Lowest record version a reader accepts: the supported read set is a closed
 /// interval `PROVISIONING_MIN_READ_VERSION..=PROVISIONING_MAX_READ_VERSION`, a
 /// set with a floor and not a ceiling. Version 0 is an unstamped record from a
 /// writer that never set `format_version`; admitting it would let a valid-shaped
-/// but unstamped record enter shard routing and be rewritten as version 1 by a
-/// CAS path, so it is refused with the same `UnsupportedVersion` error the
-/// ceiling uses (ADR-0066 decision 4).
+/// but unstamped record enter shard routing and be rewritten by a CAS path, so
+/// it is refused with [`ProvisioningError::VersionBelowFloor`] -- a distinct
+/// error from the ceiling's, because the remediation is distinct (ADR-0066
+/// decision 4).
 pub const PROVISIONING_MIN_READ_VERSION: u32 = 1;
 
 /// Object key for a (tenant, signal) provisioning record: `t/<hex>/<sig>/prov`.
@@ -122,19 +131,39 @@ pub enum ProvisioningError {
         #[source]
         source: prost::DecodeError,
     },
+    /// The record declares a version ABOVE the reader's ceiling: a newer writer
+    /// produced it, and this build cannot know which fields it carries. Refused
+    /// rather than misread. The remediation is to upgrade this binary, which is
+    /// why this is a separate variant from
+    /// [`ProvisioningError::VersionBelowFloor`] (a below-floor record is not a
+    /// future format and upgrading fixes nothing).
     #[error(
-        "provisioning record {key:?} declares format_version {got}, but this build only \
-         understands versions 1..={PROVISIONING_MAX_READ_VERSION}: refusing rather than misread a \
-         future record format"
+        "provisioning record {key:?} declares format_version {got}, above the highest version this \
+         build reads ({ceiling}): a newer writer produced it, so refusing rather than misread it. \
+         Upgrade this binary to one whose reader accepts version {got}"
     )]
-    UnsupportedVersion { key: String, got: u32 },
+    UnsupportedVersion { key: String, got: u32, ceiling: u32 },
+    /// The record declares a version BELOW the reader's floor. Version 0 is the
+    /// case that occurs in practice: an unstamped record from a writer that
+    /// never set `format_version`. This is not a future format, so upgrading
+    /// changes nothing; the record itself has to be migrated or rewritten by a
+    /// writer of a supported version.
+    #[error(
+        "provisioning record {key:?} declares format_version {got}, below the lowest version this \
+         build reads ({floor}): the record is unstamped or predates the supported floor, not a \
+         future format. Refusing rather than admit a record no supported writer produced"
+    )]
+    VersionBelowFloor { key: String, got: u32, floor: u32 },
     /// A CAS rewrite path ([`append_generation`], [`raise_format_floor`]) read a
     /// record declaring a version this build's writer cannot reproduce
     /// (> [`PROVISIONING_FORMAT_VERSION`]). Rewriting it whole would re-encode
     /// through this build's field set and silently drop any field a newer writer
     /// added, so the rewrite is refused and nothing is written (ADR-0066 decision
-    /// 5). A read-only path still accepts the record (up to
-    /// [`PROVISIONING_MAX_READ_VERSION`]); only a rewrite is refused.
+    /// 5). Distinct from [`ProvisioningError::UnsupportedVersion`] because it
+    /// says nothing was written rather than nothing was read: while
+    /// [`PROVISIONING_MAX_READ_VERSION`] exceeds the writer's version (the state
+    /// R1 shipped, and the state any future additive field re-enters) a read-only
+    /// path accepts exactly the versions a rewrite refuses here.
     #[error(
         "provisioning record {key:?} declares format_version {got}, newer than this build's writer \
          version {PROVISIONING_FORMAT_VERSION}: refusing to rewrite it whole and strip fields this \
@@ -843,6 +872,54 @@ pub fn read_generations(
     Ok(out)
 }
 
+/// Classify a record's declared `format_version` against a closed supported
+/// read interval `min_read_version..=max_read_version` (ADR-0066 decision 4).
+/// The one gate every reader of this record goes through.
+///
+/// Below the floor and above the ceiling are separate errors because the
+/// remediation is opposite: an above-ceiling record needs a newer binary, a
+/// below-floor record needs the record migrated and would not be helped by any
+/// upgrade.
+///
+/// The bounds are parameters rather than direct reads of the two constants so a
+/// test can instantiate the gate another release of this code carries. Under
+/// readers-before-writers sequencing two adjacent releases hold different bounds
+/// over this same gate, and reproducing an older binary's refusal is exactly
+/// what proves the version bump fails closed instead of stripping fields.
+fn check_read_version(
+    format_version: u32,
+    min_read_version: u32,
+    max_read_version: u32,
+    key: &str,
+) -> Result<(), ProvisioningError> {
+    if format_version < min_read_version {
+        return Err(ProvisioningError::VersionBelowFloor {
+            key: key.to_string(),
+            got: format_version,
+            floor: min_read_version,
+        });
+    }
+    if format_version > max_read_version {
+        return Err(ProvisioningError::UnsupportedVersion {
+            key: key.to_string(),
+            got: format_version,
+            ceiling: max_read_version,
+        });
+    }
+    Ok(())
+}
+
+/// [`check_read_version`] at this build's own bounds, the form every production
+/// reader calls.
+fn check_supported_version(format_version: u32, key: &str) -> Result<(), ProvisioningError> {
+    check_read_version(
+        format_version,
+        PROVISIONING_MIN_READ_VERSION,
+        PROVISIONING_MAX_READ_VERSION,
+        key,
+    )
+}
+
 /// [`read_generations`], plus the same format-version and (tenant, signal)
 /// misfile guard [`validate_record`] applies before it ever calls
 /// `read_generations`. `read_generations` alone trusts that the record was
@@ -858,14 +935,7 @@ pub fn read_generations_checked(
     tenant_hash: &TenantHash,
     signal: Signal,
 ) -> Result<Vec<ShardGeneration>, ProvisioningError> {
-    if record.format_version < PROVISIONING_MIN_READ_VERSION
-        || record.format_version > PROVISIONING_MAX_READ_VERSION
-    {
-        return Err(ProvisioningError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_supported_version(record.format_version, key)?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(ProvisioningError::CorruptRecord {
             key: key.to_string(),
@@ -1132,14 +1202,7 @@ fn validate_record(
     signal: Signal,
     shard_count: u32,
 ) -> Result<(), ProvisioningError> {
-    if record.format_version < PROVISIONING_MIN_READ_VERSION
-        || record.format_version > PROVISIONING_MAX_READ_VERSION
-    {
-        return Err(ProvisioningError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_supported_version(record.format_version, key)?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(ProvisioningError::CorruptRecord {
             key: key.to_string(),
@@ -1501,8 +1564,12 @@ pub async fn append_generation(
     });
 
     // Persist the full, now-explicit history. The scalar shard_count stays
-    // generation 0's count; every prior generation is carried verbatim.
+    // generation 0's count; every prior generation is carried verbatim. The
+    // stamp is this build's writer version, not the version read: these bytes
+    // are what this build's field set produces, so they must declare it (a
+    // version-1 record rewritten here comes back as version 2).
     let mut new_record = record;
+    new_record.format_version = PROVISIONING_FORMAT_VERSION;
     new_record.generations = history
         .iter()
         .map(|g| sysproto::ShardGeneration {
@@ -1644,14 +1711,7 @@ pub fn read_floors_checked(
     tenant_hash: &TenantHash,
     signal: Signal,
 ) -> Result<Vec<FormatFloor>, ProvisioningError> {
-    if record.format_version < PROVISIONING_MIN_READ_VERSION
-        || record.format_version > PROVISIONING_MAX_READ_VERSION
-    {
-        return Err(ProvisioningError::UnsupportedVersion {
-            key: key.to_string(),
-            got: record.format_version,
-        });
-    }
+    check_supported_version(record.format_version, key)?;
     if record.tenant_hash.as_slice() != tenant_hash.0.as_slice() {
         return Err(ProvisioningError::CorruptRecord {
             key: key.to_string(),
@@ -1815,8 +1875,11 @@ pub async fn raise_format_floor(
         raised_by: raised_by.to_string(),
     });
 
-    // Persist the full history. shard_count and generations are carried verbatim.
+    // Persist the full history. shard_count and generations are carried
+    // verbatim; the stamp becomes this build's writer version, same reason as
+    // in `append_generation`.
     let mut new_record = record;
+    new_record.format_version = PROVISIONING_FORMAT_VERSION;
     new_record.format_floors = floors
         .iter()
         .map(|f| sysproto::FormatFloor {
@@ -4040,9 +4103,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// A record built at first write carries no floors, and its bytes are
-    /// unchanged by this field (additive: the empty list is omitted on encode),
-    /// so a pre-EM reader is unaffected.
+    /// A record built at first write carries no floors, and the floor field adds
+    /// no bytes to it (additive: the empty list is omitted on encode). What a
+    /// pre-EM reader now refuses on is the version stamp alone, deliberately
+    /// (ADR-0066 R2), not the presence of field 7.
     #[test]
     fn built_record_has_no_floors_and_is_byte_compatible() {
         let built = build_record(&tenant(), Signal::Metrics, 4, 1_234);
@@ -4050,10 +4114,11 @@ pub(crate) mod tests {
             built.format_floors.is_empty(),
             "a freshly built record carries no floors"
         );
-        // ADR-0066 R1: the writer still stamps 1 while readers accept {1, 2}. A
-        // premature writer bump (R2) would flip these pins.
-        assert_eq!(built.format_version, 1, "writer stamps version 1 (R1)");
-        assert_eq!(PROVISIONING_FORMAT_VERSION, 1);
+        // ADR-0066 R2: the writer stamps 2, the ceiling R1 shipped a release
+        // earlier. The read set is unchanged at {1, 2}.
+        assert_eq!(built.format_version, 2, "writer stamps version 2 (R2)");
+        assert_eq!(PROVISIONING_FORMAT_VERSION, 2);
+        assert_eq!(PROVISIONING_MIN_READ_VERSION, 1);
         assert_eq!(PROVISIONING_MAX_READ_VERSION, 2);
         let key = provisioning_key(&tenant(), Signal::Metrics);
         let floors = read_floors(&built, &key).expect("empty floor history is valid");
@@ -4061,15 +4126,15 @@ pub(crate) mod tests {
         assert_eq!(current_floor(&floors, RSEG), None);
     }
 
-    // ---- ADR-0066 R1: reader supported set {1, 2}, rewrite refuses newer ----
+    // ---- ADR-0066: reader supported set {1, 2}, rewrite refuses newer ----
 
-    /// A version-2 record shaped exactly like one a newer writer would persist:
-    /// generation 0's implicit count plus a raised format floor in field 7,
-    /// stamped `format_version = 2`. `raise_unix`/`raised_by` are pinned so the
-    /// encoded bytes are deterministic for the exact-bytes preservation check.
-    fn version_two_record_with_floor() -> sysproto::ProvisioningRecord {
+    /// A record shaped exactly like one a newer writer would persist: generation
+    /// 0's implicit count plus a raised format floor in field 7, stamped at
+    /// `version`. `raised_unix_ns`/`raised_by` are pinned so the encoded bytes
+    /// are deterministic for the exact-bytes preservation checks.
+    fn record_with_floor_at_version(version: u32) -> sysproto::ProvisioningRecord {
         sysproto::ProvisioningRecord {
-            format_version: 2,
+            format_version: version,
             tenant_hash: tenant().0.to_vec(),
             signal: sysproto::Signal::Metrics as i32,
             shard_count: 4,
@@ -4090,8 +4155,10 @@ pub(crate) mod tests {
     /// read_generations_checked, read_floors_checked), while both a version-0
     /// record (below the floor: an unstamped record from a writer that never set
     /// format_version) and a version-3 record (above the ceiling) are refused at
-    /// each with a typed UnsupportedVersion. Pins ADR-0066 decision 4's supported
-    /// set for the three provisioning reader sites.
+    /// each, with the two refusals carrying DIFFERENT typed errors:
+    /// VersionBelowFloor and UnsupportedVersion. Pins ADR-0066 decision 4's
+    /// supported set for the three provisioning reader sites, and the split
+    /// diagnostic an operator reads off them.
     #[tokio::test]
     async fn reader_accepts_version_one_and_two_and_refuses_zero_and_three() {
         let key = provisioning_key(&tenant(), Signal::Metrics);
@@ -4131,14 +4198,22 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 read_generations_checked(&v3, &key, &tenant(), Signal::Metrics),
-                Err(ProvisioningError::UnsupportedVersion { got: 3, .. })
+                Err(ProvisioningError::UnsupportedVersion {
+                    got: 3,
+                    ceiling: 2,
+                    ..
+                })
             ),
             "read_generations_checked must refuse version 3"
         );
         assert!(
             matches!(
                 read_floors_checked(&v3, &key, &tenant(), Signal::Metrics),
-                Err(ProvisioningError::UnsupportedVersion { got: 3, .. })
+                Err(ProvisioningError::UnsupportedVersion {
+                    got: 3,
+                    ceiling: 2,
+                    ..
+                })
             ),
             "read_floors_checked must refuse version 3"
         );
@@ -4158,31 +4233,45 @@ pub(crate) mod tests {
                     AbsentPolicy::CheckOnly,
                 )
                 .await,
-                Err(ProvisioningError::UnsupportedVersion { got: 3, .. })
+                Err(ProvisioningError::UnsupportedVersion {
+                    got: 3,
+                    ceiling: 2,
+                    ..
+                })
             ),
             "validate_record must refuse version 3"
         );
 
         // Version 0 (below the floor: an unstamped record from a writer that
-        // never set format_version) is refused at each gate. A supported set has
-        // a floor as well as a ceiling: admitting version 0 would let a
-        // valid-shaped but unstamped record enter shard routing and later be
-        // rewritten as version 1 by a CAS path.
+        // never set format_version) is refused at each gate, and with the
+        // below-floor error rather than the ceiling's: an operator who upgrades
+        // on reading "a newer writer produced it" learns nothing here, the
+        // record itself is the problem. A supported set has a floor as well as a
+        // ceiling: admitting version 0 would let a valid-shaped but unstamped
+        // record enter shard routing and later be rewritten by a CAS path.
         let mut v0 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
         v0.format_version = 0;
         assert!(
             matches!(
                 read_generations_checked(&v0, &key, &tenant(), Signal::Metrics),
-                Err(ProvisioningError::UnsupportedVersion { got: 0, .. })
+                Err(ProvisioningError::VersionBelowFloor {
+                    got: 0,
+                    floor: 1,
+                    ..
+                })
             ),
-            "read_generations_checked must refuse version 0"
+            "read_generations_checked must refuse version 0 as below the floor"
         );
         assert!(
             matches!(
                 read_floors_checked(&v0, &key, &tenant(), Signal::Metrics),
-                Err(ProvisioningError::UnsupportedVersion { got: 0, .. })
+                Err(ProvisioningError::VersionBelowFloor {
+                    got: 0,
+                    floor: 1,
+                    ..
+                })
             ),
-            "read_floors_checked must refuse version 0"
+            "read_floors_checked must refuse version 0 as below the floor"
         );
         let store = mem();
         store
@@ -4200,38 +4289,42 @@ pub(crate) mod tests {
                     AbsentPolicy::CheckOnly,
                 )
                 .await,
-                Err(ProvisioningError::UnsupportedVersion { got: 0, .. })
+                Err(ProvisioningError::VersionBelowFloor {
+                    got: 0,
+                    floor: 1,
+                    ..
+                })
             ),
-            "validate_record must refuse version 0"
+            "validate_record must refuse version 0 as below the floor"
         );
     }
 
-    /// A version-2 record carrying a format floor (field 7) put through the
-    /// old-shaped `append_generation` rewrite is REFUSED, not stripped: the
-    /// rewrite re-encodes the whole record through this build's field set, which
-    /// would drop a field a newer writer added. The stored bytes must be exactly
-    /// unchanged after the refusal (no CAS write happened at all). Named per the
-    /// ADR-0066 R1 spec; field 7 is one this build does model, so the refusal is
-    /// version-driven (a v2 record may carry a field this build does NOT model),
-    /// not field-driven.
+    /// A record from a writer newer than this build (version 3, above what this
+    /// build stamps) put through the `append_generation` rewrite is REFUSED, not
+    /// stripped: the rewrite re-encodes the whole record through this build's
+    /// field set, which would drop a field that newer writer added. The stored
+    /// bytes must be exactly unchanged after the refusal (no CAS write happened
+    /// at all). The refusal is version-driven, not field-driven: field 7 is one
+    /// this build models, and the record is refused anyway because a version
+    /// above the writer's may carry a field it does not.
     #[tokio::test]
     async fn append_generation_preserves_format_floors_written_by_a_newer_writer() {
         let store = mem();
         let key = provisioning_key(&tenant(), Signal::Metrics);
-        let seeded = version_two_record_with_floor().encode_to_vec();
+        let seeded = record_with_floor_at_version(3).encode_to_vec();
         store
             .put(&key, seeded.clone().into(), PutOptions::default())
             .await
-            .expect("seed a version-2 record with a format floor");
+            .expect("seed a version-3 record with a format floor");
 
-        // Reshard append onto a version-2 record: refused, not stripped.
+        // Reshard append onto a newer record: refused, not stripped.
         let err = append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 1_000_000, 0)
             .await
             .expect_err("appending onto a newer record must be refused");
         assert!(
             matches!(
                 err,
-                ProvisioningError::RefusingToRewriteNewerRecord { got: 2, .. }
+                ProvisioningError::RefusingToRewriteNewerRecord { got: 3, .. }
             ),
             "got: {err}"
         );
@@ -4241,22 +4334,23 @@ pub(crate) mod tests {
         assert_eq!(
             after.as_ref(),
             seeded.as_slice(),
-            "the stored version-2 record must be byte-for-byte unchanged"
+            "the stored version-3 record must be byte-for-byte unchanged"
         );
     }
 
-    /// The sibling rewrite path: `raise_format_floor` refuses a version-2 record
-    /// too, leaving its bytes exactly unchanged. Sweeps the rule across both CAS
-    /// rewrite paths of this record, not only the one the spec named.
+    /// The sibling rewrite path: `raise_format_floor` refuses a record from a
+    /// newer writer too, leaving its bytes exactly unchanged. Sweeps the rule
+    /// across both CAS rewrite paths of this record, not only the one the spec
+    /// named.
     #[tokio::test]
-    async fn raise_format_floor_refuses_a_version_two_record_from_a_version_one_writer() {
+    async fn raise_format_floor_refuses_a_record_from_a_newer_writer() {
         let store = mem();
         let key = provisioning_key(&tenant(), Signal::Metrics);
-        let seeded = version_two_record_with_floor().encode_to_vec();
+        let seeded = record_with_floor_at_version(3).encode_to_vec();
         store
             .put(&key, seeded.clone().into(), PutOptions::default())
             .await
-            .expect("seed a version-2 record");
+            .expect("seed a version-3 record");
 
         let err = raise_format_floor(
             store.as_ref(),
@@ -4272,7 +4366,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 err,
-                ProvisioningError::RefusingToRewriteNewerRecord { got: 2, .. }
+                ProvisioningError::RefusingToRewriteNewerRecord { got: 3, .. }
             ),
             "got: {err}"
         );
@@ -4281,7 +4375,7 @@ pub(crate) mod tests {
         assert_eq!(
             after.as_ref(),
             seeded.as_slice(),
-            "the stored version-2 record must be byte-for-byte unchanged"
+            "the stored version-3 record must be byte-for-byte unchanged"
         );
     }
 
@@ -4343,6 +4437,176 @@ pub(crate) mod tests {
         assert!(
             matches!(err, ProvisioningError::Decode { .. }),
             "got: {err}"
+        );
+    }
+
+    // ---- ADR-0066 R2: the writer stamps 2 and a pre-R1 binary fails closed ----
+
+    /// Tag byte for field 15, varint wire type: a field number no
+    /// `ProvisioningRecord` this build models uses (1..=7 are taken). Appended to
+    /// an encoded record it is, on the wire, exactly an additive field a newer
+    /// writer added, and prost keeps no unknown fields, so any whole-record
+    /// re-encode through this build's field set drops it. That is the strip
+    /// issue #1300 is about, reproduced without needing a second binary.
+    const UNMODELED_FIELD_TAG: u8 = 15 << 3;
+    const UNMODELED_FIELD_VALUE: u8 = 0x2A;
+
+    fn with_unmodeled_field(mut encoded: Vec<u8>) -> Vec<u8> {
+        encoded.push(UNMODELED_FIELD_TAG);
+        encoded.push(UNMODELED_FIELD_VALUE);
+        encoded
+    }
+
+    /// The read-modify-write a binary predating the first round performs: its
+    /// reader gate is this same shared gate at the pre-R1 bounds (a supported set
+    /// of exactly {1}), and its write re-encodes the decoded view, so any field
+    /// it does not model is gone from the bytes it puts back. Built from the
+    /// shared gate rather than by running a second binary.
+    fn pre_r1_rewrite(stored: &[u8], key: &str) -> Result<Vec<u8>, ProvisioningError> {
+        let record = sysproto::ProvisioningRecord::decode(stored).map_err(|source| {
+            ProvisioningError::Decode {
+                key: key.to_string(),
+                source,
+            }
+        })?;
+        check_read_version(record.format_version, 1, 1, key)?;
+        Ok(record.encode_to_vec())
+    }
+
+    /// The test issue #1300 asks for, for the ProvisioningRecord family. A record
+    /// the current writer produced, carrying a field a version-1 writer never
+    /// emits, is REFUSED by a binary that predates the first round, with the
+    /// above-ceiling error, and the stored bytes are unchanged. The last
+    /// assertion shows the alternative is a real strip: a re-encode that the gate
+    /// had admitted comes back short by exactly that field.
+    ///
+    /// Flip the writer back to stamping 1 and this fails twice over: the stamp
+    /// assertion, and then the refusal, because the old gate accepts a version-1
+    /// record and strips the field.
+    #[tokio::test]
+    async fn a_pre_r1_binary_refuses_a_current_record_instead_of_stripping_it() {
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+        let seeded = with_unmodeled_field(
+            build_record(&tenant(), Signal::Metrics, 4, 1_000).encode_to_vec(),
+        );
+        store
+            .put(&key, seeded.clone().into(), PutOptions::default())
+            .await
+            .expect("seed a current-writer record carrying an unmodeled field");
+
+        let stored = sysproto::ProvisioningRecord::decode(seeded.as_slice()).expect("decode");
+        assert_eq!(
+            stored.format_version, 2,
+            "the current writer stamps exactly version 2"
+        );
+
+        let err = pre_r1_rewrite(&seeded, &key)
+            .expect_err("a binary predating R1 must refuse this record, not rewrite it");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::UnsupportedVersion {
+                    got: 2,
+                    ceiling: 1,
+                    ..
+                }
+            ),
+            "got: {err}"
+        );
+
+        // Nothing was written back: the record, unmodeled field included, is
+        // byte-for-byte what the current writer put there.
+        let after = store.get(&key, GetRange::Full).await.expect("re-read").data;
+        assert_eq!(
+            after.as_ref(),
+            seeded.as_slice(),
+            "the refused record must be byte-for-byte unchanged"
+        );
+
+        // And the strip the refusal prevents is real, not hypothetical: the
+        // bytes a whole-record re-encode produces are the seeded bytes minus
+        // exactly the two bytes of the unmodeled field.
+        let re_encoded = sysproto::ProvisioningRecord::decode(seeded.as_slice())
+            .expect("decode")
+            .encode_to_vec();
+        assert_eq!(
+            re_encoded.as_slice(),
+            &seeded[..seeded.len() - 2],
+            "a whole-record re-encode drops the unmodeled field"
+        );
+    }
+
+    /// Every writer of this record stamps 2 on the wire: first write, reshard
+    /// append, floor raise. Asserted on the bytes read back from the store and
+    /// decoded, at the exact value, not on the in-memory struct and not with an
+    /// inequality. The append case starts from a stored version-1 record, so it
+    /// also pins that a rewrite re-stamps rather than carrying the read version
+    /// through.
+    #[tokio::test]
+    async fn every_writer_stamps_version_two_on_the_wire() {
+        /// The `format_version` on the wire at `key`, decoded from the stored
+        /// bytes rather than read off any in-memory struct.
+        async fn stamped(store: &dyn ObjectStoreBackend, key: &str) -> u32 {
+            let bytes = store.get(key, GetRange::Full).await.expect("re-read").data;
+            sysproto::ProvisioningRecord::decode(bytes.as_ref())
+                .expect("decode")
+                .format_version
+        }
+
+        let store = mem();
+        let key = provisioning_key(&tenant(), Signal::Metrics);
+
+        // 1. First write, through validate_or_adopt's create path.
+        validate_or_adopt(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            4,
+            1_000,
+            AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("first write");
+        assert_eq!(
+            stamped(store.as_ref(), &key).await,
+            2,
+            "the first-write path stamps 2"
+        );
+
+        // 2. Reshard append, starting from a stored version-1 record: the
+        //    rewrite re-stamps to this build's writer version.
+        let mut v1 = build_record(&tenant(), Signal::Metrics, 4, 1_000);
+        v1.format_version = 1;
+        store
+            .put(&key, v1.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed a version-1 record");
+        append_generation(store.as_ref(), &tenant(), Signal::Metrics, 8, 1_000_000, 0)
+            .await
+            .expect("append onto a version-1 record");
+        assert_eq!(
+            stamped(store.as_ref(), &key).await,
+            2,
+            "the reshard rewrite re-stamps a version-1 record as 2"
+        );
+
+        // 3. Floor raise.
+        raise_format_floor(
+            store.as_ref(),
+            &tenant(),
+            Signal::Metrics,
+            "rseg",
+            6,
+            "job",
+            3_000,
+        )
+        .await
+        .expect("raise a floor");
+        assert_eq!(
+            stamped(store.as_ref(), &key).await,
+            2,
+            "the floor-raise rewrite stamps 2"
         );
     }
 }

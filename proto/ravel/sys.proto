@@ -92,15 +92,25 @@ message ProvisioningRecord {
   // reader that only knows a lower version refuses rather than misreading a
   // future layout as v1 (matching TenancyMarker's format_version guard).
   //
-  // Writers stamp 1. Readers accept the SET {1, 2}: this record is CAS-mutable
-  // (append_generation, raise_format_floor rewrite it whole), so per the
-  // ADR-0066 R1 amendment its readers accept the next version before any writer
-  // emits it (readers-before-writers), and its rewrite paths REFUSE a record
-  // whose version exceeds what this build's writer stamps rather than re-encode
-  // it through an older field set and strip a field a newer writer added. This
-  // is why the ADR-0052 note below, which reasons only about an old READER, is
-  // not sufficient on its own for a CAS-mutable record: an old WRITER rewriting
-  // a newer record is the hazard the SET and the rewrite refusal close.
+  // Version 2 is current: writers stamp 2 and readers accept the SET {1, 2}.
+  // Version 1 remains fully readable, so a record any earlier build wrote is
+  // still read, and nothing has to be migrated.
+  //
+  // This record is CAS-mutable (append_generation, raise_format_floor rewrite it
+  // whole), so per the ADR-0066 R1 amendment its readers accepted version 2
+  // fleet-wide one release BEFORE any writer emitted it
+  // (readers-before-writers); the R2 amendment then flipped the writer into that
+  // already-accepted ceiling. Its rewrite paths REFUSE a record whose version
+  // exceeds what this build's writer stamps rather than re-encode it through an
+  // older field set and strip a field a newer writer added. This is why the
+  // ADR-0052 note below, which reasons only about an old READER, is not
+  // sufficient on its own for a CAS-mutable record: an old WRITER rewriting a
+  // newer record is the hazard the SET and the rewrite refusal close.
+  //
+  // A version-1 writer never emits `generations` (field 6) or `format_floors`
+  // (field 7): both were added after that writer, which is exactly why a binary
+  // predating the R1 readers now refuses a version-2 record rather than
+  // rewriting it without them.
   //
   // Adding `generations` (field 6) is additive and does NOT bump the version a
   // WRITER stamps: a pre-ADR-0052 reader that skips the unknown field 6 still
@@ -147,11 +157,13 @@ message ProvisioningRecord {
   // That old-READER reasoning is necessary but not sufficient for this
   // CAS-mutable record: an old WRITER that rewrites a record a newer writer
   // stamped (append_generation, raise_format_floor) would re-encode it without a
-  // field it does not model and strip it. The R1 amendment (ADR-0066, #1300)
-  // closes that: readers accept the version SET {1, 2}, and the rewrite paths
-  // refuse a record newer than the writer stamps. Any additive field added after
-  // this one still follows the CAS-mutable rule: bump the version, ship the
-  // reader that accepts it fleet-wide, THEN flip the writer.
+  // field it does not model and strip it. The R1 and R2 amendments (ADR-0066,
+  // #1300) close that: readers accept the version SET {1, 2}, the writer now
+  // stamps 2 so a binary predating those readers fails closed on every current
+  // record instead of stripping it, and the rewrite paths refuse a record newer
+  // than the writer stamps. Any additive field added after this one still
+  // follows the CAS-mutable rule: bump the version, ship the reader that accepts
+  // it fleet-wide, THEN flip the writer.
   //
   // Decode enforces, per family, that floor_version is strictly increasing in
   // append order (floors raised only); a later entry for a family at or below an
@@ -412,7 +424,15 @@ message KeyEpochRecord {
   // Format floor: the minimum reader version that understands this record. A
   // reader that only knows a lower version refuses rather than misreading a
   // future layout as v1 (matching TenancyMarker/ProvisioningRecord/GcConfig).
-  // = 1.
+  //
+  // Writers stamp 1, and readers accept the SET {1}: a floor as well as a
+  // ceiling, since ADR-0066 R2. This record is CAS-mutable (record_key_epoch
+  // re-encodes it whole to append an epoch), so an unstamped version-0 record
+  // admitted by the old ceiling-only gate would have come back stamped 1 with
+  // any field this build does not model dropped. Version 0 is now refused with a
+  // below-floor error, distinct from the above-ceiling one. An additive field
+  // here follows the CAS-mutable rule: bump to 2, ship the reader that accepts
+  // {1, 2} fleet-wide, THEN flip the writer.
   uint32 format_version = 1;
   bytes tenant_hash = 2;         // 16 bytes; the `t/<tenant_hash>/` prefix owner
   sfixed64 created_unix_ns = 3;  // informational; when the record was first written
@@ -533,13 +553,21 @@ message TenantConfigRecord {
   // reader that only knows a lower version refuses rather than misreading a
   // future layout, matching every other durable record's version guard.
   //
-  // Writers stamp 1. Readers accept the SET {1, 2}: this record is CAS-mutable
-  // (set_tenant_config rebuilds it whole under CasVersion, naming every field it
-  // knows), so per the ADR-0066 R1 amendment its reader accepts the next version
-  // before any writer emits it, and set_tenant_config REFUSES to rewrite a record
-  // newer than this build's writer stamps rather than rebuild it at the older
-  // field set and strip a field a newer writer added (e.g. a field past
-  // `typed_attr_columns`).
+  // Version 2 is current: writers stamp 2 and readers accept the SET {1, 2}.
+  // Version 1 remains fully readable, so a record any earlier build wrote is
+  // still read, and nothing has to be migrated.
+  //
+  // This record is CAS-mutable (set_tenant_config rebuilds it whole under
+  // CasVersion, naming every field it knows), so per the ADR-0066 R1 amendment
+  // its reader accepted version 2 fleet-wide one release BEFORE any writer
+  // emitted it; the R2 amendment then flipped the writer into that
+  // already-accepted ceiling. set_tenant_config REFUSES to rewrite a record newer
+  // than this build's writer stamps rather than rebuild it at the older field set
+  // and strip a field a newer writer added.
+  //
+  // A version-1 writer never emits `typed_attr_columns` (field 12): it was added
+  // after that writer, which is exactly why a binary predating the R1 readers now
+  // refuses a version-2 record rather than rebuilding it without that field.
   uint32 format_version = 1;
   bytes tenant_hash = 2;              // 16 bytes; the `t/<tenant_hash>/` prefix owner
   TenantLifecycleState lifecycle_state = 3;
@@ -563,12 +591,14 @@ message TenantConfigRecord {
   // present-but-empty vs absent distinction). Additive field: a reader that
   // skips this unknown field reads every earlier field exactly as before, and a
   // reader that understands it sees an absent sub-message on every pre-ADR-0090
-  // record, identical to "no override". No writer version bump for THIS field
-  // (ADR-0090 Consequences). But note this record is CAS-mutable: any field
-  // added AFTER this one must follow the CAS-mutable rule (ADR-0066 R1
-  // amendment) -- bump the version, ship the reader that accepts it fleet-wide,
-  // then flip the writer -- because set_tenant_config rewrites the record whole
-  // and a lagging writer would otherwise strip the new field.
+  // record, identical to "no override". No writer version bump was taken for
+  // THIS field (ADR-0090 Consequences); the writer's later move to 2 is the
+  // ADR-0066 R2 floor signal for the record as a whole, not a bump on this
+  // field's account. Any field added AFTER this one must follow the CAS-mutable
+  // rule (ADR-0066 R1 amendment) -- bump the version, ship the reader that
+  // accepts it fleet-wide, then flip the writer -- because set_tenant_config
+  // rewrites the record whole and a lagging writer would otherwise strip the new
+  // field.
   TypedAttrColumnConfig typed_attr_columns = 12;
 }
 
@@ -642,6 +672,13 @@ message AuthTokenMap {
   // upgraded too. A v2+ reader accepts both a stored 1 and a stored 2
   // (every entry decodes the same either way; an absent `managed_by` just
   // means unmanaged).
+  //
+  // The accepted set is exactly {1, 2}: a floor as well as a ceiling, since
+  // ADR-0066 R2. This object is CAS-mutable (upsert_token and its siblings
+  // rebuild it whole under CasVersion), so an unstamped version-0 object admitted
+  // by the old ceiling-only gate would have come back stamped 2 with any field
+  // this build does not model dropped. Version 0 is now refused with a
+  // below-floor error, distinct from the above-ceiling one.
   uint32 format_version = 1;
   // A 16-byte fingerprint of the deployment key the token hashes are keyed
   // under: blake3::derive_key("ravel-auth-v1-fingerprint", deployment_key)
@@ -728,15 +765,24 @@ message MetricMetadataRecord {
   // reader that only knows a lower version refuses rather than misreading a
   // future layout, matching every other durable record's version guard.
   //
-  // Writers stamp 1. The decode gate accepts the SET {1, 2}: this record is
-  // CAS-mutable (the ingest sink reads it, field-wise re-merges via
-  // merge_entries, and CAS-writes it back), so per the ADR-0066 R1 amendment the
-  // decode gate accepts the next version before any writer emits it. The read
-  // that FEEDS that rewrite (read_metrics_meta, which returns the CAS version a
-  // caller writes back with) is stricter: it REFUSES a record newer than this
-  // build's writer stamps, so a lagging binary drops the merge window rather than
-  // re-encoding the record through an older field set and stripping a field a
-  // newer writer added.
+  // Version 2 is current: writers stamp 2 and the decode gate accepts the SET
+  // {1, 2}. Version 1 remains fully readable, so a record any earlier build wrote
+  // is still read, and nothing has to be migrated.
+  //
+  // This record is CAS-mutable (the ingest sink reads it, field-wise re-merges
+  // via merge_entries, and CAS-writes it back), so per the ADR-0066 R1 amendment
+  // the decode gate accepted version 2 fleet-wide one release BEFORE any writer
+  // emitted it; the R2 amendment then flipped the writer into that
+  // already-accepted ceiling. The read that FEEDS that rewrite
+  // (read_metrics_meta, which returns the CAS version a caller writes back with)
+  // is stricter: it REFUSES a record newer than this build's writer stamps, so a
+  // lagging binary drops the merge window rather than re-encoding the record
+  // through an older field set and stripping a field a newer writer added.
+  //
+  // Unlike the other two records the R2 flip covers, version 2 here adds NO
+  // field: every field a version-2 writer emits, a version-1 writer emitted too.
+  // The bump is purely the floor signal, so a binary predating the R1 decode gate
+  // fails closed on a current record instead of rewriting it.
   uint32 format_version = 1;
   // One entry per metric family name. Decode enforces: every family_name is
   // non-empty, no family_name repeats (a duplicate would make a
