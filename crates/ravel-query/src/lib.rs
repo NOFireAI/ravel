@@ -16,6 +16,7 @@ mod log_fetcher;
 pub mod log_series;
 mod phase_accounting;
 mod query_admission;
+mod request_budgets;
 mod segment_admission;
 pub mod span_fetcher;
 #[cfg(test)]
@@ -50,5 +51,6 @@ pub use query_admission::{
     QueryAdmissionController, QueryConcurrencyLimit, QueryPermit, QueryRejected,
     query_admission_snapshot_key, reconcile_query_admission_once,
 };
+pub use request_budgets::{EffectiveBudgets, RequestBudgets};
 pub use segment_admission::{SegmentAdmission, admit, request_budget_exceeded};
 pub use span_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
