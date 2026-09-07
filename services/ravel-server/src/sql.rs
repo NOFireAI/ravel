@@ -375,7 +375,31 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         outcome.stats.blocks_pruned_by_postings,
     );
 
-    let stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
+    let mut stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
+    // The same `io` block a PromQL query's `stats` carries (issue #1250),
+    // added beside `accounting`/`estimate` rather than folded into
+    // `accounting_stats_json` itself: that helper is shared with
+    // `/api/v1/analytics`, which has no `QueryIoShape` to render.
+    //
+    // These field names and renames are kept byte-identical to
+    // `ravel_query::http::json::IoShapeJson`'s `Serialize` impl by hand
+    // rather than by reusing that type directly: the `json` module it lives
+    // in is private to `ravel-query` (no `pub use` re-exports it), and this
+    // task's out-of-scope allowance covers only a second `io_shape.rs` entry
+    // point, not a second edit to export a type from a different module.
+    if let Some(object) = stats.as_object_mut() {
+        let shape = outcome.stats.io_shape;
+        object.insert(
+            "io".to_string(),
+            serde_json::json!({
+                "dependencyDepth": shape.dependency_depth,
+                "listPageDepth": shape.list_page_depth,
+                "serviceBatches": shape.service_batches,
+                "unfoldedSegmentsResolved": shape.unfolded_segments_resolved,
+                "planClass": shape.plan_class.name(),
+            }),
+        );
+    }
     encode(&headers, &outcome, tenant_hash, stats)
 }
 
