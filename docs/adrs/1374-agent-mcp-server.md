@@ -203,12 +203,15 @@ The `tools/list` result for the nine tools must serialize in less than
 5. A query service layer in `services/ravel-server/src/service/`. Analytics
    and exemplars gain an admission permit. PromQL gains cost on cancel.
    `labels` and `label_values` gain the audit seam. The service layer
-   finalizes usage before it maps any outcome to an error. The outcomes are
-   an audit failure, a partial-result refusal, an evaluation failure, a
-   deadline, and a cancellation. A drop guard in the pattern of
-   `sql.rs::CostGuard` records the spend on every path. As a result, the
-   D6 usage figures and the D7 cancelled-spend figure are never omitted.
-   One test per path asserts the recorded figures.
+   finalizes usage before it maps an outcome to an error. The outcomes that
+   map to an error are an audit failure, a partial-result refusal, an
+   evaluation failure, and a deadline. A cancellation is transport-level:
+   the tool future is dropped, no envelope is produced, and the usage
+   record is its only result. A drop guard in the pattern of
+   `sql.rs::CostGuard` records the spend on every path, including the
+   dropped one. As a result, the D6 usage figures and the D7
+   cancelled-spend figure are never omitted. One test per path asserts the
+   recorded figures.
 6. `AuditPipeline::spawn` in `lib.rs::start` for query modes. Flags
    `--audit-mode required|best-effort` (default `required`) and
    `--audit-text`. This closes #1187. MCP tool calls submit
@@ -228,7 +231,7 @@ Every tool returns one envelope:
   "visibility": {"snapshot_id": "", "watermark_hour": "", "pinned": false, "min_commit_tokens_applied": []},
   "coverage": {"complete": true, "partial": false, "fragments": [], "unindexed_predicates": []},
   "accuracy": {"exact": true, "approximation": null, "lower_bound_count": false},
-  "presentation": {"max_rows": 200, "row_cap_hit": false, "bytes_cap_hit": false, "cursor": null},
+  "presentation": {"max_rows": 200, "row_cap_hit": false, "bytes_cap_hit": false, "rows_omitted": 0, "cursor": null},
   "budget": {"effective": {}, "actual": {}, "estimate": {}, "estimate_is_upper_envelope": true},
   "evidence": [{"ref": "", "covers": "data.rows", "sha256": ""}],
   "warnings": [],
@@ -240,7 +243,8 @@ The four status values are different facts. `ok` is a complete query. A
 query with zero matches is `ok`. A query whose `LIMIT` the data did not fill
 is `ok`. `ok_bounded` means that the row cap stopped the result, more rows
 exist, and no cursor exists because the statement has no total order.
-`ok_page` means that the row cap stopped the result and a cursor exists.
+`ok_page` means that a cap stopped the result and a cursor exists. The cap
+is the row cap, the byte cap, or both, and `presentation` says which.
 
 `max_response_bytes` bounds the serialized `structuredContent`, that is, the
 whole envelope as JSON. When the envelope exceeds the cap, the server drops
@@ -249,10 +253,22 @@ keeps the count of rows that the query produced. `presentation.bytes_cap_hit`
 becomes `true` and `presentation.rows_omitted` carries the number of dropped
 rows. The text block is rendered from the truncated `data`, so the two
 representations never differ. When the statement has a total order, the
-cursor points at the last kept row, so the omitted rows are reachable on the
-next page. When it has no total order, the status is `ok_bounded`. The byte
-cap, the row cap, and analytic downsampling are three separate facts in the
-envelope. A downsampled analytic sets `exact: false` and names the method.
+cursor points at the last kept row and the status is `ok_page`. The omitted
+rows are then reachable on the next page. When it has no total order, the
+status is `ok_bounded`.
+
+The fixed part of the envelope is bounded so that it always fits. The server
+floors `max_response_bytes` at 16 KiB: a caller value below the floor is
+raised to the floor, and the envelope says so. This floor is a minimum on
+the presentation cap and is not a raise of any query budget. The metadata
+lists are bounded by count: at most 16 `warnings`, 8 `next_steps`, and 16
+`evidence` entries, each with a bounded string length. A test serializes an
+envelope with zero rows and every metadata list at its maximum and asserts
+that it fits under 16 KiB. When the rendering still cannot fit, which the
+test makes impossible, the result is an `error` with class `internal`. The
+byte cap, the row cap, and analytic downsampling are three separate facts in
+the envelope. A downsampled analytic sets `exact: false` and names the
+method.
 Missing coverage sets `complete: false` and names the reason. A budget
 failure or a deadline is an `error`. The server never returns a partial exact
 aggregate as `ok`. A `COUNT` over `logs` or `spans` sets
