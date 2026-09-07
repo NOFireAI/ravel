@@ -1060,18 +1060,25 @@ points that take `Option<&RequestBudgets>`; passing `None` is exactly the
 pre-existing method. On the SQL side, `SqlRequest::budgets` carries them.
 
 Enforcement on the SQL side is not yet uniform across the five tables, and a
-caller has to know which knob binds where. Only the `samples` (metrics)
-provider reads the effective `max_bytes_scanned` and `max_store_requests` at
-scan time; the `logs`, `spans`, `alerts`, and `audit` providers do not. For
-those four tables, only `max_segments` is lowered today: it binds in
-`segment_admission::admit`, which runs on the catalog resolve every table
-shares, so a per-request `max_segments` does refuse an over-wide scan on any
-of them. A per-request bytes or request ceiling set alongside it is accepted
-and clamped, and then never consulted by those four scans. This is a
-pre-existing gap in the providers, not something the per-request budgets
-introduced; enforcing the lowered byte and store-request budgets on the
-`logs`, `spans`, `alerts`, and `audit` providers is tracked as follow-up
-work and is not implemented yet, and is out of scope here.
+caller has to know which knob binds where. The effective `max_store_requests`
+ceiling IS checked for every target signal, once, immediately after
+`resolve_admitted`'s catalog resolve: a caller cannot finish a query above a
+lowered request budget on any of the five tables merely because its snapshot
+resolved empty. `max_segments` is enforced the same way, on the same shared
+resolve, via `segment_admission::admit`.
+
+What is not yet uniform is INCREMENTAL, scan-time enforcement. Only the
+`samples` (metrics) provider re-checks the running total against
+`max_bytes_scanned` and `max_store_requests` as it fetches segments (scan.rs);
+the `logs`, `spans`, `alerts`, and `audit` providers do not. A lowered request
+budget on one of those four tables therefore only ever traps once, at resolve,
+never again as the scan itself keeps issuing GETs. The byte budget fares
+worse: `max_bytes_scanned` is not consulted at all for those four tables,
+neither at resolve nor during the scan. This is a pre-existing gap in the
+providers, not something the per-request budgets introduced; enforcing the
+lowered byte budget, and the request budget's incremental scan-time re-check,
+on the `logs`, `spans`, `alerts`, and `audit` providers is tracked as
+follow-up work and is not implemented yet, and is out of scope here.
 
 ### The agent query knobs on `SqlRequest` (ADR-1374)
 

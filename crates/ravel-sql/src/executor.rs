@@ -849,20 +849,12 @@ impl SqlExecutor {
     ) -> Result<ExplainReport, SqlError> {
         let target = Self::target_signal(&req.sql)?;
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
+        // `resolve_admitted` itself checks the effective `max_s3_requests`
+        // right after resolve returns, so `explain` gets that enforcement
+        // for free here without ever reaching the segment-fetch loop in
+        // scan.rs (which it never runs: explain issues no data GET).
         let (snapshot, admission, estimate) =
             self.resolve_admitted(tenant_hash, req, accounting).await?;
-        // Checked here too (mirrors `Self::run` above): `explain` resolves and
-        // plans a statement without ever reaching the segment-fetch loop in
-        // scan.rs, so a caller's lowered `max_s3_requests` (ADR-1374 decision
-        // 3) is only enforceable against the resolve's own catalog requests.
-        if let Some(QueryError::RequestBudgetExceeded { requests, max }) = request_budget_exceeded(
-            accounting.snapshot().total_s3_requests(),
-            self.effective_config(req.budgets.as_ref())
-                .engine
-                .max_s3_requests,
-        ) {
-            return Err(SqlError::RequestBudgetExceeded { requests, max });
-        }
         let segments_resolved = snapshot.segments.len();
 
         let planned = self
@@ -934,23 +926,12 @@ impl SqlExecutor {
             // deadline trip reflects exactly this attempt's issued cost and
             // never a discarded prior attempt's.
             live.install(&accounting);
+            // `resolve` (via `resolve_admitted`) itself checks the effective
+            // `max_s3_requests` right after resolve returns, so a statement
+            // whose snapshot resolves to zero segments cannot slip past this
+            // ceiling on the strength that it never reaches the
+            // segment-fetch loop in scan.rs.
             let (snapshot, estimate) = self.resolve(tenant_hash, req, &accounting).await?;
-            // Checked here, right after resolve returns, not only in the
-            // segment-fetch loop in scan.rs: a statement whose snapshot
-            // resolves to zero segments never reaches that loop, so a
-            // caller's lowered `max_s3_requests` (ADR-1374 decision 3) must
-            // still be enforced on the strength of the resolve's own
-            // catalog requests alone.
-            if let Some(QueryError::RequestBudgetExceeded { requests, max }) =
-                request_budget_exceeded(
-                    accounting.snapshot().total_s3_requests(),
-                    self.effective_config(req.budgets.as_ref())
-                        .engine
-                        .max_s3_requests,
-                )
-            {
-                return Err(SqlError::RequestBudgetExceeded { requests, max });
-            }
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
@@ -1512,6 +1493,23 @@ impl SqlExecutor {
             }
             TargetSignal::Spans => estimate_spans_cost(&snapshot, catalog_requests),
         };
+        // Checked here, in the one resolve path `execute`, `explain`, and the
+        // Flight SQL `resolve_snapshot` all funnel through, right after
+        // resolve returns and not only in the segment-fetch loop in scan.rs:
+        // a statement whose snapshot resolves to zero segments never reaches
+        // that loop, so a caller's lowered `max_s3_requests` (ADR-1374
+        // decision 3) must still be enforced on the strength of the
+        // resolve's own catalog requests alone. Checked once here rather
+        // than once per caller, so a fourth resolve entry point cannot be
+        // added later without this check automatically covering it too.
+        if let Some(QueryError::RequestBudgetExceeded { requests, max }) = request_budget_exceeded(
+            accounting.snapshot().total_s3_requests(),
+            self.effective_config(req.budgets.as_ref())
+                .engine
+                .max_s3_requests,
+        ) {
+            return Err(SqlError::RequestBudgetExceeded { requests, max });
+        }
         Ok((snapshot, admission, estimate))
     }
 
@@ -3337,9 +3335,12 @@ mod tests {
     /// statement whose snapshot resolves to zero segments never reaches the
     /// segment-fetch loop in scan.rs, so the incremental `max_s3_requests`
     /// check there never runs. A caller-lowered budget of zero (ADR-1374
-    /// decision 3) must still be enforced right after resolve, on both the
-    /// `execute` and `explain` paths, and the server default ceiling must
-    /// not change behavior for the same fixture.
+    /// decision 3) must still be enforced right after resolve, on the
+    /// `execute`, `explain`, and Flight SQL `resolve_snapshot` paths alike --
+    /// round 2 moved the check into `resolve_admitted`, the one resolve path
+    /// all three funnel through, so this covers all three with one shared
+    /// check instead of one copy per caller -- and the server default
+    /// ceiling must not change behavior for the same fixture.
     #[tokio::test]
     async fn lowered_request_budget_is_enforced_after_resolve() {
         let tenant_hash = TenantId::new("acme-sql-budget").hash();
@@ -3397,6 +3398,33 @@ mod tests {
         assert_eq!(
             explain_requests, 3,
             "explain's resolve must issue the same exact catalog request count as execute's"
+        );
+
+        // resolve_snapshot(): the Flight SQL resolve path, which used to
+        // return right after `resolve` with no post-resolution check of its
+        // own. It shares `resolve_admitted` with `execute` and `explain`, so
+        // it must trip on the identical fixture with the identical pinned
+        // cost.
+        let mut snapshot_req = sql_request(sql, window);
+        snapshot_req.budgets = budgets;
+        let snapshot_executor = executor_over(empty_store());
+        let snapshot_accounting = QueryAccounting::new();
+        let snapshot_err = snapshot_executor
+            .resolve_snapshot(tenant_hash, &snapshot_req, &snapshot_accounting)
+            .await
+            .expect_err("resolve_snapshot must also trip on a zero store-request budget");
+        let SqlError::RequestBudgetExceeded {
+            requests: snapshot_requests,
+            max: snapshot_max,
+        } = snapshot_err
+        else {
+            panic!("expected SqlError::RequestBudgetExceeded, got {snapshot_err:?}");
+        };
+        assert_eq!(snapshot_max, 0);
+        assert_eq!(
+            snapshot_requests, 3,
+            "resolve_snapshot's resolve must issue the same exact catalog request count \
+             as execute's and explain's"
         );
 
         // Control: the server's default ceiling is far above any resolve
