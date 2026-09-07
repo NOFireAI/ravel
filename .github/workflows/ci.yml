@@ -1579,10 +1579,17 @@ jobs:
           echo "::error::ravel-server did not become ready in time"
           docker compose -f "$COMPOSE_FILE" logs --no-color || true
           exit 1
-      # telemetrygen injects a deterministic series (`gen`) for the assertions,
-      # alongside the collector's host metrics (ADR-0081 D5). OTLP/HTTP to the
-      # published loopback port, with the demo bearer token; --network host so
-      # 127.0.0.1:4318 resolves to the mapped port.
+      # First of two telemetrygen steps: this one injects the deterministic
+      # metric series (`gen`), alongside the collector's host metrics; the logs
+      # step below injects the deterministic log records the PromQL-over-logs
+      # block asserts on (ADR-0081 D5). OTLP/HTTP to the published loopback
+      # port, with the demo bearer token; --network host so 127.0.0.1:4318
+      # resolves to the mapped port. --rate 0 disables telemetrygen's default
+      # one-record-per-second-per-worker throttle so all 500 records are emitted
+      # as a burst in seconds rather than the 8m20s a rate of 1 would take; the
+      # README assertions count records over a window and only require a
+      # non-empty result, so a burst satisfies them at least as easily as a
+      # trickle.
       - name: Generate deterministic telemetry with telemetrygen
         if: steps.filter.outputs.run == 'true'
         run: |
@@ -1594,15 +1601,18 @@ jobs:
             --otlp-insecure \
             --otlp-header 'Authorization="Bearer demo-token"' \
             --metric-type Gauge \
+            --rate 0 \
             --metrics 500
-      # telemetrygen also injects deterministic LOG records so the README's
-      # PromQL-over-logs block (`sum by (job) (count_over_time(ravel_log_lines
-      # [5m]))`, README.md:185) has a log source to match. The collector's own
-      # internal-logs export is not a CI-usable source: its record count and
-      # timing depend on log level, so the assertion would flake. The resource
-      # `service.name` becomes the `job` label the query groups by
-      # (crates/ravel-query/src/log_series.rs). Mirrors the metrics step:
-      # --network host, OTLP/HTTP to the loopback port, demo bearer token.
+      # Second telemetrygen step: injects deterministic LOG records so the
+      # README's PromQL-over-logs block (`sum by (job) (count_over_time(
+      # ravel_log_lines [5m]))`, README.md:185) has a log source to match. The
+      # collector's own internal-logs export is not a CI-usable source: its
+      # record count and timing depend on log level, so the assertion would
+      # flake. The resource `service.name` becomes the `job` label the query
+      # groups by (crates/ravel-query/src/log_series.rs). Mirrors the metrics
+      # step: --network host, OTLP/HTTP to the loopback port, demo bearer token,
+      # and --rate 0 to burst all 500 records instead of throttling to one per
+      # second.
       - name: Generate deterministic logs with telemetrygen
         if: steps.filter.outputs.run == 'true'
         run: |
@@ -1614,6 +1624,7 @@ jobs:
             --otlp-insecure \
             --otlp-header 'Authorization="Bearer demo-token"' \
             --otlp-attributes 'service.name="quickstart-logs"' \
+            --rate 0 \
             --logs 500
       # Assert the collector is actually delivering, from its own counters
       # (#209). telemetrygen supplies the series the README assertions query, so

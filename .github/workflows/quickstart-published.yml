@@ -142,10 +142,16 @@ jobs:
           docker compose -f "$COMPOSE_FILE" logs --no-color || true
           exit 1
 
-      # telemetrygen injects the deterministic `gen` series the readiness query
-      # and the marked README blocks assert on (ADR-0081 D5), alongside the
-      # collector's host metrics. --network host so 127.0.0.1:4318 resolves to the
-      # published loopback port. Same step as the per-PR quickstart job.
+      # First of two telemetrygen steps: injects the deterministic `gen` metric
+      # series the readiness query and the marked README blocks assert on
+      # (ADR-0081 D5), alongside the collector's host metrics; the logs step
+      # below injects the deterministic log records the PromQL-over-logs block
+      # asserts on. --network host so 127.0.0.1:4318 resolves to the published
+      # loopback port. --rate 0 disables telemetrygen's default
+      # one-record-per-second-per-worker throttle so all 500 records burst out in
+      # seconds instead of 8m20s; the README assertions only require a non-empty
+      # result, so a burst satisfies them at least as easily as a trickle. Same
+      # step as the per-PR quickstart job.
       - name: Generate deterministic telemetry with telemetrygen
         run: |
           docker run --rm --network host \
@@ -156,16 +162,19 @@ jobs:
             --otlp-insecure \
             --otlp-header 'Authorization="Bearer demo-token"' \
             --metric-type Gauge \
+            --rate 0 \
             --metrics 500
 
-      # telemetrygen also injects deterministic LOG records so the README's
-      # PromQL-over-logs block (`sum by (job) (count_over_time(ravel_log_lines
-      # [5m]))`) has a log source to match against the PUBLISHED image. The
-      # collector's own internal-logs export is not a CI-usable source (its
-      # record count and timing depend on log level), so this lane supplies its
-      # own the same way it supplies the `gen` metric series. The resource
+      # Second telemetrygen step: injects deterministic LOG records so the
+      # README's PromQL-over-logs block (`sum by (job) (count_over_time(
+      # ravel_log_lines [5m]))`) has a log source to match against the PUBLISHED
+      # image. The collector's own internal-logs export is not a CI-usable source
+      # (its record count and timing depend on log level), so this lane supplies
+      # its own the same way it supplies the `gen` metric series. The resource
       # `service.name` becomes the `job` label the query groups by
-      # (crates/ravel-query/src/log_series.rs). Mirrors the metrics step above.
+      # (crates/ravel-query/src/log_series.rs). Mirrors the metrics step above,
+      # including --rate 0 to burst all 500 records instead of throttling to one
+      # per second.
       - name: Generate deterministic logs with telemetrygen
         run: |
           docker run --rm --network host \
@@ -176,6 +185,7 @@ jobs:
             --otlp-insecure \
             --otlp-header 'Authorization="Bearer demo-token"' \
             --otlp-attributes 'service.name="quickstart-logs"' \
+            --rate 0 \
             --logs 500
 
       # The check itself: wait for a non-empty first query, then run every marked
