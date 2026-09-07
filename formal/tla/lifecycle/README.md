@@ -372,8 +372,11 @@ Its clock bound moved from `MaxClock = 3` to `MaxClock = 2` in round eight.
 Adding the compaction pass and the second rewrite identity grew the reachable
 graph by about a factor of 75 at a fixed bound, and `MaxClock = 3` no longer
 completes inside the lane's 3600 second budget. `MaxClock = 2` completes the
-full graph to depth 31, deeper than the depth 22 the previous bound reached,
-because the two-step passes and the lease expiry add steps to every behaviour.
-That is the same clock bound `smoke.cfg` uses, so the two lanes now explore the
-same state graph and what `exhaustive.cfg` adds is the liveness lane alone;
-`results.md`, "Round eight", records the reasoning and the figures.
+full graph. Round eight reached depth 31 at this bound; round nine's
+first-supersession-stamp fix let the states after a sweep be reached in fewer
+steps and brought the complete search to depth 30, still deeper than the depth
+22 the previous bound reached, because the two-step passes and the lease expiry
+add steps to every behaviour. That is the same clock bound `smoke.cfg` uses, so
+the two lanes now explore the same state graph and what `exhaustive.cfg` adds is
+the liveness lane alone; `results.md`, "Round nine", records the current
+figures.

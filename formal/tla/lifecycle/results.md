@@ -1265,3 +1265,84 @@ from the repository root with its own exit code read.
 Every TLC log was read in full. No log in `.cache/tla/logs` contains a
 `Deadlock` line, and the only `Error:` lines are the eight expected
 negative-control violations.
+
+## Round ten: the stored variant names follow the resolved input set (review of round eight)
+
+Round eight named `PublishRewrite`'s two output variants from fixed descriptors
+`DescA` and `DescB`, both pinning `inputs |-> RawInputs`. A publish that resolved
+`CompactOut` (the `rwB` target, the rewrite of the compaction output) still wrote
+the two `RawInputs`-derived names, so `IdenticalInputSetsDoNotCollide` read names
+that no longer described the publish that stored them. The collision claim stayed
+checkable for `rwA` (which does resolve `RawInputs`), so this was a fidelity gap,
+not a broken invariant: the stored names must follow the resolved input set.
+
+### The fix
+
+`PublishRewrite` now derives the two descriptors from `rwInputs[id]`, the set the
+publishing identity resolved at its listing step, so an `rwB` publish stamps
+`CompactOut`-derived names and an `rwA` publish stamps `RawInputs`-derived names:
+
+```tla
+variantKey' = [variantKey EXCEPT
+                   !["v1"] = RewriteKey(VariantDescA(rwInputs[id])),
+                   !["v2"] = RewriteKey(VariantDescB(rwInputs[id]))]
+```
+
+`VariantDescA(ins)`/`VariantDescB(ins)` replace the fixed `DescA`/`DescB`, and
+`TypeOK`'s `variantKey` range widens to `VariantKeyRange`, the names generated
+from either resolvable input set (`RawInputs` or `CompactOut`) under either
+applied-request set, so a `CompactOut`-derived name is well typed.
+
+### The probe
+
+An invariant asserting a `CompactOut` publish cannot stamp a `RawInputs` name,
+run against a scratch `MCLifecycleGC` under `/tmp` with `smoke.cfg`'s constants:
+
+```tla
+ProbeCompactPublishStampsResolvedInputs ==
+    (PresentObj("rwB") /\ ~PresentObj("rwA")) =>
+        \A v \in {"v1","v2"} :
+            variantKey[v] \notin { <<RawInputs, {"r1"}>>,
+                                   <<RawInputs, {}>>,
+                                   <<RawInputs>> }
+```
+
+Before the fix it is VIOLATED (TLC exit 12): the trace `RequestErasure`,
+`StartCompaction`, `ExpireLease`, `PublishCompaction`, `StartRewrite`,
+`PublishRewrite` reaches `rwB` present with `rwA` absent and both stored names in
+the forbidden `RawInputs` set. After the fix it holds over the complete graph
+(exit 0), because the only publish that reaches this state resolved `CompactOut`
+and now stamps `CompactOut` names. Full reasoning in
+`counterexamples/compact-publish-stamps-resolved-inputs-probe.md`.
+
+### Figures and the bands
+
+The change is a relabeling of `variantKey` in the states where a rewrite output
+was published: it swaps a `RawInputs`-derived pair for a `CompactOut`-derived
+pair in exactly the `rwB` states, and leaves the `rwA` states alone. `rwA` and
+`rwB` never coexist in the shipped configuration, and the `rwB` states are
+already `View`-distinct from the `rwA` states through `superseded` and store
+presence, so no `View`-distinct state is split or merged. The distinct-state
+count and depth are therefore expected to hold at round nine's values (both
+configs 3786411 distinct, depth 30), and `bands.tsv` is unchanged.
+
+`IdenticalInputSetsDoNotCollide` still holds: an `rwB` publish stores
+`<<CompactOut, {"r1"}>>` and `<<CompactOut, {}>>`, which differ in the
+applied-request component, the same way the `rwA` pair does.
+
+### Documentation reconciled
+
+`README.md`'s exhaustive-result paragraph cited depth 31 as the `MaxClock = 2`
+result and pointed to round eight; the current figure is depth 30 from round
+nine's first-supersession-stamp fix. The paragraph now records depth 30 and
+points to round nine, and README, `results.md` and `bands.tsv` agree on the
+current figure.
+
+### Execution note
+
+This tree was prepared on a fleet executor that carries no Java runtime and no
+network, so TLC could not run here to re-measure the configs or capture the
+probe's depth. The `ci` and `exhaustive` lanes and the probe are confirmed by
+the PR's TLA lane, which provisions temurin 21 and runs `scripts/check-tla.sh`
+over the same constants. `python3 scripts/check_docs.py` exit 0, `docs gate:
+clean.`, was run locally.
