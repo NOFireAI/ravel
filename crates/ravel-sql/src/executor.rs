@@ -92,7 +92,7 @@ use ravel_catalog::{Catalog, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::io_shape::{
-    QueryIoShape, count_unfolded_segments, io_shape_for_resolve_with_fanouts,
+    QueryIoShape, count_unfolded_segments, io_shape_for_resolve_with_fanouts, service_batches,
 };
 use ravel_query::{LogSegmentFetcher, QueryError, SegmentFetcher, admit};
 use ravel_types::accounting::{
@@ -1147,15 +1147,56 @@ impl SqlExecutor {
     ///
     /// - The outer wave width is DataFusion's `target_partitions`
     ///   ([`crate::config::EngineConfig::sql_partition_count`] via
-    ///   `self.config.engine`), clamped to the segment count like
-    ///   [`crate::scan::RsegScanExec`] clamps its own partition count.
-    /// - The inner fan-out is `1`: [`crate::scan::RsegScanExec`] fetches each
-    ///   partition's segments strictly sequentially, so the busiest
-    ///   partition's own segment count (`segments.div_ceil(partitions)`) is
-    ///   the whole inner depth.
-    /// - `shared_get_permits` is `u64::MAX`: unlike PromQL's fetchers
-    ///   (ADR-1195's `GetLimiter`), nothing in `ravel-sql` shares a GET
-    ///   permit pool across partitions.
+    ///   `self.config.engine`). For `Metrics` and `Spans` this is clamped to
+    ///   the resolved segment count the same way [`crate::scan::RsegScanExec`]
+    ///   clamps its own partition count (both fetch strictly sequentially, one
+    ///   partition per segment). For `Logs`/`Alerts`/`Audit` the shape
+    ///   depends on whether `self.log_fetcher` (a [`LogSegmentFetcher`])
+    ///   carries ADR-0046's read cache ([`LogSegmentFetcher::has_cache`]):
+    ///   un-cached, `logs_scan.rs`'s `LogsScanExec` assigns segments the same
+    ///   segment-granular way and the same clamp applies; cache-wired (the
+    ///   server's default absent `--disable-cache`), `LogsScanExec` stripes
+    ///   every segment's surviving blocks across `target_partitions`
+    ///   unclamped by segment count, so this reports `target_partitions`
+    ///   itself, matching `LogsScanExec`'s own declared partition count.
+    /// - The segment count charged per admitted plan is the busiest
+    ///   partition's own share (`total_segments.div_ceil(partitions)`) for
+    ///   every segment-granular shape (`Metrics`, `Spans`, un-cached logs),
+    ///   where each segment is opened by exactly one partition. For
+    ///   cache-wired logs it is `total_segments` itself: block striping can
+    ///   spread any one segment's blocks across every active partition, so
+    ///   the busiest partition can end up opening every relevant segment.
+    ///   This is a real upper bound (never exceeded, since there are only
+    ///   `total_segments` segments to open) rather than an exact figure,
+    ///   because the true per-partition segment count depends on each
+    ///   segment's surviving block count, which is not resolvable here
+    ///   without an extra fetch (see `logs_scan.rs`'s module doc).
+    /// - The inner fan-out is `1` for every signal: every scan
+    ///   (`RsegScanExec`, the spans scan, and `LogsScanExec` in either mode)
+    ///   fetches its owned work strictly sequentially within one partition.
+    /// - `shared_get_permits` is
+    ///   [`EngineConfig::store_get_concurrency`](ravel_query::EngineConfig::store_get_concurrency)
+    ///   via `self.config.engine`: the real, resolved size of the one
+    ///   `GetLimiter` the server builds and shares across every fetcher it
+    ///   constructs, including all three of this executor's, the same shared
+    ///   pool ADR-1195 gives PromQL's fetchers -- not an unbounded
+    ///   `u64::MAX`.
+    /// - `Logs`/`Alerts`/`Audit` additionally serialize a plan-read phase on
+    ///   top of the scan phase: `logs_scan.rs`'s `compute_plan_counts` runs
+    ///   one plan probe per relevant segment at
+    ///   `buffer_unordered(target_partitions)` (itself bound by the same
+    ///   shared GET permits), and no scan partition drains until that whole
+    ///   pass completes (issue #691). This is added as a second
+    ///   `service_batches` term on top of the scan term rather than folded
+    ///   into it, since the two phases run strictly one after the other on
+    ///   the critical path. The term is charged even on a resolve whose later
+    ///   scan will take the predicate-free whole-segment fast path
+    ///   (`LogsScanExec::whole_segment_fast_path`, which skips the real plan
+    ///   phase entirely): this function runs at resolve time, before the
+    ///   query's predicates are available to it, so it cannot tell the fast
+    ///   path will apply, and charging the phase unconditionally is a
+    ///   documented upper-bound bias (it can overcount that case), never an
+    ///   undercount.
     /// - `whole_object_threshold` has no single SQL-wide knob; it is read
     ///   per target signal: `self.fetcher` (metrics) and `self.log_fetcher`
     ///   (logs/alerts/audit, sharing the RLOG funnel per ADR-1101 decision 1)
@@ -1164,6 +1205,9 @@ impl SqlExecutor {
     ///   concept at all -- it always issues one unconditional whole-object
     ///   GET -- so spans report `u64::MAX` rather than reusing a
     ///   metrics/logs number that would not apply.
+    /// - `metadata_only` is always `false`: no SQL statement plans a
+    ///   metadata-only class today (unlike PromQL's labels/label-values
+    ///   lane), not because one was considered here and ruled out.
     fn io_shape_for_resolve(
         &self,
         target: TargetSignal,
@@ -1179,14 +1223,29 @@ impl SqlExecutor {
             TargetSignal::Spans => u64::MAX,
         };
         let total_segments = snapshot.segments.len() as u64;
-        let partitions = self
-            .config
-            .engine
-            .sql_partition_count()
-            .max(1)
-            .min(total_segments.max(1) as usize) as u64;
-        let segments_per_plan = total_segments.div_ceil(partitions);
-        io_shape_for_resolve_with_fanouts(
+        let configured_partitions = self.config.engine.sql_partition_count().max(1) as u64;
+        let shared_get_permits = self.config.engine.store_get_concurrency().max(1) as u64;
+
+        let (segments_per_plan, partitions, plan_phase_batches) = match target {
+            TargetSignal::Metrics | TargetSignal::Spans => {
+                let partitions = configured_partitions.min(total_segments.max(1));
+                (total_segments.div_ceil(partitions), partitions, 0u32)
+            }
+            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => {
+                let (segments_per_plan, partitions, plan_partitions) =
+                    if self.log_fetcher.has_cache() {
+                        (total_segments, configured_partitions, configured_partitions)
+                    } else {
+                        let partitions = configured_partitions.min(total_segments.max(1));
+                        (total_segments.div_ceil(partitions), partitions, partitions)
+                    };
+                let plan_phase_batches =
+                    service_batches(total_segments, plan_partitions.min(shared_get_permits));
+                (segments_per_plan, partitions, plan_phase_batches)
+            }
+        };
+
+        let mut io_shape = io_shape_for_resolve_with_fanouts(
             snapshot,
             false,
             whole_object_threshold,
@@ -1194,10 +1253,12 @@ impl SqlExecutor {
             partitions,
             partitions,
             1,
-            u64::MAX,
+            shared_get_permits,
             resolve_list_requests,
             unfolded_segments_resolved,
-        )
+        );
+        io_shape.service_batches = io_shape.service_batches.saturating_add(plan_phase_batches);
+        io_shape
     }
 
     /// The equality `__name__` value a metrics query's pushed-down predicates
