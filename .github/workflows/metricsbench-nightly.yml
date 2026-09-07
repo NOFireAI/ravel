@@ -1,0 +1,141 @@
+name: metricsbench-nightly
+
+# Scheduled MetricsBench lane against MinIO (issue #939, ADR-0927).
+#
+# Replays the MetricsBench sample stream over Remote Write 1.0 into the
+# in-process Ravel path backed by a local MinIO object store, and uploads the
+# raw machine-readable JSON report as a build artifact so a diagnostic run is
+# reproducible from the command and environment that produced it.
+#
+# Profile: `ci`. MetricsBench pins three orthogonal comparable profiles
+# (cardinality/history/churn) plus the CI-sized `ci` profile (ADR-0927
+# decision 11). The comparable profiles range from 360,000,000 to
+# 1,728,000,000 samples and cannot run inside a GitHub-hosted runner, and
+# MinIO is explicitly NOT an acceptable substrate for a performance or cost
+# claim (ADR-0927 decision 10): removing per-request fees is exactly what
+# hides a request-count defect, so only the real-S3 lane (bench-s3.yml)
+# produces publishable numbers. This lane is a MinIO diagnostic/correctness
+# run, so it uses the `ci` profile, whose artifact carries its own
+# non-comparability marker.
+#
+# NON-BLOCKING by construction (ADR-0070, ADR-0075): this workflow triggers
+# only on a schedule and on manual dispatch, never on push/pull_request/
+# merge_group, so it can never gate a merge. A red nightly run signals a
+# problem without blocking anyone.
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily, 02:13 UTC. Off-peak and off the :00/:30 marks, and distinct from
+    # every other scheduled lane in this repo (sim-nightly 03:17, k8s-nightly
+    # 03:00, tla-nightly 04:37, supply-chain-nightly 05:43, bench-s3 weekly
+    # Mon 04:17, quickstart-published weekly 06:29) so the scheduled runs do
+    # not contend.
+    - cron: "13 2 * * *"
+
+# One scheduled run at a time; a manual dispatch does not cancel one already
+# in flight.
+concurrency:
+  group: metricsbench-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  metricsbench-minio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the MetricsBench ingest and report bins
+        run: |
+          cargo build --release --locked -p ravel-bench \
+            --bin metricsbench_ingest --bin metricsbench_report
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+      - name: Wait for MinIO to be live
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/live; then
+              echo "MinIO is live"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy in time"
+          docker logs minio || true
+          exit 1
+      - name: Create the MetricsBench bucket
+        run: |
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c "
+            mc alias set local http://localhost:9000 minioadmin minioadmin &&
+            mc mb -p local/metricsbench"
+      - name: Run the MetricsBench ci profile against MinIO
+        env:
+          # The harness reads these RAVEL_S3_* vars
+          # (crates/ravel-bench/src/harness.rs). MinIO is an S3-compatible
+          # endpoint reached over plain HTTP in path-addressing mode.
+          RAVEL_S3_BUCKET: metricsbench
+          RAVEL_S3_REGION: us-east-1
+          RAVEL_S3_ENDPOINT: http://localhost:9000
+          RAVEL_S3_ACCESS_KEY_ID: minioadmin
+          RAVEL_S3_SECRET_ACCESS_KEY: minioadmin
+          RAVEL_S3_ALLOW_HTTP: "true"
+          RAVEL_S3_FORCE_PATH_STYLE: "true"
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          # stdout is the machine-readable JSON report; the human-readable
+          # per-row summary goes to stderr. The bin fails the run (non-zero
+          # exit) on any sample-accounting mismatch or a zero-ingest run
+          # (ADR-0927 bands 4/5), so a malformed report can never be produced
+          # by a green run -- success here is the exit code, never an
+          # output keyword.
+          ./target/release/metricsbench_ingest \
+            --profile ci \
+            --store s3 \
+            > metricsbench-minio-report.json
+      - name: Report-schema gate rejects a malformed report (fail-closed)
+        run: |
+          # The existing report-schema validator (metricsbench_report render,
+          # ADR-0927) is the fail-closed gate a report consumer runs: it
+          # deserializes and validates a report artifact and exits non-zero on
+          # a malformed one. This step proves the gate is wired and rejects a
+          # malformed report. Correctness is decided by the exit code, never
+          # by scanning output: this repo's own error strings and test names
+          # contain the words "failed"/"error"/"refused"/"panic" while
+          # passing, so a keyword scan is not a valid success signal.
+          #
+          # The produced report above is the ingest lane's own report shape
+          # (crates/ravel-bench/src/metrics_ingest.rs::MetricsIngestReport);
+          # the reconciled MetricsBenchReport that `render` validates is
+          # emitted by the measurement-producing harness (ADR-0927 decision 1),
+          # which is separate, not-yet-built work. Until it lands, this gate
+          # enforces the schema contract on a deliberately malformed report
+          # rather than on the ingest artifact.
+          printf '{"not":"a MetricsBench report"}' > malformed-report.json
+          code=0
+          ./target/release/metricsbench_report render \
+            --report malformed-report.json || code=$?
+          if [ "$code" -eq 0 ]; then
+            echo "::error::report-schema gate accepted a malformed report (expected non-zero exit)"
+            exit 1
+          fi
+          echo "report-schema gate rejected the malformed report as required (exit $code)"
+      - name: Upload the MetricsBench MinIO report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: metricsbench-minio-report
+          path: metricsbench-minio-report.json
+          retention-days: 90
+      - name: Stop MinIO
+        if: always()
+        run: docker rm -f minio || true
