@@ -326,6 +326,32 @@ impl Cli {
             KeyConfig::Header(self.header_key_name()?)
         };
 
+        // #1293 sibling: the dev header resolves an `x-ravel-tenant` routing key
+        // from an unauthenticated header. Because the proxy forwards the original
+        // request headers and the upstream gateway re-authenticates, this forges
+        // routing affinity rather than tenant identity, which is why it is a
+        // lower guard than the gateway's. It must still never be reachable off
+        // loopback: require every bound listener to be loopback when the flag is
+        // set. Reaching here with the flag set means the key source is
+        // canonical-tenant; a non-canonical source already failed in
+        // `reject_canonical_only_flags` above.
+        if self.dev_insecure_tenant_header {
+            if !self.listen_http.ip().is_loopback() {
+                anyhow::bail!(
+                    "--dev-insecure-tenant-header refuses to enable unless --listen-http binds a \
+                     loopback address"
+                );
+            }
+            if let Some(grpc) = self.listen_grpc
+                && !grpc.ip().is_loopback()
+            {
+                anyhow::bail!(
+                    "--dev-insecure-tenant-header refuses to enable unless --listen-grpc binds a \
+                     loopback address"
+                );
+            }
+        }
+
         Ok(RouterConfig {
             gateway_service_name: self.gateway_service_name,
             gateway_service_namespace: self.gateway_service_namespace,
@@ -609,6 +635,66 @@ mod tests {
             }
             other => panic!("expected canonical key config, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_non_loopback_listen_fails_validate() {
+        // Default --listen-http is 0.0.0.0:8080, a non-loopback bind. The dev
+        // header resolves an x-ravel-tenant routing key from an unauthenticated
+        // header, so it must refuse to enable off loopback (#1293 sibling).
+        let err = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--dev-insecure-tenant-header",
+        ])
+        .into_config()
+        .expect_err("non-loopback --listen-http with the dev header must refuse startup");
+        assert!(
+            err.to_string().contains("--dev-insecure-tenant-header"),
+            "error names the flag: {err}"
+        );
+        assert!(
+            err.to_string().contains("--listen-http"),
+            "error names the listener: {err}"
+        );
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_loopback_listen_validates() {
+        // Positive control so the guard is not vacuous: both bound listeners
+        // loopback validates.
+        cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:8080",
+            "--listen-grpc",
+            "127.0.0.1:8081",
+        ])
+        .into_config()
+        .expect("both listeners loopback with the dev header is fine");
+    }
+
+    #[test]
+    fn dev_insecure_tenant_header_on_non_loopback_grpc_fails_validate() {
+        // --listen-http loopback but --listen-grpc public: the gRPC proxy
+        // listener carries the forged affinity too, so refuse.
+        let err = cli(&[
+            "--key-source",
+            "canonical-tenant",
+            "--dev-insecure-tenant-header",
+            "--listen-http",
+            "127.0.0.1:8080",
+            "--listen-grpc",
+            "0.0.0.0:8081",
+        ])
+        .into_config()
+        .expect_err("non-loopback --listen-grpc with the dev header must refuse startup");
+        assert!(
+            err.to_string().contains("--listen-grpc"),
+            "error names the gRPC listener: {err}"
+        );
     }
 
     #[test]
