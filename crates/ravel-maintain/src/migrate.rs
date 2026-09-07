@@ -523,6 +523,43 @@ pub async fn count_below_target(
 /// A bucket with no compaction or rewrite record answers from the listing
 /// alone, so the ordinary path pays no extra store read; a bucket that carries
 /// records pays one GET per record, which is what deciding authority requires.
+/// Whether a rewrite refusal on this bucket is permanent, asked against
+/// CURRENT state rather than inferred from the refusal.
+///
+/// `AlreadyCompacted` and `RewritePresent` are returned on nothing more than
+/// the bucket carrying a record when the rewrite re-lists, so the outcome
+/// alone cannot separate a permanent overlap from a concurrent compaction or
+/// erasure that landed underneath the walk and converges on a later run.
+///
+/// Permanence needs BOTH halves and neither implies the other:
+///
+/// - a record still present to cause the refusal. If retention removed every
+///   record in the meantime, [`raw_served_commit_keys`] short-circuits and
+///   returns every commit as served raw, which is indistinguishable from the
+///   overlap case by inputs alone -- yet that bucket migrates on the next run,
+///   because the rewrite finds nothing to refuse on;
+/// - an input that record leaves served raw and below the target. A bucket
+///   whose records supersede everything is refused for reasons that do not
+///   block the floor.
+async fn refusal_is_permanent(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    config: &CompactorConfig,
+    target_version: u32,
+) -> Result<bool> {
+    let fresh = list_bucket(store, bucket).await?;
+    if fresh.compaction_record_keys.is_empty() && fresh.rewrite_record_keys.is_empty() {
+        return Ok(false);
+    }
+    let served = raw_served_commit_keys(store, bucket, &fresh).await?;
+    Ok(
+        load_inputs(store, bucket, &served, config.input_read_concurrency)
+            .await?
+            .iter()
+            .any(|i| i.record.segment_format_version < target_version),
+    )
+}
+
 async fn raw_served_commit_keys(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -730,19 +767,7 @@ pub async fn migrate_family(
                         // also counted a raced-past bucket would send an
                         // operator looking for an overlap that is not there.
                         MigrateOutcome::AlreadyCompacted | MigrateOutcome::RewritePresent => {
-                            let fresh = list_bucket(store, &bucket).await?;
-                            let still_served =
-                                raw_served_commit_keys(store, &bucket, &fresh).await?;
-                            let still_below = load_inputs(
-                                store,
-                                &bucket,
-                                &still_served,
-                                config.input_read_concurrency,
-                            )
-                            .await?
-                            .iter()
-                            .any(|i| i.record.segment_format_version < target_version);
-                            if still_below {
+                            if refusal_is_permanent(store, &bucket, config, target_version).await? {
                                 report.buckets_blocked += 1;
                             }
                         }
@@ -1943,6 +1968,49 @@ mod tests {
     /// loser-only case fails with `l0_below == 1`: input 3 is excluded on the
     /// strength of a record whose parts nothing serves, and `migrate_family`
     /// raises the format floor over an object the resolver still returns raw.
+    /// `buckets_blocked` must not claim permanence when the refusal cause is
+    /// gone. Both halves of the predicate, on one fixture with one variable
+    /// changed.
+    ///
+    /// The transient half is the one the counter got wrong before: with every
+    /// record deleted, `raw_served_commit_keys` short-circuits and returns
+    /// EVERY commit as served raw, so an inputs-only test reads exactly like
+    /// the overlap case. That bucket migrates on the next run, and reporting
+    /// it as permanently blocked sends an operator looking for an overlap that
+    /// is not there, against a guide that tells them re-running will not help.
+    ///
+    /// Prove-the-test: drop the empty-records early return in
+    /// `refusal_is_permanent` and the second assertion reads true.
+    #[tokio::test]
+    async fn a_refusal_is_permanent_only_while_its_cause_survives() {
+        let store = MemoryStore::new();
+        seed_overlapping_records(&store, &[1, 2, 4]).await;
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
+        let config = CompactorConfig::default();
+
+        assert!(
+            refusal_is_permanent(&store, &bucket, &config, FUTURE_VERSION)
+                .await
+                .expect("permanence check"),
+            "the overlap survives and leaves input 3 served raw and below target"
+        );
+
+        // Retention removes the records that caused the refusal.
+        let listing = list_bucket(&store, &bucket).await.expect("list bucket");
+        for key in &listing.compaction_record_keys {
+            store.delete(key).await.expect("delete record");
+        }
+
+        assert!(
+            !refusal_is_permanent(&store, &bucket, &config, FUTURE_VERSION)
+                .await
+                .expect("permanence check"),
+            "with no record left to refuse on, the next run migrates this bucket: the \
+             inputs are still below target and still served raw, so an inputs-only \
+             check would wrongly call this permanent"
+        );
+    }
+
     /// A record listed and then deleted before it is read must not abort the
     /// walk. Retention can remove a compaction record between the listing and
     /// the read, and propagating `NotFound` would fail `migrate_family` before
