@@ -2496,6 +2496,14 @@ fn combine_phase_accounting(
 /// every figure here is a pure function of the resolved `Snapshot` and the
 /// query's own configuration, computable before a single segment fetch
 /// starts.
+///
+/// Delegates to [`crate::io_shape::io_shape_for_resolve_with_fanouts`],
+/// passing `concurrency` as both the outer and inner fan-out width -- the
+/// single-fanout special case that function's own docs describe -- and
+/// extracting `resolve_list_requests` from `accounting` here, since
+/// `PhaseAccounting` is a PromQL-engine-specific type the shared function
+/// does not depend on (issue #1250 needed a second entry point that
+/// `ravel-sql`'s single-pool `QueryAccounting` could also drive).
 #[allow(clippy::too_many_arguments)]
 fn io_shape_for_resolve(
     snapshot: &Snapshot,
@@ -2507,33 +2515,22 @@ fn io_shape_for_resolve(
     accounting: &PhaseAccounting,
     unfolded_segments_resolved: u64,
 ) -> QueryIoShape {
-    let mut counts = IoShapeCounts::default();
-    let depth = snapshot
-        .segments
-        .iter()
-        .map(|seg| crate::io_shape::depth_for_object(seg.object_size, whole_object_threshold))
-        .max()
-        .unwrap_or(0);
-    counts.record_dependency_chain(depth);
-    counts.record_service_batches(crate::io_shape::service_batches_over_plan_waves(
-        snapshot.segments.len() as u64,
-        service_fetch_multiplier,
-        concurrency,
-        shared_get_permits,
-    ));
     let resolve_list_requests = accounting
         .resolve()
         .snapshot()
         .s3_requests(AccountedOp::List);
-    counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
-    let plan_class = if metadata_only {
-        PlanClass::MetadataOnly
-    } else if snapshot.segments_pruned > 0 {
-        PlanClass::SelectiveIndexed
-    } else {
-        PlanClass::ExhaustiveScan
-    };
-    counts.into_shape(unfolded_segments_resolved, plan_class)
+    crate::io_shape::io_shape_for_resolve_with_fanouts(
+        snapshot,
+        metadata_only,
+        whole_object_threshold,
+        snapshot.segments.len() as u64,
+        service_fetch_multiplier,
+        concurrency,
+        concurrency,
+        shared_get_permits,
+        resolve_list_requests,
+        unfolded_segments_resolved,
+    )
 }
 
 /// A locally-scoped series identity for a log-derived series returned from
