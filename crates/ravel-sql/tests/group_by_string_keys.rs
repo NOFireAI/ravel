@@ -219,7 +219,7 @@ async fn declared_str_group_by_groups_on_views_and_returns_its_declared_type() {
     let declared = executor
         .resolve_declared_columns(tenant().hash(), request(&sql).now_ns)
         .await;
-    let (snapshot, _) = executor
+    let (snapshot, _, _) = executor
         .resolve_snapshot(tenant().hash(), &request(&sql), &accounting)
         .await
         .expect("snapshot resolves");
