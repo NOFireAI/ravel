@@ -1147,33 +1147,40 @@ impl SqlExecutor {
     ///
     /// - The outer wave width is DataFusion's `target_partitions`
     ///   ([`crate::config::EngineConfig::sql_partition_count`] via
-    ///   `self.config.engine`). For `Metrics` and `Spans` this is clamped to
-    ///   the resolved segment count the same way [`crate::scan::RsegScanExec`]
-    ///   clamps its own partition count (both fetch strictly sequentially, one
-    ///   partition per segment). For `Logs`/`Alerts`/`Audit` the shape
-    ///   depends on whether `self.log_fetcher` (a [`LogSegmentFetcher`])
-    ///   carries ADR-0046's read cache ([`LogSegmentFetcher::has_cache`]):
-    ///   un-cached, `logs_scan.rs`'s `LogsScanExec` assigns segments the same
-    ///   segment-granular way and the same clamp applies; cache-wired (the
-    ///   server's default absent `--disable-cache`), `LogsScanExec` stripes
-    ///   every segment's surviving blocks across `target_partitions`
-    ///   unclamped by segment count, so this reports `target_partitions`
-    ///   itself, matching `LogsScanExec`'s own declared partition count.
+    ///   `self.config.engine`). For `Metrics`, `Spans`, `Alerts`, and `Audit`
+    ///   this is clamped to the resolved segment count the same way
+    ///   [`crate::scan::RsegScanExec`] clamps its own partition count (all
+    ///   four fetch strictly sequentially, one partition per segment):
+    ///   `AlertsScanExec` (`alerts_scan.rs`) and `AuditScanExec`
+    ///   (`audit_scan.rs`) both assign segments round-robin over
+    ///   `min(target_partitions, segments.len())` unconditionally, with no
+    ///   cache-dependent striping and no separate plan-read phase, so they
+    ///   share `Metrics`/`Spans`'s exact segment-granular shape rather than
+    ///   `Logs`'s. Only `Logs` alone depends on whether `self.log_fetcher` (a
+    ///   [`LogSegmentFetcher`]) carries ADR-0046's read cache
+    ///   ([`LogSegmentFetcher::has_cache`]): un-cached, `logs_scan.rs`'s
+    ///   `LogsScanExec` assigns segments the same segment-granular way and
+    ///   the same clamp applies; cache-wired (the server's default absent
+    ///   `--disable-cache`), `LogsScanExec` stripes every segment's surviving
+    ///   blocks across `target_partitions` unclamped by segment count, so
+    ///   this reports `target_partitions` itself, matching `LogsScanExec`'s
+    ///   own declared partition count.
     /// - The segment count charged per admitted plan is the busiest
     ///   partition's own share (`total_segments.div_ceil(partitions)`) for
-    ///   every segment-granular shape (`Metrics`, `Spans`, un-cached logs),
-    ///   where each segment is opened by exactly one partition. For
-    ///   cache-wired logs it is `total_segments` itself: block striping can
-    ///   spread any one segment's blocks across every active partition, so
-    ///   the busiest partition can end up opening every relevant segment.
-    ///   This is a real upper bound (never exceeded, since there are only
-    ///   `total_segments` segments to open) rather than an exact figure,
-    ///   because the true per-partition segment count depends on each
-    ///   segment's surviving block count, which is not resolvable here
-    ///   without an extra fetch (see `logs_scan.rs`'s module doc).
+    ///   every segment-granular shape (`Metrics`, `Spans`, `Alerts`, `Audit`,
+    ///   un-cached logs), where each segment is opened by exactly one
+    ///   partition. For cache-wired logs it is `total_segments` itself: block
+    ///   striping can spread any one segment's blocks across every active
+    ///   partition, so the busiest partition can end up opening every
+    ///   relevant segment. This is a real upper bound (never exceeded, since
+    ///   there are only `total_segments` segments to open) rather than an
+    ///   exact figure, because the true per-partition segment count depends
+    ///   on each segment's surviving block count, which is not resolvable
+    ///   here without an extra fetch (see `logs_scan.rs`'s module doc).
     /// - The inner fan-out is `1` for every signal: every scan
-    ///   (`RsegScanExec`, the spans scan, and `LogsScanExec` in either mode)
-    ///   fetches its owned work strictly sequentially within one partition.
+    ///   (`RsegScanExec`, the spans scan, `AlertsScanExec`, `AuditScanExec`,
+    ///   and `LogsScanExec` in either mode) fetches its owned work strictly
+    ///   sequentially within one partition.
     /// - `shared_get_permits` is
     ///   [`EngineConfig::store_get_concurrency`](ravel_query::EngineConfig::store_get_concurrency)
     ///   via `self.config.engine`: the real, resolved size of the one
@@ -1181,8 +1188,10 @@ impl SqlExecutor {
     ///   constructs, including all three of this executor's, the same shared
     ///   pool ADR-1195 gives PromQL's fetchers -- not an unbounded
     ///   `u64::MAX`.
-    /// - `Logs`/`Alerts`/`Audit` additionally serialize a plan-read phase on
-    ///   top of the scan phase: `logs_scan.rs`'s `compute_plan_counts` runs
+    /// - `Logs` alone additionally serializes a plan-read phase on top of
+    ///   the scan phase; `Alerts` and `Audit` do not, since neither
+    ///   `AlertsScanExec` nor `AuditScanExec` runs one: `logs_scan.rs`'s
+    ///   `compute_plan_counts` runs
     ///   one plan probe per relevant segment at
     ///   `buffer_unordered(target_partitions)` (itself bound by the same
     ///   shared GET permits), and no scan partition drains until that whole
@@ -1227,11 +1236,14 @@ impl SqlExecutor {
         let shared_get_permits = self.config.engine.store_get_concurrency().max(1) as u64;
 
         let (segments_per_plan, partitions, plan_phase_batches) = match target {
-            TargetSignal::Metrics | TargetSignal::Spans => {
+            TargetSignal::Metrics
+            | TargetSignal::Spans
+            | TargetSignal::Alerts
+            | TargetSignal::Audit => {
                 let partitions = configured_partitions.min(total_segments.max(1));
                 (total_segments.div_ceil(partitions), partitions, 0u32)
             }
-            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => {
+            TargetSignal::Logs => {
                 let (segments_per_plan, partitions, plan_partitions) =
                     if self.log_fetcher.has_cache() {
                         (total_segments, configured_partitions, configured_partitions)

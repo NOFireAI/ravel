@@ -1962,24 +1962,27 @@ constructs, including all three of the SQL executor's fetchers, not only
 PromQL's.
 
 The outer/inner fan-out shape splits by target signal, because
-`metrics`/`spans` and `logs`/`alerts`/`audit` are scanned by different
+`metrics`/`spans`/`alerts`/`audit` and `logs` are scanned by different
 executors with different partition-assignment rules:
 
-- **`metrics` and `spans`**: `crates/ravel-sql/src/scan.rs`'s `RsegScanExec`
-  assigns segments to partitions round-robin and fetches each partition's own
-  segments strictly sequentially, so the wave-synchronous model above
-  collapses to a single wave. The outer fan-out width is DataFusion's
-  `target_partitions` (`EngineConfig::sql_partition_count`), clamped to the
-  resolved segment count the same way `RsegScanExec` clamps its own partition
-  count; the inner fan-out is always `1`, so the busiest partition's own
-  segment count (`total_segments.div_ceil(partitions)`) is the whole
-  per-partition depth. With `sharedGetPermits` folded in, the model is
+- **`metrics`, `spans`, `alerts`, and `audit`**: `crates/ravel-sql/src/scan.rs`'s
+  `RsegScanExec`, `alerts_scan.rs`'s `AlertsScanExec`, and `audit_scan.rs`'s
+  `AuditScanExec` all assign segments to partitions round-robin
+  (`min(target_partitions, segments.len())` partitions, unconditionally, with
+  no cache-dependent striping and no plan-read phase) and fetch each
+  partition's own segments strictly sequentially, so the wave-synchronous
+  model above collapses to a single wave. The outer fan-out width is
+  DataFusion's `target_partitions` (`EngineConfig::sql_partition_count`),
+  clamped to the resolved segment count the same way `RsegScanExec` clamps its
+  own partition count; the inner fan-out is always `1`, so the busiest
+  partition's own segment count (`total_segments.div_ceil(partitions)`) is the
+  whole per-partition depth. With `sharedGetPermits` folded in, the model is
   `ceil(total_segments.div_ceil(partitions) * partitions /
-  min(partitions, sharedGetPermits))`.
-- **`logs`, `alerts`, and `audit`** (`crates/ravel-sql/src/logs_scan.rs`'s
-  `LogsScanExec`): the shape depends on `LogSegmentFetcher::has_cache()`,
-  because the cache changes how blocks are assigned to partitions, not just
-  whether a re-fetch is free.
+  min(partitions, sharedGetPermits))`. This figure is exact, not an
+  upper bound, for all four signals.
+- **`logs`** (`crates/ravel-sql/src/logs_scan.rs`'s `LogsScanExec`): the shape
+  depends on `LogSegmentFetcher::has_cache()`, because the cache changes how
+  blocks are assigned to partitions, not just whether a re-fetch is free.
   - Uncached: segment-granular, matching `RsegScanExec` above (the outer
     fan-out is `target_partitions` clamped to the segment count, one
     partition per segment).
@@ -1995,8 +1998,8 @@ executors with different partition-assignment rules:
     `serviceBatches` whenever a segment's blocks do not actually reach every
     partition.
 
-  Both cases add a **plan-phase** term the scan-phase model above does not
-  capture: `LogsScanExec::compute_plan_counts` runs one plan probe per
+  Both `logs` cases add a **plan-phase** term the scan-phase model above does
+  not capture: `LogsScanExec::compute_plan_counts` runs one plan probe per
   relevant segment at `buffer_unordered(target_partitions)` before any scan
   partition drains, contributing
   `ceil(total_segments / min(target_partitions, sharedGetPermits))`
@@ -2006,6 +2009,8 @@ executors with different partition-assignment rules:
   predicate-free whole-segment fast path, but predicate information is not
   available at `io_shape_for_resolve`'s resolve-time call site, so the model
   charges the plan phase unconditionally -- another documented over-estimate.
+  `alerts` and `audit` never add this term: neither `AlertsScanExec` nor
+  `AuditScanExec` runs a plan-read phase at all.
 
 `dependencyDepth`'s `whole_object_threshold` has no single SQL-wide knob
 either; it is read per target signal, matching whichever fetcher that
