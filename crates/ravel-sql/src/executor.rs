@@ -95,7 +95,9 @@ use ravel_query::io_shape::{
     QueryIoShape, count_unfolded_segments, io_shape_for_resolve_with_fanouts,
 };
 use ravel_query::{LogSegmentFetcher, QueryError, SegmentFetcher, admit};
-use ravel_types::accounting::{AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::{
+    AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
+};
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
 use crate::alerts_provider::AlertsTableProvider;
@@ -620,7 +622,8 @@ impl SqlExecutor {
             // deadline trip reflects exactly this attempt's issued cost and
             // never a discarded prior attempt's.
             live.install(&accounting);
-            let (snapshot, estimate, io_shape) = self.resolve(tenant_hash, req, &accounting).await?;
+            let (snapshot, estimate, io_shape) =
+                self.resolve(tenant_hash, req, &accounting).await?;
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
