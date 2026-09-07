@@ -119,16 +119,71 @@ b < k * request_cost
 
 `--logs-request-cost-bytes <BYTES>` on `ravel-server` is that `request_cost`:
 one saved object-store round trip is worth this many saved transfer bytes.
-Unset, it takes the built-in default of 1,887,437 bytes (about 1.8 MiB). That
-default is a latency-bandwidth product: the transfer volume whose time, at one
-in-region S3 configuration's single-stream bandwidth, equals one request's
-round-trip latency, measured on one instance type at one fetch-permit count.
-It was tuned for that one configuration, so treat the default as a value to
-measure against rather than one known to be correct for your deployment.
+
+Three separate values get called "the default" for this flag, and only one of
+them is what a deployment that sets no flag actually runs with. Keeping them
+apart is the difference between leaving the read path alone and making it more
+expensive.
+
+**The built-in fallback constant** is 1,887,437 bytes (about 1.8 MiB). It is a
+latency-bandwidth product: the transfer volume whose time, at one in-region S3
+configuration's single-stream bandwidth, equals one request's round-trip
+latency, measured on one instance type at one fetch-permit count. It was tuned
+for that one configuration, so treat it as a value to measure against rather
+than one known to be correct for your deployment. It is the value the engine
+configuration carries when nothing resolves over it, and it is what
+`--logs-fetch-policy byte-minimal` and `latency-first` resolve to while this
+flag is unset. On the shipped flag set it is not the value in force.
+
+**The value the shipped flag set resolves to** is derived, not that constant.
+`--logs-fetch-policy` defaults to `cost-based`, and `cost-based` computes the
+rate from the active store cost profile (`--store-cost-profile`, which defaults
+to the reference `s3-intra-region-2026` profile) rather than falling back to the
+constant:
+
+```text
+request_cost_bytes = get_class_nanodollars x bytes_per_gib
+                     / (transfer_nanodollars_per_gib
+                        + retrieval_nanodollars_per_gib)
+```
+
+floored at one byte. Two cases matter:
+
+- At the reference profile, transfer and retrieval are both free, so a saved
+  request is worth an unbounded number of free bytes. The rate saturates and
+  every object is read whole, with no tail probe and no ranged read. The routing
+  threshold saturates with it, which overrides `--logs-block-range-threshold`,
+  and when that flag was set explicitly startup logs a WARN naming the value it
+  overrode.
+- At egress prices the derived rate is small. For a profile priced at $0.40 per
+  million GET-class requests, $0.09/GiB transfer and $0.01/GiB retrieval, the
+  derivation gives 4,294 bytes per saved request. That is the worked value the
+  request-cost decision record cited under Background uses, the same order of
+  magnitude as the dollar break-even computed further down this page, and three
+  orders of magnitude below the 1.8 MiB constant.
+
+**An explicit flag overrides that derivation.** Set, it wins over the policy's
+rate under every policy, `cost-based` included: it is an expert escape hatch,
+not a tie-breaker. So pinning the flag to 1,887,437 because something called
+that "the default" is not a no-op. On an egress-billed deployment it replaces a
+derived rate at that deployment's own dollar break-even with one three orders of
+magnitude above it, buying requests with bytes the deployment is billed for. On
+a transfer-free deployment it replaces a saturated rate with a finite one, which
+un-saturates the routing threshold and sends larger objects back down the ranged
+path the saturation was avoiding. Leave the flag unset unless a measurement on
+your own deployment says the derived value is wrong for it.
+
+Startup says which way it resolved, so none of this has to be inferred from
+this page. The `logs fetch policy resolved` line carries the effective request
+cost and its source, either the explicit flag or the policy's derivation. The
+policy and profile flags themselves are documented in
+[Operations: configuration](operations/configuration.md#logs-fetch-policy-and-store-cost-profile).
 
 Raising the value makes the engine value a request more: fewer segment fetches
 take the ranged route, more read whole objects, request count falls and bytes
-rise. Lowering it does the reverse. The decision is per segment, so one
+rise. Lowering it does the reverse. On `ravel-server` two of the three decisions
+below also need `--logs-block-range-threshold` raised with it before the routing
+moves, which the next section spells out. The decision is per segment, so one
 statement spanning many segments can take both routes within a single query.
 The counters report opens by shape rather than statements by shape for exactly
 that reason.
@@ -156,7 +211,20 @@ Deriving all three from one field is what makes recalibrating the store
 recalibrate the read path coherently, instead of leaving three thresholds to
 disagree. Two floors bound the low end (a 64 KiB coalescing gap and a 512 KiB
 whole-object crossover), so a very small value clamps rather than producing a
-one-block GET storm.
+one-block GET storm. The 4,294-byte egress derivation above sits below both, so
+that deployment gets the floors, not the raw rate.
+
+One qualification on the second and third decisions, because it changes what
+raising the value does. `ravel-server` always hands the fetcher its resolved
+`--logs-block-range-threshold`, and the fetcher then uses that threshold
+verbatim as the pre-probe crossover instead of deriving five request costs from
+this value. So on the server those two decisions follow the routing threshold,
+and the five-request-costs derivation governs only a caller that leaves the
+threshold unset. The request cost still drives them indirectly, through the
+resolution: a saturated rate saturates the routing threshold too, and that is
+what turns the second and third decisions into whole-object reads on the shipped
+flag set. Raising this value without also raising `--logs-block-range-threshold`
+moves the coalescing gap and leaves the other two where the threshold puts them.
 
 Two properties follow from what the number is:
 
@@ -198,19 +266,24 @@ trading bytes for requests spends a billed resource to save a free one. Where
 transfer is billed (cross-region, internet-facing, or an object store that
 charges egress) the sign flips: at list egress near $0.09/GB against GETs near
 $0.0004/1000, the dollar break-even lands around 4.4 KB per request, three
-orders of magnitude below the 1.8 MiB latency break-even, so the shipped
-default is already the cost-preferring setting there. The right value depends
-on the deployment's billing shape, which is why this is a flag and not a
-constant.
+orders of magnitude below the 1.8 MiB latency break-even. Give those prices to
+`--store-cost-profile` and the cost-based resolution lands in that same range on
+its own, which is what makes leaving this flag unset the cost-preferring choice
+there. Pinning it to the 1.8 MiB constant does the opposite: that constant is
+three orders of magnitude above the dollar break-even, so it spends billed
+egress to save requests that are nearly free. The right value depends on the
+deployment's billing shape, which is why this is a flag and not a constant.
 
 ### Choosing a value, cheapest lever first
 
 1. **Leave it unset** (this is the cost-preferring choice, not the
-   latency-preferring one). Costs nothing and changes nothing on its own, but
-   at the shipped reference profile the separate fetch-policy resolver
-   already saturates to whole-object reads regardless of this value, and that
-   shape measures slower and heavier, not faster: 486.0s and 463.79 GB
-   transferred against 285.8s and 150.28 GB for the ranged shape, on the same
+   latency-preferring one). Costs nothing, and at the shipped reference profile
+   it is what lets the fetch-policy resolver saturate the rate to whole-object
+   reads. Setting the flag at all is what would take that away, since an
+   explicit value replaces the saturated rate with a finite one; unset is the
+   setting that keeps it. The whole-object shape that saturation produces
+   measures slower and heavier, not faster: 486.0s and 463.79 GB transferred
+   against 285.8s and 150.28 GB for the ranged shape, on the same
    42-statement corpus, cold. Leaving this unset is still the right starting
    point when the object-store bill, not wall-clock time, is what is being
    minimized. An operator who wants the faster, byte-lighter shape has to ask
@@ -218,18 +291,32 @@ constant.
    [caching.md](caching.md)); this knob does not select it, and a different
    store, region, or fetch concurrency shifts the break-even for this knob
    independently of that choice.
-2. **Leave it unset on an egress-billed backend** too. The default already
-   sits far above that deployment's dollar break-even, so there is no lower
-   value worth inventing.
-3. **Raise it on a request-billed, transfer-free backend** (same-region S3).
-   Set it at or above the largest segment object *any* tenant this process
-   serves writes. The flag is process-wide, so a single tenant's largest
+2. **Leave it unset on an egress-billed backend** too, and give that backend's
+   prices to `--store-cost-profile` instead. Unset with those prices loaded, the
+   cost-based resolution derives a rate at that deployment's own dollar
+   break-even, and the two floors clamp it from there, so there is no lower
+   value worth inventing. Do not pin the flag to the 1.8 MiB fallback constant
+   to match what you believe the default is: on this backend that raises the
+   rate three orders of magnitude above the break-even, and the coalescing gap
+   follows it all the way up, fusing extents up to 1.8 MiB apart and moving
+   bytes this deployment is billed for.
+3. **Raise it on a request-billed, transfer-free backend** (same-region S3)
+   whose policy is not already saturating the rate for you. That caveat is the
+   whole reason this is third and not first: on the shipped `cost-based` policy
+   at the reference profile, option 1 has already delivered whole-object reads,
+   and setting the flag here would undo them. Raise it when the resolution
+   leaves a finite rate in place, that is under `byte-minimal` or
+   `latency-first`, or under `cost-based` against a profile whose bytes carry a
+   price. Set it at or above the largest segment object *any* tenant this
+   process serves writes. The flag is process-wide, so a single tenant's largest
    object is the wrong unit, and any tenant holding bigger objects keeps
    routing ranged. There is no format-level object-size cap to read this from;
    object size comes from `--batch-rows` and `--target-bytes` at write time
-   and is observable per tenant, so measure it and round up. Overshooting
-   costs nothing, because all three decisions saturate once the value exceeds
-   the largest object: every candidate segment at or under
+   and is observable per tenant, so measure it and round up. Raise
+   `--logs-block-range-threshold` with it, because on the server that threshold,
+   not the five-request-costs derivation, is the pre-probe crossover; a raise
+   here alone moves the coalescing gap and leaves the routing where the
+   threshold puts it. With both raised, every candidate segment at or under
    `--logs-max-fetch-run-bytes` becomes one GET, and a larger one becomes a
    few sequential covering GETs. What it costs
    is the other column of the comparison above, roughly twice the bytes and
@@ -238,7 +325,10 @@ constant.
 The flag is read at startup only, like the other read-path knobs in
 [query.md](query.md#operator-configurable-budgets-server-flags), and it sits
 inside `--logs-block-range-threshold`, which selects which fetcher entry point
-an object takes before this value governs how that fetch behaves.
+an object takes before this value governs how that fetch behaves. That threshold
+is itself a resolved value rather than whatever was passed: a saturated request
+cost overrides it, so on the shipped flag set the entry point every object takes
+is the whole-object one regardless of the 512 KiB the threshold defaults to.
 
 To see which way your queries are actually routing, read the logs scan's
 `fast_path_whole_object_segments` and `fast_path_ranged_segments` plan metrics
@@ -322,3 +412,6 @@ cadence and ingest affinity: ADR-0076. Per-query cost accounting and the
 whole-versus-ranged routing: ADR-0904. The read-side request budget derived
 from shard count and cadence: ADR-0075. Fetch concurrency: ADR-0088. The
 cost-based-versus-latency-first fetch policy and its measured trade: ADR-1196.
+The store cost profile, and the resolution that turns a fetch policy into the
+byte quantities the fetch layer runs on, including the precedence an explicit
+`--logs-request-cost-bytes` takes over a derived rate: ADR-0996.
