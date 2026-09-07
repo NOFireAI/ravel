@@ -331,7 +331,10 @@ impl FlightSqlService for RavelFlightSqlService {
         // DoGet records its actual with a zero estimate so the two folds sum to
         // one whole-query estimate beside the summed whole-query actual.
         let accounting = QueryAccounting::new();
-        let (snapshot, estimate) = self
+        // The third element is this resolve's `QueryIoShape` (issue #1250);
+        // Flight SQL renders no stats surface on either RPC, so it is
+        // discarded here rather than threaded through `FlightInfo`.
+        let (snapshot, estimate, _io_shape) = self
             .executor
             .resolve_snapshot(tenant, &req, &accounting)
             .await
