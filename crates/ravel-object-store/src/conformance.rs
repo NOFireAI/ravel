@@ -826,23 +826,33 @@ const CONCURRENT_CREATE_MAX_ATTEMPTS: usize = 4;
 /// The returned outcome is `Ok` (this writer won), `Err(AlreadyExists)` (it
 /// lost), a terminal error, or -- when the bound ran out -- still a retryable
 /// error, which the caller reports as a failure rather than as a loss.
+///
+/// The second element of the pair is whether this writer took the retry path
+/// at all (its first answer was retryable, so at least one further attempt
+/// ran). The caller needs it because a durable create that lost its response
+/// answers `AlreadyExists` on retry, indistinguishable from a genuine loser by
+/// the terminal outcome alone: a run with zero winners but a retried writer
+/// could not establish which writer won rather than having observed a
+/// non-atomic create.
 async fn settle_racing_create(
     store: &dyn ObjectStoreBackend,
     key: &str,
     payload: &Bytes,
     first: Result<crate::PutOutcome, StoreError>,
-) -> Result<crate::PutOutcome, StoreError> {
+) -> (Result<crate::PutOutcome, StoreError>, bool) {
     let mut outcome = first;
+    let mut retried = false;
     for _ in 1..CONCURRENT_CREATE_MAX_ATTEMPTS {
         match &outcome {
             Err(err) if err.is_retryable() => {}
             _ => break,
         }
+        retried = true;
         outcome = store
             .put(key, payload.clone(), PutOptions::create_if_absent())
             .await;
     }
-    outcome
+    (outcome, retried)
 }
 
 /// The single-winner probe ADR-0050 section 6 calls for: `CreateIfAbsent`
@@ -897,10 +907,15 @@ async fn probe_concurrent_create_if_absent(
 
     let mut winners: Vec<usize> = Vec::new();
     let mut losers = 0usize;
+    let mut retried: Vec<usize> = Vec::new();
     let mut unsettled: Vec<String> = Vec::new();
     let mut unexpected: Vec<String> = Vec::new();
     for (i, outcome) in outcomes {
-        match settle_racing_create(store, &key, &payloads[i], outcome).await {
+        let (settled, was_retried) = settle_racing_create(store, &key, &payloads[i], outcome).await;
+        if was_retried {
+            retried.push(i);
+        }
+        match settled {
             Ok(_) => winners.push(i),
             Err(StoreError::AlreadyExists) => losers += 1,
             Err(err) if err.is_retryable() => unsettled.push(format!("writer-{i}: {err}")),
@@ -932,6 +947,35 @@ async fn probe_concurrent_create_if_absent(
                  (docs/object-store-contract.md: conditional-put failure mapping)",
                 unexpected.len(),
                 unexpected.join(", ")
+            ),
+        );
+    }
+    // A durable create whose response was lost is a permitted outcome
+    // (docs/object-store-contract.md; TLA action PutCreateIfAbsentLostResponse
+    // in formal/tla/common): the write landed but the writer saw a retryable
+    // failure, so its retry against the by-then present key answers
+    // AlreadyExists. That writer is then counted as a loser and the winner it
+    // actually was disappears, leaving zero winners. The counts alone cannot
+    // tell this apart from a non-atomic create that produced no winner, so when
+    // a retried writer is present the run is reported as unable to establish a
+    // winner, not as a single-winner violation. The run still FAILS: a
+    // qualification pass requires exactly one established winner, which this run
+    // did not produce.
+    if winners.is_empty() && !retried.is_empty() {
+        let retried_writers = retried
+            .iter()
+            .map(|i| format!("writer-{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return ProbeResult::fail(
+            property,
+            format!(
+                "no CreateIfAbsent writer succeeded, but {} of {CONCURRENT_CREATE_WRITERS} \
+                 retried a retryable first response ({retried_writers}); a durable create whose \
+                 response was lost answers AlreadyExists on retry (docs/object-store-contract.md), \
+                 so this run could not establish which writer won and the single-winner property \
+                 could not be evaluated",
+                retried.len()
             ),
         );
     }
@@ -2125,6 +2169,153 @@ mod tests {
             (CONCURRENT_CREATE_WRITERS - 1) * CONCURRENT_CREATE_MAX_ATTEMPTS,
             "each of the {} losers must have been retried up to the bound",
             CONCURRENT_CREATE_WRITERS - 1
+        );
+    }
+
+    /// Wraps `MemoryStore` and loses the winning racer's response: the first
+    /// concurrent create the oracle accepts is durable, but this store answers
+    /// the winner with a retryable [`StoreError::Transient`] instead of `Ok`.
+    /// The winner's retry then races the by-then present key and lands on
+    /// `AlreadyExists`, so every writer reports `AlreadyExists` and no winner is
+    /// ever observed even though exactly one write is durable.
+    ///
+    /// The deflection is scoped to the one key the suite races and fires exactly
+    /// once, on the single accepted `Ok`; every real loser and every other probe
+    /// sees the untouched oracle.
+    struct LostWinnerResponseStore {
+        inner: MemoryStore,
+        state: Mutex<LostWinnerState>,
+    }
+
+    #[derive(Default)]
+    struct LostWinnerState {
+        /// Whether the one accepted create has already been deflected, so the
+        /// winner's retry falls through to the real `AlreadyExists`.
+        deflected: bool,
+        /// The winner's payload after it was deflected, so a test can name which
+        /// writer took the retry path rather than assume it.
+        winner_payload: Option<Bytes>,
+    }
+
+    impl LostWinnerResponseStore {
+        fn new() -> Self {
+            LostWinnerResponseStore {
+                inner: MemoryStore::new(),
+                state: Mutex::new(LostWinnerState::default()),
+            }
+        }
+
+        fn winner_payload(&self) -> Option<Bytes> {
+            self.state.lock().winner_payload.clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for LostWinnerResponseStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            let racing_create = matches!(opts.mode, PutMode::CreateIfAbsent)
+                && key.ends_with(CONCURRENT_CREATE_KEY_SUFFIX);
+            let outcome = self.inner.put(key, data.clone(), opts).await;
+            if !racing_create || outcome.is_err() {
+                return outcome;
+            }
+            let mut state = self.state.lock();
+            if state.deflected {
+                return outcome;
+            }
+            // The oracle already stored the object, so the create is durable.
+            // Report the winner a retryable failure: its retry sees the present
+            // key and answers AlreadyExists, dropping the winner from the counts.
+            state.deflected = true;
+            state.winner_payload = Some(data);
+            Err(StoreError::Transient(
+                "winner's response lost while the create was durable".to_string(),
+            ))
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// When the writer that actually won loses its response, its retry answers
+    /// `AlreadyExists` and no winner is observed. The probe must not blame a
+    /// non-atomic create -- the real cause is a lost response the counts cannot
+    /// distinguish -- but it must still FAIL, because the run never established a
+    /// single winner and qualification requires exactly one.
+    ///
+    /// Counterpart of the TLA action `PutCreateIfAbsentLostResponse`
+    /// (formal/tla/common): a durable create surfaces a retryable failure, so the
+    /// caller's retry sees the write already present.
+    #[tokio::test]
+    async fn lost_winner_response_fails_the_probe_as_unevaluable_not_non_atomic() {
+        let store = LostWinnerResponseStore::new();
+        let report = run_conformance_suite(&store, "sys/qualify/lost-winner/").await;
+        assert!(
+            !report.passed(),
+            "a run that never established a winner must not qualify"
+        );
+        let failed: HashSet<&'static str> = report.failures().map(|r| r.property.name()).collect();
+        assert_eq!(
+            failed,
+            HashSet::from([Property::ConcurrentCreateIfAbsentSingleWinner.name()]),
+            "only the concurrent-create property is affected: {failed:?}"
+        );
+        let race = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::ConcurrentCreateIfAbsentSingleWinner)
+            .expect("the concurrent create probe ran");
+        assert!(
+            race.detail.contains("could not establish which writer won"),
+            "the failure must name the unevaluable cause: {}",
+            race.detail
+        );
+        let winner_payload = store
+            .winner_payload()
+            .expect("the winner was deflected once");
+        let winner_index = String::from_utf8_lossy(&winner_payload)
+            .strip_prefix("writer-")
+            .expect("payloads are writer-<i>")
+            .to_string();
+        assert!(
+            race.detail.contains(&format!("writer-{winner_index}")),
+            "the failure must name the retried writer ({winner_index}): {}",
+            race.detail
+        );
+        assert!(
+            !race.detail.contains("not atomic"),
+            "the failure must not blame a non-atomic create when a writer was retried: {}",
+            race.detail
         );
     }
 
