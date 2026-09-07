@@ -201,6 +201,7 @@ fn build_app(store: Arc<dyn ObjectStoreBackend>, clock: Arc<AtomicI64>) -> Route
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         Some(declared),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("build_sql_state");
     state.clock = Arc::new(AdvancingClock(clock));
@@ -409,6 +410,7 @@ async fn an_explicitly_empty_declaration_overrides_the_cli_default() {
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
         Some(declared),
+        Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("build_sql_state");
     state.clock = Arc::new(AdvancingClock(Arc::clone(&clock)));
