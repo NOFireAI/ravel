@@ -79,7 +79,7 @@ use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, ScalarValue};
+use datafusion::common::{Column, DFSchema, ScalarValue, TableReference};
 use datafusion::dataframe::DataFrame;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -212,8 +212,14 @@ pub struct SqlRequest {
     ///
     /// An agent writing SQL against a window it did not choose cannot know to
     /// add that predicate, so the caller that chose the window opts in here
-    /// instead. See [`window_predicate_for`] for the column each table filters
-    /// on and [`SqlStats::window_predicate`] for what was applied.
+    /// instead. See [`window_ts_column`] for the column each table filters on
+    /// and [`SqlStats::window_predicate`] for what was applied.
+    ///
+    /// The row filter is half-open, `[start, end)` (ADR-1374 decision 4), while
+    /// the same `window` selects segments on the closed `[start, end]` bound
+    /// `TimeRange` carries. The two differ on purpose: a listing bound may only
+    /// widen, and a row bound must be exact. A request whose `start` equals its
+    /// `end` therefore returns zero rows under `row_window`, by definition.
     pub row_window: bool,
     /// Stop the stream once this many rows have been emitted, plus one
     /// (ADR-1374 decision 3, prerequisite 4). The extra row is deliberate: it
@@ -260,9 +266,11 @@ pub struct SqlStats {
     /// that wrote it lives on [`SqlOutcome::spill_by_operator`], which does not
     /// have to stay `Copy`.
     pub spill: SpillCounts,
-    /// The row filter [`SqlRequest::row_window`] applied above each scan, in
-    /// the form `"<ts_col> >= <start_ns> AND <ts_col> < <end_ns>"`. `None`
-    /// when the request did not ask for one, which is the default.
+    /// The row filter [`SqlRequest::row_window`] applied above each scan, as
+    /// the display of the [`Expr`] that was actually planted
+    /// ([`window_filter_expr`]) rather than a separately formatted description
+    /// of it. `None` when the request did not ask for one, which is the
+    /// default, and when the plan carried no scan to filter.
     pub window_predicate: Option<String>,
     /// Whether [`SqlRequest::max_rows`] cut this result: true when the plan
     /// produced the cap-plus-one'th row, meaning at least one more row
@@ -311,12 +319,24 @@ fn window_ts_column(target: TargetSignal) -> &'static str {
     }
 }
 
-/// The predicate text [`SqlStats::window_predicate`] reports for `target`
-/// filtered to `window`. Half-open on the right, matching `TimeRange` and the
-/// segment-listing bound the same window already drives.
-fn window_predicate_for(target: TargetSignal, window: TimeRange) -> String {
-    let ts = window_ts_column(target);
-    format!("{ts} >= {} AND {ts} < {}", window.start_ns, window.end_ns)
+/// The row-window predicate for one scan: `ts_col >= start AND ts_col < end`,
+/// with the column qualified by the scan's own `relation` (an unqualified
+/// column would be ambiguous the moment a plan carries two scans).
+///
+/// Half-open on the right, per ADR-1374 decision 4, and deliberately NOT the
+/// bound the same window drives on segment listing: `TimeRange` is closed
+/// (`[start, end]`) where it selects segments, because that bound may only
+/// widen. A request with `start == end` therefore lists the segments covering
+/// that instant and, under `row_window`, returns zero rows.
+///
+/// This is the one place the predicate is built, and
+/// [`SqlStats::window_predicate`] reports this expression's own display, so the
+/// reported text cannot drift from the filter that ran.
+fn window_filter_expr(relation: &TableReference, ts_col: &str, window: TimeRange) -> Expr {
+    let ts = Expr::Column(Column::new(Some(relation.clone()), ts_col));
+    ts.clone()
+        .gt_eq(ts_literal(window.start_ns))
+        .and(ts.lt(ts_literal(window.end_ns)))
 }
 
 /// A nanosecond event-time literal, in the column's own Arrow type so the
@@ -328,41 +348,54 @@ fn ts_literal(ns: i64) -> Expr {
 /// Insert `ts_col >= window.start_ns AND ts_col < window.end_ns` directly
 /// above every `TableScan` in `plan` (ADR-1374 decision 3, prerequisite 2).
 ///
-/// Rewrites the UNOPTIMIZED logical plan, which is what keeps this from
-/// interfering with pruning. At this stage a `TableScan` still carries no
-/// projection, so the event-time column is always in scope; the optimizer then
-/// pushes projections and filters down over the rewritten plan exactly as it
-/// would over the original. The provider still returns `Inexact` for every
-/// filter it is offered, so this predicate arrives at the scan as a widen-only
-/// hint and is re-applied above it: no segment or block is pruned that the
-/// statement alone would not have pruned, and a segment straddling the window
-/// is still read whole and filtered by row.
+/// Rewrites the UNOPTIMIZED logical plan. At this stage a `TableScan` still
+/// carries no projection, so the event-time column is always in scope; the
+/// optimizer then pushes projections and filters down over the rewritten plan
+/// exactly as it would over a predicate the statement itself carried. Pruning
+/// therefore tightens: the injected filter is offered to the provider like any
+/// other, and the result stays sound because every provider reports `Inexact`,
+/// so DataFusion re-applies the filter above the scan and a segment straddling
+/// the window is read whole and filtered by row.
+///
+/// The traversal descends into subqueries embedded in expressions
+/// (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`) as well as into
+/// plan children, so a statement whose `WHERE` clause carries its own `SELECT`
+/// gets the window on that scan too. A plain `transform_up` walks only the plan
+/// tree, which would leave the inner scan reading the whole overlapping segment
+/// while the reported predicate claimed the window had been applied.
 ///
 /// A `Filter` preserves its input's schema, so the planned result schema is
 /// unchanged and the caller's `DataFrame` can be rebuilt around the new plan.
+///
+/// Returns the rewritten plan and the display of the predicate actually built,
+/// which is what [`SqlStats::window_predicate`] reports; `None` when the plan
+/// carries no `TableScan` at all and nothing was filtered.
 fn apply_row_window(
     plan: LogicalPlan,
     ts_col: &str,
     window: TimeRange,
-) -> Result<LogicalPlan, SqlError> {
-    plan.transform_up(|node| {
-        if let LogicalPlan::TableScan(scan) = &node {
-            // Qualified by the scan's own relation: an unqualified column
-            // would be ambiguous the moment a plan carries two scans.
-            let ts = Expr::Column(Column::new(Some(scan.table_name.clone()), ts_col));
-            let predicate = ts
-                .clone()
-                .gt_eq(ts_literal(window.start_ns))
-                .and(ts.lt(ts_literal(window.end_ns)));
-            // An unresolvable column surfaces here as a typed plan error,
-            // never as a silently unfiltered scan.
-            let filter = Filter::try_new(predicate, Arc::new(node))?;
-            return Ok(Transformed::yes(LogicalPlan::Filter(filter)));
-        }
-        Ok(Transformed::no(node))
-    })
-    .map(|transformed| transformed.data)
-    .map_err(plan_error)
+) -> Result<(LogicalPlan, Option<String>), SqlError> {
+    let mut applied: Option<String> = None;
+    let rewritten = plan
+        .transform_up_with_subqueries(|node| {
+            if let LogicalPlan::TableScan(scan) = &node {
+                let predicate = window_filter_expr(&scan.table_name, ts_col, window);
+                // Rendered from the expression that is about to be planted, so
+                // the reported text cannot describe a different filter than the
+                // one that ran. A session registers exactly one table provider
+                // (crate::session::build_session), so every scan in a plan
+                // names the same relation and renders identically.
+                applied = Some(predicate.to_string());
+                // An unresolvable column surfaces here as a typed plan error,
+                // never as a silently unfiltered scan.
+                let filter = Filter::try_new(predicate, Arc::new(node))?;
+                return Ok(Transformed::yes(LogicalPlan::Filter(filter)));
+            }
+            Ok(Transformed::no(node))
+        })
+        .map(|transformed| transformed.data)
+        .map_err(plan_error)?;
+    Ok((rewritten, applied))
 }
 
 /// What [`SqlExecutor::explain`] found out about a statement without reading
@@ -1196,13 +1229,13 @@ impl SqlExecutor {
         // schema).
         let window_predicate = match extras.row_window {
             Some(window) => {
-                let plan = apply_row_window(
+                let (plan, predicate) = apply_row_window(
                     frame.logical_plan().clone(),
                     window_ts_column(target),
                     window,
                 )?;
                 frame = DataFrame::new(ctx.state(), plan);
-                Some(window_predicate_for(target, window))
+                predicate
             }
             None => None,
         };
@@ -4281,19 +4314,28 @@ mod tests {
             .await
             .expect("execute with the row window");
 
+        // What was applied, before what it did: the reported text is the
+        // display of the expression the rewrite built, not an independently
+        // formatted description of it, and it is pinned to an exact string so a
+        // changed bound cannot leave the report intact.
         assert_eq!(
-            filtered.stats.segments, 1,
-            "the row filter sits above the scan, so it changes no pruning"
+            filtered.stats.window_predicate.as_deref(),
+            Some(
+                window_filter_expr(&TableReference::bare("samples"), "ts", window)
+                    .to_string()
+                    .as_str()
+            )
         );
+        assert_eq!(
+            filtered.stats.window_predicate.as_deref(),
+            Some(ROW_WINDOW_200_500_PREDICATE)
+        );
+
         assert_eq!(filtered.output.num_rows(), 300);
         assert_eq!(
             unfiltered.output.num_rows() - filtered.output.num_rows(),
             700,
             "exactly the rows outside [200, 500) are excluded"
-        );
-        assert_eq!(
-            filtered.stats.window_predicate.as_deref(),
-            Some("ts >= 200 AND ts < 500")
         );
 
         let mut kept = ts_values(&filtered.output);
@@ -4302,6 +4344,83 @@ mod tests {
         assert_eq!(kept.first().copied(), Some(200), "start is inclusive");
         assert_eq!(kept.last().copied(), Some(499), "end is exclusive");
         assert_eq!(kept, (200..500).collect::<Vec<i64>>());
+    }
+
+    /// The exact predicate text a `[200, 500)` row window on `samples` reports,
+    /// pinned so a change to the rendering (a dropped qualifier, a literal
+    /// printed in another unit) fails here rather than silently changing what
+    /// `SqlStats::window_predicate` promises a caller.
+    const ROW_WINDOW_200_500_PREDICATE: &str = "samples.ts >= TimestampNanosecond(200, None) AND \
+         samples.ts < TimestampNanosecond(500, None)";
+
+    /// Finding 1. A subquery embedded in an expression is not a plan child, so
+    /// a plain `transform_up` never reaches its `TableScan`: the outer scan
+    /// would be windowed, the inner one would read the whole overlapping
+    /// segment, and `window_predicate` would still report the window as
+    /// applied. Both statements below are answerable only if BOTH scans are
+    /// filtered.
+    #[tokio::test]
+    async fn row_window_reaches_scans_inside_expression_subqueries() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("row-window-subquery-1376", 1_000, FaultPlan::empty()).await;
+        let executor = executor_over(store);
+
+        let window = TimeRange {
+            start_ns: 200,
+            end_ns: 500,
+        };
+
+        // value == ts, so the windowed inner AVG is (200 + 499) / 2 = 349.5 and
+        // the outer scan keeps ts 350..500. Unwindowed, the inner AVG over the
+        // whole segment is 499.5 and the outer result is empty.
+        let scalar = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    row_window: true,
+                    ..samples_request(
+                        "SELECT ts FROM samples WHERE value > (SELECT avg(value) FROM samples)",
+                        window,
+                    )
+                },
+            )
+            .await
+            .expect("execute the scalar-subquery statement under the row window");
+        assert_eq!(
+            scalar.output.num_rows(),
+            150,
+            "the windowed inner average is 349.5, so ts 350..500 survives"
+        );
+        let mut kept = ts_values(&scalar.output);
+        kept.sort_unstable();
+        assert_eq!(kept.first().copied(), Some(350));
+        assert_eq!(kept.last().copied(), Some(499));
+
+        // An IN subquery is the other expression-embedded shape: the inner
+        // scan's own predicate keeps ts 400..1000, and the window cuts it to
+        // 400..500.
+        let in_list = executor
+            .execute(
+                tenant_hash,
+                &SqlRequest {
+                    row_window: true,
+                    ..samples_request(
+                        "SELECT ts FROM samples WHERE ts IN (SELECT ts FROM samples WHERE value >= 400)",
+                        window,
+                    )
+                },
+            )
+            .await
+            .expect("execute the IN-subquery statement under the row window");
+        assert_eq!(
+            in_list.output.num_rows(),
+            100,
+            "the window bounds the inner scan too, so ts 400..500 survives"
+        );
+        let mut kept = ts_values(&in_list.output);
+        kept.sort_unstable();
+        assert_eq!(kept.first().copied(), Some(400));
+        assert_eq!(kept.last().copied(), Some(499));
     }
 
     /// Prerequisite 3. `explain` resolves, admits, and plans; it must never
@@ -4378,7 +4497,7 @@ mod tests {
         );
         assert_eq!(
             report.window_predicate.as_deref(),
-            Some("ts >= 200 AND ts < 500")
+            Some(ROW_WINDOW_200_500_PREDICATE)
         );
         assert!(
             report.plan_text.contains("RsegScanExec"),
