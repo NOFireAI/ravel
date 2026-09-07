@@ -1945,6 +1945,43 @@ cannot understate a lane that did, and the log lane's `unclassified` result
 cannot fabricate a worse classification than a metrics lane that pruned
 correctly.
 
+#### SQL statements
+
+A SQL statement's `stats.io` is the same `QueryIoShape` type and the same
+`stats.io` wire block a PromQL query reports, computed at `SqlExecutor`'s own
+resolve site (`crates/ravel-sql/src/executor.rs`) rather than left as a
+placeholder. `unfoldedSegmentsResolved` and the resolve's own `dependencyDepth`
+inputs are read directly off that resolve, exactly as the PromQL lane reads
+them. `serviceBatches` differs because `ravel-sql` has no `GetLimiter` and no
+outer/inner `buffer_unordered` nesting: `crates/ravel-sql/src/scan.rs`'s
+`RsegScanExec` assigns segments to partitions round-robin and fetches each
+partition's own segments strictly sequentially, so the wave-synchronous model
+above collapses to a single wave:
+
+- The outer fan-out width is DataFusion's `target_partitions`
+  (`EngineConfig::sql_partition_count`, read through the SQL statement's own
+  `SqlConfig.engine`), clamped to the resolved segment count the same way
+  `RsegScanExec` clamps its own partition count.
+- The inner fan-out is always `1`: a partition's segments are fetched one
+  after another, never concurrently, so the busiest partition's own segment
+  count (`total_segments.div_ceil(partitions)`) is the whole per-partition
+  depth.
+- `sharedGetPermits` is always `u64::MAX`: nothing in `ravel-sql` shares a GET
+  permit pool across partitions the way ADR-1195's limiter does for PromQL.
+
+With those three inputs, the model reduces to `ceil(total_segments /
+partitions)`: the busiest partition's segment count is the whole story, since
+there is no shared pool to bind concurrency below the partition count and no
+second fan-out level to add rounds.
+
+`dependencyDepth`'s `whole_object_threshold` has no single SQL-wide knob
+either; it is read per target signal, matching whichever fetcher that
+signal's scan actually uses: the metrics fetcher's own configured threshold
+for `metrics`, the log fetcher's block-range threshold for `logs`, `alerts`,
+and `audit` (they share the RLOG funnel, ADR-1101 decision 1), and `u64::MAX`
+for `spans`, because the span fetcher always issues one unconditional
+whole-object GET and has no threshold concept to report.
+
 `stats.io` carries no object keys, field values, predicates, or index
 terms: every figure is a structural count.
 
