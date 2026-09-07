@@ -738,6 +738,20 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub gc_bootstrap_waiting_since: Option<String>,
 
+    /// The qualify-Job input hash (bucket, region, endpoint, image, credentials
+    /// Secret name) that store qualification last succeeded against (issue #36).
+    /// The operator gates serving on `ravel store qualify` before it creates any
+    /// Deployment; recording the qualified inputs here makes that gate durable:
+    /// a later pass whose inputs still hash to this value proceeds without
+    /// re-running qualification even after the one-shot Job has been
+    /// TTL-garbage-collected, and a pass whose inputs no longer match re-runs it
+    /// (the `StoreQualified` condition flips back to `Pending`) without tearing
+    /// down the running Deployments. Absent until the first qualification
+    /// succeeds. Qualification is never re-run on a schedule; only an input
+    /// change re-triggers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_qualified_hash: Option<String>,
+
     /// Standard Kubernetes conditions: `Available`, `Progressing`, `Degraded`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
