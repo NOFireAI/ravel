@@ -4857,6 +4857,54 @@ mod tests {
     use ravel_catalog::DeclaredTypedColumn;
     use ravel_ingest::{CountLimit, RateLimit};
 
+    /// Records every INFO event's fields as one combined string (`"
+    /// name=value"` per field), so a test can count how many times a given
+    /// `setting=` figure appears across an `emit()` call -- the emit-line
+    /// analogue of `ravel_query::http::json`'s `IoShapeJson` wire-text
+    /// "exactly once" tests, adapted from log fields instead of JSON keys.
+    #[derive(Default, Clone)]
+    struct InfoEventCapture(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl<S> tracing_subscriber::Layer<S> for InfoEventCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            #[derive(Default)]
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value}", field.name());
+                }
+
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            self.0.lock().push(visitor.0);
+        }
+    }
+
     /// `RemoteClusterConfig`'s `Debug` must never print the bearer credential:
     /// the config flows into startup logs and error contexts, and a derived
     /// `Debug` would leak the operator token there.
@@ -5704,6 +5752,10 @@ mod tests {
         // ceiling from the fetcher cache's 25%, so the pair does not commit
         // 50% of the budget.
         assert_eq!(resolved.catalog_cache_max_bytes, 1_503_238_553);
+        // Both hard caps together, and what the derivation leaves for the
+        // shared SQL/fetch MemoryBudget accountant: budget = hard_caps + remainder.
+        assert_eq!(resolved.memory_hard_caps_bytes, 9_019_431_321);
+        assert_eq!(resolved.memory_remainder_bytes, 21_045_339_751);
         assert_eq!(resolved.sql_max_query_bytes, 8_053_063_680);
         assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
         assert_eq!(resolved.max_segments, 1_000_000);
@@ -5749,6 +5801,8 @@ mod tests {
         assert_eq!(resolved.cache_max_bytes, 1_610_612_736);
         // Catalog cache is 5% of the same budget, truncated.
         assert_eq!(resolved.catalog_cache_max_bytes, 322_122_547);
+        assert_eq!(resolved.memory_hard_caps_bytes, 1_932_735_283);
+        assert_eq!(resolved.memory_remainder_bytes, 4_509_715_661);
         assert_eq!(resolved.sql_max_query_bytes, 2_147_483_648);
         assert_eq!(resolved.sql_tenant_max_bytes, 4_294_967_296);
         // The two host-independent rules do not shrink with the host: a
@@ -5762,6 +5816,70 @@ mod tests {
             PerformanceFlags::default(),
         );
         assert_eq!(tiny.fetch_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
+    }
+
+    /// The IMDSv2-confirmed `MemTotal` of the c6a.4xlarge box issue #1395
+    /// bisected the ClickBench warm-run regression to: 16 vCPU, no cgroup cap.
+    const CLICKBENCH_HOST_MEM_BYTES: u64 = 32_903_794_688;
+    /// The ClickBench corpus size on that same box, in bytes.
+    const CLICKBENCH_CORPUS_BYTES: u64 = 11_732_474_917;
+
+    /// Exact fetch-cache carve on the real regressed host, parameterized on
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] rather than a duplicated literal, so a
+    /// future calibration of that constant recomputes this assertion instead
+    /// of silently going stale. A second, separate assertion records whether
+    /// the carve is large enough to hold the whole ClickBench corpus resident
+    /// at once; ADR-1170 decision 3 fixes the carve's BASIS (budget, not raw
+    /// `MemTotal`), not the corpus's fit, so this is a fact to record, not a
+    /// pass/fail bar the derivation must clear.
+    ///
+    /// Prove-the-test: change `percent_of(memory_budget_bytes,
+    /// CACHE_MEMORY_PERCENT)` in `resolve_performance_defaults` back to
+    /// `percent_of(total, CACHE_MEMORY_PERCENT)` (the pre-ADR-1170 flat basis)
+    /// and the first assertion reads 8,225,948,672 against the expected
+    /// 7,689,077,760.
+    #[test]
+    fn clickbench_host_derives_the_expected_fetch_cache_carve() {
+        let host = HostProfile::new(16, Some(CLICKBENCH_HOST_MEM_BYTES));
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        let expected_budget = CLICKBENCH_HOST_MEM_BYTES - MEMORY_OVERHEAD_RESERVE_BYTES;
+        let expected_cache = percent_of(expected_budget, CACHE_MEMORY_PERCENT);
+        assert_eq!(resolved.memory_budget_bytes, expected_budget);
+        assert_eq!(resolved.cache_max_bytes, expected_cache);
+
+        // Separate statement: the derived carve does not fit the reference
+        // corpus at the placeholder reserve value of
+        // MEMORY_OVERHEAD_RESERVE_BYTES (2,147,483,648) -- 7,689,077,760 is
+        // below the 11,732,474,917-byte corpus, so the whole corpus cannot sit
+        // resident in the fetch cache at once on this host at today's
+        // provisional reserve.
+        assert!(expected_cache < CLICKBENCH_CORPUS_BYTES);
+    }
+
+    /// The budget-derived carve and a flat 25%-of-`MemTotal` carve (the
+    /// pre-ADR-1170 basis issue #1395 bisected the ClickBench regression to)
+    /// disagree on any host with known memory, because
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] is nonzero: the reference host's
+    /// budget-derived carve is 7,516,192,768 while the flat share of the same
+    /// host's raw `MemTotal` would be 8,053,063,680. The resolved value must
+    /// be the budget-derived one.
+    ///
+    /// Prove-the-test: change `percent_of(memory_budget_bytes,
+    /// CACHE_MEMORY_PERCENT)` in `resolve_performance_defaults` back to
+    /// `percent_of(total, CACHE_MEMORY_PERCENT)` and `resolved.cache_max_bytes`
+    /// reads 8,053,063,680 (the flat value) against the expected
+    /// 7,516,192,768, so `assert_ne!` below no longer distinguishes anything
+    /// and the final `assert_eq!` fails.
+    #[test]
+    fn the_budget_derived_carve_differs_from_a_flat_share_of_mem_total() {
+        let host = reference_host();
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        let flat_share_of_mem_total = percent_of(REFERENCE_MEM_BYTES, CACHE_MEMORY_PERCENT);
+        assert_eq!(flat_share_of_mem_total, 8_053_063_680);
+        assert_ne!(resolved.cache_max_bytes, flat_share_of_mem_total);
+        assert_eq!(resolved.cache_max_bytes, 7_516_192_768);
     }
 
     /// Memory unknown (a non-Linux host, or an unreadable `/proc/meminfo`):
@@ -6214,6 +6332,103 @@ mod tests {
         let resolved = resolved_from(&cli);
         assert_eq!(resolved.cache_max_bytes, 4096);
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FLAG);
+    }
+
+    /// Startup refuses, never clamps, a flag combination whose two hard cache
+    /// caps together exceed `memory_budget_bytes` (ADR-1170 decision 3). An
+    /// explicit `--cache-max-bytes` bounds BOTH the fetcher and catalog caches
+    /// at that one value (the pre-#1141 coupling), so a value above half the
+    /// reference host's 30,064,771,072-byte budget makes their sum exceed it.
+    ///
+    /// Prove-the-test: replace `self.memory_hard_caps_bytes >
+    /// self.memory_budget_bytes` in `check_memory_budget` with `false` and
+    /// `expect_err` panics because `resolve_performance` returns `Ok` instead
+    /// of the expected `MemoryBudgetExceeded`.
+    #[test]
+    fn startup_refuses_hard_caps_over_the_memory_budget() {
+        let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "20000000000"])
+            .expect("flag parses");
+
+        let err = cli
+            .resolve_performance(reference_host())
+            .expect_err("hard caps of 40,000,000,000 must exceed the 30,064,771,072 budget");
+        let exceeded = err
+            .downcast_ref::<MemoryBudgetExceeded>()
+            .expect("typed MemoryBudgetExceeded error");
+        assert_eq!(exceeded.cache_max_bytes, 20_000_000_000);
+        assert_eq!(exceeded.catalog_cache_max_bytes, 20_000_000_000);
+        assert_eq!(exceeded.hard_caps_total, 40_000_000_000);
+        assert_eq!(exceeded.memory_budget_bytes, 30_064_771_072);
+
+        // Every figure an operator needs to act on the refusal is in the
+        // message itself, not just the typed struct.
+        let message = exceeded.to_string();
+        assert!(message.contains("20000000000"));
+        assert!(message.contains("40000000000"));
+        assert!(message.contains("30064771072"));
+    }
+
+    /// A flag combination the budget check does NOT refuse still resolves
+    /// normally: the refusal is exact ("hard caps > budget"), not a margin, so
+    /// hard caps exactly equal to the budget must still resolve `Ok`.
+    #[test]
+    fn startup_accepts_hard_caps_exactly_at_the_memory_budget() {
+        let resolved =
+            resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let budget = resolved.memory_budget_bytes;
+        let half = budget / 2;
+
+        let cli = Cli::try_parse_from(["ravel-server", "--cache-max-bytes", &half.to_string()])
+            .expect("flag parses");
+        let resolved = cli
+            .resolve_performance(reference_host())
+            .expect("hard caps of exactly the budget must not be refused");
+        assert_eq!(resolved.memory_hard_caps_bytes, resolved.memory_budget_bytes);
+    }
+
+    /// The four ADR-1170 decision 3/4 emit lines -- `memory_budget_bytes`,
+    /// `memory_overhead_reserve_bytes`, `memory_hard_caps_bytes`, and
+    /// `memory_remainder_bytes` -- must each appear on the existing
+    /// "performance default resolved" pattern exactly once per `emit()` call,
+    /// carrying the exact value the derivation computed.
+    ///
+    /// Prove-the-test: duplicate the `memory_budget_bytes` `tracing::info!`
+    /// call in `emit()` (call it a second time) and
+    /// `occurrences("setting=\"memory_budget_bytes\"")` reads 2, not 1.
+    #[test]
+    fn emit_logs_each_new_memory_figure_exactly_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        let captured: std::sync::Arc<parking_lot::Mutex<Vec<String>>> = Default::default();
+        let subscriber = tracing_subscriber::registry().with(InfoEventCapture(captured.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        resolved.emit(reference_host());
+
+        let lines = captured.lock();
+        let joined = lines.join("\n");
+
+        for (setting, value) in [
+            ("memory_budget_bytes", "30064771072"),
+            ("memory_overhead_reserve_bytes", "2147483648"),
+            ("memory_hard_caps_bytes", "9019431321"),
+            ("memory_remainder_bytes", "21045339751"),
+        ] {
+            let needle = format!("setting=\"{setting}\"");
+            let occurrences = joined.matches(&needle).count();
+            assert_eq!(
+                occurrences, 1,
+                "setting={setting} must appear exactly once, found {occurrences}"
+            );
+            let with_value = format!("value={value}");
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(&needle) && l.contains(&with_value)),
+                "setting={setting} must carry {with_value}, lines: {lines:?}"
+            );
+        }
     }
 
     /// `--gc-max-query-duration` reachability under the derived default: unset,
