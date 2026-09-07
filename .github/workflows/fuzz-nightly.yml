@@ -106,6 +106,26 @@ jobs:
       # opened to learn which. The five ravel-segment targets share one
       # detached fuzz workspace; decode_rspan has its own. Each run reuses the
       # checked-in seed corpus under fuzz/corpus/<target>/.
+      #
+      # -timeout=25 bounds a SINGLE input, which -max_total_time does not:
+      # without it libFuzzer's per-input default is 1200s, so one hanging
+      # input pins its target open until the job's own timeout-minutes kills
+      # the whole job, and a job killed by its timeout runs no later step, so
+      # the remaining targets never fuzz and the failure-routing step never
+      # files an issue. A hang is exactly what a fuzzer exists to find, so
+      # that silence is the worst failure mode. 25s is well under each
+      # target's 60s -max_total_time (a per-input timeout at or above 60
+      # could never fire before the target finished, making it decorative)
+      # and orders of magnitude above the sub-millisecond steady-state and
+      # cold first-execution decode times these RSEG/RSPAN decoders show
+      # locally, so a legitimately slow input on a loaded shared runner does
+      # not trip it and file a false decode-bug issue. rss_limit_mb is left
+      # at libFuzzer's 2048MB default on purpose: unlike the per-input
+      # timeout default, that default already fires well inside the runner's
+      # memory and reports an unbounded-allocation OOM as a crash, so it is
+      # already protective; raising it would let the kernel OOM killer end
+      # the process silently, and lowering it without evidence would file
+      # false OOM reports.
       - name: Fuzz all targets
         run: |
           failed=""
@@ -114,7 +134,7 @@ jobs:
             target="$2"
             echo "::group::fuzz $target"
             code=0
-            ( cd "$dir" && cargo +nightly fuzz run "$target" -- -max_total_time=60 ) || code=$?
+            ( cd "$dir" && cargo +nightly fuzz run "$target" -- -max_total_time=60 -timeout=25 ) || code=$?
             echo "::endgroup::"
             if [ "$code" -ne 0 ]; then
               echo "::error::fuzz target $target failed (exit $code)"
