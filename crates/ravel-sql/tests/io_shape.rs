@@ -15,7 +15,8 @@ use ravel_query::io_shape::PlanClass;
 use ravel_query::{EngineConfig, LogSegmentFetcher};
 use ravel_sql::SqlConfig;
 use util::{
-    Fixture, SegSpec, SeriesSpec, build_read_cache, publish_logs_segments, request, tenant_id,
+    Fixture, SegSpec, SeriesSpec, build_read_cache, publish_alerts_segments, publish_logs_segments,
+    request, tenant_id,
 };
 
 fn segment(index: i64, metric: &str) -> SegSpec {
@@ -275,7 +276,11 @@ async fn uncached_logs_scan_adds_the_plan_phase_to_the_scan_phase() {
 ///
 /// Flip-line proof: with the `has_cache()` branch removed (falling through
 /// to the uncached clamp unconditionally), this assertion (`4`) fails and
-/// reads `1` instead.
+/// reads `2` instead -- not `1`: the plan-phase term survives that edit
+/// (`plan_partitions` becomes the uncached branch's `partitions = min(8, 3) =
+/// 3`, so `service_batches(3, min(3,50)=3) = ceil(3/3) = 1`), and only the
+/// scan-phase term collapses (`active = 3`, `capacity = min(1*3,50) = 3`,
+/// `service_batches = ceil(1*3/3) = 1`), for a total of `1 + 1 = 2`.
 #[tokio::test]
 async fn cached_logs_scan_is_not_clamped_by_segment_count() {
     const TARGET_PARTITIONS: usize = 8;
@@ -318,5 +323,79 @@ async fn cached_logs_scan_is_not_clamped_by_segment_count() {
         outcome.stats.io_shape.service_batches, 4,
         "cached logs: plan phase ceil(3/min(8,50))=1 plus scan phase \
          ceil(3*8/8)=3, total 4, not the old segment-clamped model's 1"
+    );
+}
+
+/// `alerts` is segment-granular, matching `Metrics`/`Spans`, with NO
+/// plan-read phase (issue #1250 review round 3 regression fix):
+/// `AlertsScanExec` (`alerts_scan.rs`) assigns segments round-robin over
+/// `min(target_partitions, segments.len())` unconditionally -- no
+/// `has_cache()` branch, no `compute_plan_counts` probe -- so it never touches
+/// the cache-dependent, plan-phase-charging shape `logs_scan.rs`'s
+/// `LogsScanExec` uses. Round 2 wrongly grouped `Alerts` (and `Audit`) under
+/// that `Logs` shape, which always overcounts for these two signals since
+/// they never run a plan phase at all.
+///
+/// This fixture publishes 10 alert segments with `sql_partition_count = 4`
+/// and `store_get_concurrency = 8` (ample, so it never binds):
+///
+/// Fixed model: `partitions = min(4, 10) = 4`, `segments_per_plan =
+/// ceil(10/4) = 3`, one wave (`distinct_plans == outer_fanout == partitions
+/// == 4`), `active = 4`, `capacity = min(1*4, 8) = 4`, `service_batches =
+/// ceil(3*4/4) = 3`. No plan-phase term.
+///
+/// Buggy (round 2) model, alerts grouped under `Logs`'s uncached shape:
+/// scan phase unchanged at `3` (the uncached branch's clamp is the same
+/// formula), but it also charges a plan phase: `plan_partitions =
+/// partitions = 4`, `plan_phase_batches = service_batches(10, min(4,8)=4) =
+/// ceil(10/4) = 3`. Buggy total: `3 (plan) + 3 (scan) = 6`.
+///
+/// Flip-line proof: with `TargetSignal::Alerts` moved back into the `Logs`
+/// arm of `io_shape_for_resolve`'s match on `target` (reverting this fix),
+/// this assertion (`3`) fails and reads `6` instead.
+///
+/// Only `alerts` gets this test, not `audit`: both `AlertsScanExec` and
+/// `AuditScanExec` share the identical unconditional round-robin
+/// segment-granular assignment (same `let n = target_partitions.max(1)
+/// .min(segments.len().max(1))` shape, no cache, no plan phase), so one
+/// exact-value regression test through the real `SqlExecutor` proves the
+/// shared arm is correct for both; a second copy over `audit` would just
+/// re-run the same arithmetic against a different table name.
+#[tokio::test]
+async fn alerts_scan_is_segment_granular_with_no_plan_phase() {
+    const TARGET_PARTITIONS: usize = 4;
+    const STORE_GET_CONCURRENCY: usize = 8;
+    const ALERT_SEGMENTS: usize = 10;
+    let tenant = tenant_id("io-shape-alerts");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_alerts_segments(store.as_ref(), &tenant, ALERT_SEGMENTS).await;
+
+    let config = SqlConfig {
+        engine: EngineConfig {
+            sql_partition_count: Some(TARGET_PARTITIONS),
+            store_get_concurrency: Some(STORE_GET_CONCURRENCY),
+            ..EngineConfig::default()
+        },
+        ..SqlConfig::default()
+    };
+    let fixture = Fixture::build(Arc::clone(&store), &[], config, 1 << 30).await;
+
+    let outcome = fixture
+        .executor
+        .execute(
+            tenant.hash(),
+            &request("SELECT ts_ns, alert_id FROM alerts"),
+        )
+        .await
+        .expect("alerts query");
+
+    assert_eq!(
+        outcome.stats.segments, ALERT_SEGMENTS,
+        "sanity: all 10 resolve"
+    );
+    assert_eq!(
+        outcome.stats.io_shape.service_batches, 3,
+        "alerts is segment-granular with no plan phase: ceil(10/4) = 3, not \
+         the buggy Logs-shaped model's 3 (plan) + 3 (scan) = 6"
     );
 }

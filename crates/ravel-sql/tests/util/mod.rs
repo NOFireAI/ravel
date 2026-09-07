@@ -205,20 +205,25 @@ pub async fn publish_segment(
     (token, data_key)
 }
 
-/// Publish `count` real RLOG objects, each its own `Signal::Logs` commit
-/// record, so a `logs`/`alerts`/`audit`-target query resolves `count`
+/// Publish `count` real RLOG objects, each its own commit record under
+/// `signal`, so a `logs`/`alerts`/`audit`-target query resolves `count`
 /// distinct segments (mirrors tests/query_accounting.rs's `publish_logs`,
 /// parameterized by segment index so each one gets a distinct writer_seq,
-/// content_hash, and ts window instead of a single fixed segment).
-pub async fn publish_logs_segments(
+/// content_hash, and ts window instead of a single fixed segment). Shared by
+/// [`publish_logs_segments`] and [`publish_alerts_segments`]: alerts ride RLOG
+/// v1 verbatim (ADR-0040 decision 2) and resolve through the same shard-0
+/// commit-record shape as logs, only the `signal` tag differs.
+async fn publish_rlog_segments(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
     count: usize,
+    signal: Signal,
+    resource_name: &str,
 ) {
     const RECORDS_PER_SEGMENT: usize = 4;
     let resource = vec![(
         "service.name".to_string(),
-        AttrValue::Str("io-shape-logs".to_string()),
+        AttrValue::Str(resource_name.to_string()),
     )];
     let stream_id = logstream::log_stream_id(&resource, "scope", "1.0", &[]);
     let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
@@ -246,7 +251,7 @@ pub async fn publish_logs_segments(
                     observed_ts_ns: ts_ns,
                     severity_num: 9,
                     severity_text: "INFO".to_string(),
-                    body: format!("io-shape logs segment {seg} record {i}"),
+                    body: format!("io-shape {resource_name} segment {seg} record {i}"),
                     trace_id: None,
                     span_id: None,
                     flags: 0,
@@ -260,7 +265,7 @@ pub async fn publish_logs_segments(
         content_hash[0] = 100 + seg as u8;
         let new_record = NewCommitRecord {
             tenant_hash: tenant.hash(),
-            signal: Signal::Logs,
+            signal,
             shard: 0,
             writer_id,
             writer_epoch: 1,
@@ -277,16 +282,37 @@ pub async fn publish_logs_segments(
             created_unix_ns: 10 + seg as i64,
             ingest_hour_bucket: 0,
         };
-        let rec = record::build(new_record).expect("valid logs commit record");
-        let data_key = keys::reconstruct_data_key(&rec).expect("logs data key");
+        let rec = record::build(new_record).expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
         store
             .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
             .await
             .expect("put rlog object");
         publish::publish(store, &rec, &RetryPolicy::default())
             .await
-            .expect("publish logs commit record");
+            .expect("publish commit record");
     }
+}
+
+/// [`publish_rlog_segments`] under `Signal::Logs`.
+pub async fn publish_logs_segments(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    count: usize,
+) {
+    publish_rlog_segments(store, tenant, count, Signal::Logs, "io-shape-logs").await
+}
+
+/// [`publish_rlog_segments`] under `Signal::Alerts`, shard 0 -- the same shard
+/// `AlertsTableProvider`'s own acceptance fixture (tests/alerts_provider.rs)
+/// uses; unlike `Signal::Audit`, alerts carries no dedicated query shard
+/// (`QUERY_AUDIT_SHARD`) to route through.
+pub async fn publish_alerts_segments(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    count: usize,
+) {
+    publish_rlog_segments(store, tenant, count, Signal::Alerts, "io-shape-alerts").await
 }
 
 /// Build ADR-0046's RAM read cache (mirrors
