@@ -1595,6 +1595,26 @@ jobs:
             --otlp-header 'Authorization="Bearer demo-token"' \
             --metric-type Gauge \
             --metrics 500
+      # telemetrygen also injects deterministic LOG records so the README's
+      # PromQL-over-logs block (`sum by (job) (count_over_time(ravel_log_lines
+      # [5m]))`, README.md:185) has a log source to match. The collector's own
+      # internal-logs export is not a CI-usable source: its record count and
+      # timing depend on log level, so the assertion would flake. The resource
+      # `service.name` becomes the `job` label the query groups by
+      # (crates/ravel-query/src/log_series.rs). Mirrors the metrics step:
+      # --network host, OTLP/HTTP to the loopback port, demo bearer token.
+      - name: Generate deterministic logs with telemetrygen
+        if: steps.filter.outputs.run == 'true'
+        run: |
+          docker run --rm --network host \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            logs \
+            --otlp-http \
+            --otlp-endpoint 127.0.0.1:4318 \
+            --otlp-insecure \
+            --otlp-header 'Authorization="Bearer demo-token"' \
+            --otlp-attributes 'service.name="quickstart-logs"' \
+            --logs 500
       # Assert the collector is actually delivering, from its own counters
       # (#209). telemetrygen supplies the series the README assertions query, so
       # without this step a total collector failure is invisible to this job:
