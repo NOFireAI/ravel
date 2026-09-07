@@ -524,10 +524,18 @@ a suite that empirically probes a live backend rather than reading its
 declared flags. `run_conformance_suite(store, scratch_prefix)` runs, under a
 throwaway key prefix:
 
-- `ConditionalWriteCreateIfAbsent`: two concurrent `CreateIfAbsent` puts to
-  the same key: exactly one must win and the loser must observe
-  `AlreadyExists` (the losing-writer outcome the "Semantics adapters MUST
-  honor" section above requires).
+- `ConditionalWriteCreateIfAbsent`: a `CreateIfAbsent` put on a key an
+  earlier `CreateIfAbsent` put already created must fail `AlreadyExists` and
+  must not apply its bytes (the losing-writer outcome the "Semantics adapters
+  MUST honor" section above requires). This is the sequential case: the
+  loser starts after the winner finished.
+- `ConcurrentCreateIfAbsentSingleWinner`: the same conditional create with
+  eight writers racing one absent key, every request in flight at once.
+  Exactly one must return `Ok`, exactly seven must observe `AlreadyExists`,
+  and the surviving object must hold the winner's bytes. The sequential
+  probe above cannot falsify a backend that checks and applies the
+  precondition non-atomically, because it never gives it a window to lose
+  in; this one does.
 - `ConditionalWriteCasVersion`: a `CasVersion` put against a stale version
   must fail `PreconditionFailed`, not silently overwrite.
 - `ConsistentReadAfterWrite`: a `get` immediately following a `put` returns
@@ -536,17 +544,55 @@ throwaway key prefix:
 - `ConsistentListAfterWrite`: a `list` immediately following a `put`
   includes the new key, repeated the same way, to catch eventual-consistency
   listing rather than trusting the `consistent_list` flag.
+- `LexicographicListingOrder`: five keys written in non-sorted order must
+  come back in lexicographic key order, and `list_after` must resume
+  strictly after its marker in that same order, delivering exactly the keys
+  above it. A continuation token only names a position when the order is the
+  lexicographic one, which is what `S3Store::list` pagination and every
+  catalog scan built on it assume.
+- `CrossPageListing`: five keys written before the first page request must
+  all be delivered, as exactly five distinct keys across however many pages
+  the backend serves, with none lost between pages. Repeat deliveries are
+  allowed (the cross-page guarantee above permits them); losses are not.
+- `DeleteVisibility`: after a successful delete, a `get` of the key returns
+  `NotFound` and a listing of its prefix omits it while still holding the
+  sibling key that was not deleted; a second delete of the now-absent key
+  succeeds and changes nothing. Retention sweep, GC, and ADR-0064 erasure
+  all read a delete's acknowledgement as the object being gone.
 
 Each probe returns a `ProbeResult` naming which `Property` it checked, so a
 failure reads "this backend cannot do conditional writes" or "this backend's
 listing is eventually consistent" instead of a bare pass/fail, so an operator
 does not have to guess which mandatory capability the backend actually
-lacks.
+lacks. The last four probes above are the empirical counterparts of the
+common TLA model's `CreateIfAbsentWinnerUnique`,
+`ListingConsumersConsistent`, `ListReturn`/`ListEventuallyComplete`, and
+`DeleteIdempotent` (`formal/tla/common/traceability.md`).
+
+Because the delete probe deletes, the credential running `ravel-cli store
+qualify` needs delete permission on the scratch prefix
+`sys/qualify/<run-id>/**`, and only there. ADR-0055 §1's Admin row does not
+grant it yet ("Admin never deletes"), so a deployment that follows that
+table literally will see the delete probe fail with `AccessDenied` until the
+grant is added; that amendment is tracked separately and is not a defect in
+the backend under test.
 
 ADR-0050 section 6 also names cross-page listing consistency and
-multipart-complete visibility as probes for this suite; neither is
-implemented yet. `CONFORMANCE_SUITE_VERSION` exists precisely so a later
-addition can be told apart from the four probes qualifying a bucket today.
+multipart-complete visibility as probes for this suite. Cross-page listing
+is the `CrossPageListing` probe above; multipart-complete visibility is
+still not implemented.
+
+`CONFORMANCE_SUITE_VERSION` is deliberately still `1` even though the probe
+set grew from four properties to eight. Raising it would make every
+already-qualified bucket refuse to start, because `ravel-cli store qualify`
+treats an existing `sys/qualification` record as success (it prints "not
+overwritten" and exits zero) and so cannot re-record one under the new
+version, while ravel-server refuses startup on a record below the binary's
+floor. Fixing that writer is a prerequisite of the bump, not part of it. The
+practical consequence until then: a bucket qualified before these probes
+existed keeps a passing record that only four properties were checked
+against, and only a fresh bucket (or a manually removed record) is
+qualified against all eight.
 
 This is a runtime, once-per-bucket check, not a replacement for the
 compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`

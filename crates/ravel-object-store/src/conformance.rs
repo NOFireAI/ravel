@@ -2,13 +2,16 @@
 //! finding S5-20, docs/object-store-contract.md "Semantics adapters MUST
 //! honor").
 //!
-//! Ravel's commit protocol and catalog assume two properties of the backing
-//! store that nothing previously checked at runtime: conditional writes
+//! Ravel's commit protocol and catalog assume properties of the backing store
+//! that nothing previously checked at runtime: conditional writes
 //! (`CreateIfAbsent` and `CasVersion` reject a losing writer without
-//! applying it) and strong consistency (a `get`/`list` issued right after a
-//! `put` always observes it). A backend can report `Capabilities{ .. }`
-//! honestly or dishonestly; either way, [`run_conformance_suite`] exercises
-//! the real behavior instead of trusting the self-report.
+//! applying it, including when the losing writer is concurrent rather than
+//! later), strong consistency (a `get`/`list` issued right after a `put`
+//! always observes it), listing shape (lexicographic key order, `start_after`
+//! resumption, and no key lost across pages), and delete visibility. A backend
+//! can report `Capabilities{ .. }` honestly or dishonestly; either way,
+//! [`run_conformance_suite`] exercises the real behavior instead of trusting
+//! the self-report.
 //!
 //! The suite can only falsify these properties, never prove them: a pass
 //! means the backend did not fail any probe run against it here and now, not
@@ -76,6 +79,28 @@ pub enum Property {
     /// A `list`/`list_all` of a key's prefix immediately after the `put`
     /// that created it must include that key, every time.
     ConsistentListAfterWrite,
+    /// `PutMode::CreateIfAbsent` under contention: when several writers create
+    /// the same absent key concurrently, exactly one must succeed, every other
+    /// must observe `AlreadyExists`, and the surviving bytes must be the
+    /// winner's. Empirical counterpart of the common TLA model's
+    /// `CreateIfAbsentWinnerUnique` (formal/tla/common/traceability.md).
+    ConcurrentCreateIfAbsentSingleWinner,
+    /// `list` returns keys in lexicographic order, and `list_after` resumes
+    /// strictly after its `start_after` marker in that same order
+    /// (docs/object-store-contract.md: "Semantics adapters MUST honor").
+    /// Empirical counterpart of `ListingConsumersConsistent`: a consumer that
+    /// deduplicates by key can only agree with the delivered support if the
+    /// delivery order is the ordering `S3Store::list` pagination assumes.
+    LexicographicListingOrder,
+    /// A paginated listing delivers every key present before the first page
+    /// request, across as many pages as the backend chooses, losing none.
+    /// Empirical counterpart of `ListReturn`/`ListEventuallyComplete`, and the
+    /// cross-page listing consistency probe ADR-0050 section 6 names.
+    CrossPageListing,
+    /// After a delete, the key is gone from both access paths: a `get` returns
+    /// `NotFound` and a listing of its prefix omits it, and deleting it again
+    /// changes nothing. Empirical counterpart of `DeleteIdempotent`.
+    DeleteVisibility,
 }
 
 impl Property {
@@ -88,6 +113,12 @@ impl Property {
             Property::ConditionalWriteCasVersion => "conditional_write_cas_version",
             Property::ConsistentReadAfterWrite => "consistent_read_after_write",
             Property::ConsistentListAfterWrite => "consistent_list_after_write",
+            Property::ConcurrentCreateIfAbsentSingleWinner => {
+                "concurrent_create_if_absent_single_winner"
+            }
+            Property::LexicographicListingOrder => "lexicographic_listing_order",
+            Property::CrossPageListing => "cross_page_listing",
+            Property::DeleteVisibility => "delete_visibility",
         }
     }
 }
@@ -523,6 +554,12 @@ pub async fn run_conformance_suite(
         probe_conditional_write_cas_version(store, &prefix).await,
         probe_consistent_read_after_write(store, &prefix).await,
         probe_consistent_list_after_write(store, &prefix).await,
+        // Appended, not interleaved with the four probes above, so a report's
+        // result order stays stable for anything that already reads it.
+        probe_concurrent_create_if_absent(store, &prefix).await,
+        probe_lexicographic_listing_order(store, &prefix).await,
+        probe_cross_page_listing(store, &prefix).await,
+        probe_delete_visibility(store, &prefix).await,
     ];
     ConformanceReport { results }
 }
@@ -748,6 +785,454 @@ async fn probe_consistent_list_after_write(
     )
 }
 
+/// How many writers race the same absent key in
+/// [`probe_concurrent_create_if_absent`]. More than the two the contract doc's
+/// worked example names: a backend that serializes two conflicting creates by
+/// luck is less likely to serialize eight.
+const CONCURRENT_CREATE_WRITERS: usize = 8;
+
+/// The single-winner probe ADR-0050 section 6 calls for: `CreateIfAbsent`
+/// under *concurrent* same-key writers, not two sequential puts.
+///
+/// The sequential probe above cannot falsify a backend whose conditional
+/// create is checked and applied non-atomically, because the second put starts
+/// long after the first one finished. Here every writer's request is in flight
+/// at once, so a read-then-write implementation has a window to lose in.
+///
+/// The requests are concurrent futures on one task, not spawned tasks: the
+/// suite holds `&dyn ObjectStoreBackend`, which cannot be moved into a
+/// `'static` task. Against a real backend that is a genuine race, since all
+/// [`CONCURRENT_CREATE_WRITERS`] requests are on the wire together and the
+/// contention that matters is at the backend. Against an in-process store
+/// whose `put` completes on its first poll it is not a race at all, which is
+/// one more reason a pass is qualification and not proof.
+async fn probe_concurrent_create_if_absent(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+) -> ProbeResult {
+    let property = Property::ConcurrentCreateIfAbsentSingleWinner;
+    let key = format!("{prefix}cas/concurrent-create");
+
+    // Distinct payloads: whichever writer wins, its bytes are identifiable, so
+    // "the survivor is the winner's object" is checkable rather than assumed.
+    let payloads: Vec<Bytes> = (0..CONCURRENT_CREATE_WRITERS)
+        .map(|i| Bytes::from(format!("writer-{i}")))
+        .collect();
+    let outcomes = futures::future::join_all(payloads.iter().enumerate().map(|(i, payload)| {
+        let key = &key;
+        async move {
+            (
+                i,
+                store
+                    .put(key, payload.clone(), PutOptions::create_if_absent())
+                    .await,
+            )
+        }
+    }))
+    .await;
+
+    let mut winners: Vec<usize> = Vec::new();
+    let mut losers = 0usize;
+    let mut unexpected: Vec<String> = Vec::new();
+    for (i, outcome) in outcomes {
+        match outcome {
+            Ok(_) => winners.push(i),
+            Err(StoreError::AlreadyExists) => losers += 1,
+            Err(other) => unexpected.push(format!("writer-{i}: {other}")),
+        }
+    }
+
+    if !unexpected.is_empty() {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "{} of {CONCURRENT_CREATE_WRITERS} concurrent CreateIfAbsent writers failed with \
+                 something other than AlreadyExists: {} \
+                 (docs/object-store-contract.md: conditional-put failure mapping)",
+                unexpected.len(),
+                unexpected.join(", ")
+            ),
+        );
+    }
+    if winners.len() != 1 {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "{} of {CONCURRENT_CREATE_WRITERS} concurrent CreateIfAbsent writers on one \
+                 absent key succeeded, expected exactly 1; this backend's conditional create is \
+                 not atomic under contention",
+                winners.len()
+            ),
+        );
+    }
+    if losers != CONCURRENT_CREATE_WRITERS - 1 {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "one writer won but {losers} lost with AlreadyExists, expected exactly {}",
+                CONCURRENT_CREATE_WRITERS - 1
+            ),
+        );
+    }
+
+    let winner = winners[0];
+    match store.get(&key, GetRange::Full).await {
+        Ok(outcome) if outcome.data == payloads[winner] => ProbeResult::pass(
+            property,
+            format!(
+                "exactly 1 of {CONCURRENT_CREATE_WRITERS} concurrent CreateIfAbsent writers won, \
+                 the other {} were rejected with AlreadyExists, and the surviving object holds \
+                 the winner's bytes",
+                CONCURRENT_CREATE_WRITERS - 1
+            ),
+        ),
+        Ok(outcome) => ProbeResult::fail(
+            property,
+            format!(
+                "writer-{winner} won the race but the surviving object holds {:?}, not that \
+                 writer's bytes; a losing writer's bytes were applied despite AlreadyExists",
+                String::from_utf8_lossy(&outcome.data)
+            ),
+        ),
+        Err(err) => ProbeResult::fail(
+            property,
+            format!("could not read back the race winner's object: {err}"),
+        ),
+    }
+}
+
+/// Upper bound on the pages any probe here will drain. The listing probes
+/// write a handful of keys, so a backend still handing out continuation tokens
+/// past this is a broken pager: reported as a probe failure, never as a
+/// qualification run that hangs.
+const MAX_PROBE_PAGES: usize = 64;
+
+/// Drain every page of `prefix` (from `start_after`, when given) and return
+/// the keys in delivery order together with the number of pages served.
+///
+/// Deliberately not [`list_all`]: that helper deduplicates and discards both
+/// the delivery order and the page count, which are exactly what the two
+/// listing probes below examine. Errors come back as a ready-to-report detail
+/// string so a misbehaving backend produces a failed [`ProbeResult`] rather
+/// than an error the suite has to interpret twice.
+async fn drain_pages(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    start_after: Option<&str>,
+) -> Result<(Vec<String>, usize), String> {
+    let mut delivered: Vec<String> = Vec::new();
+    let mut pages = 0usize;
+    let mut token = None;
+    loop {
+        let page = store
+            .list_after(prefix, start_after, token)
+            .await
+            .map_err(|err| format!("listing {prefix} failed: {err}"))?;
+        pages += 1;
+        delivered.extend(page.objects.into_iter().map(|meta| meta.key));
+        match page.next {
+            Some(next) => token = Some(next),
+            None => return Ok((delivered, pages)),
+        }
+        if pages >= MAX_PROBE_PAGES {
+            return Err(format!(
+                "listing {prefix} still returned a continuation token after {pages} pages over \
+                 far fewer keys; this backend's pagination does not terminate"
+            ));
+        }
+    }
+}
+
+/// Keys in delivery order, with the repeats the cross-page guarantee allows
+/// collapsed, keeping first-delivery order so an ordering violation survives
+/// the deduplication.
+fn distinct_in_delivery_order(delivered: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    delivered
+        .iter()
+        .filter(|key| seen.insert((*key).clone()))
+        .cloned()
+        .collect()
+}
+
+/// The first pair of adjacent deliveries that goes backwards, if any.
+fn first_order_violation(delivered: &[String]) -> Option<(&str, &str)> {
+    delivered
+        .windows(2)
+        .find(|pair| pair[1] < pair[0])
+        .map(|pair| (pair[0].as_str(), pair[1].as_str()))
+}
+
+/// Written in this order, so a backend that simply echoes insertion order
+/// fails the probe instead of passing it by accident.
+const ORDER_PROBE_SUFFIXES: [&str; 5] = ["d", "a", "e", "c", "b"];
+
+/// Lexicographic listing order and `start_after` resumption.
+///
+/// `S3Store::list` pagination and every catalog scan built on it assume both:
+/// a continuation token means "resume after this key", which is only a
+/// position if the order is total and lexicographic, and `list_after` is how
+/// callers skip a key sub-range server-side. Nothing probed either, so a
+/// backend that returned keys in insertion or hash order could qualify.
+async fn probe_lexicographic_listing_order(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+) -> ProbeResult {
+    let property = Property::LexicographicListingOrder;
+    let list_prefix = format!("{prefix}order/");
+
+    for suffix in ORDER_PROBE_SUFFIXES {
+        let key = format!("{list_prefix}{suffix}");
+        if let Err(err) = store
+            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+        {
+            return ProbeResult::fail(property, format!("put {key} failed: {err}"));
+        }
+    }
+    let mut expected: Vec<String> = ORDER_PROBE_SUFFIXES
+        .iter()
+        .map(|suffix| format!("{list_prefix}{suffix}"))
+        .collect();
+    expected.sort();
+
+    let (delivered, _pages) = match drain_pages(store, &list_prefix, None).await {
+        Ok(result) => result,
+        Err(detail) => return ProbeResult::fail(property, detail),
+    };
+    if let Some((before, after)) = first_order_violation(&delivered) {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "listing {list_prefix} delivered {after} after {before}, which sorts before it; \
+                 this backend's listing is not in lexicographic key order, so a continuation \
+                 token does not name a position in the key space"
+            ),
+        );
+    }
+    let distinct = distinct_in_delivery_order(&delivered);
+    if distinct != expected {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "listing {list_prefix} returned {} distinct keys, expected exactly {}: got \
+                 {distinct:?}, expected {expected:?}",
+                distinct.len(),
+                expected.len()
+            ),
+        );
+    }
+
+    // start_after: resume strictly after the second key, which must yield
+    // exactly the last three, still in order.
+    let marker = expected[1].clone();
+    let expected_tail: Vec<String> = expected[2..].to_vec();
+    let (tail_delivered, _pages) = match drain_pages(store, &list_prefix, Some(&marker)).await {
+        Ok(result) => result,
+        Err(detail) => return ProbeResult::fail(property, detail),
+    };
+    if let Some(key) = tail_delivered.iter().find(|key| *key <= &marker) {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "list_after({list_prefix}, start_after={marker}) returned {key}, which does not \
+                 compare strictly greater than the marker (docs/object-store-contract.md: \
+                 start_after is exclusive)"
+            ),
+        );
+    }
+    if let Some((before, after)) = first_order_violation(&tail_delivered) {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "list_after({list_prefix}, start_after={marker}) delivered {after} after \
+                 {before}, which sorts before it"
+            ),
+        );
+    }
+    let distinct_tail = distinct_in_delivery_order(&tail_delivered);
+    if distinct_tail != expected_tail {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "list_after({list_prefix}, start_after={marker}) returned {} distinct keys, \
+                 expected exactly {}: got {distinct_tail:?}, expected {expected_tail:?}",
+                distinct_tail.len(),
+                expected_tail.len()
+            ),
+        );
+    }
+
+    ProbeResult::pass(
+        property,
+        format!(
+            "{} keys written out of order were listed in lexicographic order, and \
+             start_after={marker} resumed at {} with exactly {} keys",
+            expected.len(),
+            expected_tail[0],
+            expected_tail.len()
+        ),
+    )
+}
+
+/// How many keys [`probe_cross_page_listing`] writes. Small enough to be cheap
+/// on a real bucket, and an odd number so a page size that divides it evenly
+/// is not the only shape exercised.
+const PAGE_PROBE_KEYS: usize = 5;
+
+/// Cross-page listing consistency, the probe ADR-0050 section 6 names and the
+/// suite did not have: every key written before the first page request is
+/// delivered, across however many pages the backend serves, with none lost.
+///
+/// A key lost between pages is invisible to a caller and to
+/// [`probe_consistent_list_after_write`], which only ever looks for one key at
+/// a time under a prefix small enough to fit one page.
+async fn probe_cross_page_listing(store: &dyn ObjectStoreBackend, prefix: &str) -> ProbeResult {
+    let property = Property::CrossPageListing;
+    let list_prefix = format!("{prefix}pages/");
+
+    let mut expected: Vec<String> = Vec::with_capacity(PAGE_PROBE_KEYS);
+    for i in 0..PAGE_PROBE_KEYS {
+        let key = format!("{list_prefix}k{i}");
+        if let Err(err) = store
+            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+        {
+            return ProbeResult::fail(property, format!("put {key} failed: {err}"));
+        }
+        expected.push(key);
+    }
+    expected.sort();
+
+    let (delivered, pages) = match drain_pages(store, &list_prefix, None).await {
+        Ok(result) => result,
+        Err(detail) => return ProbeResult::fail(property, detail),
+    };
+    let mut distinct = distinct_in_delivery_order(&delivered);
+    distinct.sort();
+    if distinct != expected {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "a paginated listing of {list_prefix} returned {} distinct keys across {pages} \
+                 pages, expected exactly {PAGE_PROBE_KEYS}: got {distinct:?}, expected \
+                 {expected:?}; a key was lost or invented across pages",
+                distinct.len()
+            ),
+        );
+    }
+
+    ProbeResult::pass(
+        property,
+        format!(
+            "{PAGE_PROBE_KEYS} distinct keys across {pages} pages, none lost \
+             ({} deliveries; the cross-page guarantee allows repeats)",
+            delivered.len()
+        ),
+    )
+}
+
+/// Delete visibility: after a delete the key is gone from both access paths a
+/// caller has, and deleting it again changes nothing.
+///
+/// Nothing probed delete at all, so a backend that acknowledged a delete
+/// without performing it, or performed it lazily, could qualify. Ravel's
+/// retention sweep, GC, and ADR-0064 erasure all read a delete's
+/// acknowledgement as the object being gone.
+async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -> ProbeResult {
+    let property = Property::DeleteVisibility;
+    let list_prefix = format!("{prefix}delete/");
+    // Two keys, one deleted: the listing check then pins an exact survivor set,
+    // so a backend that deletes the whole prefix fails as loudly as one that
+    // deletes nothing.
+    let kept = format!("{list_prefix}kept");
+    let gone = format!("{list_prefix}gone");
+
+    for key in [&kept, &gone] {
+        if let Err(err) = store
+            .put(key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+        {
+            return ProbeResult::fail(property, format!("put {key} failed: {err}"));
+        }
+    }
+    if let Err(err) = store.delete(&gone).await {
+        return ProbeResult::fail(property, format!("delete of {gone} failed: {err}"));
+    }
+
+    match store.get(&gone, GetRange::Full).await {
+        Err(StoreError::NotFound) => {}
+        Ok(outcome) => {
+            return ProbeResult::fail(
+                property,
+                format!(
+                    "a get of {gone} after a successful delete still returned {} bytes; this \
+                     backend acknowledges deletes it has not applied",
+                    outcome.data.len()
+                ),
+            );
+        }
+        Err(other) => {
+            return ProbeResult::fail(
+                property,
+                format!(
+                    "a get of {gone} after a successful delete failed with {other} instead of NotFound"
+                ),
+            );
+        }
+    }
+
+    let expected = vec![kept.clone()];
+    let (delivered, _pages) = match drain_pages(store, &list_prefix, None).await {
+        Ok(result) => result,
+        Err(detail) => return ProbeResult::fail(property, detail),
+    };
+    let distinct = distinct_in_delivery_order(&delivered);
+    if distinct != expected {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "listing {list_prefix} after deleting {gone} returned {} keys, expected exactly \
+                 1 ({kept}): got {distinct:?}",
+                distinct.len()
+            ),
+        );
+    }
+
+    // Idempotence: a second delete of an absent key succeeds and changes no
+    // observable state.
+    if let Err(err) = store.delete(&gone).await {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "a second delete of the already-deleted {gone} failed with {err}; delete of an absent key must succeed"
+            ),
+        );
+    }
+    let (delivered, _pages) = match drain_pages(store, &list_prefix, None).await {
+        Ok(result) => result,
+        Err(detail) => return ProbeResult::fail(property, detail),
+    };
+    let distinct = distinct_in_delivery_order(&delivered);
+    if distinct != expected {
+        return ProbeResult::fail(
+            property,
+            format!(
+                "a second delete of the absent {gone} changed the listing of {list_prefix} to \
+                 {distinct:?}, expected it to still hold exactly 1 key ({kept})"
+            ),
+        );
+    }
+
+    ProbeResult::pass(
+        property,
+        format!(
+            "after deleting {gone}, a get returned NotFound and the listing held exactly 1 key \
+             ({kept}); a second delete of the absent key succeeded and changed nothing"
+        ),
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -759,6 +1244,11 @@ mod tests {
     use crate::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
     use crate::memory::MemoryStore;
     use crate::{Capabilities, DelimitedList, GetOutcome, ListPage, ObjectMeta, PageToken};
+
+    /// Every property [`run_conformance_suite`] gates on. Pinned here so a new
+    /// probe has to be acknowledged in the tests that assert the suite's shape
+    /// rather than silently widening them.
+    const GATING_PROPERTIES: usize = 8;
 
     /// The `sys/qualification` JSON shape is a frozen contract (ADR-0050
     /// section 6): a record written before this struct was relocated out of
@@ -870,7 +1360,7 @@ mod tests {
         assert_eq!(via_backend.status, ObjectLockStatus::Unknown);
 
         // (c) Whatever the probe reports, qualification pass/fail is unchanged:
-        // the conforming oracle passes, and the suite carries exactly the four
+        // the conforming oracle passes, and the suite carries exactly its
         // gating properties -- the probe is none of them.
         let report = run_conformance_suite(&store, "sys/qualify/object-lock/").await;
         assert!(
@@ -879,7 +1369,7 @@ mod tests {
         );
         assert_eq!(
             report.results.len(),
-            4,
+            GATING_PROPERTIES,
             "the Object Lock probe adds no gating property to the conformance suite"
         );
     }
@@ -893,7 +1383,7 @@ mod tests {
             "expected every property to pass on the oracle, got failures: {:?}",
             report.failures().collect::<Vec<_>>()
         );
-        assert_eq!(report.results.len(), 4);
+        assert_eq!(report.results.len(), GATING_PROPERTIES);
     }
 
     /// Wraps `MemoryStore` and simulates eventually consistent listing: the
@@ -969,8 +1459,15 @@ mod tests {
         let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
         assert_eq!(
             failed,
-            vec![Property::ConsistentListAfterWrite],
-            "only listing should be named; conditional writes and read-after-write are untouched"
+            vec![
+                Property::ConsistentListAfterWrite,
+                Property::LexicographicListingOrder,
+                Property::CrossPageListing,
+                Property::DeleteVisibility,
+            ],
+            "every listing-dependent property should be named (the delete probe confirms the \
+             deletion through a listing too); conditional writes and read-after-write are \
+             untouched"
         );
         let failure = report
             .results
@@ -1057,9 +1554,378 @@ mod tests {
         let failed: HashSet<&'static str> = report.failures().map(|r| r.property.name()).collect();
         assert!(failed.contains(Property::ConditionalWriteCreateIfAbsent.name()));
         assert!(failed.contains(Property::ConditionalWriteCasVersion.name()));
-        // Listing and read-after-write are untouched by this backend.
+        // The concurrent race is the same missing precondition seen under
+        // contention: all eight writers win instead of one.
+        assert!(failed.contains(Property::ConcurrentCreateIfAbsentSingleWinner.name()));
+        assert_eq!(failed.len(), 3, "unexpected extra failures: {failed:?}");
+        // Listing, read-after-write, and delete are untouched by this backend.
         assert!(!failed.contains(Property::ConsistentListAfterWrite.name()));
         assert!(!failed.contains(Property::ConsistentReadAfterWrite.name()));
+        assert!(!failed.contains(Property::LexicographicListingOrder.name()));
+        assert!(!failed.contains(Property::CrossPageListing.name()));
+        assert!(!failed.contains(Property::DeleteVisibility.name()));
+
+        let race = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::ConcurrentCreateIfAbsentSingleWinner)
+            .expect("the concurrent create probe ran");
+        assert!(
+            race.detail
+                .contains("8 of 8 concurrent CreateIfAbsent writers on one absent key succeeded"),
+            "the failure must name the exact winner count: {}",
+            race.detail
+        );
+    }
+
+    /// Wraps `MemoryStore` and reverses the key order of every listing page it
+    /// serves, leaving the page tokens, the delivered key set, and every other
+    /// operation exactly as the oracle produced them. Models a backend whose
+    /// listing is complete but not lexicographically ordered.
+    ///
+    /// Violated invariant: `ListingConsumersConsistent`
+    /// (formal/tla/common/traceability.md row for `ListReturn`). A
+    /// continuation token names "resume after this key", which is only a
+    /// position when the delivery order is the lexicographic key order; under
+    /// a reversed order a paging consumer's deduplicated view no longer tracks
+    /// the delivered support, which is what `S3Store::list` pagination and
+    /// every catalog scan built on it assume.
+    struct UnsortedListStore {
+        inner: MemoryStore,
+    }
+
+    impl UnsortedListStore {
+        fn new() -> Self {
+            UnsortedListStore {
+                inner: MemoryStore::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for UnsortedListStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let mut page_result = self.inner.list(prefix, page).await?;
+            page_result.objects.reverse();
+            Ok(page_result)
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let mut page_result = self.inner.list_after(prefix, start_after, page).await?;
+            page_result.objects.reverse();
+            Ok(page_result)
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A backend whose listing is complete but unordered fails qualification,
+    /// and fails it on exactly the ordering property: the delivered key set is
+    /// untouched, so nothing that only checks membership can catch this.
+    #[tokio::test]
+    async fn unsorted_listing_backend_fails_qualification() {
+        let store = UnsortedListStore::new();
+        let report = run_conformance_suite(&store, "sys/qualify/unsorted/").await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(
+            failed,
+            vec![Property::LexicographicListingOrder],
+            "only the ordering property should be named: this backend loses no key, so the \
+             membership-based probes are untouched"
+        );
+        let failure = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::LexicographicListingOrder)
+            .expect("the ordering probe ran");
+        assert!(
+            failure.detail.contains("not in lexicographic key order"),
+            "the failure must say what is wrong: {}",
+            failure.detail
+        );
+    }
+
+    /// Wraps `MemoryStore` and acknowledges every delete without applying it.
+    /// Models a backend that returns 204 for a delete it never performed (or
+    /// performs lazily), which every other probe is blind to.
+    ///
+    /// Violated invariant: `DeleteIdempotent`
+    /// (formal/tla/common/traceability.md `Delete / DeleteIdempotent`), whose
+    /// post-state requires the key to be absent after a delete.
+    struct LyingDeleteStore {
+        inner: MemoryStore,
+    }
+
+    impl LyingDeleteStore {
+        fn new() -> Self {
+            LyingDeleteStore {
+                inner: MemoryStore::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for LyingDeleteStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A backend that acknowledges a delete it never applied fails
+    /// qualification on exactly the delete-visibility property.
+    #[tokio::test]
+    async fn lying_delete_visibility_backend_fails_qualification() {
+        let store = LyingDeleteStore::new();
+        let report = run_conformance_suite(&store, "sys/qualify/lying-delete/").await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(
+            failed,
+            vec![Property::DeleteVisibility],
+            "only delete visibility should be named; writes, reads, and listing are untouched"
+        );
+        let failure = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::DeleteVisibility)
+            .expect("the delete probe ran");
+        assert!(
+            failure
+                .detail
+                .contains("acknowledges deletes it has not applied"),
+            "the failure must say what is wrong: {}",
+            failure.detail
+        );
+    }
+
+    /// The concurrent single-winner race (`CreateIfAbsentWinnerUnique`) with
+    /// its exact counts, both directly against the oracle and through the
+    /// probe: of eight writers creating one absent key with all eight requests
+    /// in flight, exactly one gets `Ok`, exactly seven get `AlreadyExists`, and
+    /// the surviving object holds the winner's bytes.
+    #[tokio::test]
+    async fn concurrent_create_if_absent_has_exactly_one_winner() {
+        // (a) The oracle, raced directly, so the counts are pinned
+        // independently of how the probe reports them.
+        let store = MemoryStore::new();
+        let key = "race/k";
+        let payloads: Vec<Bytes> = (0..CONCURRENT_CREATE_WRITERS)
+            .map(|i| Bytes::from(format!("writer-{i}")))
+            .collect();
+        let outcomes = futures::future::join_all(
+            payloads
+                .iter()
+                .map(|payload| store.put(key, payload.clone(), PutOptions::create_if_absent())),
+        )
+        .await;
+        let winners: Vec<usize> = outcomes
+            .iter()
+            .enumerate()
+            .filter(|(_, outcome)| outcome.is_ok())
+            .map(|(i, _)| i)
+            .collect();
+        let losers = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Err(StoreError::AlreadyExists)))
+            .count();
+        assert_eq!(
+            winners.len(),
+            1,
+            "expected exactly one winner: {outcomes:?}"
+        );
+        assert_eq!(
+            losers,
+            CONCURRENT_CREATE_WRITERS - 1,
+            "expected exactly {} AlreadyExists: {outcomes:?}",
+            CONCURRENT_CREATE_WRITERS - 1
+        );
+        let survivor = store
+            .get(key, GetRange::Full)
+            .await
+            .expect("the winner's object is readable");
+        assert_eq!(
+            survivor.data, payloads[winners[0]],
+            "the surviving bytes must be the winner's"
+        );
+
+        // (b) The probe reaches the same verdict on the oracle, and says so
+        // with the exact counts.
+        let report = run_conformance_suite(&store, "sys/qualify/race/").await;
+        assert!(
+            report.passed(),
+            "the oracle must pass every probe, got: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let race = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::ConcurrentCreateIfAbsentSingleWinner)
+            .expect("the concurrent create probe ran");
+        assert!(
+            race.detail.contains(
+                "exactly 1 of 8 concurrent CreateIfAbsent writers won, the other 7 were rejected"
+            ),
+            "the pass detail must name the exact counts: {}",
+            race.detail
+        );
+    }
+
+    /// Cross-page listing with the pagination oracle
+    /// (`MemoryStore::with_page_size(2)`): the probe's five keys come back as
+    /// exactly five distinct keys across exactly three pages, none lost
+    /// between pages.
+    #[tokio::test]
+    async fn cross_page_listing_over_five_keys_at_page_size_two_returns_all_five() {
+        let store = MemoryStore::with_page_size(2);
+        let report = run_conformance_suite(&store, "sys/qualify/pages/").await;
+        assert!(
+            report.passed(),
+            "the oracle must pass every probe at page size 2, got: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let paging = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::CrossPageListing)
+            .expect("the cross-page probe ran");
+        assert!(
+            paging.detail.contains("5 distinct keys across 3 pages"),
+            "the pass detail must name the exact key and page counts: {}",
+            paging.detail
+        );
+
+        // The same shape, walked directly over the keys the probe left behind:
+        // three pages, five distinct keys, and the multi-page path really was
+        // exercised (a one-page listing would prove nothing about it).
+        let mut pages = 0usize;
+        let mut keys: Vec<String> = Vec::new();
+        let mut token = None;
+        loop {
+            let page = store
+                .list("sys/qualify/pages/pages/", token)
+                .await
+                .expect("listing the probe's own prefix");
+            pages += 1;
+            keys.extend(page.objects.into_iter().map(|meta| meta.key));
+            match page.next {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3, "5 keys at page size 2 is exactly 3 pages");
+        assert_eq!(keys.len(), 5);
+        assert_eq!(
+            keys.iter().collect::<HashSet<_>>().len(),
+            5,
+            "5 distinct keys: {keys:?}"
+        );
+    }
+
+    /// A delete fault must surface as a named, typed [`ProbeResult`] failure
+    /// rather than a panic, and the fault must actually have fired (repo
+    /// testing pattern: assert `FaultStore` counters).
+    #[tokio::test]
+    async fn delete_fault_surfaces_as_named_probe_failure() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Delete, ScriptedFault::Timeout)
+                .with_key_contains("delete/gone")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        let report = run_conformance_suite(&store, "sys/qualify/delete-fault/").await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(failed, vec![Property::DeleteVisibility]);
+        let failure = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::DeleteVisibility)
+            .expect("the delete probe ran");
+        assert!(
+            failure.detail.contains("timeout"),
+            "the failure must carry the backend's own error: {}",
+            failure.detail
+        );
+        assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 1);
     }
 
     /// A transient fault on the very first probe call must surface as a
@@ -1332,7 +2198,7 @@ mod tests {
         // And it never touches qualification pass/fail.
         let report = run_conformance_suite(&store, "sys/qualify/bucket-config/").await;
         assert!(report.passed());
-        assert_eq!(report.results.len(), 4);
+        assert_eq!(report.results.len(), GATING_PROPERTIES);
     }
 
     /// A versioning-aware fixture that holds noncurrent versions, standing in
