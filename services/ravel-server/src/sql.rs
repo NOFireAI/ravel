@@ -375,8 +375,35 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
         outcome.stats.blocks_pruned_by_postings,
     );
 
-    let stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
+    let mut stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
+    attach_io_shape(&mut stats, outcome.stats.io_shape);
     encode(&headers, &outcome, tenant_hash, stats)
+}
+
+/// Inserts the same `io` block a PromQL query's `stats` carries (issue
+/// #1250) beside `accounting`/`estimate`, rather than folding it into
+/// `crate::query::accounting_stats_json` itself: that helper is shared with
+/// `/api/v1/analytics`, which has no `QueryIoShape` to render.
+///
+/// These field names and renames are kept byte-identical to
+/// `ravel_query::http::json::IoShapeJson`'s `Serialize` impl by hand rather
+/// than by reusing that type directly: the `json` module it lives in is
+/// private to `ravel-query` (no `pub use` re-exports it), and this task's
+/// out-of-scope allowance covers only a second `io_shape.rs` entry point,
+/// not a second edit to export a type from a different module.
+fn attach_io_shape(stats: &mut serde_json::Value, shape: ravel_query::io_shape::QueryIoShape) {
+    if let Some(object) = stats.as_object_mut() {
+        object.insert(
+            "io".to_string(),
+            serde_json::json!({
+                "dependencyDepth": shape.dependency_depth,
+                "listPageDepth": shape.list_page_depth,
+                "serviceBatches": shape.service_batches,
+                "unfoldedSegmentsResolved": shape.unfolded_segments_resolved,
+                "planClass": shape.plan_class.name(),
+            }),
+        );
+    }
 }
 
 /// Submit the query-audit event for one request through the shared sink and
@@ -640,6 +667,57 @@ mod tests {
     }
 
     const MAX: Duration = Duration::from_secs(30);
+
+    /// Mirrors `ravel_query::http::json`'s
+    /// `stats_json_io_object_has_each_figure_present_exactly_once_in_the_wire_text`
+    /// (issue #1250): counts key occurrences in the raw serialized JSON TEXT.
+    ///
+    /// This module's `io` block is built by inserting into a
+    /// `serde_json::Value`/`Map` (`attach_io_shape`), not by a
+    /// `#[derive(Serialize)]` struct serialized straight to a string writer
+    /// like `IoShapeJson` is. A `Map` cannot hold two entries under one key by
+    /// construction, so literally duplicating a `serde_json::json!` key (the
+    /// PromQL precedent's flip-line) is absorbed at macro-expansion time and
+    /// never reaches the wire -- confirmed empirically, not asserted: doing so
+    /// here still serializes each key exactly once. The reachable failure
+    /// mode for THIS shape is a figure silently dropped from the literal,
+    /// e.g. an edit that deletes the `"unfoldedSegmentsResolved"` line from
+    /// `attach_io_shape`'s `json!` block. Flip-line proof: delete that line
+    /// and `occurrences("unfoldedSegmentsResolved")` reads 0, not 1.
+    #[test]
+    fn attach_io_shape_writes_each_figure_exactly_once_in_the_wire_text() {
+        let shape = ravel_query::io_shape::QueryIoShape {
+            dependency_depth: 2,
+            list_page_depth: 13,
+            service_batches: 4,
+            unfolded_segments_resolved: 2_500,
+            plan_class: ravel_query::io_shape::PlanClass::SelectiveIndexed,
+        };
+        let mut stats = serde_json::json!({ "accounting": {}, "estimate": {} });
+        attach_io_shape(&mut stats, shape);
+        let text = serde_json::to_string(&stats).expect("serializes");
+
+        let io_start = text
+            .find("\"io\":{")
+            .expect("io object present in wire text");
+        let io_rest = &text[io_start..];
+        let io_end = io_rest.find('}').map(|i| i + 1).expect("io object closes");
+        let io_text = &io_rest[..io_end];
+
+        for key in [
+            "\"dependencyDepth\"",
+            "\"listPageDepth\"",
+            "\"serviceBatches\"",
+            "\"unfoldedSegmentsResolved\"",
+            "\"planClass\"",
+        ] {
+            let occurrences = io_text.matches(key).count();
+            assert_eq!(
+                occurrences, 1,
+                "io.{key} must be present exactly once in the wire text, found {occurrences}"
+            );
+        }
+    }
 
     #[test]
     fn an_absent_window_defaults_to_the_last_hour_ending_now() {
