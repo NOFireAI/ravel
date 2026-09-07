@@ -69,6 +69,15 @@ pub struct ScanStats {
     /// filtering. Equal to `page_bytes_fetched` for an all-columns scan; the
     /// gap to it is the column-filtering waste (ADR-0107 decision 4).
     pub page_bytes_decoded: u64,
+    /// Bytes zstd produced decompressing this object's sections for this scan:
+    /// the directory sections opened at [`RlogReader::new`] plus every block
+    /// page the scan decoded (issue #1401). Seeded at scan construction with the
+    /// open-time directory total and grown as blocks are decoded, so a
+    /// partially-drained [`BlockScan`] reports the directories plus what it has
+    /// decoded so far. A raw/`COMP_NONE` section or page contributes nothing (it
+    /// was never decompressed); a zstd one contributes its decompressed buffer's
+    /// actual length. Decompressed, not stored or wire, bytes.
+    pub decompressed_bytes: u64,
 }
 
 /// An opened RLOG object ready to scan.
@@ -92,6 +101,12 @@ pub struct RlogReader<'a> {
     /// Absent when the object was written with no indexed fields
     /// (docs/log-segment-format.md: POSTINGS is an optional section).
     postings: Option<SectionDesc>,
+    /// Bytes zstd produced decompressing the directory sections this open
+    /// decompressed (STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR), summed at
+    /// [`Self::new`] (issue #1401). A directory stored raw contributes nothing.
+    /// Each scan seeds its [`ScanStats::decompressed_bytes`] with this so the
+    /// figure counts opening the object as well as decoding its blocks.
+    open_decompressed_bytes: u64,
 }
 
 impl<'a> RlogReader<'a> {
@@ -101,11 +116,18 @@ impl<'a> RlogReader<'a> {
     /// degrade: without it no block can be located.
     pub fn new(bytes: &'a [u8], cfg: &RlogConfig) -> Result<Self, LogSegError> {
         let footer = open(bytes)?;
-        let stream_raw = read_section(bytes, section(&footer, kind::STREAM_DIR)?, cfg)?;
+        let mut open_decompressed_bytes = 0u64;
+        let stream_desc = *section(&footer, kind::STREAM_DIR)?;
+        let stream_raw = read_section(bytes, &stream_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
         let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
-        let field_raw = read_section(bytes, section(&footer, kind::FIELD_DIR)?, cfg)?;
+        let field_desc = *section(&footer, kind::FIELD_DIR)?;
+        let field_raw = read_section(bytes, &field_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
         let field_dir = FieldDir::decode(&field_raw, MAX_FIELDS)?;
-        let skip_raw = read_section(bytes, section(&footer, kind::SKIP_IDX)?, cfg)?;
+        let skip_desc = *section(&footer, kind::SKIP_IDX)?;
+        let skip_raw = read_section(bytes, &skip_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&skip_desc, &skip_raw);
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
         let blocks = *section(&footer, kind::BLOCKS)?;
         let bloom = *section(&footer, kind::BLOOM)?;
@@ -116,10 +138,11 @@ impl<'a> RlogReader<'a> {
         // is refused rather than read under a guessed layout, which would
         // decode another block's bytes as this one's.
         let page_dir = {
-            let desc = footer
+            let desc = *footer
                 .section(kind::PAGE_DIR)
                 .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
-            let raw = read_section(bytes, desc, cfg)?;
+            let raw = read_section(bytes, &desc, cfg)?;
+            open_decompressed_bytes += section_decompressed_len(&desc, &raw);
             Arc::new(PageDir::decode_validated(&raw, blocks.len, skip.l0.len())?)
         };
         Ok(RlogReader {
@@ -131,6 +154,7 @@ impl<'a> RlogReader<'a> {
             page_dir,
             bloom,
             postings,
+            open_decompressed_bytes,
         })
     }
 
@@ -242,6 +266,10 @@ impl<'a> RlogReader<'a> {
     ) -> Result<BlockScan, LogSegError> {
         let mut stats = ScanStats {
             blocks_total: self.skip.l0.len() as u32,
+            // Opening the object already decompressed its directory sections;
+            // seed the scan with that so the figure counts the open plus the
+            // block pages the scan goes on to decode (issue #1401).
+            decompressed_bytes: self.open_decompressed_bytes,
             ..ScanStats::default()
         };
 
@@ -924,6 +952,10 @@ impl BlockScan {
             .stats
             .page_bytes_decoded
             .saturating_add(decoded.page_bytes_decoded());
+        self.stats.decompressed_bytes = self
+            .stats
+            .decompressed_bytes
+            .saturating_add(decoded.decompressed_bytes());
 
         for row in 0..decoded.record_count() {
             if eval(
@@ -1008,7 +1040,15 @@ pub(crate) fn decode_v4_block(
             )));
         }
         block_crc = crc32c::crc32c_append(block_crc, stored);
-        page_bytes.push(Some(read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?));
+        let produced = read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?;
+        // Only a zstd page was decompressed; count what it actually produced
+        // (equal to `uncomp_len` for a valid page, which `read_page` already
+        // checked). A raw page was copied, not decompressed (issue #1401).
+        if p.desc.comp == crate::page::COMP_ZSTD {
+            counters.decompressed_bytes =
+                counters.decompressed_bytes.saturating_add(produced.len() as u64);
+        }
+        page_bytes.push(Some(produced));
         counters.decoded += 1;
         counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
     }
@@ -1338,6 +1378,39 @@ pub fn decode_section(
         }
         Ok(stored.to_vec())
     }
+}
+
+/// Bytes zstd produced decoding one section: the produced buffer's own length
+/// for a `COMP_ZSTD` section, zero for one stored raw (nothing was
+/// decompressed). Used both by [`RlogReader::new`] for the directory sections
+/// it opens and by [`decode_section_accounted`] (issue #1401).
+fn section_decompressed_len(desc: &SectionDesc, produced: &[u8]) -> u64 {
+    if desc.comp == COMP_ZSTD {
+        produced.len() as u64
+    } else {
+        0
+    }
+}
+
+/// [`decode_section`], additionally charging the bytes zstd produced to
+/// `accounting` (issue #1401).
+///
+/// The charge is the returned buffer's actual length, not `desc.uncomp_len`,
+/// for a `COMP_ZSTD` section, and nothing for a raw section (which was copied,
+/// not decompressed). `decode_section` has already checked the two are equal for
+/// a valid section, so a short or corrupt frame is charged as what it produced
+/// only in the error paths it also rejects. Callers pass the phase handle for
+/// the phase the read belongs to (`PhaseAccounting::scan`/`plan`), the same way
+/// the surrounding fetch already charges its GET requests and bytes.
+pub fn decode_section_accounted(
+    stored: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+    accounting: &ravel_types::accounting::QueryAccounting,
+) -> Result<Vec<u8>, LogSegError> {
+    let produced = decode_section(stored, desc, cfg)?;
+    accounting.add_decompressed_bytes(section_decompressed_len(desc, &produced));
+    Ok(produced)
 }
 
 fn flatten<'p>(pred: &'p Predicate, out: &mut Vec<&'p Predicate>) {

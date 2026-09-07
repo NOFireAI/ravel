@@ -449,6 +449,13 @@ impl LogSegmentScan {
             .add_page_bytes_fetched(stats.page_bytes_fetched);
         self.accounting
             .add_page_bytes_decoded(stats.page_bytes_decoded);
+        // Bytes zstd produced opening this object's directory sections and
+        // decoding its scanned block pages (issue #1401). This is the scan
+        // funnel's decompressed-byte output; charged to the `scan` phase, the
+        // same handle its page-byte figures land on, so a warm-cache scan that
+        // moves no wire bytes still reports the decode work it did.
+        self.accounting
+            .add_decompressed_bytes(stats.decompressed_bytes);
     }
 }
 
@@ -1428,6 +1435,7 @@ impl LogSegmentFetcher {
                     pages_skipped: 0,
                     page_bytes_fetched: 0,
                     page_bytes_decoded: 0,
+                    decompressed_bytes: 0,
                     bloom_degraded: false,
                     postings_degraded: false,
                 };
@@ -1663,6 +1671,7 @@ impl LogSegmentFetcher {
             pages_skipped: 0,
             page_bytes_fetched: 0,
             page_bytes_decoded: 0,
+            decompressed_bytes: 0,
             bloom_degraded: false,
             postings_degraded: false,
         };

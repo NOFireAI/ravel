@@ -48,7 +48,8 @@ pub use error::LogSegError;
 pub use footer::{SuffixOutcome, open_from_suffix};
 pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockRows, StreamBlockSpan};
 pub use reader::{
-    BlockScan, RlogReader, ScanStats, decode_section, read_section, stream_attr_pairs,
+    BlockScan, RlogReader, ScanStats, decode_section, decode_section_accounted, read_section,
+    stream_attr_pairs,
 };
 pub use record::{FieldSel, FieldType, LogRecord, Predicate, stream_attrs_bytes};
 pub use writer::{ObjectIdentity, RlogConfig, RlogWriter};
