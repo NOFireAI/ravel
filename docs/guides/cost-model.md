@@ -1,18 +1,32 @@
 # Predicting the S3 request bill
 
-Storage is a rounding error in Ravel's cost. Request charges dominate: at a
-modeled 100-tenant, 1 TB/day workload (three signals -- metrics, logs, and
-spans; audit runs its own separate maintenance path and is excluded here --
-at the shipped `--shards` default of 4, one ingest replica, and the shipped
-flush cadence from the next section), request fees run roughly $7-8k/month
-against roughly $100-150/month of storage, so request fees are over 97% of
-the total bill. A different shard count, replica count, or flush cadence
-moves this ratio; plug your own values into the formula below rather than
-trusting this sentence at a different scale. This guide gives an operator
-the formula and the levers to predict and control that bill before
-deploying, not after the first invoice. The write path sets most of it and
-comes first; the read path adds a request count the engine itself chooses,
-and one flag moves it.
+Storage is a rounding error in Ravel's cost. Request charges dominate: in one
+illustrative scenario, a modeled 100-tenant, 1 TB/day workload (three signals
+-- metrics, logs, and spans; audit runs its own separate maintenance path and
+is excluded here -- at the shipped `--shards` default of 4, one ingest
+replica, and the shipped flush cadence from the next section) carries roughly
+$7-8k/month of request fees against roughly $100-150/month of storage, which
+puts request fees over 97% of that scenario's bill.
+
+Both figures are an illustration, not a derivation. They come from the
+independent review reported by the request-cost decision record cited under
+Background, and the workload stated above fixes only the request side, through
+the formula in the next section. A storage amount additionally needs a
+retention window, the compressed bytes those writes occupy on object storage,
+and a per-GB-month storage price; that review's values for the three are
+recorded nowhere in this repository, so neither the $100-150 nor the 97% can
+be recomputed from this page. Supply those three inputs, plus your provider's
+per-1k-request prices, to get your own ratio. The one qualification the
+decision records do carry is that 97% is a short-retention figure: storage and
+request cost approach parity at retention windows measured in hundreds of
+days. A different shard count, replica count, or flush cadence moves the
+request side of the ratio; plug your own values into the formula below rather
+than trusting these amounts at a different scale.
+
+This guide gives an operator the formula and the levers to predict and
+control that bill before deploying, not after the first invoice. The write
+path sets most of it and comes first; the read path adds a request count the
+engine itself chooses, and one flag moves it.
 
 ## The formula
 

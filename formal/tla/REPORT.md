@@ -153,11 +153,15 @@ plus 12 named), omitting `TombstoneNotDeletedBeforeBucketEmpty` and
 `RawInputContentAssumedImmutable`. Both invariants were added to all seven
 `negative/*.cfg` files and the negative lane was re-run: every control still
 violates only its declared target invariant (exit 0 for the lane), so the
-addition is correct. The README's fourteen-invariant claim matched the
-configs by count at the time; the phrase itself was tightened on
-2026-09-07 to "all fifteen INVARIANT lines (TypeOK plus fourteen named)" in
-both this file and `lifecycle/README.md`, for precision rather than because
-the count had drifted again.
+addition is correct. The README's "fourteen" counted the named invariants in
+`smoke.cfg`, not `INVARIANT` lines in any file: `smoke.cfg` declares 15
+`INVARIANT` lines, `TypeOK` plus fourteen named, and the negative configs
+declared 13 until this fix, so the number described `smoke.cfg`'s named list
+and never matched the negative configs it was written about. All seven now
+declare the same 15 `INVARIANT` lines as `smoke.cfg`, and the phrase was
+rewritten on 2026-09-07 to "all fifteen INVARIANT lines (TypeOK plus fourteen
+named)" in both this file and `lifecycle/README.md`, so the count it states
+names lines rather than leaving a reader to infer which of the two it means.
 
 ### resharding
 
