@@ -24,7 +24,7 @@ use ravel_object_store::{
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_query::http::{AppState, StaticBearerTokenResolver, router};
-use ravel_query::{EngineConfig, LogQuery, LogSegmentFetcher, QueryEngine};
+use ravel_query::{EngineConfig, LogFetchError, LogQuery, LogSegmentFetcher, QueryEngine};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, WrittenSegment};
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::logstream::log_stream_id;
@@ -284,8 +284,8 @@ struct CapturedSpan {
     s3_requests: Option<u64>,
     s3_bytes: Option<u64>,
     decompressed_bytes: Option<u64>,
-    /// The logs `decode` span's block-scan counts. The metric
-    /// `decode` span records `decompressed_bytes` here instead.
+    /// The logs `decode` span's block-scan counts, beside the
+    /// `decompressed_bytes` both paths' `decode` spans record.
     blocks_scanned: Option<u64>,
     blocks_total: Option<u64>,
 }
@@ -482,13 +482,22 @@ async fn instant_query_emits_all_six_phase_spans() {
 
 /// Writes a small single-stream RLOG object (12 records) onto a fresh
 /// `MemoryStore` and returns it with a matching L0 `SegmentRef`, mirroring the
-/// recipe `cache_correctness.rs` uses. The `decode`-span test below scans it
-/// through `LogSegmentFetcher::fetch_accounted` and asserts the logs `decode`
-/// span records real block-scan counts.
-async fn write_log_segment_for_span_test() -> (Arc<MemoryStore>, SegmentRef) {
+/// recipe `cache_correctness.rs` uses. The `decode`-span tests below scan it
+/// through `LogSegmentFetcher::fetch_accounted` and assert what the logs
+/// `decode` span records.
+///
+/// `cfg` and `service` shape the object (block count, STREAM_DIR size) so two
+/// tests sharing the process-global span collector can each pick out their
+/// own span by its figures; `mutate` runs over the finished object before it
+/// is stored, so a test can corrupt it.
+async fn write_log_segment_for_span_test(
+    cfg: RlogConfig,
+    service: &str,
+    mutate: impl FnOnce(&mut Vec<u8>),
+) -> (Arc<MemoryStore>, SegmentRef) {
     let resource = vec![(
         "service.name".to_string(),
-        AttrValue::Str("logs-span-test".to_string()),
+        AttrValue::Str(service.to_string()),
     )];
     let stream_id = log_stream_id(&resource, "scope", "1.0", &[]);
     let stream_attrs = stream_attrs_bytes(&resource, "scope", "1.0", &[]);
@@ -515,11 +524,12 @@ async fn write_log_segment_for_span_test() -> (Arc<MemoryStore>, SegmentRef) {
         writer_epoch: 1,
         writer_seq: 1,
     };
-    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    let mut writer = RlogWriter::new(cfg, identity);
     for record in &records {
         writer.push(record.clone()).expect("push record");
     }
-    let bytes = writer.finish().expect("finish rlog object");
+    let mut bytes = writer.finish().expect("finish rlog object");
+    mutate(&mut bytes);
     let size = bytes.len() as u64;
 
     let store = Arc::new(MemoryStore::new());
@@ -552,17 +562,18 @@ async fn write_log_segment_for_span_test() -> (Arc<MemoryStore>, SegmentRef) {
 
 /// The logs read path's `decode` span must record a real, non-empty count
 /// field, unlike a phase span that carried only `signal = "logs"`. It records
-/// `blocks_scanned` and
-/// `blocks_total` from the reader's `ScanStats` (a decompressed-byte count is not
-/// cheaply available on this path; see `log_fetcher.rs` and
+/// `blocks_scanned` and `blocks_total` from the reader's `ScanStats`, and
+/// `decompressed_bytes` from the same stats (see `log_fetcher.rs` and
 /// docs/guides/tracing.md). This scans a real RLOG object through
 /// `LogSegmentFetcher::fetch_accounted` and asserts the logs-signal `decode`
-/// span captured non-empty block counts.
+/// span captured non-empty block counts and the exact byte figure the scan
+/// reported and the funnel charged.
 #[tokio::test]
 async fn logs_decode_span_records_block_scan_counts() {
     let collector = install_span_collector();
 
-    let (store, seg_ref) = write_log_segment_for_span_test().await;
+    let (store, seg_ref) =
+        write_log_segment_for_span_test(RlogConfig::default(), "logs-span-test", |_| {}).await;
     let fetcher = LogSegmentFetcher::new(store);
     let query = LogQuery::new(0, 11);
     let accounting = QueryAccounting::new();
@@ -581,14 +592,21 @@ async fn logs_decode_span_records_block_scan_counts() {
         "at least one block was scanned"
     );
 
-    // Isolate this scan's logs `decode` span from any sibling metric-path
-    // `decode` span in the shared global collector: only the logs path sets
-    // `signal = "logs"` and records the block counts.
+    // Isolate this scan's logs `decode` span in the shared global collector:
+    // only the logs path sets `signal = "logs"`, and the sibling corrupt-block
+    // span test writes a differently shaped object (four blocks, a longer
+    // STREAM_DIR), so this scan's own block total and byte figure single out
+    // its span.
     let logs_decode: Vec<CapturedSpan> = {
         let completed = collector.completed.lock().expect("completed lock");
         completed
             .iter()
-            .filter(|s| s.name == "decode" && s.signal.as_deref() == Some("logs"))
+            .filter(|s| {
+                s.name == "decode"
+                    && s.signal.as_deref() == Some("logs")
+                    && s.blocks_total == Some(u64::from(out.stats.blocks_total))
+                    && s.decompressed_bytes == Some(out.stats.decompressed_bytes)
+            })
             .cloned()
             .collect()
     };
@@ -615,10 +633,119 @@ async fn logs_decode_span_records_block_scan_counts() {
             "logs decode span must record non-empty block counts, got \
              blocks_scanned={scanned} blocks_total={total}"
         );
-        // The metric path's `decode` field must not leak onto the logs span.
-        assert!(
-            span.decompressed_bytes.is_none(),
-            "logs decode span carries no decompressed_bytes field"
+        // The byte figure is the scan's own total, which the collecting
+        // funnel also charged to the handle: one number, three places.
+        let decompressed = span
+            .decompressed_bytes
+            .expect("logs decode span records decompressed_bytes");
+        assert_eq!(
+            decompressed, out.stats.decompressed_bytes,
+            "logs decode span records exactly the scan's decompressed_bytes"
+        );
+        assert_eq!(
+            decompressed,
+            accounting.snapshot().decompressed_bytes,
+            "the funnel charged the same figure the span recorded"
+        );
+    }
+}
+
+/// When the eager drain stops on a corrupt block, the logs `decode` span still
+/// records what the scan did before the error: the counters and the bytes
+/// zstd produced opening the object, which the accounting handle was charged.
+/// A byte flipped at the start of BLOCKS breaks block 0's first page crc, so no
+/// block decodes and the only decompression is the reader's open, the four
+/// directory sections' `uncomp_len` read from the footer. The object has four
+/// blocks and a longer STREAM_DIR than the clean sibling test's, which is how
+/// its span is told apart in the shared collector.
+#[tokio::test]
+async fn logs_decode_span_records_counts_when_the_drain_stops_on_a_corrupt_block() {
+    let collector = install_span_collector();
+
+    let cfg = RlogConfig {
+        block_target_records: 3,
+        ..RlogConfig::default()
+    };
+    let (store, seg_ref) =
+        write_log_segment_for_span_test(cfg, "logs-span-test-corrupt", |bytes| {
+            let blocks = *ravel_logseg::footer::open(bytes)
+                .expect("open footer")
+                .section(ravel_logseg::footer::kind::BLOCKS)
+                .expect("BLOCKS present");
+            bytes[blocks.offset as usize] ^= 0xff;
+        })
+        .await;
+    let bytes = store
+        .get(&seg_ref.data_object_key, GetRange::Full)
+        .await
+        .expect("get object")
+        .data;
+    let footer = ravel_logseg::footer::open(&bytes).expect("open footer");
+    let mut expected = 0u64;
+    for k in [
+        ravel_logseg::footer::kind::STREAM_DIR,
+        ravel_logseg::footer::kind::FIELD_DIR,
+        ravel_logseg::footer::kind::SKIP_IDX,
+        ravel_logseg::footer::kind::PAGE_DIR,
+    ] {
+        let desc = *footer.section(k).expect("section present");
+        assert_eq!(
+            desc.comp,
+            ravel_logseg::footer::COMP_ZSTD,
+            "fixture directory section {k} must be zstd for this test"
+        );
+        expected += desc.uncomp_len;
+    }
+    let blocks_total = footer.block_count;
+
+    let fetcher = LogSegmentFetcher::new(store);
+    let query = LogQuery::new(0, 11);
+    let accounting = QueryAccounting::new();
+
+    let err = fetcher
+        .fetch_accounted(&seg_ref, &query, &accounting)
+        .await
+        .expect_err("a corrupt first page must not decode");
+    assert!(
+        matches!(err, LogFetchError::Corrupt { .. }),
+        "expected Corrupt, got {err:?}"
+    );
+    assert_eq!(
+        accounting.snapshot().decompressed_bytes,
+        expected,
+        "the handle is charged exactly the reader's four directory decodes"
+    );
+
+    let logs_decode: Vec<CapturedSpan> = {
+        let completed = collector.completed.lock().expect("completed lock");
+        completed
+            .iter()
+            .filter(|s| {
+                s.name == "decode"
+                    && s.signal.as_deref() == Some("logs")
+                    && s.blocks_total == Some(blocks_total)
+                    && s.decompressed_bytes == Some(expected)
+            })
+            .cloned()
+            .collect()
+    };
+    assert!(
+        !logs_decode.is_empty(),
+        "expected a logs-signal `decode` span recording blocks_total={blocks_total} \
+         decompressed_bytes={expected} on the error path; captured decode spans: {:?}",
+        collector
+            .completed
+            .lock()
+            .expect("completed lock")
+            .iter()
+            .filter(|s| s.name == "decode")
+            .collect::<Vec<_>>()
+    );
+    for span in &logs_decode {
+        assert_eq!(
+            span.blocks_scanned,
+            Some(0),
+            "no block decoded before the corrupt first page"
         );
     }
 }
