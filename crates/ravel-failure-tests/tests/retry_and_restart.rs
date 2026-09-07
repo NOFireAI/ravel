@@ -284,3 +284,124 @@ async fn restart_from_empty_local_state_sees_both_writer_generations() {
     assert_eq!(result_token.len(), 1);
     assert_eq!(result_token[0].value, 2.0);
 }
+
+/// #1302 reachability: a conditional-request conflict is the new member of the
+/// transient class the S3 adapter's HEAD disambiguation produces for an
+/// absent-key 409. This drives the shipping entry point (a flush's data-object
+/// and commit-record PUTs under the ingest retry loop) with that exact class,
+/// once on every PUT target, and asserts the flush still commits exactly once.
+/// The fault message mirrors the adapter's so the class the flush loop must
+/// accept is the same one #1302 adds.
+#[tokio::test]
+async fn conditional_conflict_on_every_put_still_commits_exactly_once() {
+    let conflict = ScriptedFault::Transient(
+        "conditional-request conflict on create: 409 with the key absent, retryable".into(),
+    );
+    // Fire once on the data-object PUT (`/l0/`) and once on the commit-record
+    // PUT (`/c/`): every distinct PUT the flush issues meets the conflict, then
+    // succeeds on retry. Two rules on two key patterns, each `Nth(1)`, so the
+    // retry of each PUT passes through untouched.
+    let plan = FaultPlan::empty()
+        .with_rule(
+            Rule::new(Op::Put, conflict.clone())
+                .with_key_contains("/l0/")
+                .with_occurrence(Occurrence::Nth(1)),
+        )
+        .with_rule(
+            Rule::new(Op::Put, conflict.clone())
+                .with_key_contains("/c/")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+    let clock = TestClock::new(BASE_NS);
+    let router = IngestRouter::new(config(), Arc::clone(&store), Signal::Metrics, clock.clone());
+
+    let tid = tenant("acme");
+    let event_ts = BASE_NS - NS_PER_MIN;
+    let points = vec![make_point(&tid, "conflict_metric", &[], event_ts, 7.0)];
+    let receipt = router
+        .write(
+            tid.clone(),
+            points,
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("write must survive a conditional conflict on every PUT target");
+    assert_eq!(receipt.tokens.len(), 1);
+
+    assert_eq!(
+        fault_store.fault_count(Op::Put, conflict.kind()),
+        2,
+        "the conditional conflict must have fired exactly once per PUT target"
+    );
+
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    let data_objects = objects.iter().filter(|o| o.key.contains("/l0/")).count();
+    let commit_objects = objects.iter().filter(|o| o.key.contains("/c/")).count();
+    assert_eq!(
+        data_objects, 1,
+        "a conflict retried on the data PUT must not create a second data object"
+    );
+    assert_eq!(
+        commit_objects, 1,
+        "a conflict retried on the commit PUT must not create a second commit record"
+    );
+
+    router.shutdown().await;
+}
+
+/// #1302: the HEAD disambiguation returns `Transient` only when the key is
+/// ABSENT, so a genuine already-exists still surfaces `AlreadyExists` and the
+/// commit publish path's split-brain guard is intact when the object is
+/// PRESENT. Landing a commit record, then republishing the SAME commit identity
+/// with different content, must be a fatal `SplitBrain`, never a retry that
+/// masks the collision.
+#[tokio::test]
+async fn split_brain_still_fires_when_the_commit_object_is_present() {
+    use ravel_commit::publish::{PublishError, RetryPolicy, publish};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_types::TenantHash;
+    use uuid::Uuid;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let writer_id = Uuid::new_v4();
+    let base = NewCommitRecord {
+        tenant_hash: TenantHash([0x33; 16]),
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: 100,
+        content_hash: [1u8; 32],
+        sample_count: 5,
+        series_count: 1,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: 100,
+        min_ingest_ts_ns: 0,
+        max_ingest_ts_ns: 100,
+        segment_format_version: 1,
+        created_unix_ns: 0,
+        ingest_hour_bucket: 0,
+    };
+    let r1 = record::build(base.clone()).expect("valid record");
+    publish(store.as_ref(), &r1, &RetryPolicy::default())
+        .await
+        .expect("first publish lands; the commit key is now PRESENT");
+
+    // Same pinned identity (shard/writer/epoch/seq/hour), different content, so
+    // it derives the same commit key: the second create meets a present key.
+    let mut different = base;
+    different.content_hash = [2u8; 32];
+    different.sample_count = 6;
+    let r2 = record::build(different).expect("valid record");
+    let err = publish(store.as_ref(), &r2, &RetryPolicy::default())
+        .await
+        .expect_err("a present key with different content must be split-brain, not a retry");
+    assert!(
+        matches!(err, PublishError::SplitBrain { .. }),
+        "a genuine already-exists must surface as split-brain, got {err:?}"
+    );
+}
