@@ -314,21 +314,27 @@ loop as everything else:
   many *failed* attempts run, not one attempt that never terminates: a
   qualify pod against an S3 endpoint that accepts the connection and then
   never answers would otherwise run indefinitely, leaving `StoreQualified`
-  stuck at `Pending` with no Deployment ever created. The deadline is 900 s,
-  derived from what `ravel store qualify` does: it runs 28 sequential object
+  stuck at `Pending` with no Deployment ever created. This deadline is
+  JOB-WIDE, not per-attempt: Kubernetes counts it against the Job's total
+  active time summed across every retry, and it takes precedence over
+  `backoffLimit`. So the two knobs are sized together, or a slow-but-healthy
+  first attempt plus a retry would trip `DeadlineExceeded` before the retry
+  budget was ever spent. `ravel store qualify` runs 28 sequential object
   operations (create-if-absent probe 3, CAS-version probe 4, read-after-write
   probe 10 = 5 cycles of put+get, list-after-write probe 10 = 5 cycles of
   put+list, and the final `sys/qualification` write 1; the two informational
   probes issue no request through the object-store contract). Each operation's
-  per-request ceiling is the S3 client's 20 s `request_timeout`, so a
-  slow-but-healthy run whose every operation nears that ceiling without
-  retrying is bounded by 28 * 20 s = 560 s. 900 s adds a ~1.6x margin (340 s)
-  for pod scheduling, image pull, and the odd single retry, while staying far
-  below a hung endpoint's ~200 s-per-operation worst case (`retry_timeout`
-  180 s + `request_timeout` 20 s), so a hang trips the deadline after roughly
-  four stalled operations. The deadline is a tuning knob, deliberately not
-  part of the qualified-input hash: changing it must not re-run a
-  qualification that already passed.
+  per-request ceiling is the S3 client's 20 s `request_timeout`, so one
+  slow-but-healthy attempt whose every operation nears that ceiling without
+  retrying is bounded by 28 * 20 s = 560 s; adding ~140 s per attempt for pod
+  scheduling and image pull gives a 700 s per-attempt budget. `backoffLimit`
+  is 1 (two attempts: the initial run plus one retry), so the Job-wide deadline
+  is 2 * 700 s = 1400 s -- a slow-but-healthy initial attempt AND a full retry
+  both complete before it fires. A single hung attempt still terminates, at the
+  1400 s Job-wide bound rather than running forever (a hung endpoint stalls each
+  operation at ~200 s = `retry_timeout` 180 s + `request_timeout` 20 s). Both
+  knobs are tuning parameters, deliberately not part of the qualified-input
+  hash: changing either must not re-run a qualification that already passed.
 - A new `StoreQualified` status condition carries the gate's state with the
   same shape as the other conditions (reasons `Pending` while the Job is
   created or running, `Succeeded` once it completes, `Failed` when it fails,
@@ -339,14 +345,29 @@ loop as everything else:
   `Failed` no Deployment is created and the pass requeues on the existing
   failure backoff rather than spinning.
 - The inputs qualification proves against (bucket, region, endpoint, image,
-  credentials Secret name) are hashed into a Job annotation and, on success,
-  into a durable `status.storeQualifiedHash`. A later pass whose inputs
-  still hash to the recorded value proceeds without re-running qualification
-  even after the Job's TTL garbage-collected it. When the inputs change, the
-  operator deletes the stale Job (its pod template is immutable), recreates
-  it, and flips `StoreQualified` back to `Pending`; a cluster that was
-  already serving keeps its existing Deployments up while the new inputs
+  credentials Secret name, and that credentials Secret's `resourceVersion`)
+  are hashed into a Job annotation and, on success, into a durable
+  `status.storeQualifiedHash`. A later pass whose inputs still hash to the
+  recorded value proceeds without re-running qualification even after the
+  Job's TTL garbage-collected it. When the inputs change, the operator
+  deletes the stale Job with foreground propagation (its pod template is
+  immutable, and foreground propagation tears down the old Pod before the Job
+  object disappears so the replacement never races a live stale Pod),
+  recreates it, and flips `StoreQualified` back to `Pending`; a cluster that
+  was already serving keeps its existing Deployments up while the new inputs
   qualify, rather than being torn down for a pending config edit.
+  - The credentials `resourceVersion` is what makes a fixed-name credential
+    ROTATION re-qualify: rotating the Secret in place keeps its name but bumps
+    its `resourceVersion`, so without it a rotation to credentials that no
+    longer pass the contract would skip qualification once the prior Job had
+    been TTL-collected. Only the `resourceVersion` (opaque API metadata) enters
+    the hash, never any Secret data, and it reaches neither the status nor a
+    log line. The operator does not watch Secrets (the per-namespace
+    `ravel-operator-secrets` RoleBinding grants `get` only, not `watch`), so a
+    rotation is noticed on the next periodic requeue (the controller's 300 s
+    resync): that pass reads the new `resourceVersion`, the hash changes, and
+    the gate recreates the Job. The bound on noticing an in-place rotation is
+    therefore one resync interval.
 - Non-goal: qualification is not re-run on a schedule. It runs once per
   distinct set of inputs and only re-runs when those inputs change. A
   periodic re-qualification would add object-store traffic and a recurring
@@ -357,7 +378,14 @@ Because the operator now qualifies, the kind lane's hand-run qualification
 Job is removed from scripts/kind-up.sh: it deploys through the operator, so
 the operator's Job is the single qualification and a second one would only
 duplicate it. The RBAC in deploy/k8s/operator/rbac.yaml gains a `batch`
-`jobs` rule (full lifecycle) for the Job the operator now owns. The gate
+`jobs` rule for the Job the operator now owns, scoped to the verbs the
+reconcile loop calls: `create`/`patch` (server-side apply), `get` (observe the
+Job's terminal state), and `delete` (foreground recreate on an input change).
+It is not watched by an informer, so it takes no `list`/`watch`, and every
+write is a PATCH, so it takes no `update`. That same audit -- server-side apply
+is a PATCH, not a PUT, and a resource the operator only applies and sweeps is
+never read -- removed the unused `update` verb from every rule and the unused
+read verbs from the write-only resources. The gate
 decision and the Job renderer are pure functions in `reconcile.rs` with
 unit tests; the runtime behavior (the Job actually completing and the
 Deployments appearing only after) is left to the k8s CI lane (decision 8),
