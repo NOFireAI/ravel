@@ -352,12 +352,11 @@ async fn conditional_conflict_on_every_put_still_commits_exactly_once() {
     router.shutdown().await;
 }
 
-/// #1302: the HEAD disambiguation returns `Transient` only when the key is
-/// ABSENT, so a genuine already-exists still surfaces `AlreadyExists` and the
-/// commit publish path's split-brain guard is intact when the object is
-/// PRESENT. Landing a commit record, then republishing the SAME commit identity
-/// with different content, must be a fatal `SplitBrain`, never a retry that
-/// masks the collision.
+/// #1302: the commit publish path's split-brain guard fires when the commit
+/// object is PRESENT and the identity collides with different content. Landing
+/// a commit record, then republishing the SAME commit identity with different
+/// content, must be a fatal `SplitBrain`, never a retry that masks the
+/// collision.
 #[tokio::test]
 async fn split_brain_still_fires_when_the_commit_object_is_present() {
     use ravel_commit::publish::{PublishError, RetryPolicy, publish};
