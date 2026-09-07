@@ -472,6 +472,16 @@ pub struct ServerConfig {
     /// fetcher cache; an explicit `--cache-max-bytes` sets both equal. Ignored
     /// when `disable_cache` is set.
     pub catalog_cache_max_bytes: u64,
+    /// The ADR-1170 decisions 1/3/4 process-wide memory budget: the shared
+    /// remainder left after both hard cache carves
+    /// (`ResolvedPerformanceDefaults::memory_remainder_bytes`), which `main`
+    /// fills from the resolved struct. [`start`] wraps this in ONE
+    /// `Arc<ravel_memory::MemoryBudget>` shared by the `sql`-featured
+    /// `SqlExecutor` (via `SqlExecutor::with_process_memory_budget`) and the
+    /// `/metrics` gauges on `MetricsState`, so a tenant's SQL reservation and
+    /// the exposed gauges read the SAME counter rather than two
+    /// independently drifting instances.
+    pub process_memory_budget_bytes: u64,
     /// `--cache-dir`: the ADR-0046 local-disk cache tier's directory (#97),
     /// `None` when the flag is unset. `main` sets it from `Cli::cache_dir`.
     /// When `Some` and `disable_cache` is off, [`query::build_catalog`] attaches
@@ -1789,6 +1799,19 @@ pub async fn start(
     // ADR-0076 decision 2 per-tenant PUT attribution family the same way.
     let metrics_tenant_allowlist = Arc::new(metrics_tenant_allowlist);
 
+    // The ADR-1170 process-wide memory accountant, sized from
+    // `ResolvedPerformanceDefaults::memory_remainder_bytes` (the shared
+    // headroom left after both hard cache carves, `main`'s
+    // `config.process_memory_budget_bytes`). Built once, here, before
+    // `metrics_state` and the `sql`-featured executor below so both install
+    // the SAME instance rather than two independently drifting counters: the
+    // SQL executor reserves against it via
+    // `SqlExecutor::with_process_memory_budget`, and the `/metrics` gauges
+    // read it back at scrape time.
+    let process_memory_budget = Arc::new(ravel_memory::MemoryBudget::new(
+        config.process_memory_budget_bytes,
+    ));
+
     // Liveness/readiness routes are served in every mode, including
     // maintain (whose router is otherwise empty). `readiness` starts false
     // and is latched to true below, once both listeners are bound and the
@@ -2071,6 +2094,7 @@ pub async fn start(
         // pipeline; the metrics router is merged after that block for the
         // same reason.
         audit_pipeline: None,
+        process_memory_budget: process_memory_budget.clone(),
     };
 
     // Held past the HTTP wiring so the Flight SQL service can register
@@ -2287,6 +2311,10 @@ pub async fn start(
                 query_accounting.clone(),
                 query_admission.clone(),
                 Some(declared_columns),
+                // ADR-1170 decisions 1/3: the same process-wide accountant
+                // installed on `metrics_state` above, so a tenant's SQL
+                // reservation and the `/metrics` gauges agree on one counter.
+                process_memory_budget.clone(),
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).

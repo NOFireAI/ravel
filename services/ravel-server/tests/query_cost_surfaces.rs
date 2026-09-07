@@ -219,6 +219,7 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         cache_max_bytes: 0,
         catalog_cache_max_bytes: 0,
         audit_pipeline: None,
+        process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
     });
 
     Surfaces {
@@ -630,6 +631,7 @@ mod flight {
             cache_max_bytes: 0,
             catalog_cache_max_bytes: 0,
             audit_pipeline: None,
+            process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
         });
         let scrape = scrape(&metrics).await;
         let expected = vec![
