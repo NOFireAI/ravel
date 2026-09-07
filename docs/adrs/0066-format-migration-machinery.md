@@ -212,10 +212,16 @@ which fails if a new versioned message lands unclassified):
 | `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2}** |
 | `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2}** |
 | `MetricMetadataRecord` | **CAS-mutable** | ingest metadata sink read→`merge_entries`→write | **{1, 2}** |
-| `AuthTokenMap` | **CAS-mutable** | `sys/auth` CAS-replace | {1, 2} (already, managed_by) |
-| `GcConfig` | **CAS-mutable** | `ravel-maintain::gc_config::set_gc_config` | {1} |
-| `CompactionClaim` | **CAS-mutable** | ADR-1029 claim renew/steal/complete | {1} |
-| `KeyEpochRecord` | **CAS-mutable** | `ravel-catalog::key_epoch` append-epoch CAS | {1} |
+| `AuthTokenMap` | **CAS-mutable** | `sys/auth` CAS-replace | {1, 2} (managed_by; floor added in R2) |
+| `GcConfig` | **CAS-mutable** | `ravel-maintain::gc_config::set_gc_config` | {1}, ceiling-only gate |
+| `CompactionClaim` | **CAS-mutable** | ADR-1029 claim renew/steal/complete | {1}, ceiling-only gate |
+| `KeyEpochRecord` | **CAS-mutable** | `ravel-catalog::key_epoch` append-epoch CAS | {1} (floor added in R2) |
+
+Every read set in this table that belongs to a reader in `ravel-catalog` is
+asserted against that reader's own `MIN_READ_VERSION..=MAX_READ_VERSION`
+constants by the enumeration test, so a widened gate that does not update this
+table fails. The four rows whose readers live in other crates are maintained by
+hand.
 
 "Never rewritten" covers the write-once markers AND the sole-writer
 `PutMode::Overwrite` snapshots (`AdmissionUsageSnapshot`, `WorkerHeartbeat`): each
@@ -240,10 +246,12 @@ record without the field.
 **R1 (this change, #1300).** The reader half, for the three records whose gates
 were permissive: `ProvisioningRecord`, `TenantConfigRecord`, `MetricMetadataRecord`
 now accept the read set exactly {1, 2} and their CAS rewrite paths refuse a
-record whose version exceeds what this build's writer stamps (still 1),
+record whose version exceeds what this build's writer stamps (1 as of R1; see
+the R2 amendment below, which raised it to 2),
 preventing the strip before any version-2 writer exists. The accepted set is a
-set with a floor, not a ceiling: each reader gate rejects a version below 1 with
-the same typed `UnsupportedVersion` error it uses for a version above 2. A
+set with a floor, not a ceiling: each reader gate rejects a version below 1 as
+well as one above 2. (R1 reported both sides with one typed
+`UnsupportedVersion` error; R2 split them, see below.) A
 version-0 record — a valid-shaped record from a writer that never stamped
 `format_version` — is therefore refused rather than admitted and later rewritten
 as version 1 by a CAS path; whether any pre-release binary ever wrote such a
@@ -256,11 +264,11 @@ any rolling upgrade. R1 is the readers; **R2** (a later task, after this reader
 is fleet-wide) is the writer flip that stamps 2 with a new additive field and
 models it.
 
-**R2's obligation.** When R2 adds the version-2 field, it models that field in
-these readers and re-encoders, so a version-2 record is then read AND rewritten
-without loss — the read set stays {1, 2} but the rewrite paths stop refusing 2.
-Until R2, a version-2 record cannot exist (every writer stamps 1), so R1's
-refusals only ever fire during a mixed-version window a future R2 rollout opens.
+**R2's obligation.** R2 flips the writer to stamp 2. The read set stays {1, 2}
+and the rewrite paths stop refusing 2, because 2 becomes what this build's writer
+itself produces. Until R2, a version-2 record cannot exist (every writer stamps
+1), so R1's refusals only ever fire during a mixed-version window the R2 rollout
+opens. See the R2 amendment below for what actually shipped.
 
 **A note on `MetricMetadataRecord`'s serve path.** Its record is read by two
 callers with opposite obligations: the ingest sink merges and CAS-writes it back
@@ -271,25 +279,26 @@ splits the read accordingly rather than forcing both through one function.
 with, so it refuses a version-2 record and keeps the sink from stripping.
 `read_metrics_meta_for_serve` is the read-only decoder for the cache; it applies
 the shared `decode_body` gate ({1, 2}) and does NOT apply the rewrite refusal, so
-a version-2 record's v1 fields are served rather than turned into an empty
-snapshot. The query metadata cache's fetch calls the serve reader. An earlier
+a record above what this build rewrites has its readable fields served rather
+than turned into an empty snapshot. BOTH of the query metadata cache's reads —
+the inline fill and the background refresh — call the serve reader; the strict
+`read_metrics_meta` survives only on the paths that write the record back (the
+ingest metadata sink and the server's metadata sink task). An earlier
 draft of this amendment accepted "serve an empty record for one horizon" on a
 version-2 record during an R2 rollout as a bounded cost; the split removes that
-degradation, so it is no longer a trade-off this ADR accepts. (The single
-background-refresh caller in that cache still uses the strict reader; widening it
-is follow-up work outside #1300's permitted scope and does not reintroduce the
-serve-empty horizon on the inline fetch path.)
+degradation, so it is no longer a trade-off this ADR accepts.
 
-**The four never-audited records, reported not fixed here (their crates are in
-flight under other work):** `TenantRecoveryManifest` and `AdmissionUsageSnapshot`
-are never-rewritten (write-once and sole-writer-overwrite respectively), so they
-carry no strip risk. `GcConfig` (ravel-maintain) and `KeyEpochRecord`
-(ravel-catalog `key_epoch`) ARE CAS-mutable and still carry the permissive reader
-gate; neither has an additive field shipped past version 1 today, so neither is a
-*live* strip instance, but both would be if an additive field lands before their
-gate is widened. `CompactionClaim` (ADR-1029) is likewise CAS-mutable with a
-permissive gate and no post-v1 additive field. These are flagged for their owning
-tasks; this change does not touch their gates.
+**The four never-audited records.** `TenantRecoveryManifest` and
+`AdmissionUsageSnapshot` are never-rewritten (write-once and
+sole-writer-overwrite respectively), so they carry no strip risk. `GcConfig`
+(ravel-maintain) and `KeyEpochRecord` (ravel-catalog `key_epoch`) ARE CAS-mutable
+and, at R1, still carried the permissive reader gate; neither has an additive
+field shipped past version 1 today, so neither is a *live* strip instance, but
+both would be if an additive field lands before their gate is widened.
+`CompactionClaim` (ADR-1029) is likewise CAS-mutable with a permissive gate and
+no post-v1 additive field. R1 did not touch any of their gates. R2 fixed
+`KeyEpochRecord`'s (it lives in this crate); `GcConfig` and `CompactionClaim`
+remain flagged for their owning tasks in ravel-maintain and ravel-fleet.
 
 **Rejected R1 alternatives** (and why the reader-set-plus-rewrite-refusal shape
 won): an unknown-tail bytes field to carry unmodeled fields across a rewrite (its
@@ -299,3 +308,72 @@ gate (a durable read on every CAS path, and it cannot protect the first write
 after a bump); and prospective-only (bump only future writers), which leaves f6,
 f7, and f12 strippable by every already-deployed binary — the live half of the
 bug.
+
+## Amendment (R2, 2026-09-07, #1300): the writer flip, and floors on the last two gates
+
+**The writer flip.** From this change the three CAS-mutable records this crate
+owns are stamped version 2 by every writer that emits them:
+`ProvisioningRecord` (`validate_or_adopt`, `append_generation`,
+`raise_format_floor`), `TenantConfigRecord` (`set_tenant_config`), and
+`MetricMetadataRecord` (`write_metrics_meta`). The readers' accepted set is
+unchanged at {1, 2}, so every version-1 record any earlier build wrote stays
+readable and nothing is migrated. The two CAS rewrite paths on
+`ProvisioningRecord` also re-stamp: a version-1 record they append to comes back
+as version 2.
+
+**What the flip buys, which is the whole point of the issue.** A binary that
+predates R1 accepts only version 1. Against a record this build wrote, it now
+REFUSES rather than decoding it, dropping the fields it does not model, and
+CAS-writing the stripped record back. That is the fail-closed behaviour #1300
+asks for, and it is now the observable behaviour of a real code path rather than
+a claim: each of the three record families has a test that seeds a current-writer
+record carrying a field this build does not model, hands it to the shared decode
+gate instantiated at the pre-R1 bounds (exactly {1}), asserts the typed
+above-ceiling refusal, and asserts the stored bytes are byte-identical afterwards
+— then flips the stamp to 1 and asserts the same rewrite strips the field, so the
+hazard is demonstrated and not merely asserted.
+
+**Rollout precondition, unchanged from R1 and now load-bearing.** This flip is
+safe only because R1's readers are already fleet-wide. A deployment that has NOT
+rolled out an R1 build must not run an R2 build: `ProvisioningRecord` is read on
+the ingest hot path by `GenerationSwitch`, which fails a flush CLOSED, so a
+pre-R1 binary meeting a version-2 record refuses the flush. That is the intended
+fail-closed direction, but during a rolling upgrade it is an outage, which is
+precisely why the bump was split across two releases.
+
+**Deleting version-1 read support is a later, separate change.** It is legal only
+when every bucket's recorded `format_floors` for the affected family exceeds
+version 1, per decision 3: the floor is raised by the migration job's
+verification step after an `audit-versions` enumeration comes back clean, and the
+change that drops the read support must cite those recorded floors. Nothing in
+R2 authorizes it. Until then the read set stays {1, 2} and a version-1 record is
+a first-class readable record.
+
+**The last two ceiling-only gates.** `AuthTokenMap` (`decode_map`) and
+`KeyEpochRecord` (`read_epochs_checked`) carried the same defect R1 fixed on the
+other three: a `format_version > CONSTANT` test with no floor, so version 0 — an
+unstamped record no supported writer produced — was admitted, decoded, and then
+re-encoded whole by the next CAS write, stamped at this build's version with any
+unmodeled field dropped. Both now gate on a closed set:
+`AUTH_TOKEN_MAP_MIN_READ_VERSION..=AUTH_TOKEN_MAP_MAX_READ_VERSION` = {1, 2} and
+`KEY_EPOCH_MIN_READ_VERSION..=KEY_EPOCH_MAX_READ_VERSION` = {1}. Neither ceiling
+is widened: widening one would start an unrequested readers-before-writers
+sequence for a record with no additive field to ship.
+
+**Split diagnostics.** All five gates now report the two ways a version can fall
+outside the set with two different typed errors. `UnsupportedVersion` names the
+ceiling and tells the operator to upgrade the binary; `VersionBelowFloor` names
+the floor and says explicitly that the record is unstamped or predates the floor
+and is *not* a future format. R1 used one variant whose message called a
+below-floor version "a future record format", which points at the opposite
+remediation from the one that would work.
+
+**Formal method: RUST_ONLY.** No TLA+ or Alloy model. The version stamp is a
+field on a record, not a protocol step: there is no new interleaving to check,
+because the ordering constraint (readers everywhere before any writer emits the
+new version) is the same readers-before-writers sequencing R1 already stated as
+the class rule, and this change is one release of that sequence. The properties
+that could go wrong here are single-record decode properties — which versions a
+gate admits, and whether a refused rewrite leaves the object untouched — and
+those are pinned by tests over the real code, including a `MemoryStore`
+byte-identity assertion after each refusal.
