@@ -110,6 +110,11 @@ criterion = { workspace = true }
 # span test installs a scoped fmt subscriber over a buffer and asserts each
 # phase span fires. Version comes from [workspace.dependencies].
 tracing-subscriber = { workspace = true }
+# Test-only: the metadata cache's refresh test seeds a metric metadata record
+# stamped at a format version this build's writer never emits, and the record
+# body is zstd-compressed. Version from [workspace.dependencies]; ravel-catalog,
+# ravel-segment, and ravel-logseg already depend on it.
+zstd = { workspace = true }
 
 [[bench]]
 name = "fetch_soa_vs_fetch"
