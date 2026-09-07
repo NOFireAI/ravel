@@ -159,16 +159,48 @@ fn load_policy(role: &'static str) -> Policy {
     Policy { role, statements }
 }
 
+/// IAM action names are case-insensitive: a statement granting
+/// `KMS:GenerateDataKey*` grants exactly what `kms:GenerateDataKey*` grants.
+/// Every action comparison in this file goes through this helper (or
+/// `action_has_prefix`), in both directions. A case-sensitive positive check
+/// only fails loudly, but a case-sensitive negative check reports a role
+/// unprivileged while it holds the grant.
+fn action_eq(action: &str, expected: &str) -> bool {
+    action.eq_ignore_ascii_case(expected)
+}
+
+/// Case-insensitive prefix match for action names, so `kms:GenerateDataKey`
+/// selects `KMS:GenerateDataKey*` too. Indexed with `get` rather than a slice
+/// so an action name whose bytes do not split on a char boundary at
+/// `prefix.len()` returns false instead of panicking.
+fn action_has_prefix(action: &str, prefix: &str) -> bool {
+    action
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// Every action name in a statement's `Action` (a bare string or an array),
+/// with the policy's own capitalization preserved so a failure message quotes
+/// what the template actually says.
+fn statement_actions(stmt: &serde_json::Value) -> Vec<String> {
+    match &stmt["Action"] {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// `s3:prefix` patterns from every `s3:ListBucket` statement's
 /// `Condition.StringLike` block.
 fn list_prefix_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy.statements.as_array().unwrap() {
-        let action = &stmt["Action"];
-        let is_list = action == "s3:ListBucket"
-            || action
-                .as_array()
-                .is_some_and(|a| a.iter().any(|v| v == "s3:ListBucket"));
+        let is_list = statement_actions(stmt)
+            .iter()
+            .any(|a| action_eq(a, "s3:ListBucket"));
         if !is_list {
             continue;
         }
@@ -186,8 +218,9 @@ fn list_prefix_patterns(policy: &Policy) -> Vec<String> {
 fn resource_key_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy.statements.as_array().unwrap() {
-        let action = &stmt["Action"];
-        let is_list_only = action == "s3:ListBucket";
+        let is_list_only = stmt["Action"]
+            .as_str()
+            .is_some_and(|a| action_eq(a, "s3:ListBucket"));
         if is_list_only {
             continue;
         }
@@ -214,11 +247,9 @@ fn resource_key_patterns(policy: &Policy) -> Vec<String> {
 fn put_resource_key_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy.statements.as_array().unwrap() {
-        let grants_put = match &stmt["Action"] {
-            serde_json::Value::String(s) => s == "s3:PutObject",
-            serde_json::Value::Array(a) => a.iter().any(|v| v == "s3:PutObject"),
-            _ => false,
-        };
+        let grants_put = statement_actions(stmt)
+            .iter()
+            .any(|a| action_eq(a, "s3:PutObject"));
         if !grants_put {
             continue;
         }
@@ -268,18 +299,53 @@ const WRITE_ROLES: [&str; 3] = ["gateway", "maintain", "query"];
 
 /// `kms:*` action strings appearing anywhere in `policy`'s statements
 /// (`Action` as a bare string or an array), regardless of statement Sid.
+///
+/// Selection is case-insensitive, so `KMS:GenerateDataKey*` is returned; the
+/// strings themselves keep the template's capitalization, so a caller's
+/// failure message shows what the policy said rather than a normalized form
+/// the operator would then grep for in vain. Callers compare with `action_eq`
+/// or `action_has_prefix` rather than against these strings directly.
 fn kms_actions(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy.statements.as_array().unwrap() {
-        let actions: Vec<String> = match &stmt["Action"] {
+        out.extend(
+            statement_actions(stmt)
+                .into_iter()
+                .filter(|a| action_has_prefix(a, "kms:")),
+        );
+    }
+    out
+}
+
+/// Sid and parsed `Resource` list for every statement carrying a `kms:`
+/// action. Both resource guards below go through this one selection rule, so
+/// a change to it cannot reach one guard and miss the other.
+///
+/// Panics on a `Resource` that is neither a string nor an array, as the
+/// guards did inline: a malformed template must fail the test rather than be
+/// skipped as "no resources to check".
+fn kms_statement_resources(policy: &Policy) -> Vec<(String, Vec<String>)> {
+    let role = policy.role;
+    let mut out = Vec::new();
+    for stmt in policy.statements.as_array().unwrap() {
+        if !statement_actions(stmt)
+            .iter()
+            .any(|a| action_has_prefix(a, "kms:"))
+        {
+            continue;
+        }
+        let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>").to_string();
+        let resources: Vec<String> = match &stmt["Resource"] {
             serde_json::Value::String(s) => vec![s.clone()],
             serde_json::Value::Array(a) => a
                 .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
+                .map(|v| v.as_str().expect("Resource entry is a string").to_string())
                 .collect(),
-            _ => continue,
+            other => {
+                panic!("{role}/{sid}: Resource is neither a string nor an array: {other:?}")
+            }
         };
-        out.extend(actions.into_iter().filter(|a| a.starts_with("kms:")));
+        out.push((sid, resources));
     }
     out
 }
@@ -298,7 +364,9 @@ fn write_roles_have_kms_generate_data_key() {
         let policy = load_policy(role);
         let actions = kms_actions(&policy);
         assert!(
-            actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
+            actions
+                .iter()
+                .any(|a| action_has_prefix(a, "kms:GenerateDataKey")),
             "{role}: policy is missing kms:GenerateDataKey* -- its ingest/compaction/\
              catalog-fold PUTs under t/<hash>/... will fail closed against a \
              --tenant-kms-config tenant. Found kms actions: {actions:?}"
@@ -349,13 +417,15 @@ fn roles_writing_routed_objects_have_kms_grant() {
         }
         let actions = kms_actions(&policy);
         assert!(
-            actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
+            actions
+                .iter()
+                .any(|a| action_has_prefix(a, "kms:GenerateDataKey")),
             "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
              kms:GenerateDataKey* -- those writes fail closed under \
              --tenant-kms-config. Found kms actions: {actions:?}"
         );
         assert!(
-            actions.iter().any(|a| a == "kms:Encrypt"),
+            actions.iter().any(|a| action_eq(a, "kms:Encrypt")),
             "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
              kms:Encrypt -- those writes fail closed under --tenant-kms-config. \
              Found kms actions: {actions:?}"
@@ -374,7 +444,9 @@ fn admin_has_no_kms_generate_data_key() {
     let policy = load_policy("admin");
     let actions = kms_actions(&policy);
     assert!(
-        !actions.iter().any(|a| a.starts_with("kms:GenerateDataKey")),
+        !actions
+            .iter()
+            .any(|a| action_has_prefix(a, "kms:GenerateDataKey")),
         "admin: policy must not carry kms:GenerateDataKey* (Decrypt-only per ADR-0055). \
          Found kms actions: {actions:?}"
     );
@@ -393,7 +465,7 @@ fn every_role_has_kms_decrypt() {
         let policy = load_policy(role);
         let actions = kms_actions(&policy);
         assert!(
-            actions.iter().any(|a| a == "kms:Decrypt"),
+            actions.iter().any(|a| action_eq(a, "kms:Decrypt")),
             "{role}: policy is missing kms:Decrypt -- its reads of SSE-KMS objects \
              under a --tenant-kms-config tenant will fail closed. \
              Found kms actions: {actions:?}"
@@ -456,34 +528,15 @@ fn assert_kms_resource_names_a_key_id(role: &str, sid: &str, resource: &str) {
 fn no_kms_statement_grants_every_key_in_the_region() {
     for role in ALL_ROLES {
         let policy = load_policy(role);
-        for stmt in policy.statements.as_array().unwrap() {
-            let actions: Vec<String> = match &stmt["Action"] {
-                serde_json::Value::String(s) => vec![s.clone()],
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect(),
-                _ => continue,
-            };
-            if !actions
-                .iter()
-                .any(|a| a.to_ascii_lowercase().starts_with("kms:"))
-            {
-                continue;
-            }
-            let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
-            let resources: Vec<String> = match &stmt["Resource"] {
-                serde_json::Value::String(s) => vec![s.clone()],
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .map(|v| v.as_str().expect("Resource entry is a string").to_string())
-                    .collect(),
-                other => {
-                    panic!("{role}/{sid}: Resource is neither a string nor an array: {other:?}")
-                }
-            };
+        let statements = kms_statement_resources(&policy);
+        assert!(
+            !statements.is_empty(),
+            "{role}: no statement carrying a kms: action was found -- this guard \
+             would pass having examined nothing"
+        );
+        for (sid, resources) in statements {
             for resource in &resources {
-                assert_kms_resource_is_not_account_wide(role, sid, resource);
+                assert_kms_resource_is_not_account_wide(role, &sid, resource);
             }
         }
     }
@@ -498,34 +551,15 @@ fn no_kms_statement_grants_every_key_in_the_region() {
 fn every_kms_statement_names_a_key_id() {
     for role in ALL_ROLES {
         let policy = load_policy(role);
-        for stmt in policy.statements.as_array().unwrap() {
-            let actions: Vec<String> = match &stmt["Action"] {
-                serde_json::Value::String(s) => vec![s.clone()],
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect(),
-                _ => continue,
-            };
-            if !actions
-                .iter()
-                .any(|a| a.to_ascii_lowercase().starts_with("kms:"))
-            {
-                continue;
-            }
-            let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
-            let resources: Vec<String> = match &stmt["Resource"] {
-                serde_json::Value::String(s) => vec![s.clone()],
-                serde_json::Value::Array(a) => a
-                    .iter()
-                    .map(|v| v.as_str().expect("Resource entry is a string").to_string())
-                    .collect(),
-                other => {
-                    panic!("{role}/{sid}: Resource is neither a string nor an array: {other:?}")
-                }
-            };
+        let statements = kms_statement_resources(&policy);
+        assert!(
+            !statements.is_empty(),
+            "{role}: no statement carrying a kms: action was found -- this guard \
+             would pass having examined nothing"
+        );
+        for (sid, resources) in statements {
             for resource in &resources {
-                assert_kms_resource_names_a_key_id(role, sid, resource);
+                assert_kms_resource_names_a_key_id(role, &sid, resource);
             }
         }
     }
@@ -546,17 +580,12 @@ fn mixed_case_kms_action_is_not_a_bypass() {
         "Action": "KMS:Decrypt",
         "Resource": "*"
     });
-    let actions: Vec<String> = match &stmt["Action"] {
-        serde_json::Value::String(s) => vec![s.clone()],
-        serde_json::Value::Array(a) => a
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => vec![],
-    };
+    let actions = statement_actions(&stmt);
 
-    // Observation 1: the pre-fix selection (case-sensitive) misses the
-    // mixed-case action entirely, exactly the hole this test guards against.
+    // Observation 1 (load-bearing): the pre-fix selection (case-sensitive)
+    // misses the mixed-case action entirely, exactly the hole this test guards
+    // against. Kept as the literal pre-fix expression, not a call into the
+    // fixed code, so it pins that the hole existed.
     let selected_before_fix = actions.iter().any(|a| a.starts_with("kms:"));
     assert!(
         !selected_before_fix,
@@ -565,36 +594,172 @@ fn mixed_case_kms_action_is_not_a_bypass() {
          the hole existed"
     );
 
-    // Observation 2: the post-fix selection (lowercased) catches it.
-    let selected_after_fix = actions
-        .iter()
-        .any(|a| a.to_ascii_lowercase().starts_with("kms:"));
+    // Observation 2: the post-fix selection catches it, through the same
+    // helper the guards use.
+    let selected_after_fix = actions.iter().any(|a| action_has_prefix(a, "kms:"));
     assert!(
         selected_after_fix,
         "fixture invalid: the post-fix matcher should select \"KMS:Decrypt\""
     );
 
-    // With the statement selected, the real guard's own assertion (resource
-    // != "*" && !resource.ends_with(":key/*")) must now fire on this
-    // fixture's "Resource": "*". Run it through catch_unwind so this test
-    // reports the panic as an assertion result instead of aborting the binary.
-    let resource = stmt["Resource"]
-        .as_str()
-        .expect("Resource is a string")
-        .to_string();
-    let sid = stmt["Sid"].clone();
+    // Observation 3: the guard's own function -- not a re-typed copy of its
+    // expression -- must fire on this fixture's "Resource": "*" now that the
+    // statement is selected. Run it through catch_unwind so this test reports
+    // the panic as an assertion result instead of aborting the binary.
+    let resource = stmt["Resource"].as_str().expect("Resource is a string");
+    let sid = stmt["Sid"].as_str().expect("Sid is a string");
     let guard_result = std::panic::catch_unwind(|| {
-        assert!(
-            resource != "*" && !resource.ends_with(":key/*"),
-            "statement {sid:?} grants a kms: action on {resource:?}, which \
-             covers every key in the account/region"
-        );
+        assert_kms_resource_is_not_account_wide("fixture", sid, resource)
     });
     assert!(
         guard_result.is_err(),
         "the guard must reject \"KMS:Decrypt\" on Resource \"*\" once the \
          statement is selected -- a mixed-case action must not bypass the \
          no-account-wide-key assertion"
+    );
+}
+
+/// Regression fixture for the case-sensitivity hole in a NEGATIVE assertion,
+/// which fails silent where the positive ones fail loud. IAM action names are
+/// case-insensitive, so a policy granting `KMS:GenerateDataKey*` holds exactly
+/// the privilege `admin_has_no_kms_generate_data_key` asserts the role does
+/// not hold. Both halves of that assertion used to compare case-sensitively:
+/// `kms_actions` selected on `starts_with("kms:")`, and the caller compared
+/// with `starts_with("kms:GenerateDataKey")`. Either one alone was enough to
+/// report a role Decrypt-only while it could mint ciphertext under every
+/// tenant key the statement names.
+///
+/// Synthetic, not read from `deploy/iam/`: the shipped admin template is
+/// lowercase and correct, so a fixture over it passes whichever way the
+/// matcher behaves and proves nothing about the matcher.
+#[test]
+fn mixed_case_generate_data_key_is_not_missed_by_the_negative_assertion() {
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "MixedCaseGenerateDataKey",
+            "Effect": "Allow",
+            "Action": ["KMS:GenerateDataKey*", "KMS:Decrypt"],
+            "Resource":
+                "arn:aws:kms:us-east-1:111122223333:key/abcd1234-5678-90ab-cdef-1234567890ab"
+        }]),
+    };
+    let declared: Vec<String> = policy
+        .statements
+        .as_array()
+        .expect("fixture statements are an array")
+        .iter()
+        .flat_map(statement_actions)
+        .collect();
+
+    // Observation 1 (load-bearing): the pre-fix selection saw no kms action at
+    // all, so the negative assertion held over an empty action list while the
+    // grant sat in the policy. Written as the literal pre-fix expressions, so
+    // this pins the hole rather than restating the fix.
+    let selected_before_fix: Vec<&String> =
+        declared.iter().filter(|a| a.starts_with("kms:")).collect();
+    assert!(
+        selected_before_fix.is_empty(),
+        "fixture invalid: the pre-fix selection was expected to miss \
+         \"KMS:GenerateDataKey*\" -- if it saw it, this fixture no longer \
+         proves the hole existed"
+    );
+    assert!(
+        !selected_before_fix
+            .iter()
+            .any(|a| a.starts_with("kms:GenerateDataKey")),
+        "fixture invalid: the pre-fix negative assertion was expected to hold \
+         (reporting the role unprivileged) on a policy that grants the key"
+    );
+    // The second half of the hole, independent of the first: even handed the
+    // action directly, the pre-fix comparison did not recognize it.
+    assert!(
+        !declared
+            .iter()
+            .any(|a| a.starts_with("kms:GenerateDataKey")),
+        "fixture invalid: the pre-fix comparison was expected to miss \
+         \"KMS:GenerateDataKey*\" even when given the action"
+    );
+
+    // Observation 2: the post-fix selection and comparison both see it, so the
+    // negative assertion in admin_has_no_kms_generate_data_key now fires.
+    let actions = kms_actions(&policy);
+    assert!(
+        actions
+            .iter()
+            .any(|a| action_has_prefix(a, "kms:GenerateDataKey")),
+        "the post-fix matcher must see KMS:GenerateDataKey* as the \
+         kms:GenerateDataKey* grant it is. Found kms actions: {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|a| action_eq(a, "kms:Decrypt")),
+        "the post-fix matcher must see KMS:Decrypt as kms:Decrypt. \
+         Found kms actions: {actions:?}"
+    );
+
+    // Observation 3: the selected strings keep the template's own
+    // capitalization, so a failure message quotes what the policy says rather
+    // than a normalized form the operator cannot find in the file.
+    assert!(
+        actions.iter().any(|a| a == "KMS:GenerateDataKey*"),
+        "kms_actions must preserve the policy's own spelling for failure \
+         messages. Found kms actions: {actions:?}"
+    );
+}
+
+/// The same case-sensitivity shape on the `s3:PutObject` selection that feeds
+/// `roles_writing_routed_objects_have_kms_grant`. That guard derives the set
+/// of routed PUT patterns from the policy and skips the role outright when the
+/// set is empty, so a case-sensitive match on the action name silently skips
+/// the KMS-grant check for a role that does route writes -- the same
+/// fails-silent shape as the negative assertion above, reached through an
+/// empty derived set instead of an empty action list.
+///
+/// Synthetic for the same reason: the shipped templates spell the action
+/// lowercase.
+#[test]
+fn mixed_case_put_object_still_selects_routed_write_patterns() {
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "MixedCaseRoutedPut",
+            "Effect": "Allow",
+            "Action": ["S3:PutObject"],
+            "Resource": ["arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*"]
+        }]),
+    };
+
+    // Observation 1 (load-bearing): the pre-fix case-sensitive equality
+    // selected nothing, so the derived routed-PUT set was empty and the guard
+    // continued past this role without checking any KMS grant.
+    let selected_before_fix = policy
+        .statements
+        .as_array()
+        .expect("fixture statements are an array")
+        .iter()
+        .any(|stmt| statement_actions(stmt).iter().any(|a| a == "s3:PutObject"));
+    assert!(
+        !selected_before_fix,
+        "fixture invalid: the pre-fix case-sensitive match was expected to \
+         miss \"S3:PutObject\" -- if it saw it, this fixture no longer proves \
+         the hole existed"
+    );
+
+    // Observation 2: the post-fix selection returns the pattern, and the real
+    // routing predicate confirms it is a routed write, so the guard now
+    // reaches its KMS-grant assertions for this role instead of skipping it.
+    let patterns = put_resource_key_patterns(&policy);
+    assert_eq!(
+        patterns,
+        vec!["t/*/*/l0/*".to_string()],
+        "the post-fix selection must return the statement's PUT pattern"
+    );
+    assert!(
+        patterns
+            .iter()
+            .any(|p| ravel_object_store::routes_through_tenant_key(p)),
+        "fixture invalid: {patterns:?} must route through the tenant key, or \
+         the guard would skip this role for a reason unrelated to the matcher"
     );
 }
 
