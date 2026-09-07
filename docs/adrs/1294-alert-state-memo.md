@@ -48,7 +48,12 @@ transitions written since the memo rather than the whole history.
    one), a `watermark_hour` (the ingest hour the memo was stamped in), and the
    folded records: one `AlertRecord` per `alert_id`. The reader accepts exactly
    `format_version == 1` and refuses 0 and any future version, treating a
-   refused or undecodable body the same as an absent one.
+   refused or undecodable body the same as an absent one. A body that repeats an
+   `alert_id` is a decode error, not a last-wins insert: the fold's output is
+   keyed by `alert_id`, so a duplicate is ambiguous, and silently keeping one
+   copy could seed stale state for an hour below the watermark that the tail never
+   re-reads. Refusing it routes the tick through the same full-fold-and-rewrite
+   recovery an absent or corrupt memo takes.
 
 3. **Read path (every tick, before the lease).** GET the memo. Then, whatever
    the memo says, issue one `start-after` LIST over the commit prefix that skips
@@ -70,12 +75,32 @@ transitions written since the memo rather than the whole history.
    the hour a memo was stamped in is never skipped.
 
 5. **Write path (lease holder only, end of tick).** After rule evaluation, the
-   lease holder rewrites the memo with the just-folded latest state, stamping
-   the current ingest hour as the new `watermark_hour`, using `PutMode::
-   Overwrite`. Only the lease holder writes, so there is a single writer per
-   key and no CAS is needed. The write is debounced: a tick that changed neither
-   the watermark hour nor any record writes nothing. A failed write is logged
-   and ignored; it costs the next tick a full fold, never correctness.
+   lease holder rewrites the memo with the just-folded latest state, stamping the
+   **seal-bound hour** as the new `watermark_hour`, using `PutMode::Overwrite`.
+   Only the lease holder writes, so there is a single writer per key and no CAS
+   is needed. The write is debounced: a tick that changed neither the watermark
+   hour nor any record writes nothing. A failed write is logged and ignored; it
+   costs the next tick a full fold, never correctness.
+
+   The seal-bound hour, not `hour_bucket(now_ns)`, is what the watermark may
+   advance to. The alert lease permits a two-holder overlap (`acquire_lease`):
+   a prior holder whose lease has expired can still finish one in-flight tick and
+   publish a transition after this holder's tail LIST, stamped at the prior
+   holder's own clock. If that stamp lands in an hour below the watermark, the
+   tail excludes it from every future tick and the memo omits it permanently,
+   breaking the staleness invariant below by a legal interleaving. The seal bound
+   is the newest ingest hour no overlapping holder can still write into: the
+   ingest hour of `now_ns - (lease_ttl + query_deadline)`. `lease_ttl` is
+   `LEASE_TTL_TICKS` (3) times the evaluation interval; a prior holder held the
+   lease at its own tick start, so its lease had to expire before this holder
+   took over, which puts its transition stamp at least `lease_ttl` behind this
+   holder's reading. `query_deadline` (`DEFAULT_QUERY_DEADLINE`, 30s) is added as
+   the only wall-clock tolerance the alerting path defines, covering the in-flight
+   tick's own duration and modest inter-node clock skew; the alerting path
+   defines no dedicated cross-node skew constant, and a deployment whose skew
+   exceeds the query deadline would need to widen this margin. Holding the
+   watermark back never loses correctness, only re-reads a bounded tail; the tail
+   is still a single LIST over a `start-after` marker range.
 
 6. **The memo is a derived cache, never a source of truth.** ADR-0040
    decision 3 stands unchanged: current state is still defined as the fold over
@@ -131,19 +156,43 @@ from its own `ts_ns` (`publish` stamps `ingest_hour_bucket = hour_bucket(record.
 ts_ns)`), and a record's fold order is keyed on the same `ts_ns`, so a record's
 hour and its order are consistent. Partition the records by hour. Every record
 at an hour strictly below the watermark contributed to the memo when it was
-stamped and is present in the seed; no such record is written after the memo,
-because the memo writer is always the lease holder that wrote this tick's
-transitions, in the same tick. Every record at an hour at or above the
+stamped and is present in the seed. Every record at an hour at or above the
 watermark is re-read by the tail LIST, which covers exactly those hours
 inclusive. So every record reaches the fold through one path or the other, and
 the seed-plus-tail fold sees the same record set as a full fold. The tie-break
 (memoized copy at `seq == 0` versus re-read copy at `seq > 0`) never changes the
 folded value because a re-read record is byte-identical to its memoized copy.
 
-The watermark may move backward across ticks (a backward clock step widens the
-tail to cover more hours), which only ever re-reads more, never fewer, so the
+The invariant's precondition (`watermark_hour` at or below every hour the tail
+covers) is not automatic: a `watermark_hour` at `hour_bucket(now_ns)` is broken
+by the alert lease's documented two-holder overlap. A prior holder whose lease
+has expired can still finish an in-flight tick and publish a transition after
+this holder's tail LIST, stamped at the prior holder's own clock. That stamp can
+fall in an hour strictly below `hour_bucket(now_ns)` (the prior holder's clock
+reads behind, and its transition is stamped at a tick-start reading at least one
+`lease_ttl` behind this holder's), so a watermark at `hour_bucket(now_ns)` would
+exclude that hour from every future tail and drop the record permanently: a
+below-watermark record written *after* the memo, which the "no such record is
+written after the memo" step above assumed away. The seal-bound watermark
+(decision 5) restores the precondition: it is the ingest hour of
+`now_ns - (lease_ttl + query_deadline)`, older than any hour an overlapping
+holder can still stamp into, so every late transition lands at an hour at or
+above the watermark and is re-read by the tail.
+
+The watermark may also move backward across ticks (a backward clock step widens
+the tail to cover more hours), which only ever re-reads more, never fewer, so the
 invariant is preserved; the resulting duplicate reads stay within ADR-0043
 decision 6's documented at-least-once tolerance.
+
+An alternative to the seal bound is a **lease-generation fence** (design (b)):
+carry the lease generation on every transition and in the memo, refuse a memo
+write (by CAS) when the generation has moved, and fold any tail transition from
+an older generation regardless of hour. It removes the hour-skew reasoning
+entirely but costs a new field on the frozen `AlertRecord` write path (a format
+change under ravel-alerting, out of this change's scope), a durable generation
+counter, and a CAS on the memo write that the single-writer-per-key model
+otherwise does not need. The seal bound needs no new durable field and stays
+within `alerting.rs`, so it is preferred here.
 
 ## Rejected alternatives
 
@@ -180,10 +229,18 @@ decision 6's documented at-least-once tolerance.
 
 ## Consequences
 
-- A steady-state tick costs a memo GET, a lease GET, one tail LIST, and `2T`
-  GETs where `T` is the number of transitions written since the memo
-  (`T <= R` in steady state, and `T` is often 0), down from `ceil(N / page)`
-  LISTs and `2N` GETs. The cost stops growing with history.
+- A steady-state tick costs a memo GET, a lease GET, one tail LIST (a single
+  `start-after` call over a marker range), and `2T` GETs where `T` is the number
+  of transitions in the hours the tail covers, down from `ceil(N / page)` LISTs
+  and `2N` GETs. The cost stops growing with history. Because the seal-bound
+  watermark holds back by `lease_ttl + query_deadline` (a few minutes at the
+  defaults), the tail covers not just the current hour but every hour within that
+  seal margin, so `T` counts transitions in that trailing window rather than only
+  the current hour. For a quiet tenant whose last transition is older than the
+  seal margin, `T` is 0 and the tick is exactly 2 GETs and 1 LIST; a transition
+  is re-read for the few ticks until it falls below the widened watermark. This is
+  the honest bound after the seal-bound watermark; the earlier "current hour only"
+  figure did not account for the lease overlap and could lose a late transition.
 - A cold, absent, corrupt, or unsupported-version memo pays a one-time full fold
   and then rewrites a valid memo, so the expensive path is self-healing and
   bounded to the tick that hit it.
