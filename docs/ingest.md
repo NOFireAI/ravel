@@ -553,6 +553,25 @@ for. The gauge, its configured ceiling, and the shed counter render on
 `/metrics` as `ravel_ingest_buffer_bytes`, `ravel_ingest_buffer_bytes_limit`,
 and `ravel_ingest_buffer_shed_total`.
 
+The router charge above happens after decode/normalize, so on its own it left
+one transient buffer outside the ceiling: the OTLP HTTP gzip decompression
+buffer, which inflates ahead of decode and can reach
+`MAX_DECOMPRESSED_OTLP_BODY_BYTES` (64 MiB). The gateway now charges that gauge
+too, before it inflates (the ADR-0069 amendment). On the gzip path
+`services/ravel-server/src/otlp_http.rs` charges the decompressed bytes into the
+same `IngestByteBudget` *as they are produced*, chunk by chunk, so a
+decompression whose running total would cross the ceiling is shed mid-inflate
+(HTTP 429, the same `ravel_ingest_buffer_shed_total`) instead of allocating the
+full expansion first. Charging the produced bytes, not the 64 MiB cap and not a
+compressed-size estimate, keeps the charge equal to the actual inflated length
+(no over-charge of a well-compressing request). The gateway holds that charge
+through protobuf decode and normalize and drops it once the router has taken its
+own buffered charge, so the peak decode-time bytes are accounted for their whole
+lifetime. The identity (uncompressed) path allocates no transient inflate buffer
+and takes no gateway charge; its decoded body is bounded by the 16 MiB body
+limit and `--max-inflight-ingest-requests` (term 2 below). The OTLP gRPC and
+Remote Write decode paths are unchanged by this amendment and remain term 2.
+
 ### Worst-case resident memory
 
 Worst-case ingest resident memory is the sum of three named, config-bounded
@@ -588,17 +607,40 @@ terms:
    `--max-inflight-ingest-requests` (default 1024) times the largest
    per-request decoded size (Remote Write's 64 MiB post-decompression cap, or
    OTLP's 16 MiB), the same worst case the concurrency limit already
-   documents above. It is *not* covered by the buffer budget, which is
-   charged post-decode.
+   documents above. One slice of this overhead was moved under term 1 by the
+   ADR-0069 amendment: the OTLP HTTP gzip decompression buffer,
+   which used to inflate up to 64 MiB per request entirely outside any byte
+   ceiling, is now charged against `--max-ingest-buffer-bytes` as it inflates,
+   so `--max-inflight-ingest-requests` copies of it can no longer sum past that
+   ceiling. What remains in term 2 is the *uncharged* transient decode memory:
+   the identity-path OTLP HTTP body (bounded by the 16 MiB body limit), and the
+   OTLP gRPC and Remote Write decode/decompression buffers, none of which the
+   buffer budget charges. So the worst-case transient decode memory bounded
+   only by `--max-inflight-ingest-requests` is that ceiling times the largest
+   *uncharged* decoded body (Remote Write's 64 MiB, or OTLP gRPC / identity
+   HTTP's 16 MiB); the OTLP HTTP gzip inflate is bounded by
+   `--max-ingest-buffer-bytes` instead.
 3. **Fixed overhead**: shard-actor and router state, the admission
    controller's per-tenant maps, and the read caches (`--cache-max-bytes`),
    all bounded independently of ingest volume.
 
 So an operator sizes ingest RSS as
-`max_ingest_buffer_bytes + (max_inflight_ingest_requests x largest_decoded_body)
-+ fixed_overhead`, every term a knob. Lowering `--max-ingest-buffer-bytes`
-tightens term 1 directly, trading a lower memory ceiling for earlier shedding
-under a many-tenant burst.
+`max_ingest_buffer_bytes + (max_inflight_ingest_requests x largest_uncharged_decoded_body)
++ fixed_overhead`, every term a knob, where `largest_uncharged_decoded_body` is
+now the largest body term 2 still owns (Remote Write / OTLP gRPC 64 MiB, or
+identity OTLP HTTP 16 MiB) rather than the OTLP HTTP gzip inflate. Lowering
+`--max-ingest-buffer-bytes` tightens term 1 directly, trading a lower memory
+ceiling for earlier shedding under a many-tenant burst.
+
+Boundedness of the OTLP HTTP gzip inflate (ADR-0069 amendment): before the ADR-0069
+amendment, `--max-inflight-ingest-requests` copies of the 64 MiB gzip inflate
+buffer could exist at once outside every byte ceiling -- 64 GiB at the default
+1024, on hosts whose whole RAM is a fraction of that. That transient is now
+charged against `--max-ingest-buffer-bytes` as it inflates, so the sum of all
+concurrent OTLP HTTP gzip inflate buffers is bounded by that one ceiling, the
+same gauge that bounds buffered state. Peak process RSS is a config-bounded sum
+of named knobs, not an unbounded product of concurrency and per-request inflate
+size.
 
 ### Idle-tenant state eviction (ADR-0069 decision 2)
 
