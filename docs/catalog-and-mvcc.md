@@ -164,7 +164,9 @@ reader-protection gate) and **not** membership (that is the
 
 `t/<tenant_hash>/a/state/latest` (ADR-1294, Proposed) is the alert evaluator's
 derived state memo, one object per tenant holding the folded latest record per
-`alert_id` plus the ingest hour it was stamped in. It is a derived cache of the
+`alert_id` plus the seal-bound hour it was stamped in: never the writer's own
+current-tick hour, always the newest hour no overlapping prior lease holder
+can still write into. It is a derived cache of the
 `Signal::Alerts` fold (ADR-0040 decision 3), placed deliberately outside the
 `t/<tenant_hash>/a/c/` commit prefix so neither the evaluator's own fold nor the
 `alerts` SQL table's listing of commit records ever sees it. On each tick every
