@@ -57,10 +57,14 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         ("AdmissionUsageSnapshot", Immutable(&[1])),
         ("WorkerHeartbeat", Immutable(&[1])),
         // Read-modify-write under CAS. ProvisioningRecord / TenantConfigRecord /
-        // MetricMetadataRecord accept {1, 2} after ADR-0066 R1 (this change);
-        // AuthTokenMap already accepts {1, 2} (managed_by, ADR-0072 #897). The
-        // rest still accept {1}: their reader gates are unchanged here because
-        // their crates are in flight under other work (reported, not fixed).
+        // MetricMetadataRecord accept {1, 2} after ADR-0066 R1; AuthTokenMap
+        // accepts {1, 2} (managed_by, ADR-0072 #897) and KeyEpochRecord {1}, both
+        // as a floor-and-ceiling set since ADR-0066 R2. GcConfig and
+        // CompactionClaim still carry ceiling-only gates in their own crates
+        // (ravel-maintain, ravel-fleet), outside this change's scope: reported,
+        // not fixed. Every slice belonging to a ravel-catalog reader is checked
+        // against that reader's own constants by
+        // `catalog_read_sets_match_their_readers_constants`.
         ("ProvisioningRecord", CasMutable(&[1, 2])),
         ("TenantConfigRecord", CasMutable(&[1, 2])),
         ("MetricMetadataRecord", CasMutable(&[1, 2])),
@@ -157,14 +161,77 @@ fn classification_is_complete() {
         "classification_table() names messages not in sys.proto (renamed or removed?): {stale:?}"
     );
 
-    // Sanity: the eleven versioned messages ADR-0066 enumerates are all present,
-    // so a parser regression that silently found none is itself caught.
+    // Sanity: the proto and the table enumerate the same number of messages, so a
+    // parser regression that silently found none (or found a subset) is itself
+    // caught. The count comes from the table rather than a literal so that adding
+    // a message and classifying it in the same commit does not have to edit a
+    // number in a third place -- but the floor below still catches a parser that
+    // returns nothing, which the equality alone would not if the table were also
+    // empty.
+    assert!(
+        !classified.is_empty(),
+        "the classification table is empty: it must enumerate every versioned sys.proto message"
+    );
     assert_eq!(
         in_proto.len(),
-        11,
-        "expected 11 versioned sys.proto messages (ADR-0066 decision 4); found {}: {in_proto:?}",
+        classification_table().len(),
+        "the proto and the classification table must enumerate the same messages; found {}: {in_proto:?}",
         in_proto.len()
     );
+}
+
+/// Every read-version slice in the table that belongs to a reader THIS crate owns
+/// is the closed set that reader's own `MIN_READ_VERSION..=MAX_READ_VERSION`
+/// constants define. Widening a gate without updating the table therefore fails
+/// here, which is the point: a table that merely restated the constants would
+/// track any change silently and guard nothing.
+///
+/// The six messages absent from this list are read outside ravel-catalog
+/// (ravel-fleet, ravel-maintain, ravel-server, ravel-ingest). Asserting their
+/// slices against their constants would need a dev-dependency on each of those
+/// crates, so their entries stay literal and are maintained by hand.
+#[test]
+fn catalog_read_sets_match_their_readers_constants() {
+    use ravel_catalog as cat;
+
+    let expected: BTreeMap<&'static str, Vec<u32>> = BTreeMap::from([
+        (
+            "ProvisioningRecord",
+            (cat::PROVISIONING_MIN_READ_VERSION..=cat::PROVISIONING_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "TenantConfigRecord",
+            (cat::TENANT_CONFIG_MIN_READ_VERSION..=cat::TENANT_CONFIG_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "MetricMetadataRecord",
+            (cat::METRICS_META_MIN_READ_VERSION..=cat::METRICS_META_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "AuthTokenMap",
+            (cat::AUTH_TOKEN_MAP_MIN_READ_VERSION..=cat::AUTH_TOKEN_MAP_MAX_READ_VERSION).collect(),
+        ),
+        (
+            "KeyEpochRecord",
+            (cat::KEY_EPOCH_MIN_READ_VERSION..=cat::KEY_EPOCH_MAX_READ_VERSION).collect(),
+        ),
+    ]);
+
+    let table = classification_table();
+    for (name, versions) in expected {
+        let class = table
+            .get(name)
+            .unwrap_or_else(|| panic!("{name} must be classified"));
+        let listed = match class {
+            Class::CasMutable(v) | Class::Immutable(v) => *v,
+        };
+        assert_eq!(
+            listed,
+            versions.as_slice(),
+            "{name}: the table's read set disagrees with its reader's MIN/MAX constants. \
+             A widened gate must be recorded here too (ADR-0066 decision 4)."
+        );
+    }
 }
 
 /// Every CasMutable supported set is non-empty and includes version 1 (the
