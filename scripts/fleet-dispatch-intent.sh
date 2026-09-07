@@ -15,12 +15,24 @@
 #   fleet-dispatch-intent.sh record <epic-issue> <nonce> <task-id>
 #   fleet-dispatch-intent.sh failed <epic-issue> <nonce> [reason...]
 #
+# This script writes COMMENTS. epic-status.sh reads the issue BODY and
+# nothing else, so a task recorded only here is invisible to the
+# reconciliation that exists to catch a silently dead task: it reports
+# nothing wrong because it never saw the task at all. Step 5 below is what
+# closes that, and it is not optional if you rely on epic-status.sh.
+#
 # Flow in the orchestrator turn:
 #   1. sha=$(git fetch origin main -q && git rev-parse origin/main)
 #   2. nonce=$(scripts/fleet-dispatch-intent.sh intent <epic> <ticket> "$sha")
 #   3. call fleet_dispatch with ref=$sha
 #   4a. scripts/fleet-dispatch-intent.sh record <epic> "$nonce" <task-id>
 #   4b. on error: scripts/fleet-dispatch-intent.sh failed <epic> "$nonce" <why>
+#   5. append the task id to the epic BODY's ledger, in the form
+#      `- #<ticket> task=<uuid> <status>`, then re-run
+#      `scripts/epic-status.sh <epic> --fresh` and confirm the id appears
+#      (an in-flight task reads `start=yes result=no`). Any body line
+#      containing the UUID works; epic-status.sh scans the whole body, so a
+#      dedicated section is a convenience, not a requirement.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

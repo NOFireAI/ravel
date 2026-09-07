@@ -6,6 +6,14 @@
 # task-branch PRs. This is the pre-dispatch ledger reconciliation from
 # CLAUDE.md as one command.
 #
+# The body is the ONLY source. Comments are not read, and
+# fleet-dispatch-intent.sh records into comments, so a dispatch wrapped in
+# that script is not reconciled here until its task id also appears in the
+# body. The failure is silent in the direction that matters: a task missing
+# from the body cannot be reported as dead, because it is not reported at
+# all. A row count lower than the number of dispatches you remember making
+# is the symptom.
+#
 # Usage: epic-status.sh <epic-issue-number> [--fresh]
 #   --fresh bypasses the cache.
 set -euo pipefail
