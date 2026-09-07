@@ -1676,6 +1676,9 @@ pub async fn measure_corpus(
             min_tokens: Vec::new(),
             now_ns,
             deadline,
+            row_window: false,
+            max_rows: None,
+            budgets: None,
         };
 
         // EXPLAIN side artifact, before any timed run and never counted in the
@@ -3890,6 +3893,9 @@ mod tests {
             min_tokens: Vec::new(),
             now_ns: NOW_NS,
             deadline: Duration::from_secs(30),
+            row_window: false,
+            max_rows: None,
+            budgets: None,
         };
 
         // Fetcher cache ON: a fresh executor (cold catalog byte cache, cold

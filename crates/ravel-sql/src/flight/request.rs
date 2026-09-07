@@ -104,6 +104,9 @@ pub(super) fn sql_request(
         min_tokens,
         now_ns,
         deadline,
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     })
 }
 

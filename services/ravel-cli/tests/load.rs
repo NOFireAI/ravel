@@ -94,6 +94,9 @@ async fn logs_query_rows(
         min_tokens: min_tokens.to_vec(),
         now_ns: CLOCK_NS + 1_000,
         deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     };
     let outcome = executor
         .execute(TenantId::new(tenant).hash(), &req)
