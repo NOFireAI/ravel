@@ -7,10 +7,16 @@
 
 mod util;
 
-use ravel_query::EngineConfig;
+use std::sync::Arc;
+
+use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::memory::MemoryStore;
 use ravel_query::io_shape::PlanClass;
+use ravel_query::{EngineConfig, LogSegmentFetcher};
 use ravel_sql::SqlConfig;
-use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
+use util::{
+    Fixture, SegSpec, SeriesSpec, build_read_cache, publish_logs_segments, request, tenant_id,
+};
 
 fn segment(index: i64, metric: &str) -> SegSpec {
     SegSpec::new(
@@ -178,5 +184,139 @@ async fn shared_get_permits_reflects_store_get_concurrency_not_u64_max() {
         outcome.stats.io_shape.service_batches, 3,
         "8 segments, 8 partitions, but only 3 shared GET permits: \
          ceil(8/min(8,3)) = 3, not the u64::MAX model's ceil(8/8) = 1"
+    );
+}
+
+/// Uncached Logs/Alerts/Audit is segment-granular, matching `RsegScanExec`
+/// (issue #1250 review fix, finding 2a) -- but the old model charged only
+/// the scan phase and missed `compute_plan_counts`'s own uncounted
+/// `buffer_unordered(target_partitions)` plan-probe pass (issue #691), which
+/// gates every scan partition and never overlaps with it.
+///
+/// This fixture publishes 5 log segments with `sql_partition_count = 2` and
+/// the default `store_get_concurrency` (8):
+///
+/// Scan phase (unchanged by this fix, both models agree here):
+/// `partitions = min(2, 5) = 2`, `segments_per_plan = ceil(5/2) = 3`, one
+/// wave (`distinct_plans == outer_fanout == partitions == 2`), `active = 2`,
+/// `capacity = min(1*2, 8) = 2`, `service_batches = ceil(3*2/2) = 3`.
+///
+/// Plan phase (the old model's omission): one probe per segment at
+/// `buffer_unordered(plan_partitions.min(shared_get_permits)) =
+/// buffer_unordered(min(2,8)=2)`, so `service_batches = ceil(5/2) = 3`.
+///
+/// Total, fixed model: `3 (plan) + 3 (scan) = 6`. Old (Metrics-shaped, no
+/// plan-phase term) model: `3`.
+///
+/// Flip-line proof: with the plan-phase `saturating_add` removed (or
+/// `plan_phase_batches` fixed at 0), this assertion (`6`) fails and reads `3`
+/// instead.
+#[tokio::test]
+async fn uncached_logs_scan_adds_the_plan_phase_to_the_scan_phase() {
+    const TARGET_PARTITIONS: usize = 2;
+    const LOG_SEGMENTS: usize = 5;
+    let tenant = tenant_id("io-shape-logs-uncached");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_logs_segments(store.as_ref(), &tenant, LOG_SEGMENTS).await;
+
+    let config = SqlConfig {
+        engine: EngineConfig {
+            sql_partition_count: Some(TARGET_PARTITIONS),
+            ..EngineConfig::default()
+        },
+        ..SqlConfig::default()
+    };
+    let fixture = Fixture::build(Arc::clone(&store), &[], config, 1 << 30).await;
+
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &request("SELECT ts, body FROM logs"))
+        .await
+        .expect("logs query");
+
+    assert_eq!(
+        outcome.stats.segments, LOG_SEGMENTS,
+        "sanity: all 5 resolve"
+    );
+    assert_eq!(
+        outcome.stats.io_shape.service_batches, 6,
+        "uncached logs: plan phase ceil(5/min(2,8))=3 plus scan phase \
+         ceil(3*2/2)=3, total 6, not the old Metrics-shaped model's 3 \
+         (scan phase alone)"
+    );
+}
+
+/// Cache-wired Logs/Alerts/Audit block-strides across `min(target_partitions,
+/// total_block_count)` partitions, unclamped by segment count -- the exact
+/// opposite of the uncached shape above (issue #1250 review fix, finding
+/// 2b). The old model applied the uncached (`RsegScanExec`-style) clamp
+/// uniformly, which badly undercounts here since a segment count far below
+/// the partition count no longer bounds the outer width once the cache is
+/// wired in.
+///
+/// This fixture publishes 3 log segments with `sql_partition_count = 8` and
+/// `store_get_concurrency = 50`, and wires a read cache into the
+/// `LogSegmentFetcher` so `has_cache() == true`.
+///
+/// Fixed model: `total_block_count` is not resolvable at resolve time
+/// without extra I/O (`SegmentRef` carries no block-count field), so
+/// `segments_per_plan` is upper-bounded at `total_segments = 3` and
+/// `partitions` at the configured `8` (both legitimate, never-exceeded
+/// bounds since there are only 3 segments and DataFusion never plans more
+/// than 8 partitions). Plan phase: `service_batches(3, min(8,50)=8) =
+/// ceil(3/8) = 1`. Scan phase: one wave (`distinct_plans == outer_fanout ==
+/// 8`), `active = 8`, `capacity = min(1*8, 50) = 8`,
+/// `service_batches = ceil(3*8/8) = 3`. Total: `1 + 3 = 4`.
+///
+/// Old (uncached-shaped) model: `partitions = min(8, 3) = 3` (wrongly
+/// clamped by segment count), `segments_per_plan = ceil(3/3) = 1`, one wave,
+/// `active = 3`, `capacity = min(3,50) = 3`, `service_batches = ceil(1*3/3)
+/// = 1`, no plan-phase term. Old total: `1`.
+///
+/// Flip-line proof: with the `has_cache()` branch removed (falling through
+/// to the uncached clamp unconditionally), this assertion (`4`) fails and
+/// reads `1` instead.
+#[tokio::test]
+async fn cached_logs_scan_is_not_clamped_by_segment_count() {
+    const TARGET_PARTITIONS: usize = 8;
+    const STORE_GET_CONCURRENCY: usize = 50;
+    const LOG_SEGMENTS: usize = 3;
+    let tenant = tenant_id("io-shape-logs-cached");
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_logs_segments(store.as_ref(), &tenant, LOG_SEGMENTS).await;
+
+    let cache = build_read_cache(64 << 20);
+    let log_fetcher = LogSegmentFetcher::new(Arc::clone(&store)).with_cache(cache);
+    assert!(
+        log_fetcher.has_cache(),
+        "this fixture must exercise the cache-wired path"
+    );
+
+    let config = SqlConfig {
+        engine: EngineConfig {
+            sql_partition_count: Some(TARGET_PARTITIONS),
+            store_get_concurrency: Some(STORE_GET_CONCURRENCY),
+            ..EngineConfig::default()
+        },
+        ..SqlConfig::default()
+    };
+    let fixture =
+        Fixture::build_with_log_fetcher(Arc::clone(&store), &[], config, 1 << 30, log_fetcher)
+            .await;
+
+    let outcome = fixture
+        .executor
+        .execute(tenant.hash(), &request("SELECT ts, body FROM logs"))
+        .await
+        .expect("logs query");
+
+    assert_eq!(
+        outcome.stats.segments, LOG_SEGMENTS,
+        "sanity: all 3 resolve"
+    );
+    assert_eq!(
+        outcome.stats.io_shape.service_batches, 4,
+        "cached logs: plan phase ceil(3/min(8,50))=1 plus scan phase \
+         ceil(3*8/8)=3, total 4, not the old segment-clamped model's 1"
     );
 }
