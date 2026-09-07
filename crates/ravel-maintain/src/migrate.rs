@@ -18,8 +18,9 @@
 //!    it costs a rescan, never correctness. The cursor lets a huge migration
 //!    run across many bounded invocations, each resuming exactly where the last
 //!    stopped, never reprocessing an already-migrated bucket (the pre-migration
-//!    per-bucket compaction-record check makes reprocessing a no-op even if the
-//!    cursor is lost) and never skipping one (the walk order is total and the
+//!    per-bucket raw-served check makes reprocessing a no-op even if the cursor
+//!    is lost: the migration's own record names every input it rewrote) and
+//!    never skipping one (the walk order is total and the
 //!    cursor only ever moves forward). The cursor exists only to carry an
 //!    unfinished walk across invocations, so a walk that drains clears it: it
 //!    is a position in one walk, not a permanent high-water mark, and a
@@ -49,20 +50,30 @@
 //! re-audit deliberately counts every live commit and compaction record
 //! regardless of seal state: a fresh, still-unsealed below-target record the
 //! walk could not yet migrate still blocks the raise, which is exactly the
-//! guarantee the floor must carry. "Live" excludes an L0 commit record that a
-//! compaction or rewrite record names in its input list
-//! ([`count_below_target`], keyed on the same predicate sweep rule 2 deletes
-//! by): those are sweepable leftovers of a rewrite this same walk may just
-//! have performed, not stragglers, so migrating a bucket and then re-auditing
-//! it in the same invocation converges without needing an interleaved `sweep`
-//! in between. The exclusion asks the input-set question
+//! guarantee the floor must carry. "Live" excludes an L0 commit record that an
+//! AUTHORITATIVE compaction record, or a rewrite record, names in its input
+//! list ([`count_below_target`], keyed on the same predicate sweep rule 2
+//! deletes by): those are sweepable leftovers of a rewrite this same walk may
+//! just have performed, not stragglers, so migrating a bucket and then
+//! re-auditing it in the same invocation converges without needing an
+//! interleaved `sweep` in between. The exclusion asks the input-set question
 //! directly rather than "does this record's bucket carry a compaction record",
 //! so the re-audit confirms coverage instead of assuming the seal invariant
 //! that makes the two equivalent.
+//!
+//! Authority is what makes that exclusion sound when two compaction records
+//! over one bucket overlap: they resolve to one winner per overlap component
+//! ([`ravel_catalog::select_authoritative_compaction_records`], the rule the
+//! resolver, the index fold, the sweep and the erasure completion gate share),
+//! the losers' parts are served from nowhere, and an input only a loser names
+//! is served raw by `Catalog::resolve`. Both the walk's eligibility check and
+//! the re-audit ask the question through that rule, so such an input is
+//! visited by one and counted by the other, rather than being invisible to
+//! both -- which is the false durable claim the floor must never make.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use ravel_catalog::current_floor_from_store;
+use ravel_catalog::{current_floor_from_store, select_authoritative_compaction_records};
 use ravel_commit::{keys, record};
 use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum, Version,
@@ -75,7 +86,7 @@ use crate::bucket::Bucket;
 use crate::clock::Clock;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
-use crate::read::{list_bucket, load_inputs};
+use crate::read::{BucketListing, list_bucket, load_inputs};
 use crate::rewrite::{MigrateOutcome, migrate_bucket_format};
 use crate::sweep::superseded_input_commit_keys;
 
@@ -135,9 +146,9 @@ pub enum Verification {
     /// that landed after the walk passed, or that the walk could not migrate --
     /// so the floor was left untouched. `l0` counts below-target commit records
     /// still live (a bucket's pre-rewrite commit records already superseded by
-    /// a compaction/rewrite record for that bucket are excluded, not counted
-    /// here: [`count_below_target`]), `l1` counts below-target compaction
-    /// parts.
+    /// an authoritative compaction record, or by a rewrite record, are
+    /// excluded, not counted here: [`count_below_target`]), `l1` counts
+    /// below-target compaction parts.
     Stragglers { l0: usize, l1: usize },
 }
 
@@ -157,6 +168,20 @@ pub struct FamilyMigrateReport {
     pub buckets_migrated: usize,
     /// L0 records migrated this invocation (the budget spend).
     pub records_migrated: u64,
+    /// Buckets this invocation found still serving a below-target L0 record raw
+    /// that the rewrite primitive refused, because the bucket already carries a
+    /// compaction or rewrite record set.
+    ///
+    /// The load-bearing case is a bucket whose overlapping compaction records
+    /// resolve to a winner and a loser: every input only the loser names is
+    /// served as a raw L0 segment, is live, and cannot be migrated by rewriting
+    /// that subset (a new record over it would join the same overlap component
+    /// and lose to the existing winner). Such a bucket makes
+    /// [`count_below_target`] report stragglers on every invocation, so the
+    /// floor for the family stays unraised until the overlap itself is
+    /// resolved. A nonzero value here names that condition instead of leaving
+    /// an operator to infer it from a straggler count that never drains.
+    pub buckets_blocked: usize,
     /// The `(shard, ingest_hour)` the cursor was persisted at, when this
     /// invocation stopped on its budget. `None` once the walk completes: a
     /// drained walk clears the cursor rather than leaving a position behind.
@@ -342,6 +367,22 @@ async fn list_shard_hours(
 /// the still-live, un-migrated remainder and raise the floor over data below
 /// the target, a false claim about durable state; the input-set predicate
 /// excludes exactly the records that were actually superseded.
+///
+/// Only an AUTHORITATIVE compaction record's inputs are excluded. Compaction
+/// records whose input sets overlap resolve to one winner per overlap
+/// component ([`select_authoritative_compaction_records`], the rule the
+/// resolver, the index fold, the superseded-input sweep and the erasure
+/// completion gate all share); a loser's parts are served from nowhere, so an
+/// input only a loser names is still served as a raw L0 segment by
+/// `Catalog::resolve` and is exactly the live, below-target object the floor
+/// would be falsely raised over. Excluding a loser's whole input set is
+/// therefore the same false durable claim this predicate exists to prevent,
+/// one step further in: the record would be neither migrated by the walk nor
+/// counted here.
+///
+/// Rewrite records are not part of that selection: ADR-0064 decision 3 point 5
+/// keeps one record set per bucket, so a live rewrite record has no overlapping
+/// peer to lose to and its whole input list supersedes.
 pub async fn count_below_target(
     store: &dyn ObjectStoreBackend,
     tenant_hash: &TenantHash,
@@ -363,11 +404,17 @@ pub async fn count_below_target(
         // keys it explicitly supersedes. A record must be read for its parts
         // anyway, so deriving the supersession set from its `inputs` list here
         // adds no store read over the bucket-membership version this replaced;
-        // commit records are deferred to the second pass because the full
+        // commit records are deferred to the third pass because the full
         // supersession set is only known once every record in the shard has
-        // been seen.
+        // been seen. Compaction records are additionally held per ingest-hour
+        // bucket rather than resolved inline: an overlap component is a
+        // property of one bucket (the unit the resolver reads), so which of
+        // them are authoritative is only decidable once the whole bucket's set
+        // is in hand.
         let mut commit_keys = Vec::with_capacity(metas.len());
         let mut superseded_commits: HashSet<String> = HashSet::new();
+        let mut compaction_by_bucket: HashMap<u32, Vec<(String, CompactionRecord)>> =
+            HashMap::new();
         for meta in metas {
             let entry = keys::partition_bucket_entry(&meta.key).map_err(MaintainError::Key)?;
             let key = meta.key;
@@ -386,12 +433,10 @@ pub async fn count_below_target(
                             l1_below += 1;
                         }
                     }
-                    superseded_commits.extend(superseded_input_commit_keys(
-                        tenant_hash,
-                        signal,
-                        shard,
-                        &rec,
-                    )?);
+                    compaction_by_bucket
+                        .entry(rec.ingest_hour_bucket)
+                        .or_default()
+                        .push((key, rec));
                 }
                 // A rewrite record (selective erasure, ADR-0064) carries the
                 // same CompactionPart parts as a compaction record; its
@@ -427,6 +472,26 @@ pub async fn count_below_target(
             }
         }
 
+        // Second pass: resolve each bucket's compaction records to one
+        // authoritative record per overlap component and take only a winner's
+        // inputs as superseded. An input a loser alone names has no live
+        // successor -- the loser's parts are ignored -- so it is still served
+        // raw and still counts below the target.
+        for records in compaction_by_bucket.values() {
+            let losing = select_authoritative_compaction_records(records);
+            for (key, rec) in records {
+                if losing.contains(key.as_str()) {
+                    continue;
+                }
+                superseded_commits.extend(superseded_input_commit_keys(
+                    tenant_hash,
+                    signal,
+                    shard,
+                    rec,
+                )?);
+            }
+        }
+
         for key in commit_keys {
             if superseded_commits.contains(&key) {
                 continue;
@@ -441,6 +506,86 @@ pub async fn count_below_target(
     Ok((l0_below, l1_below))
 }
 
+/// The commit keys of `listing`'s L0 records that its compaction and rewrite
+/// records leave served RAW, in listing order: the ones `Catalog::resolve`
+/// still returns as L0 segments because no authoritative record covers them.
+///
+/// This is the walk's eligibility question, asked with the same predicate
+/// [`count_below_target`] verifies with, rather than "does this bucket carry a
+/// compaction record at all". The two differ exactly where two overlapping
+/// compaction records resolve to a winner and a loser
+/// ([`select_authoritative_compaction_records`]): an input only the loser names
+/// is served raw, so a bucket carrying compaction records can still hold live,
+/// un-migrated L0. Skipping the whole bucket on record presence hides that
+/// record from the walk while the re-audit counts it, which is a migration
+/// that can never converge; counting it in neither is the false floor raise.
+///
+/// A bucket with no compaction or rewrite record answers from the listing
+/// alone, so the ordinary path pays no extra store read; a bucket that carries
+/// records pays one GET per record, which is what deciding authority requires.
+async fn raw_served_commit_keys(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    listing: &BucketListing,
+) -> Result<Vec<String>> {
+    use prost::Message;
+
+    if listing.compaction_record_keys.is_empty() && listing.rewrite_record_keys.is_empty() {
+        return Ok(listing.commit_keys.clone());
+    }
+
+    let mut compaction_records: Vec<(String, CompactionRecord)> =
+        Vec::with_capacity(listing.compaction_record_keys.len());
+    for key in &listing.compaction_record_keys {
+        let got = store.get(key, GetRange::Full).await?;
+        let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
+            MaintainError::Invariant(format!(
+                "compaction record {key} is corrupt during the migrate walk: {err}"
+            ))
+        })?;
+        compaction_records.push((key.clone(), rec));
+    }
+
+    let mut superseded: HashSet<String> = HashSet::new();
+    let losing = select_authoritative_compaction_records(&compaction_records);
+    for (key, rec) in &compaction_records {
+        if losing.contains(key.as_str()) {
+            continue;
+        }
+        superseded.extend(superseded_input_commit_keys(
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+            rec,
+        )?);
+    }
+
+    // A rewrite record has no overlapping peer to lose to (ADR-0064 decision 3
+    // point 5 keeps one record set per bucket), so its whole input list
+    // supersedes, exactly as the re-audit treats it.
+    for key in &listing.rewrite_record_keys {
+        let got = store.get(key, GetRange::Full).await?;
+        let rec = RewriteRecord::decode(got.data.as_ref()).map_err(|err| {
+            MaintainError::Invariant(format!(
+                "rewrite record {key} is corrupt during the migrate walk: {err}"
+            ))
+        })?;
+        superseded.extend(superseded_input_commit_keys(
+            &bucket.tenant_hash,
+            bucket.signal,
+            bucket.shard,
+            &rec,
+        )?);
+    }
+
+    Ok(listing
+        .commit_keys
+        .iter()
+        .filter(|key| !superseded.contains(*key))
+        .cloned()
+        .collect())
+}
+
 /// Migrate one `(tenant, signal, family)` toward `target_version`, resuming from
 /// the durable cursor, bounded by `budget`, and -- once the walk drains --
 /// verifying fresh and raising the format floor.
@@ -450,10 +595,13 @@ pub async fn count_below_target(
 /// 1. resolves the generation-aware shard range (fail-closed) and reads the
 ///    advisory cursor;
 /// 2. walks buckets in `(shard, ingest_hour)` order, skipping everything at or
-///    below the cursor, and for each sealed, un-tombstoned, not-yet-compacted
-///    bucket carrying a below-target L0 record, rewrites its whole live L0 set
-///    to the target via [`migrate_bucket_format`] (the rewrite primitive),
-///    advancing the cursor past every examined bucket;
+///    below the cursor, and for each sealed, un-tombstoned bucket that still
+///    serves a below-target L0 record raw ([`raw_served_commit_keys`], not the
+///    presence of a compaction record), rewrites its whole live L0 set to the
+///    target via [`migrate_bucket_format`] (the rewrite primitive), advancing
+///    the cursor past every examined bucket. A bucket the primitive refuses
+///    because it already carries a record set counts into
+///    [`FamilyMigrateReport::buckets_blocked`];
 /// 3. stops early once `budget` is spent (persisting the cursor and returning
 ///    with `walk_complete == false` so the caller re-invokes), or runs the
 ///    verify-and-raise step once the walk reaches its end within budget;
@@ -510,28 +658,26 @@ pub async fn migrate_family(
 
             // Discover eligibility exactly as the audit walk does: from the
             // commit records' recorded format version, never a data-object GET.
-            // Only a sealed, un-tombstoned, not-yet-compacted bucket carrying a
-            // below-target L0 record is rewritten here; a compacted bucket's L1
-            // parts are the rewrite-on-touch scope, and the re-audit below
-            // still refuses the floor raise if any such L1 straggler survives.
-            // A bucket holding a live erasure rewrite record is skipped for the
-            // same reason `migrate_bucket_format` refuses it: a second record
-            // set over the same inputs would make the catalog serve both
-            // (ADR-0064 decision 3 point 5).
+            // Only a sealed, un-tombstoned bucket that still serves at least
+            // one below-target L0 record RAW is a candidate here; a compacted
+            // bucket's L1 parts are the rewrite-on-touch scope, and the
+            // re-audit below still refuses the floor raise if any such L1
+            // straggler survives.
+            //
+            // "Still served raw" is asked through the shared authority rule
+            // ([`raw_served_commit_keys`]), not answered from the presence of a
+            // compaction record. A bucket whose overlapping compaction records
+            // resolve to a winner and a loser leaves every loser-only input
+            // served as a raw L0 segment, so record presence would skip a live
+            // below-target record that the re-audit rightly counts.
             let listing = list_bucket(store, &bucket).await?;
             if bucket.is_sealed(now, config)
                 && listing.tombstone_key.is_none()
-                && listing.compaction_record_keys.is_empty()
-                && listing.rewrite_record_keys.is_empty()
                 && !listing.commit_keys.is_empty()
             {
-                let inputs = load_inputs(
-                    store,
-                    &bucket,
-                    &listing.commit_keys,
-                    config.input_read_concurrency,
-                )
-                .await?;
+                let served = raw_served_commit_keys(store, &bucket, &listing).await?;
+                let inputs =
+                    load_inputs(store, &bucket, &served, config.input_read_concurrency).await?;
                 let l0_below = inputs
                     .iter()
                     .filter(|i| i.record.segment_format_version < target_version)
@@ -545,14 +691,28 @@ pub async fn migrate_family(
                             report.records_migrated += l0_below;
                             spent += l0_below;
                         }
-                        // A concurrent compaction/tombstone/rewrite landed
-                        // between our listing and the call: harmless, the other
-                        // actor's result stands and the re-audit still gates the
-                        // floor.
+                        // The rewrite primitive serves one record set per
+                        // bucket, so it refuses a bucket that already carries
+                        // compaction or rewrite records. Reached two ways, and
+                        // recorded rather than dropped either way: a concurrent
+                        // compaction or erasure landed between our listing and
+                        // the call (harmless, the other actor's result stands),
+                        // or the bucket holds overlapping compaction records
+                        // whose loser-only inputs are still served raw and
+                        // below the target. The second case cannot be migrated
+                        // by rewriting a subset -- a new record over those
+                        // inputs would join the same overlap component and lose
+                        // to the existing winner -- so the re-audit's straggler
+                        // refusal is the correct end state, and this counter is
+                        // what tells the operator which buckets it is waiting
+                        // on.
+                        MigrateOutcome::AlreadyCompacted | MigrateOutcome::RewritePresent => {
+                            report.buckets_blocked += 1;
+                        }
+                        // A concurrent tombstone or a bucket already at the
+                        // target: nothing to migrate and nothing to report.
                         MigrateOutcome::NotSealed
                         | MigrateOutcome::Tombstoned
-                        | MigrateOutcome::AlreadyCompacted
-                        | MigrateOutcome::RewritePresent
                         | MigrateOutcome::UpToDate => {}
                     }
                 }
@@ -1622,6 +1782,254 @@ mod tests {
              (l0_below == 1) even though its bucket carries a compaction record: only \
              the record that compaction actually named is superseded. Counting 0 here \
              is a false floor raise over live un-migrated data"
+        );
+    }
+
+    /// Build and PUT one compaction record at `(shard, hour)` naming the L0
+    /// inputs seeded at `input_seqs` (the same `seq` [`seed_at`] takes, which
+    /// fixes the input's writer identity). `hash_seed` fills `input_set_hash`
+    /// independently of `inputs`, so a test controls both the record key and
+    /// the selection rule's hash tie-break. Every part is stamped at
+    /// `part_version`, so a test can keep `l1_below` out of the figure it is
+    /// pinning. No part data objects are written: neither
+    /// [`count_below_target`] nor the walk's eligibility check reads them.
+    async fn put_compaction_record(
+        store: &dyn ObjectStoreBackend,
+        shard: u32,
+        hour: u32,
+        input_seqs: &[u64],
+        hash_seed: u8,
+        part_version: u32,
+    ) -> String {
+        use prost::Message;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart};
+
+        let th = tenant_hash();
+        let created = i64::from(hour) * NS_PER_HOUR;
+        let input_set_hash = vec![hash_seed; 32];
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: th.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket: hour,
+            level: 1,
+            inputs: input_seqs
+                .iter()
+                .map(|seq| CompactionInputIdentity {
+                    writer_id: Uuid::from_u128(u128::from(*seq)).to_string(),
+                    writer_epoch: EPOCH,
+                    writer_seq: *seq,
+                })
+                .collect(),
+            input_set_hash: input_set_hash.clone(),
+            parts: vec![CompactionPart {
+                part_index: 0,
+                first_series_id: vec![0u8; 16],
+                last_series_id: vec![0xff; 16],
+                content_hash: vec![hash_seed; 32],
+                object_size: 4096,
+                sample_count: 1,
+                series_count: 1,
+                run_count: 1,
+                min_event_ts_ns: created,
+                max_event_ts_ns: created + 100,
+                segment_format_version: part_version,
+                declared_column_stats: Vec::new(),
+            }],
+            created_unix_ns: created,
+        };
+        let hash16: String = input_set_hash[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let key = keys::compaction_record_key(&th, Signal::Metrics, shard, hour, &hash16)
+            .expect("compaction record key");
+        store
+            .put(
+                &key,
+                record.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        key
+    }
+
+    /// Seed the overlap fixture: one bucket at `(0, 100)` holding four
+    /// below-target L0 records and two OVERLAPPING compaction records, plus a
+    /// plain uncompacted below-target bucket at `(0, 101)` so the asserted
+    /// figure is a sum over two independent contributions rather than a
+    /// single-record 0-or-1 flip.
+    ///
+    /// The winner names `winner_seqs`; the loser always names `{2, 3}`, so the
+    /// two overlap on input 2 and form one component. Caller picks whether
+    /// input 3 is also named by the winner, which is the whole variable under
+    /// test. Part versions are stamped at the target so `l1_below` is 0 and the
+    /// pinned figure is purely the L0 count.
+    async fn seed_overlapping_records(store: &dyn ObjectStoreBackend, winner_seqs: &[u64]) {
+        for (seq, metric) in [(1u64, "alpha"), (2, "beta"), (3, "gamma"), (4, "delta")] {
+            seed_at(store, 0, 100, seq, metric, VERSION_V7 as u32).await;
+        }
+        // An unrelated below-target bucket with no compaction record at all:
+        // always a straggler, in every scenario.
+        seed_at(store, 0, 101, 5, "epsilon", VERSION_V7 as u32).await;
+
+        // 0x11 sorts below 0x22, so the winner also wins the hash tie-break;
+        // the input-set cardinality already decides it, and pinning the
+        // fallback too keeps the fixture from depending on which term fired.
+        put_compaction_record(store, 0, 100, winner_seqs, 0x11, FUTURE_VERSION).await;
+        put_compaction_record(store, 0, 100, &[2, 3], 0x22, FUTURE_VERSION).await;
+    }
+
+    /// Regression (issue #1156): the re-audit must take an L0 input as
+    /// superseded only where an AUTHORITATIVE compaction record names it.
+    ///
+    /// Two compaction records over one bucket overlap on input 2, so they form
+    /// one overlap component and `select_authoritative_compaction_records`
+    /// keeps exactly one. The loser's parts are served from nowhere, so input
+    /// 3 -- which only the loser names -- is still served as a raw L0 segment
+    /// by `Catalog::resolve`, is still below the target, and must still count.
+    ///
+    /// Both directions are asserted here rather than described: the same
+    /// fixture is built twice, once with the winner naming `{1, 2, 4}` (input 3
+    /// loser-only, so it counts) and once with the winner naming `{1, 2, 3, 4}`
+    /// (input 3 named by the winner, so it does not). The figures are pinned
+    /// exactly, and they differ, so neither a predicate that excludes
+    /// everything nor one that excludes nothing passes.
+    ///
+    /// The flipped line is `count_below_target`'s authority filter: drop the
+    /// `select_authoritative_compaction_records` pass and extend
+    /// `superseded_commits` from every compaction record (the pre-fix
+    /// `superseded_commits.extend(superseded_input_commit_keys(tenant_hash,
+    /// signal, shard, &rec)?)` inside the `CompactionRecord` arm) and the
+    /// loser-only case fails with `l0_below == 1`: input 3 is excluded on the
+    /// strength of a record whose parts nothing serves, and `migrate_family`
+    /// raises the format floor over an object the resolver still returns raw.
+    #[tokio::test]
+    async fn a_loser_only_l0_input_still_counts_below_the_target() {
+        // Winner names {1, 2, 4}; input 3 is named by the loser alone.
+        let store = MemoryStore::new();
+        seed_overlapping_records(&store, &[1, 2, 4]).await;
+
+        // The selection rule itself, on this exact fixture: the smaller
+        // overlapping record is the loser, so its parts are not served and its
+        // exclusive input is not superseded.
+        let bucket = Bucket::new(tenant_hash(), Signal::Metrics, 0, 100);
+        let listing = list_bucket(&store, &bucket).await.expect("list bucket");
+        let served = raw_served_commit_keys(&store, &bucket, &listing)
+            .await
+            .expect("raw-served set");
+        let expected_raw = keys::commit_key(
+            &tenant_hash(),
+            Signal::Metrics,
+            0,
+            100,
+            Uuid::from_u128(3),
+            EPOCH,
+            3,
+        )
+        .expect("commit key");
+        assert_eq!(
+            served,
+            vec![expected_raw],
+            "exactly the loser-only input is left served raw: the winner's three inputs \
+             are inside its parts, and the loser's parts are served from nowhere"
+        );
+
+        let (l0_below, l1_below) =
+            count_below_target(&store, &tenant_hash(), Signal::Metrics, 1, FUTURE_VERSION)
+                .await
+                .expect("re-audit");
+        assert_eq!(
+            (l0_below, l1_below),
+            (2, 0),
+            "exactly two below-target L0 records are live: the loser-only input 3, still \
+             served raw, and the uncompacted bucket's input 5. Counting 1 here excludes \
+             input 3 on a losing record's say-so and raises the floor over an object \
+             Catalog::resolve still serves raw"
+        );
+
+        // Same fixture, one variable changed: the winner now names input 3 too,
+        // so it IS superseded and must drop out of the count.
+        let store = MemoryStore::new();
+        seed_overlapping_records(&store, &[1, 2, 3, 4]).await;
+
+        let listing = list_bucket(&store, &bucket).await.expect("list bucket");
+        let served = raw_served_commit_keys(&store, &bucket, &listing)
+            .await
+            .expect("raw-served set");
+        assert!(
+            served.is_empty(),
+            "the winner names every input of the bucket, so nothing is served raw: {served:?}"
+        );
+
+        let (l0_below, l1_below) =
+            count_below_target(&store, &tenant_hash(), Signal::Metrics, 1, FUTURE_VERSION)
+                .await
+                .expect("re-audit");
+        assert_eq!(
+            (l0_below, l1_below),
+            (1, 0),
+            "only the uncompacted bucket's input 5 is left: an input the AUTHORITATIVE \
+             record names is superseded and must not count"
+        );
+    }
+
+    /// Regression (issue #1156), the walk half: a bucket whose compaction
+    /// records leave a below-target L0 served raw must be VISITED, not skipped
+    /// on the mere presence of a compaction record.
+    ///
+    /// The rewrite primitive still refuses it (one record set per bucket, and a
+    /// new record over the loser-only subset would join the same overlap
+    /// component and lose to the existing winner), so the correct end state is
+    /// a reported blocked bucket and a refused floor raise, not a silent skip
+    /// followed by a raise. The uncompacted bucket at `(0, 101)` is migrated in
+    /// the same walk, which is what shows the visit is selective rather than a
+    /// blanket refusal.
+    ///
+    /// The flipped line is the walk's eligibility gate: restore
+    /// `listing.compaction_record_keys.is_empty() &&
+    /// listing.rewrite_record_keys.is_empty()` to the `if` in `migrate_family`
+    /// and `buckets_blocked` is 0 -- the bucket is never examined past its
+    /// listing.
+    #[tokio::test]
+    async fn the_walk_visits_a_bucket_whose_losing_record_leaves_raw_l0_served() {
+        let store = MemoryStore::new();
+        provision(&store, 1).await;
+        seed_overlapping_records(&store, &[1, 2, 4]).await;
+
+        let clock = FixedClock::new(sealed_now_ns_for(101));
+        let report = migrate_family(
+            &store,
+            &clock,
+            &CompactorConfig::default(),
+            tenant_hash(),
+            Signal::Metrics,
+            FAMILY,
+            FUTURE_VERSION,
+            1,
+            MigrateBudget::unlimited(),
+            "test",
+        )
+        .await
+        .expect("migrate");
+
+        assert_eq!(
+            report.buckets_blocked, 1,
+            "the overlap bucket still serves a below-target L0 raw and the rewrite \
+             primitive refuses it: the walk must report it, not skip it"
+        );
+        assert_eq!(
+            report.buckets_migrated, 1,
+            "the uncompacted bucket at hour 101 is still migrated in the same walk"
+        );
+        assert_eq!(
+            report.verification,
+            Some(Verification::Stragglers { l0: 1, l1: 1 }),
+            "the floor is not raised: the loser-only L0 input is still below the target \
+             (l0 == 1), and hour 101's freshly written L1 part is below the fictional \
+             FUTURE_VERSION target exactly as in the other tests here (l1 == 1)"
         );
     }
 }
