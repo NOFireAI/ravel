@@ -585,7 +585,17 @@ impl AlertEvaluator {
             // nor any record skips the write. The memo is advisory and
             // reconstructible (ADR-0065 precedent): a failed write costs the next
             // tick a full fold, never correctness.
-            let watermark_hour = hour_bucket(now_ns);
+            //
+            // The watermark is the seal bound, not `hour_bucket(now_ns)`. The
+            // alert lease permits a two-holder overlap (see `acquire_lease`): a
+            // prior holder can still publish one in-flight transition after this
+            // holder's tail LIST, stamped at the prior holder's own clock. If
+            // that stamp lands in an hour below the watermark, the tail would
+            // exclude it from every future tick and the memo would omit it
+            // permanently. `seal_bound_hour` holds the watermark back to the
+            // newest hour no overlapping holder can still write into, so the tail
+            // always re-reads such a late transition (ADR-1294 decision 5).
+            let watermark_hour = self.seal_bound_hour(now_ns);
             let unchanged = memo
                 .as_ref()
                 .is_some_and(|m| m.watermark_hour == watermark_hour && m.records == latest);
@@ -616,6 +626,36 @@ impl AlertEvaluator {
 
         self.flush_sinks(&mut report).await;
         report
+    }
+
+    /// The newest ingest hour that is sealed for alert writes as of `now_ns`:
+    /// the memo watermark. No overlapping lease holder can still stamp a
+    /// transition into this hour or any older one, so a tail LIST that starts at
+    /// this hour re-reads every transition an in-flight prior holder might
+    /// publish after this tick's own tail LIST.
+    ///
+    /// The alert lease documents a two-holder overlap (see [`Self::acquire_lease`]):
+    /// a prior holder whose lease has expired can still finish an in-flight tick
+    /// and publish one transition. That transition is stamped at the prior
+    /// holder's own tick-start clock reading. The prior holder held the lease at
+    /// its tick start, so its lease had to expire before this holder could take
+    /// over, which puts its stamp at least one lease lifetime ([`Self::lease_ttl`],
+    /// `LEASE_TTL_TICKS` times the eval interval) behind the reading this holder
+    /// took over with. It can lag further by the in-flight tick's own duration
+    /// and by clock skew between the two holders; [`DEFAULT_QUERY_DEADLINE`] (this
+    /// evaluator's `query_deadline`) is the only wall-clock tolerance the
+    /// alerting path defines, so it stands in for that second term. The seal
+    /// margin is therefore `lease_ttl + query_deadline`, and the watermark is the
+    /// ingest hour of `now_ns - seal_margin`. A deployment whose inter-node clock
+    /// skew exceeds the query deadline would need to widen this margin.
+    fn seal_bound_hour(&self, now_ns: i64) -> u32 {
+        let seal_margin_ns = i64::try_from(
+            self.lease_ttl
+                .saturating_add(self.query_deadline)
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX);
+        hour_bucket(now_ns.saturating_sub(seal_margin_ns))
     }
 
     /// Try to own this tenant's alert lease for this tick.
@@ -1880,8 +1920,15 @@ mod tick_tests {
             min_ingest_ts_ns: written.summary.min_event_ts_ns,
             max_ingest_ts_ns: written.summary.max_event_ts_ns,
             segment_format_version: 1,
-            created_unix_ns: 10,
-            ingest_hour_bucket: 0,
+            // Created in the same hour the object's events fall in, so the
+            // commit-record cross-check (`ingest_hour_bucket` at or before the
+            // created hour) holds when the seed is in a later hour than epoch.
+            created_unix_ns: written.summary.max_event_ts_ns,
+            // Key the commit under the ingest hour of its own event time so a
+            // query whose window falls in a later hour still resolves it. At the
+            // hour-0 timestamps most tests use this is 0, unchanged; the memo
+            // seal-bound tests seed a metric in hour 1 and need it keyed there.
+            ingest_hour_bucket: hour_bucket(written.summary.max_event_ts_ns),
         })
         .expect("valid commit record");
 
@@ -2330,8 +2377,20 @@ mod tick_tests {
     /// writer seqs keep the commit keys from colliding, so `n` records yield `n`
     /// commit records under the alerts prefix.
     async fn seed_alert_history(evaluator: &AlertEvaluator, records: &[AlertRecord]) {
+        seed_alert_history_from(evaluator, records, 10_000).await;
+    }
+
+    /// [`seed_alert_history`] with an explicit base writer seq, so two seeding
+    /// calls against one evaluator (a prior-holder write published after the
+    /// first batch) do not collide on `(writer_id, epoch, seq)` and its commit
+    /// key.
+    async fn seed_alert_history_from(
+        evaluator: &AlertEvaluator,
+        records: &[AlertRecord],
+        base_seq: u64,
+    ) {
         for (i, record) in records.iter().enumerate() {
-            let seq = 10_000 + i as u64;
+            let seq = base_seq + i as u64;
             let identity = ObjectIdentity {
                 tenant_hash: evaluator.tenant.0,
                 shard: ALERT_SHARD,
@@ -2494,8 +2553,8 @@ mod tick_tests {
             .expect("the lease holder wrote a memo");
         assert_eq!(
             memo.watermark_hour,
-            hour_bucket(NOW_NS),
-            "the watermark is the tick's ingest hour"
+            ev.seal_bound_hour(NOW_NS),
+            "the watermark is the seal-bound hour, not the tick's own hour"
         );
         let rule = threshold_rule();
         let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
@@ -2538,6 +2597,179 @@ mod tick_tests {
             memo.records.get(&alert_id).map(|r| r.state),
             Some(AlertState::Firing),
             "the holder rewrote a valid memo over the garbage"
+        );
+    }
+
+    /// A memo body that repeats an alert_id is refused as a corrupt memo, so the
+    /// tick falls back to a full fold exactly as `a_corrupt_memo_is_ignored_and_
+    /// rewritten` does, and the fallback fold reads the same `2N` GETs as any
+    /// full fold (finding 1, issue #1294).
+    #[tokio::test]
+    async fn a_duplicate_alert_id_memo_falls_back_to_a_full_fold() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let tenant = TenantId::new(TENANT).hash();
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+
+        // A single transition in the durable history: a full fold of it is 2 GETs.
+        let n: u64 = 1;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| build_transition_record(&rule, AlertState::Firing, 0, NOW_NS + i as i64))
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        // A well-formed memo body that lists the one alert_id twice.
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        let hex = alert_id.to_hex();
+        let body = format!(
+            r#"{{"format_version":1,"watermark_hour":1,"records":[
+                {{"alert_id":"{hex}","rule_id":"high-cpu","state":"firing",
+                 "generation":0,"ts_ns":1,"labels":[],"annotations":[],"body":"b"}},
+                {{"alert_id":"{hex}","rule_id":"high-cpu","state":"resolved",
+                 "generation":1,"ts_ns":2,"labels":[],"annotations":[],"body":"b"}}]}}"#
+        );
+        store
+            .put(
+                &crate::alert_state_memo::alert_state_memo_key(&tenant),
+                Bytes::from(body),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put duplicate-alert_id memo");
+
+        // The reader refuses the duplicate memo outright.
+        assert!(
+            read_alert_state_memo(store.as_ref(), &tenant)
+                .await
+                .is_err(),
+            "a memo repeating an alert_id is refused, not silently deduped"
+        );
+
+        // So the tick folds `None`: a full fold, exactly 2 GETs per transition.
+        let before = metrics.snapshot();
+        let latest = ev.fold_latest(None).await.expect("full fold fallback");
+        let after = metrics.snapshot();
+        assert_eq!(latest.len(), 1, "all transitions share one alert_id");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2 * n,
+            "the duplicate-memo fallback is a full fold: one commit GET and one \
+             data GET per transition"
+        );
+    }
+
+    /// The memo watermark is the seal-bound hour, strictly older than the tick's
+    /// own hour when the tick runs within the seal margin of an hour boundary.
+    /// Pinning it to `hour_bucket(now_ns)` (the flip) would let it advance past an
+    /// hour an overlapping prior holder can still write into (finding 2,
+    /// issue #1294).
+    #[tokio::test]
+    async fn the_watermark_never_exceeds_the_seal_bound() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        // A `now` just inside hour 1, within the seal margin of the hour-0
+        // boundary, so the seal bound is hour 0 while the tick's own hour is 1.
+        let now = NS_PER_HOUR + 60 * NS_PER_SEC;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(now - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(now));
+
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+
+        let seal = ev.seal_bound_hour(now);
+        assert!(
+            seal < hour_bucket(now),
+            "test is only meaningful when the seal bound (hour {seal}) is strictly \
+             older than the tick's own hour (hour {})",
+            hour_bucket(now)
+        );
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the lease holder wrote a memo");
+        assert_eq!(
+            memo.watermark_hour, seal,
+            "the watermark is pinned to the seal-bound hour, not the tick's own hour"
+        );
+    }
+
+    /// A transition an overlapping prior holder publishes into an hour below the
+    /// tick's own hour, after this holder's tail LIST, is still folded in on the
+    /// next tick: the seal-bound watermark keeps that hour inside the tail. With
+    /// the watermark reverted to the tick's own hour (the flip) the tail skips
+    /// the hour and the transition is lost forever from the memo (finding 2,
+    /// issue #1294).
+    #[tokio::test]
+    async fn a_transition_published_by_an_overlapping_prior_holder_is_not_lost() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // A `now` just inside hour 1, within the seal margin of the hour-0
+        // boundary: the seal-bound watermark is hour 0, the tick's own hour is 1.
+        let now = NS_PER_HOUR + 60 * NS_PER_SEC;
+        // Metric above the threshold so holder A stays Firing and writes no new
+        // transition this tick.
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(now - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let mut a = evaluator(Arc::clone(&store), TestClock::at(now));
+
+        // Pre-seed a Firing transition in hour 0, so A folds to Firing.
+        let firing_ts = NS_PER_HOUR - 200 * NS_PER_SEC;
+        assert_eq!(hour_bucket(firing_ts), 0, "the firing record is in hour 0");
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, firing_ts);
+        seed_alert_history_from(&a, &[firing], 10_000).await;
+
+        // A's tick: folds Firing, writes no transition, writes the memo.
+        assert_eq!(
+            a.run_tick().await.records_written,
+            0,
+            "already firing: no new transition written this tick"
+        );
+
+        // The prior holder B, still in flight after A's tail LIST, publishes a
+        // Resolved transition. Its skewed clock stamps it in hour 0 (below A's own
+        // hour 1) but later in ts than A's firing record, so it is the new latest.
+        let resolved_ts = NS_PER_HOUR - 100 * NS_PER_SEC;
+        assert_eq!(hour_bucket(resolved_ts), 0, "the late resolve is in hour 0");
+        assert!(resolved_ts > firing_ts, "the resolve supersedes the firing");
+        let resolved = build_transition_record(&rule, AlertState::Resolved, 0, resolved_ts);
+        seed_alert_history_from(&a, &[resolved], 20_000).await;
+
+        // The next tick reads the memo A wrote and folds its tail on top.
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("A wrote a memo");
+        let via_memo = a.fold_latest(Some(&memo)).await.expect("memo fold");
+        let full = a.load_latest_records().await.expect("full fold");
+
+        assert_eq!(
+            via_memo, full,
+            "the seal-bound watermark keeps the prior holder's hour in the tail, so \
+             the memo fold matches the full fold exactly"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Resolved),
+            "the late Resolved from the overlapping prior holder is not lost"
         );
     }
 }
