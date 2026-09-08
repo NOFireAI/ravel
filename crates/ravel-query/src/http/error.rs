@@ -265,7 +265,7 @@ impl ApiError {
     /// The status, stable `errorType` tag, and message this error renders to.
     /// Extracted so both [`IntoResponse`] and the public
     /// [`QueryErrorResponse`] mapping share one table and cannot drift.
-    fn into_parts(self) -> QueryErrorResponse {
+    pub fn into_parts(self) -> QueryErrorResponse {
         let (status, error_type, message) = match self {
             ApiError::BadData(msg) => (StatusCode::BAD_REQUEST, "bad_data", msg),
             ApiError::Unsupported(msg) => (StatusCode::UNPROCESSABLE_ENTITY, "execution", msg),

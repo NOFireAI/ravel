@@ -97,23 +97,22 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use ravel_analytics::{
     AnalyticsError, ChangeKind, ChangePointParams, ChangePointResult, SummaryParams, SummaryResult,
 };
 use ravel_ingest::Clock;
-use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
+use ravel_maintain::QueryAuditSink;
 use ravel_promql::Value;
-use ravel_query::http::{QueryErrorResponse, TenantResolver};
-use ravel_query::{Coverage, QueryEngine, QueryError};
-use ravel_types::{CommitToken, LabelSet, Sample, TenantHash};
+use ravel_query::http::TenantResolver;
+use ravel_query::{QueryAdmissionController, QueryConcurrencyLimit, QueryEngine};
+use ravel_types::{CommitToken, LabelSet, Sample};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tracing::Instrument;
 
-use crate::metrics::WorkloadClass;
+use crate::service::{AnalyticsRequest, ApiError, QueryService, ServiceError};
 
 /// Cap on the request body. The analytics request is a query plus a few scalar
 /// parameters, never large in legitimate use; this mirrors the defensive bound
@@ -146,6 +145,33 @@ pub struct AnalyticsState {
     /// deployments with no pipeline; a deployment attaches the one shared
     /// pipeline.
     pub audit_sink: Arc<dyn QueryAuditSink>,
+    /// The fleet-global query concurrency ceiling (ADR-0061 decision 2). An
+    /// analytics call runs the same range evaluation `/api/v1/query_range`
+    /// runs, so it takes a permit from the same controller and is rejected with
+    /// the same 503 rather than running outside the ceiling.
+    pub query_admission: Arc<QueryAdmissionController>,
+}
+
+impl AnalyticsState {
+    /// The query service layer for this surface: the shared controls plus this
+    /// state. The handler below calls it, and so does the process-wide service
+    /// built in `lib.rs`, through one implementation of the controls.
+    pub fn service(&self) -> QueryService {
+        QueryService::with_metrics(
+            Arc::clone(&self.tenant_resolver),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.query_admission),
+            Arc::clone(&self.query_accounting),
+            Arc::clone(&self.audit_sink),
+        )
+        .with_analytics(self.clone())
+    }
+
+    /// An unlimited (never-rejecting) admission controller, for a caller that
+    /// mounts this route without a fleet ceiling.
+    pub fn unlimited_admission() -> Arc<QueryAdmissionController> {
+        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited)
+    }
 }
 
 /// The `/api/v1/analytics` router.
@@ -214,9 +240,15 @@ async fn handle(State(state): State<AnalyticsState>, req: Request<Body>) -> Resp
     }
 }
 
-async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, ApiError> {
+/// Parse, authenticate, ask the query service layer, encode. Admission, the
+/// deadline clamp, the usage record, the audit event, the partial-coverage
+/// consent gate, and error redaction all happen inside
+/// [`QueryService::analytics`], shared with every other query surface; what is
+/// left here is this endpoint's own response shape and its analytic op.
+async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, ServiceError> {
     let headers = req.headers().clone();
-    let tenant_hash = authenticate(state, &headers)?;
+    // Before the service takes a permit, so an anonymous request consumes none.
+    let tenant_hash = crate::service::authenticate(state.tenant_resolver.as_ref(), &headers)?;
 
     let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
@@ -226,21 +258,23 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
 
     // start/end/step parse exactly as `/api/v1/query_range`: a parse failure is
     // a 400 with the offending field and value, before any query runs.
-    let start_ms = parse_timestamp_ms("start", &body.start)?;
-    let end_ms = parse_timestamp_ms("end", &body.end)?;
-    let step_ms = parse_duration_ms("step", &body.step)?;
-
-    let min_tokens = body
-        .min_commit_token
-        .iter()
-        .map(|raw| {
-            CommitToken::decode(raw)
-                .map_err(|_| ApiError::bad_request(format!("invalid min_commit_token: {raw:?}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let max_deadline = state.engine.config().deadline;
-    let deadline = parse_deadline(body.timeout, max_deadline)?;
+    let request = AnalyticsRequest {
+        query: body.query.clone(),
+        start_ms: parse_timestamp_ms("start", &body.start)?,
+        end_ms: parse_timestamp_ms("end", &body.end)?,
+        step_ms: parse_duration_ms("step", &body.step)?,
+        min_tokens: body
+            .min_commit_token
+            .iter()
+            .map(|raw| {
+                CommitToken::decode(raw).map_err(|_| {
+                    ApiError::bad_request(format!("invalid min_commit_token: {raw:?}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        deadline: parse_deadline(body.timeout, state.engine.config().deadline)?,
+        allow_partial: body.allow_partial,
+    };
 
     // Percentiles are a request-level parameter: validate them once up front so
     // an invalid quantile is rejected before an expensive range evaluation and
@@ -249,107 +283,30 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
     if let OpSpec::Summary { percentiles } = &body.op {
         for &q in percentiles {
             if !(0.0..=1.0).contains(&q) {
-                return Err(ApiError::from_analytics(
-                    AnalyticsError::InvalidPercentile { got: q },
-                ));
+                return Err(
+                    ApiError::from_analytics(AnalyticsError::InvalidPercentile { got: q }).into(),
+                );
             }
         }
     }
 
-    let now_ns = state.clock.now_ns();
+    let outcome = state.service().analytics(tenant_hash, &request).await?;
 
-    // A request-level span carrying only bounded values (ADR-0044 section 5):
-    // the tenant hash, the workload class, and -- once the range evaluation
-    // finishes -- the final store request and byte counts. No query text, label
-    // values, or object keys ever become span fields. An analytics call is an
-    // interactive, client-driven query.
-    let span = tracing::info_span!(
-        "analytics_query",
-        tenant_hash = %tenant_hash.to_hex(),
-        workload_class = WorkloadClass::Interactive.name(),
-        s3_requests = tracing::field::Empty,
-        s3_bytes = tracing::field::Empty,
-    );
-    // The range evaluation now runs for a resolved tenant, so it is auditable
-    // (ADR-0062 §2a): run it, submit one audit event for the outcome, and await
-    // its durability before releasing the response. A request rejected earlier
-    // (auth, body parse, invalid parameters) never reached here and is not
-    // audited. The recorded window is the request's resolved `[start, end]`.
-    // Collect per-slice fragment observability (ADR-0071 stats.fragments[]) for the duration of the range evaluation. The sink is
-    // installed in task-local storage so every distributed slice the engine
-    // dispatches records into it; a non-distributed engine (or a query the cost
-    // gate declined to fan out) records nothing, and the field stays absent.
-    let fragment_sink = crate::distrib::FragmentStatsSink::new();
-    let eval = crate::distrib::with_fragment_stats(
-        fragment_sink.clone(),
-        state
-            .engine
-            .range_with_stats(
-                tenant_hash,
-                &body.query,
-                start_ms,
-                end_ms,
-                step_ms,
-                &min_tokens,
-                now_ns,
-                deadline,
-            )
-            .instrument(span.clone()),
-    )
-    .await;
-    let status = if eval.is_ok() {
-        QueryStatus::Ok
-    } else {
-        QueryStatus::Error
-    };
-    submit_audit(
-        state,
-        tenant_hash,
-        now_ns,
-        &body.query,
-        status,
-        ms_to_ns(start_ms),
-        ms_to_ns(end_ms),
-    )
-    .await?;
-    let (value, stats) = eval.map_err(ApiError::from_query)?;
-
-    // Consent gate (ADR-0071 "partial results are consent-gated and
-    // envelope-visible" amendment, section 2): the evaluation ran and was
-    // audited, but a partial answer the client did not opt into is refused with
-    // the typed 503 the HTTP query endpoints use, before any op runs and before
-    // any body is built. Coverage is knowable only now, and it is derived from
-    // the stats the engine already produced rather than newly tracked
-    // (amendment decision 4).
-    let coverage = Coverage::from_stats(&stats);
-    gate_partial(&coverage, body.allow_partial)?;
-
-    // Fold this query's actual cost and its pre-execution estimate into the
-    // process-global aggregator for `/metrics` (ADR-0044 section 4) and record
-    // the final counts on the span.
-    span.record("s3_requests", stats.accounting.total_s3_requests());
-    span.record("s3_bytes", stats.accounting.total_s3_bytes());
-    state.query_accounting.record(
-        tenant_hash,
-        WorkloadClass::Interactive,
-        &stats.accounting,
-        &stats.estimate,
-    );
-    let mut stats_json = crate::query::accounting_stats_json(&stats.accounting, &stats.estimate);
+    let mut stats_json =
+        crate::query::accounting_stats_json(&outcome.stats.accounting, &outcome.stats.estimate);
     // ADR-0071: a distributed run attaches a per-slice
     // `fragments[]` beside `accounting`/`estimate`; a non-distributed run
     // collected no entries, so the field is omitted rather than an empty array.
-    let fragments = fragment_sink.take();
-    if !fragments.is_empty()
+    if !outcome.fragments.is_empty()
         && let Some(object) = stats_json.as_object_mut()
     {
         object.insert(
             "fragments".to_string(),
-            crate::query::fragments_json(&fragments),
+            crate::query::fragments_json(&outcome.fragments),
         );
     }
 
-    let matrix = match value {
+    let matrix = match outcome.value {
         Value::Matrix(matrix) => matrix,
         // A range query that folds to a scalar, a string, or an instant vector
         // has no per-series matrix to analyze. Rejected as a request error,
@@ -359,14 +316,15 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
             return Err(ApiError::bad_request(format!(
                 "query evaluates to {}, but the analytics endpoint requires a range vector",
                 other.type_name()
-            )));
+            ))
+            .into());
         }
     };
 
     // ADR-0028 decision 4: enforce the series cap before running any op, as a
     // typed error rather than a truncation.
     if matrix.len() > MAX_SERIES {
-        return Err(ApiError::series_cap(matrix.len()));
+        return Err(ApiError::series_cap(matrix.len()).into());
     }
 
     let result = apply_op(&body.op, matrix)?;
@@ -387,26 +345,11 @@ async fn run(state: &AnalyticsState, req: Request<Body>) -> Result<Response, Api
             // fan-out's already-redacted per-cluster warnings (empty on a
             // complete answer). Reaching here with `partial: true` means the
             // request opted in through `allow_partial`.
-            "partial": coverage.is_partial(),
-            "warnings": stats.warnings,
+            "partial": outcome.partial,
+            "warnings": outcome.stats.warnings,
         })),
     )
         .into_response())
-}
-
-/// The consent gate, the analytics mirror of `gate_partial` in
-/// `crates/ravel-query/src/http/handlers.rs` (ADR-0071 amendment, section 2).
-/// Partial coverage the client did not opt into fails with the same typed shape
-/// the HTTP query endpoints use, HTTP 503 with `errorType: "unavailable"`, so a
-/// consumer that never asked for a partial answer fails safe instead of
-/// silently accepting one. Complete coverage, or partial coverage with
-/// `allow_partial: true`, passes and the response is a 200 whose top-level
-/// `partial` field states the coverage.
-fn gate_partial(coverage: &Coverage, allow_partial: bool) -> Result<(), ApiError> {
-    if coverage.is_partial() && !allow_partial {
-        return Err(ApiError::partial_refusal(coverage.skipped()));
-    }
-    Ok(())
 }
 
 /// Apply the selected op to every series, converting each crate result into
@@ -446,56 +389,6 @@ fn apply_op(
             })
         })
         .collect()
-}
-
-/// Submit one query-audit event for an executed analytics query and await its
-/// durability before the response is released (ADR-0062 §2a). `language` is
-/// `analytics` so the record shape stays one schema across surfaces. On a
-/// submission failure the request fails closed with a retryable 503
-/// (`audit_mode=required`); in best-effort mode the pipeline resolves it to
-/// `Ok` and the response is released.
-#[allow(clippy::too_many_arguments)]
-async fn submit_audit(
-    state: &AnalyticsState,
-    tenant_hash: TenantHash,
-    now_ns: i64,
-    query_text: &str,
-    status: QueryStatus,
-    window_start_ns: i64,
-    window_end_ns: i64,
-) -> Result<(), ApiError> {
-    let event = query_audit_event(
-        &tenant_hash,
-        now_ns,
-        query_text,
-        "analytics",
-        status,
-        window_start_ns,
-        window_end_ns,
-    );
-    state.audit_sink.submit(event).await.map_err(|_| ApiError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        error_type: "unavailable",
-        message: "query audit is temporarily unavailable; retry".to_string(),
-    })
-}
-
-/// Nanosecond form of a millisecond bound for an audit window, saturating
-/// rather than overflowing.
-fn ms_to_ns(ms: i64) -> i64 {
-    ms.saturating_mul(1_000_000)
-}
-
-fn authenticate(state: &AnalyticsState, headers: &HeaderMap) -> Result<TenantHash, ApiError> {
-    state
-        .tenant_resolver
-        .resolve(headers)
-        .map(|tenant| tenant.hash())
-        .map_err(|_| ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            error_type: "unauthorized",
-            message: "authentication required".to_string(),
-        })
 }
 
 fn labels_to_map(labels: &LabelSet) -> BTreeMap<String, String> {
@@ -574,29 +467,7 @@ fn parse_deadline(timeout: Option<f64>, max: Duration) -> Result<Duration, ApiEr
 // Error boundary
 // ---------------------------------------------------------------------------
 
-/// A client-visible error: a status, a stable type tag, and a message that has
-/// already passed the redaction boundary. `Debug` is safe to derive because
-/// every field is already redacted.
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    error_type: &'static str,
-    message: String,
-}
-
 impl ApiError {
-    fn bad_request(message: String) -> Self {
-        ApiError {
-            status: StatusCode::BAD_REQUEST,
-            error_type: "bad_data",
-            message,
-        }
-    }
-
-    fn invalid_param(name: &str, value: &str) -> Self {
-        ApiError::bad_request(format!("invalid value for parameter {name:?}: {value:?}"))
-    }
-
     /// ADR-0028 decision 4: the per-call series cap is a budget breach, mapped
     /// to 422 like the query engine's own budget rejections.
     fn series_cap(count: usize) -> Self {
@@ -605,31 +476,6 @@ impl ApiError {
             error_type: "execution",
             message: format!(
                 "analytics call matched {count} series, exceeding the limit of {MAX_SERIES}"
-            ),
-        }
-    }
-
-    /// Partial coverage without `allow_partial` (ADR-0071 amendment, section
-    /// 2). The status, the `errorType` tag, and the message shape are the ones
-    /// `ApiError::Unavailable` and `partial_refusal_message` produce on the HTTP
-    /// query endpoints (`crates/ravel-query/src/http/error.rs`,
-    /// `handlers.rs`), reproduced here because both are private to that crate;
-    /// the wording is kept identical so one refusal contract covers every read
-    /// surface. `skipped` names the degraded clusters, already redacted at the
-    /// federation seam to operator-facing cluster names, and the remedy
-    /// (`allow_partial`) is named in the failure itself.
-    fn partial_refusal(skipped: &[String]) -> Self {
-        let clusters = if skipped.is_empty() {
-            "one or more federated clusters were skipped".to_string()
-        } else {
-            skipped.join("; ")
-        };
-        ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            error_type: "unavailable",
-            message: format!(
-                "partial results: coverage is incomplete ({clusters}); \
-                 set allow_partial=true to receive partial results"
             ),
         }
     }
@@ -643,37 +489,6 @@ impl ApiError {
             error_type: "execution",
             message: err.to_string(),
         }
-    }
-
-    /// Map a `QueryError` through `ravel-query`'s public HTTP mapping, so this
-    /// endpoint keeps the exact status contract of `/api/v1/query_range`,
-    /// including the redaction of storage-layer faults, from one shared
-    /// source rather than a copy that could drift.
-    fn from_query(err: QueryError) -> Self {
-        let QueryErrorResponse {
-            status,
-            error_type,
-            message,
-        } = QueryErrorResponse::from_query_error(err);
-        ApiError {
-            status,
-            error_type,
-            message,
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            axum::Json(json!({
-                "status": "error",
-                "errorType": self.error_type,
-                "error": self.message,
-            })),
-        )
-            .into_response()
     }
 }
 
@@ -784,6 +599,8 @@ impl From<SummaryResult> for SummaryDto {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_query::http::QueryControls;
+    use ravel_query::{Coverage, QueryError};
 
     fn body(json: &str) -> AnalyticsBody {
         serde_json::from_str(json).expect("valid body")
@@ -934,30 +751,43 @@ mod tests {
     }
 
     /// The consent gate's decision table (ADR-0071 amendment, section 2). The
-    /// end-to-end behavior is pinned through the real handler in
-    /// `tests/analytics_endpoint.rs`; this pins the branch table itself,
-    /// including the empty-`skipped` fallback a partial flag with no per-cluster
-    /// warning would take.
+    /// gate itself now lives in the shared query service layer, so this pins
+    /// that the analytics surface reaches the same branch table, including the
+    /// empty-`skipped` fallback a partial flag with no per-cluster warning would
+    /// take. The end-to-end behavior is pinned through the real handler in
+    /// `tests/analytics_endpoint.rs`.
     #[test]
     fn the_consent_gate_refuses_only_unconsented_partial_coverage() {
+        let controls = QueryControls {
+            admission: AnalyticsState::unlimited_admission(),
+            cost_recorder: Arc::new(ravel_types::accounting::NoopQueryCostRecorder),
+            usage_sink: Arc::new(ravel_query::http::NoopQueryUsageSink),
+            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+        };
         let partial = Coverage::Partial {
             skipped: vec!["remote cluster west unavailable".to_string()],
         };
-        gate_partial(&Coverage::Complete, false).expect("complete coverage passes");
-        gate_partial(&Coverage::Complete, true).expect("complete coverage passes opted in");
-        gate_partial(&partial, true).expect("opted-in partial coverage passes");
+        controls
+            .gate_partial(&Coverage::Complete, false)
+            .expect("complete coverage passes");
+        controls
+            .gate_partial(&Coverage::Complete, true)
+            .expect("complete coverage passes opted in");
+        controls
+            .gate_partial(&partial, true)
+            .expect("opted-in partial coverage passes");
 
-        let err = gate_partial(&partial, false).expect_err("unconsented partial is refused");
+        let err = ApiError::from(ServiceError::from(
+            controls
+                .gate_partial(&partial, false)
+                .expect_err("unconsented partial is refused"),
+        ));
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.error_type, "unavailable");
         assert!(err.message.contains("west"), "{}", err.message);
         assert!(err.message.contains("allow_partial"), "{}", err.message);
 
-        let bare = ApiError::partial_refusal(&[]);
-        assert!(
-            bare.message.contains("one or more federated clusters"),
-            "{}",
-            bare.message
-        );
+        let bare = ravel_query::http::partial_refusal_message(&[]);
+        assert!(bare.contains("one or more federated clusters"), "{bare}");
     }
 }

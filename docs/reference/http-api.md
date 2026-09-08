@@ -99,7 +99,10 @@ than an error, and reads no object storage on that path.
 field: change point detection (`change_point`) and summary statistics
 (`summary`). An unknown `op`, a missing field, or a malformed body is 400; an
 analytics computation error or the per-call series cap is 422; partial federated
-coverage without `allow_partial: true` is 503.
+coverage without `allow_partial: true` is 503. `/api/v1/analytics` and
+`/api/v1/query_exemplars` take a permit from the same query concurrency
+ceiling as the other query routes, and a request refused by it gets the same
+503 body those routes return.
 
 `/api/v1/sql` is behind the `sql` cargo feature. The published server image
 builds that feature, so the route is available there. Its response envelope is

@@ -153,6 +153,7 @@ fn build_router_with_sink(
             std::collections::HashSet::new(),
         )),
         audit_sink,
+        query_admission: AnalyticsState::unlimited_admission(),
     })
 }
 
@@ -216,6 +217,7 @@ fn build_router_distributed(
             std::collections::HashSet::new(),
         )),
         audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+        query_admission: AnalyticsState::unlimited_admission(),
     })
 }
 
@@ -876,6 +878,7 @@ async fn federated_app(metric: &str, samples: &[(i64, f64)]) -> Router {
             std::collections::HashSet::new(),
         )),
         audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+        query_admission: AnalyticsState::unlimited_admission(),
     })
 }
 

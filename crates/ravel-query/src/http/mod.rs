@@ -8,6 +8,7 @@ mod handlers;
 mod json;
 mod metadata_cache;
 mod params;
+pub mod service;
 pub mod tenant;
 
 use std::sync::Arc;
@@ -17,9 +18,14 @@ use axum::routing::get;
 use ravel_maintain::{NoopQueryAuditSink, QueryAuditSink};
 use ravel_types::accounting::{NoopQueryCostRecorder, QueryCostRecorder};
 
-pub use error::{MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, QueryErrorResponse};
+pub use error::{ApiError, MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, QueryErrorResponse};
 pub use metadata_cache::{
     MetadataCache, MetadataCacheConfig, MetadataCacheCounters, MetadataSnapshot,
+};
+pub use service::{
+    InstantOutcome, InstantRequest, LabelValuesOutcome, LabelsOutcome, LiveUsage, MSG_CONCURRENCY,
+    MetadataOutcome, MetadataRequest, NoopQueryUsageSink, QueryControls, QueryUsageSink,
+    RangeOutcome, RangeRequest, UnobservedUsage, UsageGuard, UsageStatus, partial_refusal_message,
 };
 pub use tenant::{
     AuthError, DevHeaderTenantResolver, MtlsResolver, OidcError, OidcJwksCache, OidcResolver,
@@ -78,6 +84,14 @@ pub struct AppState {
     /// [`AppState::with_metadata_cache`], at which point the endpoint serves that
     /// process's cached view of each queried tenant's metadata.
     pub metadata_cache: Option<Arc<MetadataCache>>,
+    /// The sink each query's usage record is folded into on every exit path,
+    /// tagged with how the query ended (ADR-1374 decision 3, item 5). Separate
+    /// from [`AppState::cost_recorder`], which only ever sees a query that
+    /// produced an answer: this one also sees the cancelled, timed-out, and
+    /// failed queries. Defaults to [`NoopQueryUsageSink`] in [`AppState::new`];
+    /// a deployment attaches the `/metrics` aggregator with
+    /// [`AppState::with_usage_sink`].
+    pub usage_sink: Arc<dyn QueryUsageSink>,
 }
 
 impl AppState {
@@ -91,7 +105,29 @@ impl AppState {
             query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
             audit_sink: Arc::new(NoopQueryAuditSink),
             metadata_cache: None,
+            usage_sink: Arc::new(NoopQueryUsageSink),
         }
+    }
+
+    /// The [`QueryControls`] every handler runs its query through: the one
+    /// admission controller, cost recorder, usage sink, and audit sink this
+    /// state carries. Handlers parse and encode; the controls do everything
+    /// between.
+    pub fn controls(&self) -> QueryControls {
+        QueryControls {
+            admission: Arc::clone(&self.query_admission),
+            cost_recorder: Arc::clone(&self.cost_recorder),
+            usage_sink: Arc::clone(&self.usage_sink),
+            audit_sink: Arc::clone(&self.audit_sink),
+        }
+    }
+
+    /// Set the sink each query's usage record is folded into on every exit
+    /// path (ADR-1374 decision 3, item 5). Returns `self` so it chains off
+    /// [`AppState::new`].
+    pub fn with_usage_sink(mut self, usage_sink: Arc<dyn QueryUsageSink>) -> Self {
+        self.usage_sink = usage_sink;
+        self
     }
 
     /// Set the recorder every completed query folds its cost into. Returns
