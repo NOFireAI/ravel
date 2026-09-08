@@ -289,12 +289,12 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     );
     assert_eq!(
         scaling_label["cardinality_declared"].as_u64(),
-        Some(generator.scaling_label_cardinality(expected.samples_per_series as usize)),
+        Some(generator.scaling_label_cardinality(expected.samples_per_series)),
         "cardinality_declared must match the generator's own figure at the declared step count"
     );
     assert_eq!(
         run["scaling_label_cardinality"].as_u64(),
-        Some(generator.scaling_label_cardinality(STEPS as usize)),
+        Some(generator.scaling_label_cardinality(STEPS)),
         "run.scaling_label_cardinality must match the generator's own figure at steps_run"
     );
 

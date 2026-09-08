@@ -615,7 +615,7 @@ pub fn build_profile_record(
         label_cardinalities: workload.label_cardinalities(),
         scaling_label: ScalingLabelRecord {
             name: workload.generator.scaling_label.clone(),
-            cardinality_declared: generator.scaling_label_cardinality(steps_declared as usize),
+            cardinality_declared: generator.scaling_label_cardinality(steps_declared),
         },
         churn_basis_points_per_hour: profile.churn_basis_points_per_hour,
         families,
@@ -624,7 +624,7 @@ pub fn build_profile_record(
             total_series_created: gen_report.total_series_created,
             logical_input_bytes,
             total_samples_generated: gen_report.emitted_samples,
-            scaling_label_cardinality: generator.scaling_label_cardinality(steps_run as usize),
+            scaling_label_cardinality: generator.scaling_label_cardinality(steps_run),
         },
     }
 }
@@ -2046,12 +2046,12 @@ mod tests {
         let generator = Generator::for_profile(&workload, &profile, 0);
         assert_eq!(
             record.scaling_label.cardinality_declared,
-            generator.scaling_label_cardinality(record.steps_declared as usize),
+            generator.scaling_label_cardinality(record.steps_declared),
             "cardinality_declared must be the generator's own figure at steps_declared"
         );
         assert_eq!(
             record.run.scaling_label_cardinality,
-            generator.scaling_label_cardinality(steps as usize),
+            generator.scaling_label_cardinality(steps),
             "run.scaling_label_cardinality must be the generator's own figure at steps_run"
         );
     }
@@ -2120,12 +2120,12 @@ mod tests {
         );
         assert_eq!(
             record.scaling_label.cardinality_declared,
-            generator.scaling_label_cardinality(steps_declared as usize),
+            generator.scaling_label_cardinality(steps_declared),
             "cardinality_declared must be the generator's own figure at steps_declared"
         );
         assert_eq!(
             record.run.scaling_label_cardinality,
-            generator.scaling_label_cardinality(steps_run as usize),
+            generator.scaling_label_cardinality(steps_run),
             "run.scaling_label_cardinality must be the generator's own figure at steps_run, \
              not steps_declared"
         );
