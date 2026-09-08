@@ -1187,6 +1187,44 @@ pub struct Cli {
     #[arg(long = "idle-tenant-state-ttl", value_name = "DURATION")]
     pub idle_tenant_state_ttl: Option<String>,
 
+    /// Serve the native MCP adapter at `POST /mcp` on the query router
+    /// (ADR-1374 decision 9). Off by default, and meaningful only in a build
+    /// with the `mcp` cargo feature: without the feature the route is never
+    /// mounted and this flag is inert. Unlike `--otap`, the flag is declared
+    /// in every build so the generated flag reference does not change with
+    /// the feature set. Runs only in the query-serving modes (`all`,
+    /// `query`), on both the public HTTP listener and the mTLS listener when
+    /// one is configured, and authenticates every request with the same
+    /// tenant resolver the HTTP query routes use.
+    #[arg(long)]
+    pub mcp: bool,
+
+    /// Exact `Origin` header values the MCP adapter accepts, comma-separated.
+    /// A request whose `Origin` is not on the list is refused with 403, and a
+    /// request with no `Origin` at all is accepted (a non-browser client
+    /// sends none). ADR-1374 decision 7 makes origin validation mandatory,
+    /// because a browser page on another site can otherwise reach a
+    /// loopback-bound MCP server with the user's ambient credentials. Empty
+    /// is allowed only when `--listen-http` binds a loopback address;
+    /// otherwise `--mcp` refuses to start without this flag.
+    #[arg(
+        long = "mcp-allowed-origins",
+        value_name = "ORIGINS",
+        value_delimiter = ','
+    )]
+    pub mcp_allowed_origins: Vec<String>,
+
+    /// Largest request body, in bytes, the MCP adapter reads before answering
+    /// 413 (ADR-1374 decision 7). The cap is applied before any JSON-RPC
+    /// parsing, so an oversized body is never buffered whole. `0` is
+    /// rejected: it would refuse every request.
+    #[arg(
+        long = "mcp-max-body-bytes",
+        value_name = "BYTES",
+        default_value_t = DEFAULT_MCP_MAX_BODY_BYTES
+    )]
+    pub mcp_max_body_bytes: u64,
+
     /// Register the OTAP (OpenTelemetry Arrow) metrics gRPC service on the gRPC
     /// listener (ADR-0011). The `otap` cargo feature links the arrow decode
     /// stack; this flag is the runtime opt-in that decides whether a given
@@ -1564,6 +1602,42 @@ pub const DEFAULT_SQL_TENANT_MAX_BYTES: usize = 1024 * 1024 * 1024;
 /// not the library constant. [`Default`] still spells the library constants,
 /// which is the baseline a test constructs from, never what an unset CLI
 /// produces.
+/// The MCP surface's settings (ADR-1374 D7/D9), resolved from `--mcp`,
+/// `--mcp-allowed-origins`, and `--mcp-max-body-bytes`.
+///
+/// These ride on [`QueryBudgets`] because that is the one query-surface
+/// configuration [`Cli::query_budgets`] builds and [`crate::start`] receives;
+/// the MCP adapter is mounted on the same query router and reads them there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpConfig {
+    /// Whether `POST /mcp` is mounted at all. Off unless `--mcp` was passed,
+    /// so a build that carries the feature still serves no MCP route by
+    /// default.
+    pub enabled: bool,
+    /// The exact `Origin` header values a browser-originated request may
+    /// carry (D7). A request carrying no `Origin` at all is always accepted:
+    /// a non-browser client sends none, and a browser always does. Empty
+    /// disables the check, which is why [`Cli::validate`] refuses an empty
+    /// list on a non-loopback listener rather than serving an open surface.
+    pub allowed_origins: Vec<String>,
+    /// The request body cap in bytes (D7). A body past it is refused with 413
+    /// before the JSON-RPC frame is parsed.
+    pub max_body_bytes: u64,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        McpConfig {
+            enabled: false,
+            allowed_origins: Vec::new(),
+            max_body_bytes: DEFAULT_MCP_MAX_BODY_BYTES,
+        }
+    }
+}
+
+/// The D7 request body cap: 1 MiB.
+pub const DEFAULT_MCP_MAX_BODY_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryBudgets {
     /// The legacy combined knob (ADR-0087). Since ADR-1195 the three resolved
@@ -1627,6 +1701,9 @@ pub struct QueryBudgets {
     /// `EngineConfig::logs_max_fetch_run_bytes` and from there
     /// `LogSegmentFetcher::with_max_fetch_run_bytes`.
     pub logs_max_fetch_run_bytes: u64,
+    /// The MCP surface's settings (ADR-1374). Not a query budget; it rides
+    /// here because this is the query-surface configuration `start` receives.
+    pub mcp: McpConfig,
 }
 
 impl Default for QueryBudgets {
@@ -1645,6 +1722,7 @@ impl Default for QueryBudgets {
             logs_fetch_policy: ravel_query::LogsFetchPolicy::default(),
             store_cost_profile: StoreCostProfile::reference(),
             logs_max_fetch_run_bytes: ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -3251,6 +3329,11 @@ impl Cli {
             logs_fetch_policy: self.logs_fetch_policy.policy(),
             store_cost_profile: self.resolve_store_cost_profile()?,
             logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
+            mcp: McpConfig {
+                enabled: self.mcp,
+                allowed_origins: self.mcp_allowed_origins.clone(),
+                max_body_bytes: self.mcp_max_body_bytes,
+            },
         })
     }
 
@@ -3744,6 +3827,28 @@ impl Cli {
                  --listen-grpc bind loopback addresses: the dev header resolver trusts an \
                  unauthenticated x-ravel-tenant header and backs every public listener (HTTP, \
                  OTLP gRPC, and Flight SQL), not just HTTP"
+            );
+        }
+
+        // ADR-1374 decision 7 makes origin validation mandatory on the MCP
+        // route. An empty allowlist means "accept any Origin", which is only
+        // safe on a loopback listener that no browser page on another site
+        // can reach in the first place; on a reachable address it is the
+        // DNS-rebinding hole the decision exists to close, so refuse at
+        // startup rather than serving an open route.
+        if self.mcp && self.mcp_allowed_origins.is_empty() && !self.listen_http.ip().is_loopback() {
+            anyhow::bail!(
+                "--mcp on a non-loopback --listen-http ({}) requires --mcp-allowed-origins: an \
+                 empty allowlist accepts every Origin, which lets a page on any site drive this \
+                 server from a browser with the user's ambient credentials",
+                self.listen_http,
+            );
+        }
+
+        if self.mcp_max_body_bytes == 0 {
+            anyhow::bail!(
+                "--mcp-max-body-bytes 0 would refuse every MCP request; set a positive cap or \
+                 leave the flag unset for the 1 MiB default"
             );
         }
 
