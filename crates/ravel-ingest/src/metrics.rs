@@ -134,6 +134,14 @@ pub struct IngestMetrics {
     /// Batches rejected because two points shared a `series_id` under
     /// distinct canonical label sets (ADR-0005 fail-loud collision check).
     series_id_collisions: AtomicU64,
+    /// Flush-open stamps raised to this writer's monotonic floor because the
+    /// injected clock read below the previous stamp (ADR-1307). A backwards
+    /// wall-clock step (an NTP correction, a manual set) would otherwise mint a
+    /// `created_unix_ns` below one already committed and let a stale duplicate
+    /// sample outrank its correction under the query-time dedup order. Nonzero
+    /// means the floor absorbed at least one such step; the delta is logged at
+    /// warn. Exported as `ravel_ingest_clock_regressions_total`.
+    clock_regressions: AtomicU64,
     /// Multi-shard Strict writes that returned `WriteError::PartialWrite`
     /// (issue #1130): at least one shard committed durably and at least one
     /// sibling then failed in the same `write()` call. A nonzero value means
@@ -506,6 +514,10 @@ pub struct IngestMetricsSnapshot {
     pub acks_ok: u64,
     pub acks_err: u64,
     pub series_id_collisions: u64,
+    /// Flush-open stamps raised to this writer's monotonic floor after a
+    /// backwards clock step (ADR-1307). Exported as
+    /// `ravel_ingest_clock_regressions_total`.
+    pub clock_regressions: u64,
     /// Multi-shard Strict writes returned as `WriteError::PartialWrite`
     /// (issue #1130): a partial multi-shard commit. Exported as
     /// `ravel_ingest_partial_writes_total`.
@@ -698,6 +710,12 @@ impl IngestMetrics {
         self.series_id_collisions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush whose flush-open stamp was raised to this writer's monotonic
+    /// floor because the clock read below the previous stamp (ADR-1307).
+    pub(crate) fn record_clock_regression(&self) {
+        self.clock_regressions.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as `WriteError::PartialWrite`
     /// (issue #1130): at least one shard committed durably before a sibling
     /// failed. Recorded once per such write, at the router's error
@@ -773,6 +791,7 @@ impl IngestMetrics {
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
+            clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
@@ -810,6 +829,7 @@ mod tests {
         metrics.record_acks(2, true);
         metrics.record_acks(1, false);
         metrics.record_series_id_collision();
+        metrics.record_clock_regression();
         metrics.record_partial_write();
         metrics.record_shard_death();
         metrics.record_exemplars(2, 5);
@@ -828,6 +848,7 @@ mod tests {
         assert_eq!(snap.acks_ok, 2);
         assert_eq!(snap.acks_err, 1);
         assert_eq!(snap.series_id_collisions, 1);
+        assert_eq!(snap.clock_regressions, 1);
         assert_eq!(snap.partial_writes, 1);
         assert_eq!(snap.shard_deaths, 1);
     }
