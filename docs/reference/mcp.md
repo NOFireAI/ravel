@@ -91,22 +91,24 @@ the tool name, a hash of the arguments, the position to resume from, and
 the pinned snapshot, including which erasure predicates were pending and
 which typed attribute columns were declared at mint time.
 
-A cursor stays valid until the earlier of the call's remaining deadline or
-the pinned snapshot's protection window. Redeeming a cursor re-executes the
-original statement against the pinned snapshot with a keyset predicate;
-the server holds nothing in between calls. Only the process that minted a
-cursor can redeem it, so a load balancer needs sticky routing to a paging
-client.
+A cursor stays valid until the earlier of the call's remaining deadline
+and the protection horizon minus the grace period. Redeeming a cursor
+re-executes the original statement against the pinned snapshot with a
+keyset predicate; the server holds nothing in between calls. Only the
+process that minted a cursor can redeem it, so a load balancer needs
+sticky routing to a paging client.
 
-`ravel_query_sql` mints a cursor only when the statement's `ORDER BY`, plus
-a tiebreak the tool appends, is a total order over the projection.
-`ravel_search_logs` orders by a tuple of timestamp, observed timestamp,
-trace id, span id, and a body hash; that tuple is not unique, because
-`logs` rows carry no row identity and ingest is at-least-once. When a page
-would end inside a group of equal tuples, the tool drops the whole group
-from the page instead of splitting it, and the cursor resumes after the
-group. `ravel_get_trace` orders by start timestamp and span id under the
-same rule. When no complete group fits in a page, the result is
+`ravel_query_sql` mints a cursor only when the statement's `ORDER BY`,
+plus a tiebreak the tool appends, is a total order over the projection.
+The same equal-group rule below applies when that tiebreak is not
+unique. `ravel_search_logs` orders by a tuple of timestamp, observed
+timestamp, trace id, span id, and a body hash. That tuple is not
+unique, because `logs` rows carry no row identity and ingest is
+at-least-once. When a page would end inside a group of equal tuples,
+the tool drops the whole group from the page instead of splitting it,
+and the cursor resumes after the group. `ravel_get_trace` orders by
+`(start_ts, span_id)`, which is unique, so the equal-group rule never
+applies to it. When no complete group fits in a page, the result is
 `ok_bounded` with no cursor.
 
 An evidence reference is a token of the same family, with a `sha256` of the
