@@ -64,15 +64,16 @@ const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DECOMPRESSED_OTLP_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Size of the staging buffer the gzip decoder reads into, and so the upper
-/// bound on one retained inflate chunk. Fixed, stack-allocated, and reused for
-/// every read, so it is a fixed per-inflate overhead, not a share of the
-/// charged bytes: this buffer, the per-chunk bookkeeping [`ChunkedBody`]
-/// documents, and flate2's own decoder state (tens of KiB) are the
-/// allocations this path never charges. The compressed request body itself
-/// also stays resident for the whole inflate, bounded by
+/// bound on one retained inflate chunk. This one staging buffer is fixed,
+/// stack-allocated, and reused for every read; between the read and the
+/// retained copy it transiently holds one chunk of decompressed bytes, never
+/// the full decompressed body. It is one of the allocations this path never
+/// charges, alongside the per-chunk bookkeeping [`ChunkedBody`] documents
+/// (which scales with chunk count, not with any single chunk's size) and
+/// flate2's own decoder state (tens of KiB, fixed). The compressed request
+/// body itself also stays resident for the whole inflate, bounded by
 /// [`MAX_REQUEST_BODY_BYTES`] and already counted against
-/// `--max-inflight-ingest-requests`, not left uncharged here. None of these
-/// scale with the decompressed size.
+/// `--max-inflight-ingest-requests`, not left uncharged here.
 const INFLATE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// The `Content-Encoding` a request declared, after RFC 9110 parsing. Only the
@@ -131,15 +132,19 @@ fn parse_content_encoding(headers: &HeaderMap) -> ContentCoding {
 /// for. Retaining each inflate chunk as its own exactly-sized [`Bytes`] instead
 /// makes the charge equal the retained bytes at every instant: each chunk is
 /// allocated once at its final size, and no chunk is ever copied into a larger
-/// one. What stays uncharged is a fixed per-inflate overhead: the fixed
-/// [`INFLATE_CHUNK_BYTES`] staging buffer, this struct's per-chunk bookkeeping
-/// (one `Bytes` handle and one charge guard per chunk, together about 48
-/// bytes per 64 KiB chunk), and flate2's own decoder state (tens of KiB).
-/// The compressed request body itself also stays resident for the whole
-/// inflate, but it is bounded by [`MAX_REQUEST_BODY_BYTES`] and already
-/// counted against `--max-inflight-ingest-requests`, not left uncharged here.
-/// No uncharged allocation holds a copy of the decompressed bytes; the two
-/// vectors that hold those per-chunk handles grow by doubling.
+/// one. What stays uncharged is a fixed staging-and-decoder cost plus a
+/// per-chunk bookkeeping cost that scales with chunk count: the fixed
+/// [`INFLATE_CHUNK_BYTES`] staging buffer, which between the read and the
+/// retained copy transiently holds one chunk of decompressed bytes; flate2's
+/// own decoder state (tens of KiB, fixed); and about 48 bytes per 64 KiB chunk
+/// of bookkeeping -- one `Bytes` handle in this struct's `chunks` vector and
+/// one [`IngestByteCharge`] guard in the separate charges vector
+/// [`decompress_gzip_capped_charged`] returns to its caller, both vectors
+/// growing by doubling. The compressed request body itself also stays resident
+/// for the whole inflate, but it is bounded by [`MAX_REQUEST_BODY_BYTES`] and
+/// already counted against `--max-inflight-ingest-requests`, not left
+/// uncharged here. No uncharged allocation holds a copy of the full
+/// decompressed body; the staging buffer holds only one chunk at a time.
 ///
 /// The identity path wraps its single body chunk here unchanged, so it still
 /// makes no copy and takes no charge.
