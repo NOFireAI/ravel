@@ -440,9 +440,11 @@ the liveness lane alone.
 
 Round thirteen moved both lanes from `MaxClock = 2` to `MaxClock = 1`. The open
 ingest bucket (issue #1411) added three variables, which multiplied the reachable
-graph by about 8.5 at a fixed bound: `MaxClock = 2` reaches 30.5M distinct states
-at depth 34 and does not finish inside the 300 second smoke budget on a four-core
-runner with a 2 GB heap. `MaxClock = 1` finishes in 54 seconds at 2.8M distinct
+graph by about 8.5 at a fixed bound: `MaxClock = 2` does not finish inside the 300
+second smoke budget on a four-core runner with a 2 GB heap, where it was killed at
+300 seconds having reached about 15.1M distinct states; its complete graph is 30.5M
+distinct states at depth 34, measured separately on a 16-core host with the JVM
+default heap in 3 min 54 s. `MaxClock = 1` finishes in 54 seconds at 2.8M distinct
 states, depth 31. Each of the nine negative controls still fires its own target
 invariant at `MaxClock = 1`, which is the evidence that the smaller bound still
 reaches every guarded behaviour. `results.md`, "Round thirteen", records both

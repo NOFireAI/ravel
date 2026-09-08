@@ -1830,3 +1830,56 @@ together exceed it: the first covered catalog, commit, common, lifecycle and
 maintenance with every check passing, the second `-a resharding` finished
 `check-tla: ci: all checks passed`, exit 0 in 50s. No area regressed.
 `python3 scripts/check_docs.py` exit 0, `docs gate: clean.`.
+
+### Reachability of the out-of-scope open bucket (issue #1411 follow-up)
+
+The round left one claim without a lane behind it. The model's docs and
+`traceability.md` say an hour that opens after the acknowledgement is out of
+scope and holds nothing, and `RequestErasure` is the only writer of
+`ingestAckScope`. But `CompletionCoversEveryBucketOpenAtRequest` reads the same
+completion witness the guard feeds, so a strictly stronger guard would pass every
+shipped invariant unchanged: deleting the `ingestAckScope` conjunct from
+`IngestUnsealedInScope` (so a bucket opened after the ack also blocks completion)
+still passes all eighteen invariants at 2,203,866 distinct states. Safety
+invariants cannot catch over-strictness.
+
+A reachability probe supplies the missing evidence. A scratch cfg over the
+unmodified model, `MaxClock = 1`, carries the single state invariant
+
+```tla
+NoCompletionWithOutOfScopeOpenBucket ==
+    ~(PresentObj("doneR1") /\ ingestPhase = "open" /\ ~ingestAckScope)
+```
+
+asserting that no completion coexists with an open, out-of-scope bucket. TLC
+reports it violated:
+
+```text
+Error: Invariant NoCompletionWithOutOfScopeOpenBucket is violated.
+20275 states generated, 6876 distinct states found, 4148 states left on queue.
+The depth of the complete state graph search is 8.
+```
+
+Exit 12, counterexample seven states: `RequestErasure` fires while
+`ingestPhase = "absent"` (so `ingestAckScope` stays FALSE), `OpenBucket` opens a
+bucket after the ack, and `CompleteErasure` lands `doneR1` at clock 1 with
+`ingestPhase = "open"` and `ingestAckScope = FALSE`. The completion proceeds
+because the open bucket is genuinely out of scope. Strengthening the guard as
+above makes the same probe pass (`No error has been found`, 2,203,866 distinct),
+which is what shows the probe discriminates the shipped ack-scoped guard from an
+over-strict one rather than being vacuously violated. The witness, trace, and
+both runs are recorded in
+`counterexamples/completion-out-of-scope-bucket-probe.md`. The probe cfg is a
+reachability witness, not a shipped control, and lives under `/tmp`.
+
+Two documentation attributions were corrected in the same change. The 30.5M
+distinct / depth 34 figure at `MaxClock = 2` is the completed graph from a
+16-core, default-heap run in 3 min 54 s, not the four-core, 2 GB run, which was
+killed at 300 s having reached about 15.1M distinct; `README.md`'s bound note,
+`smoke.cfg`'s header, and `exhaustive.cfg`'s header now name the machine beside
+each figure the way this section's table does. And `ASSUME SealBound =< MaxClock`
+was added to `LifecycleGC.tla`: at `SealBound > MaxClock` the `SealBucket` guard
+`clock >= SealBound` is never enabled, so the open-bucket guard would hold
+vacuously; the ASSUME fails TLC closed on such a config. Every shipped cfg sets
+`SealBound = 1` with `MaxClock` at 1 or 2, so the ASSUME holds and the `ci` lane
+figures are unchanged.
