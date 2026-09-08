@@ -160,6 +160,116 @@ struct Policy {
     statements: serde_json::Value,
 }
 
+/// The complete set of statement keys any guard in this file reads. Sid,
+/// Effect, Action, and Resource are read directly (see `statement_actions`,
+/// `resource_key_patterns`, `delete_key_patterns`, `kms_statement_resources`,
+/// ...); Condition is read for the `s3:prefix` ListBucket block
+/// (`list_prefix_patterns`). Nothing else is examined by any guard.
+///
+/// This list is the guard's contract: a statement carrying any key outside it
+/// is one no guard reasons about, so it must fail closed at `load_policy`
+/// rather than be silently skipped (issue #1346).
+const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource", "Condition"];
+
+/// Keys that describe a statement shape these guards deliberately cannot
+/// reason about: `NotAction`/`NotResource` invert the set the Action/Resource
+/// guards inspect (so a statement carrying them is permissive in exactly the
+/// direction the guard reads, while the guard sees an empty positive set and
+/// passes it), and `Principal`/`NotPrincipal` scope a statement to identities
+/// this file models nothing about. Each is rejected with a message saying so,
+/// rather than lumped in with an unrecognized-typo key.
+const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
+    &["NotAction", "NotResource", "NotPrincipal", "Principal"];
+
+/// Fail closed on any statement shape the guards in this file do not fully
+/// understand. This is the single choke point every shipped-template guard
+/// passes through (`load_policy` calls it for each statement), so a new
+/// unhandled shape is rejected once here instead of slipping past a guard that
+/// only reads the fields it happens to know.
+///
+/// Rejects, naming the `Sid` and the offending key or field:
+/// - a statement that is not a JSON object;
+/// - `NotAction`/`NotResource`/`NotPrincipal`/`Principal` (negated or
+///   principal-scoped: the guard cannot reason about them);
+/// - any other key outside `HANDLED_STATEMENT_KEYS` (e.g. a `Resources` typo);
+/// - an `Effect` that is neither `Allow` nor `Deny`;
+/// - an `Action` or `Resource` that is neither a string nor an array of
+///   strings;
+/// - a missing `Resource` key (the exact shape #1346 records being skipped:
+///   the resource guards read `stmt["Resource"]`, find `Null`, and drop the
+///   statement as having nothing to check).
+fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Result<(), String> {
+    let obj = stmt
+        .as_object()
+        .ok_or_else(|| format!("{role}: statement #{index} is not a JSON object: {stmt:?}"))?;
+    let sid = obj
+        .get("Sid")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<no Sid>");
+
+    for key in obj.keys() {
+        if NEGATED_OR_PRINCIPAL_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "{role}/{sid}: statement uses {key:?}; the guards in this file \
+                 cannot reason about negated or principal-scoped statements \
+                 (they read only the positive Action/Resource sets), so a policy \
+                 carrying it must be rejected rather than silently passed"
+            ));
+        }
+        if !HANDLED_STATEMENT_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "{role}/{sid}: statement uses key {key:?}, which no guard in this \
+                 file handles (handled keys: {HANDLED_STATEMENT_KEYS:?}); it must \
+                 fail closed rather than sit unexamined"
+            ));
+        }
+    }
+
+    match obj.get("Effect").and_then(|v| v.as_str()) {
+        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => {}
+        other => {
+            return Err(format!(
+                "{role}/{sid}: Effect is neither \"Allow\" nor \"Deny\": {other:?}"
+            ));
+        }
+    }
+
+    if !is_string_or_string_array(obj.get("Action")) {
+        return Err(format!(
+            "{role}/{sid}: Action is neither a string nor an array of strings: {:?}",
+            obj.get("Action")
+        ));
+    }
+
+    match obj.get("Resource") {
+        None => {
+            return Err(format!(
+                "{role}/{sid}: statement has no Resource key -- a statement with no \
+                 Resource is the exact shape the resource guards skip (they read \
+                 stmt[\"Resource\"], find Null, and treat it as nothing to check)"
+            ));
+        }
+        resource if !is_string_or_string_array(resource) => {
+            return Err(format!(
+                "{role}/{sid}: Resource is neither a string nor an array of \
+                 strings: {resource:?}"
+            ));
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// True only for a JSON string or an array whose every element is a string.
+fn is_string_or_string_array(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::String(_)) => true,
+        Some(serde_json::Value::Array(a)) => a.iter().all(serde_json::Value::is_string),
+        _ => false,
+    }
+}
+
 fn load_policy(role: &'static str) -> Policy {
     let path = format!(
         "{}/../../deploy/iam/{role}.json",
@@ -170,6 +280,11 @@ fn load_policy(role: &'static str) -> Policy {
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
     let statements = json["Statement"].clone();
     assert!(statements.is_array(), "{path}: Statement is not an array");
+    for (index, stmt) in statements.as_array().unwrap().iter().enumerate() {
+        if let Err(msg) = validate_statement(role, index, stmt) {
+            panic!("{path}: {msg}");
+        }
+    }
     Policy { role, statements }
 }
 
@@ -1196,6 +1311,205 @@ fn single_character_wildcard_in_kms_resource_is_not_a_bypass() {
             key_id_guard.is_err(),
             "every_kms_statement_names_a_key_id's assertion must fire on \
              {resource:?}"
+        );
+    }
+}
+
+/// Regression fixtures for the fail-closed choke point (issue #1346, the fourth
+/// instance of the skip-what-you-do-not-understand class this guard keeps
+/// repeating: could not read `Resource`; matched the action prefix
+/// case-sensitively; accepted `?` in ARN segments; and now ignores
+/// `NotResource`/`NotAction`). Before this fix, `load_policy` performed no
+/// per-statement validation, so a statement whose permission lived in a field
+/// no guard reads -- `NotResource`, `NotAction`, an unrecognized key such as a
+/// `Resources` typo, or a statement with no `Resource` at all -- was loaded and
+/// then silently skipped by whichever guard went looking for a field it did not
+/// find. The guard ran, reported the templates safe, and the statement sat
+/// unexamined.
+///
+/// Synthetic statements, not `deploy/iam/*.json`: the shipped templates carry
+/// only handled, well-formed statements, so a fixture over them proves nothing
+/// about the choke point and goes green the day someone edits the config. Each
+/// negative case asserts in both directions -- that the pre-fix guards found
+/// nothing to object to (Observation 1, the hole) and that `validate_statement`
+/// now rejects it naming both the `Sid` and the offending key (Observation 2).
+#[test]
+fn statement_using_an_unhandled_key_fails_closed() {
+    // (Sid, statement, substring the rejection must name, which field hid the
+    // permission pre-fix: "resource" => resource_key_patterns skipped it,
+    // "action" => statement_actions saw no action).
+    let negative_cases = [
+        (
+            "NegatedResource",
+            serde_json::json!({
+                "Sid": "NegatedResource",
+                "Effect": "Allow",
+                "Action": "s3:DeleteObject",
+                "NotResource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov"
+            }),
+            "NotResource",
+            "resource",
+        ),
+        (
+            "NegatedAction",
+            serde_json::json!({
+                "Sid": "NegatedAction",
+                "Effect": "Allow",
+                "NotAction": "s3:GetObject",
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "NotAction",
+            "action",
+        ),
+        (
+            "TypoResources",
+            serde_json::json!({
+                "Sid": "TypoResources",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resources": "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*"
+            }),
+            "Resources",
+            "resource",
+        ),
+        (
+            "MissingResource",
+            serde_json::json!({
+                "Sid": "MissingResource",
+                "Effect": "Allow",
+                "Action": "s3:GetObject"
+            }),
+            "no Resource",
+            "resource",
+        ),
+    ];
+
+    for (sid, stmt, must_name, hidden_side) in &negative_cases {
+        let policy = Policy {
+            role: "fixture",
+            statements: serde_json::json!([stmt.clone()]),
+        };
+
+        // Observation 1 (load-bearing): the pre-fix guard that would have read
+        // the permission found nothing. A resource-hidden statement produces no
+        // resource pattern to check; an action-hidden statement produces no
+        // action. If the relevant set stops being empty, the fixture no longer
+        // proves the statement was skipped and must be rewritten, not deleted.
+        match *hidden_side {
+            "resource" => assert!(
+                resource_key_patterns(&policy).is_empty(),
+                "fixture {sid} invalid: resource_key_patterns was expected to \
+                 skip the statement (returning nothing); it did not"
+            ),
+            "action" => assert!(
+                statement_actions(stmt).is_empty(),
+                "fixture {sid} invalid: statement_actions was expected to see no \
+                 action (returning nothing); it did not"
+            ),
+            other => panic!("fixture {sid}: unknown hidden_side {other:?}"),
+        }
+
+        // Observation 2: the choke point rejects it, naming the Sid and the key.
+        let err = validate_statement("fixture", 0, stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        assert!(
+            err.contains(must_name),
+            "fixture {sid}: rejection must name {must_name:?}; got {err:?}"
+        );
+        assert!(
+            err.contains(sid),
+            "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+
+        // ...and so does load_policy's per-statement loop, the real call site.
+        let loaded = std::panic::catch_unwind(|| {
+            for (i, s) in policy.statements.as_array().unwrap().iter().enumerate() {
+                if let Err(msg) = validate_statement(policy.role, i, s) {
+                    panic!("{msg}");
+                }
+            }
+        });
+        assert!(
+            loaded.is_err(),
+            "fixture {sid}: the load_policy validation loop must reject it"
+        );
+    }
+
+    // Positive control: a well-formed Allow whose keys are all handled passes.
+    let ok = serde_json::json!({
+        "Sid": "WellFormedAllow",
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Resource": ["arn:aws:s3:::my-ravel-bucket/t/*"]
+    });
+    assert!(
+        validate_statement("fixture", 0, &ok).is_ok(),
+        "a well-formed Allow with only handled keys must pass"
+    );
+}
+
+/// Companion to the choke point's key check: a statement whose keys are all
+/// handled but whose values are malformed must also fail closed rather than be
+/// skipped. Pre-fix, an `Effect` that is neither Allow nor Deny was skipped by
+/// every effect-filtered guard (they compare case-insensitively against exactly
+/// those two), and an `Action` or `Resource` that is neither a string nor an
+/// array of strings was read as an empty set and dropped. Synthetic for the
+/// same reason as above.
+#[test]
+fn malformed_effect_action_or_resource_fails_closed() {
+    let cases = [
+        (
+            "BadEffect",
+            serde_json::json!({
+                "Sid": "BadEffect",
+                "Effect": "Permit",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "Effect",
+        ),
+        (
+            "ActionIsNumber",
+            serde_json::json!({
+                "Sid": "ActionIsNumber",
+                "Effect": "Allow",
+                "Action": 7,
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "Action",
+        ),
+        (
+            "ActionArrayHasNonString",
+            serde_json::json!({
+                "Sid": "ActionArrayHasNonString",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", 7],
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "Action",
+        ),
+        (
+            "ResourceIsNumber",
+            serde_json::json!({
+                "Sid": "ResourceIsNumber",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": 7
+            }),
+            "Resource",
+        ),
+    ];
+
+    for (sid, stmt, must_name) in &cases {
+        let err = validate_statement("fixture", 0, stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        assert!(
+            err.contains(must_name),
+            "fixture {sid}: rejection must name {must_name:?}; got {err:?}"
+        );
+        assert!(
+            err.contains(sid),
+            "fixture {sid}: rejection must name the Sid; got {err:?}"
         );
     }
 }
