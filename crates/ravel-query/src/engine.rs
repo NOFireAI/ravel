@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1469,8 +1469,16 @@ impl QueryEngine {
         // hand after each plan below -- otherwise two log selectors would
         // each see, and could each spend, the full remaining budget.
         let mut log_series_out: Vec<SeriesData> = Vec::new();
-        let mut log_segments_fetched: u64 = 0;
-        let mut log_segments_pruned: u64 = 0;
+        // Every plan below re-walks the SAME `log_snapshot.segments` slice
+        // (issue #1228): a segment one plan prunes at its own STREAM_DIR or
+        // time-range check can be exactly the segment another plan fetches,
+        // so a plan-summed or plan-maxed count over- or under-reports the
+        // lane's true fetched/pruned split. Unioning each plan's
+        // `fetched_segments` indexes (all indexes into this same slice, see
+        // the field doc on `LogSeriesOutput`) gives the lane's real fetched
+        // set regardless of plan count, and `segments_pruned` is the rest of
+        // the resolved set by construction.
+        let mut log_fetched_segments: HashSet<usize> = HashSet::new();
         let mut fed_metric_names: Vec<&'static str> = Vec::new();
         for plan in &log_plans {
             // `log_plans` was filtered by `log_metric_of(...).is_some()`
@@ -1503,8 +1511,7 @@ impl QueryEngine {
             let out_samples: usize = out.series.iter().map(|s| s.samples.len()).sum();
             samples_remaining = samples_remaining.saturating_sub(out_samples);
             series_remaining = series_remaining.saturating_sub(out.series.len());
-            log_segments_fetched = log_segments_fetched.max(out.segments_fetched as u64);
-            log_segments_pruned += out.segments_pruned as u64;
+            log_fetched_segments.extend(out.fetched_segments.iter().copied());
             log_series_out.extend(out.series);
             if !fed_metric_names.contains(&metric.name()) {
                 fed_metric_names.push(metric.name());
@@ -1512,14 +1519,19 @@ impl QueryEngine {
         }
 
         source.log_series = log_series_out;
+        let log_segments_fetched = log_fetched_segments.len() as u64;
+        // `log_snapshot.segments.len() - log_segments_fetched` rather than a
+        // per-plan sum/max (issue #1228): the union above already counts
+        // each segment at most once regardless of how many plans fetched
+        // it, so the rest of the resolved set is pruned by construction --
+        // `log_segments_fetched + this == log_snapshot.segments.len()`
+        // holds for any plan count. `log_snapshot.segments_pruned` is
+        // structurally 0 for this lane (comment below, at
+        // `log_plan_class`): the catalog resolve passes no name filter to
+        // prune against. Adding it anyway keeps a future resolve-side prune
+        // from being silently dropped.
+        let log_segments_pruned = log_snapshot.segments.len() as u64 - log_segments_fetched;
         stats.segments_fetched += log_segments_fetched;
-        // `log_snapshot.segments_pruned` is structurally 0 for this lane
-        // (comment below, at `log_plan_class`): the catalog resolve passes
-        // no name filter to prune against. `log_segments_pruned` is the
-        // figure that actually reflects pruning for the log lane --
-        // `fetch_log_series`'s own per-segment time-range and stream-label
-        // check, summed across every plan this lane ran. Adding both keeps
-        // a future resolve-side prune from being silently dropped.
         stats.segments_pruned += log_segments_pruned + log_snapshot.segments_pruned;
         stats.phase_accounting =
             combine_phase_accounting(&stats.phase_accounting, &log_accounting.snapshot());

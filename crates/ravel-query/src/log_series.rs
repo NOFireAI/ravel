@@ -320,6 +320,17 @@ pub struct LogSeriesOutput {
     pub records_scanned: u64,
     pub segments_fetched: usize,
     pub segments_pruned: usize,
+    /// Indexes into the `segments` slice this call was given, one per
+    /// segment that reached a Scan-phase fetch (the same segments
+    /// `segments_fetched` counts). Indexes, not `SegmentRef`/data-object-key
+    /// values: every caller in this crate re-walks the SAME slice
+    /// (`log_snapshot.segments`) for every plan in a log lane, so an index
+    /// identifies a segment within that shared slice at the cost of a
+    /// `usize` copy, with no `String` clone or hash. A caller fetching more
+    /// than one selector against that slice (`QueryEngine::prefetch`'s log
+    /// lane) unions these across plans to get the lane's true fetched-set
+    /// size, rather than summing or maxing each plan's own count.
+    pub fetched_segments: Vec<usize>,
     /// Blocks the reader decoded, from its own per-object `ScanStats`, summed
     /// over every segment this call actually opened a scan for. Zero for a
     /// segment pruned before Scan-phase (no bloom/skip-index pruning to
@@ -667,10 +678,11 @@ pub async fn fetch_log_series(
     let mut records_scanned: u64 = 0u64;
     let mut segments_fetched = 0usize;
     let mut segments_pruned = 0usize;
+    let mut fetched_segments: Vec<usize> = Vec::new();
     let mut blocks_scanned: u64 = 0u64;
     let mut blocks_total: u64 = 0u64;
 
-    for seg_ref in segments {
+    for (seg_idx, seg_ref) in segments.iter().enumerate() {
         if let Some(err) = deadline_exceeded(req.deadline) {
             return Err(err);
         }
@@ -751,6 +763,7 @@ pub async fn fetch_log_series(
             continue;
         };
         segments_fetched += 1;
+        fetched_segments.push(seg_idx);
 
         while let Some(records) = scan.next_block()? {
             if let Some(err) = deadline_exceeded(req.deadline) {
@@ -855,6 +868,7 @@ pub async fn fetch_log_series(
         records_scanned,
         segments_fetched,
         segments_pruned,
+        fetched_segments,
         blocks_scanned,
         blocks_total,
     })
