@@ -21,13 +21,11 @@ bad()  { printf 'FAIL  %s\n' "$1"; fail=$((fail + 1)); }
 # `main "$@"` call on the last line) so run_tlc can be driven directly,
 # against a throwaway FORMAL_DIR/CACHE_DIR, without needing the real TLC jar
 # or network access.
+LIB_SRC="$(mktemp)"
 source_lib() {
-    local tmp_src
-    tmp_src="$(mktemp)"
-    sed '$d' "$SCRIPT" > "$tmp_src"
+    sed '$d' "$SCRIPT" > "$LIB_SRC"
     # shellcheck disable=SC1090
-    source "$tmp_src"
-    rm -f "$tmp_src"
+    source "$LIB_SRC"
 }
 source_lib
 
@@ -50,6 +48,7 @@ run_tlc_case() {
     JAVA="$shim"
     JAR="/dev/null"
     resolve_timeout
+    resolve_tla_resources
 
     logfile="$tmp/tlc.log"
     start=$(date +%s)
@@ -290,5 +289,109 @@ echo "(c) is proved manually and reported, not replayed here: it needs the" \
      "real TLC jar, network on first fetch, and a JDK, none of which this" \
      "unit test provisions."
 
+# --- (g)-(j) issue #1421: RAVEL_TLA_WORKERS / RAVEL_TLA_XMX -----------------
+# `-workers auto` claims every core on the host and TLC's heap was left
+# uncapped; a shared or loaded box needs both fixed. A java shim that never
+# launches TLC, only records its own argv, proves what run_tlc actually
+# constructs without needing the real jar.
+run_tlc_args_case() {
+    # run_tlc_args_case -> sets CASE_ARGS_FILE (one argv token per line) and
+    # CASE_TMP, via a java shim that records "$@" and exits 0.
+    local tmp area_dir shim logfile
+    tmp="$(mktemp -d)"
+    area_dir="$tmp/area"
+    mkdir -p "$area_dir"
+    : > "$area_dir/smoke.cfg"
+    shim="$tmp/java"
+    cat > "$shim" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$tmp/args"
+exit 0
+EOF
+    chmod +x "$shim"
+
+    FORMAL_DIR="$tmp"
+    CACHE_DIR="$tmp/cache"
+    mkdir -p "$CACHE_DIR"
+    JAVA="$shim"
+    JAR="/dev/null"
+    resolve_timeout
+
+    logfile="$tmp/tlc.log"
+    run_tlc area module "$area_dir/smoke.cfg" 5 "$logfile" >/dev/null 2>&1
+    CASE_ARGS_FILE="$tmp/args"
+    CASE_TMP="$tmp"
+}
+
+# args_has_flag_value <file> <flag> <value> -> true if <flag> is followed by
+# <value> on the next line (a space-separated pair, e.g. "-workers" "2").
+args_has_flag_value() {
+    awk -v f="$2" -v v="$3" '
+        $0 == f { getline nxt; if (nxt == v) { found = 1 } }
+        END { exit !found }
+    ' "$1"
+}
+
+echo "--- (g) default resources: -workers 2 -Xmx2g"
+unset RAVEL_TLA_WORKERS RAVEL_TLA_XMX
+resolve_tla_resources
+gcode=$?
+if [ "$gcode" -eq 0 ]; then ok; else bad "g: resolve_tla_resources exited $gcode on defaults"; fi
+run_tlc_args_case
+if grep -qxF -- '-Xmx2g' "$CASE_ARGS_FILE" 2>/dev/null; then
+    ok
+else
+    bad "g: expected -Xmx2g in argv; got: $(cat "$CASE_ARGS_FILE" 2>/dev/null)"
+fi
+if args_has_flag_value "$CASE_ARGS_FILE" -workers 2; then
+    ok
+else
+    bad "g: expected -workers 2 in argv; got: $(cat "$CASE_ARGS_FILE" 2>/dev/null)"
+fi
+rm -rf "$CASE_TMP"
+
+echo "--- (h) override RAVEL_TLA_WORKERS=4 RAVEL_TLA_XMX=4g"
+RAVEL_TLA_WORKERS=4 RAVEL_TLA_XMX=4g resolve_tla_resources
+hcode=$?
+if [ "$hcode" -eq 0 ]; then ok; else bad "h: resolve_tla_resources exited $hcode on a valid override"; fi
+run_tlc_args_case
+if grep -qxF -- '-Xmx4g' "$CASE_ARGS_FILE" 2>/dev/null; then
+    ok
+else
+    bad "h: expected -Xmx4g in argv; got: $(cat "$CASE_ARGS_FILE" 2>/dev/null)"
+fi
+if args_has_flag_value "$CASE_ARGS_FILE" -workers 4; then
+    ok
+else
+    bad "h: expected -workers 4 in argv; got: $(cat "$CASE_ARGS_FILE" 2>/dev/null)"
+fi
+rm -rf "$CASE_TMP"
+unset RAVEL_TLA_WORKERS RAVEL_TLA_XMX
+
+echo "--- (i) RAVEL_TLA_WORKERS=auto is rejected"
+iout=""
+iout="$(RAVEL_TLA_WORKERS=auto bash -c "source '$LIB_SRC'; resolve_tla_resources" 2>&1)"
+icode=$?
+echo "    measured: exit=$icode"
+if [ "$icode" -eq 2 ]; then ok; else bad "i: expected exit 2, got $icode"; fi
+if printf '%s' "$iout" | grep -qF 'RAVEL_TLA_WORKERS'; then
+    ok
+else
+    bad "i: refusal message missing RAVEL_TLA_WORKERS; got: $iout"
+fi
+
+echo "--- (j) RAVEL_TLA_XMX=lots is rejected"
+jout=""
+jout="$(RAVEL_TLA_XMX=lots bash -c "source '$LIB_SRC'; resolve_tla_resources" 2>&1)"
+jcode=$?
+echo "    measured: exit=$jcode"
+if [ "$jcode" -eq 2 ]; then ok; else bad "j: expected exit 2, got $jcode"; fi
+if printf '%s' "$jout" | grep -qF 'RAVEL_TLA_XMX'; then
+    ok
+else
+    bad "j: refusal message missing RAVEL_TLA_XMX; got: $jout"
+fi
+
+rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

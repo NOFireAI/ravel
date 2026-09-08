@@ -70,6 +70,16 @@ later if TERM was ignored. Either way the run is reported as a timeout, not
 left running and not read as a pass. CI runs on Ubuntu, which ships GNU
 `timeout`, so it needs no extra setup.
 
+TLC's worker count and JVM heap cap are fixed, not left to `-workers auto`
+(which claims every core on the host) or an uncapped `-Xmx`:
+`RAVEL_TLA_WORKERS` (default `2`) and `RAVEL_TLA_XMX` (default `2g`) control
+them. Both are validated before any model runs -- `RAVEL_TLA_WORKERS` must
+be a positive integer and `RAVEL_TLA_XMX` must match the JVM's `-Xmx`
+grammar (digits then `k`, `m`, or `g`) -- and a bad value exits 2 with a
+one-line refusal rather than reaching TLC as a silently wrong flag. The
+resolved values are printed once per run (`check-tla: resources:
+workers=<n> xmx=<size>`), next to the figures they produced.
+
 ```sh
 scripts/check-tla.sh smoke            # fast safety, every area (budget 300s/cfg)
 scripts/check-tla.sh negative         # every negative control must fail correctly
@@ -82,9 +92,10 @@ scripts/check-tla.sh smoke -a common  # scope any subcommand to one area
 
 `ci` and `all` record every model under a single run id, so `last-run.tsv` is
 one coherent run rather than a config's rows overwriting the previous config's.
-Exit codes: `0` pass, `1` a check failed, `2` no usable Java or GNU
-timeout(1) unavailable. A subcommand or
-`-a` area that does not exist, and `-a` with no value, fail immediately.
+Exit codes: `0` pass, `1` a check failed, `2` no usable Java, GNU timeout(1)
+unavailable, or an invalid `RAVEL_TLA_WORKERS`/`RAVEL_TLA_XMX` value. A
+subcommand or `-a` area that does not exist, and `-a` with no value, fail
+immediately.
 
 ### The TLC jar
 
@@ -125,7 +136,7 @@ Bands are optional and live in each area's `bands.tsv`, one row per config
 exists the harness enforces it on a PASS run and fails outside it; a run
 outside the band is a regression to investigate, not a band to widen.
 Negative controls stop at the first counterexample TLC finds, which under
-`-workers auto` is not deterministic, so they carry no band. `results.md`
+multiple workers is not deterministic, so they carry no band. `results.md`
 records the figures a run produced and the bands they must stay in.
 
 ## Negative controls
