@@ -27,7 +27,7 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
+use crate::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError};
 
 /// Version of the probe set itself, recorded alongside a pass in
 /// `sys/qualification` (ADR-0050 section 6). Bump this whenever a probe is
@@ -762,9 +762,15 @@ async fn probe_consistent_list_after_write(
         {
             return ProbeResult::fail(property, format!("put {key} failed: {err}"));
         }
-        match list_all(store, &list_prefix).await {
-            Ok(objects) => {
-                if !objects.iter().any(|meta| meta.key == key) {
+        // A membership probe, deliberately order-tolerant: an unsorted backend
+        // loses no key, so this must still observe the just-written one and
+        // leave the ordering verdict to `probe_lexicographic_listing_order`.
+        // `list_all` now rejects an out-of-order key with a typed error, which
+        // would collapse membership into an ordering failure, so drain the raw
+        // pages here instead.
+        match drain_pages(store, &list_prefix, None).await {
+            Ok((keys, _pages)) => {
+                if !keys.contains(&key) {
                     return ProbeResult::fail(
                         property,
                         format!(
@@ -774,8 +780,11 @@ async fn probe_consistent_list_after_write(
                     );
                 }
             }
-            Err(err) => {
-                return ProbeResult::fail(property, format!("listing {list_prefix} failed: {err}"));
+            Err(detail) => {
+                return ProbeResult::fail(
+                    property,
+                    format!("listing {list_prefix} failed: {detail}"),
+                );
             }
         }
     }
@@ -1035,7 +1044,7 @@ const MAX_PROBE_PAGES: usize = 64;
 /// Drain every page of `prefix` (from `start_after`, when given) and return
 /// the keys in delivery order together with the number of pages served.
 ///
-/// Deliberately not [`list_all`]: that helper deduplicates and discards both
+/// Deliberately not [`crate::list_all`]: that helper deduplicates and discards both
 /// the delivery order and the page count, which are exactly what the two
 /// listing probes below examine. Errors come back as a ready-to-report detail
 /// string so a misbehaving backend produces a failed [`ProbeResult`] rather

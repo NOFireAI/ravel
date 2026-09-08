@@ -2649,6 +2649,22 @@ pub(crate) fn clone_store_error(err: &StoreError) -> StoreError {
         StoreError::InvalidRange(msg) => StoreError::InvalidRange(msg.clone()),
         StoreError::Transient(msg) => StoreError::Transient(msg.clone()),
         StoreError::Permanent(msg) => StoreError::Permanent(msg.clone()),
+        StoreError::ListRepeatedToken { prefix } => StoreError::ListRepeatedToken {
+            prefix: prefix.clone(),
+        },
+        StoreError::ListPageCeiling { prefix, ceiling } => StoreError::ListPageCeiling {
+            prefix: prefix.clone(),
+            ceiling: *ceiling,
+        },
+        StoreError::ListOrderViolation {
+            prefix,
+            previous,
+            offending,
+        } => StoreError::ListOrderViolation {
+            prefix: prefix.clone(),
+            previous: previous.clone(),
+            offending: offending.clone(),
+        },
     }
 }
 
