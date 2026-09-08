@@ -136,20 +136,38 @@ fn backend_bills_requests_from_lookup(
     }
 }
 
-/// The configured S3 endpoint's host, when `RAVEL_S3_ENDPOINT` is set. Host
-/// only: never the scheme, path, or any embedded userinfo credentials, so a
-/// report can name the substrate without ever carrying a secret.
-pub fn endpoint_host_from_env() -> Option<String> {
-    endpoint_host_from_lookup(|key| std::env::var(key).ok())
+/// The configured S3 endpoint's host, when `kind` is [`StoreKind::S3`] and
+/// `RAVEL_S3_ENDPOINT` is set. `None` for [`StoreKind::Memory`] regardless of
+/// the env var: a memory-backed run never touched an endpoint, so it must
+/// never name one. Host only: never the scheme, path, or any embedded
+/// userinfo credentials, so a report can name the substrate without ever
+/// carrying a secret.
+pub fn endpoint_host_from_env(kind: StoreKind) -> Option<String> {
+    endpoint_host_from_lookup(kind, |key| std::env::var(key).ok())
 }
 
 /// [`endpoint_host_from_env`]'s logic over an injected lookup; see
 /// [`backend_bills_requests_from_lookup`].
-fn endpoint_host_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+fn endpoint_host_from_lookup(
+    kind: StoreKind,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if !matches!(kind, StoreKind::S3) {
+        return None;
+    }
     let raw = lookup("RAVEL_S3_ENDPOINT")?;
+    // `RAVEL_S3_ENDPOINT` is commonly given without a scheme (`localhost:9000`),
+    // which `Url::parse` treats as a `localhost:`-scheme URL rather than a host:
+    // port and returns no `host_str`. Retry with an assumed `http://` prefix so a
+    // scheme-less value still reports the right host.
     reqwest::Url::parse(&raw)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
+        .or_else(|| {
+            reqwest::Url::parse(&format!("http://{raw}"))
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+        })
 }
 
 #[cfg(test)]
@@ -245,6 +263,38 @@ mod tests {
                 lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
             ),
             "MemoryStore requests are free regardless of any configured S3 endpoint"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_extracts_the_host_with_or_without_a_scheme() {
+        assert_eq!(
+            endpoint_host_from_lookup(
+                StoreKind::S3,
+                lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
+            ),
+            Some("localhost".to_string()),
+            "a scheme-carrying endpoint's host is extracted directly"
+        );
+        assert_eq!(
+            endpoint_host_from_lookup(
+                StoreKind::S3,
+                lookup(&[("RAVEL_S3_ENDPOINT", "localhost:9000")]),
+            ),
+            Some("localhost".to_string()),
+            "a scheme-less endpoint must still report its host, not silently omit it"
+        );
+    }
+
+    #[test]
+    fn endpoint_host_is_absent_for_memory_regardless_of_the_env_var() {
+        assert_eq!(
+            endpoint_host_from_lookup(
+                StoreKind::Memory,
+                lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
+            ),
+            None,
+            "a memory-backed run never touched an endpoint, so it must never name one"
         );
     }
 }
