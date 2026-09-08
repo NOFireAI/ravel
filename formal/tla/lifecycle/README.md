@@ -55,18 +55,29 @@ as such and not checked here.
 
 ## Invariants
 
-Sixteen safety invariants including `TypeOK`; see `traceability.md` for the
+Seventeen safety invariants including `TypeOK`; see `traceability.md` for the
 one-line meaning of each and its Rust source. The load-bearing protocol
 properties: `NoDeleteInsideProtectionWindow`, `HeldObjectNeverDeleted`,
 `RefreshFailureNeverSweeps`, `TombstoneExcludesBeforeDelete`,
 `TombstoneNotDeletedBeforeBucketEmpty`,
 `ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`,
+`RewriteTargetMatchesResolvedInputs`,
 `CompletionImpliesNoPreRewriteExposure`, `CompletionRespectsLegalHold`,
 `DreqRemovalCannotResurrect`, `DreqSweepRespectsLegalHold`,
 `IdenticalInputSetsDoNotCollide`, `HeadNamedObjectNeverDeletedBySupersededSweep`,
 `AtMostOneLiveRecordSetServed`.
 `RawInputContentAssumedImmutable` is not a protocol property; it pins an
 environmental assumption the model is built on (see "Assumptions" below).
+
+`RewriteTargetMatchesResolvedInputs` (issues #1289, #1221) pins the join
+between what a rewrite pass resolves and what its published object claims:
+`PublishRewrite` names its target by `TargetOf(rwInputs[id])` and fills it from
+`Predecessors(target)`, so for every completed pass the predecessors of the
+chosen target must equal the input set the pass recorded. It holds in the
+shipped model because `RawInputs` and `CompactOut` are singletons, so
+`TargetOf` and `Predecessors` cannot disagree; its non-vacuity is shown by a
+two-raw-input probe where a pass resolves a proper subset (see "Non-vacuity"
+below and `counterexamples/rewrite-target-matches-resolved-inputs-probe.md`).
 
 `AtMostOneLiveRecordSetServed` (issue #1289) counts the record sets a reader
 can be served from, meaning present in the store and not themselves superseded,
@@ -234,8 +245,8 @@ cannot make the two exclude each other and only the producer-side guard can
 
 Ten boolean CONSTANTS gate the model's guards; all are at their shipped value
 in `smoke.cfg` and `exhaustive.cfg`. Each `negative/*.cfg` flips exactly one,
-runs with `FullEnv = TRUE` and all sixteen INVARIANT lines (TypeOK plus
-fifteen named) from `smoke.cfg` (finding 5), and names the single invariant
+runs with `FullEnv = TRUE` and all seventeen INVARIANT lines (TypeOK plus
+sixteen named) from `smoke.cfg` (finding 5), and names the single invariant
 it must break, so a
 guard silently deleted from the spec fails a control rather than passing
 unnoticed under a reduction that happened to dodge the other invariants. There
@@ -282,8 +293,14 @@ which is not part of the shipped model). The mutations and the exact TLC
 violation lines are recorded under `counterexamples/*-mutant.md`. The eight
 negative controls provide the same evidence for their target invariants by
 switch (one target, `RewriteOutputsAreInputsMinusErased`, is also covered by
-a behaviour mutant above), so all fifteen named safety invariants have a
-recorded TLC violation.
+a behaviour mutant above). The sixteenth,
+`RewriteTargetMatchesResolvedInputs`, is neither a mutant nor a switch target:
+it holds vacuously on the shipped singleton model, so its non-vacuity is shown
+by widening `RawInputs` to two elements in a scratch copy where a pass resolves
+a proper subset, which breaks it (TLC exit 12) until `TargetOf` is widened to
+match; `counterexamples/rewrite-target-matches-resolved-inputs-probe.md` has
+the before/after runs. With that probe, all sixteen named safety invariants
+have a recorded TLC violation.
 
 ## State-space control
 
