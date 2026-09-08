@@ -56,25 +56,25 @@
 //! target `max_l1_part_bytes`, issue #872); only metrics still has the
 //! whole-object, single-part shape described above.
 //!
-//! ## Exemplars are dropped, not carried forward (open gap)
+//! ## Exemplars are carried forward
 //!
-//! ADR-0047 decision 3 says exemplars ride along verbatim through compaction
-//! and format-migration, with only `series_index` remapped. This module does
-//! not do that: [`build_rewrite`] calls
-//! `SegmentWriter::write_v5_with_exemplars` with an empty exemplar list, so
-//! every input's exemplars (including ones belonging to series this rewrite
-//! never touches) are dropped from the output. This does not violate the
-//! sample-count conservation gate (exemplars are not counted samples), but it
-//! is a real, silent loss of exemplar data on any bucket this pass rewrites.
-//! `read.rs`'s [`crate::read::load_catalog_from_object`] already loads each
-//! input's `InputCatalog::exemplars`, so wiring correct carry-forward (drop
-//! only exemplars whose named series has zero surviving samples, remap the
-//! rest through the same series-id resolution `build_parts` relies on) is
-//! straightforward for a follow-up but is not done here: this task's
-//! dispatch does not name exemplars among its deliverables, and reusing
-//! `build_parts`'s per-batch exemplar assignment machinery would have meant
-//! adopting its batching complexity too, which the scope reduction above
-//! deliberately avoids. Flagged here and in the task's final report.
+//! ADR-0047 decision 3 requires exemplars to ride along verbatim through
+//! compaction and format-migration, with only `series_index` remapped.
+//! [`build_rewrite`] does that: it hands every input exemplar
+//! [`crate::read::load_catalog_from_object`] loaded to
+//! `SegmentWriter::write_v5_with_exemplars`, except those whose named series
+//! has zero surviving samples in the output. An exemplar's parent series can
+//! lose every sample to an erasure predicate, and the writer rejects an
+//! exemplar naming a series absent from the output
+//! (`WriteError::ExemplarUnknownSeries`), so an exemplar is dropped exactly
+//! when its series does not survive, and never otherwise. The `series_index`
+//! remap is the writer's own: it resolves each `ExemplarInput::series_id`
+//! against the output's SERIES_IDS ordering, the same resolution
+//! `build_parts` relies on, so this module carries no second resolution path
+//! and adopts none of `build_parts`'s per-batch exemplar-assignment batching
+//! (this metrics path writes a single part, so a flat carry-forward suffices).
+//! An exemplar belonging to a series the rewrite never touches survives with
+//! that series.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -92,8 +92,8 @@ use ravel_proto::commit::v1::{
     ErasureRequest, RewriteDrop, RewriteRecord,
 };
 use ravel_segment::{
-    CompactionMetaV4, IngestBounds, ReaderLimits, RunEntry, RunInputV4, RunValuePageV4,
-    SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
+    CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunEntry, RunInputV4,
+    RunValuePageV4, SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
     decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
 };
 use ravel_types::{LabelSet, Sample, Signal, TenantHash};
@@ -1054,6 +1054,23 @@ pub async fn build_rewrite(
         }
     }
 
+    // Carry exemplars forward (ADR-0047 decision 3). Every input exemplar
+    // survives except one whose named series has zero surviving samples in
+    // this output: the writer rejects an exemplar naming a series absent from
+    // the output, and such a series carries no run here. The writer performs
+    // the series_index remap itself, keyed on `ExemplarInput::series_id` (the
+    // same resolution driving `series_out`), so this filter is the whole
+    // carry-forward. Records are cloned rather than moved because `catalogs`
+    // is borrowed; read.rs bounds each input's exemplar set to the
+    // catalog-metadata memory term, so one copy stays inside that bound.
+    let surviving_series: HashSet<[u8; 16]> = series_out.iter().map(|s| s.series_id.0).collect();
+    let exemplars: Vec<ExemplarInput> = catalogs
+        .iter()
+        .flat_map(|catalog| catalog.exemplars.iter())
+        .filter(|e| surviving_series.contains(&e.series_id.0))
+        .cloned()
+        .collect();
+
     let parts = if series_out.is_empty() {
         Vec::new()
     } else {
@@ -1062,6 +1079,7 @@ pub async fn build_rewrite(
             config,
             input_set_hash,
             series_out,
+            exemplars,
         )?]
     };
 
@@ -1090,13 +1108,19 @@ pub async fn build_rewrite(
 /// records), which a rewrite's live input may not have at all when it is
 /// itself an L1/rewrite part, and no query-correctness path reads a
 /// compaction/rewrite part's ingest bounds (they gate ingest-time admission,
-/// not query results) -- a further transparent scope reduction alongside the
-/// exemplar drop documented at the top of this module.
+/// not query results) -- a transparent scope reduction covering ingest bounds
+/// only.
+///
+/// `exemplars` are the input exemplars carried forward (ADR-0047 decision 3),
+/// already filtered by [`build_rewrite`] to series that survive into `batch`;
+/// `write_v5_with_exemplars` resolves each record's `series_index` against
+/// this part's own SERIES_IDS ordering.
 fn build_rewrite_part(
     bucket: &Bucket,
     config: &CompactorConfig,
     input_set_hash: &[u8; 32],
     batch: Vec<SeriesInputV4>,
+    exemplars: Vec<ExemplarInput>,
 ) -> Result<BuiltPart> {
     let run_count: u64 = batch.iter().map(|s| s.runs.len() as u64).sum();
     let first_series_id = batch.iter().map(|s| s.series_id).min();
@@ -1120,7 +1144,7 @@ fn build_rewrite_part(
         max_ingest_ts_ns: 0,
     };
     let written =
-        SegmentWriter::write_v5_with_exemplars(batch, identity, ingest, meta, Vec::new())?;
+        SegmentWriter::write_v5_with_exemplars(batch, identity, ingest, meta, exemplars)?;
     let content_hash = written.summary.blake3;
     let hash16 = hex::encode(&content_hash[..8]);
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
