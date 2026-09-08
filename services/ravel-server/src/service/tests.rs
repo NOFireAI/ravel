@@ -137,6 +137,23 @@ struct Harness {
     tenant_hash: TenantHash,
 }
 
+/// The `SqlConfig` every harness here builds its executor with. The three
+/// request budgets are bounded rather than `EngineConfig::default()`'s, so a
+/// clamp against them is a real lowering a test can assert on.
+#[cfg(feature = "sql")]
+fn sql_config() -> ravel_sql::SqlConfig {
+    let base = ravel_sql::SqlConfig::default();
+    ravel_sql::SqlConfig {
+        engine: EngineConfig {
+            max_bytes_scanned: ravel_query::ByteLimit::Bounded(64 << 20),
+            max_s3_requests: ravel_query::RequestLimit::Bounded(4_096),
+            max_segments: 512,
+            ..base.engine
+        },
+        ..base
+    }
+}
+
 /// The shape every test here builds: a service over `store` with both query
 /// surfaces attached, a recording usage sink and cost recorder, and whatever
 /// admission ceiling, audit sink, and federation the test needs.
@@ -146,6 +163,29 @@ fn harness(
     audit_sink: Arc<dyn QueryAuditSink>,
     federation: Option<ravel_query::distrib::Federation>,
 ) -> Harness {
+    harness_with_sql_deadline(
+        store,
+        limit,
+        audit_sink,
+        federation,
+        Duration::from_secs(30),
+    )
+}
+
+/// [`harness`] with the SQL surface's wall-deadline ceiling chosen by the
+/// caller, for the tests that assert a request deadline is clamped to it.
+fn harness_with_sql_deadline(
+    store: Arc<dyn ObjectStoreBackend>,
+    limit: QueryConcurrencyLimit,
+    audit_sink: Arc<dyn QueryAuditSink>,
+    federation: Option<ravel_query::distrib::Federation>,
+    sql_max_deadline: Duration,
+) -> Harness {
+    // The SQL surface is behind a feature; without it there is no state to
+    // carry the ceiling.
+    #[cfg(not(feature = "sql"))]
+    let _ = sql_max_deadline;
+
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let config = EngineConfig::default();
@@ -174,12 +214,31 @@ fn harness(
     };
     let exemplars = crate::exemplars::ExemplarsState::from_engine(
         engine.as_ref(),
-        catalog,
+        Arc::clone(&catalog),
         Arc::clone(&store),
         Arc::clone(&resolver),
         Arc::clone(&clock),
         Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
     );
+
+    #[cfg(feature = "sql")]
+    let sql = crate::sql::SqlState {
+        executor: Arc::new(ravel_sql::SqlExecutor::new(
+            Arc::clone(&catalog),
+            ravel_query::SegmentFetcher::new(Arc::clone(&store)),
+            ravel_query::LogSegmentFetcher::new(Arc::clone(&store)),
+            ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
+            sql_config(),
+            1 << 30,
+        )),
+        tenant_resolver: Arc::clone(&resolver),
+        store: Arc::clone(&store),
+        audit_sink: Arc::clone(&audit_sink),
+        clock: Arc::clone(&clock),
+        max_deadline: sql_max_deadline,
+        query_accounting: default_query_accounting(),
+        query_admission: Arc::clone(&admission),
+    };
 
     let service = QueryService::new(
         resolver,
@@ -192,6 +251,9 @@ fn harness(
     .with_engine(engine)
     .with_analytics(analytics)
     .with_exemplars(exemplars);
+
+    #[cfg(feature = "sql")]
+    let service = service.with_sql(sql);
 
     Harness {
         service,
@@ -222,6 +284,40 @@ fn analytics_request(query: &str, allow_partial: bool) -> AnalyticsRequest {
         min_tokens: Vec::new(),
         deadline: Duration::from_secs(30),
         allow_partial,
+    }
+}
+
+/// The PromQL range request the analytics one mirrors, over the same window.
+fn range_request(query: &str) -> RangeRequest {
+    RangeRequest {
+        query: query.to_string(),
+        start_ms: NOW_MS - 60_000,
+        end_ms: NOW_MS,
+        step_ms: 60_000,
+        min_tokens: Vec::new(),
+        deadline: Duration::from_secs(30),
+        allow_partial: false,
+        now_ns: NOW_NS,
+        budgets: None,
+    }
+}
+
+/// A statement over the same window, asking for nothing the server ceilings do
+/// not already allow.
+#[cfg(feature = "sql")]
+fn sql_request(sql: &str) -> ravel_sql::SqlRequest {
+    ravel_sql::SqlRequest {
+        sql: sql.to_string(),
+        window: ravel_types::TimeRange {
+            start_ns: NOW_NS - 60_000_000_000,
+            end_ns: NOW_NS,
+        },
+        min_tokens: Vec::new(),
+        now_ns: NOW_NS,
+        deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     }
 }
 
@@ -352,6 +448,52 @@ async fn usage_is_recorded_before_audit_failure_maps_to_error() {
     assert_eq!(usage[0].0, h.tenant_hash);
     assert_eq!(usage[0].1, UsageStatus::Success);
     assert_eq!(h.cost.records().len(), 0);
+}
+
+/// The wire contract of an audit-trail failure: the caller is told the audit
+/// is unavailable, not that storage is. The two are different operational
+/// events, and the storage string would send an operator reading a client
+/// report at the object store instead of the audit pipeline.
+///
+/// Asserted on three surfaces at once because they reach the same control
+/// through different operations; a per-surface copy of the message is exactly
+/// the drift this pins.
+#[tokio::test]
+async fn audit_failure_reports_the_audit_string_not_storage() {
+    let h = harness(
+        Arc::new(MemoryStore::new()),
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(FailingAuditSink),
+        None,
+    );
+
+    let analytics = err_of(
+        h.service
+            .analytics(h.tenant_hash, &analytics_request("up", false))
+            .await,
+    );
+    assert_eq!(analytics.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(analytics.message, ravel_query::http::MSG_AUDIT_UNAVAILABLE);
+    assert_ne!(analytics.message, ravel_query::http::MSG_UNAVAILABLE);
+
+    let promql = err_of(
+        h.service
+            .promql_range(h.tenant_hash, &range_request("up"))
+            .await,
+    );
+    assert_eq!(promql.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(promql.message, ravel_query::http::MSG_AUDIT_UNAVAILABLE);
+
+    #[cfg(feature = "sql")]
+    {
+        let sql = err_of(
+            h.service
+                .sql_execute(h.tenant_hash, &sql_request("SELECT * FROM metrics"))
+                .await,
+        );
+        assert_eq!(sql.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(sql.message, ravel_query::http::MSG_AUDIT_UNAVAILABLE);
+    }
 }
 
 /// Step 4 before step 6: a query whose coverage came back partial without the

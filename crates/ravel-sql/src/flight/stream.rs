@@ -386,8 +386,10 @@ impl Drop for RecordOnStreamEnd {
 }
 
 /// The fixed client message when a `required`-mode audit flush fails and the
-/// Flight stream must fail closed. Carries no server state.
-const AUDIT_UNAVAILABLE_MSG: &str = "query audit is temporarily unavailable; retry";
+/// Flight stream must fail closed. Carries no server state. The one definition
+/// lives in `ravel-query`, so this transport and the HTTP service layer cannot
+/// drift apart on the wire.
+const AUDIT_UNAVAILABLE_MSG: &str = ravel_query::http::MSG_AUDIT_UNAVAILABLE;
 
 /// The evidential-audit context one Flight statement submits at stream
 /// completion: the sink, the resolved tenant, the request timestamp, and the

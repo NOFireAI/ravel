@@ -44,7 +44,7 @@ use ravel_types::accounting::{
 use ravel_types::{CommitToken, LabelSet, SeriesId, TenantHash, TimeRange};
 
 use crate::engine::parse_match_selector;
-use crate::http::error::{ApiError, MSG_UNAVAILABLE};
+use crate::http::error::{ApiError, MSG_AUDIT_UNAVAILABLE};
 use crate::log_series;
 use crate::request_budgets::RequestBudgets;
 use crate::{
@@ -281,10 +281,15 @@ impl QueryControls {
             window.0,
             window.1,
         );
-        self.audit_sink
-            .submit(event)
-            .await
-            .map_err(|_| ApiError::Unavailable(MSG_UNAVAILABLE.to_string()))?;
+        self.audit_sink.submit(event).await.map_err(|err| {
+            tracing::warn!(
+                tenant = %tenant_hash.to_hex(),
+                error = %err,
+                language,
+                "query audit submission failed; failing the request closed",
+            );
+            ApiError::Unavailable(MSG_AUDIT_UNAVAILABLE.to_string())
+        })?;
         Ok(())
     }
 

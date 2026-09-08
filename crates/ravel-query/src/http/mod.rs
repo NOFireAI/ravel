@@ -18,7 +18,10 @@ use axum::routing::get;
 use ravel_maintain::{NoopQueryAuditSink, QueryAuditSink};
 use ravel_types::accounting::{NoopQueryCostRecorder, QueryCostRecorder};
 
-pub use error::{ApiError, MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE, QueryErrorResponse};
+pub use error::{
+    ApiError, MSG_AUDIT_UNAVAILABLE, MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE,
+    QueryErrorResponse,
+};
 pub use metadata_cache::{
     MetadataCache, MetadataCacheConfig, MetadataCacheCounters, MetadataSnapshot,
 };

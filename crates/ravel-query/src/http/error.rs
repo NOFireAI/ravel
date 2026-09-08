@@ -37,6 +37,14 @@ pub const MSG_CORRUPT: &str = "stored data failed integrity validation";
 /// outage apart from a permanent data fault without the leaked detail.
 pub const MSG_UNAVAILABLE: &str = "upstream storage temporarily unavailable";
 
+/// Stable client message for a query whose evidential audit event could not be
+/// made durable (ADR-0062 section 2a). Distinct from [`MSG_UNAVAILABLE`]: the
+/// read itself may have succeeded, and what failed is the audit trail, so an
+/// operator reading a client report can tell the two apart. Every query
+/// surface in the process, HTTP and Flight SQL alike, renders this exact
+/// string, so the wire contract cannot drift between transports.
+pub const MSG_AUDIT_UNAVAILABLE: &str = "query audit is temporarily unavailable; retry";
+
 /// Stable client message for a `min_commit_token` that did not resolve after
 /// the catalog's retry. The token fields come from the caller's own request,
 /// but the message is fixed for a stable, typed contract.
