@@ -566,6 +566,14 @@ full expansion first. Charging the produced bytes, not the 64 MiB cap and not a
 compressed-size estimate, keeps the charge equal to the actual inflated length
 (no over-charge of a well-compressing request).
 
+Per read the order is cap, then budget, then retain: the projected size (bytes
+produced so far plus the bytes just read) is checked against
+`MAX_DECOMPRESSED_OTLP_BODY_BYTES` before that chunk is charged or kept, so a
+body inflating past the cap is answered with 413 at the first byte past it and
+is never charged for that byte. A tight budget therefore cannot turn an over-cap
+body into a 429: the charge for such a body peaks at the cap exactly, and the
+413 is what the client sees regardless of how much headroom the gauge has.
+
 The decompressed body is kept as the list of exactly-sized chunks it was charged
 for, never appended into one growing `Vec<u8>`, and prost decodes it through
 that chunk list as a non-contiguous `Buf`. That is what makes the charge equal
@@ -639,11 +647,16 @@ terms:
    `--max-ingest-buffer-bytes` instead.
 3. **Fixed overhead**: shard-actor and router state, the admission
    controller's per-tenant maps, and the read caches (`--cache-max-bytes`),
-   all bounded independently of ingest volume.
+   all bounded independently of ingest volume. Independent of ingest volume is
+   not the same as bounded by a knob: the admission controller's maps are
+   excluded from idle-tenant eviction and grow with the number of tenants that
+   have ever written (see below), so this term is sized from measurement on the
+   deployment's tenant count, not from configuration.
 
 So an operator sizes ingest RSS as
 `max_ingest_buffer_bytes + (max_inflight_ingest_requests x largest_uncharged_decoded_body)
-+ fixed_overhead`, every term a knob, where `largest_uncharged_decoded_body` is
++ fixed_overhead`, the first two terms knobs and the third measured, where
+`largest_uncharged_decoded_body` is
 now the largest body term 2 still owns (Remote Write / OTLP gRPC 64 MiB, or
 identity OTLP HTTP 16 MiB) rather than the OTLP HTTP gzip inflate. Lowering
 `--max-ingest-buffer-bytes` tightens term 1 directly, trading a lower memory
@@ -655,9 +668,11 @@ buffer could exist at once outside every byte ceiling -- 64 GiB at the default
 1024, on hosts whose whole RAM is a fraction of that. That transient is now
 charged against `--max-ingest-buffer-bytes` as it inflates, so the sum of all
 concurrent OTLP HTTP gzip inflate buffers is bounded by that one ceiling, the
-same gauge that bounds buffered state. Peak process RSS is a config-bounded sum
-of named knobs, not an unbounded product of concurrency and per-request inflate
-size.
+same gauge that bounds buffered state. That bound is about this transient only,
+not about total process RSS: the admission controller's per-tenant maps are
+deliberately excluded from idle-tenant eviction and still grow with tenant count
+(see below), so the gzip inflate's contribution to peak RSS is a config-bounded
+term while process RSS as a whole is not a sum of named knobs.
 
 ### Idle-tenant state eviction (ADR-0069 decision 2)
 
