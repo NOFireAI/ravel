@@ -1142,6 +1142,45 @@ mod tests {
         assert_eq!(serialized_len(&envelope), MAXIMAL_METADATA_ENVELOPE_LEN);
     }
 
+    /// `floor_applied` reports whether the floor changed the caller's cap, so
+    /// it is true only strictly below the floor. At the floor exactly, and at
+    /// the 512 KiB default above it, nothing was raised and the flag is false.
+    #[test]
+    fn floor_applied_is_true_only_when_the_floor_raised_the_cap() {
+        let fitted = Envelope::default().fit(1_024);
+        assert!(fitted.presentation.floor_applied);
+        assert_eq!(
+            fitted.presentation.effective_max_response_bytes,
+            MAX_RESPONSE_BYTES_FLOOR
+        );
+        assert_eq!(fitted.presentation.effective_max_response_bytes, 256 * 1024);
+
+        let fitted = Envelope::default().fit(MAX_RESPONSE_BYTES_FLOOR - 1);
+        assert!(fitted.presentation.floor_applied);
+        assert_eq!(
+            fitted.presentation.effective_max_response_bytes,
+            MAX_RESPONSE_BYTES_FLOOR
+        );
+
+        let fitted = Envelope::default().fit(MAX_RESPONSE_BYTES_FLOOR);
+        assert!(!fitted.presentation.floor_applied);
+        assert_eq!(
+            fitted.presentation.effective_max_response_bytes,
+            MAX_RESPONSE_BYTES_FLOOR
+        );
+
+        let fitted = Envelope::default().fit(512 * 1024);
+        assert!(!fitted.presentation.floor_applied);
+        assert_eq!(fitted.presentation.effective_max_response_bytes, 512 * 1024);
+
+        let fitted = Envelope::default().fit(4 * 1024 * 1024);
+        assert!(!fitted.presentation.floor_applied);
+        assert_eq!(
+            fitted.presentation.effective_max_response_bytes,
+            4 * 1024 * 1024
+        );
+    }
+
     /// 2^53 + 1 does not round-trip through `f64`; the wire form must be a
     /// JSON string so the exact integer survives. A nanosecond timestamp is
     /// the same rule applied to the same representation.
