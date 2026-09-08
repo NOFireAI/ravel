@@ -153,12 +153,13 @@ pub struct RenderCtx {
     /// [`secrets_checksum`] alongside the other two.
     pub deployment_key_resource_version: Option<String>,
 
-    /// `resourceVersion` of the audit-token-key Secret the query tier
-    /// consumes (explicit `auditTokenKeySecretRef`, or the operator-generated
-    /// `<cluster>-audit-token-key`), or `None` when `deploymentKeySecretRef`
-    /// covers it and no such Secret is read (#1487). Folded only into the
-    /// query tier's checksum: gateway and maintain never read this Secret, so
-    /// their checksums must not move when it rotates.
+    /// `resourceVersion` of the Secret named by `auditTokenKeySecretRef`
+    /// (#1487), or `None` when the cluster has a `deploymentKeySecretRef`
+    /// (the server derives the key from it, no Secret to read) or when
+    /// neither ref is set (nothing to read; the query tier's apply is
+    /// withheld for that pass, see [`crate::controller`]). Folded only into
+    /// the query tier's checksum: gateway and maintain never read this
+    /// Secret, so their checksums must not move when it rotates.
     pub audit_token_key_resource_version: Option<String>,
 }
 
@@ -397,9 +398,9 @@ pub(crate) const DEPLOYMENT_KEY_SECRET_KEY: &str = "key";
 /// query text for audit.
 pub(crate) const AUDIT_TOKEN_KEY_ENV: &str = "RAVEL_AUDIT_TOKEN_KEY";
 
-/// Key within an explicit `auditTokenKeySecretRef` Secret holding the 64
-/// lowercase hex characters, mirroring [`DEPLOYMENT_KEY_SECRET_KEY`]'s naming
-/// for the deployment-key Secret.
+/// Key within an explicit `auditTokenKeySecretRef` Secret holding the 64 hex
+/// characters, mirroring [`DEPLOYMENT_KEY_SECRET_KEY`]'s naming for the
+/// deployment-key Secret.
 pub(crate) const AUDIT_TOKEN_KEY_SECRET_KEY: &str = "key";
 
 /// `Degraded` reason when a cluster has neither `deploymentKeySecretRef` nor
@@ -413,7 +414,7 @@ pub(crate) const AUDIT_TOKEN_KEY_MISSING_REASON: &str = "AuditTokenKeyMissing";
 /// Message for [`AUDIT_TOKEN_KEY_MISSING_REASON`], naming the field to set
 /// and the shape the Secret it points at must have.
 pub(crate) const AUDIT_TOKEN_KEY_MISSING_MESSAGE: &str = "no deploymentKeySecretRef is set, and spec.auditTokenKeySecretRef is not set; reference a \
-     Secret whose \"key\" field holds 64 lowercase hex characters (32 bytes) to enable \
+     Secret whose \"key\" field holds 64 hex characters (32 bytes) to enable \
      query-audit token key derivation, or set deploymentKeySecretRef to derive it from the \
      deployment key. The query tier's Deployment is left unchanged until then";
 

@@ -143,15 +143,15 @@ subjects:
     namespace: ravel-system
 ---
 # Secrets: get only, granted per namespace and never cluster-wide (issue #126).
-# The operator reads the credentials, tenant-token, and deployment-key Secrets a
-# RavelCluster references (crate::controller resolves them via
-# Api::<Secret>::namespaced on the RavelCluster's OWN namespace) to resolve
-# tenant names and stamp resource versions; it never lists, writes, or watches
-# them. The Secret names are user-chosen CRD fields
-# (credentialsSecretRef/tenantTokensSecretRef/deploymentKeySecretRef and the
-# per-tier credential overrides), not a fixed set, so resourceNames cannot
-# enumerate them; a bare `secrets get` bound per namespace is the tightest grant
-# that still works.
+# The operator reads the credentials, tenant-token, deployment-key, and
+# audit-token-key Secrets a RavelCluster references (crate::controller
+# resolves them via Api::<Secret>::namespaced on the RavelCluster's OWN
+# namespace) to resolve tenant names and stamp resource versions; it never
+# lists, writes, or watches them. The Secret names are user-chosen CRD fields
+# (credentialsSecretRef/tenantTokensSecretRef/deploymentKeySecretRef/
+# auditTokenKeySecretRef and the per-tier credential overrides), not a fixed
+# set, so resourceNames cannot enumerate them; a bare `secrets get` bound per
+# namespace is the tightest grant that still works.
 #
 # The rule lives in a ClusterRole so a single definition can be reused in every
 # served namespace (a RoleBinding cannot reference a Role in another namespace,
