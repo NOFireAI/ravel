@@ -1276,22 +1276,43 @@ fn flatten_fold(best: FoldedByOrder) -> HashMap<AlertId, AlertRecord> {
 /// backstop for a token that keeps changing without advancing.
 const MAX_LIST_PAGES: usize = 100_000;
 
-/// A paged listing failed to terminate. Both variants mean the backend kept
-/// reporting "another page" without making progress; draining returns the
-/// error rather than spinning forever (the seen-set would suppress the
-/// duplicate keys but never break the loop).
+/// A paged listing could not be folded. `RepeatedToken` and `PageCeiling` mean
+/// the backend kept reporting "another page" without making progress; draining
+/// returns the error rather than spinning forever (the last-key check below
+/// dedups a permitted repeat but never breaks the loop). `OrderViolation` means
+/// the backend delivered a key strictly below one already delivered, breaking
+/// the contract's lexicographic-order guarantee; folding out of order is wrong,
+/// so draining returns the error rather than silently reordering.
 #[derive(Debug, thiserror::Error)]
 enum ListDrainError {
     #[error("listing under {prefix:?} repeated its continuation token; refusing to spin")]
     RepeatedToken { prefix: String },
     #[error("listing under {prefix:?} exceeded the {ceiling}-page ceiling")]
     PageCeiling { prefix: String, ceiling: usize },
+    #[error(
+        "listing under {prefix:?} delivered {offending:?} after {previous:?}, \
+         out of lexicographic order"
+    )]
+    OrderViolation {
+        prefix: String,
+        previous: String,
+        offending: String,
+    },
 }
 
 /// Drain every page of a listing under `prefix`, deduplicating by key. With
 /// `start_after` set, every returned key sorts strictly after it (`list_after`
 /// with `None` is identical to `list`, per the object-store contract), so this
 /// serves both the full fold (`None`) and the tail fold (`Some(cursor)`).
+///
+/// Two object-store contract guarantees (docs/object-store-contract.md,
+/// "Listing") drive the dedup: keys arrive in lexicographic order, and a key
+/// MAY appear more than once so callers MUST dedup. Because a permitted repeat
+/// is therefore always equal to the last key already delivered, [`drain_pages`]
+/// dedups by holding only that last key rather than a set of every key: an
+/// equal key is dropped, a strictly smaller key breaks the order guarantee and
+/// becomes [`ListDrainError::OrderViolation`], and a larger key is kept. That
+/// is constant extra memory over the returned set.
 ///
 /// The loop terminates on `page.next == None`, on a repeated continuation
 /// token, or at [`MAX_LIST_PAGES`]; the last two are typed errors, never a
@@ -1313,7 +1334,7 @@ async fn drain_pages(
     max_pages: usize,
 ) -> anyhow::Result<Vec<ObjectMeta>> {
     let mut out: Vec<ObjectMeta> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut last_key: Option<String> = None;
     let mut page_token: Option<PageToken> = None;
     let mut prev_token: Option<PageToken> = None;
     let mut pages = 0usize;
@@ -1328,8 +1349,23 @@ async fn drain_pages(
         pages += 1;
         let page = store.list_after(prefix, start_after, page_token).await?;
         for meta in page.objects {
-            if seen.insert(meta.key.clone()) {
-                out.push(meta);
+            match last_key.as_deref() {
+                // Lexicographic order plus a permitted repeat means a key at or
+                // below the last delivered one is either that same key again
+                // (dropped) or a backend that broke ordering (a typed error).
+                Some(last) if meta.key.as_str() < last => {
+                    return Err(ListDrainError::OrderViolation {
+                        prefix: prefix.to_string(),
+                        previous: last.to_string(),
+                        offending: meta.key,
+                    }
+                    .into());
+                }
+                Some(last) if meta.key.as_str() == last => {}
+                _ => {
+                    last_key = Some(meta.key.clone());
+                    out.push(meta);
+                }
             }
         }
         match page.next {
@@ -3352,6 +3388,146 @@ mod tick_tests {
             tail,
             vec!["p/d", "p/e"],
             "the tail drain skips keys at or before the cursor"
+        );
+    }
+
+    /// A backend that replays a fixed script of pages, so a test can place an
+    /// exact key sequence across page boundaries: a contract-permitted repeat,
+    /// or a contract-violating backward key. `MemoryStore` cannot repeat a key,
+    /// so the dedup and order paths need a driver that can. Every call is
+    /// counted; the last scripted page ends the listing (`next == None`).
+    struct ScriptedList {
+        pages: Vec<Vec<String>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedList {
+        fn new(pages: &[&[&str]]) -> Self {
+            ScriptedList {
+                pages: pages
+                    .iter()
+                    .map(|page| page.iter().map(|k| k.to_string()).collect())
+                    .collect(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn meta(key: &str) -> ObjectMeta {
+            ObjectMeta {
+                key: key.to_string(),
+                size: 1,
+                etag: ravel_object_store::Etag("e".to_string()),
+                version: ravel_object_store::Version("v".to_string()),
+                last_modified_unix_ms: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for ScriptedList {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            unreachable!("ScriptedList is list-after-only")
+        }
+
+        async fn list_after(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let objects = self.pages[n].iter().map(|k| Self::meta(k)).collect();
+            let next = if n + 1 < self.pages.len() {
+                Some(PageToken(format!("tok-{n}")))
+            } else {
+                None
+            };
+            Ok(ListPage { objects, next })
+        }
+
+        async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
+            unreachable!("ScriptedList is list-after-only")
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::mandatory()
+        }
+    }
+
+    /// The object-store contract permits a key to appear more than once across
+    /// pages. When the last key of one page repeats as the first key of the
+    /// next, the fold keeps it exactly once (finding on PR #1451, issue #1294).
+    #[tokio::test]
+    async fn a_repeat_at_a_page_boundary_is_folded_once() {
+        let store = ScriptedList::new(&[&["p/a", "p/b"], &["p/b", "p/c"]]);
+        let keys: Vec<String> = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect("a permitted repeat must not error")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["p/a", "p/b", "p/c"],
+            "the boundary repeat of p/b is folded once, not twice"
+        );
+        assert_eq!(store.call_count(), 2, "both scripted pages are drained");
+    }
+
+    /// A key strictly below the last delivered one breaks the contract's
+    /// lexicographic-order guarantee. Folding out of order is wrong, so the
+    /// drain returns a typed error rather than reordering (finding on PR #1451,
+    /// issue #1294).
+    #[tokio::test]
+    async fn a_backward_key_is_a_typed_order_violation() {
+        let store = ScriptedList::new(&[&["p/a", "p/c"], &["p/b"]]);
+        let err = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect_err("a backward key must be rejected");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::OrderViolation {
+                    previous,
+                    offending,
+                    ..
+                }) if previous == "p/c" && offending == "p/b"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the violation is detected on the second page, after both are fetched"
         );
     }
 }
