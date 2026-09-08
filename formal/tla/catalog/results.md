@@ -192,7 +192,7 @@ pass, not the banded gate config, and its full graph (4,481,272 distinct
 states, depth 37, recorded here from the prior round) was not re-run this
 round; it is not one of this task's required gates. The negative configs are
 NOT deterministic: they stop at the first counterexample TLC finds, and under
-`-workers auto` which state that is varies between runs, so a negative gets no
+multiple workers which state that is varies between runs, so a negative gets no
 band. Each negative is pinned instead by its `.expect` file.
 
 Issue #1121 round five (finding 1: `DedupSurvivors`, replacing the

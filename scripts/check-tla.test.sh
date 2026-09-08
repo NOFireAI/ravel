@@ -334,9 +334,13 @@ args_has_flag_value() {
 
 echo "--- (g) default resources: -workers 2 -Xmx2g"
 unset RAVEL_TLA_WORKERS RAVEL_TLA_XMX
-resolve_tla_resources
-gcode=$?
-if [ "$gcode" -eq 0 ]; then ok; else bad "g: resolve_tla_resources exited $gcode on defaults"; fi
+# Capture the exit code in a subshell: resolve_tla_resources calls `exit` on a
+# bad value, so an in-process call can only ever leave $? at 0 (a real failure
+# would kill this test), which makes the assertion vacuous. bash -c isolates
+# the exit so a regression that made the defaults invalid would be caught.
+gout="$(bash -c "source '$LIB_SRC'; resolve_tla_resources" 2>&1)"; gcode=$?
+if [ "$gcode" -eq 0 ]; then ok; else bad "g: resolve_tla_resources exited $gcode on defaults; out: $gout"; fi
+resolve_tla_resources  # sets TLA_WORKERS/TLA_XMX in this shell for run_tlc_args_case
 run_tlc_args_case
 if grep -qxF -- '-Xmx2g' "$CASE_ARGS_FILE" 2>/dev/null; then
     ok
@@ -351,9 +355,9 @@ fi
 rm -rf "$CASE_TMP"
 
 echo "--- (h) override RAVEL_TLA_WORKERS=4 RAVEL_TLA_XMX=4g"
+hout="$(RAVEL_TLA_WORKERS=4 RAVEL_TLA_XMX=4g bash -c "source '$LIB_SRC'; resolve_tla_resources" 2>&1)"; hcode=$?
+if [ "$hcode" -eq 0 ]; then ok; else bad "h: resolve_tla_resources exited $hcode on a valid override; out: $hout"; fi
 RAVEL_TLA_WORKERS=4 RAVEL_TLA_XMX=4g resolve_tla_resources
-hcode=$?
-if [ "$hcode" -eq 0 ]; then ok; else bad "h: resolve_tla_resources exited $hcode on a valid override"; fi
 run_tlc_args_case
 if grep -qxF -- '-Xmx4g' "$CASE_ARGS_FILE" 2>/dev/null; then
     ok
@@ -368,17 +372,21 @@ fi
 rm -rf "$CASE_TMP"
 unset RAVEL_TLA_WORKERS RAVEL_TLA_XMX
 
-echo "--- (i) RAVEL_TLA_WORKERS=auto is rejected"
+echo "--- (i) RAVEL_TLA_WORKERS=auto is accepted (CI opt-in) and reaches TLC"
 iout=""
 iout="$(RAVEL_TLA_WORKERS=auto bash -c "source '$LIB_SRC'; resolve_tla_resources" 2>&1)"
 icode=$?
 echo "    measured: exit=$icode"
-if [ "$icode" -eq 2 ]; then ok; else bad "i: expected exit 2, got $icode"; fi
-if printf '%s' "$iout" | grep -qF 'RAVEL_TLA_WORKERS'; then
+if [ "$icode" -eq 0 ]; then ok; else bad "i: expected exit 0 (auto accepted), got $icode; out: $iout"; fi
+RAVEL_TLA_WORKERS=auto resolve_tla_resources
+run_tlc_args_case
+if args_has_flag_value "$CASE_ARGS_FILE" -workers auto; then
     ok
 else
-    bad "i: refusal message missing RAVEL_TLA_WORKERS; got: $iout"
+    bad "i: expected -workers auto in argv; got: $(cat "$CASE_ARGS_FILE" 2>/dev/null)"
 fi
+rm -rf "$CASE_TMP"
+unset RAVEL_TLA_WORKERS
 
 echo "--- (j) RAVEL_TLA_XMX=lots is rejected"
 jout=""
@@ -390,6 +398,33 @@ if printf '%s' "$jout" | grep -qF 'RAVEL_TLA_XMX'; then
     ok
 else
     bad "j: refusal message missing RAVEL_TLA_XMX; got: $jout"
+fi
+
+# --- (k)-(m) issue #1421 item 6: a zero heap and an out-of-range worker count
+# must be rejected with a message, not passed through to a JVM that refuses to
+# start (a FAIL row per config) or a leaked raw bash "[: integer expression
+# expected" -----------------------------------------------------------------
+echo "--- (k) RAVEL_TLA_XMX=0g is rejected (zero heap)"
+kout="$(RAVEL_TLA_XMX=0g bash -c "source '$LIB_SRC'; resolve_tla_resources" 2>&1)"; kcode=$?
+echo "    measured: exit=$kcode"
+if [ "$kcode" -eq 2 ]; then ok; else bad "k: expected exit 2, got $kcode; out: $kout"; fi
+if printf '%s' "$kout" | grep -qF 'RAVEL_TLA_XMX'; then ok; else bad "k: refusal missing RAVEL_TLA_XMX; got: $kout"; fi
+
+echo "--- (l) RAVEL_TLA_XMX=0m is rejected (zero heap)"
+lout="$(RAVEL_TLA_XMX=0m bash -c "source '$LIB_SRC'; resolve_tla_resources" 2>&1)"; lcode=$?
+echo "    measured: exit=$lcode"
+if [ "$lcode" -eq 2 ]; then ok; else bad "l: expected exit 2, got $lcode; out: $lout"; fi
+if printf '%s' "$lout" | grep -qF 'RAVEL_TLA_XMX'; then ok; else bad "l: refusal missing RAVEL_TLA_XMX; got: $lout"; fi
+
+echo "--- (m) RAVEL_TLA_WORKERS=999999999999999999999 is rejected without leaking a bash error"
+mout="$(RAVEL_TLA_WORKERS=999999999999999999999 bash -c "source '$LIB_SRC'; resolve_tla_resources" 2>&1)"; mcode=$?
+echo "    measured: exit=$mcode"
+if [ "$mcode" -eq 2 ]; then ok; else bad "m: expected exit 2, got $mcode; out: $mout"; fi
+if printf '%s' "$mout" | grep -qF 'RAVEL_TLA_WORKERS'; then ok; else bad "m: refusal missing RAVEL_TLA_WORKERS; got: $mout"; fi
+if printf '%s' "$mout" | grep -qF 'integer expression expected'; then
+    bad "m: leaked raw bash '[: integer expression expected' to stderr; out: $mout"
+else
+    ok
 fi
 
 rm -f "$LIB_SRC"

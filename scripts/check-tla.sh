@@ -24,10 +24,11 @@
 # version 17 or newer is required.
 #
 # TLC's worker count and JVM heap cap come from RAVEL_TLA_WORKERS (default 2)
-# and RAVEL_TLA_XMX (default 2g). Both are validated (a positive integer; a
-# size matching the JVM's -Xmx grammar: digits then k, m, or g) and refused
-# with a one-line message otherwise; the resolved values are printed once
-# per run.
+# and RAVEL_TLA_XMX (default 2g). Both are validated (workers: `auto` or a
+# positive integer; xmx: digits then k, m, or g, a nonzero size) and refused
+# with a one-line message otherwise; the resolved values are printed once per
+# run. An empty or unset value takes the default. CI overrides workers to
+# `auto` on its dedicated runners, where claiming every core is fine.
 set -u
 
 TLA_VERSION="1.7.4"
@@ -76,18 +77,32 @@ resolve_java() {
 # resolve_tla_resources: read the TLC worker count and JVM heap cap from
 # RAVEL_TLA_WORKERS / RAVEL_TLA_XMX (defaults 2 / 2g). `-workers auto` claims
 # every core on the host, and an uncapped heap on a loaded or shared machine
-# is the failure this guards: both are fixed and small unless overridden, and
-# both are validated so a typo fails closed instead of reaching TLC as a
-# silently wrong flag.
+# is the failure this guards: both default small unless overridden, and both
+# are validated so a typo fails closed instead of reaching TLC as a silently
+# wrong flag. `auto` is the one non-numeric worker value accepted (TLC's own
+# "use every core" setting), which CI opts into on its dedicated runners; an
+# empty or unset value takes the default.
 resolve_tla_resources() {
     TLA_WORKERS="${RAVEL_TLA_WORKERS:-2}"
-    if ! printf '%s' "$TLA_WORKERS" | grep -qE '^[0-9]+$' || [ "$TLA_WORKERS" -eq 0 ]; then
-        note "RAVEL_TLA_WORKERS must be a positive integer, got '$TLA_WORKERS'"
-        exit 2
+    if [ "$TLA_WORKERS" != auto ]; then
+        # Bound the digit count before the numeric test: an over-long run of
+        # digits passes a bare ^[0-9]+$ but overflows `[ -eq ]`, which aborts
+        # with "integer expression expected" and would otherwise leak past
+        # the guard as a silently accepted value.
+        if ! printf '%s' "$TLA_WORKERS" | grep -qE '^[0-9]{1,9}$' || [ "$TLA_WORKERS" -eq 0 ]; then
+            note "RAVEL_TLA_WORKERS must be 'auto' or a positive integer (1-999999999), got '$TLA_WORKERS'"
+            exit 2
+        fi
     fi
     TLA_XMX="${RAVEL_TLA_XMX:-2g}"
-    if ! printf '%s' "$TLA_XMX" | grep -qE '^[0-9]+[kKmMgG]$'; then
-        note "RAVEL_TLA_XMX must match the JVM -Xmx grammar (digits then k, m, or g), got '$TLA_XMX'"
+    # digits then k, m, or g, and nonzero. Not the full JVM -Xmx grammar: the
+    # JVM also takes a bare byte count and a `t` suffix, but accepting only
+    # k/m/g makes a typo like `2048` or `1t` fail here, and a zero heap
+    # (`0g`/`0m`) passes the size shape yet the JVM refuses to start, so it is
+    # rejected too.
+    if ! printf '%s' "$TLA_XMX" | grep -qE '^[0-9]+[kKmMgG]$' \
+        || printf '%s' "$TLA_XMX" | grep -qE '^0+[kKmMgG]$'; then
+        note "RAVEL_TLA_XMX must be digits then k, m, or g (a nonzero size), got '$TLA_XMX'"
         exit 2
     fi
     note "resources: workers=$TLA_WORKERS xmx=$TLA_XMX"
@@ -213,12 +228,16 @@ module_cfg() {
 
 truncate_tsv() {
     mkdir -p "$CACHE_DIR"
-    printf 'run-id\tarea\tcfg\tstates\tdistinct\tdepth\tseconds\tresult\n' > "$LAST_RUN"
+    printf 'run-id\tarea\tcfg\tstates\tdistinct\tdepth\tseconds\tworkers\txmx\tresult\n' > "$LAST_RUN"
 }
 
+# The workers/xmx columns carry the resolved resource configuration next to
+# the figures it produced, so a last-run.tsv row reads without the run's
+# environment beside it. resolve_tla_resources always sets both before any
+# model-check subcommand records a row.
 record_row() {
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$RUN_ID" "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$LAST_RUN"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$RUN_ID" "$1" "$2" "$3" "$4" "$5" "$6" "${TLA_WORKERS:--}" "${TLA_XMX:--}" "$7" >> "$LAST_RUN"
 }
 
 # --- TLC invocation ---------------------------------------------------------
