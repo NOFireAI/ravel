@@ -163,21 +163,34 @@ is shed mid-inflate (OTLP HTTP 429 with `Retry-After`, the existing shed
 counter) rather than being allocated in full and charged afterward. This
 amendment covers OTLP HTTP gzip only; OTLP gRPC gzip decompression is unchanged
 and tracked separately (#1419), so no gRPC status is described here. The charge
-is held as an RAII guard through protobuf decode and released at the instant the
-raw inflate buffer is dropped -- once prost has copied it into owned structs,
+is held as an RAII guard through protobuf decode and released once decode has
+consumed and freed the inflate chunks -- prost copies them into owned structs --
 before the router takes its own decision-1 buffered charge. A single request's
 inflate charge and buffered charge therefore never coexist: the peak that one
 request contributes to the gauge is the larger of the two, not their sum.
+
+The decompressed body is retained as the list of exactly-sized chunks that were
+charged for, and decoded through that list as a non-contiguous `Buf`, rather than
+appended into one growing `Vec<u8>`. This is what makes the charge equal the
+retained bytes at every instant: an amortized-growth buffer holds spare capacity
+past its length, and holds the old and the new allocation simultaneously while it
+reallocates, so a charge taken on the appended length would undercount the very
+buffer this amendment exists to bound (`reserve_exact` does not close the gap,
+because an allocator may return more than was requested).
 
 **What the gauge now means.** Before this amendment `ravel_ingest_buffer_bytes`
 measured buffered ingest state only. It now also counts the transient OTLP HTTP
 gzip decode state currently in flight: a request that is mid-inflate holds a
 decode charge on the same gauge, alongside every other request's buffered
 charge, so the gauge reflects the concurrent inflate buffers that used to be
-invisible. A single request does not hold both charges at once -- it releases
-the decode charge when it drops the raw inflate buffer after decode, before the
-router takes its buffered charge -- so that one request's contribution is the
-larger of the two, never their sum. This is deliberate: the ceiling bounds peak
+invisible. For that decode term the gauge counts the bytes the request has
+actually retained -- the summed length of its inflate chunks, which because each
+chunk is allocated once at its final size is also the number of bytes those
+allocations occupy -- not an estimate and not a length that a spare-capacity or
+mid-reallocation buffer would exceed. A single request does not hold both charges
+at once -- it releases the decode charge once decode has consumed and freed those
+chunks, before the router takes its buffered charge -- so that one request's
+contribution is the larger of the two, never their sum. This is deliberate: the ceiling bounds peak
 resident ingest memory, and the concurrent inflate buffers are part of that
 peak. The identity (uncompressed) path allocates no inflate buffer and takes no
 gateway charge; the OTLP gRPC and Remote Write decode paths are out of scope
@@ -189,8 +202,9 @@ traffic under a tight budget. Charging a compressed-size estimate would either
 over- or under-charge depending on the ratio. Charging each produced chunk
 makes the summed charge equal the actual decompressed length exactly: the
 over-charge bound for an admitted request is **zero**, and the peak *uncharged*
-allocation is at most one staging chunk (64 KiB). A shed request refunds every
-partial chunk on the spot.
+allocation is one staging chunk (64 KiB) plus per-chunk bookkeeping (a `Bytes`
+handle and a charge guard for each retained chunk, under 0.1% of the charged
+bytes). A shed request refunds every partial chunk on the spot.
 
 ### Rejected alternatives
 

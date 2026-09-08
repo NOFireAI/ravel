@@ -1,8 +1,8 @@
 //! End-to-end coverage for issue #1297: the OTLP HTTP gzip inflate path
 //! charges the process-wide ingest byte budget (`--max-ingest-buffer-bytes`,
-//! ADR-0069) for the bytes it inflates, *before* it finishes inflating, so a
-//! decompression that would cross the ceiling is shed with HTTP 429 rather than
-//! allocated in full. Before this fix the inflate (up to
+//! ADR-0069) for the bytes it inflates, *while* it inflates and before each
+//! chunk is retained, so a decompression that would cross the ceiling is shed
+//! with HTTP 429 rather than allocated in full. Before this fix the inflate (up to
 //! `MAX_DECOMPRESSED_OTLP_BODY_BYTES`, 64 MiB) sat entirely outside the budget:
 //! `--max-inflight-ingest-requests` copies of it could exist at once, 64 GiB at
 //! the default, and the flag that claims to bound ingest memory did not.
@@ -12,9 +12,10 @@
 //! same discipline as `ingest_concurrency_e2e.rs`) so its router buffered charge
 //! stays held while the in-flight gauge is read or a second request is shed.
 //!
-//! Issue #1297 finding 3: the gateway releases the transient inflate charge when
-//! it drops the raw inflate buffer after decode, before the router takes its own
-//! buffered charge, so a single request's inflate and batch terms never coexist.
+//! Issue #1297 finding 3: the gateway releases the transient inflate charge once
+//! decode has consumed and freed the retained inflate chunks, before the router
+//! takes its own buffered charge, so a single request's inflate and batch terms
+//! never coexist.
 //! The accept test proves a request whose two terms each fit but whose sum
 //! exceeds the ceiling is admitted; the concurrency test proves genuine
 //! simultaneous pressure (one request's held batch plus another's inflate) is
@@ -286,18 +287,18 @@ async fn measured_router_charge(points: usize) -> u64 {
 }
 
 /// A gzip body whose inflate crosses the ceiling is shed with 429 + Retry-After
-/// *before* it finishes inflating, and the buffer-budget shed counter reads
-/// exactly 1. The body is a zeros bomb: it inflates well past the 1 MiB ceiling
-/// but is not valid OTLP, so if the charge did NOT happen during inflate the
-/// bytes would inflate in full and then fail protobuf decode with 400. Asserting
-/// 429 therefore proves the budget was charged as the bytes inflated, before
-/// decode ran at all.
+/// *while* it inflates, before it finishes, and the buffer-budget shed counter
+/// reads exactly 1. The body is a zeros bomb: it inflates well past the 1 MiB
+/// ceiling but is not valid OTLP, so if the charge did NOT happen during inflate
+/// the bytes would inflate in full and then fail protobuf decode with 400.
+/// Asserting 429 therefore proves the budget was charged as the bytes inflated,
+/// before decode ran at all.
 ///
 /// Non-vacuity: revert the per-chunk `budget.try_charge` in
 /// `decompress_gzip_capped_charged` and the bomb inflates fully and fails
 /// decode, so this returns 400 instead of 429.
 #[tokio::test]
-async fn gzip_body_is_charged_against_the_budget_before_it_inflates() {
+async fn gzip_body_is_charged_against_the_budget_while_it_inflates() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let running = start_test_server(store, IngestByteBudgetLimit::Bounded(1024 * 1024)).await;
     let base = format!("http://{}", running.http_addr);
@@ -320,7 +321,7 @@ async fn gzip_body_is_charged_against_the_budget_before_it_inflates() {
     assert_eq!(
         response.status(),
         429,
-        "a gzip inflate over the buffer budget must be shed with 429 before it inflates"
+        "a gzip inflate over the buffer budget must be shed with 429 while it inflates"
     );
     assert_eq!(
         response
@@ -349,8 +350,8 @@ async fn gzip_body_is_charged_against_the_budget_before_it_inflates() {
 
 /// Issue #1297 finding 3: a single gzip request whose inflate and normalized
 /// batch each fit the budget but whose sum exceeds it is NOT shed, because at no
-/// instant are both live. The gateway releases the inflate charge when it drops
-/// the raw inflate buffer after decode, before the router charges the normalized
+/// instant are both live. The gateway releases the inflate charge once decode has
+/// consumed and freed the inflate chunks, before the router charges the normalized
 /// batch, so the request's peak contribution to the gauge is the larger of the
 /// two terms, not their sum. Held mid-flush through the FaultStore gate, the
 /// in-flight gauge reads exactly the router charge (the single live charge),
