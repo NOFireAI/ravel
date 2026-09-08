@@ -57,9 +57,38 @@ transitions written since the memo rather than the whole history.
 
 3. **Read path (every tick, before the lease).** GET the memo. Then, whatever
    the memo says, issue one `start-after` LIST over the commit prefix that skips
-   every ingest hour strictly below `watermark_hour` server-side, and fold the
-   commit records it returns (a commit GET plus a data GET per transition in
-   that window) on top of the memoized state. Each memoized record is seeded
+   every ingest hour strictly below the **effective watermark** server-side, and
+   fold the commit records it returns (a commit GET plus a data GET per
+   transition in that window) on top of the memoized state.
+
+   The effective watermark is
+   `min(memo.watermark_hour, seal_bound_hour(now_ns))`, computed against the
+   reading replica's own clock, not the persisted `watermark_hour` on its own.
+   The decoder accepts any `u32` in that field, so a persisted watermark above
+   the reader's seal bound is reachable two ways: a replica whose clock ran ahead
+   of this one stamped it, or the field was corrupted into a value that still
+   decodes. Either way an unclamped cursor would start past the hours the current
+   commit keys live in, the tail would skip them, and the fold would serve the
+   state from before those transitions. That is not a bounded cost error: the
+   evaluator uses the folded record as the prior state, so a skipped firing
+   transition reads as resolved and the tick writes the firing transition a
+   second time, and a later memo refresh at a lower watermark cannot undo an
+   evaluation that already ran.
+
+   An over-high watermark is **clamped, not treated as a corrupt memo**. It is
+   not evidence that the memo's records are wrong, and it is not distinguishable
+   from ordinary clock disagreement between replicas, which this design already
+   accepts: decision 5 notes the watermark may move backward across ticks and
+   that a backward move only widens the tail. Clamping is exactly that widening,
+   so it restores the staleness invariant's precondition at no correctness cost.
+   Classifying it as corrupt instead would force a full `O(N)` fold, the cost
+   this ADR exists to remove, on every tick of any replica whose clock reads
+   behind the writer's, and would rewrite a memo that was never wrong. The
+   records are still usable under the clamp because the seed only ever supplies
+   below-watermark state: any record the widened tail re-reads wins the tie
+   against its byte-identical memoized copy.
+
+   Each memoized record is seeded
    into the fold at order `(ts_ns, 0, 0)`, below any real commit the tail
    re-reads (order `(ts_ns, epoch, seq)` with a nonzero `seq`), so a re-read
    transition always wins the tie against its own memoized copy; the two are
@@ -185,7 +214,8 @@ flowchart TD
     tick[Evaluation tick] --> getmemo[GET t/tenant/a/state/latest]
     getmemo -->|present, version 1| seed[Seed fold from memo at order ts,0,0]
     getmemo -->|absent, corrupt, or bad version| full[Full fold over whole history]
-    seed --> tail[start-after LIST over hours at or above watermark]
+    seed --> clamp[Effective watermark = min of memo watermark and seal bound]
+    clamp --> tail[start-after LIST over hours at or above the effective watermark]
     tail --> foldtail[Commit GET + data GET per transition in the tail]
     foldtail --> latest[Folded latest state per alert_id]
     full --> latest
@@ -200,10 +230,17 @@ flowchart TD
 
 ADR-1113's verification suite covers the maintenance and catalog fold
 protocols; this memo introduces one invariant in the same style, stated here so
-that suite can adopt it. Let the **memo staleness invariant** be: if
-`memo.watermark_hour` is at or below every ingest hour that the tail LIST
-covers, then the state produced by seeding from the memo and folding the tail
-equals the state produced by a full fold over the whole history.
+that suite can adopt it. Let the **effective watermark** be
+`min(memo.watermark_hour, seal_bound_hour(now_ns))`, computed by the reader at
+fold time (decision 3), and let the **memo staleness invariant** be: if the
+effective watermark is at or below every ingest hour that the tail LIST covers,
+then the state produced by seeding from the memo and folding the tail equals the
+state produced by a full fold over the whole history.
+
+Every statement below about "the watermark" is about the effective watermark.
+The persisted `watermark_hour` is only one of its two terms, and it is the
+untrusted one: it is a `u32` the decoder accepts unconditionally, written by a
+process whose clock this reader has no way to check.
 
 The argument rests on one consistency fact: a record's ingest hour is derived
 from its own `ts_ns` (`publish` stamps `ingest_hour_bucket = hour_bucket(record.
@@ -217,9 +254,12 @@ the seed-plus-tail fold sees the same record set as a full fold. The tie-break
 (memoized copy at `seq == 0` versus re-read copy at `seq > 0`) never changes the
 folded value because a re-read record is byte-identical to its memoized copy.
 
-The invariant's precondition (`watermark_hour` at or below every hour the tail
-covers) is not automatic: a `watermark_hour` at `hour_bucket(now_ns)` is broken
-by the alert lease's documented two-holder overlap. A prior holder whose lease
+The invariant's precondition (the effective watermark at or below every hour the
+tail covers) is not automatic, and it fails in two distinct ways.
+
+The first is the writer's choice of watermark: a `watermark_hour` at
+`hour_bucket(now_ns)` is broken by the alert lease's documented two-holder
+overlap. A prior holder whose lease
 has expired can still finish an in-flight tick and publish a transition after
 this holder's tail LIST, stamped at the prior holder's own clock. That stamp can
 fall in an hour strictly below `hour_bucket(now_ns)` (the prior holder's clock
@@ -232,6 +272,17 @@ written after the memo" step above assumed away. The seal-bound watermark
 `now_ns - (lease_ttl + query_deadline)`, older than any hour an overlapping
 holder can still stamp into, so every late transition lands at an hour at or
 above the watermark and is re-read by the tail.
+
+The second is the reader's trust in what it read. A seal-bound watermark is only
+seal-bound against the clock of the process that computed it. A persisted
+`watermark_hour` above the reader's own `seal_bound_hour(now_ns)` breaks the
+precondition on the reader's side no matter how carefully the writer chose it,
+and the decoder cannot reject it (any `u32` is a syntactically valid hour). The
+reader's clamp (decision 3) closes this: the effective watermark is at or below
+`seal_bound_hour(now_ns)` by construction, and the seal bound is at or below
+every hour a transition can currently be written into, so the effective watermark
+is at or below every hour the tail must cover. Only then does the partition
+argument above apply.
 
 The watermark may also move backward across ticks (a backward clock step widens
 the tail to cover more hours), which only ever re-reads more, never fewer, so the
