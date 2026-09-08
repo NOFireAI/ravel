@@ -1756,12 +1756,10 @@ mod tests {
 
     /// The churn case: churn epochs must grow the distinct scaling-label set
     /// past one epoch's worth, which a single-epoch, manifest-only formula
-    /// cannot see (issue #1352). The pre-fix formula this issue replaces
-    /// (`bfb501ea`'s `crates/ravel-bench/src/metrics_workload.rs:330`,
-    /// `WorkloadFile::family_scaling_label_cardinality`, `ceil(instances /
-    /// family_fixed_product)`, maxed over families with no notion of an
-    /// epoch at `metrics_workload.rs:287`) reports one number for the whole
-    /// run regardless of how many epochs it spans. But
+    /// cannot see (issue #1352). A per-family `ceil(instances /
+    /// fixed_product)` maxed over families has no notion of an epoch and
+    /// reports one number for the whole run however many epochs it spans.
+    /// But
     /// `Generator::generate_into` offsets every family's instance ordinal by
     /// `churned_per_epoch * epoch` each epoch, so the true distinct-value
     /// set grows every epoch: the union of every (family, epoch) range.
@@ -1801,11 +1799,8 @@ mod tests {
     /// `ceil(60/2)=30`, classic `ceil(20/2)=10`, native `ceil(20/2)=10`,
     /// maxed to 30, half the true 60.
     ///
-    /// TO SEE THIS FAIL against the pre-fix formula: reintroduce
-    /// `WorkloadFile::family_scaling_label_cardinality` and
-    /// `WorkloadFile::family_fixed_product` (deleted by this fix) and assert
-    /// `workload.label_cardinalities(&profile)["instance"] == 60` in their
-    /// place below; that formula reports 30, not 60.
+    /// A single-epoch formula fails here: it reports 30 against the 60 this
+    /// run emits.
     #[test]
     fn scaling_label_cardinality_unions_every_family_and_epoch_under_churn() {
         let w = workload(1, clean());
