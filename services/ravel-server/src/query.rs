@@ -202,8 +202,13 @@ pub fn build_app_state(
     // cache that backs `/api/v1/metadata`. `None` in a mode that serves no
     // Prometheus-shaped query routes; when absent the endpoint keeps its
     // pre-ADR behavior byte-for-byte (a `200` with an empty `data` object).
+    // The same aggregator is the usage sink as well as the cost recorder: the
+    // cost recorder only ever sees a query that produced an answer, so without
+    // this the drop guard's cancelled, timed-out, and failed records from every
+    // Prometheus-shaped route would be folded into a sink that discards them.
     let state = AppState::new(Arc::new(engine), tenant_resolver)
-        .with_cost_recorder(query_accounting)
+        .with_cost_recorder(query_accounting.clone())
+        .with_usage_sink(query_accounting)
         .with_query_admission(query_admission);
     match metadata_cache {
         Some(cache) => state.with_metadata_cache(cache),

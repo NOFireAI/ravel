@@ -403,9 +403,11 @@ impl QueryService {
             .controls
             .clamp_deadline(request.deadline, state.engine.config().deadline);
         let now_ns = self.clock.now_ns();
+        let live = ravel_query::LiveQueryAccounting::new();
         let guard = self
             .controls
-            .usage_guard(tenant_hash, Arc::new(ravel_query::http::UnobservedUsage));
+            .usage_guard(tenant_hash, Arc::new(live.clone()));
+        let engine = state.engine.with_live_usage(&live);
 
         // Per-slice fragment observability (ADR-0071 `stats.fragments[]`). The
         // sink is installed in task-local storage so every distributed slice
@@ -415,8 +417,7 @@ impl QueryService {
         let span = query_span("analytics_query", tenant_hash);
         let eval = crate::distrib::with_fragment_stats(
             fragment_sink.clone(),
-            state
-                .engine
+            engine
                 .range_with_stats(
                     tenant_hash,
                     &request.query,
