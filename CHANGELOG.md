@@ -6,6 +6,82 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-08
+
+### Added
+
+- **The operator qualifies the object store before serving** (issue #36). Each
+  reconcile pass renders a one-shot `<cluster>-qualify` Job running
+  `ravel-cli store qualify` with the server image, credentials Secret, bucket,
+  region, and endpoint of the tiers it gates, and creates the gateway, query,
+  and maintain Deployments only once that Job reports Complete. A
+  `StoreQualified` status condition carries the gate state (Pending while the
+  Job runs, Succeeded on completion, Failed with the Job's message once its
+  backoffLimit is exhausted). The qualified inputs (bucket, region, endpoint,
+  image, credentials Secret name and resourceVersion) are hashed into
+  `status.storeQualifiedHash`, so a later pass with unchanged inputs proceeds
+  without re-running qualification even after the Job's TTL garbage-collects
+  it; an input change deletes and recreates the Job and flips the condition
+  back to Pending. The Job as a whole is bounded by `activeDeadlineSeconds`
+  (1400 s across both attempts), so a hung attempt fails rather than holding
+  `StoreQualified` at Pending; a Failed Job is
+  deleted and recreated on the next pass instead of sitting until its TTL,
+  and a status-only reconcile no longer re-triggers the gate. The kind
+  lane's hand-run qualification Job is removed since the lane now deploys
+  through the operator.
+- **The object-store conformance suite probes concurrent creates, listing
+  order, and deletes** (issue #1302). Four new probes close gaps the
+  qualification suite left open: `ConcurrentCreateIfAbsentSingleWinner` races
+  eight writers on one absent key and checks for exactly one winner,
+  `LexicographicListingOrder` and `CrossPageListing` check listing order and
+  `start_after` resumption across page boundaries, and `DeleteVisibility`
+  checks that a delete is reflected in both a follow-up get and a follow-up
+  listing. The suite tolerates the behaviors the object-store contract
+  explicitly permits: a key repeated across a listing page boundary, and a
+  losing racer's write landing before its own retryable-conflict response is
+  retried. The shipped Admin IAM template gains `s3:DeleteObject` on
+  `sys/qualify/*` so the delete probe can run under it; no other resource
+  gets a delete grant. `CONFORMANCE_SUITE_VERSION` stays at 1 on purpose, so
+  a bucket that already carries a `sys/qualification` record does not
+  re-qualify and never runs these four new probes.
+- **A derived per-tenant alert-state memo bounds alert evaluation cost**
+  (issue #1294). The alert evaluator previously re-folded a tenant's entire
+  `Signal::Alerts` transition history on every tick, so cost grew with the
+  cumulative transition count rather than the rule count. A durable memo at
+  `t/<tenant_hash>/a/state/latest` now seeds each tick's fold, and a tick
+  reads only the commit records after the memo's watermark. The watermark is
+  bound to the reader's own seal-bound hour: a watermark the memo carries
+  above that seal-bound hour is clamped down to it rather than trusted, so
+  an evaluator with a stale or ahead clock cannot skip a legally late
+  transition. A memo with a duplicate `alert_id` is treated as a decode
+  failure rather than served, and a failed memo encode leaves the previous
+  memo untouched instead of overwriting it with corrupt bytes. A missing or
+  unreadable memo falls back to a full fold.
+- **A bounded top-k optimizer rule for `GROUP BY ... ORDER BY ... LIMIT k`**
+  (issue #1402). A grouped aggregate whose only consumer is an
+  `ORDER BY ... LIMIT k` on a `min`/`max` aggregate over a non-nullable,
+  non-float column now keeps only the top k groups in a priority map instead
+  of materializing one accumulator per distinct group; ADR-0013's
+  exact-semantics contract is unaffected because the rule fires only for an
+  aggregate expression that is provably exact under the bound (max under
+  DESC, min under ASC).
+- **The operator hardens every rendered pod and scopes its own Secrets RBAC
+  per namespace, keeping a cluster-wide watch on `RavelCluster`.** Every
+  rendered gateway, query, maintain, and ingest-router container now carries
+  a `SecurityContext`: `runAsNonRoot`, no privilege escalation, every Linux
+  capability dropped, and a read-only root filesystem (safe because the only
+  local write any of these processes can opt into is the disk cache, and the
+  operator renders no `--cache-dir` flag). The operator's ServiceAccount no
+  longer holds a cluster-wide read on every Secret; it reads a
+  `RavelCluster`'s referenced Secrets through a namespaced grant in that
+  object's own namespace, while its watch on `RavelCluster` objects stays
+  cluster-wide so a cluster outside `ravel-system` still reconciles. Serving
+  a namespace other than `ravel-system` also needs the namespaced
+  RoleBinding this release ships (`deploy/k8s/operator/secrets-rolebinding.yaml`)
+  copied into that namespace, or Secret resolution 403s. The same change
+  adds a PodDisruptionBudget per tier (`maxUnavailable: 1`) and preferred
+  pod anti-affinity to every rendered Deployment.
+
 ### Changed
 
 - **`ravel-server` in mode `all` or `query` now installs the query-audit
@@ -16,14 +92,61 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`--tenant-hash-key-file`) derives the key and needs no action. Gateway and
   maintain processes are unaffected. The docker-compose quickstart now ships a
   development key.
-- **The operator's Secret change-detection checksum is now a `blake3` digest, 64
-  hex characters** (issue #36). It replaces a 16-character standard-hasher value
-  that was not stable across Rust toolchain versions. Because the annotation
-  value changes, the first reconcile after upgrading the operator rolls every
-  rendered gateway, query, and enabled maintain Deployment once, even when their
-  referenced Secrets are unchanged; subsequent reconciles are stable. Schedule
-  the operator upgrade in a maintenance window that tolerates one rolling restart
-  of each serving tier.
+- **CAS-mutable sys records (provisioning, tenant config, metric metadata)
+  move to format_version 2** (ADR-0066). An earlier release added fields to
+  these records without a version bump, so a lagging binary reading a
+  current record silently dropped the fields it did not model and wrote the
+  stripped record back under compare-and-swap. Every reader gate for these
+  three records now accepts exactly the version set {1, 2} instead of a
+  ceiling-only check, and a CAS rewrite now refuses a record whose version
+  exceeds what this build's writer stamps rather than re-encoding it through
+  an older field set. Every writer now stamps new records at version 2. The
+  background metric-metadata refresh reads through the same permissive
+  reader the cache miss path uses, so a tenant's record upgraded to version 2
+  during the writer rollout is no longer rejected by refresh and stuck
+  serving a stale pre-upgrade snapshot for the rest of the process's life.
+  The auth token map and key epoch record read gates gained the same floor:
+  a version-0, unstamped record now fails closed instead of being decoded
+  and rewritten.
+- **Every query transport (HTTP, gRPC, mTLS, Flight SQL) now runs through one
+  query service layer** (issue #1377). Each surface previously carried its
+  own copy of admission, cost accounting, and audit controls, and the copies
+  had drifted: analytics and exemplars ran outside the fleet-wide
+  concurrency ceiling, exemplars recorded no cost, only the SQL surface
+  billed a query a client disconnected mid-flight, admission was taken
+  before authentication on some routes, and a malformed `match[]` selector
+  could consume an admission permit before being rejected. All four
+  transports now authenticate, then admit, then run, then audit in the same
+  order; a malformed selector is rejected with 400 before any permit is
+  taken; a cancelled, timed-out, or failed PromQL, metadata, or analytics
+  query now bills the spend it reached instead of zero; `label_values` audit
+  events are tagged as their own audit language, distinguishable from the
+  other label route; an audit-sink submission failure is reported with the
+  audit pipeline's own failure message instead of the storage-outage string;
+  and the mTLS listener gets its own instance of the service layer so a
+  certificate-identified caller is resolved against the mTLS tenant resolver
+  rather than the public listener's bearer-token resolver.
+- **The store-request ceiling (`max_s3_requests`, `--max-s3-requests`)
+  is now checked immediately after catalog resolution, combining every
+  lane's spend so far, not only during segment fetches** (issue #1376). A
+  query whose snapshot resolved to zero segments never reached the
+  incremental checks in the fetch loop, so it could spend more catalog
+  requests during resolve than the ceiling allowed and still succeed; a
+  mixed metrics-and-logs query is now checked against its combined resolve
+  cost across both lanes. Applies to PromQL, SQL execute, SQL explain, and
+  the Flight SQL `resolve_snapshot` path.
+- **Metrics compaction releases each L1 segment's encoded bytes at PUT
+  instead of holding them until the record publishes.** Peak memory during
+  RSEG compaction previously carried a term that grew with the whole
+  bucket's L1 output; the RLOG path already had this shape (ADR-0979
+  decision 3), and this applies it to RSEG.
+- **The RLOG plan phase's whole-object read is carried into the scan, bound
+  by plan fan-out rather than the corpus.** On the whole-object fallback,
+  the plan phase and the scan each fetched the same object; the plan
+  phase's bytes are now handed to the scan and charged to `bytesReused`,
+  with retention bounded to the plan fan-out in objects times the object
+  size. On ClickBench q20 that was 6,785 GETs and 21.1 GB, where a
+  corpus-sized cache gives 4,533 GETs and 11.24 GB.
 - **The operator now bounds qualify-Job recreations for a store that keeps
   failing qualification** (issue #36). A failing `ravel-cli store qualify` Job is
   recreated on a capped exponential backoff (30 s doubling to a 480 s ceiling)
@@ -32,6 +155,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   delete/recreate every retry interval. The failure count and next-retry instant
   are persisted in `RavelCluster` status, and the `StoreQualified=False`
   condition names the attempt count and the next retry time.
+- **The operator's Secret change-detection checksum is now a `blake3` digest, 64
+  hex characters** (issue #36). It replaces a 16-character standard-hasher value
+  that was not stable across Rust toolchain versions. Because the annotation
+  value changes, the first reconcile after upgrading the operator rolls every
+  rendered gateway, query, and enabled maintain Deployment once, even when their
+  referenced Secrets are unchanged; subsequent reconciles are stable. Schedule
+  the operator upgrade in a maintenance window that tolerates one rolling restart
+  of each serving tier.
 - **`latency-first`'s published trade is re-measured and now names the commit it
   was taken on** (issue #1316). Over 3 reps on the reference corpus,
   42-statement basis, true cold in the warm-up-empty state, at concurrency 256:
@@ -45,6 +176,113 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   time, not a property of the policy. The timing half also carries more noise
   than previously assumed (6.7% to 14.8% per-arm spread across reps on the
   measurement host), so the figure is a mean with a range, not a constant.
+
+### Fixed
+
+- **OTLP HTTP gzip inflate is charged against the ingest byte budget as it
+  decompresses** (issue #1297). The OTLP HTTP metrics/logs/traces handlers
+  decompressed request bodies up to 64 MiB before the router's own buffer
+  charge ran, so up to `--max-inflight-ingest-requests` copies of a 64 MiB
+  inflate could exist at once, entirely outside `--max-ingest-buffer-bytes`.
+  Each chunk is now charged to the process-wide ingest budget before it is
+  retained, in exactly-sized allocations rather than a growing buffer, and a
+  decompression whose running total would cross the ceiling is shed
+  mid-inflate (429) rather than allocated in full; a body over
+  `MAX_DECOMPRESSED_OTLP_BODY_BYTES` is refused with 413 at the first byte
+  past the cap rather than after the whole body is decompressed.
+- **`--dev-insecure-tenant-header` is refused unless every listener (HTTP
+  and gRPC) binds loopback, not just `--listen-http`** (ADR-0009, issue #94).
+  The flag was reachable, unguarded, on a non-loopback `--listen-grpc`,
+  letting an unauthenticated request forge tenant identity on the gRPC and
+  Flight SQL surfaces. The same commit also refuses `--distributed-query`
+  and `--fragment-listener` under gateway-only and maintain mode; a
+  configuration that previously started with either flag set under one of
+  those modes now fails at startup.
+- **RLOG scan decompressed-byte accounting is complete** (issue #1401). A
+  logs scan now reports the zstd work it actually does: the directory
+  sections a segment open decompresses, each block page decode, the POSTINGS
+  probe's term-block decode, and the plan phase's fallback and eager-funnel
+  decodes (the alerts and audit scans) all charge `ScanStats.decompressed_bytes`.
+  Several of these sites previously charged nothing, so a query relying on a
+  text arm, a stream filter, or a below-threshold object could report zero
+  decompressed bytes however much it actually decoded.
+- **A column-stats object the reader refuses to decode (for example one
+  whose uncompressed body exceeds the 256 MiB decode ceiling) now logs one
+  warning per (tenant, signal, key) and degrades to no statistics, instead
+  of doing so silently.** Previously this folded into the same silent
+  "no statistics" outcome as a segment with no stats object at all. The
+  per-tenant refusal marks are swept so a tenant that never resolves does
+  not accumulate them without bound.
+- **Duplicate attribute keys within one record now resolve last-wins by a
+  fixed, documented order, consistently across SQL, ingest, and
+  maintenance.** The winner is fixed by the order `rebuild_record` lays a
+  record's attributes out: columnar occurrences first, ascending by
+  FIELD_DIR type byte, then `attrs_raw` overflow occurrences ascending by
+  canonical encoded value bytes, last entry wins. This is the record's
+  on-disk layout order, not its write order, which the format does not
+  preserve; four consumers of the merged attribute view previously
+  disagreed about which occurrence a query resolved to.
+- **RLOG corruption returns HTTP 500, not a retryable 503.** The local
+  PromQL log path folded every RLOG fault, including corruption, into the
+  same error class as a transient store error, so a Prometheus client
+  retried a query against corrupted stored data forever.
+- **Non-retryable OTLP HTTP write errors return 400 instead of 503** (issue
+  #1298). A permanent failure such as a series value-kind mismatch
+  previously fell through a catch-all that mapped it to 503, so a
+  well-behaved exporter retried a request that could never succeed; the HTTP
+  handlers now mirror the gRPC side's retryable/non-retryable distinction.
+- **A raced `CreateIfAbsent` write that the backend answers with a
+  retryable 409 is retried instead of reported as a permanent conflict.**
+  `object_store` 0.14 maps every raw 409 to `AlreadyExists`, including AWS's
+  own retryable `ConditionalRequestConflict` 409, which is distinct from a
+  genuine already-exists. The S3 adapter now disambiguates with a HEAD: key
+  present stays `AlreadyExists`, key absent becomes a retryable `Transient`.
+  A HEAD probe that itself fails transiently (throttled, timed out) is now
+  surfaced as retryable rather than folded into `AlreadyExists`, which had
+  made the commit-publish path treat a race it did not lose as lost.
+- **Erasure requests no longer complete while a bucket in their scope is
+  still unsealed at acknowledgement** (ADR-0064). A pending erasure request
+  could be marked done while an in-scope bucket was still unsealed,
+  including one that had not yet published a commit record at all and so
+  never appeared in the completion pass's own listing; the subject's
+  records then reappeared as soon as the request's exclusion filter was
+  released. Completion now blocks on every ack-time-open bucket, whether or
+  not the listing discovers it.
+- **The shipped KMS IAM templates scope their KMS actions to a placeholder
+  tenant key ARN instead of every key in the account and region.** The four
+  templates (gateway, query, maintain, admin) previously granted their KMS
+  actions on `key/*`: gateway, query, and maintain hold
+  `kms:Encrypt`/`GenerateDataKey*`/`Decrypt`, and admin holds `kms:Decrypt`
+  only. An operator using SSE-KMS must add, not replace: one array entry
+  for the `--s3-kms-key` ARN if that flag is set, plus one for every key in
+  `--tenant-kms-config`, in every role's KMS Resource array; otherwise
+  gateway, query, and maintain PUTs fail with AccessDenied and reads of
+  objects written under that key fail decryption for every role.
+- **`ravel-cli maintain migrate` reports a permanently blocked straggler
+  correctly and only counts a bucket as permanently blocked when it
+  actually is.** A below-target L0 segment that only a losing compaction
+  record names is live data the migration walk cannot touch, and CLI/guide
+  text now says re-running will not help instead of telling the operator to
+  re-run; conversely, a bucket flagged by a concurrent compaction or
+  erasure landing mid-walk is no longer counted as permanently blocked, and
+  a record retention deletes between the walk's listing and its read no
+  longer aborts the migration or produces a false permanent-block report.
+- **Compaction refuses to compact a bucket whose erasure-rewrite record is
+  already durable when the compactor lists it.** Publishing a second
+  compaction record set over inputs a rewrite already covered could
+  resurrect records the rewrite had erased once the pending-request filter
+  that was hiding them was removed. The two passes still list-then-act with
+  no CAS between them, so the maintenance driver's per-bucket serialization
+  stays load-bearing.
+- **The catalog's min-token fallback no longer serves parts from a losing
+  compaction record.** Two overlapping live compaction records in one
+  bucket could serve the losing record's parts in addition to the winning
+  record's already-resolved parts; logs and spans have no query-time dedup,
+  so this returned duplicate rows.
+- **A carried whole-object read is now bound to the exact segment and
+  tenant that produced it.** A carry could previously be handed to a read
+  of a different object with no error, decoding the wrong object's rows
+  wherever both objects were decodable.
 
 ## [0.14.0]
 
@@ -175,6 +413,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the corpus. The saving is therefore about one duplicate read per unit of
   plan fan-out; removing the rest needs the carry to stream per partition
   instead of being held at the plan barrier, tracked separately.
+  **Correction.** This change landed after the 0.14.0 tag and ships in
+  0.15.0, where the retention bound is the plan fan-out rather than the SQL
+  partition count.
 - **The RLOG raw prefetch is gated on the cursor budget before `try_join!`**
   (ADR-0979 decision 4). The merge cursor's refill fetched the next two
   row-group blocks before the budget had been checked, so up to twice the
