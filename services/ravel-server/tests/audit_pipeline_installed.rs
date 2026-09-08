@@ -30,8 +30,12 @@ use uuid::Uuid;
 const TOKEN: &str = "acme-token";
 const TENANT: &str = "acme";
 /// A second tenant, for the per-tenant audit-routing tests. Distinct token and
-/// distinct tenant id, so the two resolve to different `TenantHash`es.
+/// distinct tenant id, so the two resolve to different `TenantHash`es. Used
+/// only by `two_tenants_each_read_only_their_own_audit`, which is SQL-only;
+/// gated the same way so the default-feature build has no unused constant.
+#[cfg(feature = "sql")]
 const TOKEN_B: &str = "beta-token";
+#[cfg(feature = "sql")]
 const TENANT_B: &str = "beta";
 /// The bearer token the mTLS listener's own resolver accepts. A distinct
 /// credential, because the two listeners authenticate against different

@@ -403,10 +403,11 @@ pub fn build_sql_state(
         max_deadline,
         query_accounting,
         query_admission,
-        // The SQL HTTP audit routes through the QueryAuditSink seam;
-        // installing the process-wide AuditPipeline is a separate server-wiring
-        // step, so this defaults to the no-op today. The endpoint already
-        // submits and awaits through the trait, so enabling it is a one-line swap.
+        // The SQL HTTP audit routes through the QueryAuditSink seam. This
+        // function builds no pipeline of its own, so it defaults to the no-op
+        // sink; `start` (lib.rs) overrides this field with the process-wide
+        // AuditPipeline's sink once it builds one (ADR-0062 decision 2b), in
+        // every mode that installs a pipeline.
         audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
     })
 }

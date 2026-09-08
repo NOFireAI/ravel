@@ -146,9 +146,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ADR-0062 decision 2e: how a query-audit record carries `query.text`.
     // Resolved here, beside the deployment key its token key can be derived
-    // from, and refused outright under `redacted` with no key available: a
-    // process that cannot tokenize must not start recording verbatim text
-    // under a flag that says it does not.
+    // from. Under `redacted` with no key available, this refuses to start
+    // only in the modes that install the query-audit pipeline (`all` and
+    // `query`; `Mode::installs_query_audit_pipeline`): a process that will
+    // actually write audit records and cannot tokenize them must not start,
+    // but `gateway` and `maintain` write none and so read no key.
     let audit_text = cli
         .resolve_audit_text_policy(deployment_key.as_deref())
         .context("failed to resolve --audit-text")?;
