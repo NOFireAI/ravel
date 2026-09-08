@@ -160,8 +160,8 @@ impl Default for ColumnStatsLimits {
 /// (c6a.4xlarge): 703 column-statistics segments over 104 declared columns
 /// produced a v2 object whose uncompressed body worked out to 27,356 bytes
 /// per (segment, column) pair. This constant is that figure with the same 2x
-/// headroom convention [`DEFAULT_MAX_SNAPSHOT_PART_BYTES`] applies over
-/// `DEFAULT_BYTE_CACHE_MAX_BYTES`: 27_356 * 2 = 54_712.
+/// headroom convention `DEFAULT_BYTE_CACHE_MAX_BYTES` applies over
+/// [`DEFAULT_MAX_SNAPSHOT_PART_BYTES`]: 27_356 * 2 = 54_712.
 ///
 /// Single-sourced so the fold (which enforces the bound at write time,
 /// ADR-1413 decision 4) and a future per-part reader (decision 2, which
