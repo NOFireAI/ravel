@@ -11,7 +11,12 @@ path = "src/main.rs"
 
 [dependencies]
 kube = { workspace = true }
-kube-runtime = { workspace = true }
+# unstable-runtime-stream-control gates Controller::for_stream, used in
+# controller::run to feed the primary RavelCluster watch through a
+# predicate_filter that drops status-only updates (generation unchanged). It is
+# a cargo feature only, adds no new external crate, and does not require a
+# RUSTFLAGS cfg.
+kube-runtime = { workspace = true, features = ["unstable-runtime-stream-control"] }
 k8s-openapi = { workspace = true }
 schemars = { workspace = true }
 tokio = { workspace = true }

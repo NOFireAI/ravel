@@ -391,6 +391,26 @@ unit tests; the runtime behavior (the Job actually completing and the
 Deployments appearing only after) is left to the k8s CI lane (decision 8),
 unproven until that lane runs.
 
+**Amendment (2026-09-08): the gate no longer re-triggers itself.** Two
+refinements stop the qualification hold from spinning. First, the primary
+`RavelCluster` watch drops status-only updates: its trigger stream runs through
+a generation predicate (`predicates::generation`), so an event passes only when
+`.metadata.generation` changed. Every reconcile rewrites `.status`, and without
+the filter each write re-enqueued the object before its requeue delay elapsed,
+so a terminally `Failed` qualify Job (which the controller does not watch) was
+deleted and recreated in a tight loop. A spec edit bumps the generation and
+still reconciles; a deletion arrives as its own watch event, not a status-only
+apply. Second, status conditions preserve their `lastTransitionTime` across a
+pass that does not change the condition's status value, per the Kubernetes
+convention that the field records the last transition, not the last write, so
+an unchanged condition no longer reads as a change on every pass. The `Failed`
+qualification hold requeues on the failure backoff, not the shorter bootstrap
+poll. The kind lane (scripts/kind-up.sh) reuses clusters and re-applies the dev
+RavelCluster, so it now waits for `StoreQualified=True` at
+`observedGeneration == .metadata.generation` before `Available=True`: a
+re-qualification in flight cannot let the wait return on the previous
+generation's readiness.
+
 ## Rejected alternatives
 
 1. **Go operator (kubebuilder/controller-runtime).** The larger example
