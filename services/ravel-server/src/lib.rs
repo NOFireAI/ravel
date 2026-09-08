@@ -478,6 +478,15 @@ pub struct Running {
     /// The supervised background flush loop still owns the production cadence
     /// (`metadata_sink_task`); this handle shares the same `Arc`.
     pub metadata_sink: Option<Arc<ravel_ingest::MetadataSink>>,
+    /// The query service layer layered onto the public HTTP router, `Some` in
+    /// the query-serving modes that build one.
+    pub query_service: Option<service::QueryService>,
+    /// The query service layer layered onto the mTLS router, `Some` exactly
+    /// when a query-serving mode was configured with an mTLS listener. A
+    /// separate instance from [`Running::query_service`] because the two
+    /// listeners authenticate against different resolvers; everything else the
+    /// controls need is shared between them.
+    pub mtls_query_service: Option<service::QueryService>,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
     span_ingest_router: Option<Arc<SpanIngestRouter>>,
     fold_tasks: fold::FoldTasks,
@@ -970,6 +979,11 @@ pub async fn start(
     // configured. Deliberately serves no health or metrics routes - those
     // carry no tenant identity and stay on the public listener only.
     let mut mtls_router = Router::new();
+    // The per-listener query service layers, kept on `Running` so an
+    // in-process transport takes the one belonging to the listener it serves
+    // rather than whichever instance it can reach.
+    let mut query_service_handle: Option<service::QueryService> = None;
+    let mut mtls_query_service_handle: Option<service::QueryService> = None;
     if let (Some(router), Some(log_router), Some(span_router)) =
         (&ingest_router, &log_ingest_router, &span_ingest_router)
     {
@@ -1332,6 +1346,11 @@ pub async fn start(
         // assembled below.
         #[cfg(feature = "sql")]
         let sql_query_state: sql::SqlState;
+        // The same state under the mTLS listener's resolver, kept for that
+        // listener's own `QueryService`. `None` when no mTLS listener is
+        // configured.
+        #[cfg(feature = "sql")]
+        let mtls_sql_query_state: Option<sql::SqlState>;
         #[cfg(feature = "sql")]
         {
             // Mounted alongside the Prometheus-shaped routes on the same
@@ -1392,11 +1411,11 @@ pub async fn start(
             // once above) rather than calling `build_sql_state` a second
             // time, which would stand up a second `Catalog`/`SqlExecutor`
             // pair with its own per-tenant memory accounting.
-            if let Some(mtls) = &config.mtls_listener {
-                let mtls_state = sql::SqlState {
-                    tenant_resolver: mtls.resolver.clone(),
-                    ..state.clone()
-                };
+            mtls_sql_query_state = config.mtls_listener.as_ref().map(|mtls| sql::SqlState {
+                tenant_resolver: mtls.resolver.clone(),
+                ..state.clone()
+            });
+            if let Some(mtls_state) = mtls_sql_query_state.clone() {
                 mtls_router = mtls_router.merge(sql::router(mtls_state));
             }
             #[cfg(feature = "flight-sql")]
@@ -1424,16 +1443,20 @@ pub async fn start(
         };
         let analytics_state_for_service = analytics_state.clone();
         http_router = http_router.merge(analytics::router(analytics_state));
-        if let Some(mtls) = &config.mtls_listener {
-            let mtls_analytics_state = analytics::AnalyticsState {
-                engine: app_state.engine.clone(),
-                tenant_resolver: mtls.resolver.clone(),
-                clock: Arc::new(SystemClock),
-                query_accounting: query_accounting.clone(),
-                audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
-                query_admission: query_admission.clone(),
-            };
-            mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
+        let mtls_analytics_state =
+            config
+                .mtls_listener
+                .as_ref()
+                .map(|mtls| analytics::AnalyticsState {
+                    engine: app_state.engine.clone(),
+                    tenant_resolver: mtls.resolver.clone(),
+                    clock: Arc::new(SystemClock),
+                    query_accounting: query_accounting.clone(),
+                    audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+                    query_admission: query_admission.clone(),
+                });
+        if let Some(state) = mtls_analytics_state.clone() {
+            mtls_router = mtls_router.merge(analytics::router(state));
         }
 
         // POST /api/v1/admin/fold (issue #785): the on-demand form of the
@@ -1495,8 +1518,8 @@ pub async fn start(
         .with_query_admission(query_admission.clone())
         .with_query_accounting(query_accounting.clone());
         http_router = http_router.merge(exemplars::router(exemplars_state.clone()));
-        if let Some(mtls) = &config.mtls_listener {
-            let mtls_exemplars_state = exemplars::ExemplarsState::from_engine(
+        let mtls_exemplars_state = config.mtls_listener.as_ref().map(|mtls| {
+            exemplars::ExemplarsState::from_engine(
                 &app_state.engine,
                 catalog.clone(),
                 store.clone(),
@@ -1505,8 +1528,10 @@ pub async fn start(
                 get_limiter.clone(),
             )
             .with_query_admission(query_admission.clone())
-            .with_query_accounting(query_accounting.clone());
-            mtls_router = mtls_router.merge(exemplars::router(mtls_exemplars_state));
+            .with_query_accounting(query_accounting.clone())
+        });
+        if let Some(state) = mtls_exemplars_state.clone() {
+            mtls_router = mtls_router.merge(exemplars::router(state));
         }
 
         // The one query service layer for this process (ADR-1374 decision 3):
@@ -1531,8 +1556,41 @@ pub async fn start(
         #[cfg(feature = "sql")]
         let query_service = query_service.with_sql(sql_query_state);
         http_router = http_router.layer(axum::Extension(query_service.clone()));
-        if config.mtls_listener.is_some() {
-            mtls_router = mtls_router.layer(axum::Extension(query_service));
+        query_service_handle = Some(query_service);
+
+        // The mTLS listener gets its own instance. Everything a control needs
+        // is shared with the primary one (the same admission controller, cost
+        // recorder, usage sink, audit sink, and engine), but the tenant
+        // resolver is not: `mtls.resolver` derives the tenant from the peer
+        // certificate, and `config.tenant_resolver` from a bearer token. An
+        // in-process transport that took the primary listener's instance off an
+        // mTLS request would authenticate a certificate-identified caller
+        // against the bearer-token resolver, which is the wrong credential and,
+        // where both are configured, the wrong tenant.
+        if let Some(mtls) = &config.mtls_listener {
+            let mtls_query_service = service::QueryService::with_metrics(
+                mtls.resolver.clone(),
+                Arc::new(SystemClock),
+                query_admission.clone(),
+                query_accounting.clone(),
+                Arc::new(ravel_maintain::NoopQueryAuditSink),
+            )
+            .with_engine(app_state.engine.clone());
+            let mtls_query_service = match mtls_analytics_state {
+                Some(state) => mtls_query_service.with_analytics(state),
+                None => mtls_query_service,
+            };
+            let mtls_query_service = match mtls_exemplars_state {
+                Some(state) => mtls_query_service.with_exemplars(state),
+                None => mtls_query_service,
+            };
+            #[cfg(feature = "sql")]
+            let mtls_query_service = match mtls_sql_query_state {
+                Some(state) => mtls_query_service.with_sql(state),
+                None => mtls_query_service,
+            };
+            mtls_router = mtls_router.layer(axum::Extension(mtls_query_service.clone()));
+            mtls_query_service_handle = Some(mtls_query_service);
         }
 
         // Same `QueryEngine` (and, under the `sql` feature, the same
@@ -2152,6 +2210,8 @@ pub async fn start(
         fragment_task,
         ingest_router,
         metadata_sink,
+        query_service: query_service_handle,
+        mtls_query_service: mtls_query_service_handle,
         log_ingest_router,
         span_ingest_router,
         fold_tasks,
