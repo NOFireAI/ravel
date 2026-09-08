@@ -159,16 +159,25 @@ fn published_accounting(stats: &Value) -> Option<Value> {
 /// count is folded back in afterwards. No operation here has a total order
 /// to page over, so no cursor is minted and the capped status is
 /// `ok_bounded`.
+///
+/// Two figures are carried through rather than recomputed from what survived.
+/// `data.row_count` is the count the operation produced, which is what D4
+/// makes it and what `Envelope::fit` deliberately leaves alone: it is read
+/// off the envelope the caller passes in, before either cap runs, and
+/// `presentation.rows_omitted` beside it is what the caps took. And
+/// `presentation.row_cap_hit` is folded in rather than assigned, because a
+/// caller may already have set it from a cap of its own: the SQL executor
+/// stops its own stream at a row cap this layer never sees.
 pub(crate) fn finish(mut envelope: Envelope, budgets: &McpEffectiveBudgets) -> Envelope {
+    let produced_rows = envelope.data.row_count;
     let max_rows = budgets.max_rows as usize;
     let row_cap_omitted = envelope.data.rows.len().saturating_sub(max_rows) as u64;
     envelope.data.rows.truncate(max_rows);
-    envelope.data.row_count = envelope.data.rows.len() as u64;
 
     let mut fitted = envelope.fit(budgets.max_response_bytes);
     fitted.presentation.rows_omitted += row_cap_omitted;
-    fitted.presentation.row_cap_hit = row_cap_omitted > 0;
-    fitted.data.row_count = fitted.data.rows.len() as u64;
+    fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
+    fitted.data.row_count = produced_rows;
     fitted.finish(false)
 }
 
@@ -663,7 +672,8 @@ mod tests {
 
     /// The row cap drops the rows past it, reports exactly how many it
     /// dropped, and leaves the status `ok_bounded`: more rows matched than
-    /// came back and no cursor can reach them.
+    /// came back and no cursor can reach them. `row_count` stays the produced
+    /// count, so the returned rows plus the omitted ones account for it.
     #[test]
     fn the_row_cap_reports_the_exact_number_it_dropped() {
         let budgets = budgets();
@@ -674,11 +684,71 @@ mod tests {
         let fitted = finish(envelope, &budgets);
 
         assert_eq!(fitted.data.rows.len(), budgets.max_rows as usize);
-        assert_eq!(fitted.data.row_count, u64::from(budgets.max_rows));
+        assert_eq!(fitted.data.row_count, u64::from(budgets.max_rows) + 17);
         assert_eq!(fitted.presentation.rows_omitted, 17);
         assert!(fitted.presentation.row_cap_hit);
         assert_eq!(fitted.status, Status::OkBounded);
         assert!(fitted.presentation.cursor.is_none());
+    }
+
+    /// A cap the caller reported from its own outcome survives `finish`. The
+    /// SQL executor stops its stream at a row cap this layer never sees, so
+    /// `sql_execute` sets `row_cap_hit` from `outcome.stats.row_cap_hit`
+    /// before calling here. Overwriting it with the D6 row cap's own verdict
+    /// would report `row_cap_hit: false` and degrade the status to `ok`, which
+    /// D4 defines as a complete query.
+    #[test]
+    fn row_cap_hit_from_the_outcome_survives_finish() {
+        let budgets = budgets();
+        let mut envelope = base("mixed", "sql", &budgets);
+        envelope.data = string_list_data("label", vec!["up".to_string(), "down".to_string()]);
+        envelope.presentation.row_cap_hit = true;
+
+        let fitted = finish(envelope, &budgets);
+
+        assert!(fitted.presentation.row_cap_hit);
+        assert_eq!(fitted.status, Status::OkBounded);
+        // The D6 row cap itself dropped nothing: two rows are far under the
+        // 200-row ceiling, so the surviving `row_cap_hit` is the outcome's.
+        assert_eq!(fitted.presentation.rows_omitted, 0);
+        assert_eq!(fitted.data.rows.len(), 2);
+        assert_eq!(fitted.data.row_count, 2);
+    }
+
+    /// `data.row_count` is the count the query produced, not the length of
+    /// what survived the byte cap (D4: "data.row_count keeps the count of rows
+    /// that the query produced"). A caller reading `row_count` alone must not
+    /// see a complete-looking result whose tail the cap took; the dropped
+    /// count is in `rows_omitted` beside it, and the two account for the
+    /// produced total exactly.
+    #[test]
+    fn row_count_keeps_the_produced_count_after_a_byte_cap_drop() {
+        let budgets = budgets();
+        // 150 rows of 8 KiB, so the payload is about 1.2 MiB against the
+        // 512 KiB default cap, and the count stays under the 200-row ceiling:
+        // the byte cap is the only cap that fires here.
+        let produced = 150u64;
+        let mut envelope = base("logs", "logs", &budgets);
+        envelope.data = string_list_data(
+            "body",
+            (0..produced).map(|i| format!("{i:*<8192}")).collect(),
+        );
+
+        let fitted = finish(envelope, &budgets);
+
+        assert!(fitted.presentation.bytes_cap_hit);
+        assert!(!fitted.presentation.row_cap_hit);
+        assert_eq!(fitted.data.row_count, produced);
+        assert_eq!(fitted.presentation.rows_omitted, 87);
+        assert_eq!(fitted.data.rows.len(), 63);
+        // The two account for the produced total exactly: nothing is lost
+        // between what came back and what the cap took.
+        assert_eq!(
+            fitted.data.rows.len() as u64 + fitted.presentation.rows_omitted,
+            fitted.data.row_count
+        );
+        assert_eq!(fitted.presentation.cells_truncated, 0);
+        assert_eq!(fitted.status, Status::OkBounded);
     }
 
     /// A result inside both caps is `ok`, with nothing omitted.
