@@ -69,9 +69,12 @@ Three counters say what the fit removed outside `data.rows`.
 `metadata_elided` counts list entries dropped because their list was over
 its count bound. `entries_truncated` counts entries kept but cut because
 the entry was over its own size bound; a cut entry carries a truncation
-marker. `scalars_truncated` counts scalar fields cut or dropped because
-the scalars together were over their 4 KiB allowance. A cursor is dropped
-rather than cut, because cutting a token breaks its authentication code.
+marker. `scalars_truncated` counts scalar cuts and the cursor drop.
+Sub-bounded scalars are cut to their own bounds first. The allowance pass
+then cuts `plan`, the failure message, and the budget values. If the
+scalars are still over, the cursor is dropped and announced with a
+warning and a next step. Cutting a token breaks its authentication code,
+so it is dropped rather than cut.
 
 The first-row guarantee applies to the byte cap. It does not apply to
 the row cap. When the equal-group rule leaves no complete group inside

@@ -94,9 +94,11 @@ const SNAPSHOT_ID_BOUND: usize = 128;
 const WATERMARK_HOUR_BOUND: usize = 32;
 const APPROXIMATION_BOUND: usize = 256;
 const FAILURE_COUNTER_BOUND: usize = 128;
-const CURSOR_BOUND: usize = 2048;
 
-/// What the sub-bounded scalars can occupy together.
+/// What the sub-bounded scalars can occupy together. `presentation.cursor`
+/// has no entry here: D4 states no per-scalar bound for it, and a MAC'd
+/// token cannot be cut to one without corrupting it (see
+/// [`Envelope::cap_scalars`]).
 const FIXED_SCALAR_BOUNDS: usize = SIGNAL_BOUND
     + TABLE_BOUND
     + 2 * TIME_RANGE_BOUND
@@ -105,12 +107,13 @@ const FIXED_SCALAR_BOUNDS: usize = SIGNAL_BOUND
     + SNAPSHOT_ID_BOUND
     + WATERMARK_HOUR_BOUND
     + APPROXIMATION_BOUND
-    + FAILURE_COUNTER_BOUND
-    + CURSOR_BOUND;
+    + FAILURE_COUNTER_BOUND;
 
 /// The rest of the allowance, for the five scalars with no natural size:
 /// `plan`, `failure.message`, and the three `budget` values.
-/// [`Envelope::cap_scalars`] cuts them in that order.
+/// [`Envelope::cap_scalars`] cuts them in that order. The cursor draws on
+/// this same remaining room too, but is dropped whole rather than cut, so it
+/// has no floor to assert against here the way these five do.
 const VARIABLE_SCALAR_ALLOWANCE: usize = SCALAR_ALLOWANCE - FIXED_SCALAR_BOUNDS;
 
 /// Cutting the five variable scalars to their floor always lands the scalars
@@ -680,6 +683,14 @@ const TRUNCATION_MARKER: &str = "...[truncated]";
 /// value smaller than this.
 const MARKER_SERIALIZED_LEN: usize = TRUNCATION_MARKER.len() + 2;
 
+/// Pushed to `warnings` when [`Envelope::cap_scalars`] drops the cursor.
+const CURSOR_DROPPED_WARNING: &str =
+    "cursor dropped: the pagination token did not fit the response; narrow the query";
+/// Pushed to `next_steps` alongside [`CURSOR_DROPPED_WARNING`].
+const CURSOR_DROPPED_NEXT_STEP_ACTION: &str = "narrow the query";
+const CURSOR_DROPPED_NEXT_STEP_DETAIL: &str =
+    "the cursor did not fit the response; request a narrower time_range or fewer rows per page";
+
 /// Serialized size of `s` as a JSON string value, quotes and every escape
 /// sequence included. This is the number every budget in this module is
 /// measured in: a source byte count is not it, because one source byte can
@@ -877,12 +888,17 @@ impl Envelope {
     ///
     /// The cursor is the exception to cutting: it is a MAC'd token, so a cut
     /// one is not a shorter cursor but a corrupt one that redeems as invalid.
-    /// Over its bound it is dropped whole, and the caller sees `ok_bounded`
-    /// rather than a page it cannot turn.
+    /// It draws on the same allowance as every other scalar, but is never
+    /// itself cut, and D4 states no per-scalar bound for it either. So it is
+    /// left alone through both of the stages above, and only dropped whole,
+    /// as the last resort, if the scalars are still over the allowance once
+    /// those cuts are done. A dropped cursor is announced: the caller sees a
+    /// warning and a `next_steps` entry naming the fix, and `finish` reports
+    /// `ok_bounded` rather than a page it cannot turn.
     ///
     /// The last stage cannot leave the scalars over the allowance: with every
-    /// variable scalar at the marker the total is at most
-    /// `FIXED_SCALAR_BOUNDS + 5 * MARKER_SERIALIZED_LEN`, which the const
+    /// variable scalar at the marker and the cursor dropped, the total is at
+    /// most `FIXED_SCALAR_BOUNDS + 5 * MARKER_SERIALIZED_LEN`, which the const
     /// assertion beside [`VARIABLE_SCALAR_ALLOWANCE`] holds under the bound.
     fn cap_scalars(&mut self) -> u64 {
         let mut cut = 0u64;
@@ -910,13 +926,6 @@ impl Envelope {
         {
             cut += u64::from(bound_scalar(counter, FAILURE_COUNTER_BOUND));
         }
-        if let Some(cursor) = &self.presentation.cursor
-            && serialized_str_len(cursor) > CURSOR_BOUND
-        {
-            self.presentation.cursor = None;
-            cut += 1;
-        }
-
         let over = self
             .scalar_serialized_len()
             .saturating_sub(SCALAR_ALLOWANCE);
@@ -951,6 +960,21 @@ impl Envelope {
                 *value = AnyJson(Value::String(TRUNCATION_MARKER.to_string()));
                 cut += 1;
             }
+        }
+
+        // The last resort: the cuts above could not bring the scalars inside
+        // the allowance, so the cursor -- a MAC'd token that cannot be cut --
+        // is dropped whole. Announced, not silent: a caller polling only
+        // `scalars_truncated` would otherwise see a page it cannot turn with
+        // no indication why the cursor it expected is missing.
+        if self.presentation.cursor.is_some() && self.scalar_serialized_len() > SCALAR_ALLOWANCE {
+            self.presentation.cursor = None;
+            self.warnings.push(CURSOR_DROPPED_WARNING.to_string());
+            self.next_steps.push(NextStep {
+                action: CURSOR_DROPPED_NEXT_STEP_ACTION.to_string(),
+                detail: CURSOR_DROPPED_NEXT_STEP_DETAIL.to_string(),
+            });
+            cut += 1;
         }
         cut
     }
@@ -1511,12 +1535,19 @@ mod tests {
 
     /// The D4 scalar allowance, over the fields that have no natural size.
     ///
-    /// A 1 MiB `plan` is cut first and all the way to the marker, because the
-    /// overshoot is larger than the plan; the failure message is cut next, by
-    /// exactly what is still over; and the budget values are then already
-    /// inside the allowance and are left alone. Every scalar with a natural
-    /// size is cut to it first, and the cursor is dropped whole rather than
-    /// cut into a token that cannot redeem.
+    /// Every scalar with a natural size is cut to its own sub-bound first
+    /// (nine of the ten checked). The still-uncut cursor counts its full
+    /// size against the allowance through the rest of this pass, so the
+    /// overshoot the plan and the failure message are each cut by is larger
+    /// than it would be with the cursor already gone: a 1 MiB `plan` is cut
+    /// all the way to the marker, and so -- unlike a plan-only overshoot --
+    /// is the failure message next to it. `budget.effective` is then still
+    /// over and is replaced by the marker too; `budget.actual` (`null`) and
+    /// `budget.estimate` (`7`) are already far under the marker floor and
+    /// are left alone. Only once all of that is done, and the scalars are
+    /// still over the allowance, is the cursor itself dropped -- announced
+    /// with a warning and a `next_steps` entry -- which is why the fitted
+    /// total lands under [`SCALAR_ALLOWANCE`] rather than exactly on it.
     #[test]
     fn oversized_plan_is_cut_to_the_scalar_allowance() {
         let mut envelope = Envelope {
@@ -1545,16 +1576,26 @@ mod tests {
 
         let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
 
-        // Nine scalars cut to their own sub-bound, the cursor dropped, the
-        // plan cut to the marker, the failure message cut to what was left.
-        assert_eq!(fitted.presentation.scalars_truncated, 12);
-        assert_eq!(fitted.scalar_serialized_len(), SCALAR_ALLOWANCE);
+        // Nine scalars cut to their own sub-bound, the plan and the failure
+        // message both cut all the way to the marker, `budget.effective`
+        // replaced by the marker, and the cursor dropped last because the
+        // scalars were still over the allowance once those four were done.
+        assert_eq!(fitted.presentation.scalars_truncated, 13);
+        assert_eq!(fitted.scalar_serialized_len(), 1_089);
+        assert!(fitted.scalar_serialized_len() <= SCALAR_ALLOWANCE);
 
         assert_eq!(fitted.plan.as_deref(), Some(TRUNCATION_MARKER));
         assert_eq!(fitted.presentation.cursor, None);
+        assert_eq!(fitted.warnings, vec![CURSOR_DROPPED_WARNING.to_string()]);
+        assert_eq!(fitted.next_steps.len(), 1);
+        assert_eq!(fitted.next_steps[0].action, CURSOR_DROPPED_NEXT_STEP_ACTION);
+        assert_eq!(fitted.next_steps[0].detail, CURSOR_DROPPED_NEXT_STEP_DETAIL);
         let failure = fitted.failure.as_ref().expect("the failure is kept");
-        assert_eq!(serialized_str_len(&failure.message), 2_037);
-        assert!(failure.message.ends_with(TRUNCATION_MARKER));
+        // Cut all the way to the marker: the overshoot computed while the
+        // cursor still counted its full 4,098 B against the allowance left
+        // nothing of the message's own text to keep.
+        assert_eq!(failure.message, TRUNCATION_MARKER);
+        assert_eq!(serialized_str_len(&failure.message), MARKER_SERIALIZED_LEN);
         assert_eq!(
             serialized_str_len(failure.counter.as_deref().expect("a counter")),
             FAILURE_COUNTER_BOUND
@@ -1582,11 +1623,92 @@ mod tests {
         );
         // Already inside their bounds, so untouched by the cut.
         assert_eq!(fitted.visibility.watermark_hour, "2026090800");
+        // Over the allowance once the cursor's full size is counted in, so
+        // replaced by the marker even though it fit the allowance on its own.
         assert_eq!(
             fitted.budget.effective,
-            AnyJson(Value::String("b".repeat(1000)))
+            AnyJson(Value::String(TRUNCATION_MARKER.to_string()))
         );
         assert_eq!(fitted.budget.estimate, AnyJson(Value::Number(7.into())));
+    }
+
+    /// A cursor well under the allowance is left alone by every stage of
+    /// `cap_scalars`, and survives `finish` as a real page token.
+    #[test]
+    fn cursor_under_the_allowance_survives_fit() {
+        let cursor = "k".repeat(3 * 1024);
+        let mut envelope = Envelope::default();
+        envelope.presentation.cursor = Some(cursor.clone());
+        envelope.presentation.row_cap_hit = true;
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.presentation.scalars_truncated, 0);
+        assert_eq!(fitted.presentation.cursor.as_deref(), Some(cursor.as_str()));
+        assert!(fitted.warnings.is_empty());
+        assert!(fitted.next_steps.is_empty());
+
+        let finished = fitted.finish(true);
+        assert_eq!(finished.status, Status::OkPage);
+        assert_eq!(
+            finished.presentation.cursor.as_deref(),
+            Some(cursor.as_str())
+        );
+    }
+
+    /// The cursor draws on the same allowance `plan` does, but is cut last:
+    /// with a 3 KiB cursor and a 4 KiB plan together over the allowance, the
+    /// plan absorbs the whole overshoot and the cursor -- which alone would
+    /// already fit -- is never touched.
+    #[test]
+    fn cursor_is_dropped_only_after_the_other_scalars_are_cut() {
+        let cursor = "k".repeat(3 * 1024);
+        let mut envelope = Envelope {
+            plan: Some("p".repeat(4 * 1024)),
+            ..Default::default()
+        };
+        envelope.presentation.cursor = Some(cursor.clone());
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(
+            fitted.presentation.scalars_truncated, 1,
+            "the plan alone was cut"
+        );
+        assert!(
+            fitted
+                .plan
+                .as_deref()
+                .expect("the plan is kept")
+                .ends_with(TRUNCATION_MARKER)
+        );
+        assert_eq!(fitted.presentation.cursor.as_deref(), Some(cursor.as_str()));
+        assert!(fitted.warnings.is_empty(), "no cursor was dropped");
+        assert!(fitted.next_steps.is_empty());
+        assert_eq!(fitted.scalar_serialized_len(), SCALAR_ALLOWANCE);
+    }
+
+    /// A cursor that still does not fit once every other scalar is at its
+    /// floor is dropped whole, never cut, and the drop is announced: exactly
+    /// one warning and one `next_steps` entry, and the caller sees
+    /// `ok_bounded` rather than a page it cannot turn.
+    #[test]
+    fn dropped_cursor_is_announced() {
+        let mut envelope = Envelope::default();
+        envelope.presentation.cursor = Some("k".repeat(5 * 1024));
+        envelope.presentation.row_cap_hit = true;
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.presentation.scalars_truncated, 1);
+        assert_eq!(fitted.presentation.cursor, None);
+        assert_eq!(fitted.warnings, vec![CURSOR_DROPPED_WARNING.to_string()]);
+        assert_eq!(fitted.next_steps.len(), 1);
+        assert_eq!(fitted.next_steps[0].action, CURSOR_DROPPED_NEXT_STEP_ACTION);
+        assert_eq!(fitted.next_steps[0].detail, CURSOR_DROPPED_NEXT_STEP_DETAIL);
+
+        let finished = fitted.finish(true);
+        assert_eq!(finished.status, Status::OkBounded);
     }
 
     /// The last stage of the scalar cut: three budget values that are over
@@ -1668,7 +1790,12 @@ mod tests {
         envelope.accuracy.exact = true;
         envelope.accuracy.approximation = Some("x".repeat(APPROXIMATION_BOUND - 2));
         envelope.presentation.max_rows = 200;
-        envelope.presentation.cursor = Some("k".repeat(CURSOR_BOUND - 2));
+        // The cursor has no sub-bound of its own; it is sized here so the
+        // whole scalar block lands on exactly SCALAR_ALLOWANCE (4096) once
+        // the other scalars below (1,056 B of sub-bounded fields plus the
+        // 992 B the plan, failure message, and budget values below occupy)
+        // are added in: 4096 - 1056 - 992 - 2 (quotes) = 2046 source bytes.
+        envelope.presentation.cursor = Some("k".repeat(2046));
         // The longest failure class, so the block's own keys and value are at
         // their widest too.
         envelope.failure = Some(Failure {
