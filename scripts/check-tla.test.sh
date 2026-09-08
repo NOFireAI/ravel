@@ -466,7 +466,7 @@ rm -rf "$nrepo"
 # log and a marker file (instead of the real jar) proves both which path ran
 # and whether TLC was actually launched.
 build_fake_live_area() {
-    # build_fake_live_area <with-band: yes|no> -> sets FAKE_TMP, FAKE_SHIM.
+    # build_fake_live_area <with-band: yes|no> -> sets FAKE_TMP.
     local with_band="$1"
     local tmp area_dir shim
     tmp="$(mktemp -d)"

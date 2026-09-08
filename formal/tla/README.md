@@ -41,7 +41,7 @@ config. All areas planned by ADR-1113 are shipped:
 | Area | Contract modeled | Specification(s) | Config lanes | Status |
 |---|---|---|---|---|
 | [common](common/) | object-store put/get/delete/list/multipart | `RavelObjectStore.tla` | smoke, exhaustive, 3 negative | shipped |
-| [commit](commit/) | commit publication, acknowledgement, retry, read-your-write | `CommitProtocol.tla` | smoke, exhaustive, 11 negative, plus ungated dedup and liveness configs | shipped |
+| [commit](commit/) | commit publication, acknowledgement, retry, read-your-write | `CommitProtocol.tla` | smoke, exhaustive, live, 11 negative, plus an ungated dedup config | shipped |
 | [catalog](catalog/) | catalog fold, snapshots, compaction, MVCC | `CatalogMVCC.tla` | smoke, exhaustive, carryforward, overlap, 21 negative (14 broken-behavior, 7 reachability probes) | shipped |
 | [lifecycle](lifecycle/) | retention, erasure, legal holds, physical GC | `LifecycleGC.tla` | smoke, exhaustive, 7 negative, plus an ungated rejected-design candidate | shipped, with ADR-0064's out-of-window case open |
 | [resharding](resharding/) | generation-versioned online resharding | `OnlineResharding.tla` | smoke, exhaustive, 5 negative, plus several ungated liveness and simulation configs | shipped |
@@ -88,7 +88,8 @@ resources: workers=<n> xmx=<size>`), next to the figures they produced.
 scripts/check-tla.sh smoke            # fast safety, every area (budget 300s/cfg)
 scripts/check-tla.sh negative         # every negative control must fail correctly
 scripts/check-tla.sh traceability     # every traceability.md source ref resolves
-scripts/check-tla.sh ci               # smoke + negative + traceability, one run id (the CI lane)
+scripts/check-tla.sh live             # each area's banded live.cfg (budget 300s/cfg)
+scripts/check-tla.sh ci               # smoke + negative + live + traceability, one run id (the CI lane)
 scripts/check-tla.sh all              # ci, then exhaustive, under one run id
 scripts/check-tla.sh exhaustive       # full safety + liveness (nightly, budget 3600s/cfg)
 scripts/check-tla.sh smoke -a common  # scope any subcommand to one area

@@ -31,16 +31,18 @@ auto`), 8 GB RAM / 4 cores.
 | negative/marker-before-all-shards.cfg | 779 | 505 | n/a | 1 | VIOLATED as required (MarkerImpliesAllShardsDurable) |
 | negative/mismatched-identity-idempotent.cfg | 26950 | 12816 | n/a | 2 | VIOLATED as required (OneIdentityOneContent) |
 | negative/no-cross-shard-atomicity.cfg | 243 | 174 | n/a | 1 | VIOLATED as required (NoCrossShardAtomicityUnreachable) |
-| negative/put-commit-lost-response-reachable.cfg | 21 | 20 | n/a | 1 | VIOLATED as required (PutCommitLostResponseUnreachable) |
-| negative/put-data-lost-response-reachable.cfg | 2 | 2 | n/a | 1 | VIOLATED as required (PutDataLostResponseUnreachable) |
+| negative/put-commit-lost-response-reachable.cfg | 70 | 63 | n/a | 1 | VIOLATED as required (PutCommitLostResponseUnreachable) |
+| negative/put-data-lost-response-reachable.cfg | 11 | 11 | n/a | 1 | VIOLATED as required (PutDataLostResponseUnreachable) |
 | negative/query-reads-uncommitted-data.cfg | 77 | 65 | n/a | 1 | VIOLATED as required (NoUncommittedDataVisible) |
-| negative/transient-failure-reachable.cfg | 2 | 2 | n/a | 1 | VIOLATED as required (TransientFailureUnreachable) |
+| negative/transient-failure-reachable.cfg | 13 | 13 | n/a | 1 | VIOLATED as required (TransientFailureUnreachable) |
 | traceability | n/a | n/a | n/a | n/a | PASS, 21 rows resolve |
 | exhaustive.cfg | 17892751 | 5466239 | 36 | 131 | PASS |
 
-`smoke.cfg` and `live.cfg` were re-verified on the fleet executor host
-after issues #1356 and #1357 (see below); the other rows are unchanged
-from the prior session and were not re-run there. `exhaustive.cfg` was
+`smoke.cfg`, `live.cfg` and the three `*-reachable.cfg` probes were
+re-verified on the fleet executor host after issues #1356 and #1357 (see
+below); the probes' figures are those of their counterexample documents,
+taken under the rewritten post-state predicates. The other negative rows
+are unchanged from the prior session and were not re-run there. `exhaustive.cfg` was
 re-run on the fleet executor host too, at `-workers 2`: 17892751
 generated, 5466239 distinct, depth 36, 114s, byte-identical to the row
 above. `faultFired` (added for #1356, see below) never becomes non-empty

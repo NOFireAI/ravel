@@ -134,8 +134,9 @@ exit 12 for a safety violation. It reports exit 13 for a liveness
 violation. GNU timeout kills a run past its budget and reports exit
 124.
 
-The pull-request job runs smoke, negative, and traceability. The nightly
-job runs exhaustive.
+The pull-request job runs the `ci` kind: smoke, negative, live (for the
+areas that have banded a `live.cfg`), and traceability. The nightly job
+runs exhaustive.
 
 ## Read the results
 
