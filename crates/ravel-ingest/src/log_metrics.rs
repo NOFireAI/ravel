@@ -85,9 +85,15 @@ pub struct LogIngestMetrics {
     stream_id_collisions: AtomicU64,
     /// Flush-open stamps raised to this writer's monotonic floor because the
     /// injected clock read below the previous stamp (ADR-1307), the log-pipeline
-    /// counterpart of [`crate::IngestMetrics`]'s own counter. Exported as
-    /// `ravel_ingest_clock_regressions_total`.
+    /// counterpart of [`crate::IngestMetrics`]'s own counter. Intended for
+    /// Prometheus export under the name `ravel_ingest_clock_regressions_total`
+    /// (#1473).
     clock_regressions: AtomicU64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307): counted separately from
+    /// `clock_regressions` (absorbed). Intended for Prometheus export under the
+    /// name `ravel_ingest_clock_regressions_refused_total` (#1473).
+    clock_regressions_refused: AtomicU64,
     /// Multi-shard Strict writes that returned
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
@@ -221,9 +227,13 @@ pub struct LogIngestMetricsSnapshot {
     pub acks_err: u64,
     pub stream_id_collisions: u64,
     /// Flush-open stamps raised to this writer's monotonic floor after a
-    /// backwards clock step (ADR-1307). Exported as
-    /// `ravel_ingest_clock_regressions_total`.
+    /// backwards clock step (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_total` (#1473).
     pub clock_regressions: u64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_refused_total` (#1473).
+    pub clock_regressions_refused: u64,
     /// Multi-shard Strict writes returned as
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): a partial
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
@@ -424,6 +434,13 @@ impl LogIngestMetrics {
         self.clock_regressions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307).
+    pub(crate) fn record_clock_regression_refused(&self) {
+        self.clock_regressions_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably before a sibling failed. Recorded once per such write,
@@ -533,6 +550,7 @@ impl LogIngestMetrics {
             acks_err: self.acks_err.load(Ordering::Relaxed),
             stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
             clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
+            clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
@@ -635,6 +653,13 @@ mod tests {
             LogIngestMetrics::record_clock_regression,
             LogIngestMetricsSnapshot {
                 clock_regressions: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_regression_refused,
+            LogIngestMetricsSnapshot {
+                clock_regressions_refused: 1,
                 ..Default::default()
             },
         );
