@@ -12,6 +12,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key Secret through `spec.auditTokenKeySecretRef`.** Until they do, the
   operator reports `AuditTokenKeyMissing` and leaves the query Deployment as
   it is. Clusters with `deploymentKeySecretRef` need no action.
+- **The operator's qualified-input hash now distinguishes an absent credentials
+  `resourceVersion` from an empty one** (issue #36). The credentials
+  `resourceVersion` slot carries the same one-byte presence marker the S3
+  `endpoint` slot got in 0.15.0, so an unresolved credentials Secret no longer
+  collides with one whose `resourceVersion` resolved to the empty string. The
+  encoding of that slot changes for every cluster, so every persisted
+  `status.storeQualifiedHash` changes and the first reconcile after upgrading
+  the operator re-qualifies each existing cluster once against its unchanged
+  store. The qualify Job is a one-shot that touches no Deployment, so no serving
+  pod is restarted and there is no downtime. Subsequent reconciles are stable.
+
+### Fixed
+
+- **A `RavelCluster` held at the store-qualification gate keeps its
+  `StoreQualified` condition when the reconcile then fails** (issue #36). The
+  degraded status write replaces the whole `conditions` array and previously
+  reconstructed only the `StoreQualified=True` case, so a pass held at the gate
+  that then failed a write left a `Degraded` object carrying no `StoreQualified`
+  condition and nothing to say the store had not qualified. The gate now carries
+  out the exact condition it built, `True` or `False` with its Pending or Failed
+  reason, and records it before it creates or deletes the qualify Job, so a
+  failure in that API call cannot drop it either.
 
 ## [0.15.0] - 2026-09-08
 
@@ -154,15 +176,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with retention bounded to the plan fan-out in objects times the object
   size. On ClickBench q20 that was 6,785 GETs and 21.1 GB, where a
   corpus-sized cache gives 4,533 GETs and 11.24 GB.
-- **The operator's qualified-input hash now distinguishes an absent field from an
-  empty one for the S3 `endpoint` and the credentials `resourceVersion`** (issue
-  #36). Each carries a one-byte presence marker before its value, so `endpoint:
-  null` no longer collides with `endpoint: ""` and an unresolved credentials
-  Secret no longer collides with one whose `resourceVersion` resolved to the empty
-  string. Because the hash changes, the first reconcile after upgrading the
-  operator re-qualifies each existing cluster once against its unchanged store; the
-  qualify Job is a one-shot that touches no Deployment, so no serving pod is
-  restarted and there is no downtime. Subsequent reconciles are stable.
+- **The operator's qualified-input hash distinguishes an absent S3 `endpoint`
+  from an empty one** (issue #36). The endpoint carries a one-byte presence
+  marker before its value, so `endpoint: null` no longer hashes the same as
+  `endpoint: ""`. The two select different stores, so editing between them now
+  re-runs qualification instead of being read as an unchanged input.
 - **The operator now bounds qualify-Job recreations for a store that keeps
   failing qualification** (issue #36). A failing `ravel-cli store qualify` Job is
   recreated on a capped exponential backoff (30 s doubling to a 480 s ceiling)

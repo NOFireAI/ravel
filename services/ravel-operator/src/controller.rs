@@ -8,6 +8,7 @@
 //! references onto the rendered objects, and server-side-applies them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1090,6 +1091,32 @@ async fn delete_stale_qualify_job(api: &Api<Job>, name: &str) -> Result<(), Erro
     Ok(())
 }
 
+/// Record the gate's `StoreQualified=False` condition, then run the qualify-Job
+/// mutation the plan chose.
+///
+/// The order is the whole point of this function. `job_action` is an apply or a
+/// delete against the API server, so it can return `Err`, and that `Err` leaves
+/// [`reconcile_inner`] for the degraded status writer, which PATCHes the whole
+/// `conditions` array from `store_qualified_condition` plus the base conditions.
+/// Recording the condition first means a failed mutation still leaves the
+/// degraded object carrying `StoreQualified=False` with the gate's exact
+/// Pending/Failed reason; recording it after would leave the channel `None` and
+/// drop `StoreQualified` from the degraded object entirely, the same hole
+/// [`degraded_extra_conditions`] closes one step later.
+async fn hold_for_qualification(
+    generation: Option<i64>,
+    reason: &str,
+    message: &str,
+    store_qualified_condition: &mut Option<Condition>,
+    extra_conditions: &mut Vec<Condition>,
+    job_action: impl Future<Output = Result<(), Error>>,
+) -> Result<(), Error> {
+    let store_qualified = condition("StoreQualified", false, generation, reason, message);
+    *store_qualified_condition = Some(store_qualified.clone());
+    extra_conditions.push(store_qualified);
+    job_action.await
+}
+
 /// The `StoreQualified=False` message for a Failed qualification hold (finding
 /// 3), naming the consecutive-failure count and, when the plan set one, the next
 /// retry instant, plus the Job's own failure message when it carried one. Kept
@@ -1141,8 +1168,9 @@ fn degraded_store_qualified_hash(
 /// message. Re-adding it keeps the degraded object carrying that condition for
 /// as long as the failing step persists, so a stage-one wait keyed on it fails
 /// on the real qualification state rather than burning its full bound because
-/// the condition went missing. When the pass failed before the gate ran,
-/// `store_qualified` is `None` and the base conditions pass through untouched.
+/// the condition went missing. When the pass failed before the gate built its
+/// condition, `store_qualified` is `None` and the base conditions pass through
+/// untouched.
 fn degraded_extra_conditions(
     mut base: Vec<Condition>,
     store_qualified: Option<Condition>,
@@ -1181,7 +1209,7 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
     // computed at the gate (True on Proceed, False on a Pending/Failed hold), so
     // the degraded error path below carries the real qualification state through
     // instead of reconstructing only the True case (finding 1). A pass that fails
-    // before the gate leaves this None.
+    // before the gate builds its condition leaves this None.
     let mut store_qualified_condition: Option<Condition> = None;
     match reconcile_inner(
         &obj,
@@ -1384,26 +1412,6 @@ async fn reconcile_inner(
                 now_unix_secs(),
                 i64::try_from(BOOTSTRAP_POLL.as_secs()).unwrap_or(10),
             );
-            match plan.action {
-                QualifyJobAction::Create => {
-                    let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
-                    let mut job = desired_qualify_job(&obj.spec, instance, shared_rv);
-                    job.metadata.namespace = Some(namespace.to_string());
-                    job.metadata.owner_references = owner;
-                    apply(&jobs, &qualify_name, &job).await?;
-                }
-                QualifyJobAction::DeleteStale => {
-                    // Delete the stale or Failed Job with FOREGROUND propagation:
-                    // its owned Pod is torn down before the Job object disappears,
-                    // and a later pass observes it fully absent and creates a
-                    // fresh one. Without foreground propagation Kubernetes can
-                    // remove the Job while its Pod still runs the old inputs, and
-                    // the next reconcile would create the replacement alongside
-                    // that live stale Pod.
-                    delete_stale_qualify_job(&jobs, &qualify_name).await?;
-                }
-                QualifyJobAction::None => {}
-            }
             let (reason, message) = match plan.reason {
                 QualifyStoreReason::Pending => (
                     STORE_QUALIFIED_PENDING_REASON,
@@ -1418,19 +1426,41 @@ async fn reconcile_inner(
                     ),
                 ),
             };
-            let store_qualified = condition(
-                "StoreQualified",
-                false,
+            // The condition is recorded BEFORE the plan's Job mutation runs: see
+            // `hold_for_qualification`. Both mutations are API calls that can
+            // return Err, and that Err leaves this function for the degraded
+            // status writer, which needs the gate's condition already carried out.
+            hold_for_qualification(
                 obj.metadata.generation,
                 reason,
                 &message,
-            );
-            // Carry the False condition out so a status-write failure on this
-            // not-qualified path still lands it on the degraded object with its
-            // exact reason and message, rather than dropping StoreQualified
-            // entirely (finding 1).
-            *store_qualified_condition = Some(store_qualified.clone());
-            extra_conditions.push(store_qualified);
+                store_qualified_condition,
+                &mut extra_conditions,
+                async {
+                    match plan.action {
+                        QualifyJobAction::Create => {
+                            let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
+                            let mut job = desired_qualify_job(&obj.spec, instance, shared_rv);
+                            job.metadata.namespace = Some(namespace.to_string());
+                            job.metadata.owner_references = owner;
+                            apply(&jobs, &qualify_name, &job).await.map(|_| ())
+                        }
+                        QualifyJobAction::DeleteStale => {
+                            // Delete the stale or Failed Job with FOREGROUND
+                            // propagation: its owned Pod is torn down before the
+                            // Job object disappears, and a later pass observes it
+                            // fully absent and creates a fresh one. Without
+                            // foreground propagation Kubernetes can remove the Job
+                            // while its Pod still runs the old inputs, and the next
+                            // reconcile would create the replacement alongside that
+                            // live stale Pod.
+                            delete_stale_qualify_job(&jobs, &qualify_name).await
+                        }
+                        QualifyJobAction::None => Ok(()),
+                    }
+                },
+            )
+            .await?;
 
             // Report the readiness a prior pass recorded, so a cluster already
             // serving through a re-qualification keeps `Available=True` instead of
@@ -3203,8 +3233,8 @@ mod tests {
     /// its cloned copy, which never reaches this writer, and the writer PATCHes
     /// the whole conditions array; so without carrying it out the degraded object
     /// drops StoreQualified entirely and a stage-one wait keyed on it burns its
-    /// full bound. When the pass failed before the gate ran (`store_qualified`
-    /// None), the base conditions pass through untouched.
+    /// full bound. When the pass failed before the gate built its condition
+    /// (`store_qualified` None), the base conditions pass through untouched.
     #[test]
     fn degraded_status_keeps_store_qualified_after_a_post_proceed_failure() {
         let base = vec![condition(
@@ -3236,7 +3266,8 @@ mod tests {
         // The base conditions are preserved, not replaced.
         assert!(after.iter().any(|c| c.r#type == "SpecValid"));
 
-        // Failed before the gate: base passes through, StoreQualified absent.
+        // Failed before the gate built its condition: base passes through,
+        // StoreQualified absent.
         let untouched = degraded_extra_conditions(base.clone(), None);
         assert!(!untouched.iter().any(|c| c.r#type == "StoreQualified"));
         assert_eq!(untouched.len(), base.len());
@@ -3285,6 +3316,74 @@ mod tests {
         // Flip: dropping the carried condition leaves StoreQualified absent.
         let dropped = degraded_extra_conditions(base.clone(), None);
         assert!(!dropped.iter().any(|c| c.r#type == "StoreQualified"));
+    }
+
+    /// The not-qualified path records the gate's condition BEFORE it mutates the
+    /// qualify Job, so a failed apply or foreground delete still reaches the
+    /// degraded writer with StoreQualified=False and the gate's exact reason
+    /// rather than a None channel. `hold_for_qualification` is the function
+    /// `reconcile_inner` calls with the real `apply` / `delete_stale_qualify_job`
+    /// future; this passes one that fails the way those calls fail, since the
+    /// crate mocks no `kube::Client`. Move the recording after `job_action.await`
+    /// and the carried condition is None and the assertions below fail.
+    #[tokio::test]
+    async fn a_failed_qualify_job_mutation_still_carries_the_gate_condition() {
+        let mut carried: Option<Condition> = None;
+        let mut extra = vec![condition(
+            "SpecValid",
+            true,
+            Some(11),
+            "Accepted",
+            "spec accepted",
+        )];
+        // A Failed hold's exact reason and message: two consecutive failures with
+        // a next-retry instant, the state the gate holds when it deletes a Failed
+        // Job to recreate it.
+        let message = qualify_failed_message(2, Some(1_700_000_000), Some("probe failed"));
+
+        let err = hold_for_qualification(
+            Some(11),
+            STORE_QUALIFIED_FAILED_REASON,
+            &message,
+            &mut carried,
+            &mut extra,
+            async {
+                Err(Error::SecretNotFound {
+                    name: "ravel-s3".to_string(),
+                    reason: "the qualify Job mutation failed".to_string(),
+                })
+            },
+        )
+        .await
+        .expect_err("the injected Job-mutation failure propagates to the caller");
+        assert!(matches!(err, Error::SecretNotFound { .. }));
+
+        let store_qualified = carried
+            .as_ref()
+            .expect("the gate's condition is recorded before the fallible Job mutation");
+        assert_eq!(store_qualified.r#type, "StoreQualified");
+        assert_eq!(store_qualified.status, "False");
+        assert_eq!(store_qualified.reason, STORE_QUALIFIED_FAILED_REASON);
+        assert_eq!(store_qualified.message, message);
+        assert_eq!(store_qualified.observed_generation, Some(11));
+
+        // The local vector the success-path status writer would use got exactly
+        // one StoreQualified, alongside the one base condition: 2 conditions.
+        assert_eq!(extra.len(), 2);
+        assert_eq!(
+            extra
+                .iter()
+                .filter(|c| c.r#type == "StoreQualified")
+                .count(),
+            1
+        );
+
+        // End to end: that channel is what the degraded writer PATCHes.
+        let degraded = degraded_extra_conditions(Vec::new(), carried);
+        assert_eq!(degraded.len(), 1);
+        assert_eq!(degraded[0].status, "False");
+        assert_eq!(degraded[0].reason, STORE_QUALIFIED_FAILED_REASON);
+        assert_eq!(degraded[0].message, message);
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and
