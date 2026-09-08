@@ -104,6 +104,13 @@ services:
       RAVEL_S3_REGION: us-east-1
       RAVEL_S3_ACCESS_KEY: ravel
       RAVEL_S3_SECRET_KEY: ravel-dev-secret
+      # The query-audit pipeline tokenizes recorded query text under this key
+      # by default (ADR-0062 decision 2e). This checked-in value is a fixed
+      # DEVELOPMENT key for the quickstart only; override it with the same
+      # variable for anything beyond a laptop. A keyed deployment
+      # (--tenant-hash-key-file) derives the audit token key from the
+      # deployment key instead and needs no separate variable.
+      RAVEL_AUDIT_TOKEN_KEY: ${RAVEL_AUDIT_TOKEN_KEY:-998626405d16aeca71f4fac7673b55213a774ba40401709022e81a27f050ffd8}
 
   # The demo's data generator (ADR-0081 decision 3): a real OpenTelemetry
   # Collector scraping host metrics and exporting its own internal logs, both

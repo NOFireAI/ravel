@@ -46,6 +46,10 @@ Every published port binds loopback (`127.0.0.1`) only, and every credential is
 a fixed development value (`demo-token`, and `ravel` / `ravel-dev-secret` for
 MinIO). None of it is for a network-reachable deployment.
 
+The compose file also sets `RAVEL_AUDIT_TOKEN_KEY` to a fixed development key
+so the audit trail can tokenize query text. Set your own 64-hex-character
+value with that same variable for anything beyond a laptop.
+
 Because the store-qualify one-shot and the bucket creation both have to finish
 before `ravel-server` starts, the server is usually ready a few seconds after
 `up -d` returns. Until it is, a query gets a connection refused rather than an

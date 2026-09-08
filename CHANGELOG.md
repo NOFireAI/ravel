@@ -8,6 +8,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`ravel-server` in mode `all` or `query` now installs the query-audit
+  pipeline and records query text tokenized by default (`--audit-text
+  redacted`).** A process with no key refuses to start: an unkeyed deployment
+  (`--tenant-hash-unkeyed`) must set `RAVEL_AUDIT_TOKEN_KEY` to 64 hex
+  characters or pass `--audit-text plaintext`; a keyed deployment
+  (`--tenant-hash-key-file`) derives the key and needs no action. Gateway and
+  maintain processes are unaffected. The docker-compose quickstart now ships a
+  development key.
 - **The operator's Secret change-detection checksum is now a `blake3` digest, 64
   hex characters** (issue #36). It replaces a 16-character standard-hasher value
   that was not stable across Rust toolchain versions. Because the annotation
