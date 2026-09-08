@@ -20,6 +20,8 @@ spec:
         name: ravel-s3-credentials
   tenantTokensSecretRef:
     name: ravel-tenant-tokens
+  # No deploymentKeySecretRef or auditTokenKeySecretRef: this cluster is
+  # unkeyed, so the operator generates and owns a query-audit token key Secret.
   gateway:
     replicas: 1
     # Ingest affinity (ADR-0076 decision 1) is off here and in every existing
