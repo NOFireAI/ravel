@@ -49,6 +49,8 @@ const SHARD_COUNT: u32 = 8;
 /// under test.
 fn maintain_config(tenant: &TenantId) -> ServerConfig {
     ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,

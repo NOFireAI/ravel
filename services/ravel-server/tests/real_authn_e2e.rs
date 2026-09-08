@@ -70,6 +70,8 @@ async fn start_returning_store(
 ) -> (ravel_server::Running, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,

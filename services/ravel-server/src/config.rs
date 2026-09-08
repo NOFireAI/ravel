@@ -100,6 +100,50 @@ impl LogsFetchPolicyArg {
     }
 }
 
+/// The `--audit-mode` values (ADR-0062 decision 2b). The CLI-facing mirror of
+/// [`ravel_maintain::AuditMode`], which lives in a crate that does not depend
+/// on clap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum AuditModeArg {
+    /// A failed audit-batch flush fails every query in the batch (HTTP 503,
+    /// Flight `Unavailable`): during an object-store outage queries fail
+    /// closed instead of running unaudited.
+    #[default]
+    Required,
+    /// A failed audit-batch flush is logged and counted
+    /// (`ravel_audit_write_failures_total`); the query response proceeds.
+    /// An explicit, documented opt-out for deployments (dev, single-tenant
+    /// labs) that would rather serve unaudited than fail closed.
+    BestEffort,
+}
+
+impl AuditModeArg {
+    /// The library-level mode this flag value selects.
+    pub fn mode(self) -> ravel_maintain::AuditMode {
+        match self {
+            AuditModeArg::Required => ravel_maintain::AuditMode::Required,
+            AuditModeArg::BestEffort => ravel_maintain::AuditMode::BestEffort,
+        }
+    }
+}
+
+/// The `--audit-text` values (ADR-0062 decision 2e). Selects how a query's
+/// text is expected to be carried on its audit record's `query.text`
+/// attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum AuditTextArg {
+    /// The structure-preserving keyed-tokenization posture ADR-0062 decision
+    /// 2e describes: literals and label-matcher values replaced by a
+    /// deterministic token, selector names/operators/structure left
+    /// readable.
+    #[default]
+    Redacted,
+    /// Verbatim query text, an explicit opt-in for a compliance regime that
+    /// requires it (ADR-0062 decision 2e), storing PII under the audit
+    /// retention window.
+    Plaintext,
+}
+
 /// Dev binary wiring gateway + ingest + query into one process.
 #[derive(Debug, Parser)]
 #[command(
@@ -154,6 +198,55 @@ pub struct Cli {
     /// production deployment impossible to start.
     #[arg(long, env = "RAVEL_REQUIRE_BUCKET_PROTECTION")]
     pub require_bucket_protection: bool,
+
+    /// Failure posture of the query-audit pipeline (ADR-0062 decision 2b):
+    /// `required` (default) fails a query 503 when its audit record cannot be
+    /// made durable; `best-effort` logs and counts the failure and serves the
+    /// response anyway. Installed only in the query-serving modes (`all` and
+    /// `query`); `maintain` and `gateway` serve no query surface and install
+    /// no pipeline.
+    #[arg(
+        long = "audit-mode",
+        value_enum,
+        default_value = "required",
+        env = "RAVEL_AUDIT_MODE"
+    )]
+    pub audit_mode: AuditModeArg,
+
+    /// Expected posture of `query.text` on a query-audit record (ADR-0062
+    /// decision 2e): `redacted` (default) is the keyed-tokenization posture;
+    /// `plaintext` is an explicit opt-in for a compliance regime that
+    /// requires verbatim text.
+    #[arg(
+        long = "audit-text",
+        value_enum,
+        default_value = "redacted",
+        env = "RAVEL_AUDIT_TEXT"
+    )]
+    pub audit_text: AuditTextArg,
+
+    /// Audit group-commit batch size (ADR-0062 decision 2b): the pipeline
+    /// flushes one RLOG object plus one commit record after this many
+    /// submitted events, or after `--audit-max-age`, whichever comes first.
+    /// Unset uses the pipeline's own default
+    /// (`ravel_maintain::config::DEFAULT_AUDIT_MAX_BATCH`).
+    #[arg(
+        long = "audit-max-batch",
+        value_name = "COUNT",
+        env = "RAVEL_AUDIT_MAX_BATCH"
+    )]
+    pub audit_max_batch: Option<usize>,
+
+    /// Audit group-commit batch age ceiling (ADR-0062 decision 2b): the
+    /// pipeline flushes a non-empty batch after this long even if
+    /// `--audit-max-batch` has not been reached. Unset uses the pipeline's
+    /// own default (`ravel_maintain::config::DEFAULT_AUDIT_MAX_AGE`, 25 ms).
+    #[arg(
+        long = "audit-max-age",
+        value_name = "DURATION",
+        env = "RAVEL_AUDIT_MAX_AGE"
+    )]
+    pub audit_max_age: Option<String>,
 
     #[arg(long, env = "RAVEL_S3_ENDPOINT")]
     pub s3_endpoint: Option<String>,
@@ -2781,6 +2874,49 @@ impl Cli {
         }
     }
 
+    /// Resolve `--audit-mode`, `--audit-max-batch`, and `--audit-max-age` into
+    /// a pipeline config (ADR-0062 decision 2b). `--audit-max-batch`/
+    /// `--audit-max-age` unset fall back to the pipeline's own compiled-in
+    /// defaults, exactly as omitting `--store-probe-interval` does; a zero of
+    /// either is rejected the same way (a zero batch size or age would flush
+    /// every submitted event as its own single-record batch, defeating group
+    /// commit). `--audit-text` is not part of this config: it is not yet
+    /// wired to redact anything (see docs/guides/audit.md).
+    pub fn resolve_audit_pipeline_config(
+        &self,
+    ) -> anyhow::Result<ravel_maintain::AuditPipelineConfig> {
+        let max_batch = match self.audit_max_batch {
+            None => ravel_maintain::config::DEFAULT_AUDIT_MAX_BATCH,
+            Some(0) => anyhow::bail!(
+                "--audit-max-batch '0' would flush every submitted audit event as its own \
+                 single-record batch, defeating group commit. Omit the flag for the pipeline's \
+                 default, or set a positive count."
+            ),
+            Some(n) => n,
+        };
+        let max_age = match self.audit_max_age.as_deref() {
+            None => ravel_maintain::config::DEFAULT_AUDIT_MAX_AGE,
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --audit-max-age '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--audit-max-age '{s}' must be a positive duration: a zero max age \
+                         would flush every submitted audit event as its own single-record \
+                         batch, defeating group commit."
+                    );
+                }
+                dur
+            }
+        };
+        Ok(ravel_maintain::AuditPipelineConfig {
+            max_batch,
+            max_age,
+            audit_mode: self.audit_mode.mode(),
+            ..ravel_maintain::AuditPipelineConfig::default()
+        })
+    }
+
     /// Parse `--max-concurrent-queries` into a [`ravel_query::QueryConcurrencyLimit`]
     /// (ADR-0061 decision 2), defaulting to
     /// [`ravel_query::QueryConcurrencyLimit::Unlimited`] when unset. A zero
@@ -5018,6 +5154,52 @@ mod tests {
                 "expected a positive-duration error for {flag}, got: {err}"
             );
         }
+    }
+
+    /// `--audit-max-batch 0`/`--audit-max-age 0s` would each flush every
+    /// submitted audit event as its own single-record batch, defeating group
+    /// commit (ADR-0062 decision 2b); both must be rejected at startup.
+    #[test]
+    fn zero_audit_batch_or_age_is_rejected() {
+        let batch_err = cli(&["--audit-max-batch", "0"])
+            .resolve_audit_pipeline_config()
+            .expect_err("--audit-max-batch 0 must be rejected");
+        assert!(
+            batch_err.to_string().contains("--audit-max-batch"),
+            "expected an --audit-max-batch error, got: {batch_err}"
+        );
+
+        let age_err = cli(&["--audit-max-age", "0s"])
+            .resolve_audit_pipeline_config()
+            .expect_err("--audit-max-age 0s must be rejected");
+        assert!(
+            age_err.to_string().contains("positive"),
+            "expected a positive-duration error, got: {age_err}"
+        );
+    }
+
+    /// Omitting `--audit-max-batch`/`--audit-max-age` resolves to the
+    /// pipeline's own compiled-in defaults, and `--audit-mode` defaults to
+    /// `required` (fail closed), matching `AuditPipelineConfig::default()`.
+    #[test]
+    fn default_audit_pipeline_config_matches_the_pipeline_defaults() {
+        let resolved = cli(&[])
+            .resolve_audit_pipeline_config()
+            .expect("defaults must resolve");
+        let default = ravel_maintain::AuditPipelineConfig::default();
+        assert_eq!(resolved.max_batch, default.max_batch);
+        assert_eq!(resolved.max_age, default.max_age);
+        assert_eq!(resolved.audit_mode, ravel_maintain::AuditMode::Required);
+    }
+
+    /// `--audit-mode best-effort` must select `AuditMode::BestEffort`, not
+    /// silently stay on the fail-closed default.
+    #[test]
+    fn audit_mode_best_effort_flag_selects_best_effort() {
+        let resolved = cli(&["--audit-mode", "best-effort"])
+            .resolve_audit_pipeline_config()
+            .expect("best-effort must resolve");
+        assert_eq!(resolved.audit_mode, ravel_maintain::AuditMode::BestEffort);
     }
 
     /// ADR-0075 reachability: the S3 request budget the running binary

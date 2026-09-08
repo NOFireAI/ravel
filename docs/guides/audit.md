@@ -12,41 +12,55 @@ three kinds today, and a query selects one with `attrs['kind']`.
 
 ### `kind = query`
 
-One record for every SQL statement Ravel executes, written after the statement
-runs. Both transports submit it: `POST /api/v1/sql` submits one per request, and
-Flight SQL one per executed statement. The record comes from the server's own
-execution path, never from the request body or the ticket a client sent, so a
-tenant can neither forge one nor suppress one for a statement it ran.
+One record for every query Ravel executes, on every surface, written after the
+query runs: `POST /api/v1/sql` and Flight SQL, `/api/v1/query` and
+`/api/v1/query_range`, `/api/v1/labels`, `/api/v1/label_values`,
+`/api/v1/series`, `/api/v1/analytics`, and `/api/v1/query_exemplars`. The
+record comes from the server's own execution path, never from the request
+body or the ticket a client sent, so a tenant can neither forge one nor
+suppress one for a query it ran.
 
-**These records are not written on a stock build.** Both transports submit
-their event through a sink that startup fills with a no-op, and no shipped
-path constructs the real pipeline, so `attrs['kind'] = 'query'` selects
-nothing until a deployment attaches one. The handler behavior and the record
-shape below are in place; only the install is missing. The two kinds that
-follow are written directly by the maintenance process and are present on any
-deployment that has taken those actions.
+A single group-commit pipeline writes every surface's records; `--audit-mode`
+governs what happens when it cannot. `--audit-mode required` (the default)
+fails the query with a 503 (HTTP) or `Unavailable` (Flight) when its record
+cannot be made durable, so a query never outlives its own trail.
+`--audit-mode best-effort` logs and counts the failure instead and lets the
+response proceed, for a deployment that would rather serve unaudited than fail
+closed. `--audit-max-batch` and `--audit-max-age` bound how many records the
+pipeline groups into one write and how long a record waits before that group
+is forced out; unset, both take the pipeline's own defaults. Installed only in
+the query-serving modes (`all` and `query`); `maintain` and `gateway` serve no
+query surface and install no pipeline. `--audit-text` names the posture a
+deployment expects on the `query.text` attribute below (`redacted`, the
+default, or `plaintext`); it records the operator's choice and does not itself
+transform the text a surface writes.
 
 Attributes:
 
-- `query.language`: the query language or surface that produced the record:
-  `sql`, `promql`, `labels`, `label_values`, `series`, `analytics`, or
-  `exemplars`.
+- `query.language`: the surface that produced the record: `sql`, `promql`,
+  `labels`, `label_values`, `series`, `analytics`, or `exemplars`.
 - `query.tenant`: the hex hash of the resolved tenant, so the record is
   attributed to the tenant Ravel authenticated rather than to any identity the
   client claimed.
 - `query.status`: `ok` or `error`, the request's outcome.
-- `query.window_start_ns` and `query.window_end_ns`: the request's resolved
-  event-time range. The HTTP body carries that range explicitly and it is
-  recorded verbatim. A Flight statement's window is consumed earlier, when the
-  snapshot is pinned, and is not carried on the path that runs the statement, so
-  the Flight path records `0` and `0` rather than a fabricated range. Read a
-  `0`/`0` window as "not known at audit time", not as an empty window.
-- `query.text`: the statement text, verbatim and untruncated. The request body
-  was already size-bounded before the record was written.
+- `query.text`: the query text as that surface understands it: the SQL
+  statement for `sql`, the PromQL expression for `promql` and `analytics`, the
+  joined selector list for `labels`, `label_values`, and `series`, and the
+  selector for `exemplars`.
+- `query.window_start_ns` and `query.window_end_ns`: the resolved event-time
+  range, in the terms that surface's own request uses. `sql` and `analytics`
+  record the request's resolved range; `promql`'s instant query records its
+  one instant as `(t, t)`, its range query records `(start, end)`; `labels`,
+  `label_values`, and `series` record the resolved selector window;
+  `exemplars` records its own resolved start and end. A Flight SQL statement's
+  window is consumed earlier, when the snapshot is pinned, and is not carried
+  on the path that runs the statement, so the Flight path records `0` and `0`
+  rather than a fabricated range. Read a `0`/`0` window as "not known at audit
+  time", not as an empty window.
 
 `ts_ns` is the request timestamp, `body` is a one-line summary
 (`sql query ok`), and `severity_text` is `INFO` for `ok` and `ERROR` for
-`error`, so failed statements are selectable without parsing the map.
+`error`, so failed queries are selectable without parsing the map.
 
 ### `kind = legal_hold`
 
@@ -143,9 +157,9 @@ not bound the read.
 
 ### Worked queries
 
-The first two read `kind = query` records, which a stock build does not write;
-they return rows once a deployment attaches the pipeline. The legal-hold query
-below reads records the maintenance process writes directly and works today.
+The first two read `kind = query` records, written by every query surface.
+The legal-hold query below reads records the maintenance process writes
+directly.
 
 Every statement your tenant ran in one hour, newest first:
 
@@ -205,12 +219,10 @@ ORDER BY ts_ns;
 ## Reading the audit trail is audited
 
 A query over `audit` is a SQL statement, so it submits one more query-audit
-record, exactly as any other statement does. On a deployment that has attached
-the pipeline the trail therefore records its own readers: the statement you
-just ran appears in the next `audit` query you run, and an investigation that
-reads the trail repeatedly adds one record per read. That is the intended
-behavior and not something to work around. Until the pipeline is attached
-nothing is written, so no record of the readers exists either.
+record, exactly as any other statement does. The trail therefore records its
+own readers: the statement you just ran appears in the next `audit` query you
+run, and an investigation that reads the trail repeatedly adds one record per
+read. That is the intended behavior and not something to work around.
 
 ## Tenancy
 

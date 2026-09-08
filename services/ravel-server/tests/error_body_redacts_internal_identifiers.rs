@@ -114,6 +114,8 @@ async fn start_test_server() -> (Running, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
