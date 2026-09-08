@@ -70,6 +70,34 @@ die() {
   exit 1
 }
 
+# Wait until a RavelCluster status condition reaches a target status AND its
+# observedGeneration has caught up to .metadata.generation, i.e. the condition
+# reflects the currently applied spec rather than a prior one. The lane reuses
+# clusters and re-applies the dev RavelCluster (step 6), so a re-qualification
+# can be in flight while the operator still reports the previous generation's
+# Available=True; a bare `kubectl wait --for=condition=Available` would then
+# return before the new qualification and Deployment rollout finish. Bounded by
+# an explicit timeout so a stuck condition fails with a clear message instead of
+# hanging. Args: condition type, target status, timeout seconds, description.
+wait_cluster_condition() {
+  local ctype="$1" want="$2" timeout="$3" desc="$4"
+  local deadline=$(( SECONDS + timeout ))
+  local gen obsgen cstatus
+  while (( SECONDS < deadline )); do
+    gen="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
+      -o jsonpath='{.metadata.generation}' 2>/dev/null || true)"
+    cstatus="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
+      -o jsonpath="{.status.conditions[?(@.type==\"${ctype}\")].status}" 2>/dev/null || true)"
+    obsgen="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
+      -o jsonpath="{.status.conditions[?(@.type==\"${ctype}\")].observedGeneration}" 2>/dev/null || true)"
+    if [[ -n "$gen" && "$cstatus" == "$want" && "$obsgen" == "$gen" ]]; then
+      return 0
+    fi
+    sleep 3
+  done
+  die "timed out after ${timeout}s waiting for ${desc}: ${ctype}=${want} at generation ${gen:-?} (observed ${ctype}=${cstatus:-<none>} at generation ${obsgen:-<none>})"
+}
+
 # On any failure after the cluster exists, dump what a human would ask for
 # first. Without this the script's last line is a bare `kubectl wait` timeout,
 # which says nothing about why a pod never went ready.
@@ -254,12 +282,19 @@ spec:
 YAML
 
 # ---- 7. readiness ------------------------------------------------------------
-# The operator sets Available=True only when both the gateway and the query
-# Deployment report ready replicas, so this waits on real pods passing /readyz
-# against the real backend, not on objects existing.
-log "waiting for RavelCluster ${CLUSTER_CR} to report Available"
-kubectl wait --namespace "$NAMESPACE" --for=condition=Available --timeout=300s \
-  "ravelcluster/${CLUSTER_CR}"
+# Two bounded stages, in order, because the lane reuses clusters and re-applies
+# the dev RavelCluster. First StoreQualified=True at the current generation: on
+# a reused cluster the operator re-runs qualification for the new inputs while it
+# keeps the previous generation's Available=True, so gating on Available alone
+# could return before the new qualification (and the Deployment rollout it gates)
+# even starts. Then Available=True at the current generation, which the operator
+# sets only when both the gateway and query Deployments report ready replicas for
+# the applied spec: real pods passing /readyz against the real backend, not
+# objects existing.
+log "waiting for RavelCluster ${CLUSTER_CR} to report StoreQualified for the applied spec"
+wait_cluster_condition StoreQualified True 300 "store qualification to pass"
+log "waiting for RavelCluster ${CLUSTER_CR} to report Available for the applied spec"
+wait_cluster_condition Available True 300 "the gateway and query tiers to become ready"
 
 log "cluster up. Deployments:"
 kubectl get --namespace "$NAMESPACE" deployments
