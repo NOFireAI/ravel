@@ -237,9 +237,9 @@ request cannot consume a permit. It is also the one thing the service layer
 does not share across listeners: a process serving both the public listener
 and the mTLS listener runs an instance of the layer per listener, identical
 in every control and differing only in the tenant resolver, because the two
-listeners derive tenant identity from different credentials. Adding a transport therefore cannot add a
-surface that queries outside the ceiling, spends without recording, or
-answers without an audit trail.
+listeners derive tenant identity from different credentials. Adding a
+transport therefore cannot add a surface that queries outside the ceiling,
+spends without recording, or answers without an audit trail.
 
 Two boundaries of the layer are deliberate. The admission permit is released
 when the operation returns, before the transport encodes the response, so a
@@ -252,10 +252,18 @@ and this one never did.
 
 The usage record a disconnect folds carries the spend the query had actually
 reached, not a zero. Every operation hands the engine a live view of the
-counters for the attempt in flight and hands the same view to its usage
-guard, so a future dropped in the middle of a resolve is billed for the
-store requests it had already issued. A surface that recorded zero there
-would let a client cancel its way out of the cost of the work it started.
+counters the read spends through and hands the same view to its usage guard,
+so a future dropped in the middle of a resolve is billed for the store
+requests it had already issued. On the PromQL, metadata, and analytics
+operations that view is additive, because one request can spend through
+several counter blocks: the metrics lane and the log lane of a query naming
+both signals, one block per `match[]` selector of a metadata request, and one
+block per attempt when a snapshot is invalidated and the read re-resolves. The
+record sums all of them. The exemplars and SQL operations hold one block at a
+time and replace it when an attempt retries, so a cancellation there is billed
+for the retried attempt alone and not also for the discarded one. A surface
+that recorded zero would let a client cancel its way out of the cost of the
+work it started.
 
 The failure boundaries are the two PUTs of a write and the compare-and-swap
 of a fold. A failure on either side of them has a defined outcome and never
