@@ -440,11 +440,12 @@ pub struct ProfileRecord {
     /// regardless of the profile's own verdict, when `steps_run <
     /// steps_declared`: a truncated run's figures are not that profile's.
     pub comparable: bool,
-    /// The stated reason when `comparable` is `false`, or `"comparable"`
-    /// otherwise -- [`crate::metrics_workload::Comparability`]'s own
-    /// `Display`, never a second, hand-written copy of it, unless the run
-    /// itself was truncated, in which case this states that instead.
-    pub comparability_reason: String,
+    /// Why `comparable` is `false`; absent when it is `true`. The workload's
+    /// own [`crate::metrics_workload::Comparability::reason`], never a
+    /// second, hand-written copy of it, unless the run itself was
+    /// truncated, in which case this states that instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparability_reason: Option<String>,
     /// Active series the profile declares.
     pub active_series: u64,
     /// Steps this run actually generated (the `--steps` flag, or

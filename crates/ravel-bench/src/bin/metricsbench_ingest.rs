@@ -188,13 +188,13 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     // profile's own comparability verdict.
     let comparable = profile.is_publishable() && !truncated;
     let comparability_reason = if truncated {
-        format!(
+        Some(format!(
             "this run generated {steps} of profile `{}`'s {steps_declared} steps, so it is not \
              that profile and its figures cannot be published",
             profile.name
-        )
+        ))
     } else {
-        profile.comparability.to_string()
+        profile.comparability.reason().map(String::from)
     };
     let run_record = RunRecord {
         steps,

@@ -72,19 +72,6 @@ impl Comparability {
     }
 }
 
-impl std::fmt::Display for Comparability {
-    /// `"comparable"` for [`Comparability::Comparable`], the stated reason
-    /// for [`Comparability::NonComparable`]. The single formatting a reader
-    /// of an artifact's `comparability_reason` field is built from, so that
-    /// field is never a second, hand-written copy of this reason.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Comparability::Comparable => write!(f, "comparable"),
-            Comparability::NonComparable { reason } => write!(f, "{reason}"),
-        }
-    }
-}
-
 /// One workload profile: one axis varied, the others pinned.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
