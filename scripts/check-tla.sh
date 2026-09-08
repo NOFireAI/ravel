@@ -363,19 +363,47 @@ band_row_exists() {
 # cfg_budget <area> <cfg-name> <default> -> the exhaustive per-config TLC
 # wall-clock budget in seconds: bands.tsv's optional 6th column (budget_s) on
 # this cfg's row, or <default> when the file, the row, or the column is
-# absent or non-numeric. Uses the same awk-by-cfg-name lookup check_bands
-# uses to find the row, so a config with no bands.tsv row resolves to the
-# default exactly the way an unbanded config already does for its figures.
+# absent, non-numeric, zero, or over 9 digits. Uses the same awk-by-cfg-name
+# lookup check_bands uses to find the row, so a config with no bands.tsv row
+# resolves to the default exactly the way an unbanded config already does for
+# its figures. Every fallback logs a note naming the area, cfg, and (for a
+# malformed or out-of-range value) the rejected value: a budget silently
+# falling back to 3600s on a typo reads as "the config is just slow" instead
+# of the row being wrong.
 cfg_budget() {
     local area="$1" cfg_name="$2" default="$3"
     local bands="$FORMAL_DIR/$area/bands.tsv"
-    [ -f "$bands" ] || { echo "$default"; return 0; }
+    if [ ! -f "$bands" ]; then
+        note "$area bands: no bands.tsv for $cfg_name; using default budget ${default}s"
+        echo "$default"
+        return 0
+    fi
+    local row
+    row="$(awk -F'\t' -v c="$cfg_name" '$1==c {print; exit}' "$bands")"
+    if [ -z "$row" ]; then
+        note "$area bands: no row for $cfg_name in bands.tsv; using default budget ${default}s"
+        echo "$default"
+        return 0
+    fi
     local b
-    b="$(awk -F'\t' -v c="$cfg_name" '$1==c {print $6; exit}' "$bands")"
-    case "$b" in
-        ''|*[!0-9]*) echo "$default" ;;
-        *) echo "$b" ;;
-    esac
+    b="$(echo "$row" | cut -f6)"
+    if [ -z "$b" ]; then
+        note "$area bands: $cfg_name has no budget_s column; using default budget ${default}s"
+        echo "$default"
+        return 0
+    fi
+    # Bound the digit count before the numeric test, the same shape
+    # resolve_tla_resources uses for RAVEL_TLA_WORKERS: an over-long run of
+    # digits passes a bare ^[0-9]+$ but overflows `[ -eq ]`, and coreutils
+    # timeout(1) disables its own ceiling on 0 and rejects an out-of-range
+    # duration outright, either of which would remove the budget instead of
+    # falling back to it.
+    if ! printf '%s' "$b" | grep -qE '^[0-9]{1,9}$' || [ "$b" -eq 0 ]; then
+        note "$area bands: $cfg_name budget_s '$b' invalid (must be 1-9 digits, nonzero); using default budget ${default}s"
+        echo "$default"
+        return 0
+    fi
+    echo "$b"
 }
 
 # check_one_model <area> <module> <kind> <cfg>

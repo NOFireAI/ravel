@@ -11,11 +11,20 @@
 # Areas run as a matrix, one job per area (issue #1358): every area used to
 # run sequentially inside one job, and a single slow area (maintenance)
 # exceeding its per-config budget put the whole job over its own
-# timeout-minutes. Each area now gets its own job and its own 110-minute
+# timeout-minutes. Each area now gets its own job and its own 160-minute
 # ceiling, and fail-fast is off so one area's failure or timeout does not
 # cancel the others mid-run. check-tla.sh's own per-config TLC budget still
 # applies inside each job (3600s default, overridable per cfg via bands.tsv's
-# budget_s column).
+# budget_s column); an area can run more than one exhaustive config
+# sequentially (maintenance runs two), so the job ceiling must bound the sum
+# of that area's budgets, not any single config's. Maintenance is the
+# largest: 5400s (MCMaintenanceOwnership.exhaustive.cfg's budget_s) + 3600s
+# (MCCompactionClaims.exhaustive.cfg's default) = 9000s = 150 minutes, so
+# 160 minutes leaves 10 minutes of headroom. check-tla.test.sh's (u) case
+# sums each area's exhaustive budgets from its bands.tsv and asserts this
+# value stays at least 10 minutes above the largest sum, so a future budget
+# change that outgrows this ceiling fails the test instead of timing out
+# silently on the next nightly run.
 #
 # The area list below is the same list scripts/check-tla.sh's discover_areas
 # would find under formal/tla (every directory carrying a smoke config);
@@ -45,7 +54,7 @@ jobs:
       matrix:
         area: [catalog, commit, common, lifecycle, maintenance, resharding]
     runs-on: ubuntu-latest
-    timeout-minutes: 110
+    timeout-minutes: 160
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
