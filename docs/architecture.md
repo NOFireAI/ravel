@@ -201,11 +201,14 @@ a `RavelCluster`, it applies a one-shot `<cluster>-qualify` Job running
 `ravel store qualify` against that cluster's bucket and gates the gateway,
 query, and maintain Deployments on the Job completing, so a cluster never
 comes up as three tiers crash-looping on a backend that fails the contract.
-It records the qualified inputs (bucket, region, endpoint, image,
-credentials Secret) in a `StoreQualified` status condition and a durable
-`status.storeQualifiedHash`, re-runs qualification only when those inputs
-change (never on a schedule), and leaves a running cluster's Deployments up
-while re-qualifying (ADR-0034). The capability table, the
+It records the qualified inputs (bucket, region, endpoint, image, the
+credentials Secret name, and that Secret's `resourceVersion`) in a
+`StoreQualified` status condition and a durable `status.storeQualifiedHash`,
+re-runs qualification only when those inputs change (never on a schedule), and
+leaves a running cluster's Deployments up while re-qualifying (ADR-0034).
+Because the credentials Secret's `resourceVersion` is one of those inputs,
+rotating that Secret in place (same name, new content, bumped
+`resourceVersion`) is a changed input and re-runs qualification. The capability table, the
 qualification suite, and the retry and timeout contract are in
 [docs/object-store-contract.md](object-store-contract.md).
 

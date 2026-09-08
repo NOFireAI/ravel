@@ -45,6 +45,13 @@ ravel-types = { workspace = true }
 # pin; adds no new external crate.
 ravel-object-store = { workspace = true }
 hex = { workspace = true }
+# Stable change-detection hashing for the qualified-input hash and the
+# per-tier secrets checksum (#36 finding 3). std's DefaultHasher is not stable
+# across Rust releases, so a toolchain upgrade would re-run qualification and
+# roll every tier Deployment for unchanged inputs. blake3 is a fixed algorithm,
+# so the hash depends only on the inputs. Already a workspace pin; adds no new
+# external crate.
+blake3 = { workspace = true }
 # rustls 0.23 crypto-provider selection (main.rs). kube's rustls-tls feature
 # below pins `ring`; ravel-object-store pulls `aws-lc-rs` transitively via the
 # workspace's own jsonwebtoken pin (root Cargo.toml: aws_lc_rs, chosen there to
