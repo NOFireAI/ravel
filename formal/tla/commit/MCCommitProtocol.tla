@@ -54,31 +54,19 @@ AbandonUnreachable == ~(\E f \in FlushIds : phase[f] = "abandoned")
 \* At MaxRetries=0 the three retry actions below are permanently disabled
 \* (their `retries[f] < MaxRetries` guard can never hold), so a cfg that
 \* never sets MaxRetries > 0 leaves them, and everything they alone
-\* exercise, unreachable. Each predicate restates the action's own
-\* enabling conjuncts (the store call itself has no further guard: every
-\* branch of PutCreateIfAbsent/TransientFailure always has a successor), so
-\* a VIOLATED report here proves the action fires, not merely that its
-\* precondition looks satisfiable on paper.
+\* exercise, unreachable. Each predicate is a post-state check on faultFired,
+\* the execution witness the named action alone sets (CommitProtocol.tla),
+\* in the same shape as AbandonUnreachable above: a VIOLATED report proves
+\* the action actually FIRED, not merely that its enabling conjuncts were
+\* satisfiable in some pre-state that never took the transition.
 PutDataLostResponseUnreachable ==
-    ~(\E f \in FlushIds :
-        /\ phase[f] = "pinned"
-        /\ ~Expired(f)
-        /\ ~shardDead[f[2]]
-        /\ retries[f] < MaxRetries)
+    ~(\E f \in FlushIds : <<f, "putDataLost">> \in faultFired)
 
 PutCommitLostResponseUnreachable ==
-    ~(\E f \in FlushIds :
-        /\ phase[f] = "data"
-        /\ ~DedupSuppressed(f)
-        /\ ~Expired(f)
-        /\ ~shardDead[f[2]]
-        /\ retries[f] < MaxRetries)
+    ~(\E f \in FlushIds : <<f, "putCommitLost">> \in faultFired)
 
 TransientFailureUnreachable ==
-    ~(\E f \in FlushIds :
-        /\ phase[f] \in {"pinned", "data"}
-        /\ ~Expired(f)
-        /\ retries[f] < MaxRetries)
+    ~(\E f \in FlushIds : <<f, "transient">> \in faultFired)
 
 \* --- Liveness --------------------------------------------------------------
 \* Under weak fairness on the store retry and the flush task only, a pinned
