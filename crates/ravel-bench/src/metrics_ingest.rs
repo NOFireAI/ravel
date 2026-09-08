@@ -480,16 +480,18 @@ pub struct ProfileRecord {
     pub total_samples: u64,
     /// Distinct values per label, name to count, straight from the workload
     /// manifest (`WorkloadFile::label_cardinalities`) -- including the
-    /// scaling label (`instance`), whose total is the sum of `families`'
-    /// per-family instance cardinalities below.
+    /// scaling label (`instance`), whose count is the UNION of `families`'
+    /// per-family instance cardinalities below, not their sum: every family
+    /// shares one scaling-label value prefix, so two families' instance
+    /// ranges (each contiguous from 0) routinely overlap.
     pub label_cardinalities: BTreeMap<String, u64>,
     /// Declared series churn, in basis points per hour.
     pub churn_basis_points_per_hour: u64,
-    /// Per-family instance counts, so `label_cardinalities`' `instance` total
+    /// Per-family instance counts, so `label_cardinalities`' `instance` count
     /// is reconstructible: combined with the manifest's own label
     /// dimensions and `family.labels`, a reader can recompute each family's
     /// scaling-label cardinality (`WorkloadFile::family_scaling_label_
-    /// cardinality`) and its sum.
+    /// cardinality`) and take their maximum.
     pub families: Vec<FamilyRecord>,
     /// Figures scoped to this run's actual `steps_run`, never the declared
     /// full profile: the generator's exact counts over exactly the steps

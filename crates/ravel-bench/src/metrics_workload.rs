@@ -257,23 +257,36 @@ impl WorkloadFile {
     /// 11): every declared label dimension's value count, plus the scaling
     /// label ([`GeneratorConfig::scaling_label`]), which `Generator::labels_for`
     /// stamps on every series but which the manifest never declares as an
-    /// ordinary dimension. The scaling label's cardinality varies by
-    /// profile (it depends on `family_instances`), so it is derived per
-    /// family and summed here from [`Self::family_scaling_label_cardinality`]
-    /// -- the same figures the generator itself computes -- never a formula
-    /// re-typed against the manifest.
+    /// ordinary dimension.
+    ///
+    /// The scaling label's cardinality is the UNION of the families' distinct
+    /// values, not their sum: every family shares the same
+    /// [`GeneratorConfig::scaling_label_value_prefix`], so two families
+    /// routinely emit the same scaling-label value (under the checked-in
+    /// manifest's `ci` profile, both the gauge family and the native-histogram
+    /// family emit `metricsbench-instance-0`). `Generator::labels_for` assigns
+    /// family `f`'s global instance `i` the value `prefix + i /
+    /// family_fixed_product(f)`, and `i` itself ranges over the contiguous
+    /// `0..family_instances(f)`, so the value ranges over the contiguous
+    /// `0..family_scaling_label_cardinality(f)` -- always starting at 0.  The
+    /// union of a set of ranges that all start at 0 is exactly the widest one,
+    /// so this is the MAXIMUM of [`Self::family_scaling_label_cardinality`]
+    /// over the families, never their sum -- the same figure the generator
+    /// itself would produce by counting distinct emitted values, never a
+    /// formula re-typed against the manifest.
     pub fn label_cardinalities(&self, profile: &Profile) -> BTreeMap<String, u64> {
         let mut out: BTreeMap<String, u64> = self
             .label_dimensions
             .iter()
             .map(|d| (d.name.clone(), d.values.len() as u64))
             .collect();
-        let scaling_total: u64 = self
+        let scaling_distinct: u64 = self
             .families
             .iter()
             .map(|family| self.family_scaling_label_cardinality(profile, family))
-            .sum();
-        out.insert(self.generator.scaling_label.clone(), scaling_total);
+            .max()
+            .unwrap_or(0);
+        out.insert(self.generator.scaling_label.clone(), scaling_distinct);
         out
     }
 
