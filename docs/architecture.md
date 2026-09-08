@@ -254,6 +254,15 @@ listeners derive tenant identity from different credentials. Adding a transport 
 surface that queries outside the ceiling, spends without recording, or
 answers without an audit trail.
 
+Two boundaries of the layer are deliberate. The admission permit is released
+when the operation returns, before the transport encodes the response, so a
+slow client does not hold a fleet-wide slot for the length of its download;
+encoding is CPU-bound work over a result the query budgets already capped.
+And a request the transport rejects before it calls an operation, a metadata
+selector that does not parse for instance, produces no audit event, because
+the audit trail records queries that reached execution for a resolved tenant
+and this one never did.
+
 The usage record a disconnect folds carries the spend the query had actually
 reached, not a zero. Every operation hands the engine a live view of the
 counters for the attempt in flight and hands the same view to its usage

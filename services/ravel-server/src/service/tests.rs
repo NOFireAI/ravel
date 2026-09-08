@@ -357,6 +357,23 @@ fn sql_request(sql: &str) -> ravel_sql::SqlRequest {
     }
 }
 
+/// The metadata family's equivalent of [`analytics_request`]: one selector
+/// over the same one-minute window.
+fn metadata_request(allow_partial: bool) -> ravel_query::http::MetadataRequest {
+    ravel_query::http::MetadataRequest {
+        selectors: vec!["up".to_string()],
+        window: ravel_types::TimeRange {
+            start_ns: NOW_NS - 60_000_000_000,
+            end_ns: NOW_NS,
+        },
+        min_tokens: Vec::new(),
+        deadline: Duration::from_secs(30),
+        allow_partial,
+        now_ns: NOW_NS,
+        budgets: None,
+    }
+}
+
 fn exemplars_request() -> ExemplarsRequest {
     ExemplarsRequest {
         query: "up".to_string(),
@@ -569,6 +586,32 @@ async fn usage_is_recorded_before_partial_refusal() {
     assert!(outcome.partial);
     assert_eq!(h.usage.records().len(), 2);
     assert_eq!(h.cost.records().len(), 1);
+
+    // The metadata family runs the same order on a path with no value to
+    // return, where "record what it spent" is the only thing the refusal can
+    // leave behind. `/api/v1/labels` and `/api/v1/series` share one
+    // implementation, so one of each pair of assertions covers both.
+    let err = err_of(
+        h.service
+            .labels(h.tenant_hash, &metadata_request(false))
+            .await,
+    );
+    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err.kind, ServiceErrorKind::Unavailable);
+    assert!(err.message.contains("set allow_partial=true"));
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 3);
+    assert_eq!(usage[2].1, UsageStatus::Success);
+    assert_eq!(h.cost.records().len(), 1);
+
+    let outcome = h
+        .service
+        .labels(h.tenant_hash, &metadata_request(true))
+        .await
+        .expect("consented partial coverage is served");
+    assert!(outcome.partial);
+    assert_eq!(h.usage.records().len(), 4);
+    assert_eq!(h.cost.records().len(), 2);
 }
 
 /// Step 4 before the evaluation failure becomes a response. A rejected query
