@@ -436,7 +436,12 @@ pub struct Budget {
 pub struct EvidenceEntry {
     pub r#ref: String,
     pub covers: String,
-    pub sha256: String,
+    /// Lowercase hex BLAKE3-256 digest of the canonical bytes `covers`
+    /// names. The field says which function produced it: this crate hashes
+    /// with BLAKE3 everywhere (`ravel_sql::flight_ticket` does too), and a
+    /// field called `sha256` carrying a BLAKE3 digest cannot be verified by
+    /// anyone who believes the name.
+    pub blake3_256: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
@@ -626,14 +631,18 @@ fn bound_evidence(entries: &mut [EvidenceEntry]) -> u64 {
         let overhead = entry_serialized_len(entry).saturating_sub(
             serialized_str_len(&entry.r#ref)
                 + serialized_str_len(&entry.covers)
-                + serialized_str_len(&entry.sha256),
+                + serialized_str_len(&entry.blake3_256),
         );
         let EvidenceEntry {
             r#ref,
             covers,
-            sha256,
+            blake3_256,
         } = entry;
-        if bound_entry_fields(&mut [r#ref, covers, sha256], overhead, EVIDENCE_ENTRY_BOUND) {
+        if bound_entry_fields(
+            &mut [r#ref, covers, blake3_256],
+            overhead,
+            EVIDENCE_ENTRY_BOUND,
+        ) {
             truncated += 1;
         }
     }
@@ -1677,9 +1686,9 @@ mod tests {
             .collect();
         envelope.evidence = (0..MAX_EVIDENCE)
             .map(|i| EvidenceEntry {
-                r#ref: format!("{i:0>2}_{}", "r".repeat(402)),
+                r#ref: format!("{i:0>2}_{}", "r".repeat(398)),
                 covers: "data.rows".to_string(),
-                sha256: "0".repeat(64),
+                blake3_256: "0".repeat(64),
             })
             .collect();
 
