@@ -128,26 +128,61 @@ pub(crate) fn checked_ingest_hour_bucket(flush_open_ns: i64) -> Result<u32, Stri
 /// A backwards clock step within this bound is absorbed: the stamp is held at
 /// the floor so duplicate resolution stays monotonic, the step is counted
 /// (`clock_regressions`), and the flush proceeds. A hold larger than this is
-/// refused with a typed error (counted as `clock_regressions_refused`) and the
-/// floor re-anchors to the raw reading, because a hold this large can only
-/// arise two ways, both of which must fail loud rather than be papered over:
+/// refused with a typed, retryable error (counted as `clock_regressions_refused`)
+/// and the floor re-anchors to the raw reading, because a hold this large can
+/// only arise two ways, both of which must fail loud rather than be papered over:
 ///
 /// - a genuine multi-minute backwards step, which the floor cannot absorb
 ///   without drifting the stamp arbitrarily far from wall time and into a
 ///   stale ingest-hour bucket; and
 /// - the tail of a spurious forward glitch that already ratcheted the floor
 ///   ahead of wall time. Absorbing here would stamp every later flush into a
-///   future ingest hour that LIST-discovered resolve never scans
-///   (`window_hour_bounds` caps listing at `now + clock_skew_allowance`), so
-///   one glitch would silently strand all subsequent writes. Re-anchoring on
-///   refusal means exactly the one flush that crosses the bound fails; the
-///   next normal reading proceeds.
+///   future ingest hour that LIST-discovered resolve never scans, so one glitch
+///   would silently strand all subsequent writes. Re-anchoring on refusal means
+///   exactly the one flush that crosses the bound fails; the next normal
+///   reading proceeds.
 ///
-/// Sized as the catalog clock-skew allowance (5 min) plus the fold safety
-/// margin (15 min): a stamp held at most this far above wall time still lands
-/// within the unsealed recent-hours tail every query already scans, so an
-/// absorbed step stays discoverable.
-pub(crate) const MAX_FLUSH_CLOCK_HOLD_NS: i64 = 20 * 60 * 1_000_000_000;
+/// Sized as the catalog clock-skew allowance alone, derived from
+/// [`ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`] rather than a literal.
+/// That allowance is the only term that governs the *future* end of the resolve
+/// window: `Catalog::window_hour_bounds` caps a token-less query's hour listing
+/// at `now + clock_skew_allowance`, so a stamp held at most this far above wall
+/// time still lands in an hour bucket that query lists. The fold safety margin
+/// does not belong in this bound: it feeds the seal watermark, which governs how
+/// far *back* the unsealed tail is scanned, not how far forward a query lists. A
+/// stamp held past `now + clock_skew_allowance` sits in a future hour bucket a
+/// token-less query skips (a hole in the result, not staleness), which is why
+/// the bound is the clock-skew allowance and nothing more.
+///
+/// Known limitation: `clock_skew_allowance_ns` is operator-configurable per
+/// catalog (`ravel_catalog::CatalogConfig`). This bound is fixed at compile time
+/// from the *default* allowance, so an operator who lowers the catalog's
+/// allowance below it widens the window in which an absorbed stamp is
+/// undiscoverable. A runtime cross-check against the configured allowance is a
+/// follow-up (reported, not fixed here).
+pub const MAX_FLUSH_CLOCK_HOLD_NS: i64 = ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
+
+/// Why [`monotonic_flush_open_ns`] declined to produce a flush-open stamp. The
+/// two arms surface different write errors because they are different failures.
+///
+/// [`monotonic_flush_open_ns`]: crate::shard::ShardActor::monotonic_flush_open_ns
+pub(crate) enum FlushClockError {
+    /// The raw flush-open reading is not a usable wall-clock value: non-positive,
+    /// below the 2020 plausibility floor, or yielding no representable
+    /// ingest-hour bucket. A grossly broken host clock, not a transient step:
+    /// the next flush reads the same broken clock until an operator fixes it, so
+    /// this is surfaced fail-loud as the non-retryable `SegmentBuild` (ADR-0051
+    /// amendment) and counted as `abandoned_input_rejected`.
+    InvalidReading(String),
+    /// The per-writer floor would have to hold the stamp more than
+    /// [`MAX_FLUSH_CLOCK_HOLD_NS`] above the raw reading (ADR-1307): a backwards
+    /// step too large to absorb, or the tail of a spurious forward glitch. A
+    /// transient condition the next flush recovers from once the floor
+    /// re-anchors, and nothing in this flush was acknowledged, so it is surfaced
+    /// as the retryable `Abandoned` and counted as `clock_regressions_refused`,
+    /// never as an `abandoned_input_rejected` client signal.
+    RegressionRefused(String),
+}
 
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -56,7 +56,8 @@ use uuid::Uuid;
 use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{
-    IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket,
+    FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_CLOCK_HOLD_NS,
+    checked_ingest_hour_bucket,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -1215,8 +1216,8 @@ impl LogShardActor {
     /// The floor is in-process state, never persisted, so it resets to 0 on
     /// restart by construction. The guarantee is per-process; ADR-1307 records
     /// the cross-restart limitation.
-    fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, String> {
-        checked_ingest_hour_bucket(raw_ns)?;
+    fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, FlushClockError> {
+        checked_ingest_hour_bucket(raw_ns).map_err(FlushClockError::InvalidReading)?;
         if raw_ns >= self.last_flush_open_ns {
             self.last_flush_open_ns = raw_ns;
             return Ok(raw_ns);
@@ -1231,11 +1232,11 @@ impl LogShardActor {
                 bound_ns = MAX_FLUSH_CLOCK_HOLD_NS,
                 "ravel-ingest: flush clock regressed beyond the monotonic hold bound; refusing the flush and re-anchoring the floor"
             );
-            return Err(format!(
+            return Err(FlushClockError::RegressionRefused(format!(
                 "flush clock regressed {held_ns} ns below the previous flush-open stamp, \
                  beyond the monotonic hold bound of {MAX_FLUSH_CLOCK_HOLD_NS} ns; \
                  refusing the flush (ADR-1307)"
-            ));
+            )));
         }
         self.metrics.record_clock_regression();
         tracing::warn!(
@@ -1309,18 +1310,29 @@ impl LogShardActor {
                 FlushPayload::Columnar(batches)
             }
         };
-        self.metrics.record_flush(self.shard, trigger);
-
         let tenant_hash = tenant.hash();
         let seq = self.next_seq;
         self.next_seq += 1;
         let raw_ns = self.clock.now_ns();
+        // The flush-open stamp is decided before `record_flush`: a flush refused
+        // here never touched the store, so it must not be counted as a flush that
+        // happened (ADR-1307 finding 1).
         let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
             Ok(ns) => ns,
-            Err(msg) => {
+            Err(FlushClockError::InvalidReading(msg)) => {
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
+                return 0;
+            }
+            Err(FlushClockError::RegressionRefused(msg)) => {
+                // Already counted as `clock_regressions_refused` inside the
+                // helper; a clock regression is a transient server condition the
+                // next flush recovers from, so it is retryable (`Abandoned`, 503),
+                // not a client `SegmentBuild` (400) that would drop the buffered
+                // rows on a conformant exporter.
+                self.ctx
+                    .ack_waiters(waiters, Err(LogWriteError::Abandoned(msg)));
                 return 0;
             }
         };
@@ -1333,6 +1345,7 @@ impl LogShardActor {
                 return 0;
             }
         };
+        self.metrics.record_flush(self.shard, trigger);
         // ADR-1307 finding 4: the abandonment deadline measures real-time
         // budget, so it derives from the raw clock reading, not the (possibly
         // floor-raised) stamp.

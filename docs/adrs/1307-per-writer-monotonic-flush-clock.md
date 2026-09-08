@@ -53,24 +53,44 @@ plausibility-checked, then raised to that floor, in these steps:
    raw_ns`:
    - If `held_ns <= MAX_FLUSH_CLOCK_HOLD_NS`, absorb it: stamp the floor
      (unchanged), increment `clock_regressions`, and log the delta at `warn`.
-   - If `held_ns > MAX_FLUSH_CLOCK_HOLD_NS`, refuse the flush with a typed
-     error, increment `clock_regressions_refused`, log at `warn`, and
-     re-anchor the floor to `raw_ns`.
+   - If `held_ns > MAX_FLUSH_CLOCK_HOLD_NS`, refuse the flush with a typed,
+     retryable error (`WriteError::Abandoned`, so the gateway answers 503),
+     increment `clock_regressions_refused`, log at `warn`, and re-anchor the
+     floor to `raw_ns`. This is distinct from a non-positive or sub-floor raw
+     reading in step 2, which is a grossly broken clock the next flush cannot
+     recover from: that path stays fail-loud and non-retryable
+     (`WriteError::SegmentBuild`, 400), counted as `abandoned_input_rejected`.
+     `record_flush` is deferred until after the stamp is decided, so a refused
+     flush is not counted as a flush that happened.
 
-`MAX_FLUSH_CLOCK_HOLD_NS` is the catalog clock-skew allowance (5 min) plus the
-fold safety margin (15 min), 20 minutes total. A stamp held at most that far
-above wall time still lands within the unsealed recent-hours tail every query
-already scans, so an absorbed step stays discoverable. A hold larger than the
-bound can only be a genuine multi-minute backwards step (which the floor cannot
-absorb without drifting the stamp arbitrarily far from wall time) or the tail
-of a spurious forward glitch that already ratcheted the floor ahead of wall
-time. Both must fail loud rather than be papered over: absorbing the latter
-would stamp every later flush into a future ingest hour that LIST-discovered
-resolve never scans (`window_hour_bounds` caps listing at `now +
-clock_skew_allowance`), silently stranding all subsequent writes. Re-anchoring
-the floor to `raw_ns` on refusal means exactly the one flush that crosses the
-bound fails, and the next normal reading proceeds; one glitch cannot pin the
-writer forever.
+`MAX_FLUSH_CLOCK_HOLD_NS` is the catalog clock-skew allowance alone, derived
+from `ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS` (5 min) rather than a
+literal. That allowance is the only term that governs the *future* end of the
+resolve window: `Catalog::window_hour_bounds` caps a token-less query's hour
+listing at `now + clock_skew_allowance`, so a stamp held at most this far above
+wall time still lands in an hour bucket that query lists. The fold safety margin
+does not belong in this bound: it feeds the seal watermark, which governs how
+far *back* the unsealed tail is scanned, not how far forward a query lists. A
+stamp held past `now + clock_skew_allowance` sits in a future hour bucket a
+token-less query skips for up to the fold safety margin -- a hole in the result,
+not staleness (a later commit in the current hour is included while the held one
+is not) -- which is why the bound is the clock-skew allowance and nothing more.
+A hold larger than the bound can only be a genuine multi-minute backwards step
+(which the floor cannot absorb without drifting the stamp arbitrarily far from
+wall time) or the tail of a spurious forward glitch that already ratcheted the
+floor ahead of wall time. Both must fail loud rather than be papered over:
+absorbing the latter would stamp every later flush into a future ingest hour
+that LIST-discovered resolve never scans, silently stranding all subsequent
+writes. Re-anchoring the floor to `raw_ns` on refusal means exactly the one
+flush that crosses the bound fails, and the next normal reading proceeds; one
+glitch cannot pin the writer forever.
+
+`clock_skew_allowance_ns` is operator-configurable per catalog
+(`ravel_catalog::CatalogConfig`). `MAX_FLUSH_CLOCK_HOLD_NS` is fixed at compile
+time from the *default* allowance, so an operator who lowers the catalog's
+allowance below it widens the window in which an absorbed stamp is
+undiscoverable by a token-less query. A runtime cross-check of the ingest bound
+against the tenant's configured allowance is a follow-up, not done here.
 
 The flush's abandonment deadline (`max_flush_lifetime`) derives from `raw_ns`,
 not from the floor-raised stamp. The deadline bounds real elapsed time before a
@@ -97,12 +117,12 @@ consulted.
 ```mermaid
 flowchart TD
     A["clock.now_ns()<br/>raw_ns"] --> V{"raw_ns plausible?<br/>(checked_ingest_hour_bucket)"}
-    V -- "no" --> R1["refuse flush<br/>typed error"]
+    V -- "no" --> R1["refuse flush: fail-loud<br/>SegmentBuild (400, non-retryable)<br/>abandoned_input_rejected += 1"]
     V -- "yes" --> B{"raw_ns &lt; last_flush_open_ns?"}
     B -- "no (forward or equal)" --> C["stamped = raw_ns<br/>floor = raw_ns"]
     B -- "yes (backwards step)" --> H{"held_ns &gt; MAX_FLUSH_CLOCK_HOLD_NS?"}
     H -- "no (within bound)" --> D["stamped = floor<br/>clock_regressions += 1<br/>warn(delta)"]
-    H -- "yes (beyond bound)" --> G["refuse flush<br/>clock_regressions_refused += 1<br/>floor = raw_ns (re-anchor)"]
+    H -- "yes (beyond bound)" --> G["refuse flush: retryable<br/>Abandoned (503)<br/>clock_regressions_refused += 1<br/>floor = raw_ns (re-anchor)"]
     C --> F["created_unix_ns = stamped<br/>deadline from raw_ns"]
     D --> F
 ```
@@ -158,11 +178,14 @@ flowchart TD
   follow-up (#1473); the counters are present in the ingest metrics snapshot
   now.
 - A backwards step larger than `MAX_FLUSH_CLOCK_HOLD_NS` fails that one flush
-  with a typed error (strict-mode waiters see it; buffered-mode data is not
-  lost, since the flush is retried on the next trigger once the floor has
-  re-anchored). This is a deliberate, bounded availability cost paid only for a
-  clock that moved more than 20 minutes, in exchange for never stranding a
-  writer in a future ingest hour.
+  with a typed, retryable error (`Abandoned`, 503): strict-mode waiters see it
+  and retry the whole write; buffered-mode data is not lost, since the flush is
+  retried on the next trigger once the floor has re-anchored. Surfacing it as
+  retryable rather than as a client `SegmentBuild` (400) matters: a conformant
+  OTLP exporter drops a batch on 4xx, so a transient clock condition must not
+  reach the client as Bad Request. This is a deliberate, bounded availability
+  cost paid only for a clock that moved more than the clock-skew allowance, in
+  exchange for never stranding a writer in a future ingest hour.
 - No format, schema, or key layout changes. The stamp still lands in the
   existing `created_unix_ns` field; only its monotonicity within a process
   changes.
