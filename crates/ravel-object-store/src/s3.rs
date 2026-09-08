@@ -1338,6 +1338,17 @@ impl S3Store {
             Err(
                 e @ (StoreError::Throttled { .. } | StoreError::Timeout | StoreError::Transient(_)),
             ) => Err(e),
+            // The listing-drain variants are synthesized by `list_all`, never
+            // returned by `head`, so they are unreachable here. Pass them
+            // through unchanged rather than fold them into `AlreadyExists`:
+            // that keeps an impossible value honest without fabricating a
+            // terminal collision verdict. Named, not a wildcard, so a new
+            // variant still fails to compile here.
+            Err(
+                e @ (StoreError::ListRepeatedToken { .. }
+                | StoreError::ListPageCeiling { .. }
+                | StoreError::ListOrderViolation { .. }),
+            ) => Err(e),
             Err(
                 StoreError::AccessDenied(_)
                 | StoreError::PreconditionFailed
