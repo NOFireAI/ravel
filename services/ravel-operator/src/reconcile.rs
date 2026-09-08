@@ -2155,13 +2155,24 @@ pub fn qualify_job_input_hash(
         Some(value) => format!("\u{1}{value}"),
         None => "\u{0}".to_string(),
     };
+    // The credentials resourceVersion carries the same presence byte as the
+    // endpoint (finding 3, issue #36): an unresolved Secret (None) and a Secret
+    // whose resourceVersion resolved to the empty string are different states,
+    // yet unwrap_or("") fed the hasher the same "" for both and hashed them
+    // identically. 0x01 then the value for Some, a lone 0x00 for None keeps the
+    // two apart, so the field separator's boundary is joined by a presence byte
+    // the separator alone cannot supply.
+    let credentials_rv = match credentials_resource_version {
+        Some(value) => format!("\u{1}{value}"),
+        None => "\u{0}".to_string(),
+    };
     blake3_hex(&[
         spec.storage.s3.bucket.as_str(),
         spec.storage.s3.region.as_str(),
         endpoint.as_str(),
         spec.image.as_str(),
         spec.storage.s3.credentials_secret_ref.name.as_str(),
-        credentials_resource_version.unwrap_or(""),
+        credentials_rv.as_str(),
     ])
 }
 
@@ -6158,76 +6169,127 @@ mod tests {
         let manifest = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-        // No rule anywhere grants `update` (matched with its YAML quotes so the
-        // word "update" in a comment does not count).
+        // No rule anywhere grants `update`. Scan the comment-stripped lines for a
+        // bare `update` token so a reformat of any rule to block sequences
+        // (`- update`, unquoted) cannot make this go quiet: the old check matched
+        // only the quoted "update" substring and saw nothing in block style. The
+        // word "update" in a comment is stripped before the scan, so it does not
+        // count.
+        let grants_update = manifest.lines().any(|line| {
+            line.split('#')
+                .next()
+                .unwrap_or("")
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|token| token == "update")
+        });
         assert!(
-            !manifest.contains("\"update\""),
+            !grants_update,
             "server-side apply is a PATCH, not a PUT: no rule may grant the update verb"
         );
 
-        // Every rule's resources line paired with the exact verbs line that must
-        // follow it. The `resources:` line uniquely identifies each rule (the two
-        // ClusterRoles never repeat one), and the `verbs:` line is always the next
-        // line, matching rbac.yaml's apiGroups/resources/verbs ordering.
-        let rules: &[(&str, &str)] = &[
+        // Every rule's apiGroups/resources/verbs lines, in rbac.yaml's fixed
+        // ordering: the `resources:` line uniquely identifies each rule, with its
+        // `apiGroups:` line immediately before and its `verbs:` line immediately
+        // after.
+        let rules: &[(&str, &str, &str)] = &[
             (
+                "- apiGroups: [\"apps\"]",
                 "resources: [\"deployments\"]",
                 "verbs: [\"create\", \"patch\", \"get\", \"list\", \"watch\", \"delete\"]",
             ),
             (
+                "- apiGroups: [\"\"]",
                 "resources: [\"services\"]",
                 "verbs: [\"create\", \"patch\", \"get\", \"list\", \"watch\", \"delete\"]",
             ),
             (
+                "- apiGroups: [\"networking.k8s.io\"]",
                 "resources: [\"ingresses\"]",
                 "verbs: [\"create\", \"patch\", \"list\", \"watch\", \"delete\"]",
             ),
             (
+                "- apiGroups: [\"gateway.networking.k8s.io\"]",
                 "resources: [\"httproutes\", \"grpcroutes\"]",
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
+                "- apiGroups: [\"\"]",
                 "resources: [\"serviceaccounts\"]",
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
+                "- apiGroups: [\"rbac.authorization.k8s.io\"]",
                 "resources: [\"roles\", \"rolebindings\"]",
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
+                "- apiGroups: [\"discovery.k8s.io\"]",
                 "resources: [\"endpointslices\"]",
                 "verbs: [\"get\", \"list\", \"watch\"]",
             ),
             (
+                "- apiGroups: [\"ravel.nofire.ai\"]",
                 "resources: [\"ravelclusters\"]",
                 "verbs: [\"list\", \"watch\"]",
             ),
             (
+                "- apiGroups: [\"ravel.nofire.ai\"]",
                 "resources: [\"ravelclusters/status\"]",
                 "verbs: [\"patch\"]",
             ),
             (
+                "- apiGroups: [\"policy\"]",
                 "resources: [\"poddisruptionbudgets\"]",
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
+                "- apiGroups: [\"batch\"]",
                 "resources: [\"jobs\"]",
                 "verbs: [\"create\", \"patch\", \"get\", \"delete\"]",
             ),
-            ("resources: [\"secrets\"]", "verbs: [\"get\"]"),
+            (
+                "- apiGroups: [\"\"]",
+                "resources: [\"secrets\"]",
+                "verbs: [\"get\"]",
+            ),
         ];
 
-        for (resources_line, expected_verbs) in rules {
-            let verbs = manifest
-                .lines()
-                .skip_while(|l| l.trim() != *resources_line)
-                .nth(1)
-                .map(str::trim)
-                .unwrap_or_else(|| {
-                    panic!("rbac.yaml defines a rule for {resources_line} with a verbs line")
-                });
+        let lines: Vec<&str> = manifest.lines().map(str::trim).collect();
+
+        // Exhaustiveness: the table must pin every rule in the manifest. Count the
+        // `verbs:` lines and require the table length to match, so a thirteenth
+        // rule cannot be added without a matching table row.
+        let verbs_lines = lines.iter().filter(|l| l.starts_with("verbs:")).count();
+        assert_eq!(
+            verbs_lines,
+            rules.len(),
+            "the table must pin every rule: rbac.yaml has {verbs_lines} verbs lines, \
+             the table has {} rows",
+            rules.len()
+        );
+
+        for rule in rules {
+            let (apigroups_line, resources_line, expected_verbs) = *rule;
+            // The resources line identifies the rule; assert it occurs exactly
+            // once so a duplicated resources line with wider verbs cannot hide
+            // behind the first match.
+            let occurrences = lines.iter().filter(|l| **l == resources_line).count();
             assert_eq!(
-                verbs, *expected_verbs,
+                occurrences, 1,
+                "the {resources_line} rule must appear exactly once"
+            );
+            let idx = lines
+                .iter()
+                .position(|l| *l == resources_line)
+                .unwrap_or_else(|| panic!("rbac.yaml defines a rule for {resources_line}"));
+            assert_eq!(
+                idx.checked_sub(1).and_then(|i| lines.get(i)).copied(),
+                Some(apigroups_line),
+                "the {resources_line} rule must be under {apigroups_line}"
+            );
+            assert_eq!(
+                lines.get(idx + 1).copied(),
+                Some(expected_verbs),
                 "the {resources_line} rule must grant exactly {expected_verbs}"
             );
         }
@@ -6340,6 +6402,17 @@ mod tests {
             qualify_job_input_hash(&endpoint_none, Some("rv-1")),
             qualify_job_input_hash(&endpoint_empty, Some("rv-1")),
             "endpoint: null and endpoint: \"\" are different stores and must hash differently"
+        );
+
+        // Credentials resourceVersion presence is significant the same way
+        // (finding 3): an unresolved Secret (None) and a resolved empty
+        // resourceVersion (Some("")) are different states, so they must hash
+        // differently. unwrap_or("") fed the hasher "" for both.
+        assert_ne!(
+            qualify_job_input_hash(&spec, None),
+            qualify_job_input_hash(&spec, Some("")),
+            "credentials resourceVersion None and Some(\"\") are different states and \
+             must hash differently"
         );
     }
 
@@ -6546,13 +6619,14 @@ mod tests {
             Some(value) => format!("\u{1}{value}"),
             None => "\u{0}".to_string(),
         };
+        let credentials_rv = format!("\u{1}{}", "rv-1");
         let expected = blake3_hex(&[
             spec.storage.s3.bucket.as_str(),
             spec.storage.s3.region.as_str(),
             endpoint.as_str(),
             spec.image.as_str(),
             spec.storage.s3.credentials_secret_ref.name.as_str(),
-            "rv-1",
+            credentials_rv.as_str(),
         ]);
 
         assert_eq!(
@@ -6605,12 +6679,14 @@ mod tests {
     /// `resourceVersion` hash to a fixed literal, stable by construction across
     /// Rust releases. The literal changed when the endpoint slot gained a
     /// presence byte (0x01 before a Some value) so endpoint: null and
-    /// endpoint: "" no longer collide.
+    /// endpoint: "" no longer collide, and again when the credentials
+    /// `resourceVersion` slot gained the same presence byte so an unresolved
+    /// Secret (None) and a resolved empty version (Some("")) no longer collide.
     #[test]
     fn qualify_job_input_hash_golden_is_stable_by_construction() {
         assert_eq!(
             qualify_job_input_hash(&base_spec(), Some("rv-golden")),
-            "492577362c8a6c9f6057e4281937d8b7a90289116e21e496c0acc7ed55d3784d",
+            "9dbbf674caab21157d312101c70e8d6947f8d86b14d075910a1e02779d7610fd",
         );
     }
 
@@ -6879,13 +6955,14 @@ mod tests {
             Some(value) => format!("\u{1}{value}"),
             None => "\u{0}".to_string(),
         };
+        let credentials_rv = format!("\u{1}{}", "rv");
         let expected = blake3_hex(&[
             spec.storage.s3.bucket.as_str(),
             spec.storage.s3.region.as_str(),
             endpoint.as_str(),
             spec.image.as_str(),
             spec.storage.s3.credentials_secret_ref.name.as_str(),
-            "rv",
+            credentials_rv.as_str(),
         ]);
         assert_eq!(qualify_job_input_hash(&spec, Some("rv")), expected);
     }

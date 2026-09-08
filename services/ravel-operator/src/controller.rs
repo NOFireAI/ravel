@@ -1131,28 +1131,24 @@ fn degraded_store_qualified_hash(
 }
 
 /// The `extra_conditions` to PATCH onto the degraded status (finding 1).
-/// [`reconcile_inner`] takes `extra_conditions` by clone and pushes
-/// `StoreQualified=True` onto that local copy in the `Proceed` arm, so the
-/// mutation never reaches the outer error path here, and
-/// [`write_degraded_status`] replaces the whole `conditions` array. When a pass
-/// qualified before a later step failed (`qualification_passed`), re-add the
-/// condition so the degraded object still carries `StoreQualified=True` for as
-/// long as that step keeps failing; otherwise a stage-one wait keyed on the
-/// condition burns its full bound instead of failing on the `Degraded` reason.
-/// Reconstructed from the same `proceed_hash` signal the persisted hash reads.
+/// [`reconcile_inner`] takes `extra_conditions` by clone and pushes the
+/// `StoreQualified` condition it computes onto that local copy, so the mutation
+/// never reaches the outer error path here, and [`write_degraded_status`]
+/// replaces the whole `conditions` array. The gate carries the exact condition
+/// it computed out through `store_qualified`, whichever value the pass reached:
+/// `True` when qualification proceeded before a later step failed, or the
+/// `False` the not-qualified path built with its own Pending/Failed reason and
+/// message. Re-adding it keeps the degraded object carrying that condition for
+/// as long as the failing step persists, so a stage-one wait keyed on it fails
+/// on the real qualification state rather than burning its full bound because
+/// the condition went missing. When the pass failed before the gate ran,
+/// `store_qualified` is `None` and the base conditions pass through untouched.
 fn degraded_extra_conditions(
     mut base: Vec<Condition>,
-    qualification_passed: bool,
-    generation: Option<i64>,
+    store_qualified: Option<Condition>,
 ) -> Vec<Condition> {
-    if qualification_passed {
-        base.push(condition(
-            "StoreQualified",
-            true,
-            generation,
-            STORE_QUALIFIED_SUCCEEDED_REASON,
-            STORE_QUALIFIED_MESSAGE,
-        ));
+    if let Some(cond) = store_qualified {
+        base.push(cond);
     }
     base
 }
@@ -1181,6 +1177,12 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
     // reaches `QualificationDecision::Proceed`, so the degraded error path below
     // persists it rather than the stale `obj.status` value (finding 2).
     let mut proceed_hash: Option<String> = None;
+    // Set by `reconcile_inner` to whichever `StoreQualified` condition the pass
+    // computed at the gate (True on Proceed, False on a Pending/Failed hold), so
+    // the degraded error path below carries the real qualification state through
+    // instead of reconstructing only the True case (finding 1). A pass that fails
+    // before the gate leaves this None.
+    let mut store_qualified_condition: Option<Condition> = None;
     match reconcile_inner(
         &obj,
         client,
@@ -1188,6 +1190,7 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
         &instance,
         extra_conditions.clone(),
         &mut proceed_hash,
+        &mut store_qualified_condition,
     )
     .await
     {
@@ -1209,11 +1212,8 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
             // pass's proof and re-run qualification once the Job's TTL collected
             // it; using it when the pass never qualified is correct.
             let qualification_passed = proceed_hash.is_some();
-            let degraded_conditions = degraded_extra_conditions(
-                extra_conditions,
-                qualification_passed,
-                obj.metadata.generation,
-            );
+            let degraded_conditions =
+                degraded_extra_conditions(extra_conditions, store_qualified_condition);
             let store_qualified_hash = degraded_store_qualified_hash(
                 proceed_hash,
                 obj.status
@@ -1280,6 +1280,7 @@ async fn reconcile_inner(
     instance: &str,
     mut extra_conditions: Vec<Condition>,
     proceed_hash: &mut Option<String>,
+    store_qualified_condition: &mut Option<Condition>,
 ) -> Result<Action, Error> {
     // Read the resourceVersion of every credential Secret the spec references
     // BEFORE the qualification gate (finding 3): the shared storage.s3 credential
@@ -1329,13 +1330,17 @@ async fn reconcile_inner(
     // gate that keeps existing Deployments up while the new inputs qualify).
     let store_qualified_hash = match &decision {
         QualificationDecision::Proceed => {
-            extra_conditions.push(condition(
+            let store_qualified = condition(
                 "StoreQualified",
                 true,
                 obj.metadata.generation,
                 STORE_QUALIFIED_SUCCEEDED_REASON,
                 STORE_QUALIFIED_MESSAGE,
-            ));
+            );
+            // Carry the condition out so the degraded error path keeps it if a
+            // later step fails after the gate proceeded (finding 1).
+            *store_qualified_condition = Some(store_qualified.clone());
+            extra_conditions.push(store_qualified);
             // Qualification passed this pass. Carry the fresh hash into the
             // outer error path (finding 2): a later fallible step
             // (resolve_deployment_key, an apply) can still return Err, and
@@ -1413,13 +1418,19 @@ async fn reconcile_inner(
                     ),
                 ),
             };
-            extra_conditions.push(condition(
+            let store_qualified = condition(
                 "StoreQualified",
                 false,
                 obj.metadata.generation,
                 reason,
                 &message,
-            ));
+            );
+            // Carry the False condition out so a status-write failure on this
+            // not-qualified path still lands it on the degraded object with its
+            // exact reason and message, rather than dropping StoreQualified
+            // entirely (finding 1).
+            *store_qualified_condition = Some(store_qualified.clone());
+            extra_conditions.push(store_qualified);
 
             // Report the readiness a prior pass recorded, so a cluster already
             // serving through a re-qualification keeps `Available=True` instead of
@@ -3187,14 +3198,13 @@ mod tests {
         assert_eq!(degraded_store_qualified_hash(None, None), None);
     }
 
-    /// The degraded error path re-adds StoreQualified=True when the pass reached
-    /// Proceed before a later step failed (finding 1), exact condition. The
-    /// Proceed arm pushes it onto reconcile_inner's cloned copy, which never
-    /// reaches this writer, and the writer PATCHes the whole conditions array; so
-    /// without the re-add the degraded object drops StoreQualified entirely and a
-    /// stage-one wait keyed on it burns its full bound. When the pass failed
-    /// before the gate (`qualification_passed` false), the base conditions pass
-    /// through untouched and StoreQualified stays absent.
+    /// The degraded error path carries whichever StoreQualified condition the
+    /// gate computed (finding 1), exact condition. reconcile_inner pushes it onto
+    /// its cloned copy, which never reaches this writer, and the writer PATCHes
+    /// the whole conditions array; so without carrying it out the degraded object
+    /// drops StoreQualified entirely and a stage-one wait keyed on it burns its
+    /// full bound. When the pass failed before the gate ran (`store_qualified`
+    /// None), the base conditions pass through untouched.
     #[test]
     fn degraded_status_keeps_store_qualified_after_a_post_proceed_failure() {
         let base = vec![condition(
@@ -3206,12 +3216,19 @@ mod tests {
         )];
 
         // Reached Proceed, then a later apply failed: StoreQualified=True is
-        // re-added with the exact success reason and message, generation carried.
-        let after = degraded_extra_conditions(base.clone(), true, Some(7));
+        // carried with the exact success reason and message, generation carried.
+        let carried_true = condition(
+            "StoreQualified",
+            true,
+            Some(7),
+            STORE_QUALIFIED_SUCCEEDED_REASON,
+            STORE_QUALIFIED_MESSAGE,
+        );
+        let after = degraded_extra_conditions(base.clone(), Some(carried_true));
         let store_qualified = after
             .iter()
             .find(|c| c.r#type == "StoreQualified")
-            .expect("StoreQualified re-added on the degraded write after Proceed");
+            .expect("StoreQualified carried onto the degraded write after Proceed");
         assert_eq!(store_qualified.status, "True");
         assert_eq!(store_qualified.reason, STORE_QUALIFIED_SUCCEEDED_REASON);
         assert_eq!(store_qualified.message, STORE_QUALIFIED_MESSAGE);
@@ -3220,9 +3237,54 @@ mod tests {
         assert!(after.iter().any(|c| c.r#type == "SpecValid"));
 
         // Failed before the gate: base passes through, StoreQualified absent.
-        let untouched = degraded_extra_conditions(base.clone(), false, Some(7));
+        let untouched = degraded_extra_conditions(base.clone(), None);
         assert!(!untouched.iter().any(|c| c.r#type == "StoreQualified"));
         assert_eq!(untouched.len(), base.len());
+    }
+
+    /// A pass that computes StoreQualified=False at the gate (a Pending/Failed
+    /// hold) and then fails its status write lands that exact False condition on
+    /// the degraded status, not a reconstructed True and not a missing condition
+    /// (finding 1). The gate carries the condition it built, reason and message
+    /// included, out to the degraded writer; dropping the carried condition (the
+    /// flip: pass None) leaves StoreQualified absent and a Failed hold reads as an
+    /// unexplained Degraded instead.
+    #[test]
+    fn degraded_status_keeps_a_false_store_qualified_from_the_gate() {
+        let base = vec![condition(
+            "SpecValid",
+            true,
+            Some(7),
+            "Accepted",
+            "spec accepted",
+        )];
+
+        // The exact Failed-hold condition reconcile_inner's not-qualified arm
+        // builds: StoreQualified=False with the Failed reason and the retry
+        // message qualify_failed_message renders.
+        let message = qualify_failed_message(3, None, Some("backend rejected CAS"));
+        let carried_false = condition(
+            "StoreQualified",
+            false,
+            Some(7),
+            STORE_QUALIFIED_FAILED_REASON,
+            &message,
+        );
+
+        let after = degraded_extra_conditions(base.clone(), Some(carried_false));
+        let store_qualified = after
+            .iter()
+            .find(|c| c.r#type == "StoreQualified")
+            .expect("the gate's StoreQualified=False is carried onto the degraded write");
+        assert_eq!(store_qualified.status, "False");
+        assert_eq!(store_qualified.reason, STORE_QUALIFIED_FAILED_REASON);
+        assert_eq!(store_qualified.message, message);
+        assert_eq!(store_qualified.observed_generation, Some(7));
+        assert!(after.iter().any(|c| c.r#type == "SpecValid"));
+
+        // Flip: dropping the carried condition leaves StoreQualified absent.
+        let dropped = degraded_extra_conditions(base.clone(), None);
+        assert!(!dropped.iter().any(|c| c.r#type == "StoreQualified"));
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and
