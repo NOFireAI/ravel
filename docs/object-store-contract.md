@@ -170,15 +170,20 @@ trait honors cancellation by drop, so the query deadline (usually well under
 - Listing is paginated (S3 pages at 1000 keys). Cross-page guarantee: any
   key created before the first page request is returned; keys created
   during the scan may or may not appear; a key MAY appear more than once
-  and callers MUST dedup by key. Because keys arrive in lexicographic
-  order, a permitted repeat is always equal to the last key already
-  delivered, so a caller draining every page dedups at constant memory by
-  holding only that last key. A key strictly below the last delivered one
-  is an order violation, not a repeat, and the client rejects it. The
-  client also bounds the drain: a continuation token equal to the previous
-  one is a spinning backend and the client fails rather than looping
-  forever, and a token that keeps changing without ending is bounded by a
-  page ceiling (100 000 pages, 100 million keys at the 1000-key page size).
+  and callers MUST dedup by key. The RAW delivery sequence, across every
+  page of one drain and counting repeats, is non-decreasing, and a repeat
+  re-delivers the last key delivered, never an earlier one. That is what
+  `MemoryStore::list`, `S3Store::list`, and S3 itself do, and the
+  conformance suite's `LexicographicListingOrder` probe judges the raw
+  sequence on exactly this rule: equal adjacent keys pass, a decrease
+  fails qualification. So a caller draining every page dedups at constant
+  memory by holding only the last key: an equal key is dropped, and a key
+  strictly below it is an order violation, not a repeat, which the client
+  rejects rather than reordering. The client also bounds the drain: a
+  continuation token equal to the previous one is a spinning backend and
+  the client fails rather than looping forever, and a token that keeps
+  changing without ending is bounded by a page ceiling (100 000 pages,
+  100 million keys at the 1000-key page size).
 - `list_after(prefix, start_after, page)` returns exactly the keys `list`
   would, minus every key `<= start_after`: each returned key compares
   strictly greater than `start_after`, in the same lexicographic order and
@@ -551,13 +556,20 @@ throwaway key prefix:
   read-your-writes gap that only shows up intermittently.
 - `ConsistentListAfterWrite`: a `list` immediately following a `put`
   includes the new key, repeated the same way, to catch eventual-consistency
-  listing rather than trusting the `consistent_list` flag.
+  listing rather than trusting the `consistent_list` flag. This probe
+  drains `list` itself, which `S3Store` implements separately from
+  `list_after` and every catalog scan issues, so the suite covers both
+  methods rather than reaching one only through the other's default.
 - `LexicographicListingOrder`: five keys written in non-sorted order must
   come back in lexicographic key order, and `list_after` must resume
   strictly after its marker in that same order, delivering exactly the keys
   above it. A continuation token only names a position when the order is the
   lexicographic one, which is what `S3Store::list` pagination and every
-  catalog scan built on it assume.
+  catalog scan built on it assume. Both passes judge the raw delivery
+  sequence, repeats included, on the rule the listing bullet above states:
+  a repeat of the last delivered key passes, a repeat of an earlier one
+  fails. Judging a deduplicated sequence instead would qualify a backend
+  whose every drain then fails with `ListOrderViolation`.
 - `CrossPageListing`: five keys written before the first page request must
   all be delivered, as exactly five distinct keys across however many pages
   the backend serves, with none lost between pages. Repeat deliveries are

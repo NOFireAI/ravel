@@ -23,7 +23,9 @@ use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::erasure::compute_compaction_input_set_hash;
 use ravel_commit::keys::{self, BucketEntry};
 use ravel_commit::record;
-use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
+use ravel_object_store::{
+    DrainStep, GetRange, MAX_LIST_PAGES, ObjectMeta, ObjectStoreBackend, StoreError, drain_pages,
+};
 use ravel_proto::commit::v1::{CommitRecord, CompactionInputIdentity};
 use ravel_segment::{
     ExemplarInput, FooterLocation, FooterOutcome, ReaderLimits, ValueKind, decode_catalog_v4,
@@ -73,8 +75,9 @@ pub async fn list_bucket(store: &dyn ObjectStoreBackend, bucket: &Bucket) -> Res
 
 /// [`list_bucket`], counting each listing page into `ledger`'s
 /// [`RequestPhase::List`] (ADR-0996 task 996-8). The listing drain is the same
-/// one [`ravel_object_store::list_all`] performs; it is spelled out here only so
-/// the per-page request count is recorded where the page is fetched, rather than
+/// one [`ravel_object_store::list_all`] performs, through the same
+/// [`ravel_object_store::drain_pages`]; the only difference is a per-page hook,
+/// so the request count is recorded where the page is fetched rather than
 /// inferred afterwards from a total.
 pub async fn list_bucket_with_ledger(
     store: &dyn ObjectStoreBackend,
@@ -109,33 +112,36 @@ pub async fn list_bucket_with_ledger(
 }
 
 /// Drain every page of a listing, deduplicating by key per the cross-page
-/// guarantee, recording one [`RequestPhase::List`] request per page. Byte for
-/// byte the behaviour of [`ravel_object_store::list_all`]; only the counting
-/// hook is added, and a listing response body is not visible at the store seam,
-/// so no byte figure moves.
+/// guarantee, recording one [`RequestPhase::List`] request per page.
+///
+/// Byte for byte the behaviour of [`ravel_object_store::list_all`]: both drain
+/// through [`ravel_object_store::drain_pages`] with the same page ceiling, so
+/// the dedup, the order check, and the typed refusal of a backend that repeats
+/// its continuation token are identical. Only the counting hook is added, and a
+/// listing response body is not visible at the store seam, so no byte figure
+/// moves.
 async fn list_all_counted(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
     ledger: Option<&RequestLedger>,
 ) -> Result<Vec<ObjectMeta>> {
     let mut out: Vec<ObjectMeta> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut page_token = None;
-    loop {
-        // Recorded before the error check: a failed page was still spent.
-        let page = store.list(prefix, page_token).await;
-        note_metadata(ledger, RequestPhase::List);
-        let page = page?;
-        for meta in page.objects {
-            if seen.insert(meta.key.clone()) {
-                out.push(meta);
-            }
-        }
-        match page.next {
-            Some(next) => page_token = Some(next),
-            None => break,
-        }
-    }
+    drain_pages(
+        prefix,
+        None,
+        MAX_LIST_PAGES,
+        |_start_after, page_token| async move {
+            // Recorded before the error check: a failed page was still spent.
+            let page = store.list(prefix, page_token).await;
+            note_metadata(ledger, RequestPhase::List);
+            Ok(page?)
+        },
+        |meta: ObjectMeta| -> Result<DrainStep> {
+            out.push(meta);
+            Ok(DrainStep::Continue)
+        },
+    )
+    .await?;
     Ok(out)
 }
 
@@ -779,5 +785,108 @@ mod tests {
                 "dropping section kind {dropped} must fail closed, got {got:?}"
             );
         }
+    }
+    /// Hands out the same continuation token on every `list` call, with one
+    /// in-order key per page: the spinning backend `list_all_counted` used to
+    /// page against forever before it drained through
+    /// [`ravel_object_store::drain_pages`].
+    struct RepeatingTokenStore {
+        calls: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RepeatingTokenStore {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: bytes::Bytes,
+            _opts: ravel_object_store::PutOptions,
+        ) -> std::result::Result<ravel_object_store::PutOutcome, StoreError> {
+            Err(StoreError::Permanent("put not supported".to_string()))
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+            _range: GetRange,
+        ) -> std::result::Result<ravel_object_store::GetOutcome, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        async fn head(&self, _key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            _page: Option<ravel_object_store::PageToken>,
+        ) -> std::result::Result<ravel_object_store::ListPage, StoreError> {
+            let seq = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(ravel_object_store::ListPage {
+                objects: vec![ObjectMeta {
+                    key: format!("{prefix}{seq:08}"),
+                    size: 0,
+                    etag: ravel_object_store::Etag(String::new()),
+                    version: ravel_object_store::Version(String::new()),
+                    last_modified_unix_ms: 0,
+                }],
+                next: Some(ravel_object_store::PageToken("stuck".to_string())),
+            })
+        }
+
+        async fn list_delimited(
+            &self,
+            _prefix: &str,
+        ) -> std::result::Result<ravel_object_store::DelimitedList, StoreError> {
+            Err(StoreError::Permanent(
+                "list_delimited not supported".to_string(),
+            ))
+        }
+
+        async fn delete(&self, _key: &str) -> std::result::Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            ravel_object_store::Capabilities::mandatory()
+        }
+    }
+
+    /// #1448 finding 2: `list_all_counted` claimed to be `list_all` plus a
+    /// counting hook while draining with no bound of its own. A backend that
+    /// repeats its continuation token must now stop it after exactly two
+    /// pages with the typed store error, having recorded exactly one
+    /// `RequestPhase::List` request per page issued.
+    #[tokio::test]
+    async fn list_all_counted_refuses_a_repeated_continuation_token() {
+        let store = RepeatingTokenStore {
+            calls: std::sync::atomic::AtomicU64::new(0),
+        };
+        let ledger = RequestLedger::new();
+
+        let err = list_all_counted(&store, "t/bucket/", Some(&ledger))
+            .await
+            .expect_err("a repeated continuation token must be a typed error");
+        assert!(
+            matches!(
+                &err,
+                MaintainError::Store(StoreError::ListRepeatedToken { prefix })
+                    if prefix == "t/bucket/"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.calls.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the drain detects the repeat on the second page and issues no third"
+        );
+        assert_eq!(
+            ledger.report().phase(RequestPhase::List).requests,
+            2,
+            "the per-page counting hook fired once per page issued"
+        );
     }
 }
