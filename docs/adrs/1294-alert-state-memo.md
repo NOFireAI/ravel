@@ -79,8 +79,16 @@ transitions written since the memo rather than the whole history.
    **seal-bound hour** as the new `watermark_hour`, using `PutMode::Overwrite`.
    Only the lease holder writes, so there is a single writer per key and no CAS
    is needed. The write is debounced: a tick that changed neither the watermark
-   hour nor any record writes nothing. A failed write is logged and ignored; it
-   costs the next tick a full fold, never correctness.
+   hour nor any record writes nothing. A failed write is logged and the memo is
+   left as it was: `write_alert_state_memo` never clears or deletes the prior
+   object, so if the `Overwrite` fails before it replaces the object, the
+   previous memo stays readable and the next tick reads it and folds only the
+   tail over it, exactly as it would over any successful memo. A full fold
+   happens only when no readable memo exists at all: a cold start, or an absent,
+   undecodable, unsupported-version, or duplicate-`alert_id` memo. A write that
+   merely failed does not produce that state, so it does not force a full fold.
+   Correctness holds either way, because the tail LIST re-reads every hour at or
+   above the surviving memo's watermark.
 
    The seal-bound hour, not `hour_bucket(now_ns)`, is what the watermark may
    advance to. The alert lease permits a two-holder overlap (`acquire_lease`):
@@ -123,6 +131,52 @@ decision 3): a self-owned, `Overwrite`, versioned-tag, advisory,
 reconstructible snapshot beside the data it summarises, where losing or staling
 the snapshot costs at most a rescan. This memo is the same pattern, scoped
 per tenant rather than per maintenance worker.
+
+### Memo growth and the retention contract (issue #1438)
+
+`fold_latest` seeds the memo from the fold's output with no active-rule filter,
+so every `alert_id` that has ever appeared in the tenant's transition history is
+carried forward, including alert_ids for rules that were later deleted and for
+label sets that a rule has since changed away from (a label change moves the rule
+to a new `alert_id`, leaving the old one folded from history). This is required
+for correctness, not an oversight: the seed-plus-tail invariant holds only if the
+seed contains *every* below-watermark folded record. Dropping an old record here
+(say an old `Resolved`) would make the memo fold differ from a full fold, and on
+a later refire `evaluate_transition` would see no prior record and
+`write_alert_record` could lose the lifecycle generation.
+
+The true growth bound is therefore: the memo holds one entry per distinct alert
+identity ever configured for the tenant (one per rule, and one more per historical
+label set of a rule), never one per tick and never one per transition. A tenant
+with a fixed rule set has a memo whose size is fixed at the rule count regardless
+of how long it runs or how often its alerts flap; only churning the rule set or a
+rule's labels grows it, and only by the count of distinct identities that churn
+produces.
+
+Pruning that growth is deliberately out of scope here and is tracked as
+issue #1438. When it lands it is a versioned change, not an in-place edit, and it
+must keep these invariants:
+
+- **Prune only into a compact form, never by deletion.** An identity outside the
+  configured rule set may be replaced by a compact record that preserves at least
+  its lifecycle `generation` and its last `state`, so a refire still finds a prior
+  record and `write_alert_record` still advances the generation. A pruned identity
+  may not simply vanish from the memo.
+- **Below-watermark completeness still holds.** After a prune the seed must still
+  represent every below-watermark identity (in full or compact form), so the
+  seed-plus-tail fold still equals a full fold for every identity the tail does
+  not re-read.
+- **Reader before writer, ADR-0066 Class A discipline.** The compact form is a new
+  memo body shape, so it bumps the memo's `format_version` to 2. A reader that
+  accepts the read set exactly `{1, 2}` must be deployed across the fleet before
+  any process writes a version-2 memo; only once every reader accepts 2 may the
+  writer flip to emitting it. This is the readers-before-writers rollout ADR-0066
+  Class A defines, applied to the memo's own version tag. Until then the reader's
+  supported set stays `{1}` and an unrecognized future body falls back to a full
+  fold exactly as any unsupported version does.
+
+Issue #1438 is the tracked implementation of that pruning; this ADR only states
+the bound and freezes the contract the implementation must meet.
 
 ### Data flow
 
@@ -237,10 +291,18 @@ within `alerting.rs`, so it is preferred here.
   defaults), the tail covers not just the current hour but every hour within that
   seal margin, so `T` counts transitions in that trailing window rather than only
   the current hour. For a quiet tenant whose last transition is older than the
-  seal margin, `T` is 0 and the tick is exactly 2 GETs and 1 LIST; a transition
-  is re-read for the few ticks until it falls below the widened watermark. This is
-  the honest bound after the seal-bound watermark; the earlier "current hour only"
-  figure did not account for the lease overlap and could lose a late transition.
+  seal margin, `T` is 0 and the tick is exactly 2 GETs and 1 LIST. The watermark
+  advances only at hour granularity (it is `seal_bound_hour(now_ns)`, an ingest
+  hour), so a transition written near the start of an hour H stays in the tail
+  until the watermark passes H entirely, not merely for a few ticks: the re-read
+  duration approaches a whole hour plus the seal margin (three evaluation
+  intervals plus thirty seconds at the defaults). So `T` can cover nearly the
+  whole current hour, not just the last few ticks' worth of transitions. The
+  per-tick bound is unchanged regardless: each such tick still costs one memo
+  GET, one lease GET, one tail LIST, and `2T` GETs for the `T` transitions the
+  tail covers. This is the honest bound after the seal-bound watermark; the
+  earlier "current hour only" figure did not account for the lease overlap and
+  could lose a late transition.
 - A cold, absent, corrupt, or unsupported-version memo pays a one-time full fold
   and then rewrites a valid memo, so the expensive path is self-healing and
   bounded to the tick that hit it.
