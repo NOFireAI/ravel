@@ -427,6 +427,39 @@ else
     ok
 fi
 
+# --- (n) traceability: zero resolved rows fails, naming the area (issue #1356)
+# check_traceability used to report PASS on a table with only a header row
+# and no data rows, since it asserted rc -eq 0 without checking count > 0. An
+# area whose table lost every row (a bad edit, a rebase) would then pass
+# silently.
+echo "--- (n) traceability: zero resolved rows fails, naming the area"
+nrepo="$(mktemp -d)"
+mkdir -p "$nrepo/crates" "$nrepo/formal/tla/emptyarea"
+cat > "$nrepo/formal/tla/emptyarea/traceability.md" <<'EOF'
+# Empty area traceability
+
+| TLA+ action or property | meaning | Rust path and symbol | existing test | new test needed |
+|---|---|---|---|---|
+EOF
+
+orig_repo_root2="$REPO_ROOT"
+orig_formal_dir2="$FORMAL_DIR"
+REPO_ROOT="$nrepo"
+FORMAL_DIR="$nrepo/formal/tla"
+
+nout="$(check_traceability emptyarea 2>&1)"
+ncode=$?
+if [ "$ncode" -ne 0 ]; then ok; else bad "n: expected nonzero exit on zero resolved rows, got 0; output: $nout"; fi
+if printf '%s' "$nout" | grep -qF "emptyarea traceability"; then
+    ok
+else
+    bad "n: expected the failure message to name the area 'emptyarea'; output: $nout"
+fi
+
+REPO_ROOT="$orig_repo_root2"
+FORMAL_DIR="$orig_formal_dir2"
+rm -rf "$nrepo"
+
 rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
