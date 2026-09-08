@@ -1281,6 +1281,13 @@ async fn logs_query_stats_report_the_lane_segments_pruned() {
          pruned by fetch_log_series's own time-range check, not the \
          catalog resolve's structural 0 for this lane"
     );
+    assert_eq!(
+        stats.segments_fetched, 2,
+        "seg2 (BASE+95s) and seg3 (BASE+105s) are the only two of the five \
+         resolved segments inside [BASE+90s, BASE+110s]; a single-plan \
+         query must report exactly the fetched set, not a count that lost \
+         track of which segments they were"
+    );
 }
 
 #[tokio::test]
@@ -1317,5 +1324,111 @@ async fn logs_query_stats_segments_pruned_zero_when_window_covers_every_segment(
         stats.segments_pruned, 0,
         "the window covers every segment, so the lane figure must be 0, \
          not the segment total"
+    );
+    assert_eq!(
+        stats.segments_fetched, 5,
+        "all 5 published segments are resolved and inside the window, so \
+         the lane must report all 5 as fetched -- a resolve that silently \
+         returned nothing must not pass the zero-pruned case above by \
+         also fetching nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1228 fix-round: the log lane's fetched/pruned figures must be
+// set-based over the union of segments any plan in the lane fetched, not a
+// per-plan sum or max. Every plan in a log lane re-walks the SAME
+// `log_snapshot.segments` slice, so a plan-summed `segments_pruned` (the
+// pre-fix-round code) double-counts a segment pruned by more than one plan,
+// and a plan-maxed `segments_fetched` under-counts a segment fetched by only
+// one of several plans -- either way `segments_pruned + segments_fetched`
+// can land above or below `log_snapshot.segments.len()`.
+// ---------------------------------------------------------------------------
+
+/// The reviewer's worked example that blocked the previous fix-round commit
+/// (beb90166): two log plans over the two-object `fixture()`, each pruning
+/// the OTHER plan's segment at STREAM_DIR (`job="api"` prunes `fixture-b`,
+/// `job="worker"` prunes `fixture-a`) and fetching its own. Summing each
+/// plan's `segments_pruned` reports pruned=2 over a 2-segment snapshot on a
+/// query that pruned nothing at all; maxing `segments_fetched` across plans
+/// (fetched=1/pruned=0 for one plan, fetched=0/pruned=1 for the other, so
+/// max+max = 1+1 = 2) still lands pruned+fetched=4 over 2 segments. Against
+/// beb90166 this assertion fails with `segments_fetched == 1,
+/// segments_pruned == 2` (the flipped line is the `log_segments_pruned +=
+/// out.segments_pruned as u64;` next to `log_segments_fetched =
+/// log_segments_fetched.max(out.segments_fetched as u64);` in
+/// `QueryEngine::prefetch`'s log lane, `engine.rs`). The union-based fix
+/// reports the true set: both segments are fetched by SOME plan, so
+/// fetched=2 and pruned=0 exactly.
+#[tokio::test]
+async fn two_log_plans_that_prune_different_segments_report_the_union() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    fixture(&store, th).await;
+    let (engine, _tid) = build_engine(store, EngineConfig::default());
+
+    let (_value, stats) = engine
+        .instant_with_stats(
+            th,
+            r#"count_over_time(ravel_log_lines{job="api"}[1h]) or count_over_time(ravel_log_lines{job="worker"}[1h])"#,
+            ms(BASE + 20 * NS),
+            &[],
+            NOW_NS,
+            DEADLINE,
+        )
+        .await
+        .expect("query succeeds");
+
+    assert_eq!(
+        stats.segments_fetched, 2,
+        "fixture-a is fetched by the job=\"api\" plan and fixture-b by the \
+         job=\"worker\" plan; the union of what any plan fetched is both \
+         segments"
+    );
+    assert_eq!(
+        stats.segments_pruned, 0,
+        "every segment in the 2-segment snapshot was fetched by some plan, \
+         so nothing was actually pruned from the lane's perspective, even \
+         though each individual plan pruned one segment of its own"
+    );
+}
+
+/// A single-plan query whose selector matches no stream in one of the two
+/// resolved segments, so the prune happens at STREAM_DIR (`matching_streams
+/// .is_empty()` in `fetch_log_series`) -- the path an ordinary query hits,
+/// as opposed to the time-window prune, which the catalog resolve already
+/// filters out before `fetch_log_series` ever sees the segment in normal
+/// operation (see `logs_query_stats_report_the_lane_segments_pruned`'s
+/// `min_tokens` workaround to force a time-window prune to reach this lane
+/// at all).
+#[tokio::test]
+async fn stream_dir_prune_counts_toward_segments_pruned() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    fixture(&store, th).await;
+    let (engine, _tid) = build_engine(store, EngineConfig::default());
+
+    let (_value, stats) = engine
+        .instant_with_stats(
+            th,
+            r#"count_over_time(ravel_log_lines{job="api"}[1h])"#,
+            ms(BASE + 20 * NS),
+            &[],
+            NOW_NS,
+            DEADLINE,
+        )
+        .await
+        .expect("query succeeds");
+
+    assert_eq!(
+        stats.segments_fetched, 1,
+        "only fixture-a matches job=\"api\" at STREAM_DIR"
+    );
+    assert_eq!(
+        stats.segments_pruned, 1,
+        "fixture-b is pruned at STREAM_DIR: its only stream is \
+         service.name=worker, which never matches job=\"api\""
     );
 }

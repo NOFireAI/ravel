@@ -1892,9 +1892,12 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   pre-existing per-run `rawF64Pages`/`rawF64Bytes`. No `segmentsPruned`
   here: `stats.segmentsPruned` (below) is the sole source. For the metrics
   lane it is `Catalog::resolve`'s own postings-pruning count; for the log
-  lane it is `fetch_log_series`'s own per-segment pruning (time-window and
-  stream-directory checks), since the log lane's own catalog resolve passes
-  no name filter and so never prunes there.
+  lane it is set-based over the lane's resolved snapshot, unioning each
+  plan's `fetch_log_series` fetch (time-window and stream-directory checks
+  survived) across every plan the lane ran: a segment fetched by any plan
+  counts once as fetched, and `segmentsPruned` is the rest of the resolved
+  set, since the log lane's own catalog resolve passes no name filter and
+  so never prunes there.
 - `stats.estimate`: the `CostEstimate`, carrying `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
