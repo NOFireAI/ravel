@@ -8,9 +8,11 @@
 //! one of these calls (ADR-1374 decision 7). Taking a second permit here
 //! would deadlock a deployment whose ceiling is 1.
 //!
-//! Nothing here spawns. The service call is awaited on the transport's own
-//! task, so a dropped stream drops the engine call and the usage guard inside
-//! the service bills what the dropped future had already spent.
+//! Nothing here spawns: the service call is awaited on the same task the tool
+//! future runs on, so cancelling that future cancels the engine call and the
+//! usage guard inside the service bills what it had already spent. Which
+//! client actions reach that future is a per-revision property of rmcp's
+//! transport, stated in [`super`].
 //!
 //! Two figures the service outcomes do not carry are absent rather than
 //! invented. The metadata operations (`labels`, `label_values`, `series`)
