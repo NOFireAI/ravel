@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **RavelClusters without a deployment key must now reference an audit token
+  key Secret through `spec.auditTokenKeySecretRef`.** Until they do, the
+  operator reports `AuditTokenKeyMissing` and leaves the query Deployment as
+  it is. Clusters with `deploymentKeySecretRef` need no action.
+
 ## [0.15.0] - 2026-09-08
 
 ### Added
