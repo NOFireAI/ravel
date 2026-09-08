@@ -1,9 +1,10 @@
 # MCP tools reference
 
 > This page describes the surface as designed. The tools ship behind the
-> `mcp` cargo feature and the `--mcp` flag, both off by default.
+> `mcp` cargo feature and the `--mcp` flag, both off by default. The
+> `POST /mcp` route does not exist until the feature ships.
 
-Every route below is served over `POST /mcp`, using the Model Context
+Every route below will be served over `POST /mcp`, using the Model Context
 Protocol. A reader who knows which tool they want comes here for its exact
 shape: what it takes, what it returns, its bounds, and the failure classes
 it can produce. See [the agents guide](../guides/agents.md) for the
@@ -16,14 +17,14 @@ the envelope, and the empty-result checklist.
 | Tool | Purpose | Inputs | Output blocks used | Bounds | Failure classes |
 | --- | --- | --- | --- | --- | --- |
 | `ravel_capabilities` | Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `unauthorized`, `internal` |
-| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal` | `data`, `scope`, `visibility`, `coverage` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `internal` |
-| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter, `time_range` (required). An unfiltered tenant-wide list is refused | `data`, `scope`, `coverage` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal`, an optional `cursor` | `data`, `scope`, `visibility`, `coverage` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `internal` |
+| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter, `time_range` (required), an optional `evidence_ref`. An unfiltered tenant-wide list is refused | `data`, `scope`, `coverage` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
-| `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent | `data`, `scope`, `coverage`, `accuracy`, `budget` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
-| `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required) | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_get_trace` | Spans of one trace id, the span tree, missing parents, orphans | `trace_id`, `time_range` (required), an optional logs pass | `data`, `scope`, `coverage`, `presentation`, `budget` | the shared budgets in the section below | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result | `query`, `time_range`, `step`, `op` | `data`, `accuracy`, `budget` | reports the minimum point count the method needs | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `deadline`, `unavailable`, `internal` |
+| `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent, an optional `evidence_ref` | `data`, `scope`, `coverage`, `accuracy`, `budget` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
+| `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required), an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_get_trace` | Spans of one trace id, the span tree, missing parents, orphans | `trace_id`, `time_range` (required), an optional logs pass, an optional `evidence_ref` | `data`, `scope`, `coverage`, `presentation`, `budget` | the shared budgets in the section below | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result | `query`, `time_range`, `step`, `op`, an optional `evidence_ref` | `data`, `accuracy`, `budget` | reports the minimum point count the method needs | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `deadline`, `unavailable`, `internal` |
 <!-- mcp-tools:end -->
 
 ## The envelope
@@ -120,7 +121,8 @@ trace id, span id, and a body hash. That tuple is not unique, because
 `logs` rows carry no row identity and ingest is at-least-once. When a
 page would end inside a group of equal tuples, the tool drops the whole
 group from the page instead of splitting it, and the cursor resumes
-after the group.
+after the group. The second page is requested by passing the cursor
+from `presentation.cursor` back as `cursor`, with the same arguments.
 
 `ravel_get_trace` orders by `(start_ts, span_id)`, which is unique, so
 the equal-group rule never applies to it.
@@ -128,11 +130,20 @@ the equal-group rule never applies to it.
 When no complete group fits in the row cap, the server returns the
 rows it has, up to the row cap, with status `ok_bounded` and no cursor.
 
-An evidence reference is a token of the same family, with a `sha256` of the
-canonical row bytes added. Redeeming it while its pin is valid re-executes
-against the pin and compares hashes. After the pin expires, redemption
-re-executes fresh, reports `pinned: false`, and reports whether the hash
-still matches.
+`ravel_describe_data` also pages with a cursor. The response carries
+`presentation.cursor` when more families exist. Request the next page
+with the same signal and that cursor. The cursor follows the same codec,
+tenant binding, and lifetime as every other cursor.
+
+Every data tool accepts an optional `evidence_ref` input. Redeeming a
+reference re-executes the tool with the reference's own arguments. The
+re-execution runs against the reference's pinned snapshot while the pin is
+valid. The server then compares the sha256 of the canonical row bytes.
+After the pin expires, redemption re-executes fresh instead of using the
+pin. It reports `pinned: false` and states whether the hash matched.
+`cursor_invalid` and `cursor_expired` do not apply to an evidence reference
+after its pin expires. A fresh re-execution runs instead of either
+failure.
 
 ## Budget defaults and floors
 
@@ -152,15 +163,15 @@ raise a value past its ceiling.
 
 ## Protocol headers per revision
 
-The server serves both listed protocol revisions on the same `POST /mcp`
-endpoint and re-authenticates every request against the bearer credential
-regardless of revision. The `Origin` header is validated against the
-server's allowed-origins configuration on every request.
+The server will serve both listed protocol revisions on the same `POST
+/mcp` endpoint. It will re-authenticate every request against the bearer
+credential regardless of revision. The `Origin` header will be validated
+against the server's allowed-origins configuration on every request.
 
 | Revision | Handshake | Headers this revision requires | Session |
 | --- | --- | --- | --- |
 | `2026-07-28` | none | `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` | none; each call stands alone |
 | `2025-11-25` | `initialize` | `MCP-Protocol-Version` required, not `Mcp-Method` or `Mcp-Name` | `Mcp-Session-Id`, held in server memory |
 
-A request that mismatches its own revision's header rule fails before the
-tool layer runs.
+A request that mismatches its own revision's header rule will fail before
+the tool layer runs.
