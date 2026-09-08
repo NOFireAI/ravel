@@ -4856,7 +4856,6 @@ dependencies = [
  "base64 0.23.0",
  "blake3",
  "proptest",
- "ravel-catalog",
  "ravel-query",
  "ravel-sql",
  "ravel-types",

@@ -163,6 +163,11 @@ pub use metadata_agg::{METADATA_ONLY_AGGREGATE_RULE, MetadataOnlyAggregate, Meta
 pub use output::QueryOutput;
 pub use provider::RavelTableProvider;
 pub use pushdown::Pushdown;
+/// Re-exported beside [`SegmentPin`], whose `level` field has this type: a
+/// caller of the pin codec would otherwise need its own `ravel-catalog`
+/// dependency to name a value it can already read off the struct.
+#[cfg(feature = "pin-codec")]
+pub use ravel_catalog::SegmentLevel;
 pub use redact::{RedactError, redact};
 pub use schema::{internal_schema, public_schema};
 pub use session::{
