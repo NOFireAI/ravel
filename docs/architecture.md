@@ -198,7 +198,7 @@ server starts, which proves the backend honours the semantics the commit
 protocol depends on before any data rides on them. On Kubernetes the
 operator makes that run itself: before it creates any serving Deployment for
 a `RavelCluster`, it applies a one-shot `<cluster>-qualify` Job running
-`ravel store qualify` against that cluster's bucket and gates the gateway,
+`ravel-cli store qualify` against that cluster's bucket and gates the gateway,
 query, and maintain Deployments on the Job completing, so a cluster never
 comes up as three tiers crash-looping on a backend that fails the contract.
 It records the qualified inputs (bucket, region, endpoint, image, the

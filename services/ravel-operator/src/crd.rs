@@ -740,7 +740,7 @@ pub struct RavelClusterStatus {
 
     /// The qualify-Job input hash (bucket, region, endpoint, image, credentials
     /// Secret name) that store qualification last succeeded against (issue #36).
-    /// The operator gates serving on `ravel store qualify` before it creates any
+    /// The operator gates serving on `ravel-cli store qualify` before it creates any
     /// Deployment; recording the qualified inputs here makes that gate durable:
     /// a later pass whose inputs still hash to this value proceeds without
     /// re-running qualification even after the one-shot Job has been
@@ -751,6 +751,28 @@ pub struct RavelClusterStatus {
     /// change re-triggers it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_qualified_hash: Option<String>,
+
+    /// Consecutive qualify-Job failures for the current inputs (issue #36, finding
+    /// 3). Drives the capped exponential recreation backoff and the terminal
+    /// cooldown: the operator does not recreate a failing qualify Job unboundedly,
+    /// it spaces the recreations out and, past a threshold, holds. Reset to absent
+    /// on a successful qualification and on any input change (a moving
+    /// `storeQualifiedHash` input); never part of the qualified-input hash, so
+    /// counting failures never re-runs a qualification that would otherwise pass.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it on success; a skipped field would leave a stale count behind.
+    #[serde(default)]
+    pub qualify_failure_count: Option<i32>,
+
+    /// RFC3339 instant before which the operator creates no new qualify Job after
+    /// a failure (issue #36, finding 3): the next point on the capped exponential
+    /// backoff, or the terminal cooldown's expiry. Absent when not holding.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it; a skipped field would leave a stale deadline behind.
+    #[serde(default)]
+    pub qualify_next_retry_time: Option<String>,
 
     /// Standard Kubernetes conditions: `Available`, `Progressing`, `Degraded`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

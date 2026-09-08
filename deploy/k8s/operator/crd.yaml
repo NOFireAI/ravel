@@ -600,6 +600,17 @@
                     "nullable": true,
                     "type": "integer"
                   },
+                  "qualifyFailureCount": {
+                    "description": "Consecutive qualify-Job failures for the current inputs (issue #36, finding\n3). Drives the capped exponential recreation backoff and the terminal\ncooldown: the operator does not recreate a failing qualify Job unboundedly,\nit spaces the recreations out and, past a threshold, holds. Reset to absent\non a successful qualification and on any input change (a moving\n`storeQualifiedHash` input); never part of the qualified-input hash, so\ncounting failures never re-runs a qualification that would otherwise pass.\n\nSerialized even when absent (as explicit `null`) so the status merge patch\nclears it on success; a skipped field would leave a stale count behind.",
+                    "format": "int32",
+                    "nullable": true,
+                    "type": "integer"
+                  },
+                  "qualifyNextRetryTime": {
+                    "description": "RFC3339 instant before which the operator creates no new qualify Job after\na failure (issue #36, finding 3): the next point on the capped exponential\nbackoff, or the terminal cooldown's expiry. Absent when not holding.\n\nSerialized even when absent (as explicit `null`) so the status merge patch\nclears it; a skipped field would leave a stale deadline behind.",
+                    "nullable": true,
+                    "type": "string"
+                  },
                   "queryReadyReplicas": {
                     "description": "Ready replicas reported by the query Deployment.",
                     "format": "int32",
@@ -607,7 +618,7 @@
                     "type": "integer"
                   },
                   "storeQualifiedHash": {
-                    "description": "The qualify-Job input hash (bucket, region, endpoint, image, credentials\nSecret name) that store qualification last succeeded against (issue #36).\nThe operator gates serving on `ravel store qualify` before it creates any\nDeployment; recording the qualified inputs here makes that gate durable:\na later pass whose inputs still hash to this value proceeds without\nre-running qualification even after the one-shot Job has been\nTTL-garbage-collected, and a pass whose inputs no longer match re-runs it\n(the `StoreQualified` condition flips back to `Pending`) without tearing\ndown the running Deployments. Absent until the first qualification\nsucceeds. Qualification is never re-run on a schedule; only an input\nchange re-triggers it.",
+                    "description": "The qualify-Job input hash (bucket, region, endpoint, image, credentials\nSecret name) that store qualification last succeeded against (issue #36).\nThe operator gates serving on `ravel-cli store qualify` before it creates any\nDeployment; recording the qualified inputs here makes that gate durable:\na later pass whose inputs still hash to this value proceeds without\nre-running qualification even after the one-shot Job has been\nTTL-garbage-collected, and a pass whose inputs no longer match re-runs it\n(the `StoreQualified` condition flips back to `Pending`) without tearing\ndown the running Deployments. Absent until the first qualification\nsucceeds. Qualification is never re-run on a schedule; only an input\nchange re-triggers it.",
                     "nullable": true,
                     "type": "string"
                   }
