@@ -518,13 +518,36 @@ impl QueryService {
         Ok(ExemplarsOutcome { series, stats })
     }
 
-    /// `POST /api/v1/sql`: one read-only SQL statement.
+    /// Step 2 for the SQL surface: the request as it will actually run, with
+    /// its wall deadline lowered to `SqlState::max_deadline` and its budgets
+    /// lowered to the executor's configured ceilings.
     ///
-    /// The wall deadline and the per-request budgets are already clamped on
-    /// the [`SqlRequest`](ravel_sql::SqlRequest) the transport built (its
-    /// `timeout` can only lower `SqlState::max_deadline`), so step 2 is a
-    /// no-op reassertion here rather than a second clamp with a different
-    /// ceiling.
+    /// The HTTP transport clamps the deadline too, and the executor re-clamps
+    /// the budgets through `RequestBudgets::clamp`, which is idempotent. Both
+    /// stay. What the layer owes is that the clamp holds for every caller of
+    /// the operation, not only for the ones that happen to clamp first: the
+    /// MCP adapter (issue #1381) builds a `SqlRequest` directly, and an
+    /// operation whose only clamp lives in one of its transports has no clamp
+    /// at all from the others.
+    #[cfg(feature = "sql")]
+    pub(crate) fn clamped_sql_request(
+        &self,
+        state: &crate::sql::SqlState,
+        request: &ravel_sql::SqlRequest,
+    ) -> ravel_sql::SqlRequest {
+        ravel_sql::SqlRequest {
+            deadline: self
+                .controls
+                .clamp_deadline(request.deadline, state.max_deadline),
+            budgets: Some(
+                self.controls
+                    .clamp_budgets(request.budgets.as_ref(), &state.executor.config().engine),
+            ),
+            ..request.clone()
+        }
+    }
+
+    /// `POST /api/v1/sql`: one read-only SQL statement.
     #[cfg(feature = "sql")]
     pub async fn sql_execute(
         &self,
@@ -537,6 +560,7 @@ impl QueryService {
             .ok_or_else(|| ServiceError::unsupported_surface("SQL"))?;
 
         let _permit = self.controls.admit()?;
+        let request = &self.clamped_sql_request(state, request);
         let live = ravel_sql::LiveAccounting::new();
         let guard = self
             .controls
@@ -589,6 +613,7 @@ impl QueryService {
             .ok_or_else(|| ServiceError::unsupported_surface("SQL"))?;
 
         let _permit = self.controls.admit()?;
+        let request = &self.clamped_sql_request(state, request);
         // An explain resolves a snapshot, so it spends store requests and is
         // accounted like any other read.
         let accounting = QueryAccounting::new();

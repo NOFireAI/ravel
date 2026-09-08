@@ -882,3 +882,103 @@ async fn unauthenticated_request_consumes_no_permit() {
         .expect("the ceiling has its permit back");
     assert_eq!(h.usage.records().len(), 1);
 }
+
+/// Step 2 on the SQL surface, which used to skip it: `sql_execute` and
+/// `sql_explain` took the request's own deadline and budgets as given and
+/// relied on the HTTP transport having clamped them first.
+///
+/// The clamp is asserted on the request the layer builds, not on an executed
+/// statement, because the executor re-clamps the same budgets against the same
+/// config through `RequestBudgets::clamp`, which is idempotent: no outcome
+/// distinguishes a service that clamped from one that did not. What the layer
+/// owes is that the clamp holds for a caller that is not the HTTP transport,
+/// and the MCP adapter (issue #1381) building a `SqlRequest` directly is
+/// exactly that caller.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn sql_explain_clamps_the_deadline_and_budgets() {
+    let h = harness_with_sql_deadline(
+        Arc::new(MemoryStore::new()),
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(NoopQueryAuditSink),
+        None,
+        Duration::from_secs(5),
+    );
+    let state = &h.transports.sql;
+
+    // A caller asking for more than the server allows on every dimension. Each
+    // value comes back as the server's own, exactly.
+    let greedy = ravel_sql::SqlRequest {
+        deadline: Duration::from_secs(600),
+        budgets: Some(ravel_query::RequestBudgets {
+            max_bytes_scanned: Some(ravel_query::ByteLimit::Unlimited),
+            max_store_requests: Some(ravel_query::RequestLimit::Unlimited),
+            max_segments: Some(1_000_000),
+        }),
+        ..sql_request("SELECT 1")
+    };
+    let clamped = h.service.clamped_sql_request(state, &greedy);
+    assert_eq!(clamped.deadline, Duration::from_secs(5));
+    let budgets = clamped
+        .budgets
+        .expect("the layer resolves budgets rather than leaving them absent");
+    assert_eq!(
+        budgets.max_bytes_scanned,
+        Some(ravel_query::ByteLimit::Bounded(64 << 20)),
+    );
+    assert_eq!(
+        budgets.max_store_requests,
+        Some(ravel_query::RequestLimit::Bounded(4_096)),
+    );
+    assert_eq!(budgets.max_segments, Some(512));
+
+    // Lowering only: a caller under every ceiling keeps its own values.
+    let modest = ravel_sql::SqlRequest {
+        deadline: Duration::from_secs(2),
+        budgets: Some(ravel_query::RequestBudgets {
+            max_bytes_scanned: Some(ravel_query::ByteLimit::Bounded(1 << 20)),
+            max_store_requests: Some(ravel_query::RequestLimit::Bounded(7)),
+            max_segments: Some(3),
+        }),
+        ..sql_request("SELECT 1")
+    };
+    let clamped = h.service.clamped_sql_request(state, &modest);
+    assert_eq!(clamped.deadline, Duration::from_secs(2));
+    let budgets = clamped.budgets.expect("budgets");
+    assert_eq!(
+        budgets.max_bytes_scanned,
+        Some(ravel_query::ByteLimit::Bounded(1 << 20)),
+    );
+    assert_eq!(
+        budgets.max_store_requests,
+        Some(ravel_query::RequestLimit::Bounded(7)),
+    );
+    assert_eq!(budgets.max_segments, Some(3));
+
+    // A caller that named no budgets at all still runs under concrete ones.
+    let clamped = h
+        .service
+        .clamped_sql_request(state, &sql_request("SELECT 1"));
+    let budgets = clamped.budgets.expect("budgets");
+    assert_eq!(
+        budgets.max_bytes_scanned,
+        Some(ravel_query::ByteLimit::Bounded(64 << 20)),
+    );
+    assert_eq!(
+        budgets.max_store_requests,
+        Some(ravel_query::RequestLimit::Bounded(4_096)),
+    );
+    assert_eq!(budgets.max_segments, Some(512));
+
+    // And both operations run the clamped request rather than the caller's:
+    // the greedy deadline above is beyond the ceiling, and neither call
+    // reports one.
+    h.service
+        .sql_explain(h.tenant_hash, &greedy)
+        .await
+        .expect("an explain over an empty store");
+    h.service
+        .sql_execute(h.tenant_hash, &greedy)
+        .await
+        .expect("a statement over an empty store");
+}
