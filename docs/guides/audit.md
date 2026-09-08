@@ -59,9 +59,11 @@ accepting both would let one spelling of a key mean two different keys). With
 that variable unset, the key is derived from the deployment key configured by
 `--tenant-hash-key-file`. If neither is available, a query-serving process
 refuses to start under `redacted` rather than fall back to recording verbatim
-text. Keep the key for as long as the records tokenized under it: a different
-key produces different tokens for the same value, so records written under a
-lost key stay readable but no longer correlate with later ones.
+text. A `gateway` or `maintain` process never reads the key: it writes no
+query-audit record, so it has nothing to tokenize. Keep the key for as long
+as the records tokenized under it: a different key produces different tokens
+for the same value, so records written under a lost key stay readable but no
+longer correlate with later ones.
 
 `--audit-text plaintext` stores the query text verbatim. It is an explicit
 opt-in for a regime that requires the original text, and it puts whatever the

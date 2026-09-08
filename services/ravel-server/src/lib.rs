@@ -1349,7 +1349,7 @@ pub async fn start(
     // same store.
     let mut alert_tasks = alerting::AlertEvalTasks::none();
 
-    if matches!(config.mode, Mode::All | Mode::Query) {
+    if config.mode.installs_query_audit_pipeline() {
         // ADR-0062 decision 2b: one AuditPipeline for the process, shared by
         // every query surface below (SQL, Flight SQL, PromQL, labels,
         // label_values, series, analytics, exemplars) so `kind = query`

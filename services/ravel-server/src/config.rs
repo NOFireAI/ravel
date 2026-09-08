@@ -27,6 +27,20 @@ pub enum Mode {
     Maintain,
 }
 
+impl Mode {
+    /// Whether [`crate::start`] installs a process-wide
+    /// `ravel_maintain::AuditPipeline` for this mode (ADR-0062 decision 2b):
+    /// true only for [`Mode::All`] and [`Mode::Query`], the modes that build a
+    /// query engine. [`Mode::Gateway`] and [`Mode::Maintain`] serve no query
+    /// surface and write no query-audit record, so they never need
+    /// `--audit-text`'s policy resolved. Shared by the resolve site
+    /// ([`resolve_audit_text_policy_for_mode`]) and the install site
+    /// (`start` in lib.rs) so the two cannot drift apart.
+    pub fn installs_query_audit_pipeline(self) -> bool {
+        matches!(self, Mode::All | Mode::Query)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum StoreKind {
     Memory,
@@ -271,6 +285,27 @@ pub fn resolve_audit_text_policy(
     ))
 }
 
+/// [`resolve_audit_text_policy`], gated to the modes that actually install
+/// the query-audit pipeline ([`Mode::installs_query_audit_pipeline`]).
+///
+/// `gateway` and `maintain` write no query-audit record, so resolving the
+/// policy for them must not fail startup for a key those modes never read: a
+/// `redacted`-posture gateway or maintain process on a bucket with no
+/// deployment key would otherwise refuse to start over a subsystem it does
+/// not run. Those modes get [`ravel_maintain::AuditTextPolicy::default()`]
+/// (`Plaintext`), which is never installed anywhere and is inert.
+pub fn resolve_audit_text_policy_for_mode(
+    mode: Mode,
+    audit_text: AuditTextArg,
+    raw_token_key: Option<&str>,
+    deployment_key: Option<&[u8; 32]>,
+) -> anyhow::Result<ravel_maintain::AuditTextPolicy> {
+    if !mode.installs_query_audit_pipeline() {
+        return Ok(ravel_maintain::AuditTextPolicy::default());
+    }
+    resolve_audit_text_policy(audit_text, raw_token_key, deployment_key)
+}
+
 /// Parse a `RAVEL_AUDIT_TOKEN_KEY` value: exactly 64 hex characters. A
 /// wrong-length key is refused rather than padded or truncated, because a key
 /// that is not the operator's key tokenizes every value differently and makes
@@ -362,7 +397,9 @@ pub struct Cli {
     /// 2e): `redacted` (default) tokenizes every literal and label-matcher
     /// value under the key in RAVEL_AUDIT_TOKEN_KEY, or one derived from the
     /// deployment key, and refuses to start with neither; `plaintext` is an
-    /// explicit opt-in to storing verbatim text.
+    /// explicit opt-in to storing verbatim text. Resolved only in the
+    /// query-serving modes (`all` and `query`); `maintain` and `gateway`
+    /// serve no query surface and never read the key.
     #[arg(
         long = "audit-text",
         value_enum,
@@ -3068,14 +3105,20 @@ impl Cli {
     /// (ADR-0062 decision 2e), reading the token key from
     /// [`AUDIT_TOKEN_KEY_ENV`] and falling back to a key derived from
     /// `deployment_key`. Fails startup under `redacted` when neither is
-    /// available; see [`resolve_audit_text_policy`], which holds the logic and
-    /// takes both inputs explicitly.
+    /// available and `self.mode` installs the pipeline; see
+    /// [`resolve_audit_text_policy_for_mode`], which holds the mode gate and
+    /// the logic and takes every input explicitly.
     pub fn resolve_audit_text_policy(
         &self,
         deployment_key: Option<&[u8; 32]>,
     ) -> anyhow::Result<ravel_maintain::AuditTextPolicy> {
         let raw = std::env::var(AUDIT_TOKEN_KEY_ENV).ok();
-        resolve_audit_text_policy(self.audit_text, raw.as_deref(), deployment_key)
+        resolve_audit_text_policy_for_mode(
+            self.mode,
+            self.audit_text,
+            raw.as_deref(),
+            deployment_key,
+        )
     }
 
     /// Parse `--max-concurrent-queries` into a [`ravel_query::QueryConcurrencyLimit`]
@@ -5400,6 +5443,101 @@ mod tests {
         let policy = resolve_audit_text_policy(AuditTextArg::Plaintext, None, None)
             .expect("plaintext must resolve without a key");
         assert!(matches!(policy, ravel_maintain::AuditTextPolicy::Plaintext));
+    }
+
+    /// With no `RAVEL_AUDIT_TOKEN_KEY`, no deployment key, and the default
+    /// `redacted` posture, `gateway` and `maintain` resolve because they
+    /// install no query-audit pipeline and never read the key; `all` and
+    /// `query` still refuse, still naming the variable, exactly as
+    /// `redacted_without_a_key_fails_startup` pins for the ungated function.
+    #[test]
+    fn audit_text_policy_is_gated_to_query_serving_modes() {
+        for mode in [Mode::Gateway, Mode::Maintain] {
+            let policy =
+                resolve_audit_text_policy_for_mode(mode, AuditTextArg::default(), None, None)
+                    .unwrap_or_else(|e| panic!("mode {mode:?} must not need a key: {e}"));
+            assert!(
+                matches!(policy, ravel_maintain::AuditTextPolicy::Plaintext),
+                "mode {mode:?} installs no pipeline, so the resolved policy must be inert"
+            );
+        }
+
+        for mode in [Mode::All, Mode::Query] {
+            let err = resolve_audit_text_policy_for_mode(mode, AuditTextArg::default(), None, None)
+                .expect_err("a query-serving mode must still refuse without a key");
+            let message = err.to_string();
+            assert!(
+                message.contains(AUDIT_TOKEN_KEY_ENV),
+                "mode {mode:?} error must name {AUDIT_TOKEN_KEY_ENV}, got: {message}"
+            );
+        }
+    }
+
+    /// A 64-character all-hex string parses to its exact 32 bytes: pinned
+    /// against a known input rather than only checking that parsing succeeds,
+    /// so a transposition inside `parse_audit_token_key` would fail this test.
+    #[test]
+    fn parse_audit_token_key_pins_the_exact_bytes() {
+        let key = parse_audit_token_key(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .expect("64 hex characters must parse");
+        assert_eq!(
+            key,
+            [
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f,
+            ]
+        );
+    }
+
+    /// One character short of 64 is refused, not zero-padded.
+    #[test]
+    fn parse_audit_token_key_rejects_63_characters() {
+        let raw = "a".repeat(63);
+        let err = parse_audit_token_key(&raw).expect_err("63 characters must be refused");
+        assert!(
+            err.to_string().contains("64 hex characters"),
+            "expected a length error, got: {err}"
+        );
+    }
+
+    /// One character over 64 is refused, not truncated.
+    #[test]
+    fn parse_audit_token_key_rejects_65_characters() {
+        let raw = "a".repeat(65);
+        let err = parse_audit_token_key(&raw).expect_err("65 characters must be refused");
+        assert!(
+            err.to_string().contains("64 hex characters"),
+            "expected a length error, got: {err}"
+        );
+    }
+
+    /// 64 characters with one non-hex character is refused rather than
+    /// silently dropping or replacing the bad character.
+    #[test]
+    fn parse_audit_token_key_rejects_non_hex_character() {
+        let raw = format!("{}g{}", "a".repeat(31), "a".repeat(32));
+        assert_eq!(raw.len(), 64, "test fixture must stay 64 characters long");
+        let err = parse_audit_token_key(&raw).expect_err("a non-hex character must be refused");
+        assert!(
+            err.to_string().contains("64 hex characters"),
+            "expected a length/hex-digit error, got: {err}"
+        );
+    }
+
+    /// The error message must never echo the key text: a startup log or error
+    /// body carrying the literal key would leak the secret the check exists
+    /// to protect.
+    #[test]
+    fn parse_audit_token_key_error_never_contains_the_key_text() {
+        let raw = "a".repeat(63);
+        let err = parse_audit_token_key(&raw).expect_err("63 characters must be refused");
+        assert!(
+            !err.to_string().contains(&raw),
+            "error message must not contain the key text, got: {err}"
+        );
     }
 
     /// ADR-0075 reachability: the S3 request budget the running binary
