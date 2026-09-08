@@ -562,17 +562,12 @@ for `.cstat` envelope versions is `{1, 2, 3}` for this window; it narrows to
 retirement changes, each citing the recorded format floors (ADR-0066
 decision 3), independently of each other.
 
-**Known GC-sweep gap (reported, not fixed by this change; out of
-`ravel-catalog`'s scope).** The sweep rule described above
-(`ravel_maintain::sweep::sweep_unreferenced_catalog_objects`) currently
-treats only HEAD's own `column_stats.key` (field 11) and
-`column_stats_part.key` (field 13) as referenced; it does not yet walk
-`parts[].column_stats.key` (field 7) into its referenced-keys set. Until
-that sweep rule is extended, a v3 per-part object is at risk of being swept
-as unreferenced once its owning part is superseded and the object's age
-exceeds `protection_horizon_ns`, even though HEAD's current parts list still
-names it via field 7. This must be fixed in `ravel-maintain` before v3
-objects are relied upon for query correctness under GC.
+**GC-sweep coverage.** The sweep rule described above
+(`ravel_maintain::sweep::sweep_unreferenced_catalog_objects`) treats HEAD's
+own `column_stats.key` (field 11), `column_stats_part.key` (field 13), and
+every `parts[].column_stats.key` (field 7) as referenced, so a v3 per-part
+object HEAD's current parts list still names is never swept as unreferenced
+while its owning part is live.
 
 ### Idempotency marker body layout
 
