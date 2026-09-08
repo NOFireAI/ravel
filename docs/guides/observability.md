@@ -476,11 +476,13 @@ is still being served, which the operations guide pages on.
 
 ### Query audit (`ravel_audit_write_failures_total`)
 
-Labels: `mode` only. The failing unit is one group-commit flush, which carries
-several tenants' records, so there is no `tenant_hash` dimension to attribute
-it to. It renders only in a mode that installed the query-audit pipeline
-(`all` or `query`); a gateway- or maintain-only process omits the family
-rather than reporting a zero for a pipeline it never ran.
+Labels: `mode` only. Within one flush, the counter increments once per tenant
+group whose write fails, since a flush now writes one object per tenant. A
+`tenant_hash` label would disclose which tenant's writes failed on this
+unauthenticated route, so the family carries none. It renders only in a mode
+that installed the query-audit pipeline (`all` or `query`); a gateway- or
+maintain-only process omits the family rather than reporting a zero for a
+pipeline it never ran.
 
 | Metric | Meaning |
 |---|---|

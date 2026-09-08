@@ -503,9 +503,9 @@ async fn required_mode_fails_closed_on_audit_write_fault() {
         .expect("metrics body readable");
     // Usage was recorded before the audit write was attempted (the T2a
     // order), pinned as the accounting row itself: exactly one row, keyed
-    // `error`, carrying exactly one query. The `ravel_query_*` family folds
-    // only successful queries, so a failed query's usage record lives in the
-    // outcome split alone.
+    // `success`, carrying exactly one query. The `ravel_query_*` family folds
+    // only successful queries, so this record lives in the outcome split
+    // alone.
     let outcomes = running.query_accounting.outcome_snapshot();
     assert_eq!(
         outcomes.len(),
@@ -1248,7 +1248,12 @@ impl ObjectStoreBackend for StalledAuditWrites {
     }
 
     fn capabilities(&self) -> ravel_object_store::Capabilities {
-        self.inner.capabilities()
+        // This double never overrides `put_multipart`, so it inherits the
+        // trait's refusing default even though `inner` supports it.
+        ravel_object_store::Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
     }
 }
 
