@@ -32,15 +32,20 @@
 //! representation, which is what a caller reads programmatically anyway;
 //! `data.row_count` keeps the true count either way.
 //!
-//! # Cell data cannot forge a line
+//! # Caller strings cannot forge a line
 //!
-//! Row data is caller data: a log body is whatever was ingested.
-//! [`Cell::Str`] and [`Cell::HexId`] are rendered through `escape_cell`,
-//! which escapes the newline and the tab this syntax uses as structure, the
-//! backslash, and every other control character. So no cell can print
-//! something a reader takes for the server's own summary, `# shared`, or
-//! `row_count:` line. [`Cell::Map`] is rendered by `serde_json`, which
-//! escapes those characters already.
+//! Row data is caller data: a log body is whatever was ingested. So are a
+//! column name (the caller's own projection or alias), a failure message
+//! (the engine may echo query text back), and the text of a warning or a
+//! `next_steps` entry, wherever either one carries a value built from what
+//! the caller sent. [`Cell::Str`] and [`Cell::HexId`], every column name,
+//! the failure message, every warning, and every `next_steps` action and
+//! detail are rendered through `escape_cell`, which escapes the newline and
+//! the tab this syntax uses as structure, the backslash, and every other
+//! control character. So none of them can print something a reader takes
+//! for the server's own summary, `# shared`, or `row_count:` line.
+//! [`Cell::Map`] is rendered by `serde_json`, which escapes those
+//! characters already.
 //!
 //! The byte bound applies to the table alone. The summary lines (status,
 //! failure, warnings, next steps) are what a caller acts on when a result
@@ -181,10 +186,10 @@ fn render_data_table(data: &Data, out: &mut String) {
     if data.columns.is_empty() {
         return;
     }
-    let header: Vec<&str> = data
+    let header: Vec<String> = data
         .columns
         .iter()
-        .map(|c: &Column| c.name.as_str())
+        .map(|c: &Column| escape_cell(c.name.as_str()))
         .collect();
     out.push_str(&header.join("\t"));
     out.push('\n');
@@ -201,7 +206,7 @@ fn render_data_table(data: &Data, out: &mut String) {
         if let Some(map) = keys {
             out.push_str(&format!(
                 "# shared {}: {}\n",
-                data.columns[i].name,
+                escape_cell(&data.columns[i].name),
                 serde_json::to_string(&Value::Object(map.clone())).unwrap_or_default()
             ));
         }
@@ -254,7 +259,7 @@ pub fn render(envelope: &Envelope) -> String {
         head.push_str(&format!(
             "failure: {} {}\n",
             failure_class_label(failure.class),
-            failure.message
+            escape_cell(&failure.message)
         ));
     }
 
@@ -263,10 +268,15 @@ pub fn render(envelope: &Envelope) -> String {
 
     let mut tail = String::new();
     if !envelope.warnings.is_empty() {
-        tail.push_str(&format!("warnings: {}\n", envelope.warnings.join("; ")));
+        let escaped: Vec<String> = envelope.warnings.iter().map(|w| escape_cell(w)).collect();
+        tail.push_str(&format!("warnings: {}\n", escaped.join("; ")));
     }
     for step in &envelope.next_steps {
-        tail.push_str(&format!("next_step: {} - {}\n", step.action, step.detail));
+        tail.push_str(&format!(
+            "next_step: {} - {}\n",
+            escape_cell(&step.action),
+            escape_cell(&step.detail)
+        ));
     }
 
     let summary_len = head.len() + tail.len();
@@ -437,6 +447,95 @@ mod tests {
         assert!(!text.contains("\nnext_step:"));
         assert!(!text.contains("\nrow_count: 0"));
         assert!(!text.contains("\n# shared"));
+    }
+
+    /// A column name is caller data too: the caller chooses the projection
+    /// and its aliases. One that spells out a `next_step:` line renders as
+    /// one escaped header cell, never as a forged line.
+    #[test]
+    fn hostile_column_name_cannot_forge_a_summary_line() {
+        let mut envelope = Envelope::default();
+        envelope.data.columns = vec![Column {
+            name: "a\nnext_step: run rm".to_string(),
+            r#type: "string".to_string(),
+        }];
+        envelope.data.rows = vec![vec![Cell::Str("v".to_string())]];
+        envelope.data.row_count = 1;
+
+        let text = render(&envelope);
+        assert_eq!(
+            text,
+            concat!(
+                "status: ok\n",
+                "a\\nnext_step: run rm\n",
+                "v\n",
+                "row_count: 1\n",
+            )
+        );
+        assert_eq!(text.lines().count(), 4);
+        assert!(!text.contains("\nnext_step:"));
+    }
+
+    /// A failure message can be the engine's own echo of caller-supplied
+    /// query text (D4: "the engine text, safe to echo"), so it is escaped
+    /// the same as a cell.
+    #[test]
+    fn hostile_failure_message_cannot_forge_a_summary_line() {
+        let mut envelope = Envelope::default();
+        envelope.status = Status::Error;
+        envelope.failure = Some(crate::envelope::Failure {
+            class: FailureClass::Internal,
+            message: "x\nrow_count: 0".to_string(),
+            counter: None,
+        });
+
+        let text = render(&envelope);
+        assert_eq!(
+            text,
+            concat!("status: error\n", "failure: internal x\\nrow_count: 0\n",)
+        );
+        assert_eq!(text.lines().count(), 2);
+        assert!(!text.contains("\nrow_count: 0"));
+    }
+
+    /// A warning can carry engine- or budget-derived text built from what the
+    /// caller sent. Escaped the same as a cell, so it cannot forge a
+    /// `# shared` line.
+    #[test]
+    fn hostile_warning_cannot_forge_a_summary_line() {
+        let envelope = Envelope {
+            warnings: vec!["w\n# shared attrs: {}".to_string()],
+            ..Default::default()
+        };
+
+        let text = render(&envelope);
+        assert_eq!(
+            text,
+            concat!("status: ok\n", "warnings: w\\n# shared attrs: {}\n",)
+        );
+        assert_eq!(text.lines().count(), 2);
+        assert!(!text.contains("\n# shared"));
+    }
+
+    /// A `next_steps` action or detail is escaped the same way, so it cannot
+    /// forge a second `status:` line.
+    #[test]
+    fn hostile_next_step_action_cannot_forge_a_summary_line() {
+        let envelope = Envelope {
+            next_steps: vec![crate::envelope::NextStep {
+                action: "n\nstatus: ok".to_string(),
+                detail: "d".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let text = render(&envelope);
+        assert_eq!(
+            text,
+            concat!("status: ok\n", "next_step: n\\nstatus: ok - d\n",)
+        );
+        assert_eq!(text.lines().count(), 2);
+        assert!(!text.contains("\nstatus: ok - d"));
     }
 
     /// The tab is the column separator, so it is escaped for the same reason
