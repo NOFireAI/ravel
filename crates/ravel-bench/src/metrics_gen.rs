@@ -802,7 +802,7 @@ mod tests {
     use super::*;
     use crate::metrics_workload::{
         AnomalyRates, Comparability, GeneratorConfig, LabelDimension, WORKLOAD_FORMAT_VERSION,
-        gate_workload,
+        gate_workload, load_workload,
     };
 
     /// A four-family manifest at the `ci` scale, small enough that every figure
@@ -1619,5 +1619,78 @@ mod tests {
             assert!((0.0..100.0).contains(&v), "{v} out of range");
             assert_eq!(v, f64::from_bits(v.to_bits()));
         }
+    }
+
+    /// The value of a rendered series' `instance="..."` label, or `None` if
+    /// `series` (`metric{k="v",...}`) carries no such label.
+    fn instance_label(series: &str) -> Option<&str> {
+        let open = series.find('{')?;
+        let inner = series[open + 1..].strip_suffix('}')?;
+        inner.split(',').find_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            (k == "instance").then(|| v.trim_matches('"'))
+        })
+    }
+
+    /// `WorkloadFile::label_cardinalities`' `instance` figure must be the
+    /// UNION of distinct scaling-label values the generator actually emits,
+    /// never the sum of the families' per-family counts: every family shares
+    /// one `scaling_label_value_prefix`
+    /// (`benchmarks/metrics/workload.json`'s `"metricsbench-instance-"`), so
+    /// two families routinely emit the same value.
+    ///
+    /// Under the checked-in manifest's `ci` profile (1,000 active series),
+    /// `WorkloadFile::family_scaling_label_cardinality` per family is:
+    /// `metricsbench_gauge_cpu_percent`: 400 instances / 12 (job x region)
+    /// fixed combos = ceil(400/12) = 34, values 0..33.
+    /// `metricsbench_requests_total`: 300 / 64 (job x method x status) =
+    /// ceil(300/64) = 5, values 0..4.
+    /// `metricsbench_request_duration_seconds`: 15 instances (150 series / 10
+    /// series-per-classic-histogram-instance) / 4 (job) = ceil(15/4) = 4,
+    /// values 0..3.
+    /// `metricsbench_latency_native`: 100 / 4 (job) = ceil(100/4) = 25, values
+    /// 0..24.
+    /// `metricsbench_build_info`: 50 instances / 8 (job x version) =
+    /// ceil(50/8) = 7, values 0..6.
+    /// Every one of those ranges starts at 0 (`Generator::labels_for` assigns
+    /// `global / fixed_product`, and `global` itself starts at 0 for every
+    /// family), so their union is exactly the widest range: 34 distinct
+    /// values, not the sum of the five counts (34 + 5 + 4 + 25 + 7 = 75).
+    ///
+    /// TO SEE THIS FAIL against the pre-fix `label_cardinalities` (summing
+    /// the per-family counts): change its `.max().unwrap_or(0)` back to
+    /// `.sum()`; this test then observes 75 != 34.
+    #[test]
+    fn scaling_label_cardinality_equals_the_distinct_values_the_generator_emits() {
+        let workload = load_workload(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/metrics/workload.json"
+        )))
+        .expect("load the checked-in workload manifest");
+        let profile = workload.profile("ci").expect("ci profile declared");
+
+        let (bytes, _report) = Generator::new(&workload, "ci", 0)
+            .expect("generator builds")
+            .generate_bytes(1)
+            .expect("generates one step");
+        let text = String::from_utf8(bytes).expect("utf8");
+
+        let distinct_instances: std::collections::BTreeSet<&str> = text
+            .lines()
+            .filter_map(|line| line.split('\t').nth(1))
+            .filter_map(instance_label)
+            .collect();
+
+        assert_eq!(
+            distinct_instances.len(),
+            34,
+            "the ci profile's generator emits 34 distinct instance values: {distinct_instances:?}"
+        );
+        assert_eq!(
+            workload.label_cardinalities(profile)["instance"],
+            distinct_instances.len() as u64,
+            "label_cardinalities must report the distinct values the generator emits, not a sum \
+             that double-counts values shared across families"
+        );
     }
 }
