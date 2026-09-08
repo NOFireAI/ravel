@@ -208,20 +208,41 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         profile["churn_basis_points_per_hour"].as_u64(),
         Some(expected.churn_basis_points_per_hour)
     );
+    // A full, untruncated run: steps_run equals the profile's own declared
+    // step count.
+    assert_eq!(
+        profile["steps_declared"].as_u64(),
+        Some(expected.samples_per_series)
+    );
+    assert_eq!(
+        profile["steps_run"].as_u64(),
+        profile["steps_declared"].as_u64(),
+        "run_lane_full_profile() takes no --steps override, so the run is complete"
+    );
+    let run = &profile["run"];
+    assert_eq!(
+        run["steps"].as_u64(),
+        profile["steps_run"].as_u64(),
+        "run.steps must name the same basis as steps_run"
+    );
     // `ci` declares zero churn, so the generator creates exactly the active
     // set and no churned-in cohorts: the generator's exact count and the
     // manifest's declared count coincide, and either is the correct
     // expectation here.
     assert_eq!(
-        profile["total_series_created"].as_u64(),
+        run["total_series_created"].as_u64(),
         Some(expected.active_series),
         "with zero churn, total series created must equal the declared active set"
     );
     assert!(
-        profile["logical_input_bytes"]
-            .as_u64()
-            .is_some_and(|b| b > 0),
+        run["logical_input_bytes"].as_u64().is_some_and(|b| b > 0),
         "the generator produced a non-empty logical input stream"
+    );
+    assert!(
+        run["total_samples_generated"]
+            .as_u64()
+            .is_some_and(|s| s > 0),
+        "the generator emitted a non-empty sample count"
     );
     let label_cardinalities = profile["label_cardinalities"]
         .as_object()

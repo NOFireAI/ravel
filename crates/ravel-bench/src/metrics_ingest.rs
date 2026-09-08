@@ -424,27 +424,34 @@ pub struct SystemQueryResult {
     pub elapsed_secs: f64,
 }
 
-/// The nine ADR-0927 decision-11 profile figures, plus the workload's own
+/// The ADR-0927 decision-11 profile figures, plus the workload's own
 /// comparability verdict. Every figure here is the profile's pre-registered
-/// value or the generator's exact count -- never derived from the offered
-/// sample count, so a reader can compare this row against the workload
-/// definition directly instead of trusting the run that produced it.
+/// value, the generator's exact count for a run-scoped one (under `run`), or
+/// derived from either -- never from the offered sample count, so a reader
+/// can compare this row against the workload definition directly instead of
+/// trusting the run that produced it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProfileRecord {
     /// The `--profile` name (`cardinality`, `history`, `churn`, `ci`, ...).
     pub name: String,
     /// Whether this profile's figures may be compared across runs or
     /// systems (ADR-0927 decision 11). `ci` is `false`: it exists for
-    /// reachability, not for a performance or cost claim.
+    /// reachability, not for a performance or cost claim. Also `false`,
+    /// regardless of the profile's own verdict, when `steps_run <
+    /// steps_declared`: a truncated run's figures are not that profile's.
     pub comparable: bool,
     /// The stated reason when `comparable` is `false`, or `"comparable"`
     /// otherwise -- [`crate::metrics_workload::Comparability`]'s own
-    /// `Display`, never a second, hand-written copy of it.
+    /// `Display`, never a second, hand-written copy of it, unless the run
+    /// itself was truncated, in which case this states that instead.
     pub comparability_reason: String,
     /// Active series the profile declares.
     pub active_series: u64,
-    /// Total series the generator actually created over the run.
-    pub total_series_created: u64,
+    /// Steps this run actually generated (the `--steps` flag, or
+    /// `steps_declared` when unset).
+    pub steps_run: u64,
+    /// The profile's full, declared step count (`samples_per_series`).
+    pub steps_declared: u64,
     /// Samples per series per scrape, as declared.
     pub samples_per_series: u64,
     /// Scrape interval, as declared.
@@ -458,8 +465,6 @@ pub struct ProfileRecord {
     /// scaling label (`instance`), whose total is the sum of `families`'
     /// per-family instance cardinalities below.
     pub label_cardinalities: BTreeMap<String, u64>,
-    /// Logical (uncompressed, pre-wire) input bytes the generator produced.
-    pub logical_input_bytes: u64,
     /// Declared series churn, in basis points per hour.
     pub churn_basis_points_per_hour: u64,
     /// Per-family instance counts, so `label_cardinalities`' `instance` total
@@ -468,6 +473,27 @@ pub struct ProfileRecord {
     /// scaling-label cardinality (`WorkloadFile::family_scaling_label_
     /// cardinality`) and its sum.
     pub families: Vec<FamilyRecord>,
+    /// Figures scoped to this run's actual `steps_run`, never the declared
+    /// full profile: the generator's exact counts over exactly the steps
+    /// this run generated.
+    pub run: RunRecord,
+}
+
+/// Figures scoped to the run's actual step count (`ProfileRecord::steps_run`),
+/// as opposed to the profile's declared full-run figures: the generator's
+/// exact counts, never derived from the offered sample count.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RunRecord {
+    /// Steps this run generated. Equal to `ProfileRecord::steps_run`.
+    pub steps: u64,
+    /// Distinct series the generator actually created over these steps.
+    pub total_series_created: u64,
+    /// Logical (uncompressed, pre-wire) input bytes the generator produced
+    /// over these steps.
+    pub logical_input_bytes: u64,
+    /// Samples the generator emitted over these steps (after omissions and
+    /// stale markers; the generator's exact count).
+    pub total_samples_generated: u64,
 }
 
 /// One metric family's exact instance count under the run's profile, and the
