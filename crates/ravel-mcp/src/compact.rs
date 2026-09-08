@@ -88,7 +88,8 @@ fn cell_display(cell: &Cell) -> String {
         Cell::Float(f) if *f == f64::INFINITY => "+Inf".to_string(),
         Cell::Float(f) if *f == f64::NEG_INFINITY => "-Inf".to_string(),
         Cell::Float(f) => f.to_string(),
-        Cell::HexId(s) | Cell::Str(s) => s.clone(),
+        Cell::HexId(id) => id.as_str().to_string(),
+        Cell::Str(s) => s.clone(),
         Cell::Map(m) => serde_json::to_string(&Value::Object(m.clone())).unwrap_or_default(),
     }
 }
