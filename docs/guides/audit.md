@@ -24,9 +24,9 @@ A single group-commit pipeline writes every surface's records; `--audit-mode`
 governs what happens when it cannot. `--audit-mode required` (the default)
 fails the query with a 503 (HTTP) or `Unavailable` (Flight) when its record
 cannot be made durable, so a query never outlives its own trail.
-`--audit-mode best-effort` logs and counts the failure instead and lets the
-response proceed, for a deployment that would rather serve unaudited than fail
-closed. `--audit-max-batch` and `--audit-max-age` bound how many records the
+`--audit-mode best-effort` logs the failure, counts it on
+`ravel_audit_write_failures_total`, and lets the response proceed, for a
+deployment that would rather serve unaudited than fail closed. `--audit-max-batch` and `--audit-max-age` bound how many records the
 pipeline groups into one write and how long a record waits before that group
 is forced out; unset, both take the pipeline's own defaults. Installed only in
 the query-serving modes (`all` and `query`); `maintain` and `gateway` serve no

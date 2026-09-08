@@ -535,18 +535,6 @@ impl Running {
         self.audit_pipeline.is_some()
     }
 
-    /// The query-audit pipeline's best-effort flush-failure count (ADR-0062
-    /// decision 2b): `0` when no pipeline was installed for this process's
-    /// mode. Not yet exported as a `/metrics` series (`metrics.rs` is outside
-    /// this change's scope; see the audit-pipeline installation report), so
-    /// this is the only way to observe it from outside the process.
-    pub fn audit_write_failures(&self) -> u64 {
-        self.audit_pipeline
-            .as_ref()
-            .map(|pipeline| pipeline.flush_failures())
-            .unwrap_or(0)
-    }
-
     /// Stops accepting new connections, waits for both listeners to drain,
     /// then flushes and joins every ingest shard actor: metrics, logs, and
     /// spans alike.
@@ -1242,7 +1230,7 @@ pub async fn start(
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
     // where today only /healthz and /readyz exist. Cloned here, before
     // `catalog` is moved into `fold::spawn` below in every non-maintain mode.
-    let metrics_state = metrics::MetricsState {
+    let mut metrics_state = metrics::MetricsState {
         mode: config.mode,
         store_metrics,
         ingest_router: ingest_router.clone(),
@@ -1271,8 +1259,11 @@ pub async fn start(
         durable_auth: durable_auth.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
         metadata_cache: metadata_cache.clone(),
+        // Filled in below, once the query-serving block has spawned the
+        // pipeline; the metrics router is merged after that block for the
+        // same reason.
+        audit_pipeline: None,
     };
-    http_router = http_router.merge(metrics::router(metrics_state));
 
     // Held past the HTTP wiring so the Flight SQL service can register
     // against the same executor rather than building a second one; `None`
@@ -1340,6 +1331,9 @@ pub async fn start(
         // under `plaintext` this hands back the pipeline itself unwrapped.
         let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> =
             config.audit_text.wrap(audit_pipeline_handle.clone());
+        // `/metrics` reads the pipeline's failure counter at scrape time, so it
+        // takes the pipeline itself rather than a snapshot taken here.
+        metrics_state.audit_pipeline = Some(audit_pipeline_handle.clone());
         running_audit_pipeline = Some(audit_pipeline_handle);
 
         // The real query engine's deadline is the value `main` validated
@@ -1737,6 +1731,11 @@ pub async fn start(
             .await;
         }
     }
+
+    // Merged after the query-serving block so the exposition can carry that
+    // block's audit pipeline. Route order is irrelevant: `/metrics` collides
+    // with nothing above.
+    http_router = http_router.merge(metrics::router(metrics_state));
 
     // Fold optimizes query-resolve cost; a maintain-only process serves no
     // query surface, so folding would be wasted work. Skip it in maintain mode

@@ -545,10 +545,25 @@ async fn best_effort_mode_serves_the_response_and_counts_the_failure() {
         1,
         "exactly one faulted audit PUT"
     );
+    // The failure is observable from outside the process, on `/metrics`, and
+    // the rendered line carries exactly the one failure: a count of `2` (a
+    // retry counted twice) or a second sample line would both fail here.
+    let metrics = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request sent")
+        .text()
+        .await
+        .expect("metrics body readable");
+    let failure_samples: Vec<&str> = metrics
+        .lines()
+        .filter(|line| line.starts_with("ravel_audit_write_failures_total{"))
+        .collect();
     assert_eq!(
-        running.audit_write_failures(),
-        1,
-        "exactly one counted best-effort flush failure"
+        failure_samples,
+        vec!["ravel_audit_write_failures_total{mode=\"all\"} 1"],
+        "exactly one rendered sample, carrying exactly one counted failure"
     );
 
     running.shutdown().await.expect("graceful shutdown");
