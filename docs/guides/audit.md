@@ -26,11 +26,22 @@ fails the query with a 503 (HTTP) or `Unavailable` (Flight) when its record
 cannot be made durable, so a query never outlives its own trail.
 `--audit-mode best-effort` logs the failure, counts it on
 `ravel_audit_write_failures_total`, and lets the response proceed, for a
-deployment that would rather serve unaudited than fail closed. `--audit-max-batch` and `--audit-max-age` bound how many records the
-pipeline groups into one write and how long a record waits before that group
-is forced out; unset, both take the pipeline's own defaults. Installed only in
-the query-serving modes (`all` and `query`); `maintain` and `gateway` serve no
+deployment that would rather serve unaudited than fail closed.
+`--audit-max-batch` and `--audit-max-age` bound how many records the pipeline
+groups into one write and how long a record waits before that group is forced
+out; unset, both take the pipeline's own defaults. Installed only in the
+query-serving modes (`all` and `query`); `maintain` and `gateway` serve no
 query surface and install no pipeline.
+
+On shutdown, the server stops every listener first, then drains whatever is
+still buffered: one last group write, after which no query surface can submit
+again. That drain is bounded at `--audit-max-age` plus five seconds. A store
+that is merely slow finishes well inside it, since the write is one object PUT
+plus one commit record under the usual retry ladder. A store that never answers
+does not keep the process alive: the bound elapses, a warning says the still
+buffered records may not be durable, and shutdown completes. Records already
+written are unaffected, and in `required` mode no response was released for
+them in the first place.
 
 `--audit-text` selects how the `query.text` attribute below is recorded.
 `redacted`, the default, stores a structure-preserving tokenization: every

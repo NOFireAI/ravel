@@ -1175,3 +1175,139 @@ async fn every_sink_install_site_is_the_pipeline() {
 
     running.shutdown().await.expect("graceful shutdown");
 }
+
+/// A store whose audit data-object writes never answer, wrapping a
+/// [`MemoryStore`] that serves everything else. `FaultStore`'s
+/// [`ScriptedFault::Timeout`] returns a timeout *error*, which the flush path
+/// handles and reports; the shutdown bound is only exercised by a call that
+/// never resolves at all, which is what an unreachable object store looks like
+/// to a caller with no deadline of its own.
+struct StalledAuditWrites {
+    inner: MemoryStore,
+    /// Notified as each stalled PUT is entered, so the test can wait for the
+    /// drain to have work in flight instead of sleeping for it.
+    entered: Arc<tokio::sync::Notify>,
+    /// How many PUTs this store has swallowed, so the test pins the count
+    /// rather than asserting it stalled at least once.
+    stalled: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for StalledAuditWrites {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        if key.contains("/u/l0/") {
+            self.stalled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// Shutdown drains the pipeline, and the drain is bounded: an object store
+/// whose audit write never answers must not hold the process open once every
+/// listener has stopped. The outer timeout is the assertion: without the bound
+/// in `Running::shutdown`, the drain awaits the stalled PUT forever and this
+/// test never returns.
+#[tokio::test]
+async fn shutdown_drain_is_bounded_when_the_store_never_answers() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let stalled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(StalledAuditWrites {
+        inner: MemoryStore::new(),
+        entered: Arc::clone(&entered),
+        stalled: Arc::clone(&stalled),
+    });
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+
+    let running = start_server(store.clone(), Mode::All, Default::default()).await;
+    let service = running
+        .query_service
+        .clone()
+        .expect("Mode::All builds the query service");
+
+    // Through the in-process service rather than an HTTP route: in the default
+    // `Required` mode the query awaits its audit flush, which never completes
+    // here, and an in-flight HTTP connection would hold the listener join in
+    // `shutdown` before the drain is ever reached.
+    let tenant_hash = TenantId::new(TENANT).hash();
+    let query = tokio::spawn(async move {
+        let instant = ravel_query::http::service::InstantRequest {
+            query: "m".to_string(),
+            time_ms: 0,
+            min_tokens: Vec::new(),
+            deadline: std::time::Duration::from_secs(30),
+            allow_partial: false,
+            now_ns: NOW_NS,
+            budgets: None,
+        };
+        service.promql_instant(tenant_hash, &instant).await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), entered.notified())
+        .await
+        .expect("the audit flush should reach its data-object PUT");
+
+    tokio::time::timeout(std::time::Duration::from_secs(60), running.shutdown())
+        .await
+        .expect("shutdown must return on the drain bound, not wait for the store")
+        .expect("a drain that hits its bound is a warning, not a shutdown error");
+
+    assert_eq!(
+        stalled.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one audit data-object PUT was attempted and swallowed"
+    );
+    let records = query_audit_records(store.as_ref(), &TenantId::new(TENANT)).await;
+    assert_eq!(
+        records.len(),
+        0,
+        "the stalled write means the record never became durable; the bound is what \
+         gives up on it"
+    );
+    query.abort();
+}
