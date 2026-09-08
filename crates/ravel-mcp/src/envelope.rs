@@ -683,10 +683,17 @@ const TRUNCATION_MARKER: &str = "...[truncated]";
 /// value smaller than this.
 const MARKER_SERIALIZED_LEN: usize = TRUNCATION_MARKER.len() + 2;
 
-/// Pushed to `warnings` when [`Envelope::cap_scalars`] drops the cursor.
+/// Inserted into `warnings` when [`Envelope::cap_scalars`] drops the cursor.
+/// Serializes to 81 B, far under [`WARNING_ENTRY_BOUND`] (512): it is
+/// inserted before [`Envelope::cap_metadata_lists`] runs, so
+/// [`bound_string_entries`] would still cut it like any other warning if
+/// this text ever grew past that bound.
 const CURSOR_DROPPED_WARNING: &str =
     "cursor dropped: the pagination token did not fit the response; narrow the query";
-/// Pushed to `next_steps` alongside [`CURSOR_DROPPED_WARNING`].
+/// Inserted into `next_steps` alongside [`CURSOR_DROPPED_WARNING`]. The whole
+/// entry (both fields, keys, and braces) serializes to 130 B, far under
+/// [`NEXT_STEP_ENTRY_BOUND`] (512): [`bound_next_steps`] runs over it the
+/// same as [`CURSOR_DROPPED_WARNING`] above.
 const CURSOR_DROPPED_NEXT_STEP_ACTION: &str = "narrow the query";
 const CURSOR_DROPPED_NEXT_STEP_DETAIL: &str =
     "the cursor did not fit the response; request a narrower time_range or fewer rows per page";
@@ -894,7 +901,14 @@ impl Envelope {
     /// as the last resort, if the scalars are still over the allowance once
     /// those cuts are done. A dropped cursor is announced: the caller sees a
     /// warning and a `next_steps` entry naming the fix, and `finish` reports
-    /// `ok_bounded` rather than a page it cannot turn.
+    /// `ok_bounded` rather than a page it cannot turn. The announcement is
+    /// inserted at index 0 of both lists, not appended, because [`fit`] runs
+    /// this method before [`Envelope::cap_metadata_lists`]: a caller already
+    /// at the D4 count bound for either list still gets the announcement as
+    /// the kept-first entry, and the list's own last entry is what the count
+    /// cap displaces into `metadata_elided` instead.
+    ///
+    /// [`fit`]: Envelope::fit
     ///
     /// The last stage cannot leave the scalars over the allowance: with every
     /// variable scalar at the marker and the cursor dropped, the total is at
@@ -969,23 +983,38 @@ impl Envelope {
         // no indication why the cursor it expected is missing.
         if self.presentation.cursor.is_some() && self.scalar_serialized_len() > SCALAR_ALLOWANCE {
             self.presentation.cursor = None;
-            self.warnings.push(CURSOR_DROPPED_WARNING.to_string());
-            self.next_steps.push(NextStep {
-                action: CURSOR_DROPPED_NEXT_STEP_ACTION.to_string(),
-                detail: CURSOR_DROPPED_NEXT_STEP_DETAIL.to_string(),
-            });
+            // Inserted at index 0, not pushed: see the doc comment above.
+            // `cap_metadata_lists`, which runs after this method returns,
+            // keeps the first `MAX_WARNINGS`/`MAX_NEXT_STEPS` entries of
+            // each list, so index 0 is the one position guaranteed to
+            // survive that cap regardless of how full the list already is.
+            self.warnings.insert(0, CURSOR_DROPPED_WARNING.to_string());
+            self.next_steps.insert(
+                0,
+                NextStep {
+                    action: CURSOR_DROPPED_NEXT_STEP_ACTION.to_string(),
+                    detail: CURSOR_DROPPED_NEXT_STEP_DETAIL.to_string(),
+                },
+            );
             cut += 1;
         }
         cut
     }
 
     /// The D4 byte-cap algorithm. Floors `max_response_bytes` at
-    /// [`MAX_RESPONSE_BYTES_FLOOR`], caps every metadata list to its bound,
-    /// caps the scalars to their allowance, then drops rows from the end of
-    /// `data.rows` until the envelope fits. If a single remaining row still
-    /// does not fit, keeps it and shortens its oversized cells instead of
-    /// dropping it, so `data.rows` is never empty while `rows_omitted` is
+    /// [`MAX_RESPONSE_BYTES_FLOOR`], caps the scalars to their allowance,
+    /// caps every metadata list to its bound, then drops rows from the end
+    /// of `data.rows` until the envelope fits. If a single remaining row
+    /// still does not fit, keeps it and shortens its oversized cells instead
+    /// of dropping it, so `data.rows` is never empty while `rows_omitted` is
     /// positive and a retained row always fits.
+    ///
+    /// Scalars are capped first because [`Envelope::cap_scalars`] can insert
+    /// into `warnings` and `next_steps` (a dropped-cursor announcement), and
+    /// those lists need to go through the count and per-entry bounds
+    /// afterward like any other entry -- capping metadata first would let an
+    /// announcement inserted later push a list that was already at its D4
+    /// count bound over it.
     ///
     /// The one case that overrides the first-row guarantee is a row nothing
     /// can shorten enough: a row of cells that are all at their own type's
@@ -996,10 +1025,10 @@ impl Envelope {
     /// that remains is under [`MAXIMAL_FIXED_PART`], which is under the
     /// smallest cap `fit` can be given.
     pub fn fit(mut self, requested_max_response_bytes: u64) -> Envelope {
+        self.presentation.scalars_truncated = self.cap_scalars();
         let caps = self.cap_metadata_lists();
         self.presentation.metadata_elided = caps.elided;
         self.presentation.entries_truncated = caps.entries_truncated;
-        self.presentation.scalars_truncated = self.cap_scalars();
 
         let effective_cap = requested_max_response_bytes.max(MAX_RESPONSE_BYTES_FLOOR);
         self.presentation.effective_max_response_bytes = effective_cap;
@@ -1709,6 +1738,84 @@ mod tests {
 
         let finished = fitted.finish(true);
         assert_eq!(finished.status, Status::OkBounded);
+    }
+
+    /// The announcement text stays comfortably under the D4 per-entry
+    /// bounds today, but is placed in the same `bound_string_entries`/
+    /// `bound_next_steps` path as any other list entry: pinning the exact
+    /// serialized sizes here means growing either string past its bound
+    /// shows up as a change here rather than as a silently-over-bound
+    /// announcement in production.
+    #[test]
+    fn cursor_dropped_announcement_text_is_under_its_entry_bounds() {
+        assert_eq!(serialized_str_len(CURSOR_DROPPED_WARNING), 81);
+        assert!(serialized_str_len(CURSOR_DROPPED_WARNING) <= WARNING_ENTRY_BOUND);
+
+        let step = NextStep {
+            action: CURSOR_DROPPED_NEXT_STEP_ACTION.to_string(),
+            detail: CURSOR_DROPPED_NEXT_STEP_DETAIL.to_string(),
+        };
+        assert_eq!(entry_serialized_len(&step), 130);
+        assert!(entry_serialized_len(&step) <= NEXT_STEP_ENTRY_BOUND);
+    }
+
+    /// `cap_scalars` runs before `cap_metadata_lists` in `fit`, and inserts
+    /// the cursor announcement at index 0 of `warnings` and `next_steps`.
+    /// With both lists already at their D4 count bound, the announcement
+    /// still lands as the kept-first entry: the count cap runs afterward and
+    /// displaces the list's own last entry into `metadata_elided` instead of
+    /// leaving the list one entry over its bound.
+    #[test]
+    fn dropped_cursor_announcement_respects_the_list_bounds() {
+        let full_warnings =
+            || -> Vec<String> { (0..MAX_WARNINGS).map(|i| format!("warning {i}")).collect() };
+        let full_next_steps = || -> Vec<NextStep> {
+            (0..MAX_NEXT_STEPS)
+                .map(|i| NextStep {
+                    action: format!("action {i}"),
+                    detail: format!("detail {i}"),
+                })
+                .collect()
+        };
+
+        let baseline = Envelope {
+            warnings: full_warnings(),
+            next_steps: full_next_steps(),
+            ..Default::default()
+        }
+        .fit(MAX_RESPONSE_BYTES_FLOOR);
+        assert_eq!(
+            baseline.presentation.metadata_elided, 0,
+            "both lists are already exactly at their count bound, not over it"
+        );
+
+        let mut envelope = Envelope {
+            warnings: full_warnings(),
+            next_steps: full_next_steps(),
+            ..Default::default()
+        };
+        envelope.presentation.cursor = Some("k".repeat(5 * 1024));
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.presentation.scalars_truncated, 1);
+        assert_eq!(fitted.presentation.cursor, None);
+        assert_eq!(fitted.warnings.len(), MAX_WARNINGS);
+        assert_eq!(fitted.warnings[0], CURSOR_DROPPED_WARNING);
+        assert_eq!(fitted.next_steps.len(), MAX_NEXT_STEPS);
+        assert_eq!(fitted.next_steps[0].action, CURSOR_DROPPED_NEXT_STEP_ACTION);
+        assert_eq!(fitted.next_steps[0].detail, CURSOR_DROPPED_NEXT_STEP_DETAIL);
+        assert_eq!(
+            fitted.presentation.metadata_elided,
+            baseline.presentation.metadata_elided + 2,
+            "the announcement displaces one warning and one next_step past the count bound"
+        );
+
+        let size = serialized_len(&fitted);
+        assert!(
+            size <= MAX_RESPONSE_BYTES_FLOOR as usize,
+            "serialized size {size} exceeds cap"
+        );
     }
 
     /// The last stage of the scalar cut: three budget values that are over
