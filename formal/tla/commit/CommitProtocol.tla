@@ -133,7 +133,13 @@ VARIABLES
                  \* as it was when the query ran, because a token that is not
                  \* yet visible is a retryable failure, not a stale result
     queried,     \* BOOLEAN: whether the read-path query has run this behaviour
-    queryAnswer  \* SUBSET FlushIds: the flushes the read-path query returned
+    queryAnswer, \* SUBSET FlushIds: the flushes the read-path query returned
+    faultFired   \* SUBSET (FlushIds \X FaultKinds): execution witness, set only
+                 \* by the fault action it names, never by a state merely
+                 \* enabled to take it. PutDataLostResponse, PutCommitLostResponse
+                 \* and TransientFailure share every other field they touch
+                 \* (retries' = retries + 1), so none of those distinguishes
+                 \* "fired" from "could fire"; this is the field that does
 
 Store == INSTANCE RavelObjectStore
             WITH Keys <- ObjKeys, Content <- AllContent,
@@ -143,15 +149,19 @@ Phases == {"idle", "pinned", "data", "committed", "acked",
            "abandoned", "stopped", "retired"}
 AckKinds == {"none", "strict", "buffered", "timeout", "error"}
 
+\* Execution-witness tags, one per fault action instrumented below. Named for
+\* the action that alone sets its tag in faultFired.
+FaultKinds == {"putDataLost", "putCommitLost", "transient"}
+
 \* The store's own variables, named locally: an INSTANCE's tuple cannot be
 \* primed through the instance prefix.
 sVars == <<store, lastModified, versionCounter, uploads, listState>>
 
 protoVars == <<phase, pinned, openedAt, retries, clock, shardDead,
-               ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+               ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           phase, pinned, openedAt, retries, clock, shardDead,
-          ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+          ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
 
 \* The commit PUT witness: what the caller asked for, what the store already
 \* held, and what the operator returned. Invariants read THIS and the store,
@@ -182,6 +192,7 @@ TypeOK ==
     /\ publishedAt \in [FlushIds -> 0..(MaxTicks + 1)]
     /\ queried \in BOOLEAN
     /\ queryAnswer \subseteq FlushIds
+    /\ faultFired \subseteq (FlushIds \X FaultKinds)
 
 Init ==
     /\ Store!StoreInit
@@ -203,6 +214,7 @@ Init ==
     /\ publishedAt = [f \in FlushIds |-> MaxTicks + 1]
     /\ queried = FALSE
     /\ queryAnswer = {}
+    /\ faultFired = {}
 
 \* --- derived views ----------------------------------------------------------
 
@@ -251,7 +263,7 @@ PinFlush(f, c) ==
     \* action (BufferedAck) and is not what this switch models.
     /\ ackKind' = [ackKind EXCEPT ![f] =
                      IF AckAtEnqueue THEN "strict" ELSE @]
-    /\ UNCHANGED <<retries, clock, shardDead, marker, lastPut, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<retries, clock, shardDead, marker, lastPut, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* IngestRouter::write_points returning at enqueue in buffered mode: the client
@@ -260,7 +272,7 @@ BufferedAck(f) ==
     /\ phase[f] = "pinned"
     /\ ackKind[f] = "none"
     /\ ackKind' = [ackKind EXCEPT ![f] = "buffered"]
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* FlushCtx::put_data_object_with_retry -> publish::put_data_object.
@@ -272,7 +284,7 @@ PutData(f) ==
     /\ ~shardDead[f[2]]
     /\ Store!PutCreateIfAbsent(DataKey(f), pinned[f])
     /\ phase' = [phase EXCEPT ![f] = "data"]
-    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
 
 \* The response to the data PUT was lost: the effect landed, the caller saw a
 \* failure and retries the same pinned flush. The retry is the PutData step
@@ -284,6 +296,7 @@ PutDataLostResponse(f) ==
     /\ retries[f] < MaxRetries
     /\ Store!PutCreateIfAbsentLostResponse(DataKey(f), pinned[f])
     /\ retries' = [retries EXCEPT ![f] = @ + 1]
+    /\ faultFired' = faultFired \cup {<<f, "putDataLost">>}
     /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
 
 \* FlushCtx::publish_with_retry -> publish::publish_with_rng.
@@ -317,7 +330,7 @@ PutCommit(f) ==
                           ELSE shardDead
           /\ publishedAt' = [publishedAt EXCEPT ![f] =
                                 IF Store!Present(k) THEN @ ELSE clock]
-    /\ UNCHANGED <<pinned, openedAt, retries, clock, ackKind, marker, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<pinned, openedAt, retries, clock, ackKind, marker, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
 
 \* The commit PUT landed and its response was lost. The caller retries the same
 \* pinned flush; that retry takes the AlreadyExists path above.
@@ -331,6 +344,7 @@ PutCommitLostResponse(f) ==
                         IF Store!Present(CommitKey(f)) THEN @ ELSE clock]
     /\ Store!PutCreateIfAbsentLostResponse(CommitKey(f), pinned[f])
     /\ retries' = [retries EXCEPT ![f] = @ + 1]
+    /\ faultFired' = faultFired \cup {<<f, "putCommitLost">>}
     /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind, marker, lastPut, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
 
 \* A transient store failure applies nothing; the caller retries.
@@ -340,6 +354,7 @@ TransientFailure(f) ==
     /\ retries[f] < MaxRetries
     /\ Store!TransientFailure
     /\ retries' = [retries EXCEPT ![f] = @ + 1]
+    /\ faultFired' = faultFired \cup {<<f, "transient">>}
     /\ UNCHANGED <<phase, pinned, openedAt, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
 
 \* FlushCtx::ack_waiters, then the router's token collection and
@@ -350,7 +365,7 @@ StrictAck(f) ==
     /\ ackKind[f] \in {"none", "buffered"}
     /\ phase' = [phase EXCEPT ![f] = "acked"]
     /\ ackKind' = [ackKind EXCEPT ![f] = "strict"]
-    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* WriteError::AckTimeout. The client's wait is dropped while the flush task
@@ -359,7 +374,7 @@ AckTimeout(f) ==
     /\ phase[f] \in {"pinned", "data"}
     /\ ackKind[f] = "none"
     /\ ackKind' = [ackKind EXCEPT ![f] = "timeout"]
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* WriteError::Abandoned. FlushCtx::bound_to_deadline races every attempt
@@ -369,7 +384,7 @@ Abandon(f) ==
     /\ Expired(f)
     /\ phase' = [phase EXCEPT ![f] = "abandoned"]
     /\ ackKind' = [ackKind EXCEPT ![f] = IF @ = "none" THEN "error" ELSE @]
-    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<pinned, openedAt, retries, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* A crash loses everything in memory. Durable objects stay; the pinned flush
@@ -384,7 +399,7 @@ Crash(f) ==
     /\ pinned' = [pinned EXCEPT ![f] = @]
     /\ retries' = [retries EXCEPT ![f] = 0]
     /\ ackKind' = [ackKind EXCEPT ![f] = IF @ = "none" THEN "error" ELSE @]
-    /\ UNCHANGED <<openedAt, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<openedAt, clock, shardDead, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* ravel_ingest::write_marker, from the logs and traces handlers. The marker is
@@ -397,7 +412,7 @@ WriteMarker ==
        \/ (MarkerAfterFirstShard /\ DurableSet # {})   \* BROKEN switch
     /\ Store!PutCreateIfAbsent(MarkerKey, CHOOSE c \in Contents : TRUE)
     /\ marker' = "written"
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
 
 \* Accidental reuse of a commit identity with different content: the hazard
 \* ADR-0002 names. The protocol does not prevent it, it DETECTS it: the commit
@@ -413,7 +428,7 @@ ReuseIdentity(f, c) ==
     /\ openedAt' = [openedAt EXCEPT ![f] = clock]
     /\ retries' = [retries EXCEPT ![f] = 0]
     /\ publishedAt' = [publishedAt EXCEPT ![f] = MaxTicks + 1]
-    /\ UNCHANGED <<clock, shardDead, ackKind, marker, lastPut, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<clock, shardDead, ackKind, marker, lastPut, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* A CLIENT retry after a lost acknowledgement. The first attempt's client saw
@@ -449,7 +464,7 @@ ClientRetry(f, g) ==
     \* g is the client's resend of f, which is what makes a second durable
     \* record a duplicate rather than an unrelated write of equal content
     /\ retryOf' = [retryOf EXCEPT ![g] = f]
-    /\ UNCHANGED <<retries, clock, shardDead, ackKind, marker, lastPut, tombstoned, superseded, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<retries, clock, shardDead, ackKind, marker, lastPut, tombstoned, superseded, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* Retention tombstones a bucket (retention::write_tombstone), and a compaction
@@ -465,7 +480,7 @@ TombstoneBucket(f) ==
     /\ superseded = {}
     /\ f \notin tombstoned
     /\ tombstoned' = tombstoned \cup {f}
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 SupersedeRecord(f) ==
@@ -476,7 +491,7 @@ SupersedeRecord(f) ==
     /\ f \notin superseded
     /\ f \notin tombstoned
     /\ superseded' = superseded \cup {f}
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* Catalog::resolve_min_token: an exact-key GET on the commit key the token
@@ -496,7 +511,7 @@ ResolveToken(f) ==
              present |-> Store!Present(CommitKey(f)),
              tomb    |-> f \in tombstoned,
              sup     |-> f \in superseded]]
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, queried, queryAnswer>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 \* The read path, abstracted to what an answer contains rather than how it was
@@ -514,13 +529,13 @@ RunQuery ==
                           IF QueryReadsDataDirectly
                           THEN Visible(f) \/ DataPresent(f)   \* BROKEN switch
                           ELSE Visible(f)}
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, clock, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, faultFired>>
     /\ UNCHANGED sVars
 
 Tick ==
     /\ clock < MaxTicks
     /\ clock' = clock + 1
-    /\ UNCHANGED <<phase, pinned, openedAt, retries, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer>>
+    /\ UNCHANGED <<phase, pinned, openedAt, retries, shardDead, ackKind, marker, lastPut, publishedAt, tombstoned, superseded, retryOf, tokenResult, queried, queryAnswer, faultFired>>
     /\ UNCHANGED sVars
 
 Next ==
@@ -563,6 +578,11 @@ Fairness ==
     /\ \A f \in FlushIds : WF_vars(PutData(f))
     /\ \A f \in FlushIds : WF_vars(PutCommit(f))
     /\ \A f \in FlushIds : WF_vars(StrictAck(f))
+    \* The flush task abandons an expired flush rather than retrying it
+    \* forever (crates/ravel-ingest/src/shard.rs::bound_to_deadline), so a
+    \* pinned flush past its deadline is fairly forced to abandon rather than
+    \* stutter.
+    /\ \A f \in FlushIds : WF_vars(Abandon(f))
 
 FairSpec == Spec /\ Fairness
 
