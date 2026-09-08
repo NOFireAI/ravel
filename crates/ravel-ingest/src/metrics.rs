@@ -140,8 +140,19 @@ pub struct IngestMetrics {
     /// `created_unix_ns` below one already committed and let a stale duplicate
     /// sample outrank its correction under the query-time dedup order. Nonzero
     /// means the floor absorbed at least one such step; the delta is logged at
-    /// warn. Exported as `ravel_ingest_clock_regressions_total`.
+    /// warn. Intended for Prometheus export under the name
+    /// `ravel_ingest_clock_regressions_total` (#1473).
     clock_regressions: AtomicU64,
+    /// Flushes refused because the floor would have had to hold the stamp more
+    /// than `MAX_FLUSH_CLOCK_HOLD_NS` above the raw reading (ADR-1307): a
+    /// backwards step too large to absorb, or the tail of a spurious forward
+    /// glitch that ratcheted the floor ahead of wall time. The flush fails with
+    /// a typed error and the floor re-anchors to the raw reading, so exactly the
+    /// one flush that crosses the bound is refused. Distinct from
+    /// `clock_regressions` (absorbed) so the two outcomes are counted
+    /// separately. Intended for Prometheus export under the name
+    /// `ravel_ingest_clock_regressions_refused_total` (#1473).
+    clock_regressions_refused: AtomicU64,
     /// Multi-shard Strict writes that returned `WriteError::PartialWrite`
     /// (issue #1130): at least one shard committed durably and at least one
     /// sibling then failed in the same `write()` call. A nonzero value means
@@ -515,9 +526,13 @@ pub struct IngestMetricsSnapshot {
     pub acks_err: u64,
     pub series_id_collisions: u64,
     /// Flush-open stamps raised to this writer's monotonic floor after a
-    /// backwards clock step (ADR-1307). Exported as
-    /// `ravel_ingest_clock_regressions_total`.
+    /// backwards clock step (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_total` (#1473).
     pub clock_regressions: u64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_refused_total` (#1473).
+    pub clock_regressions_refused: u64,
     /// Multi-shard Strict writes returned as `WriteError::PartialWrite`
     /// (issue #1130): a partial multi-shard commit. Exported as
     /// `ravel_ingest_partial_writes_total`.
@@ -716,6 +731,13 @@ impl IngestMetrics {
         self.clock_regressions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307).
+    pub(crate) fn record_clock_regression_refused(&self) {
+        self.clock_regressions_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as `WriteError::PartialWrite`
     /// (issue #1130): at least one shard committed durably before a sibling
     /// failed. Recorded once per such write, at the router's error
@@ -792,6 +814,7 @@ impl IngestMetrics {
             acks_err: self.acks_err.load(Ordering::Relaxed),
             series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
             clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
+            clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
@@ -830,6 +853,7 @@ mod tests {
         metrics.record_acks(1, false);
         metrics.record_series_id_collision();
         metrics.record_clock_regression();
+        metrics.record_clock_regression_refused();
         metrics.record_partial_write();
         metrics.record_shard_death();
         metrics.record_exemplars(2, 5);
@@ -849,6 +873,7 @@ mod tests {
         assert_eq!(snap.acks_err, 1);
         assert_eq!(snap.series_id_collisions, 1);
         assert_eq!(snap.clock_regressions, 1);
+        assert_eq!(snap.clock_regressions_refused, 1);
         assert_eq!(snap.partial_writes, 1);
         assert_eq!(snap.shard_deaths, 1);
     }
