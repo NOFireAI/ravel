@@ -1274,6 +1274,51 @@ impl Catalog {
                 _ => HashMap::new(),
             };
 
+            // Issue #1482 finding 4: an old part carried forward by reference
+            // below (`existing_by_blake3`) never touches `v3_content_baseline`
+            // at all -- the per-span loop `continue`s straight past the v3
+            // block for it -- so fetching that part's previous stats object
+            // here was a wasted GET on every incremental fold, one per
+            // untouched sealed part, forever, independent of how many parts
+            // this fold actually re-derives. Spans are cheap to re-hash (pure
+            // CPU, no I/O; `encode_part_ranged` is re-run once more, without
+            // its result, in the per-span loop below), so precompute here
+            // exactly which old part hashes this fold's spans reproduce
+            // byte-for-byte and will therefore carry forward unchanged: only
+            // an old part NOT in that set is actually about to be re-derived
+            // and can use its prior per-segment statistics as a baseline.
+            let reused_old_part_hashes: HashSet<[u8; 32]> = {
+                let single_part = spans.len() == 1;
+                spans
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(span_index, span)| {
+                        let is_tail = span_index + 1 == spans.len();
+                        let (part_min_hour, part_watermark) = if single_part {
+                            (0, watermark_hour)
+                        } else if is_tail {
+                            (span.min_hour, watermark_hour)
+                        } else {
+                            (span.min_hour, span.watermark_hour)
+                        };
+                        let part_entries = &entries[span.start..span.end];
+                        let part_bytes = snapshot_format::encode_part_ranged(
+                            tenant.0,
+                            signal_num,
+                            shard_ceiling,
+                            part_min_hour,
+                            part_watermark,
+                            part_entries,
+                        )
+                        .ok()?;
+                        let part_hash = *blake3::hash(&part_bytes).as_bytes();
+                        existing_by_blake3
+                            .contains_key(part_hash.as_slice())
+                            .then_some(part_hash)
+                    })
+                    .collect()
+            };
+
             // ADR-1413 decision 1 (v2 semantics): reuse the previous fold's
             // per-part v3 column-stats objects the same way the field-13 (v2)
             // baseline below reuses its own predecessor, so a part that grows
@@ -1283,7 +1328,9 @@ impl Catalog {
             // key); merged across every old part still valid for reuse
             // (excluded: a part covering a dirty hour, whose old statistics
             // cannot be trusted forward, mirroring `existing_by_blake3`
-            // above).
+            // above; also excluded: a part this fold's spans reproduce
+            // byte-for-byte and will carry forward by reference, whose
+            // baseline would never be consulted).
             let v3_content_baseline: HashMap<Vec<u8>, ColumnStatsSegment> = if typed_attr_columns
                 .is_empty()
                 || rebuilt
@@ -1302,6 +1349,9 @@ impl Catalog {
                     let Ok(old_part_hash) = <[u8; 32]>::try_from(old_part.blake3.as_slice()) else {
                         continue;
                     };
+                    if reused_old_part_hashes.contains(&old_part_hash) {
+                        continue;
+                    }
                     match self.store().get(&stats_ref.key, GetRange::Full).await {
                         Ok(got) => {
                             counters.get_requests += 1;
@@ -3307,24 +3357,25 @@ mod tests {
         //
         // Segment A is read exactly once, by the name-postings pass, which
         // aborts on the first L0 entry because a logs RLOG object is not a
-        // metrics RSEG. Neither column-stats publish reads it: both the v1
-        // (tuple-keyed) and the v2 (content-hash-keyed) baselines cover it.
+        // metrics RSEG. None of the three column-stats publishes reads it:
+        // the v1 (tuple-keyed), v2 (content-hash-keyed), and v3
+        // (content-hash-keyed, per part) baselines all cover it.
         assert_eq!(
             store.count_gets_of(&key_a),
             1,
-            "only the postings pass reads A; both publishes reuse its baseline record"
+            "only the postings pass reads A; all three publishes reuse its baseline record"
         );
         assert_eq!(
             store.count_gets_of(&key_b),
             0,
             "segment B's stats were reused, not recomputed"
         );
-        // Issue #964: the one genuinely new segment is read ONCE for both
-        // publishes. Against the pre-fix two-fetch code this is 2.
+        // Issue #964: the one genuinely new segment is read ONCE for all
+        // three publishes. Against the pre-fix two-fetch code this is 2.
         assert_eq!(
             store.count_gets_of(&key_c),
             1,
-            "the new hour-11 segment is fetched once, for both publishes"
+            "the new hour-11 segment is fetched once, for all three publishes"
         );
 
         // Reuse still produced a complete artifact covering all three segments.
@@ -3338,6 +3389,146 @@ mod tests {
             loaded.segments.len(),
             3,
             "the reused baseline plus the new segment cover all three"
+        );
+    }
+
+    /// Issue #1482 finding 4: `v3_content_baseline` must fetch a previous
+    /// per-part stats object only for an old part this fold is actually about
+    /// to re-derive, never for one about to be carried forward by reference.
+    /// `snapshot_part_max_entries = 1` seals every hour into its own part, so
+    /// the first fold over hours 10-12 produces three parts: two sealed
+    /// (hour 10, hour 11) whose `(min_hour, watermark_hour)` come from their
+    /// own entries and never change again, and one tail (hour 12) whose
+    /// watermark is overridden to the fold's overall watermark. The first
+    /// fold seals at hour 15 (`now_at_seal(15)`) even though entries only
+    /// reach hour 12, so that override tuple is `(12, 15)` -- deliberately
+    /// different from what hour 12 encodes to once it seals for real, so the
+    /// second fold's reseal is a genuine content change, not a coincidental
+    /// hash match.
+    ///
+    /// The second fold appends an hour-13 entry: hours 10 and 11 stay
+    /// byte-identical and are carried by reference (untouched), while hour
+    /// 12 seals from tail to non-tail -- its tuple becomes `(12, 12)`, so it
+    /// genuinely re-derives even though its one entry's content is
+    /// unchanged, and reuses that entry's segment statistics from the first
+    /// fold's baseline. Pre-fix, all three non-dirty old parts get their
+    /// stats object GET regardless of reuse; post-fix, only hour 12's does.
+    #[tokio::test]
+    async fn incremental_fold_bounds_baseline_gets_to_parts_actually_rederived() {
+        let store = Arc::new(RecordingStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        publish_logs_segment(store.as_ref(), 1, 10, &[200]).await;
+        publish_logs_segment(store.as_ref(), 2, 11, &[404]).await;
+        publish_logs_segment(store.as_ref(), 3, 12, &[500]).await;
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(15),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        assert_eq!(first.parts_total, 3, "one part per hour under a cap of 1");
+
+        let head_1 = read_logs_head(store.as_ref()).await;
+        let stats_key_of = |hour: u32| {
+            head_1
+                .parts
+                .iter()
+                .find(|p| p.min_hour == hour)
+                .unwrap_or_else(|| panic!("part for hour {hour}"))
+                .column_stats
+                .clone()
+                .unwrap_or_else(|| panic!("v3 object for hour {hour}"))
+                .key
+        };
+        let stats_key_10 = stats_key_of(10);
+        let stats_key_11 = stats_key_of(11);
+        let stats_key_12 = stats_key_of(12);
+
+        publish_logs_segment(store.as_ref(), 4, 13, &[200]).await;
+
+        store.clear_gets();
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(16),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "the second fold is incremental");
+
+        let head_2 = read_logs_head(store.as_ref()).await;
+        let part_10 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 10)
+            .expect("hour 10 part survives");
+        let part_11 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 11)
+            .expect("hour 11 part survives");
+        let part_12 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 12)
+            .expect("hour 12 part survives, now sealed");
+        assert_eq!(
+            part_10.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_10),
+            "hour 10's v3 object is carried forward at its same key"
+        );
+        assert_eq!(
+            part_11.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_11),
+            "hour 11's v3 object is carried forward at its same key"
+        );
+        assert_ne!(
+            part_12.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_12),
+            "hour 12 reseals from tail to non-tail and gets a new v3 object"
+        );
+
+        // The bound this finding fixes: an untouched, carried-forward part's
+        // previous stats object must never be fetched as a baseline. Against
+        // the pre-fix code (baseline built from every non-dirty old part
+        // unconditionally) these are each 1.
+        assert_eq!(
+            store.count_gets_of(&stats_key_10),
+            0,
+            "hour 10 is carried by reference; its old stats object must not be fetched"
+        );
+        assert_eq!(
+            store.count_gets_of(&stats_key_11),
+            0,
+            "hour 11 is carried by reference; its old stats object must not be fetched"
+        );
+        // Hour 12 is genuinely re-derived (tail -> sealed), so its baseline
+        // fetch is legitimate work, not the bug: exactly one GET reuses its
+        // one entry's segment statistics instead of re-fetching the segment
+        // itself.
+        assert_eq!(
+            store.count_gets_of(&stats_key_12),
+            1,
+            "hour 12 is re-derived and its prior stats object is fetched once as a baseline"
         );
     }
 
