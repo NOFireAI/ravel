@@ -1551,6 +1551,7 @@ pub async fn start(
             let mut mtls_app_state =
                 ravel_query::http::AppState::new(app_state.engine.clone(), mtls.resolver.clone())
                     .with_cost_recorder(query_accounting.clone())
+                    .with_usage_sink(query_accounting.clone())
                     .with_query_admission(query_admission.clone());
             // Same read-side metadata cache the primary listener serves from
             // (ADR-0085 decision 1): the mTLS `/api/v1/metadata` must serve the

@@ -558,6 +558,128 @@ async fn usage_is_recorded_before_evaluation_error() {
     assert_eq!(h.cost.records().len(), 0);
 }
 
+/// The dropped-future path on a Prometheus-shaped route, which reads its spend
+/// from the engine's live accounting view rather than from a result it never
+/// gets. Before that view existed, this record was all zeros: the engine owned
+/// its `QueryAccounting` internally and returned it only on success.
+#[tokio::test]
+async fn usage_is_recorded_on_cancel_for_promql() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(1));
+    let h = harness(
+        fault_store,
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+
+    let request = range_request("up");
+    let mut query = Box::pin(h.service.promql_range(h.tenant_hash, &request));
+
+    tokio::select! {
+        _ = &mut query => panic!("the query is held inside the store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(gate.held_count(), 1);
+
+    drop(query);
+
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].0, h.tenant_hash);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
+    // The exact spend the resolve had reached when the gate held it: the two
+    // requests it issued before its first listing. Not a lower bound. Zero here
+    // is what a guard reading an unobserved live handle records.
+    assert_eq!(usage[0].2.total_s3_requests(), 2);
+    assert_eq!(h.cost.records().len(), 0);
+}
+
+/// The same, on the analytics surface, which reaches the engine through its
+/// own state rather than through the shared PromQL operations.
+#[tokio::test]
+async fn usage_is_recorded_on_cancel_for_analytics() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(1));
+    let h = harness(
+        fault_store,
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+
+    let request = analytics_request("up", false);
+    let mut query = Box::pin(h.service.analytics(h.tenant_hash, &request));
+
+    tokio::select! {
+        _ = &mut query => panic!("the query is held inside the store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(gate.held_count(), 1);
+
+    drop(query);
+
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].0, h.tenant_hash);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
+    assert_eq!(usage[0].2.total_s3_requests(), 2);
+    assert_eq!(h.cost.records().len(), 0);
+}
+
+/// The sink `build_app_state` wires. The whole PromQL route family folded its
+/// usage records into a discarding default before, so `ravel_query_outcome_*`
+/// stayed empty for PromQL traffic no matter how many queries ran; only the
+/// completed-query cost family moved.
+#[tokio::test]
+async fn promql_routes_record_usage_through_the_wired_sink() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let query_accounting = default_query_accounting();
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), tenant());
+    let resolver: Arc<dyn TenantResolver> = Arc::new(StaticBearerTokenResolver::new(tokens));
+
+    let state = crate::query::build_app_state(
+        catalog,
+        Arc::clone(&store),
+        resolver,
+        None,
+        EngineConfig::default(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+        Arc::clone(&query_accounting),
+        QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+        None,
+        None,
+        None,
+    );
+
+    let start_s = NOW_MS / 1_000 - 60;
+    let end_s = NOW_MS / 1_000;
+    let request = Request::builder()
+        .uri(format!(
+            "/api/v1/query_range?query=up&start={start_s}&end={end_s}&step=60"
+        ))
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = ravel_query::http::router(state)
+        .oneshot(request)
+        .await
+        .expect("the route answers");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let rows = query_accounting.outcome_snapshot();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, crate::metrics::QueryOutcomeStatus::Success);
+    assert_eq!(rows[0].counters.queries, 1);
+}
+
 /// The dropped-future path: a client that disconnects mid-query leaves exactly
 /// one trace, the usage record, and no error is ever mapped because there is no
 /// caller left to map one for.
@@ -566,7 +688,7 @@ async fn usage_is_recorded_before_evaluation_error() {
 /// query's completion: the operation is parked inside a store call whose
 /// occurrence the test asserts before it drops the future.
 #[tokio::test]
-async fn usage_is_recorded_on_cancel() {
+async fn usage_is_recorded_on_cancel_for_exemplars() {
     let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
     let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(1));
     let h = harness(

@@ -330,6 +330,54 @@ fn estimate_cost(
     )
 }
 
+/// A running evaluation's spend, readable from outside the call.
+///
+/// The engine builds a fresh [`PhaseAccounting`] per attempt and returns its
+/// snapshot only inside a successful [`QueryStats`], so a caller whose future
+/// is dropped mid-query has nothing to read. An engine handed one of these
+/// through [`QueryEngine::with_live_usage`] points it at each attempt's handle
+/// before that attempt issues its first store call, so a drop guard can read
+/// what the abandoned query had spent by then. The mirror of
+/// `ravel_sql::LiveAccounting`, which is what the SQL surface reads on the
+/// same path.
+///
+/// A retried attempt re-points the view at its own handle, so a snapshot taken
+/// after the retry started reflects that attempt alone and never the discarded
+/// one, matching ADR-0044 decision 1.
+#[derive(Clone, Default)]
+pub struct LiveQueryAccounting(Arc<std::sync::Mutex<PhaseAccounting>>);
+
+impl LiveQueryAccounting {
+    /// A live view whose counters are all zero until an attempt installs its
+    /// handle.
+    pub fn new() -> Self {
+        LiveQueryAccounting::default()
+    }
+
+    /// The spend issued so far by whichever attempt is installed, pooled
+    /// across phases the way [`QueryStats::accounting`] is.
+    pub fn snapshot(&self) -> QueryAccountingSnapshot {
+        self.lock().snapshot().pooled()
+    }
+
+    /// Point this view at `accounting` (the attempt about to run). Clones the
+    /// handle, so the two share one counter block and every increment the
+    /// attempt makes is visible through [`Self::snapshot`].
+    fn install(&self, accounting: &PhaseAccounting) {
+        *self.lock() = accounting.clone();
+    }
+
+    /// Lock the inner slot, recovering a poisoned guard. The slot holds one
+    /// cheap-to-clone handle and no torn state, so recovering is strictly
+    /// better than failing every later snapshot.
+    fn lock(&self) -> std::sync::MutexGuard<'_, PhaseAccounting> {
+        match self.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
 /// Resolves snapshots, fetches segments, merges cross-segment duplicates,
 /// and evaluates PromQL over the result (docs/query-engine.md).
 pub struct QueryEngine {
@@ -357,6 +405,11 @@ pub struct QueryEngine {
     /// clusters and unioning their series into the merge pool; see
     /// [`QueryEngine::with_federation`].
     federation: Option<Arc<crate::distrib::Federation>>,
+    /// A caller's live view of this query's spend, installed per attempt in
+    /// `resolve_snapshot_with_retry`. `None` is the default: an engine nobody
+    /// asked for a live view from installs nothing. See
+    /// [`QueryEngine::with_live_usage`].
+    live_usage: Option<LiveQueryAccounting>,
 }
 
 impl QueryEngine {
@@ -415,6 +468,7 @@ impl QueryEngine {
             config,
             distributed: None,
             federation: None,
+            live_usage: None,
         }
     }
 
@@ -502,6 +556,33 @@ impl QueryEngine {
             config: budgets.clamp(&self.config).applied_to(&self.config),
             distributed: self.distributed.clone(),
             federation: self.federation.clone(),
+            live_usage: self.live_usage.clone(),
+        }
+    }
+
+    /// This engine, reporting every attempt's accounting handle into `live`
+    /// before that attempt issues a store call.
+    ///
+    /// The caller keeps `live` and can read it at any instant, including from
+    /// a drop guard after the query's future was dropped, which is the one
+    /// path that has no [`QueryStats`] to read a spend from. Without it a
+    /// cancelled PromQL, metadata, or analytics query records a spend of zero
+    /// no matter how many objects it had already fetched.
+    ///
+    /// The clone shares state exactly as [`Self::scoped_to`]'s does: same
+    /// catalog, same fetchers, same [`GetLimiter`]. Handing a request-scoped
+    /// engine to `instant_with_budgets` and friends keeps working, because
+    /// `scoped_to` carries the live view through.
+    pub fn with_live_usage(&self, live: &LiveQueryAccounting) -> QueryEngine {
+        QueryEngine {
+            catalog: Arc::clone(&self.catalog),
+            fetcher: self.fetcher.clone(),
+            log_fetcher: self.log_fetcher.clone(),
+            get_limiter: Arc::clone(&self.get_limiter),
+            config: self.config,
+            distributed: self.distributed.clone(),
+            federation: self.federation.clone(),
+            live_usage: Some(live.clone()),
         }
     }
 
@@ -1907,6 +1988,14 @@ impl QueryEngine {
         Ok((source, stats))
     }
 
+    /// Point a caller's live view, if it asked for one, at this attempt's
+    /// accounting handle.
+    fn install_live_usage(&self, accounting: &PhaseAccounting) {
+        if let Some(live) = &self.live_usage {
+            live.install(accounting);
+        }
+    }
+
     /// Resolves a snapshot, enforces `max_segments`, runs `attempt` once,
     /// and on a store `NotFound` (a pinned segment vanished under a
     /// concurrent GC/compaction) re-resolves and retries the whole query
@@ -1970,6 +2059,10 @@ impl QueryEngine {
         // discarded first attempt's in-flight counts must not bleed into the
         // attempt that actually produced the result.
         let first_accounting = PhaseAccounting::new();
+        // Before the resolve, not after it: a caller's future dropped during
+        // the first catalog LIST must still find this attempt's counters
+        // through the live view.
+        self.install_live_usage(&first_accounting);
         let (first, first_generations, first_unfolded) = self
             .resolve_bounded(
                 tenant_hash,
@@ -2012,6 +2105,7 @@ impl QueryEngine {
                 ..
             })) => {
                 let second_accounting = PhaseAccounting::new();
+                self.install_live_usage(&second_accounting);
                 let (second, second_generations, second_unfolded) = self
                     .resolve_bounded(
                         tenant_hash,

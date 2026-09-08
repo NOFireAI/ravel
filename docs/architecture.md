@@ -237,6 +237,13 @@ request cannot consume a permit. Adding a transport therefore cannot add a
 surface that queries outside the ceiling, spends without recording, or
 answers without an audit trail.
 
+The usage record a disconnect folds carries the spend the query had actually
+reached, not a zero. Every operation hands the engine a live view of the
+counters for the attempt in flight and hands the same view to its usage
+guard, so a future dropped in the middle of a resolve is billed for the
+store requests it had already issued. A surface that recorded zero there
+would let a client cancel its way out of the cost of the work it started.
+
 The failure boundaries are the two PUTs of a write and the compare-and-swap
 of a fold. A failure on either side of them has a defined outcome and never
 an ambiguous one for Ravel, only sometimes for the client. Storage

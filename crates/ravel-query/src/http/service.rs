@@ -48,7 +48,8 @@ use crate::http::error::{ApiError, MSG_AUDIT_UNAVAILABLE};
 use crate::log_series;
 use crate::request_budgets::RequestBudgets;
 use crate::{
-    Coverage, EngineConfig, QueryAdmissionController, QueryEngine, QueryPermit, QueryStats,
+    Coverage, EngineConfig, LiveQueryAccounting, QueryAdmissionController, QueryEngine,
+    QueryPermit, QueryStats,
 };
 
 /// Resolve the caller's credentials to a tenant, the one authentication step
@@ -122,19 +123,13 @@ pub trait LiveUsage: Send + Sync {
     fn snapshot(&self) -> QueryAccountingSnapshot;
 }
 
-/// A live-usage handle for a call that exposes none. Its snapshot is all
-/// zeros, so a cancelled query on that path records the cancellation itself
-/// without claiming a spend it cannot measure.
-///
-/// The Prometheus-shaped engine entry points build and own their
-/// `QueryAccounting` internally and return it only on success, so this is what
-/// they use. Replacing it needs a live handle on `QueryEngine`, which is a
-/// change to `engine.rs`.
-pub struct UnobservedUsage;
-
-impl LiveUsage for UnobservedUsage {
+/// `ravel-query`'s own live accounting view, as a [`LiveUsage`]. Every
+/// Prometheus-shaped operation below hands one to the engine through
+/// [`QueryEngine::with_live_usage`] and the same one to its usage guard, so a
+/// cancelled query records what it had actually spent.
+impl LiveUsage for LiveQueryAccounting {
     fn snapshot(&self) -> QueryAccountingSnapshot {
-        QueryAccountingSnapshot::default()
+        LiveQueryAccounting::snapshot(self)
     }
 }
 
@@ -453,7 +448,9 @@ pub async fn promql_instant(
     let _permit = controls.admit()?;
     let deadline = controls.clamp_deadline(request.deadline, engine.config().deadline);
     let budgets = controls.clamp_budgets(request.budgets.as_ref(), engine.config());
-    let guard = controls.usage_guard(tenant_hash, Arc::new(UnobservedUsage));
+    let live = LiveQueryAccounting::new();
+    let guard = controls.usage_guard(tenant_hash, Arc::new(live.clone()));
+    let engine = engine.with_live_usage(&live);
 
     let exec = engine
         .instant_with_budgets(
@@ -511,7 +508,9 @@ pub async fn promql_range(
     let _permit = controls.admit()?;
     let deadline = controls.clamp_deadline(request.deadline, engine.config().deadline);
     let budgets = controls.clamp_budgets(request.budgets.as_ref(), engine.config());
-    let guard = controls.usage_guard(tenant_hash, Arc::new(UnobservedUsage));
+    let live = LiveQueryAccounting::new();
+    let guard = controls.usage_guard(tenant_hash, Arc::new(live.clone()));
+    let engine = engine.with_live_usage(&live);
 
     let exec = engine
         .range_hist_with_budgets(
@@ -635,9 +634,11 @@ async fn metadata(
     let _permit = controls.admit()?;
     let deadline = controls.clamp_deadline(request.deadline, engine.config().deadline);
     let budgets = controls.clamp_budgets(request.budgets.as_ref(), engine.config());
-    let guard = controls.usage_guard(tenant_hash, Arc::new(UnobservedUsage));
+    let live = LiveQueryAccounting::new();
+    let guard = controls.usage_guard(tenant_hash, Arc::new(live.clone()));
+    let engine = engine.with_live_usage(&live);
 
-    let resolved = resolve_matched_series(engine, tenant_hash, request, deadline, &budgets).await;
+    let resolved = resolve_matched_series(&engine, tenant_hash, request, deadline, &budgets).await;
     let status = finish_usage(guard, &resolved, |resolved: &ResolvedSeries| {
         (resolved.accounting, resolved.estimate)
     });

@@ -28,7 +28,9 @@ pub use config::{
     LATENCY_FIRST_MEASURED_CONCURRENCY, LogsFetchPolicy, REQUEST_BUDGET_FIXED_OVERHEAD,
     RequestLimit, ResolvedLogsFetch, derive_max_s3_requests, resolve_logs_fetch,
 };
-pub use engine::{Coverage, QueryEngine, QueryStats, snapshot_erasure_predicates};
+pub use engine::{
+    Coverage, LiveQueryAccounting, QueryEngine, QueryStats, snapshot_erasure_predicates,
+};
 pub use error::QueryError;
 pub use fetcher::{
     CacheFetchError, FetchError, FetchStats, FetchedSeries, FetchedSeriesSoa, ReadCache,
