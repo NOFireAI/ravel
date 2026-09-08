@@ -152,6 +152,12 @@ message SnapshotPartRef {
   // bytes. Absent (proto3 zero) means 0, matching a legacy single-part
   // ref. See SnapshotPartHeader.min_hour.
   uint32 min_hour = 6;
+  // Additive, ADR-1413. The per-part column-statistics object covering
+  // exactly this part's segments. Absent (proto3 default) means this part
+  // has no per-part statistics; the reader falls back to the whole-object
+  // ref at SnapshotHead field 13 (ADR-0942), then field 11 (ADR-0850), then
+  // to scan. Absence is never an error.
+  SnapshotColumnStatsPartRef column_stats = 7;
 }
 
 // Reference to a name-postings object (RNP1 envelope), phase P5a.

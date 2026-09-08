@@ -211,6 +211,19 @@ pub enum SnapshotFormatError {
     },
     #[error("column-stats header part_blake3 does not match the expected covered parts")]
     ColumnStatsPartBindingMismatch,
+    /// ADR-1413: a v3 (per-part) column-stats header must name exactly one
+    /// part. Any other count means the object was framed for the wrong
+    /// version or is corrupt; never decoded as if it covered zero or several
+    /// parts.
+    #[error("v3 column-stats header part_blake3 must have exactly one entry, got {0}")]
+    ColumnStatsV3PartBlake3CountMismatch(usize),
+    /// ADR-1413: the fold refuses to write a per-part column-stats object
+    /// whose uncompressed body would exceed the part's own byte bound
+    /// (`per_part_column_stats_bound`), checked before compression. Never a
+    /// silent skip: the caller must fail the whole fold for this part rather
+    /// than publish no v3 object for it.
+    #[error("column-stats part object body {declared} bytes exceeds the per-part bound {bound}")]
+    ColumnStatsPartOverBound { declared: u64, bound: u64 },
     #[error("column-stats segment carries duplicate column name {name:?}")]
     ColumnStatsDuplicateColumnName { name: String },
     #[error("column-stats column {name:?} has an unknown declared_type {declared_type}")]

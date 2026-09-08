@@ -2683,6 +2683,7 @@ mod tests {
                 entry_count: 1,
                 watermark_hour: 100,
                 min_hour: 0,
+                column_stats: None,
             }],
             folder_id: vec![0u8; 16],
             created_unix_ns: 0,

@@ -147,4 +147,19 @@ pub enum CatalogError {
     /// revisited.
     #[error("rewrite record supersession cycle detected at key {key:?}")]
     RewriteSupersessionCycle { key: String },
+    /// A fold-built per-part column-statistics object (ADR-1413, `.cstat` v3,
+    /// `SnapshotPartRef.column_stats` field 7) would exceed its per-part byte
+    /// bound. Fatal for that part: the fold must not publish a truncated or
+    /// over-bound v3 object, and must not silently skip it and carry on with
+    /// only the whole-tenant v1/v2 objects, so this fails the whole fold for
+    /// the (tenant, signal) rather than the generic
+    /// [`CatalogError::SnapshotFormat`] conversion, which carries no part key.
+    #[error(
+        "column-stats part object for part {part_key:?} would be {declared} bytes, over its per-part bound of {bound}"
+    )]
+    ColumnStatsPartOverBound {
+        part_key: String,
+        declared: u64,
+        bound: u64,
+    },
 }

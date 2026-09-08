@@ -400,6 +400,7 @@ async fn head_ahead_of_reader_fails_closed() {
             entry_count: 0,
             watermark_hour: watermark,
             min_hour: 0,
+            column_stats: None,
         }],
         postings: None,
         folder_id: vec![0x22; 16],
