@@ -11,6 +11,16 @@
 //! re-resolution. An evidence reference pins a single row for later
 //! recall by a `ravel_get_trace`-style follow-up.
 //!
+//! # The pinned snapshot is `ravel_sql::SegmentPin`
+//!
+//! A cursor's segment set is a `Vec<ravel_sql::SegmentPin>` encoded through
+//! that crate's own per-pin codec (ADR-1374 decision 9), not a local
+//! projection of the fields the pagination path happens to branch on. The two
+//! tokens pin a snapshot for the same reason and must reconstruct the same
+//! `SegmentRef`, so they share the layout and the field list; a narrower
+//! mirror silently drops the pruning bounds, the routing fields, and each
+//! segment's on-object format version.
+//!
 //! # The D5 wrong-tenant rule
 //!
 //! A cursor minted for tenant A that is redeemed by tenant B must decode as
@@ -35,7 +45,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ravel_query::erasure::ErasurePredicate;
-use ravel_sql::{DeclaredColumn, DeclaredType};
+use ravel_sql::{DeclaredColumn, DeclaredType, FlightTicketError, SegmentPin};
 use ravel_types::TenantHash;
 
 /// Length in bytes of the trailing keyed-MAC tag.
@@ -56,16 +66,25 @@ pub const CURSOR_KEY_LEN: usize = 32;
 pub type CursorKey = [u8; CURSOR_KEY_LEN];
 
 const CURSOR_MAGIC: [u8; 4] = *b"RMC1";
-const CURSOR_VERSION: u8 = 1;
+/// Version 2 pins each segment as a whole `ravel_sql::SegmentPin` (all 15
+/// fields, through that crate's own codec) instead of the five-field local
+/// projection version 1 carried. A version 1 token decodes as
+/// [`CursorError::Invalid`] like any other unsupported version, which is
+/// correct and costs nothing: these tokens are process-local and
+/// deadline-bounded, so none survives the deploy that changes the number.
+const CURSOR_VERSION: u8 = 2;
 const EVIDENCE_MAGIC: [u8; 4] = *b"RME1";
 const EVIDENCE_VERSION: u8 = 1;
 
-/// Typed decode failure for both [`Cursor`] and [`EvidenceRef`]. Deliberately
-/// only two variants (ADR-1374 D5): every malformed, truncated, tampered, or
-/// wrong-tenant token is [`CursorError::Invalid`] -- undifferentiated on
-/// purpose, so a caller cannot distinguish "not yours" from "corrupt" -- and
-/// only a structurally valid, correctly-tenanted token past its deadline is
-/// [`CursorError::Expired`].
+/// Typed failure for both [`Cursor`] and [`EvidenceRef`]. The two decode
+/// outcomes are the ones ADR-1374 D5 names, and they stay
+/// undifferentiated on purpose: every malformed, truncated, tampered, or
+/// wrong-tenant token is [`CursorError::Invalid`], so a caller cannot
+/// distinguish "not yours" from "corrupt", and only a structurally valid,
+/// correctly-tenanted token past its deadline is [`CursorError::Expired`].
+/// [`CursorError::FieldTooLong`] is not a third decode outcome: it is a
+/// length that does not fit the wire layout at all, and a caller that hits it
+/// is never a client holding a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CursorError {
     /// The token is malformed, truncated, tampered with (MAC mismatch), an
@@ -77,6 +96,12 @@ pub enum CursorError {
     /// `deadline_ns` has passed.
     #[error("cursor has expired")]
     Expired,
+    /// A length the wire layout cannot carry: at mint time a field longer
+    /// than the `u32` its length prefix is written as. Never returned for a
+    /// token a client could hold, which is why it is not one of the two D5
+    /// decode outcomes above.
+    #[error("cursor field length {len} exceeds the {max}-byte cap")]
+    FieldTooLong { len: usize, max: usize },
 }
 
 /// Where a paginated result left off. A keyset position is an opaque,
@@ -88,19 +113,6 @@ pub enum CursorPosition {
     RowRange { start: u64, end: u64 },
 }
 
-/// One pinned segment inside a [`Cursor`]: enough identity and dedup-order
-/// state to keep a paged scan pinned to the snapshot it started against,
-/// without pulling `ravel_catalog::SegmentLevel` (and so `ravel-catalog`)
-/// into this crate for a field the pagination path itself never branches on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PinnedSegment {
-    pub data_object_key: String,
-    pub content_hash: [u8; 32],
-    pub writer_epoch: u64,
-    pub writer_seq: u64,
-    pub created_unix_ns: i64,
-}
-
 /// The D5 cursor: an opaque, snapshot-pinning pagination token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
@@ -110,7 +122,16 @@ pub struct Cursor {
     /// so a cursor cannot be redeemed against a call with different
     /// arguments than the one that minted it.
     pub argument_hash: [u8; 32],
-    pub segments: Vec<PinnedSegment>,
+    /// The pinned snapshot, one entry per resolved segment.
+    ///
+    /// This is `ravel_sql::SegmentPin` itself, not a narrower local mirror
+    /// (ADR-1374 decision 9): a cursor pins a snapshot for exactly the reason
+    /// a Flight ticket does, so it carries the same 15 fields through the
+    /// same codec. A projection of "the fields pagination branches on" drops
+    /// the pruning bounds, the routing fields, and the on-object format
+    /// version, and page 2 then cannot rebuild the `SegmentRef` page 1
+    /// planned against.
+    pub segments: Vec<SegmentPin>,
     pub pending_erasure: Vec<ErasurePredicate>,
     pub declared_columns: Vec<DeclaredColumn>,
     pub position: CursorPosition,
@@ -133,44 +154,45 @@ pub struct EvidenceRef {
 
 impl Cursor {
     /// Encode to the wire layout, sign with `key`, and base64url the result.
-    pub fn encode(&self, key: &CursorKey) -> String {
+    ///
+    /// Fails with [`CursorError::FieldTooLong`] if any length prefix would
+    /// not fit in a `u32` (not reachable with real object keys, tool names,
+    /// or positions). A silent `as u32` truncation here would mint a token
+    /// whose own length prefix disagrees with its payload.
+    pub fn encode(&self, key: &CursorKey) -> Result<String, CursorError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&CURSOR_MAGIC);
         buf.push(CURSOR_VERSION);
         buf.extend_from_slice(&self.tenant.0);
-        write_len_prefixed(&mut buf, self.tool.as_bytes());
+        write_len_prefixed(&mut buf, self.tool.as_bytes())?;
         buf.extend_from_slice(&self.argument_hash);
 
-        write_u32(&mut buf, self.segments.len() as u32);
+        write_count(&mut buf, self.segments.len())?;
         for seg in &self.segments {
-            write_len_prefixed(&mut buf, seg.data_object_key.as_bytes());
-            buf.extend_from_slice(&seg.content_hash);
-            buf.extend_from_slice(&seg.writer_epoch.to_le_bytes());
-            buf.extend_from_slice(&seg.writer_seq.to_le_bytes());
-            buf.extend_from_slice(&seg.created_unix_ns.to_le_bytes());
+            seg.encode_into(&mut buf)?;
         }
 
-        write_u32(&mut buf, self.pending_erasure.len() as u32);
+        write_count(&mut buf, self.pending_erasure.len())?;
         for predicate in &self.pending_erasure {
-            write_u32(&mut buf, predicate.matchers().len() as u32);
+            write_count(&mut buf, predicate.matchers().len())?;
             for (k, v) in predicate.matchers() {
-                write_len_prefixed(&mut buf, k.as_bytes());
-                write_len_prefixed(&mut buf, v.as_bytes());
+                write_len_prefixed(&mut buf, k.as_bytes())?;
+                write_len_prefixed(&mut buf, v.as_bytes())?;
             }
             buf.extend_from_slice(&predicate.window_start_ns().to_le_bytes());
             buf.extend_from_slice(&predicate.window_end_ns().to_le_bytes());
         }
 
-        write_u32(&mut buf, self.declared_columns.len() as u32);
+        write_count(&mut buf, self.declared_columns.len())?;
         for column in &self.declared_columns {
-            write_len_prefixed(&mut buf, column.key.as_bytes());
+            write_len_prefixed(&mut buf, column.key.as_bytes())?;
             buf.push(declared_type_tag(column.ty));
         }
 
         match &self.position {
             CursorPosition::Keyset(bytes) => {
                 buf.push(0);
-                write_len_prefixed(&mut buf, bytes);
+                write_len_prefixed(&mut buf, bytes)?;
             }
             CursorPosition::RowRange { start, end } => {
                 buf.push(1);
@@ -184,7 +206,7 @@ impl Cursor {
 
         let tag = mac(key, &buf);
         buf.extend_from_slice(&tag);
-        URL_SAFE_NO_PAD.encode(buf)
+        Ok(URL_SAFE_NO_PAD.encode(buf))
     }
 
     /// Decode and MAC-verify a wire token. Does NOT check the tenant field
@@ -216,20 +238,10 @@ impl Cursor {
         let argument_hash = cur.read_array::<32>()?;
 
         let seg_count = cur.read_u32()?;
+        // Never pre-allocate from the untrusted count; push and grow.
         let mut segments = Vec::new();
         for _ in 0..seg_count {
-            let data_object_key = read_string(&mut cur)?;
-            let content_hash = cur.read_array::<32>()?;
-            let writer_epoch = u64::from_le_bytes(cur.read_array::<8>()?);
-            let writer_seq = u64::from_le_bytes(cur.read_array::<8>()?);
-            let created_unix_ns = i64::from_le_bytes(cur.read_array::<8>()?);
-            segments.push(PinnedSegment {
-                data_object_key,
-                content_hash,
-                writer_epoch,
-                writer_seq,
-                created_unix_ns,
-            });
+            segments.push(cur.read_segment_pin()?);
         }
 
         let erasure_count = cur.read_u32()?;
@@ -313,19 +325,21 @@ impl Cursor {
 }
 
 impl EvidenceRef {
-    pub fn encode(&self, key: &CursorKey) -> String {
+    /// See [`Cursor::encode`], including the [`CursorError::FieldTooLong`]
+    /// condition on the tool name's length prefix.
+    pub fn encode(&self, key: &CursorKey) -> Result<String, CursorError> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&EVIDENCE_MAGIC);
         buf.push(EVIDENCE_VERSION);
         buf.extend_from_slice(&self.tenant.0);
-        write_len_prefixed(&mut buf, self.tool.as_bytes());
+        write_len_prefixed(&mut buf, self.tool.as_bytes())?;
         buf.extend_from_slice(&self.sha256);
         buf.extend_from_slice(&self.mint_ns.to_le_bytes());
         buf.extend_from_slice(&self.deadline_ns.to_le_bytes());
 
         let tag = mac(key, &buf);
         buf.extend_from_slice(&tag);
-        URL_SAFE_NO_PAD.encode(buf)
+        Ok(URL_SAFE_NO_PAD.encode(buf))
     }
 
     pub fn decode(token: &str, key: &CursorKey) -> Result<EvidenceRef, CursorError> {
@@ -429,9 +443,21 @@ fn write_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
-fn write_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
-    write_u32(buf, bytes.len() as u32);
+/// Writes a count or length as the `u32` the wire layout reads it back as,
+/// refusing rather than truncating one that does not fit.
+fn write_count(buf: &mut Vec<u8>, len: usize) -> Result<(), CursorError> {
+    let v = u32::try_from(len).map_err(|_| CursorError::FieldTooLong {
+        len,
+        max: u32::MAX as usize,
+    })?;
+    write_u32(buf, v);
+    Ok(())
+}
+
+fn write_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) -> Result<(), CursorError> {
+    write_count(buf, bytes.len())?;
     buf.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn read_string(cur: &mut ByteReader<'_>) -> Result<String, CursorError> {
@@ -481,15 +507,71 @@ impl<'a> ByteReader<'a> {
     fn read_u32(&mut self) -> Result<u32, CursorError> {
         Ok(u32::from_le_bytes(self.read_array::<4>()?))
     }
+
+    /// Reads one segment pin through `ravel_sql`'s own codec, which owns the
+    /// layout, and advances by however many bytes it consumed. A typed
+    /// `FlightTicketError` from there (truncation, bad UTF-8, an invalid
+    /// level tag) becomes [`CursorError::Invalid`] like any other malformed
+    /// input: a cursor exposes exactly the two D5 decode outcomes and never
+    /// reports which field of which pin was wrong.
+    fn read_segment_pin(&mut self) -> Result<SegmentPin, CursorError> {
+        let rest = self.buf.get(self.pos..).ok_or(CursorError::Invalid)?;
+        let (pin, consumed) = SegmentPin::decode_from(rest).map_err(|_| CursorError::Invalid)?;
+        self.pos = self.pos.checked_add(consumed).ok_or(CursorError::Invalid)?;
+        Ok(pin)
+    }
+}
+
+impl From<FlightTicketError> for CursorError {
+    /// The pin codec's encode-side length refusal is this codec's own; every
+    /// other variant is a decode failure, which is [`CursorError::Invalid`].
+    fn from(error: FlightTicketError) -> Self {
+        match error {
+            FlightTicketError::FieldTooLong(len) => CursorError::FieldTooLong {
+                len,
+                max: u32::MAX as usize,
+            },
+            _ => CursorError::Invalid,
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use ravel_catalog::SegmentLevel;
+    use uuid::Uuid;
+
     use super::*;
 
     fn test_key() -> CursorKey {
         [0x11u8; CURSOR_KEY_LEN]
+    }
+
+    /// A pin with every one of its 15 fields set to a distinct non-default
+    /// value, so a field dropped anywhere in the cursor's codec changes the
+    /// decoded struct rather than round-tripping a zero through a zero.
+    fn every_field_pin() -> SegmentPin {
+        SegmentPin {
+            data_object_key: "t/aa/logs/l1/2026090812/w.7.9.deadbeef.rseg".to_owned(),
+            object_size: 4_194_304,
+            min_event_ts_ns: 1_700_000_000_111_111_111,
+            max_event_ts_ns: 1_700_000_003_222_222_222,
+            ingest_hour_bucket: 472_222,
+            sample_count: 123_456,
+            series_count: 789,
+            shard: 5,
+            content_hash: [0xC3u8; 32],
+            writer_id: Uuid::from_bytes([0xD7u8; 16]),
+            writer_epoch: 11,
+            writer_seq: 22,
+            created_unix_ns: 1_700_000_004_333_333_333,
+            level: SegmentLevel::L1 {
+                input_set_hash: [0xE5u8; 32],
+                part_index: 3,
+            },
+            segment_format_version: 4,
+        }
     }
 
     fn sample_cursor(tenant: TenantHash) -> Cursor {
@@ -497,12 +579,22 @@ mod tests {
             tenant,
             tool: "ravel_search_logs".to_owned(),
             argument_hash: [9u8; 32],
-            segments: vec![PinnedSegment {
+            segments: vec![SegmentPin {
                 data_object_key: "t/aa/logs/l0/0000/w.1.2.abc.rseg".to_owned(),
+                object_size: 65_536,
+                min_event_ts_ns: 1_700_000_000_000_000_000,
+                max_event_ts_ns: 1_700_000_001_000_000_000,
+                ingest_hour_bucket: 472_222,
+                sample_count: 10,
+                series_count: 4,
+                shard: 0,
                 content_hash: [3u8; 32],
+                writer_id: Uuid::from_bytes([4u8; 16]),
                 writer_epoch: 1,
                 writer_seq: 2,
                 created_unix_ns: 1_700_000_000_000_000_000,
+                level: SegmentLevel::L0,
+                segment_format_version: 3,
             }],
             pending_erasure: vec![ErasurePredicate::windowless(vec![(
                 "region".to_owned(),
@@ -526,7 +618,7 @@ mod tests {
         assert_ne!(tenant_a, tenant_b, "test must use two distinct tenants");
 
         let key = test_key();
-        let token = sample_cursor(tenant_a).encode(&key);
+        let token = sample_cursor(tenant_a).encode(&key).expect("encodes");
 
         let err = Cursor::redeem(&token, &key, tenant_b, 1_700_000_000_500_000_000)
             .expect_err("must be refused");
@@ -539,7 +631,7 @@ mod tests {
     fn tampered_mac_is_cursor_invalid() {
         let tenant = TenantHash([0x42u8; 16]);
         let key = test_key();
-        let token = sample_cursor(tenant).encode(&key);
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
 
         let mut bytes = URL_SAFE_NO_PAD.decode(&token).expect("decode base64");
         let last = bytes.len() - 1;
@@ -559,10 +651,32 @@ mod tests {
         let key = test_key();
         let cursor = sample_cursor(tenant);
         let deadline = cursor.deadline_ns;
-        let token = cursor.encode(&key);
+        let token = cursor.encode(&key).expect("encodes");
 
         let err = Cursor::redeem(&token, &key, tenant, deadline)
             .expect_err("must be expired at exactly the deadline");
         assert_eq!(err, CursorError::Expired);
+    }
+
+    /// The whole point of pinning `ravel_sql::SegmentPin` itself: every one
+    /// of its 15 fields survives the cursor round trip. Asserted on the whole
+    /// struct, so a field the codec forgets to write fails here whether or
+    /// not this test is updated to name it.
+    #[test]
+    fn cursor_round_trips_every_segment_pin_field() {
+        let tenant = TenantHash([0x5Eu8; 16]);
+        let key = test_key();
+        let pin = every_field_pin();
+        let mut cursor = sample_cursor(tenant);
+        cursor.segments = vec![pin.clone(), every_field_pin()];
+
+        let token = cursor.encode(&key).expect("encodes");
+        let decoded = Cursor::redeem(&token, &key, tenant, 1_700_000_000_500_000_000)
+            .expect("round-trips through its own codec");
+
+        assert_eq!(decoded.segments.len(), 2);
+        assert_eq!(decoded.segments[0], pin);
+        assert_eq!(decoded.segments[1], pin);
+        assert_eq!(decoded, cursor);
     }
 }

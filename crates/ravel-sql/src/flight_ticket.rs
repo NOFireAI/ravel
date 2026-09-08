@@ -419,6 +419,37 @@ impl SegmentPin {
             declared_column_stats: Default::default(),
         }
     }
+
+    /// Append this pin's wire layout to `buf`: the same bytes
+    /// [`FlightTicket::encode`] writes for each of its own segments, in the
+    /// same order.
+    ///
+    /// Reachable under the `pin-codec` feature so a crate that pins a
+    /// resolved snapshot in a token of its own (`ravel-mcp`'s cursors,
+    /// ADR-1374 decision 9) reuses this layout rather than defining a second,
+    /// narrower one that would silently drop identity, pruning, or routing
+    /// fields. The bytes carry no magic, no version, and no MAC of their own:
+    /// the enclosing token supplies all three, and both callers here cover
+    /// these bytes with their own MAC.
+    ///
+    /// Returns [`FlightTicketError::FieldTooLong`] if the object key's length
+    /// would not fit in a `u32`.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), FlightTicketError> {
+        write_segment_pin(buf, self)
+    }
+
+    /// Decode one pin from the front of `bytes`, returning it and the number
+    /// of bytes it consumed, so a caller reading a sequence of pins knows
+    /// where the next one starts. Trailing bytes are left to the caller and
+    /// are not an error here.
+    ///
+    /// Every malformed or truncated input yields a typed
+    /// [`FlightTicketError`], never a panic.
+    pub fn decode_from(bytes: &[u8]) -> Result<(SegmentPin, usize), FlightTicketError> {
+        let mut cur = Cursor::new(bytes);
+        let pin = read_segment_pin(&mut cur)?;
+        Ok((pin, cur.pos))
+    }
 }
 
 /// A self-describing, snapshot-pinning Flight SQL ticket.
@@ -503,21 +534,7 @@ impl FlightTicket {
 
         write_u32(&mut buf, u32_len(self.segments.len())?);
         for seg in &self.segments {
-            buf.extend_from_slice(&seg.writer_epoch.to_le_bytes());
-            buf.extend_from_slice(&seg.writer_seq.to_le_bytes());
-            buf.extend_from_slice(&seg.created_unix_ns.to_le_bytes());
-            buf.extend_from_slice(&seg.object_size.to_le_bytes());
-            buf.extend_from_slice(&seg.min_event_ts_ns.to_le_bytes());
-            buf.extend_from_slice(&seg.max_event_ts_ns.to_le_bytes());
-            buf.extend_from_slice(&seg.sample_count.to_le_bytes());
-            buf.extend_from_slice(&seg.series_count.to_le_bytes());
-            buf.extend_from_slice(&seg.ingest_hour_bucket.to_le_bytes());
-            buf.extend_from_slice(&seg.shard.to_le_bytes());
-            buf.extend_from_slice(&seg.content_hash);
-            buf.extend_from_slice(seg.writer_id.as_bytes());
-            write_len_prefixed(&mut buf, seg.data_object_key.as_bytes())?;
-            write_segment_level(&mut buf, &seg.level);
-            write_u32(&mut buf, seg.segment_format_version);
+            write_segment_pin(&mut buf, seg)?;
         }
 
         write_u32(&mut buf, u32_len(self.pending_erasure.len())?);
@@ -588,40 +605,7 @@ impl FlightTicket {
         let seg_count = cur.read_u32()?;
         let mut segments = Vec::new();
         for _ in 0..seg_count {
-            let writer_epoch = u64::from_le_bytes(cur.read_array::<8>()?);
-            let writer_seq = u64::from_le_bytes(cur.read_array::<8>()?);
-            let created_unix_ns = i64::from_le_bytes(cur.read_array::<8>()?);
-            let object_size = u64::from_le_bytes(cur.read_array::<8>()?);
-            let min_event_ts_ns = i64::from_le_bytes(cur.read_array::<8>()?);
-            let max_event_ts_ns = i64::from_le_bytes(cur.read_array::<8>()?);
-            let sample_count = u64::from_le_bytes(cur.read_array::<8>()?);
-            let series_count = u64::from_le_bytes(cur.read_array::<8>()?);
-            let ingest_hour_bucket = u32::from_le_bytes(cur.read_array::<4>()?);
-            let shard = u32::from_le_bytes(cur.read_array::<4>()?);
-            let content_hash = cur.read_array::<32>()?;
-            let writer_id = Uuid::from_bytes(cur.read_array::<16>()?);
-            let key = cur.read_len_prefixed()?;
-            let data_object_key =
-                std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
-            let level = read_segment_level(&mut cur)?;
-            let segment_format_version = cur.read_u32()?;
-            segments.push(SegmentPin {
-                data_object_key: data_object_key.to_owned(),
-                object_size,
-                min_event_ts_ns,
-                max_event_ts_ns,
-                ingest_hour_bucket,
-                sample_count,
-                series_count,
-                shard,
-                content_hash,
-                writer_id,
-                writer_epoch,
-                writer_seq,
-                created_unix_ns,
-                level,
-                segment_format_version,
-            });
+            segments.push(read_segment_pin(&mut cur)?);
         }
 
         let erasure_count = cur.read_u32()?;
@@ -823,6 +807,66 @@ fn write_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) -> Result<(), FlightTicke
     write_u32(buf, u32_len(bytes.len())?);
     buf.extend_from_slice(bytes);
     Ok(())
+}
+
+/// The per-segment field order of the ticket's wire layout, in one place so
+/// [`FlightTicket::encode`] and [`SegmentPin::encode_into`] cannot drift
+/// apart: the two must produce identical bytes for the same pin, since the
+/// same reader below parses both.
+fn write_segment_pin(buf: &mut Vec<u8>, seg: &SegmentPin) -> Result<(), FlightTicketError> {
+    buf.extend_from_slice(&seg.writer_epoch.to_le_bytes());
+    buf.extend_from_slice(&seg.writer_seq.to_le_bytes());
+    buf.extend_from_slice(&seg.created_unix_ns.to_le_bytes());
+    buf.extend_from_slice(&seg.object_size.to_le_bytes());
+    buf.extend_from_slice(&seg.min_event_ts_ns.to_le_bytes());
+    buf.extend_from_slice(&seg.max_event_ts_ns.to_le_bytes());
+    buf.extend_from_slice(&seg.sample_count.to_le_bytes());
+    buf.extend_from_slice(&seg.series_count.to_le_bytes());
+    buf.extend_from_slice(&seg.ingest_hour_bucket.to_le_bytes());
+    buf.extend_from_slice(&seg.shard.to_le_bytes());
+    buf.extend_from_slice(&seg.content_hash);
+    buf.extend_from_slice(seg.writer_id.as_bytes());
+    write_len_prefixed(buf, seg.data_object_key.as_bytes())?;
+    write_segment_level(buf, &seg.level);
+    write_u32(buf, seg.segment_format_version);
+    Ok(())
+}
+
+/// Inverse of [`write_segment_pin`], reading one pin from `cur`.
+fn read_segment_pin(cur: &mut Cursor<'_>) -> Result<SegmentPin, FlightTicketError> {
+    let writer_epoch = u64::from_le_bytes(cur.read_array::<8>()?);
+    let writer_seq = u64::from_le_bytes(cur.read_array::<8>()?);
+    let created_unix_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+    let object_size = u64::from_le_bytes(cur.read_array::<8>()?);
+    let min_event_ts_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+    let max_event_ts_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+    let sample_count = u64::from_le_bytes(cur.read_array::<8>()?);
+    let series_count = u64::from_le_bytes(cur.read_array::<8>()?);
+    let ingest_hour_bucket = u32::from_le_bytes(cur.read_array::<4>()?);
+    let shard = u32::from_le_bytes(cur.read_array::<4>()?);
+    let content_hash = cur.read_array::<32>()?;
+    let writer_id = Uuid::from_bytes(cur.read_array::<16>()?);
+    let key = cur.read_len_prefixed()?;
+    let data_object_key = std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
+    let level = read_segment_level(cur)?;
+    let segment_format_version = cur.read_u32()?;
+    Ok(SegmentPin {
+        data_object_key: data_object_key.to_owned(),
+        object_size,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        ingest_hour_bucket,
+        sample_count,
+        series_count,
+        shard,
+        content_hash,
+        writer_id,
+        writer_epoch,
+        writer_seq,
+        created_unix_ns,
+        level,
+        segment_format_version,
+    })
 }
 
 /// Per-segment wire encoding of [`SegmentLevel`]: a single tag byte (0 = L0,
