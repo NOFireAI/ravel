@@ -6154,6 +6154,74 @@ mod tests {
         );
     }
 
+    /// Does any `verbs:` list in the manifest grant `update`?
+    ///
+    /// Scans the comment-stripped `verbs:` lines and, when a `verbs:` line opens
+    /// a block sequence, its items, for a bare `update` token. Flow style
+    /// (`verbs: ["create", "update"]`) and block style (`- update`, quoted or
+    /// not) both count; a comment or a blank line inside a block sequence does
+    /// not end it. Nothing outside a verbs list is scanned, so a resource named
+    /// `updates` or the word in a comment cannot fail the caller's assertion for
+    /// the wrong reason.
+    fn verbs_grant_update(manifest: &str) -> bool {
+        let has_update = |text: &str| {
+            text.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|token| token == "update")
+        };
+        let mut in_verbs_block = false;
+        for raw in manifest.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("verbs:") {
+                if has_update(rest) {
+                    return true;
+                }
+                // A `verbs:` key with nothing after it opens a block sequence
+                // whose items are the verbs.
+                in_verbs_block = rest.trim().is_empty();
+                continue;
+            }
+            if in_verbs_block && !line.is_empty() {
+                match line.strip_prefix("- ") {
+                    Some(item) if has_update(item) => return true,
+                    Some(_) => {}
+                    // The next key ends the sequence.
+                    None => in_verbs_block = false,
+                }
+            }
+        }
+        false
+    }
+
+    /// [`verbs_grant_update`] catches the `update` verb in both YAML spellings a
+    /// rules list can use, and reports nothing for an `update` outside a verbs
+    /// list. The block-style cases are the ones a quoted-substring check missed;
+    /// the negative cases are why the scan is narrowed to verbs lines instead of
+    /// running over every line in the file.
+    #[test]
+    fn the_update_verb_scan_covers_both_yaml_styles_and_nothing_else() {
+        // Flow style, the shape rbac.yaml ships.
+        assert!(verbs_grant_update("    verbs: [\"create\", \"update\"]\n"));
+        // Block style, quoted and unquoted.
+        assert!(verbs_grant_update(
+            "    verbs:\n      - create\n      - update\n      - delete\n"
+        ));
+        assert!(verbs_grant_update("    verbs:\n      - \"update\"\n"));
+        // A comment or a blank line inside the sequence does not end it.
+        assert!(verbs_grant_update(
+            "    verbs:\n      - create\n      # rationale\n\n      - update\n"
+        ));
+
+        // Narrowed: an `update` outside a verbs list is not a grant.
+        assert!(!verbs_grant_update("    resources: [\"updates\"]\n"));
+        assert!(!verbs_grant_update("    verbs: [\"get\"] # never update\n"));
+        assert!(!verbs_grant_update("    # verbs: [\"update\"]\n"));
+        assert!(!verbs_grant_update("    strategy: update\n"));
+        // The next key ends a block sequence, so a later value is out of scope.
+        assert!(!verbs_grant_update(
+            "    verbs:\n      - get\n    resources: [\"update\"]\n"
+        ));
+    }
+
     /// Finding 1 verb sweep. Every operator write is server-side apply (a PATCH,
     /// with `create` for objects that do not yet exist) or a delete, never a
     /// PUT, so no rule grants the `update` verb. Each rule grants exactly the
@@ -6169,21 +6237,13 @@ mod tests {
         let manifest = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-        // No rule anywhere grants `update`. Scan the comment-stripped lines for a
-        // bare `update` token so a reformat of any rule to block sequences
-        // (`- update`, unquoted) cannot make this go quiet: the old check matched
-        // only the quoted "update" substring and saw nothing in block style. The
-        // word "update" in a comment is stripped before the scan, so it does not
-        // count.
-        let grants_update = manifest.lines().any(|line| {
-            line.split('#')
-                .next()
-                .unwrap_or("")
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .any(|token| token == "update")
-        });
+        // No rule anywhere grants `update`. The scan covers the verbs lines only
+        // (the same lines the count assertion below identifies) and their block
+        // sequence items, so a reformat of any rule to block style (`- update`,
+        // unquoted) cannot make it go quiet while an `update` anywhere else in
+        // the file cannot fail it for the wrong reason.
         assert!(
-            !grants_update,
+            !verbs_grant_update(&manifest),
             "server-side apply is a PATCH, not a PUT: no rule may grant the update verb"
         );
 
