@@ -5,6 +5,13 @@ Date: 2026-09-07
 Epic: #1374
 Reviewed revision: `2b8c2a51ddcd844e3362ad4513d314c01fa35b6f`
 
+**Amendment (2026-09-08, #1468).** Three changes. D4 adds the
+`missing_argument` failure class, already used in the Time paragraph. D4 and
+D5 state that a cursor or evidence reference for the wrong tenant fails with
+`cursor_invalid`, the same class as a forged token. D2 and D4 add the
+optional `plan` envelope block: `ravel_explain_query` returns the plan shape
+there, and the effective schema goes in `data.columns` with zero rows.
+
 ## Context
 
 An AI agent that investigates an incident or a security event needs four
@@ -157,7 +164,7 @@ annotations `readOnlyHint: true`, `destructiveHint: false`, and
 | `ravel_capabilities` | Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals. Zero store reads | none |
 | `ravel_describe_data` | Per signal: effective schema (fixed and declared columns), indexed keys, metric families with type and unit (one bounded page), freshness watermark, coverage window, exact catalog row counts where they exist | D3 explain path, `MetadataCache`, one resolve per signal |
 | `ravel_find_labels` | Metric names for a selector, label names, or label values for one label under a selector. The result says if the list is declared, observed, or exact. An unfiltered tenant-wide list is refused, and the refusal names the bounded form | label machinery through the service layer |
-| `ravel_explain_query` | Validate SQL or PromQL, resolve the snapshot, return the target table, the effective schema, the admitted segment count, the estimate against the effective budget, and the plan shape. No scan | D3 `SqlExecutor::explain` |
+| `ravel_explain_query` | Validate SQL or PromQL, resolve the snapshot, return the target table, the effective schema in `data.columns` with zero rows, the admitted segment count, the estimate against the effective budget, and the plan shape in `plan`. No scan | D3 `SqlExecutor::explain` |
 | `ravel_query_sql` | One `SELECT` over one table, with a required `time_range` applied as a row filter, `max_rows`, budgets that can only be lowered, and a keyset cursor | D3 |
 | `ravel_query_promql` | Instant or range evaluation, partial-coverage consent, step alignment, the two log pseudo-metrics | `QueryEngine` through the service layer |
 | `ravel_search_logs` | Typed log search compiled to SQL. Uses indexed and declared predicates, `has_word`, severity, and trace id. Orders by `ts`. Groups rows by attribute set and hoists shared attributes once | D3 |
@@ -226,6 +233,7 @@ Every tool returns one envelope:
   "status": "ok | ok_bounded | ok_page | error",
   "failure": null,
   "data": {"columns": [], "rows": [], "row_count": 0},
+  "plan": null,
   "scope": {"signal": "", "table": "", "time_range": {}, "predicates_applied": [], "order_by": []},
   "ids": {"query_id": "", "audit_ref": ""},
   "visibility": {"snapshot_id": "", "watermark_hour": "", "pinned": false, "min_commit_tokens_applied": []},
@@ -238,6 +246,9 @@ Every tool returns one envelope:
   "next_steps": [{"action": "", "detail": ""}]
 }
 ```
+
+`plan` carries the plan text that `ravel_explain_query` returns and stays
+`null` on every other tool.
 
 The four status values are different facts. `ok` is a complete query. A
 query with zero matches is `ok`. A query whose `LIMIT` the data did not fill
@@ -327,14 +338,19 @@ exceed 2^53. Floats keep `NaN`, `+Inf`, and `-Inf` as strings. Finite floats
 are numbers with the sign of zero preserved (the rule of
 `output.rs::float_to_json`). Binary is hex. Maps are objects.
 
-Failure classes: `unauthorized`, `invalid_argument`, `validation` (the engine
-text, safe to echo), `unsupported`, `budget_estimate_exceeds_ceiling`,
-`budget_exceeded` (with the counter that tripped), `deadline`, `unavailable`
-(retryable), `snapshot_invalidated` (retryable once), `cursor_expired`,
-`cursor_invalid`, and `internal` (fixed message). A failure is a tool result
-with `isError: true`, so the model can correct itself. Protocol errors are
-for malformed JSON-RPC and unknown tools only. Every failure carries
+Failure classes: `unauthorized`, `invalid_argument`, `missing_argument` (a
+required argument is absent), `validation` (the engine text, safe to echo),
+`unsupported`, `budget_estimate_exceeds_ceiling`, `budget_exceeded` (with the
+counter that tripped), `deadline`, `unavailable` (retryable),
+`snapshot_invalidated` (retryable once), `cursor_expired`, `cursor_invalid`,
+and `internal` (fixed message). A failure is a tool result with
+`isError: true`, so the model can correct itself. Protocol errors are for
+malformed JSON-RPC and unknown tools only. Every failure carries
 `next_steps`.
+
+A cursor or evidence reference presented for the wrong tenant fails with
+`cursor_invalid`. The class matches a forged token, so the failure leaks no
+tenant-mismatch signal.
 
 ### D5. Consistency, cursors, and evidence references
 
@@ -353,7 +369,11 @@ stores nothing. A page
 re-executes the statement against the pin with a keyset predicate. A cursor
 from a dead process fails with `cursor_expired`. Only the process that minted
 a cursor can redeem it. The documentation says this, and it names sticky
-routing as the option for a load balancer.
+routing as the option for a load balancer. The server also compares the
+tenant hash inside the token with the resolved tenant on every redemption. A
+cursor or evidence reference from another tenant fails with
+`cursor_invalid`, the same class a forged token gets, so the failure leaks no
+tenant-mismatch signal.
 
 `ravel_query_sql` mints a cursor only when the `ORDER BY`, plus a
 deterministic tiebreak that the tool appends, is a total order over the
