@@ -1205,8 +1205,9 @@ pub struct Cli {
     /// sends none). ADR-1374 decision 7 makes origin validation mandatory,
     /// because a browser page on another site can otherwise reach a
     /// loopback-bound MCP server with the user's ambient credentials. Empty
-    /// is allowed only when `--listen-http` binds a loopback address;
-    /// otherwise `--mcp` refuses to start without this flag.
+    /// is allowed only when every listener the route is mounted on binds a
+    /// loopback address (`--listen-http`, and `--mtls-listener` when one is
+    /// configured); otherwise `--mcp` refuses to start without this flag.
     #[arg(
         long = "mcp-allowed-origins",
         value_name = "ORIGINS",
@@ -3668,6 +3669,33 @@ impl Cli {
         })
     }
 
+    /// Every listener `POST /mcp` is mounted on, each with the flag that binds
+    /// it, in the order `lib.rs` merges the MCP router in: the plain HTTP
+    /// listener, and the mTLS listener when one is configured.
+    ///
+    /// The route is mounted per listener, so a loopback rule that reads only
+    /// one of them leaves the other unguarded. This is the same shape as the
+    /// dev-header rule in [`Self::validate`], which guards `--listen-http` and
+    /// `--listen-grpc` together for the same reason (issue #1293): a listener
+    /// added to the mount site in `lib.rs` has to be added here too, or the
+    /// origin allowlist silently stops being required on it.
+    fn mcp_route_listeners(&self) -> Vec<(&'static str, SocketAddr)> {
+        let mut listeners = vec![("--listen-http", self.listen_http)];
+        if let Some(mtls_listener) = self.mtls_listener {
+            listeners.push(("--mtls-listener", mtls_listener));
+        }
+        listeners
+    }
+
+    /// The [`Self::mcp_route_listeners`] entries bound to an address something
+    /// other than this host can reach.
+    fn public_mcp_route_listeners(&self) -> Vec<(&'static str, SocketAddr)> {
+        self.mcp_route_listeners()
+            .into_iter()
+            .filter(|(_, listener)| !listener.ip().is_loopback())
+            .collect()
+    }
+
     /// Cross-flag startup invariants that do not fit `parse_auth_resolvers`'s
     /// per-resolver shape (ADR-0050 section 1, plus the pre-existing
     /// dev-header loopback rule this consolidates from `main`). Every case
@@ -3835,14 +3863,24 @@ impl Cli {
         // safe on a loopback listener that no browser page on another site
         // can reach in the first place; on a reachable address it is the
         // DNS-rebinding hole the decision exists to close, so refuse at
-        // startup rather than serving an open route.
-        if self.mcp && self.mcp_allowed_origins.is_empty() && !self.listen_http.ip().is_loopback() {
-            anyhow::bail!(
-                "--mcp on a non-loopback --listen-http ({}) requires --mcp-allowed-origins: an \
-                 empty allowlist accepts every Origin, which lets a page on any site drive this \
-                 server from a browser with the user's ambient credentials",
-                self.listen_http,
-            );
+        // startup rather than serving an open route. Every listener the route
+        // is mounted on counts, not just `--listen-http`: the same mistake the
+        // dev-header rule above made before issue #1293.
+        if self.mcp && self.mcp_allowed_origins.is_empty() {
+            let public = self.public_mcp_route_listeners();
+            if !public.is_empty() {
+                let named = public
+                    .iter()
+                    .map(|(flag, listener)| format!("{flag} {listener}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                anyhow::bail!(
+                    "--mcp requires --mcp-allowed-origins: POST /mcp is mounted on every \
+                     query-serving listener, and these are not loopback: {named}. An empty \
+                     allowlist accepts every Origin, which lets a page on any site drive this \
+                     server from a browser with the user's ambient credentials"
+                );
+            }
         }
 
         if self.mcp_max_body_bytes == 0 {
@@ -8249,6 +8287,92 @@ mod tests {
         ])
         .validate()
         .expect("both listeners loopback with the dev header is fine");
+    }
+
+    #[test]
+    fn mcp_on_a_public_http_listener_still_requires_the_allowlist() {
+        // The original case: `--listen-http` is public, so the empty allowlist
+        // would serve an origin-unchecked POST /mcp on a reachable address.
+        let err = cli(&["--mcp", "--listen-http", "0.0.0.0:8080"])
+            .validate()
+            .expect_err("--mcp on a public --listen-http must refuse startup");
+        let message = err.to_string();
+        assert!(
+            message.contains("--mcp-allowed-origins"),
+            "error names the flag: {message}"
+        );
+        assert!(
+            message.contains("--listen-http 0.0.0.0:8080"),
+            "error names the public listener: {message}"
+        );
+        assert!(
+            !message.contains("--mtls-listener"),
+            "no mTLS listener is configured, so none is named: {message}"
+        );
+    }
+
+    #[test]
+    fn mcp_on_a_public_mtls_listener_requires_the_origin_allowlist() {
+        // `--listen-http` is loopback, so the pre-#1381 rule passed this
+        // configuration. `lib.rs` mounts POST /mcp on the mTLS router too, so
+        // it served an origin-unchecked route on 0.0.0.0:8443.
+        let err = cli(&[
+            "--mcp",
+            "--listen-http",
+            "127.0.0.1:8080",
+            "--mtls-enabled",
+            "--mtls-listener",
+            "0.0.0.0:8443",
+        ])
+        .validate()
+        .expect_err("--mcp on a public --mtls-listener must refuse startup");
+        let message = err.to_string();
+        assert!(
+            message.contains("--mcp-allowed-origins"),
+            "error names the flag: {message}"
+        );
+        assert!(
+            message.contains("--mtls-listener 0.0.0.0:8443"),
+            "error names the public listener: {message}"
+        );
+        assert!(
+            !message.contains("--listen-http"),
+            "the loopback HTTP listener is not the reason: {message}"
+        );
+    }
+
+    #[test]
+    fn mcp_on_loopback_listeners_needs_no_allowlist() {
+        // Positive control so neither half of the guard can be vacuous: both
+        // listeners loopback, empty allowlist, and startup proceeds.
+        cli(&[
+            "--mcp",
+            "--listen-http",
+            "127.0.0.1:8080",
+            "--mtls-enabled",
+            "--mtls-listener",
+            "127.0.0.1:8443",
+        ])
+        .validate()
+        .expect("--mcp on loopback listeners needs no allowlist");
+    }
+
+    #[test]
+    fn mcp_allowlist_admits_a_public_listener() {
+        // The allowlist is what the refusals above are about: with one origin
+        // configured, the same public listeners start.
+        cli(&[
+            "--mcp",
+            "--mcp-allowed-origins",
+            "https://console.example",
+            "--listen-http",
+            "0.0.0.0:8080",
+            "--mtls-enabled",
+            "--mtls-listener",
+            "0.0.0.0:8443",
+        ])
+        .validate()
+        .expect("a non-empty allowlist admits public listeners");
     }
 
     #[test]
