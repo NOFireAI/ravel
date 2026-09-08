@@ -2118,13 +2118,25 @@ async fn read_head_reference(
                 ))
             })?;
             let mut referenced = HashSet::with_capacity(
-                head.parts.len()
+                head.parts.len() * 2
                     + usize::from(head.postings.is_some())
                     + usize::from(head.column_stats.is_some())
                     + usize::from(head.column_stats_part.is_some()),
             );
             for part in &head.parts {
                 referenced.insert(part.key.clone());
+                // Additive, ADR-1413. `part.column_stats` (field 7,
+                // `SnapshotColumnStatsPartRef`) names a per-part v3
+                // column-stats object living under the same `idx/` prefix
+                // this sweep lists. It is reachable only through the part
+                // that carries it, never through SnapshotHead field 11/13, so
+                // it must be added to the set here or a live v3 object goes
+                // unreferenced and is swept once its age crosses the
+                // protection horizon, even though a sealed part never gets
+                // rewritten and the HEAD still names it (issue #1482).
+                if let Some(column_stats) = &part.column_stats {
+                    referenced.insert(column_stats.key.clone());
+                }
             }
             if let Some(postings) = &head.postings {
                 referenced.insert(postings.key.clone());
@@ -2133,12 +2145,14 @@ async fn read_head_reference(
             // reachable object under the same `idx/` prefix this sweep lists
             // (fold.rs writes `.cstat` there), so omitting it lets the sweep
             // delete an object a resolvable snapshot still references (#958).
-            // Both carriers are covered: field 11 `column_stats`
-            // (`SnapshotColumnStatsRef`, ADR-0850) is what folds write today,
-            // and field 13 `column_stats_part` (`SnapshotColumnStatsPartRef`,
-            // ADR-0942's part-hash re-keying) is additive and may be written by
-            // a later fold path. Whichever a HEAD carries names a `.cstat` key
-            // that must be spared exactly like a part or the postings object.
+            // All three carriers are covered: field 11 `column_stats`
+            // (`SnapshotColumnStatsRef`, ADR-0850) and field 13
+            // `column_stats_part` (`SnapshotColumnStatsPartRef`, ADR-0942's
+            // part-hash re-keying) are whole-object refs on the HEAD itself;
+            // `parts[].column_stats` (field 7, ADR-1413) is the per-part v3
+            // ref handled in the loop above. Whichever a HEAD carries names a
+            // `.cstat` key that must be spared exactly like a part or the
+            // postings object.
             if let Some(column_stats) = &head.column_stats {
                 referenced.insert(column_stats.key.clone());
             }
@@ -3691,6 +3705,122 @@ mod tests {
         assert!(
             present(&store, &part).await,
             "the HEAD-named part is spared"
+        );
+    }
+
+    /// A part ref carrying a per-part v3 column-stats ref (field 7,
+    /// `SnapshotColumnStatsPartRef`, ADR-1413).
+    fn part_ref_with_v3_stats(
+        key: &str,
+        blake3: [u8; 32],
+        min_hour: u32,
+        watermark_hour: u32,
+        v3_stats_key: &str,
+    ) -> SnapshotPartRef {
+        SnapshotPartRef {
+            min_hour,
+            watermark_hour,
+            column_stats: Some(SnapshotColumnStatsPartRef {
+                key: v3_stats_key.to_string(),
+                blake3: [9u8; 32].to_vec(),
+                size: 1,
+                segment_count: 1,
+                part_blake3: vec![blake3.to_vec()],
+            }),
+            ..part_ref(key, blake3)
+        }
+    }
+
+    /// Issue #1482: a per-part v3 column-stats object (`SnapshotPartRef.
+    /// column_stats`, field 7, ADR-1413) is reachable only through the part
+    /// that carries it, never through `SnapshotHead.column_stats` (field 11)
+    /// or `column_stats_part` (field 13). Before the fix, `read_head_reference`
+    /// only walked those two HEAD-level fields, so a live v3 object crossed
+    /// the protection horizon and was swept out from under a sealed part the
+    /// current HEAD still names -- and, unlike a `.csnap` part, a sealed part
+    /// is never rewritten, so the object was never recreated. Two parts each
+    /// carry a field-7 ref; a third, unrelated `.cstat` is unreferenced. All
+    /// three are older than the horizon. Only the unreferenced one is swept.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_v3_per_part_column_stats() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part_a = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let part_b = format!(
+            "{}20260102T00.bbbb.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let v3_stats_a = format!(
+            "{}20260101T00.aaaa.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let v3_stats_b = format!(
+            "{}20260102T00.bbbb.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let unreferenced_cstat = format!(
+            "{}20251231T00.zzzz.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+
+        put_catalog_object(&store, &part_a).await;
+        put_catalog_object(&store, &part_b).await;
+        put_catalog_object(&store, &v3_stats_a).await;
+        put_catalog_object(&store, &v3_stats_b).await;
+        put_catalog_object(&store, &unreferenced_cstat).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![
+                part_ref_with_v3_stats(&part_a, [1u8; 32], 0, 100, &v3_stats_a),
+                part_ref_with_v3_stats(&part_b, [2u8; 32], 101, 200, &v3_stats_b),
+            ],
+            None,
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        // Exact key set: only the unreferenced `.cstat` is deleted; both
+        // parts and both field-7-referenced v3 objects survive. Against
+        // c82f13d0 (pre-fix), this assertion fails: `outcome.deleted == 3`,
+        // with `v3_stats_a` and `v3_stats_b` both gone, because
+        // `read_head_reference` never walked `part.column_stats` -- only the
+        // line adding it to `referenced` inside the `for part in &head.parts`
+        // loop distinguishes the two runs.
+        assert_eq!(outcome.deleted, 1, "only the unreferenced v3 object");
+        assert_eq!(outcome.kept, 4, "both parts and both referenced v3 objects");
+        assert!(
+            present(&store, &v3_stats_a).await,
+            "a v3 object a live part still references (field 7) must survive (#1482)"
+        );
+        assert!(
+            present(&store, &v3_stats_b).await,
+            "a v3 object a live part still references (field 7) must survive (#1482)"
+        );
+        assert!(
+            present(&store, &part_a).await,
+            "the HEAD-named part a is spared"
+        );
+        assert!(
+            present(&store, &part_b).await,
+            "the HEAD-named part b is spared"
+        );
+        assert!(
+            !present(&store, &unreferenced_cstat).await,
+            "an old v3 object no part references must still be swept"
         );
     }
 
