@@ -126,7 +126,11 @@ pub trait LiveUsage: Send + Sync {
 /// `ravel-query`'s own live accounting view, as a [`LiveUsage`]. Every
 /// Prometheus-shaped operation below hands one to the engine through
 /// [`QueryEngine::with_live_usage`] and the same one to its usage guard, so a
-/// cancelled query records what it had actually spent.
+/// cancelled query records what it had actually spent. The view is additive
+/// over every lane, selector, and attempt the request spent through, so one
+/// view per operation is enough even where the operation makes several engine
+/// calls: `resolve_matched_series` below resolves each `match[]` selector
+/// separately and the guard still reads the whole request's spend.
 impl LiveUsage for LiveQueryAccounting {
     fn snapshot(&self) -> QueryAccountingSnapshot {
         LiveQueryAccounting::snapshot(self)

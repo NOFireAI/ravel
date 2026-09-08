@@ -330,47 +330,56 @@ fn estimate_cost(
     )
 }
 
-/// A running evaluation's spend, readable from outside the call.
+/// A running request's spend, readable from outside the call.
 ///
-/// The engine builds a fresh [`PhaseAccounting`] per attempt and returns its
-/// snapshot only inside a successful [`QueryStats`], so a caller whose future
-/// is dropped mid-query has nothing to read. An engine handed one of these
-/// through [`QueryEngine::with_live_usage`] points it at each attempt's handle
-/// before that attempt issues its first store call, so a drop guard can read
-/// what the abandoned query had spent by then. The mirror of
+/// The engine builds a fresh [`PhaseAccounting`] per lane and per attempt and
+/// returns its snapshot only inside a successful [`QueryStats`], so a caller
+/// whose future is dropped mid-query has nothing to read. An engine handed one
+/// of these through [`QueryEngine::with_live_usage`] registers each of those
+/// handles here before it issues its first store call, so a drop guard can read
+/// what the abandoned request had spent by then. The mirror of
 /// `ravel_sql::LiveAccounting`, which is what the SQL surface reads on the
 /// same path.
 ///
-/// A retried attempt re-points the view at its own handle, so a snapshot taken
-/// after the retry started reflects that attempt alone and never the discarded
-/// one, matching ADR-0044 decision 1.
+/// The view is ADDITIVE: it keeps every handle registered during the request
+/// and [`Self::snapshot`] sums them. One request can spend through several
+/// handles -- the metrics lane and the log lane of one PromQL query, one per
+/// `match[]` selector of a metadata request, and one per attempt when a
+/// snapshot is invalidated and the query re-resolves -- and a cancelled request
+/// owes the total, not whichever handle happened to be installed last. Each
+/// site registers a handle it just built, exactly once, so no counter block is
+/// summed twice.
 #[derive(Clone, Default)]
-pub struct LiveQueryAccounting(Arc<std::sync::Mutex<PhaseAccounting>>);
+pub struct LiveQueryAccounting(Arc<std::sync::Mutex<Vec<PhaseAccounting>>>);
 
 impl LiveQueryAccounting {
-    /// A live view whose counters are all zero until an attempt installs its
-    /// handle.
+    /// A live view whose counters are all zero until a lane or an attempt
+    /// registers its handle.
     pub fn new() -> Self {
         LiveQueryAccounting::default()
     }
 
-    /// The spend issued so far by whichever attempt is installed, pooled
-    /// across phases the way [`QueryStats::accounting`] is.
+    /// The spend issued so far across every registered handle, each pooled
+    /// across phases the way [`QueryStats::accounting`] is and then summed.
     pub fn snapshot(&self) -> QueryAccountingSnapshot {
-        self.lock().snapshot().pooled()
+        self.lock()
+            .iter()
+            .fold(QueryAccountingSnapshot::default(), |total, accounting| {
+                total.saturating_add(&accounting.snapshot().pooled())
+            })
     }
 
-    /// Point this view at `accounting` (the attempt about to run). Clones the
-    /// handle, so the two share one counter block and every increment the
-    /// attempt makes is visible through [`Self::snapshot`].
+    /// Register `accounting` (the lane or attempt about to run) with this
+    /// view. Clones the handle, so the two share one counter block and every
+    /// increment the lane makes is visible through [`Self::snapshot`].
     fn install(&self, accounting: &PhaseAccounting) {
-        *self.lock() = accounting.clone();
+        self.lock().push(accounting.clone());
     }
 
-    /// Lock the inner slot, recovering a poisoned guard. The slot holds one
-    /// cheap-to-clone handle and no torn state, so recovering is strictly
+    /// Lock the inner slot, recovering a poisoned guard. The slot holds
+    /// cheap-to-clone handles and no torn state, so recovering is strictly
     /// better than failing every later snapshot.
-    fn lock(&self) -> std::sync::MutexGuard<'_, PhaseAccounting> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<PhaseAccounting>> {
         match self.0.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -405,10 +414,11 @@ pub struct QueryEngine {
     /// clusters and unioning their series into the merge pool; see
     /// [`QueryEngine::with_federation`].
     federation: Option<Arc<crate::distrib::Federation>>,
-    /// A caller's live view of this query's spend, installed per attempt in
-    /// `resolve_snapshot_with_retry`. `None` is the default: an engine nobody
-    /// asked for a live view from installs nothing. See
-    /// [`QueryEngine::with_live_usage`].
+    /// A caller's live view of this request's spend. Every site that builds a
+    /// `PhaseAccounting` registers it here: each attempt in
+    /// `resolve_snapshot_with_retry`, and the log lane in `prefetch`. `None`
+    /// is the default: an engine nobody asked for a live view from registers
+    /// nothing. See [`QueryEngine::with_live_usage`].
     live_usage: Option<LiveQueryAccounting>,
 }
 
@@ -560,14 +570,16 @@ impl QueryEngine {
         }
     }
 
-    /// This engine, reporting every attempt's accounting handle into `live`
-    /// before that attempt issues a store call.
+    /// This engine, registering every lane's and every attempt's accounting
+    /// handle with `live` before that lane issues a store call.
     ///
     /// The caller keeps `live` and can read it at any instant, including from
     /// a drop guard after the query's future was dropped, which is the one
     /// path that has no [`QueryStats`] to read a spend from. Without it a
     /// cancelled PromQL, metadata, or analytics query records a spend of zero
-    /// no matter how many objects it had already fetched.
+    /// no matter how many objects it had already fetched. `live` sums the
+    /// handles, so one engine handed to a multi-selector metadata request
+    /// reports every selector's spend and not only the last one's.
     ///
     /// The clone shares state exactly as [`Self::scoped_to`]'s does: same
     /// catalog, same fetchers, same [`GetLimiter`]. Handing a request-scoped
@@ -1359,6 +1371,13 @@ impl QueryEngine {
         // second attempt exists to paper over, not a case worth duplicating
         // that machinery for.
         let log_accounting = PhaseAccounting::new();
+        // Before the log lane's own resolve, for the reason the metrics lane
+        // installs before its own: this lane spends through a handle of its
+        // own, and a caller's future dropped inside the log resolve or the
+        // log fetch below must still find these counters through the live
+        // view. Without it a query naming only `ravel_log_lines` (ADR-1103)
+        // never registers a handle at all and a cancellation records zero.
+        self.install_live_usage(&log_accounting);
         let (log_snapshot, _log_generations, log_unfolded) = self
             .resolve_bounded(
                 tenant_hash,
@@ -1988,8 +2007,10 @@ impl QueryEngine {
         Ok((source, stats))
     }
 
-    /// Point a caller's live view, if it asked for one, at this attempt's
-    /// accounting handle.
+    /// Register this lane's or attempt's accounting handle with the caller's
+    /// live view, if it asked for one. The view sums every handle registered
+    /// with it, so calling this once per handle is what makes the live figure
+    /// the request's total rather than one lane's.
     fn install_live_usage(&self, accounting: &PhaseAccounting) {
         if let Some(live) = &self.live_usage {
             live.install(accounting);
@@ -2057,7 +2078,9 @@ impl QueryEngine {
         // once per query" -- here, per the query attempt that wins). A
         // retried attempt re-resolves and re-fetches from scratch, so the
         // discarded first attempt's in-flight counts must not bleed into the
-        // attempt that actually produced the result.
+        // `QueryStats` the successful attempt reports. The live view is the
+        // other side of that: it sums both attempts, because a caller that
+        // cancelled after a retry started owes what both of them issued.
         let first_accounting = PhaseAccounting::new();
         // Before the resolve, not after it: a caller's future dropped during
         // the first catalog LIST must still find this attempt's counters
