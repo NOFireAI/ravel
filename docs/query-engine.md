@@ -1890,10 +1890,11 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `cacheMisses`/`cacheBytes`, `decompressedBytes`, `segmentsOpened`,
   `seriesMatched`, `bytesReused`, `peakIntermediateBytes`, and the
   pre-existing per-run `rawF64Pages`/`rawF64Bytes`. No `segmentsPruned`
-  here: `stats.segmentsPruned` (below) is the sole source, sourced from
-  `Catalog::resolve`'s own count; `QueryAccounting`'s own
-  `segments_pruned` counter has no caller in `ravel-query` or
-  `ravel-catalog` and would only ever render 0.
+  here: `stats.segmentsPruned` (below) is the sole source. For the metrics
+  lane it is `Catalog::resolve`'s own postings-pruning count; for the log
+  lane it is `fetch_log_series`'s own per-segment pruning (time-window and
+  stream-directory checks), since the log lane's own catalog resolve passes
+  no name filter and so never prunes there.
 - `stats.estimate`: the `CostEstimate`, carrying `estimatedRequests`,
   `estimatedStoreBytes`, `estimatedDecompressedBytes`, `segments`,
   `series`.
