@@ -41,7 +41,7 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, HEAD_FORMAT_VERSION, NamePostings, PartLimits, SnapshotFormatError,
-    per_part_column_stats_bound,
+    column_stats_segments_concat,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -166,11 +166,21 @@ pub struct FoldReport {
     /// part carried forward by reference: its existing
     /// `SnapshotPartRef.column_stats` ref, if any, is forwarded unchanged).
     /// `0` on a no-op fold or when the tenant has no configured typed
-    /// columns. Unlike [`Self::column_stats_part_built`], there is no
-    /// leniency counterpart here: a part whose statistics exceed the
-    /// per-part bound fails the whole fold (ADR-1413 decision 4) rather than
-    /// being silently skipped, so this counter is exact, never a lower bound.
+    /// columns. A part whose statistics exceed the ceiling still gets an
+    /// object here (ADR-1413 decision 4, amended): the fold degrades it by
+    /// dropping dictionaries (see [`Self::column_stats_dictionaries_dropped`])
+    /// rather than skipping it, and only fails the whole fold when no
+    /// dictionary is left and it is still over ceiling.
     pub column_stats_part_objects_built: u64,
+    /// Total (segment, column) dictionaries this fold dropped (largest
+    /// encoded size first, `dictionary_present` set to `false`) across every
+    /// per-part column-statistics object, to bring an over-ceiling part's
+    /// body under [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]
+    /// (ADR-1413 decision 4, amended). `0` when every part's statistics
+    /// already fit the ceiling with every dictionary intact. min/max/count/sum
+    /// are never affected: only the dictionary is dropped, never truncated
+    /// (ADR-0850 decision 3's omit-never-truncate rule).
+    pub column_stats_dictionaries_dropped: u64,
     /// Number of commit-bucket entries this fold skipped rather than
     /// aborting on: an unrecognized bucket-key shape, or a commit record
     /// whose identity duplicates one already folded. Both are layout drift
@@ -580,6 +590,19 @@ struct PartSpan {
     end: usize,
     min_hour: u32,
     watermark_hour: u32,
+}
+
+/// One span's part encoding, computed once and reused by both the
+/// `reused_old_part_hashes` baseline pass and the main per-span build loop
+/// (issue #1482 finding: encoding and hashing every span twice was wasted
+/// CPU on every fold). `min_hour`/`watermark` are this span's already-resolved
+/// part bounds (single-part/tail overrides applied), not the raw `PartSpan`
+/// values.
+struct SpanEncoding {
+    min_hour: u32,
+    watermark: u32,
+    bytes: Vec<u8>,
+    hash: blake3::Hash,
 }
 
 /// Partition the fully hour-major-sorted `entries` into hour-range parts under
@@ -1280,44 +1303,57 @@ impl Catalog {
             // block for it -- so fetching that part's previous stats object
             // here was a wasted GET on every incremental fold, one per
             // untouched sealed part, forever, independent of how many parts
-            // this fold actually re-derives. Spans are cheap to re-hash (pure
-            // CPU, no I/O; `encode_part_ranged` is re-run once more, without
-            // its result, in the per-span loop below), so precompute here
-            // exactly which old part hashes this fold's spans reproduce
-            // byte-for-byte and will therefore carry forward unchanged: only
-            // an old part NOT in that set is actually about to be re-derived
-            // and can use its prior per-segment statistics as a baseline.
-            let reused_old_part_hashes: HashSet<[u8; 32]> = {
-                let single_part = spans.len() == 1;
-                spans
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(span_index, span)| {
-                        let is_tail = span_index + 1 == spans.len();
-                        let (part_min_hour, part_watermark) = if single_part {
-                            (0, watermark_hour)
-                        } else if is_tail {
-                            (span.min_hour, watermark_hour)
-                        } else {
-                            (span.min_hour, span.watermark_hour)
-                        };
-                        let part_entries = &entries[span.start..span.end];
-                        let part_bytes = snapshot_format::encode_part_ranged(
-                            tenant.0,
-                            signal_num,
-                            shard_ceiling,
-                            part_min_hour,
-                            part_watermark,
-                            part_entries,
-                        )
-                        .ok()?;
-                        let part_hash = *blake3::hash(&part_bytes).as_bytes();
-                        existing_by_blake3
-                            .contains_key(part_hash.as_slice())
-                            .then_some(part_hash)
+            // this fold actually re-derives. Precompute here exactly which old
+            // part hashes this fold's spans reproduce byte-for-byte and will
+            // therefore carry forward unchanged: only an old part NOT in that
+            // set is actually about to be re-derived and can use its prior
+            // per-segment statistics as a baseline.
+            //
+            // Encoded once per span (kept in `span_encodings`, not discarded):
+            // the per-span build loop below consumes the same bytes and hash
+            // rather than re-running `encode_part_ranged` and `blake3::hash`
+            // a second time over identical input.
+            let single_part = spans.len() == 1;
+            let span_encodings: Vec<Result<SpanEncoding, SnapshotFormatError>> = spans
+                .iter()
+                .enumerate()
+                .map(|(span_index, span)| {
+                    let is_tail = span_index + 1 == spans.len();
+                    let (min_hour, watermark) = if single_part {
+                        (0, watermark_hour)
+                    } else if is_tail {
+                        (span.min_hour, watermark_hour)
+                    } else {
+                        (span.min_hour, span.watermark_hour)
+                    };
+                    let part_entries = &entries[span.start..span.end];
+                    let bytes = snapshot_format::encode_part_ranged(
+                        tenant.0,
+                        signal_num,
+                        shard_ceiling,
+                        min_hour,
+                        watermark,
+                        part_entries,
+                    )?;
+                    let hash = blake3::hash(&bytes);
+                    Ok(SpanEncoding {
+                        min_hour,
+                        watermark,
+                        bytes,
+                        hash,
                     })
-                    .collect()
-            };
+                })
+                .collect();
+            let reused_old_part_hashes: HashSet<[u8; 32]> = span_encodings
+                .iter()
+                .filter_map(|encoding| encoding.as_ref().ok())
+                .filter_map(|encoding| {
+                    let hash = *encoding.hash.as_bytes();
+                    existing_by_blake3
+                        .contains_key(hash.as_slice())
+                        .then_some(hash)
+                })
+                .collect();
 
             // ADR-1413 decision 1 (v2 semantics): reuse the previous fold's
             // per-part v3 column-stats objects the same way the field-13 (v2)
@@ -1388,14 +1424,13 @@ impl Catalog {
                 HashMap::new()
             };
 
-            let single_part = spans.len() == 1;
             let mut part_refs: Vec<SnapshotPartRef> = Vec::with_capacity(spans.len());
             let mut part_hashes: Vec<[u8; 32]> = Vec::with_capacity(spans.len());
             let mut total_part_bytes: u64 = 0;
             let mut parts_reused: u64 = 0;
             let mut column_stats_part_objects_built: u64 = 0;
-            for (span_index, span) in spans.iter().enumerate() {
-                let is_tail = span_index + 1 == spans.len();
+            let mut column_stats_dictionaries_dropped: u64 = 0;
+            for (span, encoding) in spans.iter().zip(span_encodings) {
                 // Single-part fold keeps exact v1 semantics: min_hour 0 (the
                 // epoch floor) and the fold watermark, byte-identical to the
                 // legacy encode so existing single-part objects and their
@@ -1403,24 +1438,15 @@ impl Catalog {
                 // its real first hour as min_hour; sealed parts end at their
                 // last contained hour, and only the tail carries the fold
                 // watermark, so HEAD.watermark == max part watermark == fold
-                // watermark (the `validate_head` contract).
-                let (part_min_hour, part_watermark) = if single_part {
-                    (0, watermark_hour)
-                } else if is_tail {
-                    (span.min_hour, watermark_hour)
-                } else {
-                    (span.min_hour, span.watermark_hour)
-                };
+                // watermark (the `validate_head` contract). Both already
+                // resolved into `encoding` above.
+                let SpanEncoding {
+                    min_hour: part_min_hour,
+                    watermark: part_watermark,
+                    bytes: part_bytes,
+                    hash: part_hash,
+                } = encoding?;
                 let part_entries = &entries[span.start..span.end];
-                let part_bytes = snapshot_format::encode_part_ranged(
-                    tenant.0,
-                    signal_num,
-                    shard_ceiling,
-                    part_min_hour,
-                    part_watermark,
-                    part_entries,
-                )?;
-                let part_hash = blake3::hash(&part_bytes);
                 if let Some(existing) = existing_by_blake3.get(part_hash.as_bytes().as_slice()) {
                     // Carried by reference: the previous HEAD already names an
                     // object with these exact bytes, so no PUT is issued and
@@ -1437,16 +1463,17 @@ impl Catalog {
                 let hash16 = &part_hash.to_hex()[..16];
                 let part_key = part_object_key(tenant, signal, part_watermark, hash16);
 
-                // ADR-1413: build (and bound-check) the per-part (v3)
-                // column-statistics object BEFORE writing the part's own
-                // `.csnap` object below. Unlike the v1/v2 builds below, a
-                // failure here is never graceful: an over-bound part must
-                // fail the whole fold rather than publish a truncated object
-                // or silently carry on without one (decision 4). Deriving it
-                // first means that refusal happens before the part object is
-                // ever written, so a refused fold leaves no orphaned
-                // `.csnap` behind for a part that will never gain a HEAD
-                // entry.
+                // ADR-1413: build (degrading dictionaries as needed to fit
+                // the ceiling) the per-part (v3) column-statistics object
+                // BEFORE writing the part's own `.csnap` object below. Unlike
+                // the v1/v2 builds below, a failure here (no dictionary left
+                // and still over ceiling) is never graceful: it must fail the
+                // whole fold rather than publish a truncated object or
+                // silently carry on without one (decision 4, amended).
+                // Deriving it first means that refusal happens before the
+                // part object is ever written, so a refused fold leaves no
+                // orphaned `.csnap` behind for a part that will never gain a
+                // HEAD entry.
                 let column_stats = if typed_attr_columns.is_empty() {
                     None
                 } else {
@@ -1484,23 +1511,68 @@ impl Catalog {
                     }
                     sort_and_dedup_part_segments(&mut v3_segments);
 
-                    let per_part_bound = per_part_column_stats_bound(
-                        part_entries.len() as u64,
-                        typed_attr_columns.len() as u64,
-                    );
+                    // ADR-1413 decision 4 (amended): degrade before refusing.
+                    // While the segments' uncompressed body -- measured
+                    // exactly as the encoder will measure it -- exceeds the
+                    // ceiling, drop the largest remaining dictionary (by its
+                    // own encoded size) and re-measure. min/max/count/sum are
+                    // never touched: only `dictionary_present`/`dictionary`
+                    // are cleared, the same omitted-dictionary shape ADR-0850
+                    // decision 3 already uses for the cardinality ceiling.
+                    // Only once no dictionary is left does
+                    // `encode_column_stats_v3` below refuse.
+                    let ceiling = self.column_stats_part_ceiling();
+                    let mut dropped_this_part: u64 = 0;
+                    while column_stats_segments_concat(&v3_segments).len() as u64 > ceiling {
+                        let largest = v3_segments
+                            .iter()
+                            .enumerate()
+                            .flat_map(|(seg_idx, seg)| {
+                                seg.columns
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, col)| col.dictionary_present)
+                                    .map(move |(col_idx, col)| {
+                                        let size: usize = col
+                                            .dictionary
+                                            .iter()
+                                            .map(prost::Message::encoded_len)
+                                            .sum();
+                                        (size, seg_idx, col_idx)
+                                    })
+                            })
+                            .max_by_key(|(size, _, _)| *size);
+                        let Some((_, seg_idx, col_idx)) = largest else {
+                            break;
+                        };
+                        let col = &mut v3_segments[seg_idx].columns[col_idx];
+                        col.dictionary_present = false;
+                        col.dictionary.clear();
+                        dropped_this_part += 1;
+                    }
+                    if dropped_this_part > 0 {
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            part_key = %part_key,
+                            dropped = dropped_this_part,
+                            ceiling,
+                            "per-part column-stats degrade dropped dictionaries to fit the ceiling"
+                        );
+                        column_stats_dictionaries_dropped += dropped_this_part;
+                    }
                     let stats_bytes = snapshot_format::encode_column_stats_v3(
                         tenant.0,
                         signal_num,
                         *part_hash.as_bytes(),
                         &v3_segments,
-                        per_part_bound,
+                        ceiling,
                     )
                     .map_err(|err| match err {
-                        SnapshotFormatError::ColumnStatsPartOverBound { declared, bound } => {
+                        SnapshotFormatError::ColumnStatsPartOverBound { declared, ceiling } => {
                             CatalogError::ColumnStatsPartOverBound {
                                 part_key: part_key.clone(),
                                 declared,
-                                bound,
+                                ceiling,
                             }
                         }
                         other => CatalogError::SnapshotFormat(other),
@@ -2184,6 +2256,7 @@ impl Catalog {
                         column_stats_part_built,
                         column_stats_part_bytes: column_stats_part_size,
                         column_stats_part_objects_built,
+                        column_stats_dictionaries_dropped,
                         layout_drift_count,
                         frontier_hours_reconciled,
                         frontier_hours_deferred,
@@ -2944,6 +3017,7 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         column_stats_part_built: false,
         column_stats_part_bytes: 0,
         column_stats_part_objects_built: 0,
+        column_stats_dictionaries_dropped: 0,
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
@@ -3532,6 +3606,121 @@ mod tests {
         );
     }
 
+    /// Declare three I64 typed logs columns (`col_a`, `col_b`, `col_c`) so a
+    /// fold builds column statistics with three distinct-size dictionaries per
+    /// part, for the degrade-loop tests.
+    async fn set_three_column_config(store: &dyn ObjectStoreBackend) {
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(vec![
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_a".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_b".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_c".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+            ]),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    /// Publish one L0 segment of `rows` entries, each carrying all three
+    /// `col_a`/`col_b`/`col_c` declared columns with deliberately distinct
+    /// cardinality (`col_a` all-distinct, `col_b` 30 distinct, `col_c` 3
+    /// distinct), so their per-column dictionaries encode to distinct sizes.
+    async fn publish_logs_segment_wide(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        rows: usize,
+    ) -> CommitRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        );
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for i in 0..rows {
+            let ts = base_ts + i as i64;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![
+                    ("col_a".to_string(), AttrValue::I64(i as i64)),
+                    ("col_b".to_string(), AttrValue::I64((i % 30) as i64)),
+                    ("col_c".to_string(), AttrValue::I64((i % 3) as i64)),
+                ],
+            })
+            .expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: rows as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: max_ts,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
     /// Declare `status` as an I64 typed logs column so the fold builds column
     /// statistics for a (tenant, Logs) pair.
     async fn set_status_column_config(store: &dyn ObjectStoreBackend) {
@@ -3902,26 +4091,190 @@ mod tests {
         }
     }
 
-    /// ADR-1413 decision 4: a part whose per-part column-statistics object
-    /// would exceed `per_part_column_stats_bound` fails the WHOLE fold with a
-    /// typed error naming the part, the declared size, and the bound. It
-    /// never publishes a truncated v3 object, and it never silently drops v3
-    /// and carries on with only the v1/v2 whole-tenant objects.
+    /// ADR-1413 decision 4 (amended): a part whose per-part column-statistics
+    /// body exceeds the ceiling degrades rather than refuses -- the fold
+    /// drops the largest remaining dictionary (by its own encoded size),
+    /// re-measures, and repeats until the part fits. Three declared columns
+    /// with deliberately distinct dictionary sizes (`col_a` all-distinct
+    /// across `rows` entries, `col_b` 30 distinct, `col_c` 3 distinct) let a
+    /// small injected ceiling force exactly the two largest (`col_a`,
+    /// `col_b`) to drop while `col_c`'s dictionary survives; min/max/count/sum
+    /// stay exact for all three regardless.
     #[tokio::test]
-    async fn fold_refuses_a_part_whose_stats_exceed_the_per_part_bound_and_writes_no_object() {
+    async fn fold_drops_the_largest_dictionaries_until_a_part_fits_the_ceiling() {
+        let rows = 300;
+
+        // Reference fold at the real (unbounded-for-this-fixture) ceiling:
+        // every dictionary intact. Used only to measure, via the same
+        // `column_stats_segments_concat` the fold itself measures with, the
+        // exact post-drop body size -- so the injected ceiling below is
+        // derived from the encoder's own accounting rather than a guessed
+        // constant.
+        let reference_store = Arc::new(MemoryStore::new());
+        set_three_column_config(reference_store.as_ref()).await;
+        publish_logs_segment_wide(reference_store.as_ref(), 0, 10, rows).await;
+        let reference_catalog = Catalog::new(reference_store.clone(), config(1)).expect("catalog");
+        let reference_report = reference_catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("reference fold at the real ceiling never degrades");
+        assert_eq!(
+            reference_report.column_stats_dictionaries_dropped, 0,
+            "the real ceiling admits this small fixture with every dictionary intact"
+        );
+        let reference_head = read_logs_head(reference_store.as_ref()).await;
+        let reference_ref = reference_head.parts[0]
+            .column_stats
+            .clone()
+            .expect("v3 ref");
+        let reference_got = reference_store
+            .get(&reference_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let reference_decoded = snapshot_format::decode_column_stats(
+            &reference_got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v3 decodes");
+        assert_eq!(reference_decoded.segments.len(), 1);
+        let reference_columns = reference_decoded.segments[0].columns.clone();
+
+        let mut sizes: Vec<(usize, usize)> = reference_columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let size: usize = c.dictionary.iter().map(|e| e.encoded_len()).sum();
+                (i, size)
+            })
+            .collect();
+        sizes.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+        let largest_idx = sizes[0].0;
+        let second_idx = sizes[1].0;
+        let kept_idx = sizes[2].0;
+        assert_eq!(
+            reference_columns[largest_idx].name, "col_a",
+            "col_a has the most distinct values, so the largest dictionary"
+        );
+        assert_eq!(
+            reference_columns[second_idx].name, "col_b",
+            "col_b is the second-most distinct"
+        );
+        assert_eq!(
+            reference_columns[kept_idx].name, "col_c",
+            "col_c has the fewest distinct values, so the smallest dictionary"
+        );
+
+        let mut post_drop_segments = reference_decoded.segments.clone();
+        post_drop_segments[0].columns[largest_idx].dictionary_present = false;
+        post_drop_segments[0].columns[largest_idx]
+            .dictionary
+            .clear();
+        post_drop_segments[0].columns[second_idx].dictionary_present = false;
+        post_drop_segments[0].columns[second_idx].dictionary.clear();
+        let ceiling =
+            snapshot_format::column_stats_segments_concat(&post_drop_segments).len() as u64;
+
+        // Fresh store, byte-identical fixture, ceiling injected: dropping only
+        // the single largest dictionary still leaves `col_b`'s dictionary in
+        // the body, which is strictly larger than `ceiling` (built from
+        // dropping both), so the degrade loop must continue to a second drop.
+        let store = Arc::new(MemoryStore::new());
+        set_three_column_config(store.as_ref()).await;
+        publish_logs_segment_wide(store.as_ref(), 0, 10, rows).await;
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(ceiling);
+
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("an over-ceiling part degrades rather than refusing");
+        assert_eq!(
+            report.column_stats_dictionaries_dropped, 2,
+            "exactly the two largest dictionaries are dropped"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        let stats_ref = head.parts[0].column_stats.clone().expect("v3 ref");
+        let got = store
+            .get(&stats_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let limits = crate::snapshot_format::ColumnStatsLimits {
+            max_column_stats_bytes: ceiling,
+        };
+        let decoded = snapshot_format::decode_column_stats(&got.data, &limits)
+            .expect("the degraded object decodes under the injected ceiling");
+        let columns = &decoded.segments[0].columns;
+        assert!(
+            !columns[largest_idx].dictionary_present,
+            "col_a's dictionary (largest) was dropped"
+        );
+        assert!(
+            columns[largest_idx].dictionary.is_empty(),
+            "a dropped dictionary is empty, not truncated"
+        );
+        assert!(
+            !columns[second_idx].dictionary_present,
+            "col_b's dictionary (second-largest) was dropped"
+        );
+        assert!(columns[second_idx].dictionary.is_empty());
+        assert!(
+            columns[kept_idx].dictionary_present,
+            "col_c's dictionary (smallest) survives"
+        );
+        assert_eq!(
+            columns[kept_idx].dictionary, reference_columns[kept_idx].dictionary,
+            "the surviving dictionary is unchanged"
+        );
+        for i in 0..3 {
+            assert_eq!(
+                columns[i].non_null_count, reference_columns[i].non_null_count,
+                "column {i} non_null_count stays exact regardless of dictionary drop"
+            );
+            assert_eq!(
+                columns[i].min, reference_columns[i].min,
+                "column {i} min stays exact"
+            );
+            assert_eq!(
+                columns[i].max, reference_columns[i].max,
+                "column {i} max stays exact"
+            );
+            assert_eq!(
+                columns[i].sum, reference_columns[i].sum,
+                "column {i} sum stays exact"
+            );
+        }
+    }
+
+    /// ADR-1413 decision 4 (amended): the fold refuses a part ONLY once no
+    /// dictionary is left to drop and the dictionary-free body (fixed
+    /// fields: name, declared_type, non_null_count, null_count, min, max,
+    /// sum, plus the segment/header framing) is still over the ceiling. A
+    /// ceiling of 1 byte is below that fixed-field floor for any declared
+    /// column, so this never depends on dictionary cardinality at all.
+    #[tokio::test]
+    async fn fold_refuses_only_a_part_whose_dictionary_free_stats_exceed_the_ceiling() {
         let store = Arc::new(MemoryStore::new());
         set_status_column_config(store.as_ref()).await;
+        publish_logs_segment(store.as_ref(), 0, 10, &[200, 404, 200]).await;
 
-        // One L0 segment (entry_count == 1) carrying enough distinct `status`
-        // values that its dictionary alone exceeds
-        // per_part_column_stats_bound(1, 1) ==
-        // PER_SEGMENT_COLUMN_STATS_BOUND_BYTES (54_712 bytes), while staying
-        // under DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES (10_000) so the
-        // dictionary stays present instead of degrading to min/max/sum only.
-        let statuses: Vec<i64> = (0..8_000).collect();
-        publish_logs_segment(store.as_ref(), 0, 10, &statuses).await;
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(1);
 
-        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
         let err = catalog
             .fold(
                 &tenant(),
@@ -3932,25 +4285,21 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("an over-bound part fails the whole fold");
+            .expect_err("dictionary-free stats alone still exceed a 1-byte ceiling");
         match err {
             CatalogError::ColumnStatsPartOverBound {
                 part_key,
                 declared,
-                bound,
+                ceiling,
             } => {
                 assert!(
                     part_key.contains(".csnap"),
                     "error names the part object's own key, got {part_key}"
                 );
-                assert_eq!(
-                    bound,
-                    crate::snapshot_format::per_part_column_stats_bound(1, 1),
-                    "one entry, one declared column"
-                );
+                assert_eq!(ceiling, 1);
                 assert!(
-                    declared > bound,
-                    "declared {declared} must exceed bound {bound} for this to be the refusal path"
+                    declared > ceiling,
+                    "declared {declared} must exceed ceiling {ceiling} for this to be the refusal path"
                 );
             }
             other => panic!("expected ColumnStatsPartOverBound, got {other:?}"),
@@ -3964,7 +4313,7 @@ mod tests {
             keys.iter().all(|k| !k.ends_with(".cstat")),
             "no column-stats object of any version was written, got {keys:?}"
         );
-        // The v3 bound check runs before the part's own `.csnap` PUT, so a
+        // The ceiling check runs before the part's own `.csnap` PUT, so a
         // refused part never leaves an orphan part object behind either.
         assert!(
             keys.iter().all(|k| !k.ends_with(".csnap")),
@@ -4109,7 +4458,10 @@ mod tests {
         );
         assert!(
             store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
-            "the scripted fault on A's third read must actually fire"
+            "at least one Permanent Get fault fired; this counter is aggregate \
+             across the /snap/ rule and the sequence, so it does not alone prove \
+             the sequence's third-read fault hit A -- decoded_2.segments below \
+             (len 1, surviving segment is B) is what proves that"
         );
 
         let head_2 = read_logs_head(store.as_ref()).await;

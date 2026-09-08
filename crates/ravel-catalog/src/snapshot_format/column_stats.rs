@@ -99,6 +99,20 @@ pub fn encode_column_stats_v2(
     )
 }
 
+/// The uncompressed, length-delimited protobuf concatenation of `segments`:
+/// exactly the bytes [`frame_column_stats`] compresses, and exactly what a
+/// pre-encode ceiling check must measure to agree with the encoder. Shared by
+/// [`encode_column_stats_v3`]'s ceiling check and the fold's degrade loop
+/// (`ravel_catalog::fold`) so the two can never drift apart on what "over
+/// ceiling" means.
+pub fn column_stats_segments_concat(segments: &[ColumnStatsSegment]) -> Vec<u8> {
+    let mut segments_raw = Vec::new();
+    for segment in segments {
+        segments_raw.extend_from_slice(&segment.encode_length_delimited_to_vec());
+    }
+    segments_raw
+}
+
 /// Encodes a **v3** (ADR-1413, per-part, content-hash-keyed) column-statistics
 /// object, referenced by `SnapshotPartRef.column_stats` (field 7). Unlike
 /// [`encode_column_stats_v2`], the header's `part_blake3` names exactly the
@@ -108,27 +122,26 @@ pub fn encode_column_stats_v2(
 ///
 /// Refuses to encode, returning
 /// [`SnapshotFormatError::ColumnStatsPartOverBound`], when the segments'
-/// concatenated uncompressed length would exceed `per_part_bound_bytes`
-/// (computed by [`super::per_part_column_stats_bound`]), checked before
-/// compression. This is the write-time enforcement ADR-1413 decision 4
-/// requires: the caller must treat this as a hard failure for the part, never
-/// publish a truncated or over-bound object, and never silently skip it.
+/// concatenated uncompressed length would exceed `ceiling_bytes` (ADR-1413
+/// decision 3: `DEFAULT_MAX_COLUMN_STATS_BYTES`, the same fixed ceiling the
+/// v3 reader enforces), checked before compression. The fold degrades before
+/// ever calling this with a part still over ceiling (ADR-1413 decision 4): by
+/// the time this refuses, no dictionary is left to drop, so the caller must
+/// treat this as a hard failure for the part, never publish a truncated or
+/// over-ceiling object, and never silently skip it.
 pub fn encode_column_stats_v3(
     tenant_hash: [u8; 16],
     signal: u32,
     part_blake3: [u8; 32],
     segments: &[ColumnStatsSegment],
-    per_part_bound_bytes: u64,
+    ceiling_bytes: u64,
 ) -> Result<Vec<u8>, SnapshotFormatError> {
     validate_segments(segments, 3)?;
-    let declared: u64 = segments
-        .iter()
-        .map(|s| s.encode_length_delimited_to_vec().len() as u64)
-        .sum();
-    if declared > per_part_bound_bytes {
+    let declared = column_stats_segments_concat(segments).len() as u64;
+    if declared > ceiling_bytes {
         return Err(SnapshotFormatError::ColumnStatsPartOverBound {
             declared,
-            bound: per_part_bound_bytes,
+            ceiling: ceiling_bytes,
         });
     }
     frame_column_stats(3, tenant_hash, signal, vec![part_blake3.to_vec()], segments)
@@ -163,10 +176,7 @@ fn frame_column_stats(
     part_blake3: Vec<Vec<u8>>,
     segments: &[ColumnStatsSegment],
 ) -> Result<Vec<u8>, SnapshotFormatError> {
-    let mut segments_raw = Vec::new();
-    for segment in segments {
-        segments_raw.extend_from_slice(&segment.encode_length_delimited_to_vec());
-    }
+    let segments_raw = column_stats_segments_concat(segments);
     let body_uncompressed_len = segments_raw.len() as u64;
 
     let body = zstd::bulk::compress(&segments_raw, ZSTD_LEVEL)
@@ -1328,9 +1338,9 @@ mod tests {
             3,
             part_blake3,
             std::slice::from_ref(&seg),
-            crate::snapshot_format::PER_SEGMENT_COLUMN_STATS_BOUND_BYTES,
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
         )
-        .expect("fits the per-part bound");
+        .expect("fits the ceiling");
         assert_eq!(bytes[4], 3, "envelope version byte is v3");
         let decoded =
             decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("v3 decodes");
@@ -1340,20 +1350,20 @@ mod tests {
     }
 
     /// The write-time enforcement ADR-1413 decision 4 requires: a segment set
-    /// whose concatenated uncompressed length exceeds the caller's per-part
-    /// bound is refused with the declared size and the bound, never truncated
-    /// or silently written over budget.
+    /// whose concatenated uncompressed length exceeds the caller's ceiling is
+    /// refused with the declared size and the ceiling, never truncated or
+    /// silently written over budget.
     #[test]
-    fn encode_v3_refuses_a_segment_over_the_per_part_bound() {
+    fn encode_v3_refuses_a_segment_over_the_ceiling() {
         let mut seg = segment(1, 0, 1);
         seg.writer_id = vec![0x88; 32];
         let declared = seg.encode_length_delimited_to_vec().len() as u64;
-        let bound = declared - 1;
-        let err = encode_column_stats_v3([0x11; 16], 3, [0x66; 32], &[seg], bound)
-            .expect_err("a segment set over the bound is refused");
+        let ceiling = declared - 1;
+        let err = encode_column_stats_v3([0x11; 16], 3, [0x66; 32], &[seg], ceiling)
+            .expect_err("a segment set over the ceiling is refused");
         assert_eq!(
             err,
-            SnapshotFormatError::ColumnStatsPartOverBound { declared, bound }
+            SnapshotFormatError::ColumnStatsPartOverBound { declared, ceiling }
         );
     }
 
@@ -1381,96 +1391,45 @@ mod tests {
         );
     }
 
-    /// One segment with a single string-typed column whose dictionary holds
-    /// one large, highly compressible value. `PAYLOAD_LEN` is chosen so
-    /// `SEGMENT_COUNT` copies of it push the object's declared *uncompressed*
-    /// body past [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]
-    /// while its on-the-wire (compressed) size, and the memory needed to
-    /// build it, stay tiny -- the point is to exercise the real
-    /// `body_uncompressed_len` size check, not to allocate 256+ MiB of
-    /// incompressible data.
-    const OVERSIZED_PAYLOAD_LEN: usize = 45_000;
-    const OVERSIZED_SEGMENT_COUNT: u32 = 6_500;
-
-    fn big_string_segment(index: u32, payload_len: usize) -> ColumnStatsSegment {
-        let mut writer_id = vec![0u8; 32];
-        writer_id[24..].copy_from_slice(&u64::from(index).to_be_bytes());
-        let small = ColumnValue {
-            kind: Some(ravel_proto::catalog::v1::column_value::Kind::StrUtf8(
-                "a".to_string(),
-            )),
-        };
-        let big = ColumnValue {
-            kind: Some(ravel_proto::catalog::v1::column_value::Kind::StrUtf8(
-                "x".repeat(payload_len),
-            )),
-        };
-        ColumnStatsSegment {
-            ingest_hour_bucket: index,
-            shard: 0,
-            writer_id,
-            writer_epoch: 1,
-            writer_seq: u64::from(index),
-            columns: vec![ColumnStat {
-                name: "big_col".to_string(),
-                declared_type: 1, // StrUtf8 (see is_kind_for_type)
-                non_null_count: 1,
-                null_count: 0,
-                min: Some(small.clone()),
-                max: Some(small),
-                dictionary_present: true,
-                dictionary: vec![DictEntry {
-                    value: Some(big),
-                    count: 1,
-                }],
-                sum: None,
-            }],
-        }
-    }
-
-    /// The per-part bound and the decoder's whole-object `max_column_stats_bytes`
-    /// ceiling are independent knobs. This builds a v3 object whose declared,
-    /// uncompressed body genuinely exceeds
-    /// [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`] (256 MiB) --
-    /// `OVERSIZED_SEGMENT_COUNT` segments of `OVERSIZED_PAYLOAD_LEN` bytes each,
-    /// about 279 MiB total -- but still fits comfortably inside
-    /// `per_part_column_stats_bound` for its own actual segment/column counts
-    /// (one declared column, `OVERSIZED_SEGMENT_COUNT` entries: ~339 MiB). A
-    /// reader sized to the stale whole-object default rejects it; one sized to
-    /// the per-part bound (the read-time sizing ADR-1413 decision 4's
-    /// companion, T2/#1483, is expected to use) decodes it clean.
+    /// ADR-1413 (amended): the per-part ceiling IS the reader's fixed
+    /// whole-object ceiling, so a v3 object at exactly the ceiling decodes,
+    /// and a reader sized one byte under the object's declared uncompressed
+    /// body rejects it. A small injected ceiling keeps this fast: no
+    /// hundreds-of-MB fixture is needed to exercise the boundary, since the
+    /// decoder's check is against `header.body_uncompressed_len`, not the
+    /// constant's real-world value.
     #[test]
-    fn v3_object_over_the_whole_object_ceiling_but_inside_the_part_bound_decodes() {
-        let segments: Vec<ColumnStatsSegment> = (0..OVERSIZED_SEGMENT_COUNT)
-            .map(|i| big_string_segment(i, OVERSIZED_PAYLOAD_LEN))
-            .collect();
+    fn v3_object_at_the_ceiling_decodes_and_one_byte_over_is_rejected() {
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x99; 32];
         let part_blake3 = [0x55u8; 32];
-        let per_part_bound = crate::snapshot_format::per_part_column_stats_bound(
-            u64::from(OVERSIZED_SEGMENT_COUNT),
-            1,
-        );
-        assert!(
-            per_part_bound > crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
-            "the fixture's own per-part bound must exceed the whole-object default \
-             for this test to distinguish the two ceilings"
-        );
-        let bytes = encode_column_stats_v3([0x11; 16], 3, part_blake3, &segments, per_part_bound)
-            .expect("fixture is sized to fit the per-part bound");
+        let declared = seg.encode_length_delimited_to_vec().len() as u64;
+        let bytes = encode_column_stats_v3(
+            [0x11; 16],
+            3,
+            part_blake3,
+            std::slice::from_ref(&seg),
+            declared,
+        )
+        .expect("fixture is sized to fit its own declared length exactly");
 
-        let err = decode_column_stats(&bytes, &ColumnStatsLimits::default())
-            .expect_err("the whole-object default ceiling (256 MiB) rejects this body");
+        let at_ceiling = ColumnStatsLimits {
+            max_column_stats_bytes: declared,
+        };
+        let decoded =
+            decode_column_stats(&bytes, &at_ceiling).expect("decodes at exactly the ceiling");
+        assert_eq!(decoded.segments, vec![seg]);
+        assert_eq!(decoded.header.part_blake3, vec![part_blake3.to_vec()]);
+
+        let one_under = ColumnStatsLimits {
+            max_column_stats_bytes: declared - 1,
+        };
+        let err = decode_column_stats(&bytes, &one_under)
+            .expect_err("one byte over a reader's ceiling is rejected");
         assert!(matches!(
             err,
             SnapshotFormatError::ColumnStatsDecompressedTooLarge { .. }
         ));
-
-        let part_sized_limits = ColumnStatsLimits {
-            max_column_stats_bytes: per_part_bound,
-        };
-        let decoded = decode_column_stats(&bytes, &part_sized_limits)
-            .expect("decodes once limits are sized to the per-part bound");
-        assert_eq!(decoded.segments, segments);
-        assert_eq!(decoded.header.part_blake3, vec![part_blake3.to_vec()]);
     }
 
     /// A v3 segment set of arbitrary size (0..6 distinct part-hash-keyed
