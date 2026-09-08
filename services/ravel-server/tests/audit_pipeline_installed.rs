@@ -24,11 +24,15 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
-use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
+use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
 const TOKEN: &str = "acme-token";
 const TENANT: &str = "acme";
+/// A second tenant, for the per-tenant audit-routing tests. Distinct token and
+/// distinct tenant id, so the two resolve to different `TenantHash`es.
+const TOKEN_B: &str = "beta-token";
+const TENANT_B: &str = "beta";
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// Small so `Catalog::resolve` issues few LISTs, matching `sql_endpoint.rs`
 /// and `otlp_trace_export_e2e.rs`.
@@ -40,7 +44,18 @@ const NOW_S: i64 = NOW_NS / 1_000_000_000;
 /// `otlp_trace_export_e2e.rs::publish_segment`), so a query against it
 /// returns a clean 200 through the real router.
 async fn publish_segment(store: &dyn ObjectStoreBackend, metric: &str, samples: &[(i64, f64)]) {
-    let tenant = TenantId::new(TENANT);
+    publish_segment_for(store, TENANT, metric, samples).await
+}
+
+/// [`publish_segment`] for an arbitrary tenant name, so a multi-tenant test can
+/// give each of its tenants real data to query.
+async fn publish_segment_for(
+    store: &dyn ObjectStoreBackend,
+    tenant_name: &str,
+    metric: &str,
+    samples: &[(i64, f64)],
+) {
+    let tenant = TenantId::new(tenant_name);
     let tenant_hash = tenant.hash();
     let label_set = LabelSet::new(vec![Label {
         name: "__name__".to_string(),
@@ -109,6 +124,7 @@ fn server_config(
     tokens: HashMap<String, TenantId>,
     mode: Mode,
     audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    fold_tenants: Vec<TenantHash>,
 ) -> ServerConfig {
     ServerConfig {
         audit_pipeline,
@@ -125,7 +141,7 @@ fn server_config(
         shard_count: 1,
         tenant_resolver: ravel_server::tenant::build_resolver(tokens, false),
         mtls_listener: None,
-        fold_tenants: vec![TenantId::new(TENANT).hash()],
+        fold_tenants,
         fold: FoldTaskConfig {
             enabled: false,
             ..FoldTaskConfig::default()
@@ -169,10 +185,32 @@ async fn start_server(
     mode: Mode,
     audit_pipeline: ravel_maintain::AuditPipelineConfig,
 ) -> ravel_server::Running {
+    start_server_with(
+        store,
+        mode,
+        audit_pipeline,
+        &[(TOKEN, TENANT)],
+        vec![TenantId::new(TENANT).hash()],
+    )
+    .await
+}
+
+/// [`start_server`] with an explicit bearer-token table and `fold_tenants`
+/// list, so a test can serve several tenants and can start a server with no
+/// static tenant list at all (the OIDC/mTLS deployment shape).
+async fn start_server_with(
+    store: Arc<dyn ObjectStoreBackend>,
+    mode: Mode,
+    audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    token_pairs: &[(&str, &str)],
+    fold_tenants: Vec<TenantHash>,
+) -> ravel_server::Running {
     let mut tokens = HashMap::new();
-    tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
+    for (token, tenant) in token_pairs {
+        tokens.insert((*token).to_string(), TenantId::new(*tenant));
+    }
     ravel_server::start(
-        server_config(tokens, mode, audit_pipeline),
+        server_config(tokens, mode, audit_pipeline, fold_tenants),
         store.clone(),
         store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
@@ -212,6 +250,63 @@ async fn query_audit_records(store: &dyn ObjectStoreBackend, tenant: &TenantId) 
         }
     }
     out
+}
+
+/// Every L0 data-object key on any tenant's [`Signal::Audit`] prefix. The
+/// signal prefix for `Signal::Audit` is `u`, so `t/<hex>/u/l0/` selects audit
+/// data objects and excludes their commit records and every other signal.
+#[cfg(feature = "sql")]
+async fn audit_data_object_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+    list_all(store, "t/")
+        .await
+        .expect("list every tenant prefix")
+        .into_iter()
+        .map(|meta| meta.key)
+        .filter(|key| key.contains("/u/l0/"))
+        .collect()
+}
+
+/// Runs one SQL statement as `token` over an explicit event-time window (Unix
+/// seconds) and returns the response status and decoded JSON body.
+#[cfg(feature = "sql")]
+async fn run_sql(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    sql: &str,
+    start_s: i64,
+    end_s: i64,
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let response = client
+        .post(format!("{base}/api/v1/sql"))
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(
+            serde_json::json!({
+                "query": sql,
+                "start": start_s as f64,
+                "end": end_s as f64,
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("sql request sent");
+    let status = response.status();
+    let value: serde_json::Value = response.json().await.expect("sql response is JSON");
+    (status, value)
+}
+
+/// The wall-clock second the server's own clock is reading. `ravel_server::start`
+/// takes no injected clock, so a query-audit record it writes is stamped with
+/// real time; an `audit` statement therefore needs a window around real now
+/// rather than around the 1970 timestamps the sample segments use.
+#[cfg(feature = "sql")]
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after the unix epoch")
+        .as_secs() as i64
 }
 
 /// The value of a string `attrs` entry, or `None` if absent or non-string.
@@ -463,4 +558,134 @@ async fn maintain_and_gateway_modes_install_no_pipeline() {
 
         running.shutdown().await.expect("graceful shutdown");
     }
+}
+
+/// The shared body of the two per-tenant routing tests: two tenants each run
+/// one SQL statement through one real server, and each reads its own
+/// query-audit trail back and only its own.
+///
+/// One pipeline serves both tenants, so this is the assertion that the
+/// pipeline routes per event rather than per construction. Every count is
+/// exact: "at least one row" would pass on a store holding both tenants'
+/// records under one prefix, which is the disclosure being ruled out.
+#[cfg(feature = "sql")]
+async fn two_tenants_each_read_only_their_own_audit(fold_tenants: Vec<TenantHash>) {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment_for(store.as_ref(), TENANT, "m", &[(100, 1.0), (200, 2.5)]).await;
+    publish_segment_for(store.as_ref(), TENANT_B, "m", &[(300, 3.5)]).await;
+    let running = start_server_with(
+        store.clone(),
+        Mode::All,
+        Default::default(),
+        &[(TOKEN, TENANT), (TOKEN_B, TENANT_B)],
+        fold_tenants,
+    )
+    .await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let hash_a = TenantId::new(TENANT).hash();
+    let hash_b = TenantId::new(TENANT_B).hash();
+    assert_ne!(hash_a, hash_b, "the two tenants must hash differently");
+
+    // One statement each. The texts differ so a mis-attributed record is
+    // identifiable, not just miscounted.
+    let (status, value) = run_sql(
+        &client,
+        &base,
+        TOKEN,
+        "SELECT ts, value FROM samples ORDER BY ts",
+        0,
+        NOW_S,
+    )
+    .await;
+    assert_eq!(status, 200, "tenant a's statement should succeed: {value}");
+    let (status, value) = run_sql(
+        &client,
+        &base,
+        TOKEN_B,
+        "SELECT value FROM samples ORDER BY ts",
+        0,
+        NOW_S,
+    )
+    .await;
+    assert_eq!(status, 200, "tenant b's statement should succeed: {value}");
+
+    // The store now holds exactly one audit data object per tenant, each under
+    // that tenant's own prefix and nowhere else. Asserted before either audit
+    // statement runs, since those add a record of their own.
+    let keys = audit_data_object_keys(store.as_ref()).await;
+    let prefix_a = format!("t/{}/u/l0/", hash_a.to_hex());
+    let prefix_b = format!("t/{}/u/l0/", hash_b.to_hex());
+    let under_a = keys.iter().filter(|key| key.starts_with(&prefix_a)).count();
+    let under_b = keys.iter().filter(|key| key.starts_with(&prefix_b)).count();
+    assert_eq!(
+        under_a, 1,
+        "exactly one audit object under {prefix_a}: {keys:?}"
+    );
+    assert_eq!(
+        under_b, 1,
+        "exactly one audit object under {prefix_b}: {keys:?}"
+    );
+    assert_eq!(
+        keys.len(),
+        2,
+        "two audit objects in total, so none landed under a third prefix \
+         (an all-zero hash, or one tenant's prefix holding both): {keys:?}"
+    );
+
+    // Each tenant reads its own trail: one row, its own hash, never the
+    // other's. A window around real time, because `start` takes no injected
+    // clock.
+    let now_s = now_seconds();
+    let audit_sql = "SELECT attrs['query.tenant'] FROM audit WHERE attrs['kind'] = 'query'";
+    for (token, own, other) in [(TOKEN, hash_a, hash_b), (TOKEN_B, hash_b, hash_a)] {
+        let (status, value) = run_sql(
+            &client,
+            &base,
+            token,
+            audit_sql,
+            now_s - 3_600,
+            now_s + 3_600,
+        )
+        .await;
+        assert_eq!(status, 200, "the audit statement should succeed: {value}");
+        let rows = value["data"]["rows"].as_array().expect("rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly the one statement this tenant ran: {value}"
+        );
+        assert_eq!(
+            rows[0][0],
+            serde_json::json!(own.to_hex()),
+            "the row must carry this tenant's own hash: {value}"
+        );
+        assert_ne!(
+            rows[0][0],
+            serde_json::json!(other.to_hex()),
+            "the row must never carry the other tenant's hash: {value}"
+        );
+    }
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Two tenants, one process-wide pipeline: each tenant's query-audit record is
+/// written under its own audit prefix, so each reads exactly its own statement
+/// back through `audit` and never the other's.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn two_tenants_read_only_their_own_query_audit() {
+    two_tenants_each_read_only_their_own_audit(vec![TenantId::new(TENANT).hash()]).await;
+}
+
+/// The same guarantee with no `--fold-tenant` list at all, which is the
+/// OIDC/mTLS deployment shape: the pipeline has no static tenant list to fall
+/// back on, and must still route each record by the tenant its request
+/// resolved to.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn empty_fold_tenants_still_routes_audit_per_tenant() {
+    two_tenants_each_read_only_their_own_audit(Vec::new()).await;
 }

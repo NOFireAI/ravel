@@ -1320,30 +1320,13 @@ pub async fn start(
         // every query surface below (SQL, Flight SQL, PromQL, labels,
         // label_values, series, analytics, exemplars) so `kind = query`
         // records land through a single group-committing writer rather than
-        // one pipeline per surface.
-        //
-        // KNOWN GAP (reported, not silently worked around): `AuditPipeline`
-        // is scoped to exactly one `TenantHash` at construction and has no
-        // per-event tenant routing (see `ravel_maintain::AuditPipeline`).
-        // `ravel-server` is genuinely multi-tenant, and `config.fold_tenants`
-        // is legitimately empty for an OIDC/mTLS deployment with no static
-        // tenant list. Using the first configured tenant (or an all-zero
-        // sentinel when none is configured) means every other tenant's query
-        // audit records are written under this one tenant's object-storage
-        // prefix: invisible to their own `audit` table reads, and readable
-        // by whichever tenant was picked. This is the literal reading of the
-        // task and of ADR-0062 decision 2b ("A single AuditPipeline in
-        // ravel-server..."), not a local design choice; a correct multi-tenant
-        // fix needs a per-tenant pipeline registry in `ravel-maintain`, out of
-        // this task's scope.
-        let audit_tenant = config
-            .fold_tenants
-            .first()
-            .copied()
-            .unwrap_or(TenantHash([0u8; 16]));
+        // one pipeline per surface. The pipeline holds no tenant of its own:
+        // each event carries the tenant the request resolved to, and a flush
+        // groups its batch by that field, so one process-wide pipeline serves
+        // every tenant without needing a static tenant list (which an
+        // OIDC/mTLS deployment legitimately does not have).
         let audit_pipeline_handle = Arc::new(ravel_maintain::AuditPipeline::spawn(
             store.clone(),
-            audit_tenant,
             config.audit_pipeline.clone(),
         ));
         let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> = audit_pipeline_handle.clone();

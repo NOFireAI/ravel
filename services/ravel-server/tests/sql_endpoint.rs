@@ -475,14 +475,14 @@ fn build_router_with_sink(
     })
 }
 
-/// A group-commit [`AuditPipeline`] for `tenant` over `store`, as the shared
-/// sink for the audit tests. `max_batch = 1` flushes on every submit, so a
-/// single query's event is durable in `store` by the time the response returns
-/// -- exactly what `submit` awaiting durability guarantees -- and the existing
-/// `query_audit_records` helper reads it straight back out of the store.
+/// A group-commit [`AuditPipeline`] over `store`, as the shared sink for the
+/// audit tests. `max_batch = 1` flushes on every submit, so a single query's
+/// event is durable in `store` by the time the response returns -- exactly
+/// what `submit` awaiting durability guarantees -- and the existing
+/// `query_audit_records` helper reads it straight back out of the store. The
+/// pipeline holds no tenant: each event carries its own.
 fn audit_pipeline(
     store: Arc<dyn ObjectStoreBackend>,
-    tenant: &TenantId,
     mode: ravel_maintain::AuditMode,
 ) -> Arc<dyn ravel_maintain::QueryAuditSink> {
     let config = ravel_maintain::AuditPipelineConfig {
@@ -492,11 +492,7 @@ fn audit_pipeline(
         audit_mode: mode,
         channel_capacity: 64,
     };
-    Arc::new(ravel_maintain::AuditPipeline::spawn(
-        store,
-        tenant.hash(),
-        config,
-    ))
+    Arc::new(ravel_maintain::AuditPipeline::spawn(store, config))
 }
 
 fn tokens(pairs: &[(&str, &str)]) -> HashMap<String, TenantId> {
@@ -1241,11 +1237,7 @@ async fn sql_query_against_audit_table_returns_the_previous_querys_audit_record(
     let app = build_router_with_sink(
         Arc::clone(&store),
         tokens(&[("acme-token", "acme")]),
-        audit_pipeline(
-            Arc::clone(&store),
-            &tenant,
-            ravel_maintain::AuditMode::Required,
-        ),
+        audit_pipeline(Arc::clone(&store), ravel_maintain::AuditMode::Required),
     );
 
     let first = "SELECT ts, value FROM samples ORDER BY ts";
@@ -1637,11 +1629,7 @@ async fn a_successful_query_writes_one_ok_audit_record() {
     let app = build_router_with_sink(
         Arc::clone(&store),
         tokens(&[("acme-token", "acme")]),
-        audit_pipeline(
-            Arc::clone(&store),
-            &tenant,
-            ravel_maintain::AuditMode::Required,
-        ),
+        audit_pipeline(Arc::clone(&store), ravel_maintain::AuditMode::Required),
     );
 
     let sql = "SELECT ts, value FROM samples ORDER BY ts";
@@ -1681,11 +1669,7 @@ async fn a_failed_query_writes_one_error_audit_record() {
     let app = build_router_with_sink(
         Arc::clone(&store),
         tokens(&[("acme-token", "acme")]),
-        audit_pipeline(
-            Arc::clone(&store),
-            &tenant,
-            ravel_maintain::AuditMode::Required,
-        ),
+        audit_pipeline(Arc::clone(&store), ravel_maintain::AuditMode::Required),
     );
 
     // An unknown column reaches the executor and fails to plan.
@@ -1716,11 +1700,7 @@ async fn a_request_rejected_before_execution_is_not_audited() {
     let app = build_router_with_sink(
         Arc::clone(&store),
         tokens(&[("acme-token", "acme")]),
-        audit_pipeline(
-            Arc::clone(&store),
-            &tenant,
-            ravel_maintain::AuditMode::Required,
-        ),
+        audit_pipeline(Arc::clone(&store), ravel_maintain::AuditMode::Required),
     );
 
     let (status, _bytes) = post(&app, Some("acme-token"), None, "{ not json".to_string()).await;
@@ -1756,11 +1736,7 @@ async fn an_audit_write_failure_fails_the_query_closed_in_required_mode() {
     let app = build_router_with_sink(
         Arc::clone(&backend),
         tokens(&[("acme-token", "acme")]),
-        audit_pipeline(
-            Arc::clone(&backend),
-            &tenant,
-            ravel_maintain::AuditMode::Required,
-        ),
+        audit_pipeline(Arc::clone(&backend), ravel_maintain::AuditMode::Required),
     );
 
     let (status, value) = post_json(
