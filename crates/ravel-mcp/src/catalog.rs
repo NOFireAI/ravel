@@ -37,6 +37,11 @@ pub struct FindLabelsInput {
     pub label_name: Option<String>,
     pub filter: Option<String>,
     pub time_range: TimeRange,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB. A label list is bounded by its own page, but the page is
+    /// still what a caller may need to make smaller.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
     pub evidence_ref: Option<String>,
 }
 
@@ -44,6 +49,11 @@ pub struct FindLabelsInput {
 pub struct ExplainQueryInput {
     pub query: String,
     pub time_range: TimeRange,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB. An explain returns a plan and an effective schema, both of
+    /// which grow with the statement.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
 }
 
 /// Every data-returning tool declares the same six lowerable budget knobs
@@ -55,6 +65,10 @@ pub struct ExplainQueryInput {
 /// here. The fields are repeated per input struct rather than shared,
 /// because `tools/list` advertises each tool's input schema on its own and a
 /// caller reads that one schema, not a definition it would have to resolve.
+///
+/// `ravel_find_labels`, `ravel_explain_query`, and `ravel_analyze_timeseries`
+/// return no caller-sized row set, so they take the two knobs that still
+/// apply to them: `max_response_bytes` and `deadline_ms`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct QuerySqlInput {
     pub query: String,
@@ -82,6 +96,9 @@ pub struct QueryPromqlInput {
     /// Set alone for an instant evaluation. Exactly one of this or the
     /// `time_range`/`step` pair must be present.
     pub evaluation_time: Option<String>,
+    /// Absent means no consent: a partial-coverage result is refused rather
+    /// than the whole call failing to deserialize.
+    #[serde(default)]
     pub allow_partial_coverage: bool,
     /// Series rows returned; default 200, ceiling 5,000.
     pub max_rows: Option<u32>,
@@ -150,6 +167,11 @@ pub struct AnalyzeTimeseriesInput {
     pub time_range: TimeRange,
     pub step: String,
     pub op: AnalyzeOp,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB. An analysis runs a PromQL range evaluation underneath, so it
+    /// takes the same deadline and response bound the evaluation would.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
     pub evidence_ref: Option<String>,
 }
 
@@ -159,6 +181,27 @@ fn read_only_annotations() -> ToolAnnotations {
         .destructive(false)
         .open_world(false)
 }
+
+/// The 14 D4 envelope blocks, in the order [`crate::envelope::Envelope`]
+/// serializes them. Both halves of the output schema are built from this one
+/// list, so a block cannot appear in `properties` and be missing from
+/// `required`.
+const ENVELOPE_BLOCKS: [&str; 14] = [
+    "status",
+    "failure",
+    "data",
+    "plan",
+    "scope",
+    "ids",
+    "visibility",
+    "coverage",
+    "accuracy",
+    "presentation",
+    "budget",
+    "evidence",
+    "warnings",
+    "next_steps",
+];
 
 /// The D4 envelope's top-level shape, deliberately shallow.
 ///
@@ -175,36 +218,31 @@ fn read_only_annotations() -> ToolAnnotations {
 /// "unconstrained schema is the honest one" choice `envelope.rs` already
 /// makes for `Cell` and `AnyJson`, extended to the tool-catalog level.
 fn envelope_output_schema() -> Arc<JsonObject> {
-    let schema = json!({
-        "type": "object",
-        "description": "The D4 result envelope. See docs/reference/mcp.md#the-envelope.",
-        "properties": {
-            "status": {"type": "string", "enum": ["ok", "ok_bounded", "ok_page", "error"]},
-            "failure": {},
-            "data": {},
-            "plan": {},
-            "scope": {},
-            "ids": {},
-            "visibility": {},
-            "coverage": {},
-            "accuracy": {},
-            "presentation": {},
-            "budget": {},
-            "evidence": {},
-            "warnings": {},
-            "next_steps": {}
-        },
-        "required": [
-            "status", "failure", "data", "plan", "scope", "ids", "visibility",
-            "coverage", "accuracy", "presentation", "budget", "evidence",
-            "warnings", "next_steps"
-        ]
-    });
-    let object = match schema {
-        Value::Object(map) => map,
-        _ => unreachable!("the literal above is always a JSON object"),
-    };
-    Arc::new(object)
+    let mut properties = JsonObject::new();
+    for block in ENVELOPE_BLOCKS {
+        let shape = if block == "status" {
+            json!({"type": "string", "enum": ["ok", "ok_bounded", "ok_page", "error"]})
+        } else {
+            json!({})
+        };
+        properties.insert(block.to_string(), shape);
+    }
+    let required: Vec<Value> = ENVELOPE_BLOCKS
+        .iter()
+        .map(|block| Value::String((*block).to_string()))
+        .collect();
+
+    let mut schema = JsonObject::new();
+    schema.insert("type".to_string(), Value::String("object".to_string()));
+    schema.insert(
+        "description".to_string(),
+        Value::String(
+            "The D4 result envelope. See docs/reference/mcp.md#the-envelope.".to_string(),
+        ),
+    );
+    schema.insert("properties".to_string(), Value::Object(properties));
+    schema.insert("required".to_string(), Value::Array(required));
+    Arc::new(schema)
 }
 
 fn tool<T: JsonSchema + 'static>(
@@ -286,7 +324,7 @@ mod tests {
     /// every client parses on every reconnect, and it should be read in a
     /// diff rather than absorbed silently anywhere under the bound. Update
     /// it in the same commit as the schema change that moves it.
-    const TOOLS_LIST_SERIALIZED_LEN: usize = 14_206;
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 15_378;
 
     /// D2 bounds `tools/list` so the catalog itself never competes with a
     /// data response for the response-size budget.
@@ -370,13 +408,19 @@ mod tests {
         );
     }
 
-    /// Every data-returning tool takes the same six lowerable budget knobs
-    /// (docs/reference/mcp.md#budget-defaults-and-floors). A tool missing
-    /// one advertises no way to lower it, so a caller that cannot afford
-    /// the default has only the server ceiling to fall back on.
+    /// Every row-returning tool takes the same six lowerable budget knobs
+    /// (docs/reference/mcp.md#budget-defaults-and-floors), and every other
+    /// tool that spends a budget takes the two that apply to it. A tool
+    /// missing one advertises no way to lower it, so a caller that cannot
+    /// afford the default has only the server ceiling to fall back on.
+    ///
+    /// `ravel_capabilities` and `ravel_describe_data` are the two tools with
+    /// no budget knob at all: the first reads nothing from the store, and
+    /// the second answers from the metadata cache and one resolve per
+    /// signal.
     #[test]
     fn every_data_tool_advertises_the_lowerable_budgets() {
-        const BUDGET_KEYS: [&str; 6] = [
+        const ROW_BUDGET_KEYS: [&str; 6] = [
             "deadline_ms",
             "max_bytes_scanned",
             "max_response_bytes",
@@ -384,15 +428,22 @@ mod tests {
             "max_segments",
             "max_store_requests",
         ];
-        const DATA_TOOLS: [&str; 4] = [
-            "ravel_query_sql",
-            "ravel_query_promql",
-            "ravel_search_logs",
-            "ravel_get_trace",
+        /// The subset that applies to a tool returning no caller-sized row
+        /// set: it still occupies a response and still spends wall clock.
+        const SHARED_BUDGET_KEYS: [&str; 2] = ["deadline_ms", "max_response_bytes"];
+
+        let expected: [(&str, &[&str]); 7] = [
+            ("ravel_query_sql", &ROW_BUDGET_KEYS),
+            ("ravel_query_promql", &ROW_BUDGET_KEYS),
+            ("ravel_search_logs", &ROW_BUDGET_KEYS),
+            ("ravel_get_trace", &ROW_BUDGET_KEYS),
+            ("ravel_find_labels", &SHARED_BUDGET_KEYS),
+            ("ravel_explain_query", &SHARED_BUDGET_KEYS),
+            ("ravel_analyze_timeseries", &SHARED_BUDGET_KEYS),
         ];
 
         let catalog = tool_catalog();
-        for name in DATA_TOOLS {
+        for (name, keys) in expected {
             let tool = catalog
                 .iter()
                 .find(|tool| tool.name == name)
@@ -403,12 +454,99 @@ mod tests {
                 .and_then(Value::as_object)
                 .unwrap_or_else(|| panic!("{name} advertises input properties"));
 
-            let mut present: Vec<&str> = BUDGET_KEYS
+            let mut present: Vec<&str> = ROW_BUDGET_KEYS
                 .into_iter()
                 .filter(|key| properties.contains_key(*key))
                 .collect();
             present.sort_unstable();
-            assert_eq!(present, BUDGET_KEYS, "{name} is missing a budget knob");
+            assert_eq!(present, keys, "{name} advertises the wrong budget knobs");
         }
+
+        for name in ["ravel_capabilities", "ravel_describe_data"] {
+            let tool = catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the catalog"));
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let present: Vec<&str> = ROW_BUDGET_KEYS
+                .into_iter()
+                .filter(|key| properties.contains_key(*key))
+                .collect();
+            assert!(present.is_empty(), "{name} spends no budget");
+        }
+    }
+
+    /// D2's three flat properties of the whole catalog, asserted for all
+    /// nine tools at once: the `readOnlyHint: true`, `destructiveHint:
+    /// false`, `openWorldHint: false` annotations, the `ravel_` name prefix,
+    /// and the order the reference doc lists the tools in (a client renders
+    /// `tools/list` in the order it arrives, so the order is part of what is
+    /// advertised).
+    ///
+    /// `idempotent_hint` stays unset on purpose. ADR-1374 D2 names three
+    /// annotations, and rmcp documents that hint as meaningful only when
+    /// `readOnlyHint == false`, so setting it here would advertise something
+    /// the ADR does not.
+    #[test]
+    fn every_tool_is_read_only_idempotent_and_ravel_prefixed_in_catalog_order() {
+        const CATALOG_ORDER: [&str; 9] = [
+            "ravel_capabilities",
+            "ravel_describe_data",
+            "ravel_find_labels",
+            "ravel_explain_query",
+            "ravel_query_sql",
+            "ravel_query_promql",
+            "ravel_search_logs",
+            "ravel_get_trace",
+            "ravel_analyze_timeseries",
+        ];
+
+        let catalog = tool_catalog();
+        let names: Vec<&str> = catalog.iter().map(|tool| tool.name.as_ref()).collect();
+        assert_eq!(names, CATALOG_ORDER);
+
+        for tool in &catalog {
+            assert!(
+                tool.name.starts_with("ravel_"),
+                "{} is missing the D2 prefix",
+                tool.name
+            );
+            let annotations = tool
+                .annotations
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} carries annotations", tool.name));
+            assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
+            assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
+            assert_eq!(annotations.open_world_hint, Some(false), "{}", tool.name);
+            assert_eq!(annotations.idempotent_hint, None, "{}", tool.name);
+        }
+    }
+
+    /// `allow_partial_coverage` absent means no consent, not a
+    /// deserialization failure: a caller that never asked for a partial
+    /// result should not have to say so to make a whole-coverage call.
+    #[test]
+    fn absent_allow_partial_coverage_deserializes_as_no_consent() {
+        let input: QueryPromqlInput = serde_json::from_value(
+            json!({"query": "up", "evaluation_time": "2026-09-08T00:00:00Z"}),
+        )
+        .expect("a call without the consent flag deserializes");
+        assert!(!input.allow_partial_coverage);
+
+        let schema = tool_catalog()
+            .into_iter()
+            .find(|tool| tool.name == "ravel_query_promql")
+            .expect("ravel_query_promql is in the catalog")
+            .input_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(schema, vec![Value::String("query".to_string())]);
     }
 }
