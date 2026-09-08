@@ -104,7 +104,6 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use prost::Message;
 use ravel_catalog::select_authoritative_compaction_records;
 use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
 use ravel_commit::record;
@@ -1590,7 +1589,7 @@ async fn get_compaction_record_opt(
 ) -> Result<Option<CompactionRecord>> {
     match store.get(key, GetRange::Full).await {
         Ok(got) => {
-            let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
+            let record = record::decode_compaction(got.data.as_ref()).map_err(|e| {
                 MaintainError::Invariant(format!("compaction record decode failed: {e}"))
             })?;
             keys::verify_compaction_record_key(&record, key)?;
@@ -2591,7 +2590,7 @@ async fn get_compaction_record(
     key: &str,
 ) -> Result<CompactionRecord> {
     let got = store.get(key, GetRange::Full).await?;
-    let record = CompactionRecord::decode(got.data.as_ref())
+    let record = record::decode_compaction(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("compaction record decode failed: {e}")))?;
     keys::verify_compaction_record_key(&record, key)?;
     Ok(record)
@@ -4103,6 +4102,59 @@ mod tests {
         assert!(
             present(&store, &part).await,
             "no object is deleted when the HEAD cannot be decoded"
+        );
+    }
+
+    /// A compaction record stamped a future `format_version` in a bucket is
+    /// refused by the superseded sweep's bucket read (ADR-0066 decision 2), not
+    /// read as version 1: the pass fails before it deletes anything, so the
+    /// record and every input it would have named survive. The record is
+    /// otherwise fully self-consistent (its identity fields reconstruct its own
+    /// key), so the version gate is the only thing that can reject it. Removing
+    /// that gate makes this test fail: the record then decodes as version 1,
+    /// the pass proceeds, and `sweep_superseded` returns `Ok`.
+    #[tokio::test]
+    async fn superseded_sweep_refuses_a_future_version_compaction_record() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 0;
+        let store = MemoryStore::new();
+
+        let mut record = CompactionRecord {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal).into(),
+            shard,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x22; 32],
+            ..Default::default()
+        };
+        record.parts.clear();
+        let key = keys::compaction_record_key_for(&record).expect("key");
+        store
+            .put(
+                &key,
+                record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(config.orphan_age_gate_ns() + 1);
+        let err = sweep_superseded(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect_err("a version-2 compaction record must fail the pass, not read as v1");
+        match &err {
+            MaintainError::Invariant(msg) => assert!(
+                msg.contains("format_version") && msg.contains("2"),
+                "the failure names the version gate and the version seen: {msg}"
+            ),
+            other => panic!("expected Invariant from the version gate, got {other:?}"),
+        }
+        assert!(
+            present(&store, &key).await,
+            "a failed superseded pass deletes nothing from the bucket"
         );
     }
 }

@@ -11,6 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 use parking_lot::Mutex;
+#[cfg(test)]
 use prost::Message;
 use ravel_cache::{
     Cache, CacheKey, CacheLimits, DiskCache, SingleFlightError, Source, TieredCache,
@@ -2979,7 +2980,7 @@ impl Catalog {
         }
         let got = self.guarded_get(key, GetRange::Full, accounting).await?;
         let bytes = got.data.len() as u64;
-        let record = CompactionRecord::decode(got.data.as_ref()).map_err(|e| {
+        let record = record::decode_compaction(got.data.as_ref()).map_err(|e| {
             CatalogError::CompactionRecordDecode {
                 key: key.to_string(),
                 source: e,
@@ -8208,5 +8209,60 @@ mod tests {
             "the covered part set is unchanged by eviction"
         );
         assert_eq!(loaded_value(&reloaded_a), 42, "and carry tenant A's value");
+    }
+
+    /// A compaction record stamped a future `format_version` is refused by the
+    /// resolve read path (`load_and_validate_compaction`, docs/catalog-and-mvcc.md
+    /// step 2), not read as version 1. The record is otherwise fully
+    /// self-consistent: its identity fields reconstruct its own key, so the
+    /// only thing that can reject it is the ADR-0066 decision 2 version gate.
+    /// Removing that gate (making `check_format_version` always `Ok`) makes
+    /// this test fail: the record then decodes and validates as version 1 and
+    /// the call returns `Ok`.
+    #[tokio::test]
+    async fn resolve_refuses_a_future_version_compaction_record() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+
+        let record = ravel_proto::commit::v1::CompactionRecord {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal::to_proto(signal).into(),
+            shard: 0,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x11; 32],
+            ..Default::default()
+        };
+        let key = ravel_commit::keys::compaction_record_key_for(&record).expect("key");
+        store
+            .put(
+                &key,
+                ravel_commit::record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let err = catalog
+            .load_and_validate_compaction(&tenant, signal, 0, &key, &accounting)
+            .await
+            .expect_err("a version-2 compaction record must be refused, not read as v1");
+        assert!(
+            err.to_string().contains("compaction record"),
+            "the error names the record kind: {err}"
+        );
+        match err {
+            CatalogError::CompactionRecordDecode { source, .. } => match source {
+                ravel_commit::record::RecordError::UnsupportedRecordFormatVersion {
+                    actual,
+                    ..
+                } => assert_eq!(actual, 2, "the error carries the version seen"),
+                other => panic!("expected UnsupportedRecordFormatVersion, got {other:?}"),
+            },
+            other => panic!("expected CompactionRecordDecode, got {other:?}"),
+        }
     }
 }

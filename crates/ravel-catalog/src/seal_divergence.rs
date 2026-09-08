@@ -25,12 +25,12 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+#[cfg(test)]
 use prost::Message;
 use ravel_commit::erasure::compute_compaction_input_set_hash;
 use ravel_commit::keys::{self, KeyError};
 use ravel_commit::record::{self, RecordError};
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
-use ravel_proto::commit::v1::CompactionRecord;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
@@ -138,7 +138,7 @@ pub enum SealDivergenceError {
     CompactionRecordCorrupt {
         key: String,
         #[source]
-        source: prost::DecodeError,
+        source: RecordError,
     },
     #[error(
         "compaction record at {key} declares input_set_hash {declared} but its own inputs \
@@ -286,7 +286,7 @@ pub async fn verify_seal_divergence(
                         key: object.key.clone(),
                         source,
                     })?;
-                let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|source| {
+                let rec = record::decode_compaction(got.data.as_ref()).map_err(|source| {
                     SealDivergenceError::CompactionRecordCorrupt {
                         key: object.key.clone(),
                         source,

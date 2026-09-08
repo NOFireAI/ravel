@@ -422,7 +422,7 @@ pub async fn count_below_target(
                 keys::BucketEntry::CommitRecord(_) => commit_keys.push(key),
                 keys::BucketEntry::CompactionRecord(_) => {
                     let got = store.get(&key, GetRange::Full).await?;
-                    let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
+                    let rec = record::decode_compaction(got.data.as_ref()).map_err(|err| {
                         MaintainError::Invariant(format!(
                             "compaction record {key} is corrupt during migration re-audit: \
                              {err}"
@@ -608,7 +608,7 @@ async fn raw_served_commit_keys(
             Err(ravel_object_store::StoreError::NotFound) => continue,
             Err(err) => return Err(err.into()),
         };
-        let rec = CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
+        let rec = record::decode_compaction(got.data.as_ref()).map_err(|err| {
             MaintainError::Invariant(format!(
                 "compaction record {key} is corrupt during the migrate walk: {err}"
             ))

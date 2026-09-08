@@ -377,6 +377,16 @@ and the CAS read/write helpers.
   unclassified `rw.` key would have had its supersession of the erased inputs
   ignored by the index fold, letting erased records reappear in a folded
   snapshot.
+- Format-version gate on read (ADR-0066 decision 2). A compaction record and a
+  retention tombstone each carry a `format_version` (= 1), and every production
+  reader decodes them through `ravel_commit::record::decode_compaction` and
+  `decode_tombstone`, which validate that version against the supported set {1}
+  and return a typed `RecordError::UnsupportedRecordFormatVersion` naming the
+  record kind and the version seen. A record a future writer stamps at a version
+  this build does not know is refused, never read as version 1: supersession is
+  the load-bearing consumer, so a misread compaction record would let the sweeper
+  delete a live L0 input or the resolver skip one. The raw `prost` decode, which
+  skips this gate, is confined to test helpers.
 - Selective-erasure request and completion records (ADR-0064 decision 1) live
   under a separate `t/<tenant_hash>/<signal>/del/` prefix, not in `c/`, so the
   bucket-resolution LIST never sees them; the resolver LISTs `del/` once per
