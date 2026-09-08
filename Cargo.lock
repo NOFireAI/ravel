@@ -4844,7 +4844,6 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kube-runtime",
- "rand 0.10.2",
  "ravel-catalog",
  "ravel-object-store",
  "ravel-tracing-export",

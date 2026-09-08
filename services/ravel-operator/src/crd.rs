@@ -79,13 +79,17 @@ pub struct RavelClusterSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_key_secret_ref: Option<LocalSecretRef>,
 
-    /// Secret with a single key `key` holding 64 hex characters, the
-    /// query-audit token key the query tier reads as `RAVEL_AUDIT_TOKEN_KEY`
-    /// (#1487). Query tier only: gateway and maintain never read a
-    /// query-audit token. Omit on a cluster with `deploymentKeySecretRef`
-    /// set -- the server derives the key from the deployment key -- or to
-    /// let the operator generate one and manage a Secret named
-    /// `<cluster>-audit-token-key`.
+    /// Secret with a single key `key` holding 64 lowercase hex characters,
+    /// the query-audit token key the query tier reads as
+    /// `RAVEL_AUDIT_TOKEN_KEY` (#1487). Query tier only: gateway and
+    /// maintain never read a query-audit token. Omit on a cluster with
+    /// `deploymentKeySecretRef` set -- the server derives the key from the
+    /// deployment key. Omitting both leaves the query tier unable to start
+    /// audit tokenization: the operator does not generate this Secret
+    /// (issue #126's `secrets get`-only posture forbids the create/patch
+    /// that would need), so a cluster with neither ref set reports
+    /// `AuditTokenKeyMissing` and its query tier's Deployment is left as it
+    /// is until this field is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_token_key_secret_ref: Option<LocalSecretRef>,
 

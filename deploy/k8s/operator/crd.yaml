@@ -26,7 +26,7 @@
                 "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.",
                 "properties": {
                   "auditTokenKeySecretRef": {
-                    "description": "Secret with a single key `key` holding 64 hex characters, the\nquery-audit token key the query tier reads as `RAVEL_AUDIT_TOKEN_KEY`\n(#1487). Query tier only: gateway and maintain never read a\nquery-audit token. Omit on a cluster with `deploymentKeySecretRef`\nset -- the server derives the key from the deployment key -- or to\nlet the operator generate one and manage a Secret named\n`<cluster>-audit-token-key`.",
+                    "description": "Secret with a single key `key` holding 64 lowercase hex characters,\nthe query-audit token key the query tier reads as\n`RAVEL_AUDIT_TOKEN_KEY` (#1487). Query tier only: gateway and\nmaintain never read a query-audit token. Omit on a cluster with\n`deploymentKeySecretRef` set -- the server derives the key from the\ndeployment key. Omitting both leaves the query tier unable to start\naudit tokenization: the operator does not generate this Secret\n(issue #126's `secrets get`-only posture forbids the create/patch\nthat would need), so a cluster with neither ref set reports\n`AuditTokenKeyMissing` and its query tier's Deployment is left as it\nis until this field is set.",
                     "nullable": true,
                     "properties": {
                       "name": {

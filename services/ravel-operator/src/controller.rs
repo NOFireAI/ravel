@@ -36,7 +36,7 @@ use crate::crd::{
     RavelClusterSpec, RavelClusterStatus, ShardOverridesSpec,
 };
 use crate::reconcile::{
-    AUDIT_TOKEN_KEY_SECRET_KEY, AuditTokenKeySecretAction, AuditTokenKeySecretObservation,
+    AUDIT_TOKEN_KEY_MISSING_MESSAGE, AUDIT_TOKEN_KEY_MISSING_REASON, AUDIT_TOKEN_KEY_SECRET_KEY,
     DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_STALL_AFTER,
     GC_BOOTSTRAP_STALLED_REASON, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE, GC_BOOTSTRAP_UNAVAILABLE_REASON,
     GcBootstrapGate, QUALIFY_COMPONENT, QUALIFY_SPEC_HASH_ANNOTATION, QualificationDecision,
@@ -44,11 +44,11 @@ use crate::reconcile::{
     S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY, STORE_QUALIFIED_FAILED_REASON,
     STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON, STORE_QUALIFIED_SUCCEEDED_REASON,
     STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
-    audit_token_key_secret_name, desired_objects, desired_qualify_job, grpcroute_api_resource,
-    httproute_api_resource, plan_audit_token_key_secret, plan_qualify_gate,
-    possible_gateway_route_names, possible_ingest_ingress_names,
-    possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
-    qualify_job_input_hash, qualify_job_phase,
+    audit_token_key_missing, desired_objects, desired_qualify_job, grpcroute_api_resource,
+    httproute_api_resource, plan_qualify_gate, possible_gateway_route_names,
+    possible_ingest_ingress_names, possible_pod_disruption_budget_names,
+    possible_router_object_names, qualification_decision, qualify_job_input_hash,
+    qualify_job_phase,
 };
 
 /// Server-side-apply field manager name.
@@ -381,6 +381,32 @@ fn parse_deployment_key(raw: &[u8]) -> Result<[u8; 32], String> {
     ))
 }
 
+/// Validate an `auditTokenKeySecretRef` Secret's `key` field: exactly 64
+/// lowercase hex characters (32 bytes), matching `ravel-server`'s
+/// `AUDIT_TOKEN_KEY_ENV` parser (`services/ravel-server/src/config.rs`) but
+/// case-strict. Unlike [`parse_deployment_key`] there is no raw-32-byte
+/// fallback: the audit-token-key field is new with this CRD version, so
+/// there is no legacy raw-bytes form to stay compatible with, and no caller
+/// needs the decoded bytes back (only the server derives anything from this
+/// value; the operator only validates its shape and reads the Secret's
+/// `resourceVersion`). Returns the reason a value was rejected, never the
+/// value itself, so [`Error::InvalidSecretValue`] can never echo a key
+/// fragment into a status condition or a log line.
+fn parse_audit_token_key(raw: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(raw).map_err(|_| "value is not valid UTF-8".to_string())?;
+    if text.len() == 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "must be exactly 64 lowercase hex characters (32 bytes); got {} characters",
+        text.len()
+    ))
+}
+
 /// What the controller resolves from the deployment key Secret: the parsed
 /// 32-byte key and the Secret's `resourceVersion`. Every tier's pod template
 /// mounts this same Secret, so its `resourceVersion` feeds the shared
@@ -434,93 +460,79 @@ async fn resolve_deployment_key(
     })
 }
 
-/// Resolve the `resourceVersion` the query tier's checksum folds in for the
-/// audit-token-key Secret (#1487), creating the operator-generated Secret
-/// `<instance>-audit-token-key` the first time it is observed absent.
+/// What [`resolve_audit_token_key`] found for a cluster's query-audit token
+/// key. The operator never generates a Secret for this (#1487 rework, issue
+/// #126): it only reads whatever the spec already points at.
+enum AuditTokenKeyResolution {
+    /// `spec.audit_token_key_secret_ref` is set and resolved: the Secret's
+    /// `resourceVersion`, to fold into the query tier's checksum.
+    Explicit(Option<String>),
+    /// No `auditTokenKeySecretRef`, but `spec.deployment_key_secret_ref` is
+    /// set: the server derives the key from the deployment key, no Secret
+    /// read needed here.
+    DerivedFromDeploymentKey,
+    /// Neither ref is set: there is no key for the query tier to use.
+    Missing,
+}
+
+/// Resolve the cluster's query-audit token key source (#1487 rework): read
+/// and validate an explicit `auditTokenKeySecretRef`, or report which of the
+/// other two states applies. Matches
+/// [`crate::reconcile::audit_token_key_env`]/[`crate::reconcile::audit_token_key_missing`]'s
+/// three-way split so the render decision and this resolution can never
+/// disagree about which state a cluster is in.
 ///
-/// Three cases, matching [`crate::reconcile::audit_token_key_env`]:
-/// - `spec.audit_token_key_secret_ref` set: read that Secret's
-///   `resourceVersion` directly, the same as [`resolve_deployment_key`] does
-///   for its own ref.
-/// - Unset, but `spec.deployment_key_secret_ref` set: nothing to read, the
-///   server derives the key from the deployment key. Returns `None` without
-///   any Secret access, matching [`crate::reconcile::plan_audit_token_key_secret`]'s
-///   `NotGenerated`.
-/// - Both unset: the operator owns Secret `<instance>-audit-token-key`.
-///   [`plan_audit_token_key_secret`] decides `Reuse` (already present, return
-///   its `resourceVersion` unchanged) or `Create` (absent: generate 32 random
-///   bytes, hex-encode them, and apply the Secret once). The random bytes are
-///   generated only on the `Create` branch, never on `Reuse`, so an
-///   already-provisioned cluster's key is never touched by this call.
+/// An explicit ref is validated the same way [`resolve_deployment_key`]
+/// validates its own ref: the `key` field must exist and hold exactly 64
+/// lowercase hex characters, or the whole reconcile fails with
+/// [`Error::InvalidSecretValue`] naming the Secret and field, never the
+/// value. The operator does not generate a Secret for the `Missing` case:
+/// issue #126's `secrets get`-only RBAC posture grants no `create`/`patch`
+/// on Secrets, so [`crate::controller::reconcile_inner`] instead records a
+/// `Degraded` condition and withholds the query tier's Deployment apply.
 async fn resolve_audit_token_key(
     client: &Client,
     namespace: &str,
-    instance: &str,
     spec: &RavelClusterSpec,
-    owner: Option<&[OwnerReference]>,
-) -> Result<Option<String>, Error> {
+) -> Result<AuditTokenKeyResolution, Error> {
     if let Some(explicit) = spec.audit_token_key_secret_ref.as_ref() {
-        return secret_resource_version(
-            client,
-            namespace,
-            &explicit.name,
-            "auditTokenKeySecretRef",
-        )
-        .await;
+        let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+        let secret = api.get(&explicit.name).await.map_err(|err| {
+            secret_error(err, &explicit.name, namespace, "auditTokenKeySecretRef")
+        })?;
+        let resource_version = secret.resource_version();
+        let raw = secret_value(&secret, AUDIT_TOKEN_KEY_SECRET_KEY).ok_or_else(|| {
+            Error::InvalidSecretValue {
+                name: explicit.name.clone(),
+                field: AUDIT_TOKEN_KEY_SECRET_KEY.to_string(),
+                reason: "key not present in Secret".to_string(),
+            }
+        })?;
+        parse_audit_token_key(&raw).map_err(|reason| Error::InvalidSecretValue {
+            name: explicit.name.clone(),
+            field: AUDIT_TOKEN_KEY_SECRET_KEY.to_string(),
+            reason,
+        })?;
+        return Ok(AuditTokenKeyResolution::Explicit(resource_version));
     }
     if spec.deployment_key_secret_ref.is_some() {
-        return Ok(None);
+        return Ok(AuditTokenKeyResolution::DerivedFromDeploymentKey);
     }
+    Ok(AuditTokenKeyResolution::Missing)
+}
 
-    let name = audit_token_key_secret_name(instance);
-    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let existing = match secrets.get(&name).await {
-        Ok(secret) => Some(secret),
-        Err(err) if is_not_found(&err) => None,
-        Err(err) => {
-            return Err(secret_error(
-                err,
-                &name,
-                namespace,
-                "auditTokenKeySecretRef",
-            ));
-        }
-    };
-    let observation = if existing.is_some() {
-        AuditTokenKeySecretObservation::Present
+/// The query tier's `Deployment` to apply this pass, or `None` when
+/// [`audit_token_key_missing`] withholds it (#1487 rework): a cluster with
+/// neither `auditTokenKeySecretRef` nor `deploymentKeySecretRef` cannot
+/// render a query Deployment the server will start cleanly, so this pass
+/// leaves any existing query Deployment as it is rather than rolling it to a
+/// spec missing the env var the server requires to start with audit
+/// tokenization enabled.
+fn query_tier_apply_target(spec: &RavelClusterSpec, rendered: Deployment) -> Option<Deployment> {
+    if audit_token_key_missing(spec) {
+        None
     } else {
-        AuditTokenKeySecretObservation::Absent
-    };
-    // Generated lazily, only on the Absent branch: a `Reuse` or
-    // `NotGenerated` decision must never consume randomness or touch the
-    // existing value.
-    let fresh_key = if observation == AuditTokenKeySecretObservation::Absent {
-        let mut raw = [0u8; 32];
-        rand::fill(&mut raw);
-        hex::encode(raw)
-    } else {
-        String::new()
-    };
-
-    match plan_audit_token_key_secret(spec, observation, &fresh_key) {
-        AuditTokenKeySecretAction::NotGenerated => Ok(None),
-        AuditTokenKeySecretAction::Reuse => {
-            Ok(existing.and_then(|secret| secret.resource_version()))
-        }
-        AuditTokenKeySecretAction::Create { key } => {
-            let mut secret = Secret {
-                string_data: Some(BTreeMap::from([(
-                    AUDIT_TOKEN_KEY_SECRET_KEY.to_string(),
-                    key,
-                )])),
-                ..Default::default()
-            };
-            secret.metadata.name = Some(name.clone());
-            secret.metadata.namespace = Some(namespace.to_string());
-            secret.metadata.owner_references = owner.map(<[OwnerReference]>::to_vec);
-            let applied = apply(&secrets, &name, &secret).await?;
-            Ok(applied.resource_version())
-        }
+        Some(rendered)
     }
 }
 
@@ -1472,8 +1484,17 @@ async fn reconcile_inner(
     // referenced (some tier falls back to it unless all three override).
     let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
 
-    let audit_token_key_resource_version =
-        resolve_audit_token_key(client, namespace, instance, &obj.spec, owner.as_deref()).await?;
+    let audit_token_key = resolve_audit_token_key(client, namespace, &obj.spec).await?;
+    let audit_token_key_resource_version = match &audit_token_key {
+        AuditTokenKeyResolution::Explicit(rv) => rv.clone(),
+        AuditTokenKeyResolution::DerivedFromDeploymentKey | AuditTokenKeyResolution::Missing => {
+            None
+        }
+    };
+    // Same predicate `audit_token_key_env`/`query_tier_apply_target` use, so
+    // this pass's `Degraded` decision can never disagree with what actually
+    // got rendered and applied for the query tier.
+    let audit_key_missing = audit_token_key_missing(&obj.spec);
 
     let render_ctx = RenderCtx {
         tenant_names: token_secret.tenant_names,
@@ -1594,9 +1615,20 @@ async fn reconcile_inner(
     // conditions array is keyed by type, so a pass may record at most one
     // `Degraded` entry, and the `sys/gc` bootstrap check below can also produce
     // one. Resolved once, after that check.
-    let mut degraded: Option<(String, String)> = desired
-        .router_render_error
-        .map(|err| degraded_reason(&Error::Render(err)));
+    //
+    // A missing audit-token-key (#1487 rework) takes this slot ahead of a
+    // router render error: it means the query tier itself cannot be rolled to
+    // a working spec, where a router error only stops ingest routing.
+    let mut degraded: Option<(String, String)> = if audit_key_missing {
+        Some((
+            AUDIT_TOKEN_KEY_MISSING_REASON.to_string(),
+            AUDIT_TOKEN_KEY_MISSING_MESSAGE.to_string(),
+        ))
+    } else {
+        desired
+            .router_render_error
+            .map(|err| degraded_reason(&Error::Render(err)))
+    };
     let mut desired_router_names: BTreeSet<String> = BTreeSet::new();
     if let Some(mut sa) = desired.router_service_account {
         let name = sa.name_any();
@@ -1703,7 +1735,11 @@ async fn reconcile_inner(
 
     let mut tiers = TierDeployments {
         gateway: Some(desired.gateway_deployment),
-        query: Some(desired.query_deployment),
+        // Withheld (`None`) when the audit-token-key is missing (#1487
+        // rework): any existing query Deployment is left exactly as it is
+        // rather than rolled to a spec missing the env var the server needs
+        // to start with audit tokenization enabled.
+        query: query_tier_apply_target(&obj.spec, desired.query_deployment),
         maintain: desired.maintain_deployment,
         applied: BTreeMap::new(),
     };
@@ -3368,6 +3404,101 @@ mod tests {
             [7u8; 32]
         );
         assert!(parse_deployment_key(b"too short").is_err());
+    }
+
+    /// #1487: an `auditTokenKeySecretRef` Secret's `key` field must be
+    /// exactly 64 lowercase hex characters -- 63 chars, 65 chars, and
+    /// uppercase hex are all rejected, and the rejected value never appears
+    /// in the error text (only its length). A missing `key` field is a
+    /// separate error built directly by [`resolve_audit_token_key`] (there is
+    /// no value to validate), asserted here via its exact rendered message.
+    /// Flip [`parse_audit_token_key`]'s `text.len() == 64` to `<= 64` and the
+    /// 65-char case fails; flip `is_ascii_digit() || (b'a'..=b'f')` to
+    /// `is_ascii_hexdigit()` and the uppercase case fails.
+    #[test]
+    fn audit_key_secret_with_wrong_length_or_missing_key_is_invalid_secret_value() {
+        let too_short = "a".repeat(63);
+        let too_long = "a".repeat(65);
+        let uppercase = "A".repeat(64);
+
+        for (raw, label) in [
+            (too_short.as_str(), "63 chars"),
+            (too_long.as_str(), "65 chars"),
+            (uppercase.as_str(), "uppercase hex"),
+        ] {
+            let err =
+                parse_audit_token_key(raw.as_bytes()).expect_err(&format!("{label} is rejected"));
+            assert!(
+                !err.contains(raw),
+                "{label}: the error text must never contain the rejected value"
+            );
+        }
+
+        let missing_key = Error::InvalidSecretValue {
+            name: "audit-key".to_string(),
+            field: AUDIT_TOKEN_KEY_SECRET_KEY.to_string(),
+            reason: "key not present in Secret".to_string(),
+        };
+        assert_eq!(
+            missing_key.to_string(),
+            "secret audit-key field key: key not present in Secret"
+        );
+    }
+
+    /// #1487 rework: a cluster with neither `auditTokenKeySecretRef` nor
+    /// `deploymentKeySecretRef` reports `AuditTokenKeyMissing` (naming the
+    /// field and the 64-hex requirement) and has its query tier's Deployment
+    /// withheld from apply this pass -- gateway, maintain, and every other
+    /// child still reconcile (unaffected by [`query_tier_apply_target`],
+    /// which only ever governs the query tier). Any of the other three
+    /// shapes (explicit ref only, deployment key only, or both) applies the
+    /// query tier normally. Flip [`query_tier_apply_target`]'s
+    /// `if audit_token_key_missing(spec)` to `if !audit_token_key_missing(spec)`
+    /// and every assertion below inverts.
+    #[test]
+    fn unkeyed_cluster_without_audit_key_ref_reports_missing_and_skips_the_query_tier() {
+        let missing = spec_with_affinity(None); // neither ref set
+        assert!(
+            audit_token_key_missing(&missing),
+            "a cluster with neither ref set must be reported missing"
+        );
+        assert_eq!(AUDIT_TOKEN_KEY_MISSING_REASON, "AuditTokenKeyMissing");
+        assert!(
+            AUDIT_TOKEN_KEY_MISSING_MESSAGE.contains("spec.auditTokenKeySecretRef")
+                && AUDIT_TOKEN_KEY_MISSING_MESSAGE.contains("64"),
+            "the Degraded message must name the field and the 64-hex requirement"
+        );
+        assert!(
+            query_tier_apply_target(&missing, Deployment::default()).is_none(),
+            "the query tier's Deployment must be withheld from apply when the audit key is missing"
+        );
+
+        let mut explicit_only = spec_with_affinity(None);
+        explicit_only.audit_token_key_secret_ref = Some(LocalSecretRef {
+            name: "audit-key".to_string(),
+        });
+        assert!(
+            query_tier_apply_target(&explicit_only, Deployment::default()).is_some(),
+            "an explicit ref must let the query tier apply normally"
+        );
+
+        let mut keyed_only = spec_with_affinity(None);
+        keyed_only.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "dk".to_string(),
+        });
+        assert!(
+            query_tier_apply_target(&keyed_only, Deployment::default()).is_some(),
+            "a deploymentKeySecretRef must let the query tier apply normally"
+        );
+
+        let mut both = keyed_only;
+        both.audit_token_key_secret_ref = Some(LocalSecretRef {
+            name: "audit-key".to_string(),
+        });
+        assert!(
+            query_tier_apply_target(&both, Deployment::default()).is_some(),
+            "both refs set must let the query tier apply normally"
+        );
     }
 
     fn memory_store() -> ravel_object_store::memory::MemoryStore {
