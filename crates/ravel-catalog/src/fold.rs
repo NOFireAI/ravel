@@ -1475,7 +1475,24 @@ impl Catalog {
 
                     let stats_crc = crc32c::crc32c(&stats_bytes);
                     let stats_hash = blake3::hash(&stats_bytes);
-                    let stats_key = column_stats_object_key(tenant, signal, part_watermark, hash16);
+                    // Keyed by the hash of the object's OWN bytes
+                    // (`stats_hash16`), the same derivation the field-13 (v2)
+                    // object uses, NOT by the part's hash (`hash16`): the
+                    // per-segment build has a warn-and-omit path
+                    // (column_stats_cache above), so two folds over the same
+                    // part can produce different statistics bytes. Keying by
+                    // the part's hash would let a second fold's PUT collide
+                    // with the first's under `AlreadyExists`, which this
+                    // code (like the part PUT above) treats as "bytes are
+                    // identical by construction" -- false here, leaving a
+                    // field-7 ref whose blake3 describes bytes that were
+                    // never stored. Content-addressing on the object's own
+                    // bytes makes that assumption true again: identical
+                    // bytes always collapse onto the same key, and differing
+                    // bytes always land on a different one.
+                    let stats_hash16 = &stats_hash.to_hex()[..16];
+                    let stats_key =
+                        column_stats_object_key(tenant, signal, part_watermark, stats_hash16);
                     let size = stats_bytes.len() as u64;
                     let segment_count = v3_segments.len() as u32;
                     match self
@@ -1489,9 +1506,8 @@ impl Catalog {
                         .await
                     {
                         Ok(_) => {}
-                        // Content-addressed under the part's own hash: bytes
-                        // are identical by construction (mirrors the part
-                        // object's own PUT above).
+                        // Content-addressed under the object's own hash:
+                        // bytes really are identical by construction here.
                         Err(StoreError::AlreadyExists) => {}
                         Err(e) => return Err(CatalogError::Store(e)),
                     }
@@ -2890,7 +2906,7 @@ mod tests {
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, PutOptions};
@@ -3761,6 +3777,202 @@ mod tests {
                 .await
                 .is_err(),
             "HEAD must not exist after a fold that failed before publishing"
+        );
+    }
+
+    /// Issue #1482 finding 2: a v3 object keyed by the PART's own hash
+    /// (`hash16`, the pre-fix code) rather than the hash of its OWN bytes
+    /// collides across two folds that recompute the same byte-identical part
+    /// but derive different statistics for it. Here `snapshot_part_max_entries
+    /// = 2` seals hour 10's two segments (A, B) into a non-tail part on the
+    /// very first fold, alongside a separate tail part for hour 11's segment
+    /// (C); a non-tail part's `(min_hour, watermark_hour)` come from its own
+    /// entries, not the fold's overall watermark, so this part's `.csnap`
+    /// bytes -- and therefore its part hash -- never change no matter how far
+    /// later folds advance. A permanent fault on every `/snap/` GET forces the
+    /// second fold to rebuild from the commit layout (ADR-0063 section 4)
+    /// rather than forward the byte-identical part by reference, so it
+    /// genuinely re-derives that part's v3 statistics from the two segments a
+    /// second time. A `Sequence` scripted onto segment A's own data key lets
+    /// its first two reads (the first fold's v3 build, then the first fold's
+    /// name-postings pass, which aborts immediately because a logs RLOG
+    /// object is not a metrics RSEG) succeed normally, then fails the third
+    /// read -- the second fold's v3 build -- permanently. That is the
+    /// warn-and-omit path (fold.rs's per-entry v3 loop only logs and
+    /// continues on a fetch failure), and it drops A from the second fold's
+    /// v3 segments while B (a distinct key, never faulted) still succeeds:
+    /// the second fold's stats object for this part covers only B, genuinely
+    /// different bytes than the first fold's two-segment object for the exact
+    /// same part.
+    ///
+    /// Reverting the fix (`stats_hash16` back to the part's own `hash16`)
+    /// turns this from two objects at two keys into one: the second fold's
+    /// PUT collides under `AlreadyExists` with the first fold's object
+    /// already sitting at that part-hash-derived key, and the code (like the
+    /// legitimate content-addressed case) treats that as "bytes are
+    /// identical" and skips writing anything. The HEAD's field-7 ref still
+    /// gets the SECOND fold's `blake3` (computed directly off the just-built,
+    /// one-segment bytes, independent of where they landed), so the ref names
+    /// a hash that the object actually stored at its key does not have --
+    /// exactly the corruption this test's final assertion below would catch.
+    #[tokio::test]
+    async fn fold_keys_v3_object_by_its_own_content_hash_not_the_parts_hash() {
+        let inner = MemoryStore::new();
+        set_status_column_config(&inner).await;
+
+        let rec_a = publish_logs_segment(&inner, 1, 10, &[200, 404]).await;
+        let rec_b = publish_logs_segment(&inner, 2, 10, &[500]).await;
+        publish_logs_segment(&inner, 3, 11, &[200]).await;
+        let key_a = keys::reconstruct_data_key(&rec_a).expect("key a");
+
+        let plan = FaultPlan::empty()
+            .with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent("part unreadable".into()))
+                    .with_key_contains("/snap/"),
+            )
+            .with_sequence(
+                Sequence::new(Op::Get)
+                    .with_key_contains(key_a.clone())
+                    .then_passthrough() // first fold's v3 build reads A
+                    .then_passthrough() // first fold's postings pass reads A, aborts (RLOG vs RSEG)
+                    .then_fault(ScriptedFault::Permanent(
+                        "segment A unreadable on rebuild".into(),
+                    )), // second fold's v3 build: warn-and-omit
+            );
+        let store = Arc::new(FaultStore::new(inner, plan));
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 2,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        assert_eq!(
+            first.parts_total, 2,
+            "hour 10 seals off from hour 11's tail"
+        );
+
+        let head_1 = read_logs_head(store.as_ref()).await;
+        let part_1 = head_1
+            .parts
+            .iter()
+            .find(|p| p.entry_count == 2)
+            .expect("the sealed two-entry part")
+            .clone();
+        let stats_ref_1 = part_1
+            .column_stats
+            .clone()
+            .expect("first fold's v3 object for the sealed part");
+        let stored_1 = store
+            .get(&stats_ref_1.key, GetRange::Full)
+            .await
+            .expect("first fold's v3 object present");
+        let decoded_1 = snapshot_format::decode_column_stats(
+            &stored_1.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("first fold's v3 object decodes");
+        assert_eq!(
+            decoded_1.segments.len(),
+            2,
+            "first fold covers both A and B"
+        );
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(12),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(
+            second.rebuilt,
+            "the /snap/ fault forces a rebuild from the commit layout"
+        );
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the scripted fault on A's third read must actually fire"
+        );
+
+        let head_2 = read_logs_head(store.as_ref()).await;
+        let part_2 = head_2
+            .parts
+            .iter()
+            .find(|p| p.entry_count == 2)
+            .expect("the same sealed two-entry part, rebuilt")
+            .clone();
+        assert_eq!(
+            part_2.blake3, part_1.blake3,
+            "byte-identical part: same entries, same non-tail (min_hour, watermark_hour)"
+        );
+        let stats_ref_2 = part_2
+            .column_stats
+            .clone()
+            .expect("second fold's v3 object for the same part");
+
+        // The bug this guards against: two different keys, not one collided
+        // key. With the fix, content-addressing guarantees this on its own;
+        // asserting it is what would catch a regression back to part-hash
+        // keying, since fold1 and fold2 share the same part hash.
+        assert_ne!(
+            stats_ref_2.key, stats_ref_1.key,
+            "different statistics bytes must land at different keys, even though \
+             both folds computed this from the exact same part"
+        );
+
+        // First fold's object at its own key is untouched.
+        let restored_1 = store
+            .get(&stats_ref_1.key, GetRange::Full)
+            .await
+            .expect("first fold's object still present, unmodified");
+        assert_eq!(
+            restored_1.data, stored_1.data,
+            "the first fold's v3 object must not be overwritten by the second"
+        );
+
+        // The core correctness property (issue #1482 finding 2): the field-7
+        // ref's blake3 must match what is actually stored at its key. Under
+        // the pre-fix part-hash keying this fails, because the second PUT is
+        // skipped on a false `AlreadyExists` against the first fold's bytes.
+        let stored_2 = store
+            .get(&stats_ref_2.key, GetRange::Full)
+            .await
+            .expect("second fold's v3 object present at its declared key");
+        assert_eq!(
+            blake3::hash(&stored_2.data).as_bytes().to_vec(),
+            stats_ref_2.blake3,
+            "the ref's blake3 must describe the bytes actually stored at its key"
+        );
+        let decoded_2 = snapshot_format::decode_column_stats(
+            &stored_2.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("second fold's v3 object decodes");
+        assert_eq!(
+            decoded_2.segments.len(),
+            1,
+            "A was dropped by the warn-and-omit path; only B survived"
+        );
+        assert_eq!(
+            decoded_2.segments[0].writer_id, rec_b.content_hash,
+            "the surviving segment is B's (entry.content_hash), not A's"
         );
     }
 

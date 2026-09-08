@@ -520,12 +520,20 @@ Absence is never an error.
 The fold writes one v3 object per part it actually re-encodes this fold
 (never for a part carried forward by reference, since that part's `.csnap`
 bytes, and therefore its existing field-7 ref, are unchanged), immediately
-after PUTting the part object itself and under the same content-addressed
-key scheme (`column_stats_object_key(tenant, signal, part_watermark,
-hash16)`, keyed by the PART's own hash, not the fold's overall watermark).
-Like the part object's own PUT, a `StoreError::AlreadyExists` on the v3
-object's PUT is treated as success (two folders racing the same input write
-the same content-addressed bytes).
+after PUTting the part object itself and under the same
+`column_stats_object_key(tenant, signal, part_watermark, stats_hash16)`
+scheme v1 and v2 use: keyed by the hash of the v3 object's OWN bytes
+(`stats_hash16`), not the part's hash. Keying by the part's hash instead
+would be unsound: the per-segment build has a warn-and-omit path
+(`column_stats_build`'s per-entry fetch degrading on a failed GET), so two
+folds over the same part can produce different statistics bytes, and a
+part-hash key would let the second fold's PUT collide with the first's
+under `AlreadyExists` -- treated as success on the false assumption that
+the bytes are identical, leaving a field-7 ref whose blake3 describes bytes
+that were never stored at its key. Content-addressing on the object's own
+bytes, like the part object's own PUT, makes `AlreadyExists` really mean
+"two folders raced the same input and wrote the same content-addressed
+bytes."
 
 **Per-part bound and refusal (ADR-1413 decisions 3-4).** Before compressing,
 `encode_column_stats_v3` checks the concatenated uncompressed body against
