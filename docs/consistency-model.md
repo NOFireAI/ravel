@@ -231,6 +231,20 @@ and no stronger; it does not promise a single stored copy per record.
   far-past or far-future hour. The same floor extends the fail-loud flush-open
   check, so a clock that goes bad between a buffered ack and flush open fails
   the flush instead of writing a nonsense bucket.
+- That compiled floor bounds the *range* of a flush-open reading, not its
+  *order* against earlier flushes of the same writer. The flush-open reading is
+  also stamped as the commit record's `created_unix_ns`, the primary key of the
+  query-time duplicate-resolution order (docs/catalog-and-mvcc.md,
+  "Cross-segment duplicate samples"), so a backwards wall-clock step (an NTP
+  correction, a manual set) small enough to stay above the floor could stamp a
+  correction below the stale sample it supersedes and invert the resolution.
+  Each shard actor therefore holds the flush-open stamp to a per-writer
+  monotonic floor: every reading is raised to the highest stamp this writer has
+  already issued, so stamps are non-decreasing within a process lifetime and
+  each absorbed step is counted (`ravel_ingest_clock_regressions_total`). The floor
+  is in-process state, never read back after a restart; a restart mints a fresh
+  `writer_id`, so cross-process order rests on that identity component of the
+  dedup key, not on the floor (ADR-1307).
 - Config discipline: `max_ingest_lag` is one shared bound, not a per-signal
   one, in the sense that matters operationally, though it is not shared by
   reference: the admission checks (one `max_ingest_lag_ns` constant per
