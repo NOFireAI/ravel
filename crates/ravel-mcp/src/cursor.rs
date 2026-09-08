@@ -1326,6 +1326,25 @@ mod tests {
         assert_eq!(err, CursorError::Invalid);
     }
 
+    /// The version byte is checked for an evidence token the same way it is
+    /// for a cursor: a token in the version 2 layout is `Invalid` rather than
+    /// parsed as a later version. Re-MAC'd, so the failure is the version
+    /// check and not the MAC.
+    #[test]
+    fn wrong_version_evidence_token_is_cursor_invalid() {
+        let tenant = TenantHash([0x4Eu8; 16]);
+        let key = test_key();
+        let token = sample_evidence(tenant).encode(&key).expect("encodes");
+
+        let mut bytes = token_bytes(&token);
+        bytes[4] = EVIDENCE_VERSION - 1;
+        let reminted = remint(bytes, &key);
+
+        let err = EvidenceRef::redeem(&reminted, &key, tenant, SAMPLE_TOOL, NOW_NS, FAR_HORIZON_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
     /// The magic is checked, so an evidence reference cannot be redeemed as a
     /// cursor even under this process's own key.
     #[test]
