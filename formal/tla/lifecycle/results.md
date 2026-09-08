@@ -1567,3 +1567,266 @@ traceability also pass) and `scripts/check-tla.sh exhaustive -a lifecycle` PASS
 included). The three probe runs above were measured on the same runtime with
 `-workers 2 -Xmx2g`. `python3 scripts/check_docs.py` exit 0, `docs gate:
 clean.`.
+
+## Round thirteen: the ingest hour open at the erasure ack (issue #1411)
+
+The formal half of issue #1290. The obligation the issue states is that an
+ingest hour can be OPEN at the moment an erasure request is acknowledged, and
+that no erasure completion may be published while a bucket that was open at
+that acknowledgement is still unsealed. The shipped code is
+`crates/ravel-maintain/src/erasure_rewrite.rs::ack_open_ingest_hours`, which
+derives each pending request's hour from the request's own timestamp and unions
+it into the pass's discovered hours, with `bucket_in_scope_at_ack` deciding
+membership and `erasure_seal_wait_bound_ns` fixing the seal wait;
+`services/ravel-server/src/maintain.rs::run_erasure_pass` wires the derived
+hours into the pass. Before this round the model had no ingest bucket at all, so
+that obligation was unmodelled.
+
+### What changed in the model
+
+`LifecycleGC.tla` gains one open ingest bucket with three variables and four
+actions. `ingestPhase` is `"absent" | "open" | "sealed"`; `OpenBucket` opens it
+at clock 0 and `SealBucket` seals it once `clock >= SealBound`, the model's
+`erasure_seal_wait_bound_ns`. `ingestLate` is `"none" | "serving" | "cleared"`:
+`IngestLateWrite` lands one record of the erased subject in the still-open
+bucket, and `RewriteOpenBucket` drops it once the bucket is sealed. That is the
+derived-bucket case the shipped helper exists for: the flush's commit record need
+not have landed when the erasure pass lists, so the hour has to be derived from
+the request rather than discovered by listing.
+
+`ingestAckScope` is the capture. `RequestErasure`, the acknowledgement, is the
+only action that sets it, so the open set is captured AT THE ACKNOWLEDGEMENT and
+not at completion time. A bucket that opens after the acknowledgement is never
+captured and never blocks a completion: `OpenBucket` does not touch
+`ingestAckScope`.
+
+`CompleteErasure` gains one conjunct,
+`(CompletionIgnoresOpenBucket \/ OpenBucketPermitsCompletion)`, where
+
+```text
+OpenBucketPermitsCompletion ==
+    /\ ~IngestUnsealedInScope
+    /\ ~IngestLateStillServes
+```
+
+reads the captured scope, not the live bucket. The completion witness on
+`lastGc` records both observations at the completion's own step
+(`openUnsealedInScope`, `openLateServed`), and the new invariant
+`CompletionCoversEveryBucketOpenAtRequest` reads the witness, for the same
+retroactivity reason `CompletionRespectsLegalHold` does: a bucket that seals
+after a legitimate completion is a later state, not evidence the completion was
+wrong.
+
+### The capture had to accumulate, not overwrite
+
+The draft carried into this round wrote `ingestAckScope' = (ingestPhase =
+"open")`, an overwriting capture. That fails the obligation's second half: it
+lets something other than a seal discharge the obligation. `DreqSweep` removes
+the `.dreq`, which re-enables `RequestErasure`, and a second acknowledgement
+taken while the bucket is already sealed then clears a capture the first
+acknowledgement took while it was open. The transition is reachable. Adding the
+action property
+
+```text
+AckScopeNeverCleared == [][ingestAckScope => ingestAckScope']_vars
+```
+
+to `smoke.cfg` in a scratch copy gives, against the overwriting form,
+
+```text
+Error: Action property AckScopeNeverCleared is violated.
+```
+
+at depth 11, on the trace `OpenBucket`, `RequestErasure`, `Tick`, `SealBucket`,
+`RetireBucket`, `DropRetiredBucketFromHead`, `CompleteErasure`, `DreqSweep`,
+`RequestErasure`. The same probe passes against the shipped form,
+`ingestAckScope' = (ingestAckScope \/ ingestPhase = "open")`, with the lane's
+own figures unchanged at `2835448` distinct, depth 31.
+
+No unsafe completion was reachable through the overwriting form in this model,
+because `doneR1` is written once and never deleted and `DreqSweep` requires it
+present, so every clearing step is strictly after the single completion. The
+accumulating form is what makes the guard independent of that coincidence:
+`SealBucket` and `RewriteOpenBucket` are the only ways a captured bucket leaves
+the obligation.
+
+### Negative control
+
+`negative/completion-ignores-open-bucket.cfg` flips `CompletionIgnoresOpenBucket`
+to `TRUE` and nothing else, under `FullEnv = TRUE` and the full smoke invariant
+list. `scripts/check-tla.sh ci -a lifecycle` reports
+
+```text
+check-tla: lifecycle negative completion-ignores-open-bucket: VIOLATED as expected (exit 12, CompletionCoversEveryBucketOpenAtRequest)
+```
+
+and the eight pre-existing controls each still fire their own target and no
+other, which is the rule the "Negative controls" section states:
+
+```text
+check-tla: lifecycle negative compaction-ignores-rewrite: VIOLATED as expected (exit 12, AtMostOneLiveRecordSetServed)
+check-tla: lifecycle negative complete-ignores-served-set: VIOLATED as expected (exit 12, CompletionImpliesNoPreRewriteExposure)
+check-tla: lifecycle negative delete-before-horizon: VIOLATED as expected (exit 12, NoDeleteInsideProtectionWindow)
+check-tla: lifecycle negative dreq-ignores-held-inputs: VIOLATED as expected (exit 12, DreqSweepRespectsLegalHold)
+check-tla: lifecycle negative refresh-failure-is-no-hold: VIOLATED as expected (exit 12, RefreshFailureNeverSweeps)
+check-tla: lifecycle negative rewrite-identity-omits-requests: VIOLATED as expected (exit 12, IdenticalInputSetsDoNotCollide)
+check-tla: lifecycle negative rewrite-keeps-erased-records: VIOLATED as expected (exit 12, RewriteOutputsAreInputsMinusErased)
+check-tla: lifecycle negative superseded-sweep-ungated: VIOLATED as expected (exit 12, HeadNamedObjectNeverDeletedBySupersededSweep)
+```
+
+The new control's trace is 7 states, 13252 distinct explored, depth 8:
+`OpenBucket`, `RequestErasure` while the bucket is open, `RetireBucket`,
+`DropRetiredBucketFromHead`, `Tick`, `CompleteErasure` at clock 1 with
+`ingestPhase = "open"`, and the witness
+
+```text
+/\ lastGc = [ rule |-> "complete",
+  openUnsealedInScope |-> TRUE,
+  openLateServed |-> FALSE ]
+```
+
+### Flip-line proof on the invariant itself
+
+A control proves a switch is wired to something. It does not prove the invariant
+catches the guard's removal, and TLC stops at the shallowest violation, so this
+control only ever exercises the first clause. Each clause was deleted on its own
+in a scratch copy under `/tmp`, with `CompletionIgnoresOpenBucket = FALSE`, and
+`scripts/check-tla.sh smoke -a lifecycle` run against it.
+
+Deleting the guard conjunct from `CompleteErasure`:
+
+```text
+-    /\ (CompletionIgnoresOpenBucket \/ OpenBucketPermitsCompletion)
+```
+
+```text
+Error: Invariant CompletionCoversEveryBucketOpenAtRequest is violated.
+```
+
+TLC exit 12, depth 8, 9505 distinct states explored.
+
+Deleting only the second conjunct of `OpenBucketPermitsCompletion`, so the guard
+still waits for the seal but no longer waits for the pre-ack record:
+
+```text
+ OpenBucketPermitsCompletion ==
+     /\ ~IngestUnsealedInScope
+-    /\ ~IngestLateStillServes
+```
+
+```text
+Error: Invariant CompletionCoversEveryBucketOpenAtRequest is violated.
+```
+
+TLC exit 12, depth 10, 39497 distinct states explored, on the trace
+`OpenBucket`, `Tick`, `IngestLateWrite`, `RequestErasure`, `SealBucket`,
+`RetireBucket`, `DropRetiredBucketFromHead`, `CompleteErasure`, with the mirror
+witness `openUnsealedInScope |-> FALSE`, `openLateServed |-> TRUE`. Both clauses
+are load-bearing. `counterexamples/completion-ignores-open-bucket.md` records
+the control and both mutants.
+
+### The bound
+
+The open bucket's three variables multiply the reachable graph by about 8.5 at a
+fixed clock bound, so the round-eight-through-twelve bound no longer fits the
+lane budget. Measured on a four-core, 2 GB-heap emulation of the CI runner
+(`taskset -c 0-3`, `_JAVA_OPTIONS=-Xmx2g`), against the 300 second smoke budget:
+
+| bound | distinct | depth | wall at 4 cores / 2 GB | outcome |
+|---|---|---|---|---|
+| MaxClock = 2 | 30493326 | 34 | over budget, killed at 300s having reached 15.1M distinct | TIMEOUT |
+| MaxClock = 1 | 2835448 | 31 | 54s | PASS |
+
+`MaxClock = 2` is what every round from eight onward measured, so it was tried
+first and kept only if it fit. It does not fit: `check-tla: lifecycle/MCLifecycleGC
+smoke: TIMEOUT after 300s`. The full graph at that bound does complete given 16
+cores and the JVM's default heap, in 3min 54s, which is how the 30493326 figure
+was measured; that is not the machine the gate has to pass on.
+
+`SealBound` was not a usable lever. It is a guard threshold on `SealBucket`, not
+a variable, so moving it inside `0..MaxClock` reshapes which interleavings are
+reachable without removing a dimension from the state vector, and lowering it to
+0 would make the seal wait vacuous, which is the behaviour under test. The
+environment was not shrunk either: `FullEnv` stays `TRUE` and no invariant was
+dropped from any cfg, as the task requires. That leaves `MaxClock`.
+
+The risk of the smaller bound is that it hollows out the lane: an invariant whose
+guarded behaviour is no longer reachable holds for the wrong reason. That was
+checked rather than assumed. All nine negative controls were re-run at
+`MaxClock = 1` in a scratch copy and each still fires its own target:
+
+```text
+check-tla: negative: all checks passed
+```
+
+with the same nine VIOLATED lines quoted above. A control fires only by reaching
+the behaviour its guard protects, so this is direct evidence that `MaxClock = 1`
+still reaches the retention delete, the erasure completion, the `.dreq` sweep,
+the superseded sweep, the compaction/rewrite overlap and the hold-refresh path.
+The shipped controls stay at `MaxClock = 2`, one step above the smoke lane: they
+terminate at the first violation in one or two seconds each, so the wider bound
+costs nothing and checks more.
+
+### Figures
+
+`smoke.cfg` and `exhaustive.cfg` both move to `MaxClock = 1` and reach `2835448`
+distinct states at depth 31, down from `3587643` at depth 30. `bands.tsv` moves
+to `2832000`-`2839000` for both configs, depth 31, the observed figure with the
+same +/-0.12% margin the prior band carried.
+
+```text
+check-tla: lifecycle/MCLifecycleGC smoke: PASS  states=19107333 distinct=2835448 depth=31 54s
+check-tla: lifecycle/MCLifecycleGC exhaustive: PASS  states=19107333 distinct=2835448 depth=31 523s
+check-tla: exhaustive: all checks passed
+```
+
+The exhaustive lane completed the state graph, `0 states left on queue`, well
+inside its 3600 second budget, and both `PROPERTY` lines were checked on it:
+
+```text
+Checking 3 branches of temporal properties for the complete state space with 8506344 total distinct states
+Finished checking temporal properties in 01min 07s
+Model checking completed. No error has been found.
+```
+
+`EventuallySwept` and `EventuallyCompleted` therefore both hold under `FairSpec`
+at this bound. The 523 second figure was measured with the runner's full core
+count and the JVM default heap, not under the four-core, 2 GB emulation used for
+the smoke budget above, because the exhaustive lane does not run in the same CI
+job as the smoke gate.
+
+### Documentation reconciled
+
+`README.md` now reads eighteen safety invariants (TypeOK plus seventeen named)
+and lists `CompletionCoversEveryBucketOpenAtRequest`; its negative-controls
+section reads eleven switch constants, nine controls and all eighteen INVARIANT
+lines; its Non-vacuity section records nine behaviour mutants and the new
+control; "What the model contains" gains the open ingest bucket actor and the
+two new witness fields; and the Running section records the bound move with its
+measurements. `traceability.md` gains the
+`OpenBucket / SealBucket / CompletionCoversEveryBucketOpenAtRequest` row citing
+`ack_open_ingest_hours`, `bucket_in_scope_at_ack` and
+`erasure_seal_wait_bound_ns`, pinned by
+`completion_waits_for_a_bucket_still_open_at_acknowledgement` and
+`records_ingested_after_the_acknowledgement_neither_erase_nor_hold_completion`
+(22 rows now resolve, from 21). The stale bound comments in `smoke.cfg` and
+`exhaustive.cfg` are corrected, and the new control's own header comment now
+describes the trace TLC actually reports rather than a longer one it does not.
+
+### Execution note
+
+TLC ran this round. The host carried no Java runtime, so a Temurin JRE 21 was
+fetched from Adoptium into `/tmp` and passed through `RAVEL_TLA_JAVA`; nothing
+from `/tmp` or `.cache` is committed. `scripts/check-tla.sh` takes its worker
+count and heap from `-workers auto` and the JVM default, not from environment
+variables, so the CI runner was emulated with `taskset -c 0-3` and
+`_JAVA_OPTIONS=-Xmx2g` rather than by setting anything the script reads.
+`scripts/check-tla.sh ci -a lifecycle` exit 0 under that emulation, in 66s
+wall (lifecycle smoke `states=19107333 distinct=2835448 depth=31`, 54s; nine
+negative controls VIOLATED as expected with their named target; traceability 22
+rows resolve). The whole-repository `ci` lane was run too, in two invocations
+because the executor's foreground command cap is 10 minutes and the six areas
+together exceed it: the first covered catalog, commit, common, lifecycle and
+maintenance with every check passing, the second `-a resharding` finished
+`check-tla: ci: all checks passed`, exit 0 in 50s. No area regressed.
+`python3 scripts/check_docs.py` exit 0, `docs gate: clean.`.

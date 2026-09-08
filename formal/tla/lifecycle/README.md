@@ -33,6 +33,13 @@ as such and not checked here.
   the compaction maintainer, the retention maintainer (data-object sweep and the
   final tombstone sweep), and the physical GC maintainer (superseded and
   request-marker sweeps).
+- One open ingest bucket (issue #1411): the ingest hour that can be open at the
+  moment an erasure request is acknowledged. It opens at clock 0, seals once its
+  seal wait bound elapses, and while open it can accept one record of the erased
+  subject that becomes visible only after the erasure pass listed the bucket.
+  `RequestErasure` captures whether it was open at the acknowledgement, and only
+  sealing it and rewriting the sealed bucket discharge the obligation that
+  capture creates.
 - Every maintenance pass in two steps, a listing and a publish, because the
   shipped passes are two object-store round trips with no compare-and-swap
   between them. That split is what makes a decision taken against a listing
@@ -47,15 +54,17 @@ as such and not checked here.
   never stamp or supersede an object retention swept after it listed.
 - A witness, `lastGc`, that records what a delete (or, for `CompleteErasure`,
   a completion write) OBSERVED at its own step: the hold state, the refresh
-  state, the permitted-query needs, the HEAD-named subset, and whether a held
-  raw input served the erased subject. Every safety invariant reads the
+  state, the permitted-query needs, the HEAD-named subset, whether a held
+  raw input served the erased subject, and, for a completion, whether a bucket
+  open at the request's acknowledgement was still unsealed or still served a
+  record accepted before that acknowledgement. Every safety invariant reads the
   witness or the store, never a ghost field the action writes about itself,
   so a hold or refresh flipped after a legitimate delete or completion
   cannot retroactively make it look unsafe.
 
 ## Invariants
 
-Seventeen safety invariants including `TypeOK`; see `traceability.md` for the
+Eighteen safety invariants including `TypeOK`; see `traceability.md` for the
 one-line meaning of each and its Rust source. The load-bearing protocol
 properties: `NoDeleteInsideProtectionWindow`, `HeldObjectNeverDeleted`,
 `RefreshFailureNeverSweeps`, `TombstoneExcludesBeforeDelete`,
@@ -65,7 +74,7 @@ properties: `NoDeleteInsideProtectionWindow`, `HeldObjectNeverDeleted`,
 `CompletionImpliesNoPreRewriteExposure`, `CompletionRespectsLegalHold`,
 `DreqRemovalCannotResurrect`, `DreqSweepRespectsLegalHold`,
 `IdenticalInputSetsDoNotCollide`, `HeadNamedObjectNeverDeletedBySupersededSweep`,
-`AtMostOneLiveRecordSetServed`.
+`AtMostOneLiveRecordSetServed`, `CompletionCoversEveryBucketOpenAtRequest`.
 `RawInputContentAssumedImmutable` is not a protocol property; it pins an
 environmental assumption the model is built on (see "Assumptions" below).
 
@@ -243,15 +252,19 @@ cannot make the two exclude each other and only the producer-side guard can
 
 ## Switches and negative controls
 
-Ten boolean CONSTANTS gate the model's guards; all are at their shipped value
+Eleven boolean CONSTANTS gate the model's guards; all are at their shipped value
 in `smoke.cfg` and `exhaustive.cfg`. Each `negative/*.cfg` flips exactly one,
-runs with `FullEnv = TRUE` and all seventeen INVARIANT lines (TypeOK plus
-sixteen named) from `smoke.cfg` (finding 5), and names the single invariant
+runs with `FullEnv = TRUE` and all eighteen INVARIANT lines (TypeOK plus
+seventeen named) from `smoke.cfg` (finding 5), and names the single invariant
 it must break, so a
 guard silently deleted from the spec fails a control rather than passing
 unnoticed under a reduction that happened to dodge the other invariants. There
-are eight controls, one per `negative/*.cfg`; each has a note under
+are nine controls, one per `negative/*.cfg`; each has a note under
 `counterexamples/`.
+
+The controls run at `MaxClock = 2`, one step above the smoke lane's bound. Each
+still fires its own target at `MaxClock = 1`, so the wider bound is a deliberate
+widening of the control lane rather than a bound the controls need.
 
 Notes under `counterexamples/` are dated records of the run that produced
 them, and `results.md` is append-only by round. Both keep the action and
@@ -259,7 +272,7 @@ operator names the model carried at the time, so a note from an earlier round
 may name an action this spec has since split or renamed (`PerformRewrite`,
 split into `StartRewrite` and `PublishRewrite` in round eight;
 `RewriteOutputContent`, now `RecordSetContent`). Renaming them in place would
-falsify the record. The notes for the eight live controls, which describe traces
+falsify the record. The notes for the nine live controls, which describe traces
 the current lane still produces, do use the current names.
 
 The two constants added for issues #1289 and #1221 are
@@ -281,25 +294,29 @@ switch TRUE.
 
 ## Non-vacuity
 
-An invariant that no reachable behaviour can break is decoration. Eight of
+An invariant that no reachable behaviour can break is decoration. Nine of
 them are shown breakable by mutating the BEHAVIOUR (not a switch) in a
 scratch copy and running TLC: `HeldObjectNeverDeleted`,
 `TombstoneExcludesBeforeDelete`, `TombstoneNotDeletedBeforeBucketEmpty`,
 `ErasedSubjectNeverServedAfterRequest`, `RewriteOutputsAreInputsMinusErased`
 (the "kept" direction), `CompletionRespectsLegalHold`,
-`DreqRemovalCannotResurrect`, and `RawInputContentAssumedImmutable` (a
+`DreqRemovalCannotResurrect`, `CompletionCoversEveryBucketOpenAtRequest` (both
+clauses, each deleted on its own), and `RawInputContentAssumedImmutable` (a
 scratch action that mutates a raw input's content, disjuncted into `Next`,
 which is not part of the shipped model). The mutations and the exact TLC
-violation lines are recorded under `counterexamples/*-mutant.md`. The eight
+violation lines are recorded under `counterexamples/*-mutant.md`, except the
+`CompletionCoversEveryBucketOpenAtRequest` pair, which sits with its control in
+`counterexamples/completion-ignores-open-bucket.md`. The nine
 negative controls provide the same evidence for their target invariants by
-switch (one target, `RewriteOutputsAreInputsMinusErased`, is also covered by
-a behaviour mutant above). The sixteenth,
+switch (two targets, `RewriteOutputsAreInputsMinusErased` and
+`CompletionCoversEveryBucketOpenAtRequest`, are also covered by
+a behaviour mutant above). The seventeenth,
 `RewriteTargetMatchesResolvedInputs`, is neither a mutant nor a switch target:
 it holds vacuously on the shipped singleton model, so its non-vacuity is shown
 by widening `RawInputs` to two elements in a scratch copy where a pass resolves
 a proper subset, which breaks it (TLC exit 12) until `TargetOf` is widened to
 match; `counterexamples/rewrite-target-matches-resolved-inputs-probe.md` has
-the before/after runs. With that probe, all sixteen named safety invariants
+the before/after runs. With that probe, all seventeen named safety invariants
 have a recorded TLC violation.
 
 ## State-space control
@@ -419,5 +436,14 @@ steps and brought the complete search to depth 30, still deeper than the depth
 22 the previous bound reached, because the two-step passes and the lease expiry
 add steps to every behaviour. That is the same clock bound `smoke.cfg` uses, so
 the two lanes now explore the same state graph and what `exhaustive.cfg` adds is
-the liveness lane alone; `results.md`, "Round eleven", records the current
-figures.
+the liveness lane alone.
+
+Round thirteen moved both lanes from `MaxClock = 2` to `MaxClock = 1`. The open
+ingest bucket (issue #1411) added three variables, which multiplied the reachable
+graph by about 8.5 at a fixed bound: `MaxClock = 2` reaches 30.5M distinct states
+at depth 34 and does not finish inside the 300 second smoke budget on a four-core
+runner with a 2 GB heap. `MaxClock = 1` finishes in 54 seconds at 2.8M distinct
+states, depth 31. Each of the nine negative controls still fires its own target
+invariant at `MaxClock = 1`, which is the evidence that the smaller bound still
+reaches every guarded behaviour. `results.md`, "Round thirteen", records both
+runs and the bound decision.

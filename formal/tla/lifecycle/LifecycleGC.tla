@@ -88,15 +88,24 @@ CONSTANTS
     CompactionIgnoresRewrite,   \* the compactor publishes a record set without
                                 \* checking the listing for a live rewrite record
                                 \* (drops the RewritePresent refusal, issue #1289)
-    SerializeCompactionAndRewrite \* base TRUE: the maintenance driver runs at most
+    SerializeCompactionAndRewrite, \* base TRUE: the maintenance driver runs at most
                                 \* one of compaction and erasure rewrite over a
                                 \* bucket at a time, so neither pass can be between
                                 \* its listing and its publish while the other lists.
                                 \* FALSE models two workers that both believe they
                                 \* own the bucket (ADR-0065 membership overlap), the
                                 \* residual window cdce1722 documents as open.
+    SealBound,                  \* the seal wait bound for an open ingest bucket
+                                \* (erasure_seal_wait_bound_ns): the single open
+                                \* bucket, opened at clock 0, may only be sealed once
+                                \* the clock has reached this bound (issue #1290).
+    CompletionIgnoresOpenBucket \* negative control (base FALSE): completion drops
+                                \* the ack-open-bucket guard, so a .done can land
+                                \* while a bucket open at the acknowledgement is still
+                                \* unsealed or still serves a pre-ack record (#1290).
 
 ASSUME ProtectionHorizon \in Nat /\ Grace \in Nat
+ASSUME SealBound \in Nat
 ASSUME MaxQueryDuration \in Nat /\ ClockSkew \in Nat
 ASSUME MaxClock \in Nat
 \* The GC startup inequality (gc_config.rs::satisfies_constraint) is a precondition
@@ -255,20 +264,35 @@ VARIABLES
                       \* resolved at its listing step, the listing-time snapshot the
                       \* publish is checked against
     sysgc,            \* [ph, mqd, grace, skew]
-    lastGc            \* witness of the last GC deletion step
+    lastGc,           \* witness of the last GC deletion step
+    \* --- The open ingest bucket (issue #1290) -----------------------------------
+    \* One ingest bucket, opened at clock 0, models the ingest hour that is open at
+    \* the moment an erasure request is acknowledged. It is unsealed until its seal
+    \* bound elapses; while unsealed it can still accept a subject's pre-ack record
+    \* that becomes visible only after the erasure pass listed the bucket.
+    ingestPhase,      \* "absent" | "open" | "sealed": the open bucket's lifecycle
+    ingestAckScope,   \* BOOLEAN: TRUE iff the bucket was open at some request's ack
+                      \* (the hour open at the ack, bucket_in_scope_at_ack). Set by
+                      \* RequestErasure and never cleared, so once an acknowledgement
+                      \* has taken the obligation on, only sealing the bucket and
+                      \* rewriting its pre-ack record discharge it.
+    ingestLate        \* "none" | "serving" | "cleared": the single late-landing
+                      \* pre-ack record. "serving" once it lands (visible after the
+                      \* pass listed), "cleared" once a rewrite over the sealed bucket
+                      \* drops it. One late write per behaviour.
 
 storeVars == <<store, lastModified, versionCounter, uploads, listState>>
 protoVars == <<head, headState, clock, superseded, heldBuckets,
                refreshFailed, query, erasureRequested, tombRetiredAt,
                dreqHorizon, doneAt, supersededAt, objContent, variantKey,
                leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
-               sysgc, lastGc>>
+               sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           head, headState, clock, superseded, heldBuckets,
           refreshFailed, query, erasureRequested, tombRetiredAt,
           dreqHorizon, doneAt, supersededAt, objContent, variantKey,
           leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
-          sysgc, lastGc>>
+          sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate>>
 
 \* The maintenance-pass bookkeeping (who holds the lease, how far each pass got,
 \* and the input sets each pass resolved). Every action that is not a maintenance
@@ -281,6 +305,13 @@ vars == <<store, lastModified, versionCounter, uploads, listState,
 \* take any value in the step, so the tuple has to be spelled out somewhere for
 \* every action, and using the name is what keeps the two forms from drifting.
 maintVars == <<leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+
+\* The open ingest bucket's own three variables. Every action that does not touch
+\* the open bucket names this tuple in its UNCHANGED list. The five that do touch
+\* it (OpenBucket, SealBucket, IngestLateWrite, RewriteOpenBucket assign a subset,
+\* and RequestErasure assigns ingestAckScope) spell out the ones they leave alone
+\* instead, for the same reason maintVars does.
+ingestVars == <<ingestPhase, ingestAckScope, ingestLate>>
 
 S == INSTANCE RavelObjectStore
        WITH Keys <- Objects, Content <- {"dat", "nc"}, NoContent <- "nc",
@@ -325,7 +356,7 @@ View ==
     <<StoreView, head, headState, clock, superseded, heldBuckets, refreshFailed,
       query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt, supersededAt,
       objContent, variantKey, leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
-      sysgc, lastGc>>
+      sysgc, lastGc, ingestPhase, ingestAckScope, ingestLate>>
 
 \* A delete decision needs a readable HEAD, present or absent: an absent HEAD
 \* names nothing, so the delete may proceed exactly as if EffectiveHead were
@@ -383,6 +414,29 @@ HeldInputServes(s) == \E o \in DataObjects : HeldObject(o, heldBuckets) /\ Prese
 \* and nothing any reader can still reach serves it.
 ServedRead(s) == ServesAny(s) /\ ~PresentObj("dreqR1")
 
+\* --- The ack-open ingest bucket (issue #1290) --------------------------------
+\* A bucket that was open at the request's acknowledgement and is still unsealed:
+\* the derived-bucket case (bucket_erasure_completion's `!bucket.is_sealed` branch,
+\* which blocks every request whose scope covered the bucket at the ack, even when
+\* the listing returned nothing because no commit record has landed yet).
+IngestUnsealedInScope == ingestAckScope /\ ingestPhase # "sealed"
+
+\* A pre-ack record that is still served from the ack-open bucket, whether the
+\* bucket is unsealed (the record has not been rewritten yet) or sealed but not
+\* yet rewritten. Mirrors the live served-set that bucket_erasure_completion
+\* reconstructs once the bucket is sealed: a request stays blocked while the live
+\* view still serves it.
+IngestLateStillServes == ingestAckScope /\ ingestLate = "serving"
+
+\* The ack-open-bucket completion gate (issue #1290). A completion may be
+\* published only when every bucket open at the request's acknowledgement is
+\* sealed AND no pre-ack record it holds is still served. Absent an ack-open
+\* bucket (ingestAckScope FALSE) it is vacuously permitted, so a request whose
+\* ack found no open bucket completes exactly as before.
+OpenBucketPermitsCompletion ==
+    /\ ~IngestUnsealedInScope
+    /\ ~IngestLateStillServes
+
 --------------------------------------------------------------------------------
 \* TypeOK
 RecT == [present: BOOLEAN, content: {"dat","nc"}, version: Nat]
@@ -418,6 +472,11 @@ TypeOK ==
     /\ lastGc.refreshWasFailed \in BOOLEAN
     /\ lastGc.permittedNeeds \subseteq DataObjects
     /\ lastGc.heldInputServed \in BOOLEAN
+    /\ lastGc.openUnsealedInScope \in BOOLEAN
+    /\ lastGc.openLateServed \in BOOLEAN
+    /\ ingestPhase \in {"absent","open","sealed"}
+    /\ ingestAckScope \in BOOLEAN
+    /\ ingestLate \in {"none","serving","cleared"}
 
 --------------------------------------------------------------------------------
 \* Init: a populated store (raw1, raw2, d2, sysgc present), HEAD naming the data,
@@ -456,7 +515,11 @@ Init ==
                 mqd |-> MaxQueryDuration, grace |-> Grace, skew |-> ClockSkew]
     /\ lastGc = [rule |-> "none", deleted |-> {}, atClock |-> 0,
                  held |-> FALSE, refreshWasFailed |-> FALSE,
-                 permittedNeeds |-> {}, heldInputServed |-> FALSE]
+                 permittedNeeds |-> {}, heldInputServed |-> FALSE,
+                 openUnsealedInScope |-> FALSE, openLateServed |-> FALSE]
+    /\ ingestPhase = "absent"
+    /\ ingestAckScope = FALSE
+    /\ ingestLate = "none"
 
 \* A GC witness records what the deleting store operation OBSERVED at its own
 \* step: the TRUE legal-hold state (over heldBuckets, not the sweep's known set),
@@ -478,20 +541,30 @@ GcWitness(r, dels) ==
                held |-> \E o \in dels : HeldObject(o, heldBuckets),
                refreshWasFailed |-> refreshFailed,
                permittedNeeds |-> PermittedNeeds,
-               heldInputServed |-> HeldInputServes("s1")]
+               heldInputServed |-> HeldInputServes("s1"),
+               openUnsealedInScope |-> FALSE, openLateServed |-> FALSE]
 
 NoGc == lastGc' = [rule |-> "none", deleted |-> {}, atClock |-> clock,
                    held |-> FALSE, refreshWasFailed |-> FALSE,
-                   permittedNeeds |-> {}, heldInputServed |-> FALSE]
+                   permittedNeeds |-> {}, heldInputServed |-> FALSE,
+                   openUnsealedInScope |-> FALSE, openLateServed |-> FALSE]
 
 \* CompleteErasure is not a delete, so it does not fit the GcWitness shape (no
 \* object is deleted), but it needs the same per-step held-input witness as the
 \* GC actions: whether HeldInputServes("s1") was true at the moment it wrote
 \* .done, tagged with its own rule so CompletionRespectsLegalHold can find it.
+\* CompleteErasure also records what it observed about the ack-open ingest bucket
+\* at the step it wrote .done (issue #1290): whether a bucket open at the request's
+\* acknowledgement was still unsealed, and whether a pre-ack record it holds was
+\* still served. CompletionCoversEveryBucketOpenAtRequest reads these captured
+\* values, not the live ingest state, so the same retroactivity argument as
+\* heldInputServed applies.
 CompletionWitness ==
     lastGc' = [rule |-> "complete", deleted |-> {}, atClock |-> clock,
                held |-> FALSE, refreshWasFailed |-> refreshFailed,
-               permittedNeeds |-> {}, heldInputServed |-> HeldInputServes("s1")]
+               permittedNeeds |-> {}, heldInputServed |-> HeldInputServes("s1"),
+               openUnsealedInScope |-> IngestUnsealedInScope,
+               openLateServed |-> IngestLateStillServes]
 
 --------------------------------------------------------------------------------
 \* Environment actor
@@ -505,7 +578,7 @@ Tick ==
     /\ UNCHANGED <<head, headState, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 \* Pin an in-flight query at the current HEAD; its deadline is pin + mqd. It is
@@ -520,7 +593,7 @@ PinQuery ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 ExpireQuery ==
@@ -531,7 +604,7 @@ ExpireQuery ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 \* Place / release a legal hold on bucket b (its data prefixes).
@@ -542,7 +615,7 @@ PlaceHold(b) ==
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 ReleaseHold(b) ==
@@ -552,7 +625,7 @@ ReleaseHold(b) ==
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 \* The HEAD object read can fail (unreadable) or find the HEAD gone (absent).
@@ -573,7 +646,7 @@ SetHeadState(s) ==
     /\ UNCHANGED <<head, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 \* Toggle this tick's legal-hold refresh outcome.
@@ -585,7 +658,7 @@ SetRefresh(f) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 --------------------------------------------------------------------------------
@@ -600,9 +673,20 @@ RequestErasure ==
     /\ S!PutCreateIfAbsent("dreqR1", "dat")
     /\ erasureRequested' = erasureRequested \cup {"s1"}
     /\ dreqHorizon' = clock + DreqHorizonDelta
+    \* Capture the ack-open ingest hour (issue #1290): whether the single open
+    \* ingest bucket was open at the moment this request was acknowledged. This is
+    \* the hour open at the ack (ack_open_ingest_hours / bucket_in_scope_at_ack);
+    \* a later hour that opens after the ack is out of scope and never captured.
+    \* The capture accumulates rather than overwrites: an acknowledgement can only
+    \* add a bucket to the obligation, never discharge one an earlier
+    \* acknowledgement captured. Only SealBucket and RewriteOpenBucket discharge
+    \* it. RequestErasure is re-enabled once DreqSweep removes the .dreq, and an
+    \* overwriting capture would let that second acknowledgement clear an
+    \* obligation the first one took on while the bucket was still unsealed.
+    /\ ingestAckScope' = (ingestAckScope \/ ingestPhase = "open")
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, tombRetiredAt, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestLate>>
     /\ NoGc
 
 \* --- Live input resolution (resolve_live_inputs) ------------------------------
@@ -667,6 +751,7 @@ StartRewrite(id) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, cmpPhase, cmpInputs>>
+    /\ UNCHANGED ingestVars
     /\ NoGc
 
 \* The publish. Deliberately unguarded by the lease: nothing between the listing
@@ -711,6 +796,7 @@ PublishRewrite(id) ==
     /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
                    leaseOwner, rwInputs, cmpPhase, cmpInputs>>
+    /\ UNCHANGED ingestVars
     /\ NoGc
 
 \* The lease expires under a pass that has already listed. ADR-0065 decision 2:
@@ -726,6 +812,7 @@ ExpireLease ==
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, rwPhase, rwInputs,
                    cmpPhase, cmpInputs>>
+    /\ UNCHANGED ingestVars
     /\ NoGc
 
 \* --- Compaction actor (maintainer) --------------------------------------------
@@ -785,6 +872,7 @@ StartCompaction ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, rwPhase, rwInputs>>
+    /\ UNCHANGED ingestVars
     /\ NoGc
 
 \* The compaction publish, unguarded for the same reason PublishRewrite is: the
@@ -816,6 +904,7 @@ PublishCompaction ==
     /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
                    variantKey, leaseOwner, rwPhase, rwInputs, cmpInputs>>
+    /\ UNCHANGED ingestVars
     /\ NoGc
 
 \* A listed compaction whose recorded input vanished between listing and publish
@@ -837,6 +926,7 @@ CancelCompaction ==
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, leaseOwner,
                    rwPhase, rwInputs>>
+    /\ UNCHANGED ingestVars
     /\ NoGc
 
 \* Switch the HEAD onto the live record sets, dropping the superseded objects (a
@@ -849,7 +939,7 @@ HeadAdvanceRewrite ==
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 \* Complete the erasure: write .done only when the served set no longer serves the
@@ -858,20 +948,107 @@ HeadAdvanceRewrite ==
 \* that serves the subject blocks completion unconditionally (finding 1):
 \* bucket_is_held is checked before the served-set read and has no switch of its
 \* own in the code, so the model gates on it the same way, with no bypass.
+\*
+\* THE ACK-OPEN-BUCKET GUARD (issue #1290), from
+\* crates/ravel-maintain/src/erasure_rewrite.rs::bucket_erasure_completion and its
+\* helpers ack_open_ingest_hours / bucket_in_scope_at_ack / erasure_seal_wait_bound_ns,
+\* wired through services/ravel-server/src/maintain.rs::run_erasure_pass (which
+\* unions the ack-open ingest hours into the pass's discovered hours), commit
+\* landed under issue #1290:
+\*
+\*     if !bucket.is_sealed(clock.now_ns(), config) {
+\*         for pending_request in pending {
+\*             if bucket_in_scope_at_ack(bucket, &pending_request.request, config) {
+\*                 out.blocked.insert(pending_request.request.request_id.clone());
+\*             }
+\*         }
+\*         return Ok(out);
+\*     }
+\*
+\* A bucket open at the acknowledgement (ingestAckScope) blocks completion while it
+\* is unsealed, INCLUDING the derived-bucket case where the listing missed it
+\* because no commit record had landed yet (ingestLate = "none"); once sealed it
+\* blocks only while a pre-ack record it holds is still served. CompletionIgnoresOpenBucket
+\* drops the guard; it is the negative control for CompletionCoversEveryBucketOpenAtRequest.
 CompleteErasure ==
     /\ ~PresentObj("doneR1")
     /\ PresentObj("dreqR1")
     /\ HeadDeletable   \* completion needs a real served-set read of HEAD
     /\ (CompleteIgnoresServedSet \/ ~ServesNow("s1"))
     /\ ~HeldInputServes("s1")
+    /\ (CompletionIgnoresOpenBucket \/ OpenBucketPermitsCompletion)
     /\ clock > 0
     /\ S!PutOverwrite("doneR1", "dat")
     /\ doneAt' = clock
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ CompletionWitness
+
+--------------------------------------------------------------------------------
+\* Open ingest bucket actor (issue #1290)
+--------------------------------------------------------------------------------
+\* The single ingest bucket opens at clock 0 (one open bucket at a time; the
+\* fixed open clock keeps the seal wait expressible without a per-bucket opened-at
+\* variable). A flush accepting records is in progress: its commit record has not
+\* necessarily landed, which is exactly why the commit-prefix listing can miss the
+\* bucket that ack_open_ingest_hours must derive.
+OpenBucket ==
+    /\ clock = 0
+    /\ ingestPhase = "absent"
+    /\ ingestPhase' = "open"
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
+                   query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
+                   sysgc, supersededAt, objContent, variantKey, maintVars,
+                   ingestAckScope, ingestLate>>
+    /\ NoGc
+
+\* The bucket seals once its seal bound has elapsed (erasure_seal_wait_bound_ns).
+\* Only a sealed bucket has a complete listing, so completion may consider it.
+SealBucket ==
+    /\ ingestPhase = "open"
+    /\ clock >= SealBound
+    /\ ingestPhase' = "sealed"
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
+                   query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
+                   sysgc, supersededAt, objContent, variantKey, maintVars,
+                   ingestAckScope, ingestLate>>
+    /\ NoGc
+
+\* A subject's pre-acknowledgement record lands in the still-open bucket and
+\* becomes visible only now, after the erasure pass listed the bucket. It was
+\* accepted before the ack (its event time is in the request's scope), so once the
+\* .dreq is swept and the query-time filter stops applying it would serve the
+\* erased subject again unless a rewrite over the sealed bucket dropped it first.
+\* One late write per behaviour.
+IngestLateWrite ==
+    /\ ingestPhase = "open"
+    /\ ingestLate = "none"
+    /\ ingestLate' = "serving"
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
+                   query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
+                   sysgc, supersededAt, objContent, variantKey, maintVars,
+                   ingestPhase, ingestAckScope>>
+    /\ NoGc
+
+\* A later pass rewrites the now-sealed bucket, dropping the erased subject's
+\* pre-ack record. This is the rewrite the completion gate waits for: only after
+\* it runs does the sealed bucket's live view stop serving the subject.
+RewriteOpenBucket ==
+    /\ ingestPhase = "sealed"
+    /\ ingestLate = "serving"
+    /\ PresentObj("dreqR1")
+    /\ ingestLate' = "cleared"
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
+                   query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
+                   sysgc, supersededAt, objContent, variantKey, maintVars,
+                   ingestPhase, ingestAckScope>>
+    /\ NoGc
 
 --------------------------------------------------------------------------------
 \* Retention actor (maintainer)
@@ -885,7 +1062,7 @@ RetireBucket ==
     /\ tombRetiredAt' = [tombRetiredAt EXCEPT !["b1"] = clock]
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 \* Fold reconciles a retired bucket out of the HEAD; it may lag (a late fold) and
@@ -901,7 +1078,7 @@ DropRetiredBucketFromHead ==
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
     /\ NoGc
 
 \* Retention physical sweep of one b1 data object. Gates on now >= retired_at +
@@ -936,7 +1113,7 @@ RetentionSweep(o) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
 
 \* Final tombstone delete (finding 3, round four): physical_sweep deletes the
 \* bucket's data, verifies via bucket_is_empty_but_tombstone that only the
@@ -958,7 +1135,7 @@ SweepTombstone ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
 
 --------------------------------------------------------------------------------
 \* Physical GC actor (maintainer): superseded-input sweep and .dreq sweep
@@ -989,7 +1166,7 @@ SupersededSweep(o) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
 
 \* .dreq sweep: delete the .dreq when a matching .done exists, its completed
 \* timestamp is non-zero, the horizon has passed, no reader (the current HEAD or
@@ -1015,7 +1192,7 @@ DreqSweep ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   maintVars>>
+                   maintVars, ingestPhase, ingestAckScope, ingestLate>>
 
 --------------------------------------------------------------------------------
 Next ==
@@ -1034,6 +1211,10 @@ Next ==
     \/ CancelCompaction
     \/ HeadAdvanceRewrite
     \/ CompleteErasure
+    \/ OpenBucket
+    \/ SealBucket
+    \/ IngestLateWrite
+    \/ RewriteOpenBucket
     \/ RetireBucket
     \/ DropRetiredBucketFromHead
     \/ \E o \in DataObjects : RetentionSweep(o)
@@ -1197,6 +1378,25 @@ AtMostOneLiveRecordSetServed ==
 CompletionImpliesNoPreRewriteExposure ==
     PresentObj("doneR1") => ~ServesNow("s1")
 
+\* No erasure completion is published while a bucket open at the request's
+\* acknowledgement is still unsealed, and every record accepted before the
+\* acknowledgement is either rewritten or absent when completion is published
+\* (issue #1290). Reads the CompletionWitness captured at CompleteErasure's own
+\* step (openUnsealedInScope, openLateServed), not the live ingest state, for the
+\* same retroactivity reason as CompletionRespectsLegalHold: a bucket sealing or a
+\* record clearing AFTER a legitimate completion is a different state, not evidence
+\* the completion was wrong. openUnsealedInScope pins the first clause (no
+\* completion over an unsealed ack-open bucket, which is the derived-bucket case
+\* too: the bucket may carry no committed record when the pass lists, and the guard
+\* must still block); openLateServed pins the second (a pre-ack record still served
+\* from the ack-open bucket at completion). CompletionIgnoresOpenBucket drops the
+\* guard on CompleteErasure and this invariant fires;
+\* negative/completion-ignores-open-bucket.cfg is the proof it can.
+CompletionCoversEveryBucketOpenAtRequest ==
+    (lastGc.rule = "complete") =>
+        /\ ~lastGc.openUnsealedInScope
+        /\ ~lastGc.openLateServed
+
 \* Legal hold wins over erasure completion (finding 1, ADR-0064 section 6): a
 \* still-present, legally held superseded input that served the erased subject
 \* at the moment CompleteErasure ran means that step should not have happened.
@@ -1345,10 +1545,17 @@ EventuallySwept ==
 \* is the action being described, and its own effect is to write .done, so an
 \* antecedent that also requires .done absent can never hold permanently once
 \* the action is enabled (finding, issue #1122).
+\* The ack-open-bucket guard is part of CompleteErasure's enabling condition, so it
+\* is part of the antecedent (issue #1290): when a bucket open at the request never
+\* seals, or a pre-ack record it holds is never rewritten, completion legitimately
+\* waits, and the antecedent simply never holds permanently rather than the
+\* consequent failing.
 EventuallyCompleted ==
     <>[](PresentObj("dreqR1") /\ HeadDeletable
          /\ (CompleteIgnoresServedSet \/ ~ServesNow("s1"))
-         /\ ~HeldInputServes("s1") /\ clock > 0) ~>
+         /\ ~HeldInputServes("s1")
+         /\ (CompletionIgnoresOpenBucket \/ OpenBucketPermitsCompletion)
+         /\ clock > 0) ~>
         PresentObj("doneR1")
 
 ===============================================================================
