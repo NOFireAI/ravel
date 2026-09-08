@@ -15,15 +15,15 @@ the envelope, and the empty-result checklist.
 <!-- mcp-tools:begin -->
 | Tool | Purpose | Inputs | Output blocks used | Bounds | Failure classes |
 | --- | --- | --- | --- | --- | --- |
-| `ravel_capabilities` | Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `internal` |
-| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal` | `data`, `scope`, `visibility`, `coverage` | 100 metric families per page | `invalid_argument`, `unavailable`, `deadline`, `internal` |
-| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter; an unfiltered tenant-wide list is refused | `data`, `scope`, `coverage` | 2,000 segments admitted for resolution | `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_explain_query` | Validate a SQL or PromQL statement and estimate its cost with no scan | `query`, `time_range` | `scope`, `budget` | compares the estimate against the effective budget | `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
-| `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent | `data`, `scope`, `coverage`, `accuracy`, `budget` | `max_response_bytes` 512 KiB default, 256 KiB floor | `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
-| `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required) | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_get_trace` | Spans of one trace id, the span tree, missing parents, orphans | `trace_id`, `time_range` (required), an optional logs pass | `data`, `scope`, `coverage`, `presentation`, `budget` | the shared budgets in the section below | `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result | `query`, `time_range`, `step`, `op` | `data`, `accuracy`, `budget` | reports the minimum point count the method needs | `missing_argument`, `invalid_argument`, `unsupported`, `deadline`, `unavailable`, `internal` |
+| `ravel_capabilities` | Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `unauthorized`, `internal` |
+| `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal` | `data`, `scope`, `visibility`, `coverage` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `internal` |
+| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter; an unfiltered tenant-wide list is refused | `data`, `scope`, `coverage` | 2,000 segments admitted for resolution | `unauthorized`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
+| `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent | `data`, `scope`, `coverage`, `accuracy`, `budget` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
+| `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required) | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_get_trace` | Spans of one trace id, the span tree, missing parents, orphans | `trace_id`, `time_range` (required), an optional logs pass | `data`, `scope`, `coverage`, `presentation`, `budget` | the shared budgets in the section below | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result | `query`, `time_range`, `step`, `op` | `data`, `accuracy`, `budget` | reports the minimum point count the method needs | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `deadline`, `unavailable`, `internal` |
 <!-- mcp-tools:end -->
 
 ## The envelope
@@ -64,7 +64,7 @@ per-cell budget is cut to that budget.
 
 | Class | Meaning |
 | --- | --- |
-| `unauthorized` | The credential does not resolve to a tenant, or a cursor or evidence reference was presented back for a different tenant than the one it was minted for. |
+| `unauthorized` | The credential does not resolve to a tenant. |
 | `invalid_argument` | An argument is well-formed but not acceptable as given: two mutually exclusive fields set together, a value out of range, an unfiltered tenant-wide list. |
 | `missing_argument` | A required argument, most often a time input, was not sent. |
 | `validation` | The query engine rejected the statement itself. The message is the engine's own text, safe to show. |
@@ -141,7 +141,7 @@ server's allowed-origins configuration on every request.
 | Revision | Handshake | Headers this revision requires | Session |
 | --- | --- | --- | --- |
 | `2026-07-28` | none | `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` | none; each call stands alone |
-| `2025-11-25` | `initialize` | none of the `2026-07-28` headers | `Mcp-Session-Id`, held in server memory |
+| `2025-11-25` | `initialize` | `MCP-Protocol-Version` required, not `Mcp-Method` or `Mcp-Name` | `Mcp-Session-Id`, held in server memory |
 
 A request that mismatches its own revision's header rule fails before the
 tool layer runs.

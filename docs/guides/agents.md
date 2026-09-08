@@ -59,8 +59,8 @@ maintenance.
 
 - `ravel_explain_query`: validates a SQL or PromQL statement, resolves the
   snapshot it targets, and returns the target table, the effective schema,
-  how many segments it admits, and the cost estimate against the effective
-  budget. It runs no scan.
+  how many segments it admits, the cost estimate against the effective
+  budget, and the plan shape. It runs no scan.
 
 ### Run a query
 
@@ -160,8 +160,8 @@ when one exists.
 
 `effective` (the server ceiling, the tenant ceiling, and your request,
 combined to their minimum), `actual` (what the call spent), `estimate` (for
-`ravel_explain_query`), and `estimate_is_upper_envelope`, always `true`: the
-estimate never undercounts.
+`ravel_explain_query`), and `estimate_is_upper_envelope`. The estimate is
+an upper envelope, never a prediction, and the field says so.
 
 ### `evidence`
 
@@ -224,17 +224,18 @@ mints on the fly, not something the server stores. Each carries the tenant,
 the tool, a hash of the arguments that produced it, and the pinned snapshot
 it belongs to.
 
-A cursor stays valid until the earlier of the call's remaining deadline or
-the pinned snapshot's protection window. Only the server process that
-minted a cursor can redeem it: a cursor from a process that has since
-restarted fails with `cursor_expired`. A cursor sent back for the wrong
-tenant, or altered, fails with `cursor_invalid`.
+A cursor stays valid until the earlier of the call's remaining deadline
+and the protection horizon minus the grace period. Only the server
+process that minted a cursor can redeem it: a cursor from a process
+that has since restarted fails with `cursor_expired`. A cursor sent
+back for the wrong tenant, or altered, fails with `cursor_invalid`.
 
 `ravel_query_sql` mints a cursor only when the statement's `ORDER BY`,
 together with the tiebreak the tool appends, orders every row uniquely.
-`ravel_search_logs` and `ravel_get_trace` order by a tuple that is not
-always unique, since neither `logs` nor `spans` rows carry a row identity.
-When a page would end in the middle of a group of equal rows, the tool
+`ravel_search_logs` orders by a tuple that is not always unique, since
+`logs` rows carry no row identity. `ravel_get_trace` orders by `start_ts`
+and `span_id`, and every span carries a `span_id`.
+When a page would end inside a group of equal rows, `ravel_search_logs`
 drops that whole group from the page rather than split it, and the next
 cursor starts after the group. If no complete group fits in one page, the
 call returns `ok_bounded` with no cursor, and `next_steps` names narrowing
