@@ -122,7 +122,36 @@ pub const CURSOR_KEY_LEN: usize = 32;
 /// to a client, or persisted -- a process restart mints a fresh key, which is
 /// safe because every token here is bounded by `deadline_ns` and never
 /// expected to outlive the process that minted it.
-pub type CursorKey = [u8; CURSOR_KEY_LEN];
+///
+/// The field is private and [`CursorKey::from_process_secret`] is the only
+/// constructor, so the contract that a key is process-local is stated at the
+/// one place a key can come into existence.
+#[derive(Clone)]
+pub struct CursorKey([u8; CURSOR_KEY_LEN]);
+
+impl CursorKey {
+    /// Wrap the process's own freshly generated key bytes.
+    ///
+    /// The adapter generates `bytes` at process start from the OS entropy
+    /// source and never derives them from a shared, configured, or persisted
+    /// secret. A derived key would be the same key in two processes, so a
+    /// cursor minted by a process that has since died would carry this
+    /// process's nonce and verify under this process's key: it would decode as
+    /// live and be read against a pinned snapshot no live process is holding
+    /// open, which is exactly what ADR-1374 D5 makes the process nonce
+    /// prevent.
+    pub fn from_process_secret(bytes: [u8; CURSOR_KEY_LEN]) -> CursorKey {
+        CursorKey(bytes)
+    }
+}
+
+/// Redacted: a key must not reach a log line or an error body through a
+/// derived `Debug`.
+impl std::fmt::Debug for CursorKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CursorKey(<redacted>)")
+    }
+}
 
 const CURSOR_MAGIC: [u8; 4] = *b"RMC1";
 /// Version 2 pinned each segment as a whole `ravel_sql::SegmentPin` (all 15
@@ -157,6 +186,17 @@ const NONCE_CONTEXT: &[u8] = b"ravel-mcp cursor process nonce v1";
 /// any real snapshot, and a bound on what a caller can make this process
 /// allocate from one token.
 pub const MAX_TOKEN_BYTES: usize = 1024 * 1024;
+
+/// The `grace` component of a deployment's GC protection horizon, 24 h
+/// (`ravel_catalog::DEFAULT_PROTECTION_HORIZON_NS` is `max_query_duration` 1 h
+/// + `grace` 24 h + `clock_skew_allowance` 5 m).
+///
+/// A redemption never spends it: the grace exists so a sweep that observes a
+/// stale frontier still cannot delete a segment a running query holds, not to
+/// extend how long a token may name that segment. Subtracting it leaves
+/// `max_query_duration + clock_skew_allowance`, which is the part of the
+/// window a redemption starting now may still use.
+pub const GRACE_NS: i64 = 24 * 3_600 * 1_000_000_000;
 
 /// Typed failure for both [`Cursor`] and [`EvidenceRef`]. The two decode
 /// outcomes are the ones ADR-1374 D5 names, and they stay
@@ -428,6 +468,12 @@ impl Cursor {
     /// wrong-tenant rule extended to the other two bindings): no separate
     /// signal is ever returned for "this cursor belongs to someone else", to
     /// another tool, or to another argument set.
+    ///
+    /// The deadline checked is [`effective_deadline_ns`] of the embedded one
+    /// and `protection_horizon_ns`, not the embedded one alone, and the
+    /// returned cursor carries that clamped value in `deadline_ns` so a caller
+    /// that bounds its own work by the field cannot read past the pin's
+    /// protection either.
     pub fn redeem(
         token: &str,
         key: &CursorKey,
@@ -435,8 +481,9 @@ impl Cursor {
         tool: &str,
         argument_hash: &[u8; 32],
         now_ns: i64,
+        protection_horizon_ns: i64,
     ) -> Result<Cursor, CursorError> {
-        let cursor = Self::decode(token, key)?;
+        let mut cursor = Self::decode(token, key)?;
         if cursor.tenant != caller_tenant {
             return Err(CursorError::Invalid);
         }
@@ -446,6 +493,7 @@ impl Cursor {
         if !ct_eq(&cursor.argument_hash, argument_hash) {
             return Err(CursorError::Invalid);
         }
+        cursor.deadline_ns = effective_deadline_ns(cursor.deadline_ns, protection_horizon_ns);
         if now_ns >= cursor.deadline_ns {
             return Err(CursorError::Expired);
         }
@@ -521,14 +569,20 @@ impl EvidenceRef {
     /// own arguments. Tampering under this process's own key, a wrong tenant,
     /// a wrong tool, and any malformed body are all still
     /// [`CursorError::Invalid`].
+    ///
+    /// The deadline is re-clamped exactly as in [`Cursor::redeem`]: a
+    /// reference whose embedded deadline outlives `protection_horizon_ns`
+    /// minus [`GRACE_NS`] redeems as [`Redeemed::Unpinned`], since the pin it
+    /// names is no longer protected even though the token itself is intact.
     pub fn redeem(
         token: &str,
         key: &CursorKey,
         caller_tenant: TenantHash,
         tool: &str,
         now_ns: i64,
+        protection_horizon_ns: i64,
     ) -> Result<Redeemed, CursorError> {
-        let (evidence, pin_verified) =
+        let (mut evidence, pin_verified) =
             match open_token(token, key, EVIDENCE_MAGIC, EVIDENCE_VERSION)? {
                 Opened::Local(body) => (Self::parse(&body)?, true),
                 Opened::Foreign(body) => (Self::parse(&body)?, false),
@@ -539,6 +593,7 @@ impl EvidenceRef {
         if evidence.tool != tool {
             return Err(CursorError::Invalid);
         }
+        evidence.deadline_ns = effective_deadline_ns(evidence.deadline_ns, protection_horizon_ns);
         if pin_verified && now_ns < evidence.deadline_ns {
             return Ok(Redeemed::Pinned(evidence));
         }
@@ -615,6 +670,22 @@ fn open_token(
     Ok(Opened::Local(body))
 }
 
+/// The deadline a redemption may actually use: the embedded one, re-clamped
+/// to the deployment's pin protection.
+///
+/// `protection_horizon_ns` is the absolute epoch-ns instant through which the
+/// caller's deployment protects a pinned snapshot from the sweeper (the caller
+/// computes it as `now + protection_horizon`, the same duration
+/// `ravel_catalog::DEFAULT_PROTECTION_HORIZON_NS` names). This mirrors
+/// `ravel_sql::FlightSqlConfig::clamp_ticket_deadline_ns`: an embedded
+/// deadline may only shorten the effective one, never lengthen it, so a token
+/// minted with an honest but over-long deadline (a misconfigured adapter, a
+/// horizon shortened after the mint) cannot outlive the protection its pin
+/// depends on.
+fn effective_deadline_ns(embedded_deadline_ns: i64, protection_horizon_ns: i64) -> i64 {
+    embedded_deadline_ns.min(protection_horizon_ns.saturating_sub(GRACE_NS))
+}
+
 /// The plaintext nonce every token carries: a keyed BLAKE3 tag over a fixed
 /// context string.
 ///
@@ -625,7 +696,7 @@ fn open_token(
 /// and BLAKE3's keyed hash is a PRF, so publishing this tag reveals nothing
 /// about the key.
 fn process_nonce(key: &CursorKey) -> [u8; NONCE_LEN] {
-    let tag = blake3::keyed_hash(key, NONCE_CONTEXT);
+    let tag = blake3::keyed_hash(&key.0, NONCE_CONTEXT);
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&tag.as_bytes()[..NONCE_LEN]);
     nonce
@@ -655,7 +726,7 @@ fn declared_type_from_tag(tag: u8) -> Result<DeclaredType, CursorError> {
 /// process-local [`CursorKey`]: a cursor and a Flight ticket are separate
 /// trust domains and are never verified with the same secret.
 fn mac(key: &CursorKey, bytes: &[u8]) -> [u8; MAC_LEN] {
-    *blake3::keyed_hash(key, bytes).as_bytes()
+    *blake3::keyed_hash(&key.0, bytes).as_bytes()
 }
 
 /// Constant-time byte-slice comparison, so verifying a MAC does not leak how
@@ -783,8 +854,13 @@ mod tests {
     const SAMPLE_ARGS: [u8; 32] = [9u8; 32];
     const NOW_NS: i64 = 1_700_000_000_500_000_000;
 
+    /// A protection horizon a year past every deadline below, so the
+    /// re-clamp is inert in every test but the one that exercises it: those
+    /// tests assert the embedded deadline's own behavior.
+    const FAR_HORIZON_NS: i64 = NOW_NS + 365 * 24 * 3_600 * 1_000_000_000 + GRACE_NS;
+
     fn test_key() -> CursorKey {
-        [0x11u8; CURSOR_KEY_LEN]
+        CursorKey::from_process_secret([0x11u8; CURSOR_KEY_LEN])
     }
 
     /// Re-signs mutated token bytes with `key`, so the decode failure a test
@@ -886,8 +962,16 @@ mod tests {
         let key = test_key();
         let token = sample_cursor(tenant_a).encode(&key).expect("encodes");
 
-        let err = Cursor::redeem(&token, &key, tenant_b, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &token,
+            &key,
+            tenant_b,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -904,8 +988,16 @@ mod tests {
         bytes[last] ^= 0xFF;
         let tampered = URL_SAFE_NO_PAD.encode(bytes);
 
-        let err = Cursor::redeem(&tampered, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &tampered,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -937,8 +1029,16 @@ mod tests {
         bytes[at] ^= 0x20;
         let tampered = URL_SAFE_NO_PAD.encode(bytes);
 
-        let err = Cursor::redeem(&tampered, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &tampered,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -952,8 +1052,16 @@ mod tests {
         let deadline = cursor.deadline_ns;
         let token = cursor.encode(&key).expect("encodes");
 
-        let err = Cursor::redeem(&token, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, deadline)
-            .expect_err("must be expired at exactly the deadline");
+        let err = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            deadline,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be expired at exactly the deadline");
         assert_eq!(err, CursorError::Expired);
     }
 
@@ -970,8 +1078,16 @@ mod tests {
         cursor.segments = vec![pin.clone(), every_field_pin()];
 
         let token = cursor.encode(&key).expect("encodes");
-        let decoded = Cursor::redeem(&token, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect("round-trips through its own codec");
+        let decoded = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect("round-trips through its own codec");
 
         assert_eq!(decoded.segments.len(), 2);
         assert_eq!(decoded.segments[0], pin);
@@ -995,6 +1111,7 @@ mod tests {
             "ravel_query_promql",
             &SAMPLE_ARGS,
             NOW_NS,
+            FAR_HORIZON_NS,
         )
         .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
@@ -1012,8 +1129,16 @@ mod tests {
 
         let mut other = SAMPLE_ARGS;
         other[31] ^= 0x01;
-        let err = Cursor::redeem(&token, &key, tenant, SAMPLE_TOOL, &other, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &other,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -1025,7 +1150,7 @@ mod tests {
     fn token_minted_by_another_process_is_cursor_expired() {
         let tenant = TenantHash([0x6Du8; 16]);
         let minting_key = test_key();
-        let redeeming_key: CursorKey = [0x22u8; CURSOR_KEY_LEN];
+        let redeeming_key = CursorKey::from_process_secret([0x22u8; CURSOR_KEY_LEN]);
         assert_ne!(
             process_nonce(&minting_key),
             process_nonce(&redeeming_key),
@@ -1040,6 +1165,7 @@ mod tests {
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
             NOW_NS,
+            FAR_HORIZON_NS,
         )
         .expect_err("must be refused");
         assert_eq!(err, CursorError::Expired);
@@ -1050,8 +1176,15 @@ mod tests {
         let evidence = sample_evidence(tenant)
             .encode(&minting_key)
             .expect("encodes");
-        let redeemed = EvidenceRef::redeem(&evidence, &redeeming_key, tenant, SAMPLE_TOOL, NOW_NS)
-            .expect("a foreign reference redeems unpinned");
+        let redeemed = EvidenceRef::redeem(
+            &evidence,
+            &redeeming_key,
+            tenant,
+            SAMPLE_TOOL,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect("a foreign reference redeems unpinned");
         assert_eq!(
             redeemed,
             Redeemed::Unpinned {
@@ -1078,8 +1211,16 @@ mod tests {
         let key = test_key();
 
         let over = "A".repeat(MAX_TOKEN_BYTES + 1);
-        let err = Cursor::redeem(&over, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &over,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(
             err,
             CursorError::TokenTooLong {
@@ -1090,8 +1231,16 @@ mod tests {
         assert_eq!(MAX_TOKEN_BYTES, 1024 * 1024);
 
         let at_cap = "A".repeat(MAX_TOKEN_BYTES);
-        let err = Cursor::redeem(&at_cap, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &at_cap,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -1117,8 +1266,16 @@ mod tests {
             let mut truncated = bytes.clone();
             truncated.truncate(cut);
             let token = URL_SAFE_NO_PAD.encode(truncated);
-            let err = Cursor::redeem(&token, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-                .expect_err("a truncated token must be refused");
+            let err = Cursor::redeem(
+                &token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                NOW_NS,
+                FAR_HORIZON_NS,
+            )
+            .expect_err("a truncated token must be refused");
             assert_eq!(err, CursorError::Invalid, "cut at {cut}");
         }
 
@@ -1126,8 +1283,16 @@ mod tests {
         let tag_at = extended.len() - MAC_LEN;
         extended.insert(tag_at, 0x00);
         let reminted = remint(extended, &key);
-        let err = Cursor::redeem(&reminted, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("a token with trailing bytes must be refused");
+        let err = Cursor::redeem(
+            &reminted,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("a token with trailing bytes must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -1145,8 +1310,16 @@ mod tests {
         bytes[4] = CURSOR_VERSION - 1;
         let reminted = remint(bytes, &key);
 
-        let err = Cursor::redeem(&reminted, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &reminted,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -1162,8 +1335,16 @@ mod tests {
         bytes[..4].copy_from_slice(&EVIDENCE_MAGIC);
         let reminted = remint(bytes, &key);
 
-        let err = Cursor::redeem(&reminted, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &reminted,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -1189,8 +1370,16 @@ mod tests {
         bytes[at] = 0xFF;
         let reminted = remint(bytes, &key);
 
-        let err = Cursor::redeem(&reminted, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
-            .expect_err("must be refused");
+        let err = Cursor::redeem(
+            &reminted,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -1207,8 +1396,9 @@ mod tests {
         let deadline = evidence.deadline_ns;
         let token = evidence.encode(&key).expect("encodes");
 
-        let redeemed = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, NOW_NS)
-            .expect("round-trips through its own codec");
+        let redeemed =
+            EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, NOW_NS, FAR_HORIZON_NS)
+                .expect("round-trips through its own codec");
         assert_eq!(redeemed, Redeemed::Pinned(evidence.clone()));
         let decoded = EvidenceRef::decode(&token, &key).expect("decodes");
         assert_eq!(decoded, evidence);
@@ -1218,18 +1408,26 @@ mod tests {
         assert_eq!(decoded.mint_ns, 1_700_000_000_000_000_000);
         assert_eq!(decoded.deadline_ns, deadline);
 
-        let err = EvidenceRef::redeem(&token, &key, other, SAMPLE_TOOL, NOW_NS)
+        let err = EvidenceRef::redeem(&token, &key, other, SAMPLE_TOOL, NOW_NS, FAR_HORIZON_NS)
             .expect_err("wrong tenant must be refused");
         assert_eq!(err, CursorError::Invalid);
 
-        let err = EvidenceRef::redeem(&token, &key, tenant, "ravel_get_trace", NOW_NS)
-            .expect_err("wrong tool must be refused");
+        let err = EvidenceRef::redeem(
+            &token,
+            &key,
+            tenant,
+            "ravel_get_trace",
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("wrong tool must be refused");
         assert_eq!(err, CursorError::Invalid);
 
         // At exactly the deadline the pin is gone, and the reference is
         // unpinned rather than expired.
-        let redeemed = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, deadline)
-            .expect("past its pin, still redeemable");
+        let redeemed =
+            EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, deadline, FAR_HORIZON_NS)
+                .expect("past its pin, still redeemable");
         assert_eq!(
             redeemed,
             Redeemed::Unpinned {
@@ -1251,17 +1449,24 @@ mod tests {
         let other = TenantHash([0xA2u8; 16]);
         assert_ne!(tenant, other, "test must use two distinct tenants");
         let key = test_key();
-        let foreign_key: CursorKey = [0x33u8; CURSOR_KEY_LEN];
+        let foreign_key = CursorKey::from_process_secret([0x33u8; CURSOR_KEY_LEN]);
         let evidence = sample_evidence(tenant);
         let deadline = evidence.deadline_ns;
         let token = evidence.encode(&key).expect("encodes");
 
-        let err = EvidenceRef::redeem(&token, &key, other, SAMPLE_TOOL, deadline)
+        let err = EvidenceRef::redeem(&token, &key, other, SAMPLE_TOOL, deadline, FAR_HORIZON_NS)
             .expect_err("past the deadline, wrong tenant is still refused");
         assert_eq!(err, CursorError::Invalid);
 
-        let err = EvidenceRef::redeem(&token, &foreign_key, other, SAMPLE_TOOL, NOW_NS)
-            .expect_err("foreign process, wrong tenant is still refused");
+        let err = EvidenceRef::redeem(
+            &token,
+            &foreign_key,
+            other,
+            SAMPLE_TOOL,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("foreign process, wrong tenant is still refused");
         assert_eq!(err, CursorError::Invalid);
     }
 
@@ -1286,8 +1491,141 @@ mod tests {
         bytes[digest_at] ^= 0x01;
         let tampered = URL_SAFE_NO_PAD.encode(bytes);
 
-        let err = EvidenceRef::redeem(&tampered, &key, tenant, SAMPLE_TOOL, NOW_NS)
+        let err = EvidenceRef::redeem(&tampered, &key, tenant, SAMPLE_TOOL, NOW_NS, FAR_HORIZON_NS)
             .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// The process nonce is a function of the key and nothing else: two keys
+    /// give two nonces (which is what makes a restart's tokens foreign), and
+    /// one key gives one nonce every time (which is what makes this process's
+    /// own tokens redeemable). The exact bytes are pinned so a change to
+    /// [`NONCE_CONTEXT`], to the derivation, or to the truncation length is a
+    /// test failure and not a silent wire change.
+    #[test]
+    fn two_keys_produce_two_process_nonces() {
+        let key = test_key();
+        let other = CursorKey::from_process_secret([0x12u8; CURSOR_KEY_LEN]);
+
+        assert_eq!(process_nonce(&key), [93, 236, 37, 126, 78, 123, 230, 12]);
+        assert_eq!(process_nonce(&other), [54, 26, 121, 90, 155, 156, 167, 55]);
+        assert_ne!(process_nonce(&key), process_nonce(&other));
+        assert_eq!(
+            process_nonce(&key),
+            process_nonce(&CursorKey::from_process_secret([0x11u8; CURSOR_KEY_LEN])),
+            "one key must give one nonce"
+        );
+    }
+
+    /// A token's embedded deadline may only shorten the effective one. A
+    /// deadline 10 days out, redeemed against a 25h05m protection horizon,
+    /// stops being redeemable 1h05m in: the horizon minus the 24 h grace a
+    /// redemption may not spend. Without the re-clamp the cursor would still
+    /// be live 10 days later, pinning segments the sweeper is free to delete.
+    #[test]
+    fn redeem_reclamps_the_deadline_to_the_protection_horizon() {
+        let tenant = TenantHash([0xB7u8; 16]);
+        let key = test_key();
+
+        // `ravel_catalog::DEFAULT_PROTECTION_HORIZON_NS`: max_query_duration
+        // 1 h + grace 24 h + clock_skew_allowance 5 m.
+        let horizon = NOW_NS + 25 * 3_600 * 1_000_000_000 + 5 * 60 * 1_000_000_000;
+        let embedded = NOW_NS + 10 * 24 * 3_600 * 1_000_000_000;
+        let clamped = NOW_NS + 3_900 * 1_000_000_000;
+        assert_eq!(effective_deadline_ns(embedded, horizon), clamped);
+        assert_eq!(
+            effective_deadline_ns(embedded, FAR_HORIZON_NS),
+            embedded,
+            "the clamp never lengthens a deadline"
+        );
+
+        let mut cursor = sample_cursor(tenant);
+        cursor.deadline_ns = embedded;
+        let token = cursor.encode(&key).expect("encodes");
+
+        let redeemed = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            horizon,
+        )
+        .expect("inside the clamped deadline");
+        assert_eq!(redeemed.deadline_ns, clamped);
+        assert_ne!(redeemed.deadline_ns, embedded);
+
+        let err = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            clamped,
+            horizon,
+        )
+        .expect_err("the clamped deadline has passed");
+        assert_eq!(err, CursorError::Expired);
+
+        let still_live = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            clamped,
+            FAR_HORIZON_NS,
+        )
+        .expect("the same instant is inside the embedded deadline");
+        assert_eq!(still_live.deadline_ns, embedded);
+
+        // The evidence leg re-clamps the same way, and answers `Unpinned`
+        // where the cursor answers `Expired`.
+        let mut evidence = sample_evidence(tenant);
+        evidence.deadline_ns = embedded;
+        let token = evidence.encode(&key).expect("encodes");
+
+        let redeemed = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, NOW_NS, horizon)
+            .expect("inside the clamped deadline");
+        assert_eq!(
+            redeemed,
+            Redeemed::Pinned(EvidenceRef {
+                tenant,
+                tool: SAMPLE_TOOL.to_owned(),
+                argument_hash: SAMPLE_ARGS,
+                sha256: [0x8Au8; 32],
+                mint_ns: 1_700_000_000_000_000_000,
+                deadline_ns: clamped,
+            })
+        );
+
+        let redeemed = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, clamped, horizon)
+            .expect("past its pin, still redeemable");
+        assert_eq!(
+            redeemed,
+            Redeemed::Unpinned {
+                digest: [0x8Au8; 32],
+                tool: SAMPLE_TOOL.to_owned(),
+                argument_hash: SAMPLE_ARGS,
+                tenant,
+            }
+        );
+
+        let redeemed =
+            EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, clamped, FAR_HORIZON_NS)
+                .expect("the same instant is inside the embedded deadline");
+        assert_eq!(
+            redeemed,
+            Redeemed::Pinned(EvidenceRef {
+                tenant,
+                tool: SAMPLE_TOOL.to_owned(),
+                argument_hash: SAMPLE_ARGS,
+                sha256: [0x8Au8; 32],
+                mint_ns: 1_700_000_000_000_000_000,
+                deadline_ns: embedded,
+            }),
+            "the horizon, not the clock, produced the unpinned outcome above"
+        );
     }
 }
