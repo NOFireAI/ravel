@@ -566,6 +566,142 @@ LAST_RUN="$orig_last_run3"
 JAVA="$orig_java3"
 JAR="$orig_jar3"
 
+# --- (q)-(s) issue #1358: per-config exhaustive budget via bands.tsv's
+# optional budget_s column -----------------------------------------------
+# cfg_budget resolves the override from bands.tsv the same way check_bands
+# resolves its figures; (s) proves check_one_model actually wires that
+# result into run_tlc's budget rather than only cfg_budget returning the
+# right number in isolation.
+echo "--- (q) cfg_budget: bands.tsv row with a budget_s column returns it"
+qdir="$(mktemp -d)"
+qarea_dir="$qdir/farea"
+mkdir -p "$qarea_dir"
+printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\tbudget_s\nFoo.exhaustive.cfg\t1\t2\t3\t4\t5400\n' \
+    > "$qarea_dir/bands.tsv"
+orig_formal_dir4="$FORMAL_DIR"
+FORMAL_DIR="$qdir"
+qout="$(cfg_budget farea Foo.exhaustive.cfg 3600)"
+if [ "$qout" = "5400" ]; then ok; else bad "q: expected 5400, got '$qout'"; fi
+FORMAL_DIR="$orig_formal_dir4"
+rm -rf "$qdir"
+
+echo "--- (r) cfg_budget: row without a budget_s column falls back to the default"
+rdir="$(mktemp -d)"
+rarea_dir="$rdir/farea"
+mkdir -p "$rarea_dir"
+printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nBar.exhaustive.cfg\t1\t2\t3\t4\n' \
+    > "$rarea_dir/bands.tsv"
+FORMAL_DIR="$rdir"
+rout="$(cfg_budget farea Bar.exhaustive.cfg 3600)"
+if [ "$rout" = "3600" ]; then ok; else bad "r: expected 3600 (default), got '$rout'"; fi
+FORMAL_DIR="$orig_formal_dir4"
+rm -rf "$rdir"
+
+echo "--- (s) check_one_model: an exhaustive run honors bands.tsv's budget_s override (measured timeout)"
+sdir="$(mktemp -d)"
+sarea_dir="$sdir/formal/tla/fakebudget"
+mkdir -p "$sarea_dir"
+cat > "$sarea_dir/MCFake.tla" <<'EOF'
+---- MODULE MCFake ----
+====
+EOF
+cat > "$sarea_dir/MCFake.exhaustive.cfg" <<'EOF'
+SPECIFICATION Spec
+EOF
+# min/max_distinct and min/max_depth are irrelevant here (the run never
+# reaches check_bands: the shim java hangs and run_tlc times out first), so
+# they are set wide open.
+printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\tbudget_s\nMCFake.exhaustive.cfg\t0\t999999999\t0\t999\t2\n' \
+    > "$sarea_dir/bands.tsv"
+sshim="$sdir/java"
+cat > "$sshim" <<'EOF'
+#!/usr/bin/env bash
+exec sleep 60
+EOF
+chmod +x "$sshim"
+
+orig_cache_dir4="$CACHE_DIR"
+orig_log_dir4="$LOG_DIR"
+orig_last_run4="$LAST_RUN"
+orig_java4="${JAVA:-}"
+orig_jar4="${JAR:-}"
+
+FORMAL_DIR="$sdir/formal/tla"
+CACHE_DIR="$sdir/cache"
+LOG_DIR="$CACHE_DIR/logs"
+LAST_RUN="$CACHE_DIR/last-run.tsv"
+JAVA="$sshim"
+JAR="/dev/null"
+resolve_timeout
+resolve_tla_resources
+truncate_tsv
+RUN_ID="test-run"
+
+sstart=$(date +%s)
+sout="$(check_one_model fakebudget MCFake exhaustive "$sarea_dir/MCFake.exhaustive.cfg" 2>&1)"
+scode=$?
+send=$(date +%s)
+selapsed=$((send - sstart))
+echo "    measured: exit=$scode elapsed=${selapsed}s"
+if [ "$scode" -ne 0 ]; then ok; else bad "s: expected a nonzero (timeout) exit, got 0; output: $sout"; fi
+# EXHAUSTIVE_BUDGET is 3600s; only a real budget_s override explains a
+# timeout this fast.
+if [ "$selapsed" -ge 1 ] && [ "$selapsed" -le 8 ]; then
+    ok
+else
+    bad "s: expected a ~2s timeout (budget_s override), took ${selapsed}s; output: $sout"
+fi
+if printf '%s' "$sout" | grep -qF "budget 2s"; then
+    ok
+else
+    bad "s: expected the per-config start line to log 'budget 2s'; output: $sout"
+fi
+if printf '%s' "$sout" | grep -qF "TIMEOUT after 2s"; then
+    ok
+else
+    bad "s: expected 'TIMEOUT after 2s' naming the overridden budget; output: $sout"
+fi
+
+FORMAL_DIR="$orig_formal_dir4"
+CACHE_DIR="$orig_cache_dir4"
+LOG_DIR="$orig_log_dir4"
+LAST_RUN="$orig_last_run4"
+JAVA="$orig_java4"
+JAR="$orig_jar4"
+rm -rf "$sdir"
+
+# --- (t) issue #1358: the nightly workflow's area matrix stays in sync with
+# discover_areas --------------------------------------------------------
+# The matrix in .github/workflows/tla-nightly.yml is a literal list (a
+# workflow step can't call discover_areas itself), so nothing stops it from
+# silently drifting from the areas the harness actually finds once a new one
+# is added. Parse the `area: [...]` line and diff it against discover_areas.
+echo "--- (t) tla-nightly.yml matrix names every area discover_areas finds"
+workflow="$REPO_ROOT/.github/workflows/tla-nightly.yml"
+if [ -f "$workflow" ]; then
+    matrix_line="$(grep -E '^[[:space:]]*area:[[:space:]]*\[' "$workflow" | head -1)"
+    matrix_areas="$(printf '%s\n' "$matrix_line" \
+        | sed -E 's/.*\[(.*)\].*/\1/' | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | sort)"
+    # FORMAL_DIR does not track REPO_ROOT here: run_tlc_case (used by tests
+    # a1/a2/g/h/i above) sets it as a side effect and never restores it, so by
+    # this point in the suite it may point at an already-removed temp dir.
+    # discover_areas only reads $FORMAL_DIR, so pin it to the real tree.
+    discovered_areas="$(FORMAL_DIR="$REPO_ROOT/formal/tla" discover_areas | sort)"
+    if [ -n "$matrix_line" ]; then
+        ok
+    else
+        bad "t: no 'area: [...]' matrix line found in $workflow"
+    fi
+    if [ "$matrix_areas" = "$discovered_areas" ]; then
+        ok
+    else
+        bad "t: matrix areas != discover_areas; matrix='$matrix_areas' discovered='$discovered_areas'"
+    fi
+else
+    bad "t: $workflow not found"
+fi
+
 rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

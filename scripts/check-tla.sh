@@ -14,7 +14,8 @@
 #                            measured band is the opt-in), same 300s budget
 #                            as smoke; an unbanded live.cfg is reported SKIP
 #                            and does not fail the lane
-#   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg)
+#   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg,
+#                            overridable per cfg via bands.tsv's budget_s)
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
 #   traceability [-a AREA]   check every traceability.md source ref resolves
 #   ci           [-a AREA]   smoke + live + negative + traceability under one run id
@@ -359,16 +360,39 @@ band_row_exists() {
     [ -n "$row" ]
 }
 
+# cfg_budget <area> <cfg-name> <default> -> the exhaustive per-config TLC
+# wall-clock budget in seconds: bands.tsv's optional 6th column (budget_s) on
+# this cfg's row, or <default> when the file, the row, or the column is
+# absent or non-numeric. Uses the same awk-by-cfg-name lookup check_bands
+# uses to find the row, so a config with no bands.tsv row resolves to the
+# default exactly the way an unbanded config already does for its figures.
+cfg_budget() {
+    local area="$1" cfg_name="$2" default="$3"
+    local bands="$FORMAL_DIR/$area/bands.tsv"
+    [ -f "$bands" ] || { echo "$default"; return 0; }
+    local b
+    b="$(awk -F'\t' -v c="$cfg_name" '$1==c {print $6; exit}' "$bands")"
+    case "$b" in
+        ''|*[!0-9]*) echo "$default" ;;
+        *) echo "$b" ;;
+    esac
+}
+
 # check_one_model <area> <module> <kind> <cfg>
 check_one_model() {
     local area="$1" module="$2" kind="$3" cfg="$4"
     local area_dir="$FORMAL_DIR/$area"
     local cfg_name budget logfile
     cfg_name="$(basename "$cfg")"
-    if [ "$kind" = exhaustive ]; then budget=$EXHAUSTIVE_BUDGET; else budget=$SMOKE_BUDGET; fi
+    if [ "$kind" = exhaustive ]; then
+        budget="$(cfg_budget "$area" "$cfg_name" "$EXHAUSTIVE_BUDGET")"
+    else
+        budget=$SMOKE_BUDGET
+    fi
     mkdir -p "$LOG_DIR"
     logfile="$LOG_DIR/${area}-${module}-${kind}.log"
     local label="$area/$module ${kind}"
+    note "$label: budget ${budget}s"
 
     local start=$SECONDS code=0
     run_tlc "$area" "$module" "$cfg" "$budget" "$logfile" || code=$?

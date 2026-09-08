@@ -34,19 +34,47 @@ proved. The traceability index records the rows still without one.
 
 ## What TLC checked
 
-Every exhaustive configuration runs under a 3600-second ceiling per
-configuration. The table below names each area, its specification module, and
-the exhaustive configuration's distinct-state count and wall time.
+Every exhaustive configuration runs under a per-configuration wall-clock
+ceiling: 3600 seconds by default, or the value the config's `bands.tsv` row
+sets in its optional `budget_s` column when one config on a given runner
+measurably needs more than the rest (see "Per-configuration budgets"
+below). The table below names each area, its specification module, the host
+the figures were measured on, and the exhaustive configuration's
+distinct-state count and wall time.
 
-| Area | Specification | Distinct states | Wall time |
-|---|---|---|---|
-| common | `RavelObjectStore.tla` | 3845952 | 252 seconds |
-| commit | `CommitProtocol.tla` | 5466239 | 131 seconds |
-| catalog | `CatalogMVCC.tla` | 3422524 | 510 seconds |
-| lifecycle | `LifecycleGC.tla` | 230815 | 30 seconds |
-| resharding | `OnlineResharding.tla` | 1179718 | under 300 seconds |
-| maintenance | `MaintenanceOwnership.tla` | 13183990 | 1769 seconds |
-| maintenance | `CompactionClaims.tla` | 543 | 2 seconds |
+| Area | Specification | Host | Distinct states | Wall time |
+|---|---|---|---|---|
+| common | `RavelObjectStore.tla` | fleet executor | 3845952 | 252 seconds |
+| commit | `CommitProtocol.tla` | fleet executor | 5466239 | 131 seconds |
+| catalog | `CatalogMVCC.tla` | fleet executor | 3422524 | 510 seconds |
+| lifecycle | `LifecycleGC.tla` | fleet executor | 230815 | 30 seconds |
+| resharding | `OnlineResharding.tla` | fleet executor | 1179718 | under 300 seconds |
+| maintenance | `MaintenanceOwnership.tla` | fleet executor | 13183990 | 1769 seconds |
+| maintenance | `MaintenanceOwnership.tla` | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | 12448134 (TIMEOUT at 3600 s, 1,450,354 states still queued; projected 4,000 to 4,200 s to finish) | 3600 seconds (killed) |
+| maintenance | `CompactionClaims.tla` | fleet executor | 543 | 2 seconds |
+
+The fleet executor and the GitHub-hosted runner are different machines: the
+1769-second `MaintenanceOwnership.tla` figure is what the fleet executor
+measured, and the hosted-runner row next to it is the nightly lane's own
+runner timing out on the same configuration before finishing, roughly 2.3x
+slower per distinct state. That gap is why this one configuration carries a
+per-configuration budget override rather than the default. See
+[`formal/tla/maintenance/results.md`](../../formal/tla/maintenance/results.md)
+for the full measurement this projection rests on.
+
+### Per-configuration budgets
+
+`bands.tsv`'s optional sixth column, `budget_s`, overrides the 3600-second
+default for one exhaustive config on the lane that reads it (`check_one_model`
+resolves it the same way it resolves the distinct/depth band, by cfg name).
+`MCMaintenanceOwnership.exhaustive.cfg` sets `budget_s = 5400` in
+`formal/tla/maintenance/bands.tsv`, about 30% headroom over the 4,000 to
+4,200 s hosted-runner projection above; every other exhaustive config in the
+suite keeps the 3600 s default. The nightly workflow
+(`.github/workflows/tla-nightly.yml`) runs the six areas as a matrix, one job
+per area, instead of one job running all six in sequence: a single area's
+larger budget then only extends that area's own job, not a shared job
+covering every area.
 
 Each area splits its negative configurations into two kinds. A control
 is a deliberately broken variant of the correct model. When TLC checks

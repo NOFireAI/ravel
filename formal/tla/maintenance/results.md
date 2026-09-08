@@ -36,6 +36,7 @@ This verifies the protocol designs; implementation conformance is argued in
 |---|---|---|---|---|---|---|---|
 | MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 47377233 | 2773760 | 21 | 90 | fleet executor | PASS |
 | MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 136617032 | 13183990 | 20 | 1769 | fleet executor | PASS |
+| MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 116707410 | 12448134 | 17 | 3600 | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | TIMEOUT at 3600 s, 12,448,134 distinct, 1,450,354 queued, projected 4,000 to 4,200 s |
 | MCCompactionClaims.smoke.cfg | 1.7.4 | 65454526 | 11155721 | 17 | 161 | fleet executor | PASS |
 | MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 11 | 2 | fleet executor | PASS |
 | negative/ownership-as-publication-authority.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
@@ -67,6 +68,40 @@ model. Only the invariant name and the exit code are stable facts for a VIOLATED
 row (exit 12: an `INVARIANT` failed; exit 13: a `PROPERTY` failed), so that is
 all this table records for one; see "Per-invariant audit" below for which
 invariant each negative control targets.
+
+## Hosted-runner exhaustive budget (issue #1358)
+
+The nightly exhaustive lane runs on a GitHub-hosted `ubuntu-24.04` runner,
+not the fleet executor the completed run above was measured on, and the
+hosted runner is slower per distinct state. Run 34230857065
+(`workflow_dispatch` of `tla-nightly` on `main` `8a85d76c`,
+`RAVEL_TLA_WORKERS=auto`, `-Xmx2g`, `tla2tools` as pinned) hit the harness's
+3600 s per-configuration budget on `MCMaintenanceOwnership.exhaustive.cfg`
+before it could finish: 116,707,410 states generated, 12,448,134 distinct,
+1,450,354 states left on the queue, search depth 17, at roughly 2.4M states
+per minute and 120k to 180k distinct states per minute in the last ten
+minutes before the kill (TLC also ran its temporal-property check every six
+minutes, for about a minute each time). The recorded complete run above
+(136,617,032 generated, 13,183,990 distinct, depth 20, 1769 s, fleet
+executor) reached 94% of its final distinct-state count by the time this run
+was killed; at this run's own distinct-state rate the remainder needs
+roughly 400 to 600 s more, a projected total of 4,000 to 4,200 s. That makes
+the hosted runner about 2.3x slower per distinct state than the fleet
+executor the 1769 s figure was recorded on. The other five areas all
+finished well inside 3600 s on the same run (catalog 1034 s, commit 96 s,
+common 287 s, lifecycle 1371 s, `MCCompactionClaims.exhaustive.cfg` 1 s), so
+only this one configuration needed headroom.
+
+`scripts/check-tla.sh` now reads an optional per-configuration budget from
+`bands.tsv`'s `budget_s` column (`check_one_model` via `cfg_budget`) instead
+of applying `EXHAUSTIVE_BUDGET` (3600 s) to every exhaustive config. This
+row's 4,000 to 4,200 s projection is what `MCMaintenanceOwnership.exhaustive.cfg`'s
+`budget_s = 5400` in `bands.tsv` rests on: roughly 30% headroom over the
+high end of the projection, without raising the ceiling for every other
+config that already finishes comfortably under 3600 s. The nightly workflow
+also moved from one sequential job covering every area to one job per area
+(a matrix), so a single area's larger budget cannot push the other areas'
+jobs past their own `timeout-minutes`.
 
 ## Constants chosen for exhaustive
 
