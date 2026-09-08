@@ -163,6 +163,17 @@ ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.15.0" }
 # internal crate is pinned.
 ravel-sql = { path = "../../crates/ravel-sql", version = "0.15.0", optional = true }
 
+# The transport-independent MCP tool layer (ADR-1374): the envelope, the
+# cursor codec, the budget clamp, the compact renderer, the tool catalog, and
+# the dispatch this crate's adapter calls into. A path dependency pinned to a
+# version for the same reason ravel-sql above is.
+ravel-mcp = { path = "../../crates/ravel-mcp", version = "0.15.0", optional = true }
+
+# The MCP protocol crate. Only the `mcp` feature links it, and only for its
+# Streamable HTTP server transport and its `tower_service::Service` adapter;
+# the tool catalog's own rmcp types come through ravel-mcp.
+rmcp = { workspace = true, optional = true }
+
 # Flight service codegen for the `flight-sql` feature. This is arrow 58's
 # arrow-flight, a different arrow major than the `arrow` dev-dependency below;
 # the two never exchange types.
@@ -204,7 +215,31 @@ sql = ["dep:ravel-sql"]
 # `flight` module, and the prepared-statement methods answer UNIMPLEMENTED.
 flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
 
+# The native MCP adapter at `POST /mcp` (ADR-1374 decision 9). Implies `sql`:
+# four of the nine tools execute SQL through the query service, so there is no
+# deployment that wants the MCP surface without it. `ravel-sql/pin-codec` is
+# the pinned-snapshot codec the cursor and evidence references share with
+# Flight tickets, without pulling the Flight stack in. Off by default, and
+# `--mcp` is a second, runtime opt-in on top.
+mcp = [
+    "sql",
+    "ravel-sql/pin-codec",
+    "dep:ravel-mcp",
+    "dep:rmcp",
+    "rmcp/transport-streamable-http-server",
+    "rmcp/tower",
+]
+
 [dev-dependencies]
+# Test-only: the MCP end-to-end tests drive the mounted route with a real MCP
+# client rather than a hand-rolled JSON-RPC body, so the negotiation the
+# protocol requires is exercised by an implementation that is not ours.
+# Cargo does not allow an optional dev-dependency, so this builds in the
+# default feature set too; the tests that use it are behind `feature = "mcp"`.
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 # `query` on top of the normal dependency's `json`: the test client builds
 # query strings the server binary itself never needs to.
 reqwest = { version = "0.13", features = ["json", "query"] }
