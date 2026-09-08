@@ -286,6 +286,17 @@ after a load the honest answer is `nothing_eligible`: an ingest hour is not
 foldable until the sealing window behind it has elapsed. See
 [architecture](docs/architecture.md#on-demand-catalog-fold).
 
+## Agents (MCP)
+
+Ravel exposes a Model Context Protocol (MCP) surface for an AI agent host,
+alongside the HTTP query API. It answers the same read-only queries an
+agent needs to investigate an incident: what data exists, a bounded query
+with a known cost, and a result a person can check again.
+
+The surface is off by default. It ships behind the `mcp` cargo feature and
+the `--mcp` flag: a build must compile the feature and an operator must
+pass the flag to serve it. See the [agents guide](docs/guides/agents.md).
+
 ## Kubernetes
 
 The operator runs the same ingest and query round trip on a real cluster. This

@@ -68,6 +68,10 @@ The mental model, in the order it makes sense.
 - [guides/inspecting-data.md](guides/inspecting-data.md): `ravel-cli`
   worked examples that read segments, commit records and catalog listings
   straight from the bucket. Read this to see what is actually stored.
+- [guides/agents.md](guides/agents.md): the MCP surface for an AI agent
+  host, how to connect, the nine tools grouped by task, the result
+  envelope field by field, budgets and cursors, and what an empty result
+  means.
 
 ## Operate
 
@@ -122,6 +126,9 @@ The mental model, in the order it makes sense.
   codes, whether it needs a bearer token, which modes serve it, and its
   cargo feature gate where it has one. Derived from the router, not from
   another page.
+- [reference/mcp.md](reference/mcp.md): every MCP tool, its inputs, the
+  envelope blocks it uses, its bounds, and its failure classes, plus the
+  shared envelope, cursor, budget, and protocol-header contracts.
 - [reference/ravel-server-flags.md](reference/ravel-server-flags.md):
   every `ravel-server` flag, its environment variable and its default,
   generated from the binary's own definition and checked by a test.
