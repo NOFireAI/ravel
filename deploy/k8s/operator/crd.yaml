@@ -25,6 +25,20 @@
               "spec": {
                 "description": "`RavelCluster` spec. Each field maps onto `ravel-server`'s real CLI surface\n(`services/ravel-server/src/config.rs`); the memory store is deliberately\nunrepresentable (ADR-0034 decision 2), so `storage.s3` is mandatory.",
                 "properties": {
+                  "auditTokenKeySecretRef": {
+                    "description": "Secret with a single key `key` holding 64 hex characters, the\nquery-audit token key the query tier reads as `RAVEL_AUDIT_TOKEN_KEY`\n(#1487). Query tier only: gateway and maintain never read a\nquery-audit token. Omit on a cluster with `deploymentKeySecretRef`\nset -- the server derives the key from the deployment key -- or to\nlet the operator generate one and manage a Secret named\n`<cluster>-audit-token-key`.",
+                    "nullable": true,
+                    "properties": {
+                      "name": {
+                        "description": "Name of the Secret.",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "name"
+                    ],
+                    "type": "object"
+                  },
                   "deploymentKeySecretRef": {
                     "description": "Secret with a single key `key` holding the deployment's 32-byte\ndeployment key (64 hex characters or 32 raw bytes, the same format\n`--tenant-hash-key-file` reads). This one key doubles as the v2-keyed\ntenant-hash key and the `sys/auth` token-hashing key (ADR-0072\ndecision 4): when set, the operator mounts it and renders\n`--tenant-hash-key-file` instead of `--tenant-hash-unkeyed`, and\nreconciles `sys/auth` from `tenantTokensSecretRef` each cycle. Additive\nopt-in, not a migration of existing unkeyed clusters; omit to keep\nunkeyed behavior unchanged.",
                     "nullable": true,

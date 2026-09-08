@@ -79,6 +79,16 @@ pub struct RavelClusterSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_key_secret_ref: Option<LocalSecretRef>,
 
+    /// Secret with a single key `key` holding 64 hex characters, the
+    /// query-audit token key the query tier reads as `RAVEL_AUDIT_TOKEN_KEY`
+    /// (#1487). Query tier only: gateway and maintain never read a
+    /// query-audit token. Omit on a cluster with `deploymentKeySecretRef`
+    /// set -- the server derives the key from the deployment key -- or to
+    /// let the operator generate one and manage a Secret named
+    /// `<cluster>-audit-token-key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_token_key_secret_ref: Option<LocalSecretRef>,
+
     /// Gateway (ingest + query API) tier.
     #[serde(default)]
     pub gateway: GatewaySpec,
@@ -1353,6 +1363,43 @@ mod tests {
         });
         let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
         assert_eq!(spec.deployment_key_secret_ref, None);
+    }
+
+    #[test]
+    fn audit_token_key_secret_ref_is_in_the_schema_and_optional() {
+        // #1487: the CRD carries an optional auditTokenKeySecretRef at the top
+        // level, sibling to deploymentKeySecretRef. Must be visible in the
+        // schema and default to None so an existing spec still deserializes
+        // unchanged.
+        let crd = ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let spec_props = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema")
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("spec")
+            .expect("spec prop")
+            .properties
+            .as_ref()
+            .expect("spec props");
+        assert!(
+            spec_props.contains_key("auditTokenKeySecretRef"),
+            "spec must expose auditTokenKeySecretRef in its schema"
+        );
+
+        let json = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(spec.audit_token_key_secret_ref, None);
     }
 
     #[test]
