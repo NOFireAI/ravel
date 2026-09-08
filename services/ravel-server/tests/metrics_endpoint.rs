@@ -22,6 +22,8 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -296,6 +298,8 @@ async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -515,6 +519,8 @@ async fn start_attribution_server() -> ravel_server::Running {
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let store = Arc::new(MemoryStore::new());
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,

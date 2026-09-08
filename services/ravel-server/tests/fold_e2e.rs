@@ -341,6 +341,8 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
 
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -487,6 +489,8 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
     let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
 
     let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,

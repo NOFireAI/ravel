@@ -499,6 +499,10 @@ async fn main() -> anyhow::Result<()> {
             .parse_distrib_settings()
             .context("failed to resolve --distributed-query settings")?,
         remote_clusters,
+        audit_pipeline: cli
+            .resolve_audit_pipeline_config()
+            .context("failed to resolve --audit-mode/--audit-max-batch/--audit-max-age")?,
+        audit_text: cli.audit_text,
     };
 
     let running =
