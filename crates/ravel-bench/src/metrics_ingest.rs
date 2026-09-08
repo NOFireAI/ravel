@@ -98,6 +98,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::metrics_workload::{Profile, WorkloadFile};
 use prost::Message;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{
@@ -530,6 +531,70 @@ pub struct FamilyRecord {
     /// Series one instance emits: 1 for a gauge, a counter, or a native
     /// histogram; bounds-plus-3 for a classic histogram.
     pub series_per_instance: u64,
+}
+
+/// Builds the ADR-0927 decision-11 profile block for one run.
+///
+/// `comparable` is forced `false` whenever `steps_run` truncates `profile`'s
+/// declared `samples_per_series`, regardless of the profile's own verdict --
+/// a truncated run is never that profile's figures. `comparability_reason`
+/// then states the truncation, not the profile's own (possibly `None`)
+/// reason. When the run is not truncated, `comparable` and
+/// `comparability_reason` come straight from `profile.comparability`.
+///
+/// A caller passes `steps_run` and `logical_input_bytes` separately from
+/// `gen_report` because both are known before the report is built: the
+/// former is the `--steps` the run resolved to, the latter is the encoded
+/// stream's length before it is parsed back into [`LogicalSample`]s.
+pub fn build_profile_record(
+    workload: &WorkloadFile,
+    profile: &Profile,
+    steps_run: u64,
+    logical_input_bytes: u64,
+    gen_report: &crate::metrics_gen::GenerationReport,
+) -> ProfileRecord {
+    let families = workload
+        .families
+        .iter()
+        .map(|family| FamilyRecord {
+            name: family.name.clone(),
+            instances: workload.family_instances(profile, family),
+            series_per_instance: workload.series_per_instance(family.kind),
+        })
+        .collect();
+    let steps_declared = profile.samples_per_series;
+    let truncated = steps_run < steps_declared;
+    let comparable = profile.is_publishable() && !truncated;
+    let comparability_reason = if truncated {
+        Some(format!(
+            "this run generated {steps_run} of profile `{}`'s {steps_declared} steps, so it is \
+             not that profile and its figures cannot be published",
+            profile.name
+        ))
+    } else {
+        profile.comparability.reason().map(String::from)
+    };
+    ProfileRecord {
+        name: profile.name.clone(),
+        comparable,
+        comparability_reason,
+        active_series: profile.active_series,
+        steps_run,
+        steps_declared,
+        samples_per_series: profile.samples_per_series,
+        scrape_interval_secs: profile.scrape_interval_secs,
+        duration_secs: profile.duration_secs,
+        total_samples: profile.total_samples,
+        label_cardinalities: workload.label_cardinalities(profile),
+        churn_basis_points_per_hour: profile.churn_basis_points_per_hour,
+        families,
+        run: RunRecord {
+            steps: steps_run,
+            total_series_created: gen_report.total_series_created,
+            logical_input_bytes,
+            total_samples_generated: gen_report.emitted_samples,
+        },
+    }
 }
 
 /// The storage backend a run replayed against, and whether it bills for
@@ -1886,6 +1951,118 @@ mod tests {
                 ("instance".to_string(), "mb-instance-0".to_string()),
                 ("job".to_string(), "api".to_string()),
             ]
+        );
+    }
+
+    fn ci_workload() -> WorkloadFile {
+        crate::metrics_workload::load_workload(std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../benchmarks/metrics/workload.json"
+        )))
+        .expect("load the checked-in workload manifest")
+    }
+
+    /// Covers the nightly full-steps path that the JSON smoke test's
+    /// `--steps 5` run cannot reach: with `steps_run == steps_declared`, the
+    /// truncation branch never fires, so `comparable == false` can only be
+    /// explained by the `ci` profile's own manifest verdict. Before this test
+    /// existed, `--steps 5` forced `comparable` false through truncation on
+    /// every run, and the profile's-own-reason branch in
+    /// `build_profile_record` had zero coverage.
+    #[test]
+    fn profile_record_is_non_comparable_for_the_profiles_own_reason_when_not_truncated() {
+        use crate::metrics_gen::Generator;
+
+        let workload = ci_workload();
+        let ci = workload.profile("ci").expect("ci profile declared");
+        // Small enough to generate fast; steps_run below is set equal to this
+        // so the truncation branch never fires.
+        let steps = 3;
+        let profile = Profile {
+            samples_per_series: steps,
+            ..ci.clone()
+        };
+
+        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
+            .expect("generator builds")
+            .generate_bytes(steps)
+            .expect("generates steps");
+        let logical_input_bytes = bytes.len() as u64;
+
+        let record =
+            build_profile_record(&workload, &profile, steps, logical_input_bytes, &gen_report);
+
+        assert_eq!(
+            record.steps_run, record.steps_declared,
+            "this test's premise is steps_run == steps_declared"
+        );
+        assert!(
+            !record.comparable,
+            "the ci profile is non-comparable by its own manifest verdict, not by truncation"
+        );
+        assert_eq!(
+            record.comparability_reason.as_deref(),
+            ci.comparability.reason(),
+            "the reason must be the manifest's own reason, not a truncation message, since \
+             this run was not truncated"
+        );
+    }
+
+    /// The mirror case: a profile whose own verdict IS comparable, but the
+    /// run truncates it. `comparable` must still be `false`, and the reason
+    /// must be the truncation message, not the (absent) profile reason --
+    /// the forcing rule in `build_profile_record` applies regardless of the
+    /// profile's own verdict.
+    #[test]
+    fn profile_record_is_non_comparable_from_truncation_even_when_the_profile_is_comparable() {
+        use crate::metrics_gen::Generator;
+        use crate::metrics_workload::Comparability;
+
+        let workload = ci_workload();
+        let ci = workload.profile("ci").expect("ci profile declared");
+        let steps_declared = 10;
+        let steps_run = 3;
+        let profile = Profile {
+            comparability: Comparability::Comparable,
+            samples_per_series: steps_declared,
+            ..ci.clone()
+        };
+        assert!(
+            profile.is_publishable(),
+            "this test's premise is a profile that IS comparable"
+        );
+
+        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
+            .expect("generator builds")
+            .generate_bytes(steps_run)
+            .expect("generates steps");
+        let logical_input_bytes = bytes.len() as u64;
+
+        let record = build_profile_record(
+            &workload,
+            &profile,
+            steps_run,
+            logical_input_bytes,
+            &gen_report,
+        );
+
+        assert!(
+            steps_run < steps_declared,
+            "this test's premise is a truncated run"
+        );
+        assert!(
+            !record.comparable,
+            "a truncated run is never comparable, even when the profile itself is"
+        );
+        let expected_reason = format!(
+            "this run generated {steps_run} of profile `{}`'s {steps_declared} steps, so it is \
+             not that profile and its figures cannot be published",
+            profile.name
+        );
+        assert_eq!(
+            record.comparability_reason,
+            Some(expected_reason),
+            "the truncation reason must state the run's actual vs declared step counts"
         );
     }
 }

@@ -27,9 +27,9 @@ use ravel_bench::harness::{
 };
 use ravel_bench::metrics_gen::Generator;
 use ravel_bench::metrics_ingest::{
-    FamilyRecord, HttpReplayConfig, LogicalSample, MetricsIngestReport, ProfileRecord,
-    RavelReplayConfig, RunRecord, Substrate, parse_logical_stream, query_after_replay,
-    replay_into_ravel, replay_over_http,
+    HttpReplayConfig, LogicalSample, MetricsIngestReport, RavelReplayConfig, Substrate,
+    build_profile_record, parse_logical_stream, query_after_replay, replay_into_ravel,
+    replay_over_http,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_ingest::{Clock, SystemClock};
@@ -173,51 +173,8 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let profile = workload.profile(&args.profile).ok_or_else(|| {
         RunError::Generate(format!("manifest declares no profile `{}`", args.profile))
     })?;
-    let families = workload
-        .families
-        .iter()
-        .map(|family| FamilyRecord {
-            name: family.name.clone(),
-            instances: workload.family_instances(profile, family),
-            series_per_instance: workload.series_per_instance(family.kind),
-        })
-        .collect();
-    let steps_declared = profile.samples_per_series;
-    let truncated = steps < steps_declared;
-    // A truncated run is never that profile's figures, regardless of the
-    // profile's own comparability verdict.
-    let comparable = profile.is_publishable() && !truncated;
-    let comparability_reason = if truncated {
-        Some(format!(
-            "this run generated {steps} of profile `{}`'s {steps_declared} steps, so it is not \
-             that profile and its figures cannot be published",
-            profile.name
-        ))
-    } else {
-        profile.comparability.reason().map(String::from)
-    };
-    let run_record = RunRecord {
-        steps,
-        total_series_created: gen_report.total_series_created,
-        logical_input_bytes,
-        total_samples_generated: gen_report.emitted_samples,
-    };
-    let profile_record = ProfileRecord {
-        name: profile.name.clone(),
-        comparable,
-        comparability_reason,
-        active_series: profile.active_series,
-        steps_run: steps,
-        steps_declared,
-        samples_per_series: profile.samples_per_series,
-        scrape_interval_secs: profile.scrape_interval_secs,
-        duration_secs: profile.duration_secs,
-        total_samples: profile.total_samples,
-        label_cardinalities: workload.label_cardinalities(profile),
-        churn_basis_points_per_hour: profile.churn_basis_points_per_hour,
-        families,
-        run: run_record,
-    };
+    let profile_record =
+        build_profile_record(&workload, profile, steps, logical_input_bytes, &gen_report);
 
     // The in-process Ravel path: strict, durable-on-ack, commit tokens.
     let (store, store_metrics) = store_and_metrics_from_env(args.store);
