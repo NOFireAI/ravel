@@ -7,9 +7,16 @@
 #                                     # more than one crate
 #   scripts/gates.sh -p CRATE ...     # scope clippy/test to one or more
 #                                     # crates -- fast local iteration
+#   scripts/gates.sh --flag-doc-guard-only [FILE]
+#                                     # run only the ingest-memory flag-doc
+#                                     # overclaim guard, against FILE or the
+#                                     # committed config.rs, and exit with its
+#                                     # code (so the guard itself is testable)
 set -euo pipefail
 
 crate_args=()
+flag_doc_guard_only=0
+flag_doc_guard_file=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -p)
@@ -21,12 +28,104 @@ while [[ $# -gt 0 ]]; do
       crate_args+=("-p" "$1")
       shift
       ;;
+    --flag-doc-guard-only)
+      shift
+      flag_doc_guard_only=1
+      if [[ $# -gt 0 ]]; then
+        flag_doc_guard_file="$1"
+        shift
+      fi
+      ;;
     *)
       echo "gates.sh: unknown argument: $1" >&2
       exit 64
       ;;
   esac
 done
+
+# Ingest-memory flag-doc overclaim guard (issue #1297). The two ingest memory
+# flags (--max-inflight-ingest-requests, --max-ingest-buffer-bytes) once
+# documented a memory bound that silently excluded the transient gzip inflate,
+# so the flags claimed a ceiling they did not enforce. Each flag's own doc block
+# must therefore both state what ingest memory it bounds and name the gzip
+# inflate/decompression term that qualifies the claim.
+#
+# The check is scoped to the two flags' `///` blocks, not to config.rs as a
+# whole: a file-wide scan passes on any file that mentions inflate anywhere,
+# including a regression test's own doc comments, so both flag descriptions
+# could lose the inflate wording while keeping their memory claim and the guard
+# would still be green.
+#
+# Each block is flattened to one line (the `///` prefixes stripped, newlines
+# turned into spaces) before matching, so a wording that wraps across two
+# comment lines is still seen as one sentence. grep -q reports its own exit
+# code (no pipe), per the script's own conventions.
+config_rs="${flag_doc_guard_file:-$(dirname "$0")/../services/ravel-server/src/config.rs}"
+
+# The contiguous `///` block immediately above `pub <ident>:`, flattened to a
+# single line. The flag's own `#[arg(...)]` attribute lines are skipped so they
+# do not break the block; any other line resets it. Exit 1 when the identifier
+# is not found at all, so a renamed field fails the guard instead of emptying
+# it.
+flag_doc_block() {
+  awk -v ident="$1" '
+    /^[[:space:]]*\/\/\// {
+      line = $0
+      sub(/^[[:space:]]*\/\/\/[[:space:]]?/, "", line)
+      block = block line " "
+      next
+    }
+    /^[[:space:]]*#\[/ { next }
+    $0 ~ "pub[[:space:]]+" ident "[[:space:]]*:" { print block; found = 1; exit }
+    { block = "" }
+    END { if (!found) exit 1 }
+  ' "$2"
+}
+
+check_ingest_memory_flag_docs() {
+  local file="$1"
+  local failed=0
+  local pair ident flag block tmp
+  for pair in \
+    "max_inflight_ingest_requests:--max-inflight-ingest-requests" \
+    "max_ingest_buffer_bytes:--max-ingest-buffer-bytes"; do
+    ident="${pair%%:*}"
+    flag="${pair##*:}"
+    block="$(flag_doc_block "${ident}" "${file}")" || block=""
+    if [[ -z "${block// /}" ]]; then
+      echo "gates.sh: no /// doc block found for ${flag} (${ident}) in ${file}; \
+the guard cannot check a flag whose doc it cannot find (issue #1297)" >&2
+      failed=1
+      continue
+    fi
+    tmp="$(mktemp)"
+    printf '%s\n' "${block}" >"${tmp}"
+    if ! grep -qiE '(buffered|resident|ingest)[^.]*memory' "${tmp}"; then
+      echo "gates.sh: ${flag}'s doc no longer says which ingest memory it \
+bounds, so the inflate qualification below has nothing to qualify (issue \
+#1297)" >&2
+      failed=1
+    fi
+    # The term must be the gzip inflate, in one sentence with the word gzip: an
+    # unqualified "decompress" matches Remote Write's own post-decompression cap,
+    # which these flags mention for unrelated reasons and which would satisfy a
+    # looser pattern while the gzip qualification was gone.
+    if ! grep -qiE '(gzip[^.]*(inflate|decompress)|(inflate|decompress)[^.]*gzip)' "${tmp}"; then
+      echo "gates.sh: ${flag}'s doc claims an ingest memory bound without \
+naming the gzip inflate/decompression term (issue #1297); the flag overclaims a \
+ceiling that excludes the gzip inflate" >&2
+      failed=1
+    fi
+    rm -f "${tmp}"
+  done
+  return "${failed}"
+}
+
+if [[ ${flag_doc_guard_only} -eq 1 ]]; then
+  guard_code=0
+  check_ingest_memory_flag_docs "${config_rs}" || guard_code=$?
+  exit "${guard_code}"
+fi
 
 # Linker OOM guard. On low-memory hosts (fleet executors run with 8 GB)
 # the default parallelism links several multi-GB test binaries at once and
@@ -69,24 +168,10 @@ echo "==> scripts/guards/check-test-hygiene.sh"
 echo "==> scripts/check-injected-clock-helpers.sh"
 "$(dirname "$0")/check-injected-clock-helpers.sh"
 
-# Ingest-memory flag-doc overclaim guard (issue #1297). The two ingest memory
-# flags (--max-inflight-ingest-requests, --max-ingest-buffer-bytes) once
-# documented a memory bound that silently excluded the transient gzip inflate,
-# so the flags claimed a ceiling they did not enforce. A flag doc in config.rs
-# that speaks of bounding buffered/resident/ingest memory must therefore also
-# name the inflate/decompression term somewhere in the file's flag docs; a
-# memory-bound claim with no inflate term to qualify it fails here, before the
-# expensive lanes, so the overclaim cannot return by edit. grep -q reports its
-# own exit code (no pipe), per the script's own conventions.
+# The flag-doc overclaim guard defined above, in the ordinary gate run: a source
+# scan, no build, so it fails before the expensive lanes.
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
-config_rs="$(dirname "$0")/../services/ravel-server/src/config.rs"
-if grep -qiE '///.*(buffered|resident|ingest)[^.]*memory' "$config_rs" \
-   && ! grep -qiE '///.*(inflate|decompress)' "$config_rs"; then
-  echo "gates.sh: config.rs documents an ingest memory bound without naming the \
-inflate/decompression term (issue #1297); the flag overclaims a ceiling that \
-excludes the gzip inflate" >&2
-  exit 1
-fi
+check_ingest_memory_flag_docs "${config_rs}"
 
 # Match CI's `check` job: it runs `cargo nextest run --workspace
 # --cargo-profile ci`. Use nextest when it is installed so a local run
