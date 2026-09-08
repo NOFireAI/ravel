@@ -1,7 +1,8 @@
 # Agents (MCP)
 
 > This page describes the surface as designed. The tools ship behind the
-> `mcp` cargo feature and the `--mcp` flag, both off by default.
+> `mcp` cargo feature and the `--mcp` flag, both off by default. The
+> `POST /mcp` route does not exist until the feature ships.
 
 ## What the MCP surface is for
 
@@ -14,21 +15,26 @@ things over one connection.
 
 ## Connecting
 
-The server exposes MCP over Streamable HTTP at `POST /mcp`, on the same
-listener as the rest of the query API. Authenticate with the same bearer
+The server will expose MCP over Streamable HTTP at `POST /mcp`, on the same
+listener as the rest of the query API. It will accept the same bearer
 credential the HTTP query routes use: `Authorization: Bearer <token>`. There
-is no separate agent credential and no second login step.
+will be no separate agent credential and no second login step.
 
-The server speaks two protocol revisions. `2026-07-28` carries its protocol
-version and method name in headers on every request and needs no handshake.
-`2025-11-25` is the older revision that most deployed clients still speak: it
-opens with an `initialize` call and keeps a session id. Use whichever
-revision your MCP client sends. The server answers both on the same
-endpoint.
+The bearer credential travels only over TLS. A deployment terminates TLS in
+front of the server or on the mTLS listener. Every proxy hop that carries
+the credential runs TLS, and the client does not follow a redirect to plain
+HTTP.
 
-Every MCP request authenticates on its own. A cursor or an evidence
-reference from an earlier call carries no authority by itself: the server
-always checks it against the credential on the current request.
+The server will speak two protocol revisions. `2026-07-28` will carry its
+protocol version and method name in headers on every request and will need
+no handshake. `2025-11-25` is the older revision that most deployed clients
+still speak: it opens with an `initialize` call and keeps a session id. Use
+whichever revision your MCP client sends. The server will answer both on
+the same endpoint.
+
+Every MCP request will authenticate on its own. A cursor or an evidence
+reference from an earlier call carries no authority by itself. The server
+will always check it against the credential on the current request.
 
 ## The nine tools
 
@@ -214,7 +220,11 @@ Defaults and floors:
 - `max_response_bytes`: 512 KiB, with a floor of 256 KiB. Send a value below
   the floor and the server raises it to the floor; `presentation.floor_applied`
   states so.
-- `ravel_describe_data`: 100 metric families per page.
+- `ravel_describe_data`: 100 metric families per page. An optional
+  `cursor` input asks for the next page. The response carries
+  `presentation.cursor` when more families exist. Request the next page
+  with the same signal and that cursor. The cursor follows the same
+  codec, tenant binding, and lifetime as every other cursor.
 - `ravel_find_labels`: 2,000 segments admitted for label resolution.
 
 `ravel_explain_query` compares its cost estimate to the effective budget
@@ -255,10 +265,17 @@ When no complete group fits in the row cap, the server returns the
 rows it has, up to the row cap, with status `ok_bounded` and no cursor.
 `next_steps` names narrowing `time_range`.
 
-An evidence reference works the same way, with one difference: redeeming it
-after its pin expires re-runs the query fresh instead of failing, reports
-`pinned: false`, and reports whether the row's hash still matches. A
-matching hash proves the bytes are identical. It proves nothing about
+Every data tool accepts an optional `evidence_ref` input. Redeeming a
+reference re-executes the tool with the reference's own arguments. The
+re-execution runs against the reference's pinned snapshot while the pin is
+valid. The server then compares the sha256 of the canonical row bytes.
+After the pin expires, redemption re-executes fresh instead of using the
+pin. It reports `pinned: false` and states whether the hash matched.
+`cursor_invalid` and `cursor_expired` do not apply to an evidence reference
+after its pin expires. A fresh re-execution runs instead of either
+failure.
+
+A matching hash proves the bytes are identical. It proves nothing about
 whether the same query would return that row today.
 
 No cursor and no evidence reference carries an object storage key, a tenant
