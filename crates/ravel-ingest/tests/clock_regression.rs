@@ -25,7 +25,10 @@ use std::time::Duration;
 use common::{TestClock, make_point, tenant};
 use ravel_commit::keys;
 use ravel_commit::record;
-use ravel_ingest::{IngestConfig, IngestRouter, LogIngestRouter, SpanIngestRouter, WriteMode};
+use ravel_ingest::{
+    IngestConfig, IngestRouter, LogIngestRouter, MAX_FLUSH_CLOCK_HOLD_NS, SpanIngestRouter,
+    WriteMode,
+};
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
@@ -38,11 +41,12 @@ use ravel_types::{CommitToken, Signal, TenantId};
 const T0: i64 = 1_700_000_000_000_000_000;
 const TEN_MINUTES_NS: i64 = 600_000_000_000;
 const ONE_MINUTE_NS: i64 = 60_000_000_000;
-/// Mirrors `config::MAX_FLUSH_CLOCK_HOLD_NS` (20 minutes), the largest
-/// backwards hold the floor absorbs before refusing. A test-local copy so a
-/// change to the production bound surfaces here as a failure rather than a
-/// silently tracking constant.
-const MAX_FLUSH_CLOCK_HOLD_NS: i64 = 20 * 60 * 1_000_000_000;
+/// A backwards step small enough to sit within the production hold bound
+/// [`MAX_FLUSH_CLOCK_HOLD_NS`], so the floor absorbs it (counted as
+/// `clock_regressions`) instead of refusing. Derived from the production bound,
+/// not a literal, so it stays within the bound if the bound moves in either
+/// direction (F2: the test must import the production constant, never copy it).
+const ABSORBED_STEP_NS: i64 = MAX_FLUSH_CLOCK_HOLD_NS / 2;
 
 /// Reads back the flush-open stamp (`created_unix_ns`) and `writer_seq` a
 /// commit token addresses, so a test can compare the exact query-time
@@ -118,8 +122,8 @@ fn norm_span(start_ns: i64, status: StatusCode) -> NormalizedSpan {
 /// not below), so its full duplicate-resolution key `(created_unix_ns,
 /// writer_seq)` is strictly greater via the seq tiebreak, and the step is
 /// counted exactly once. Flipping `monotonic_flush_open_ns` back to a raw
-/// `now_ns()` read stamps the correction 10 minutes below the original, which
-/// inverts both the created-stamp equality and the counted regression.
+/// `now_ns()` read stamps the correction below the original, which inverts both
+/// the created-stamp equality and the counted regression.
 #[tokio::test]
 async fn metrics_backward_step_holds_correction_above_stale_sample() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -149,9 +153,9 @@ async fn metrics_backward_step_holds_correction_above_stale_sample() {
         .expect("original sample flushes");
     let original_token = original.tokens.first().expect("one token").clone();
 
-    // NTP steps the host back ten minutes, then the correction for the same
-    // (series, ts) is written and flushed.
-    clock.set_ns(T0 - TEN_MINUTES_NS);
+    // NTP steps the host back, within the hold bound, then the correction for
+    // the same (series, ts) is written and flushed.
+    clock.set_ns(T0 - ABSORBED_STEP_NS);
     let correction = router
         .write(
             tenant.clone(),
@@ -180,7 +184,7 @@ async fn metrics_backward_step_holds_correction_above_stale_sample() {
     );
     assert_eq!(
         corr_created, orig_created,
-        "the backwards step is absorbed: the correction is stamped at the floor, not 10 minutes below"
+        "the backwards step is absorbed: the correction is stamped at the floor, not below the original"
     );
     assert!(
         corr_seq > orig_seq,
@@ -388,7 +392,7 @@ async fn logs_backward_step_holds_correction_above_stale_record() {
         .expect("original record flushes");
     let original_token = original.tokens.first().expect("one token").clone();
 
-    clock.set_ns(T0 - TEN_MINUTES_NS);
+    clock.set_ns(T0 - ABSORBED_STEP_NS);
     let correction = router
         .write(
             tenant.clone(),
@@ -408,7 +412,7 @@ async fn logs_backward_step_holds_correction_above_stale_record() {
     assert_eq!(orig_created, T0);
     assert_eq!(
         corr_created, orig_created,
-        "the correction is stamped at the floor, not 10 minutes below"
+        "the correction is stamped at the floor, not below the original"
     );
     assert!((corr_created, corr_seq) > (orig_created, orig_seq));
     assert_eq!(router.metrics().snapshot().clock_regressions, 1);
@@ -436,7 +440,7 @@ async fn spans_backward_step_holds_correction_above_stale_span() {
         .expect("original span flushes");
     let original_token = original.tokens.first().expect("one token").clone();
 
-    clock.set_ns(T0 - TEN_MINUTES_NS);
+    clock.set_ns(T0 - ABSORBED_STEP_NS);
     let correction = router
         .write(
             tenant.clone(),
@@ -456,7 +460,7 @@ async fn spans_backward_step_holds_correction_above_stale_span() {
     assert_eq!(orig_created, T0);
     assert_eq!(
         corr_created, orig_created,
-        "the correction is stamped at the floor, not 10 minutes below"
+        "the correction is stamped at the floor, not below the original"
     );
     assert!((corr_created, corr_seq) > (orig_created, orig_seq));
     assert_eq!(router.metrics().snapshot().clock_regressions, 1);
@@ -530,6 +534,12 @@ async fn sub_floor_reading_after_floor_armed_fails_before_the_floor() {
         msg.contains("flush_open_ns=1000"),
         "the error names the exact sub-floor reading, got: {msg}"
     );
+    assert!(
+        !err.is_retryable(),
+        "a grossly broken (sub-floor) raw reading is fail-loud, not a transient \
+         regression: it surfaces as the non-retryable SegmentBuild, unlike the \
+         over-bound refusal which is a retryable Abandoned (ADR-1307); got: {err:?}"
+    );
 
     let snap = router.metrics().snapshot();
     assert_eq!(
@@ -587,7 +597,7 @@ async fn forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors() {
         .await
         .expect("baseline flush arms the floor at T0");
 
-    // A forward glitch of 40 minutes ratchets the floor to T0 + 40m.
+    // A forward glitch of twice the hold bound ratchets the floor far ahead.
     let glitch_ns = T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS;
     clock.set_ns(glitch_ns);
     router
@@ -606,8 +616,8 @@ async fn forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors() {
         .await
         .expect("a forward step stamps raw and ratchets the floor");
 
-    // The clock corrects back to T0 + 1m: a 39-minute backwards step from the
-    // ratcheted floor, beyond the 20-minute bound, so it is refused.
+    // The clock corrects back to T0 + 1m: a backwards step from the ratcheted
+    // floor of nearly twice the hold bound, so it is refused.
     clock.set_ns(T0 + ONE_MINUTE_NS);
     let refused = router
         .write(
@@ -628,10 +638,16 @@ async fn forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors() {
         err.to_string().contains("beyond the monotonic hold bound"),
         "expected the hold-bound error, got: {err}"
     );
+    assert!(
+        err.is_retryable(),
+        "a refused clock regression is a transient server condition: it must be \
+         retryable (Abandoned, 503), not a client SegmentBuild (400) that drops \
+         the buffered rows on a conformant exporter (ADR-1307 finding 1); got: {err:?}"
+    );
 
     // The floor re-anchored to T0 + 1m on refusal, so a normal reading above it
     // (T0 + 2m, still far below the glitched floor) proceeds. Absent the
-    // re-anchor this would itself be a 38-minute backwards step and refuse.
+    // re-anchor this would itself be an over-bound backwards step and refuse.
     clock.set_ns(T0 + 2 * ONE_MINUTE_NS);
     router
         .write(
@@ -666,11 +682,11 @@ async fn forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors() {
 /// floor-raised stamp. With `max_flush_lifetime` zero, every flush's deadline
 /// equals its raw open reading, so `bound_to_deadline` abandons at once. Under
 /// a backwards step the floor raises the stamp to `T0` while the raw reading is
-/// `T0 - 10m`; if the deadline used the raised stamp its budget would be a full
-/// 10 minutes and the flush would publish. It must not: the deadline uses raw,
-/// so the flush abandons and nothing is published. Flipping the deadline source
-/// from `raw_ns` to `flush_open_ns` makes the regressed flush publish, so the
-/// object listing is no longer empty.
+/// `T0 - ABSORBED_STEP_NS`; if the deadline used the raised stamp its budget
+/// would be that whole step and the flush would publish. It must not: the
+/// deadline uses raw, so the flush abandons and nothing is published. Flipping
+/// the deadline source from `raw_ns` to `flush_open_ns` makes the regressed
+/// flush publish, so the object listing is no longer empty.
 #[tokio::test]
 async fn deadline_derives_from_raw_reading_not_the_floor() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -703,7 +719,7 @@ async fn deadline_derives_from_raw_reading_not_the_floor() {
         "a zero lifetime abandons the first flush at its deadline too"
     );
 
-    clock.set_ns(T0 - TEN_MINUTES_NS);
+    clock.set_ns(T0 - ABSORBED_STEP_NS);
     let regressed = router
         .write(
             tenant.clone(),
@@ -721,7 +737,7 @@ async fn deadline_derives_from_raw_reading_not_the_floor() {
     assert!(
         regressed.is_err(),
         "the regressed flush's deadline is raw + 0 = now, so it abandons; a deadline \
-         from the floor-raised stamp would give it 10 minutes of budget and publish"
+         from the floor-raised stamp would give it the whole step of budget and publish"
     );
 
     let snap = router.metrics().snapshot();
@@ -736,6 +752,277 @@ async fn deadline_derives_from_raw_reading_not_the_floor() {
         objects.is_empty(),
         "both flushes abandoned at their raw-derived deadlines; nothing is published: \
          {objects:?}"
+    );
+
+    router.shutdown().await;
+}
+
+/// Logs: mirror of `forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors`
+/// in the log shard actor. A forward glitch ratchets the floor; the correction
+/// back toward wall time is a backwards step beyond `MAX_FLUSH_CLOCK_HOLD_NS`,
+/// so it is refused, re-anchors the floor, and the refusal surfaces as a
+/// retryable error (ADR-1307 finding 1), not a client `SegmentBuild`.
+#[tokio::test]
+async fn logs_forward_glitch_beyond_bound_is_refused_and_retryable() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "boot")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("baseline flush arms the floor at T0");
+
+    let glitch_ns = T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS;
+    clock.set_ns(glitch_ns);
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(2_000, "glitch")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a forward step stamps raw and ratchets the floor");
+
+    clock.set_ns(T0 + ONE_MINUTE_NS);
+    let refused = router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(3_000, "correction")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await;
+    let err = refused.expect_err("a backwards step beyond the bound must fail the flush");
+    assert!(
+        err.to_string().contains("beyond the monotonic hold bound"),
+        "expected the hold-bound error, got: {err}"
+    );
+    assert!(
+        err.is_retryable(),
+        "a refused clock regression is retryable (Abandoned, 503), not a client \
+         SegmentBuild (400); got: {err:?}"
+    );
+
+    // Re-anchored to T0 + 1m, so a normal reading above it proceeds.
+    clock.set_ns(T0 + 2 * ONE_MINUTE_NS);
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(4_000, "next")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the next reading proceeds: the floor re-anchored, it is not pinned");
+
+    let snap = router.metrics().snapshot();
+    assert_eq!(
+        snap.clock_regressions_refused, 1,
+        "exactly the one over-bound step is refused"
+    );
+    assert_eq!(
+        snap.clock_regressions, 0,
+        "no step is within the bound, so nothing is absorbed"
+    );
+
+    router.shutdown().await;
+}
+
+/// Logs: mirror of `sub_floor_reading_after_floor_armed_fails_before_the_floor`
+/// in the log shard actor. With the floor armed at `T0`, a sub-floor raw reading
+/// fails the flush with the exact sub-floor error before the floor is consulted,
+/// moves neither regression counter, and is fail-loud (non-retryable), so the
+/// sub-floor flush publishes nothing.
+#[tokio::test]
+async fn logs_sub_floor_reading_after_floor_armed_fails_before_the_floor() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "boot")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("first record arms the floor at T0");
+
+    clock.set_ns(1_000);
+    let sub_floor = router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(2_000, "sub-floor")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await;
+    let err = sub_floor.expect_err("a sub-floor flush reading must fail the flush");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("below the plausibility floor"),
+        "expected the sub-floor error, got: {msg}"
+    );
+    assert!(
+        msg.contains("flush_open_ns=1000"),
+        "the error names the exact sub-floor reading, got: {msg}"
+    );
+    assert!(
+        !err.is_retryable(),
+        "a sub-floor reading is fail-loud (non-retryable SegmentBuild), not a \
+         transient regression; got: {err:?}"
+    );
+
+    let snap = router.metrics().snapshot();
+    assert_eq!(snap.clock_regressions, 0);
+    assert_eq!(snap.clock_regressions_refused, 0);
+
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        2,
+        "only the first flush published; the sub-floor flush published nothing: {objects:?}"
+    );
+
+    router.shutdown().await;
+}
+
+/// Spans: mirror of the refuse-path test in the span shard actor.
+#[tokio::test]
+async fn spans_forward_glitch_beyond_bound_is_refused_and_retryable() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("baseline flush arms the floor at T0");
+
+    let glitch_ns = T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS;
+    clock.set_ns(glitch_ns);
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(2_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a forward step stamps raw and ratchets the floor");
+
+    clock.set_ns(T0 + ONE_MINUTE_NS);
+    let refused = router
+        .write(
+            tenant.clone(),
+            vec![norm_span(3_000, StatusCode::Error)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await;
+    let err = refused.expect_err("a backwards step beyond the bound must fail the flush");
+    assert!(
+        err.to_string().contains("beyond the monotonic hold bound"),
+        "expected the hold-bound error, got: {err}"
+    );
+    assert!(
+        err.is_retryable(),
+        "a refused clock regression is retryable (Abandoned, 503), not a client \
+         SegmentBuild (400); got: {err:?}"
+    );
+
+    clock.set_ns(T0 + 2 * ONE_MINUTE_NS);
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(4_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the next reading proceeds: the floor re-anchored, it is not pinned");
+
+    let snap = router.metrics().snapshot();
+    assert_eq!(
+        snap.clock_regressions_refused, 1,
+        "exactly the one over-bound step is refused"
+    );
+    assert_eq!(
+        snap.clock_regressions, 0,
+        "no step is within the bound, so nothing is absorbed"
+    );
+
+    router.shutdown().await;
+}
+
+/// Spans: mirror of the raw-first sub-floor test in the span shard actor.
+#[tokio::test]
+async fn spans_sub_floor_reading_after_floor_armed_fails_before_the_floor() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("first span arms the floor at T0");
+
+    clock.set_ns(1_000);
+    let sub_floor = router
+        .write(
+            tenant.clone(),
+            vec![norm_span(2_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await;
+    let err = sub_floor.expect_err("a sub-floor flush reading must fail the flush");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("below the plausibility floor"),
+        "expected the sub-floor error, got: {msg}"
+    );
+    assert!(
+        msg.contains("flush_open_ns=1000"),
+        "the error names the exact sub-floor reading, got: {msg}"
+    );
+    assert!(
+        !err.is_retryable(),
+        "a sub-floor reading is fail-loud (non-retryable SegmentBuild), not a \
+         transient regression; got: {err:?}"
+    );
+
+    let snap = router.metrics().snapshot();
+    assert_eq!(snap.clock_regressions, 0);
+    assert_eq!(snap.clock_regressions_refused, 0);
+
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        2,
+        "only the first flush published; the sub-floor flush published nothing: {objects:?}"
     );
 
     router.shutdown().await;
