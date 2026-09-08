@@ -17,12 +17,14 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_maintain::{AuditEvent, MaintainError, NoopQueryAuditSink};
 use ravel_object_store::ObjectStoreBackend;
-use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::{EngineConfig, QueryConcurrencyLimit};
 use ravel_tenant_resolve::StaticBearerTokenResolver;
 use ravel_types::TenantId;
-use ravel_types::accounting::QueryWorkloadClass;
+use ravel_types::accounting::{AccountedOp, QueryWorkloadClass};
 
 use super::*;
 
@@ -703,6 +705,276 @@ async fn usage_is_recorded_on_cancel_for_analytics() {
     assert_eq!(usage[0].0, h.tenant_hash);
     assert_eq!(usage[0].1, UsageStatus::Canceled);
     assert_eq!(usage[0].2.total_s3_requests(), 2);
+    assert_eq!(h.cost.records().len(), 0);
+}
+
+/// The spend one metrics-lane resolve reaches before it issues its first
+/// listing, and its total once it finishes. The log lane's resolve has the same
+/// shape, which is what lets the mixed-lane and multi-selector figures below be
+/// written as a sum of named parts rather than one opaque number.
+const SPEND_BEFORE_FIRST_LIST: u64 = 2;
+const SPEND_PER_RESOLVE: u64 = 3;
+/// Every resolve issues this many listings: one bounded shard listing plus the
+/// unconditional pending-erasure listing. It is what turns "the Nth lane" into
+/// the occurrence a hold must name.
+const LISTS_PER_RESOLVE: u64 = 2;
+/// The same resolve against a tenant that has one published segment: the same
+/// listings, plus the get that reads the commit record they returned.
+const SPEND_PER_RESOLVE_WITH_ONE_SEGMENT: u64 = SPEND_PER_RESOLVE + 1;
+/// The fetch that finds its object gone and makes the engine resolve again.
+const SPEND_OF_THE_INVALIDATED_FETCH: u64 = 1;
+
+/// Publish one real RSEG segment plus its commit record for the harness's
+/// tenant, so a query for `up` resolves to an object and then fetches it.
+/// Against an empty tenant nothing is ever fetched, and the snapshot
+/// invalidation the engine retries on cannot happen at all.
+async fn publish_up_segment(store: &dyn ObjectStoreBackend) {
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_object_store::PutOptions;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal};
+
+    const SAMPLE_TS_NS: i64 = NOW_NS - 30_000_000_000;
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    let tenant = tenant();
+    let tenant_hash = tenant.hash();
+    let labels = LabelSet::new(vec![Label {
+        name: "__name__".to_string(),
+        value: "up".to_string(),
+    }])
+    .expect("valid labels");
+    let series = vec![SeriesInput {
+        series_id: SeriesId::compute(&tenant, "up", &labels).expect("series id"),
+        labels,
+        samples: vec![Sample {
+            ts_ns: SAMPLE_TS_NS,
+            value: 1.0,
+        }],
+    }];
+
+    let writer_id = uuid::Uuid::from_u128(2_000);
+    let written = SegmentWriter::write(
+        series,
+        SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        },
+        IngestBounds {
+            min_ingest_ts_ns: SAMPLE_TS_NS,
+            max_ingest_ts_ns: SAMPLE_TS_NS,
+        },
+    )
+    .expect("write segment");
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: NOW_NS,
+        ingest_hour_bucket: u32::try_from(SAMPLE_TS_NS / NS_PER_HOUR).expect("hour bucket"),
+    })
+    .expect("valid commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// A query naming only the log signal (ADR-1103). Its metrics lane has no plans
+/// and returns without touching the store, so before the log lane registered a
+/// handle of its own the request registered none at all and this record was a
+/// zero.
+#[tokio::test]
+async fn usage_is_recorded_on_cancel_for_a_log_only_promql_query() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    // The first listing of the whole request is the log lane's: the metrics
+    // lane never reaches the store.
+    let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(1));
+    let h = harness(
+        fault_store,
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+
+    let request = range_request("ravel_log_lines{service=\"x\"}");
+    let mut query = Box::pin(h.service.promql_range(h.tenant_hash, &request));
+
+    tokio::select! {
+        _ = &mut query => panic!("the query is held inside the store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(gate.held_count(), 1);
+
+    drop(query);
+
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].0, h.tenant_hash);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
+    assert_eq!(usage[0].2.total_s3_requests(), SPEND_BEFORE_FIRST_LIST);
+    assert_eq!(h.cost.records().len(), 0);
+}
+
+/// A query naming both signals spends through two handles, one per lane. The
+/// record owes their sum: billing the lane that happened to register last
+/// forgives whichever one the cancellation did not land in.
+#[tokio::test]
+async fn usage_on_cancel_sums_the_metrics_and_log_lanes() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    // The metrics lane runs first and issues both of its listings, so the log
+    // lane's first listing is the request's third.
+    let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(LISTS_PER_RESOLVE + 1));
+    let h = harness(
+        fault_store,
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+
+    let request = range_request("up + ravel_log_lines{service=\"x\"}");
+    let mut query = Box::pin(h.service.promql_range(h.tenant_hash, &request));
+
+    tokio::select! {
+        _ = &mut query => panic!("the query is held inside the log lane's store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(gate.held_count(), 1);
+
+    drop(query);
+
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
+    // The metrics lane in full, plus what the log lane had reached when the
+    // gate held it. Either part alone is a figure a lane-at-a-time view
+    // reports.
+    assert_eq!(
+        usage[0].2.total_s3_requests(),
+        SPEND_PER_RESOLVE + SPEND_BEFORE_FIRST_LIST
+    );
+    assert_eq!(h.cost.records().len(), 0);
+}
+
+/// A `/api/v1/series` request resolves each `match[]` selector separately, each
+/// through a handle of its own. A cancellation during the last one owes every
+/// selector's spend, not the last selector's.
+#[tokio::test]
+async fn usage_on_cancel_sums_every_selector_of_a_series_request() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    // Two selectors resolve in full ahead of it, so the third selector's first
+    // listing is the request's fifth.
+    let gate: GateHandle =
+        fault_store.hold(Op::List, None, Occurrence::Nth(2 * LISTS_PER_RESOLVE + 1));
+    let h = harness(
+        fault_store,
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+
+    let request = ravel_query::http::MetadataRequest {
+        selectors: vec!["up".to_string(), "down".to_string(), "other".to_string()],
+        ..metadata_request(false)
+    };
+    let mut query = Box::pin(h.service.series(h.tenant_hash, &request));
+
+    tokio::select! {
+        _ = &mut query => panic!("the query is held inside the third selector's store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(gate.held_count(), 1);
+
+    drop(query);
+
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
+    assert_eq!(
+        usage[0].2.total_s3_requests(),
+        2 * SPEND_PER_RESOLVE + SPEND_BEFORE_FIRST_LIST
+    );
+    assert_eq!(h.cost.records().len(), 0);
+}
+
+/// A snapshot invalidated under a running read: the object the resolve listed
+/// is gone by the time the fetch asks for it, so the engine discards the
+/// attempt and resolves again. `QueryStats` reports the surviving attempt
+/// alone, which is right, but the spend a cancellation owes is both: the
+/// discarded attempt's requests were issued and billed by the store.
+#[tokio::test]
+async fn usage_on_cancel_sums_both_attempts_of_a_retry() {
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(Op::Get, ScriptedFault::NotFoundBlip)
+            .with_key_contains(".rseg")
+            .with_occurrence(Occurrence::Nth(1)),
+    );
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+    publish_up_segment(fault_store.as_ref()).await;
+    // The first attempt resolves and then 404s on its fetch, so the second
+    // attempt's first listing is the query's third.
+    let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(LISTS_PER_RESOLVE + 1));
+    let h = harness(
+        Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>,
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+
+    let request = range_request("up");
+    let mut query = Box::pin(h.service.promql_range(h.tenant_hash, &request));
+
+    tokio::select! {
+        _ = &mut query => panic!("the query is held inside the second attempt's store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(gate.held_count(), 1);
+    // The retry happened because the fault fired, not because of a race.
+    assert_eq!(fault_store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+
+    drop(query);
+
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
+    // The discarded attempt in full, its 404'd fetch included, plus what the
+    // second attempt had reached. A view that replaces on each attempt reports
+    // the second part alone.
+    assert_eq!(
+        usage[0].2.total_s3_requests(),
+        SPEND_PER_RESOLVE_WITH_ONE_SEGMENT
+            + SPEND_OF_THE_INVALIDATED_FETCH
+            + SPEND_BEFORE_FIRST_LIST
+    );
+    // The same figure split by operation, so the sum above is checked against
+    // its parts rather than against itself: the discarded attempt's two
+    // listings and the held attempt's one, and four gets (two commit-record
+    // reads, the 404, and the second attempt's first read).
+    assert_eq!(usage[0].2.s3_requests(AccountedOp::List), 3);
+    assert_eq!(usage[0].2.s3_requests(AccountedOp::Get), 4);
     assert_eq!(h.cost.records().len(), 0);
 }
 
