@@ -251,6 +251,9 @@ VARIABLES
     rwInputs,         \* [RewriteIds -> SUBSET SupersededCandidates]: the live input
                       \* set each identity resolved at its listing step
     cmpPhase,         \* "idle" | "listed" | "done": the compaction pass's own window
+    cmpInputs,        \* SUBSET RawInputs: the live L0 inputs the compaction pass
+                      \* resolved at its listing step, the listing-time snapshot the
+                      \* publish is checked against
     sysgc,            \* [ph, mqd, grace, skew]
     lastGc            \* witness of the last GC deletion step
 
@@ -258,19 +261,20 @@ storeVars == <<store, lastModified, versionCounter, uploads, listState>>
 protoVars == <<head, headState, clock, superseded, heldBuckets,
                refreshFailed, query, erasureRequested, tombRetiredAt,
                dreqHorizon, doneAt, supersededAt, objContent, variantKey,
-               leaseOwner, rwPhase, rwInputs, cmpPhase,
+               leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
                sysgc, lastGc>>
 vars == <<store, lastModified, versionCounter, uploads, listState,
           head, headState, clock, superseded, heldBuckets,
           refreshFailed, query, erasureRequested, tombRetiredAt,
           dreqHorizon, doneAt, supersededAt, objContent, variantKey,
-          leaseOwner, rwPhase, rwInputs, cmpPhase,
+          leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
           sysgc, lastGc>>
 
-\* The maintenance-pass bookkeeping (who holds the lease, how far each pass got).
-\* Every action that is not a maintenance pass leaves all four alone, so it is
-\* worth a name rather than four entries on a dozen UNCHANGED lists.
-maintVars == <<leaseOwner, rwPhase, rwInputs, cmpPhase>>
+\* The maintenance-pass bookkeeping (who holds the lease, how far each pass got,
+\* and the input sets each pass resolved). Every action that is not a maintenance
+\* pass leaves all five alone, so it is worth a name rather than five entries on a
+\* dozen UNCHANGED lists.
+maintVars == <<leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
 
 S == INSTANCE RavelObjectStore
        WITH Keys <- Objects, Content <- {"dat", "nc"}, NoContent <- "nc",
@@ -314,7 +318,7 @@ StoreView == [o \in Objects |-> store[o].present]
 View ==
     <<StoreView, head, headState, clock, superseded, heldBuckets, refreshFailed,
       query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt, supersededAt,
-      objContent, variantKey, leaseOwner, rwPhase, rwInputs, cmpPhase,
+      objContent, variantKey, leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs,
       sysgc, lastGc>>
 
 \* A delete decision needs a readable HEAD, present or absent: an absent HEAD
@@ -399,6 +403,7 @@ TypeOK ==
     /\ rwPhase \in [RewriteIds -> {"idle","listed","done"}]
     /\ rwInputs \in [RewriteIds -> SUBSET SupersededCandidates]
     /\ cmpPhase \in {"idle","listed","done"}
+    /\ cmpInputs \subseteq RawInputs
     /\ sysgc \in [ph: Nat, mqd: Nat, grace: Nat, skew: Nat]
     /\ lastGc.rule \in {"none","superseded","retention","dreq","complete","tombstone"}
     /\ lastGc.deleted \subseteq Objects
@@ -440,6 +445,7 @@ Init ==
     /\ rwPhase = [id \in RewriteIds |-> "idle"]
     /\ rwInputs = [id \in RewriteIds |-> {}]
     /\ cmpPhase = "idle"
+    /\ cmpInputs = {}
     /\ sysgc = [ph |-> ProtectionHorizon,
                 mqd |-> MaxQueryDuration, grace |-> Grace, skew |-> ClockSkew]
     /\ lastGc = [rule |-> "none", deleted |-> {}, atClock |-> 0,
@@ -493,7 +499,7 @@ Tick ==
     /\ UNCHANGED <<head, headState, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* Pin an in-flight query at the current HEAD; its deadline is pin + mqd. It is
@@ -508,7 +514,7 @@ PinQuery ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 ExpireQuery ==
@@ -519,7 +525,7 @@ ExpireQuery ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* Place / release a legal hold on bucket b (its data prefixes).
@@ -530,7 +536,7 @@ PlaceHold(b) ==
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 ReleaseHold(b) ==
@@ -540,7 +546,7 @@ ReleaseHold(b) ==
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* The HEAD object read can fail (unreadable) or find the HEAD gone (absent).
@@ -561,7 +567,7 @@ SetHeadState(s) ==
     /\ UNCHANGED <<head, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* Toggle this tick's legal-hold refresh outcome.
@@ -573,7 +579,7 @@ SetRefresh(f) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 --------------------------------------------------------------------------------
@@ -590,7 +596,7 @@ RequestErasure ==
     /\ dreqHorizon' = clock + DreqHorizonDelta
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, tombRetiredAt, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* --- Live input resolution (resolve_live_inputs) ------------------------------
@@ -654,7 +660,7 @@ StartRewrite(id) ==
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
-                   sysgc, supersededAt, objContent, variantKey, cmpPhase>>
+                   sysgc, supersededAt, objContent, variantKey, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* The publish. Deliberately unguarded by the lease: nothing between the listing
@@ -698,7 +704,7 @@ PublishRewrite(id) ==
                                         !["v2"] = RewriteKey(VariantDescB(rwInputs[id]))]
     /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
-                   leaseOwner, rwInputs, cmpPhase>>
+                   leaseOwner, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* The lease expires under a pass that has already listed. ADR-0065 decision 2:
@@ -713,7 +719,7 @@ ExpireLease ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
                    sysgc, supersededAt, objContent, variantKey, rwPhase, rwInputs,
-                   cmpPhase>>
+                   cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* --- Compaction actor (maintainer) --------------------------------------------
@@ -764,6 +770,11 @@ StartCompaction ==
     /\ \E o \in RawInputs : PresentObj(o)
     /\ leaseOwner' = "C"
     /\ cmpPhase' = "listed"
+    \* Snapshot the live L0 inputs this pass resolved at its listing step, so the
+    \* publish can be held to the set that was actually present when it listed
+    \* rather than to a static RawInputs (finding, #1289). compact_bucket_scoped
+    \* reads every one of these to build the compaction output.
+    /\ cmpInputs' = { o \in RawInputs : PresentObj(o) }
     /\ UNCHANGED storeVars
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
                    query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
@@ -779,20 +790,47 @@ StartCompaction ==
 PublishCompaction ==
     /\ cmpPhase = "listed"
     /\ ~PresentObj("cmpA")
+    \* Every input the listing snapshot recorded must still be present. The
+    \* shipped compactor reads each input to build its output, so an input swept
+    \* between listing and publish fails the pass rather than letting it stamp
+    \* and supersede an object that is no longer there (finding, #1289). The
+    \* supersession and its stamp are applied only after this check passes.
+    /\ \A o \in cmpInputs : PresentObj(o)
     /\ S!PutCreateIfAbsent("cmpA", "dat")
     /\ cmpPhase' = "done"
-    /\ superseded' = superseded \cup RawInputs
+    /\ superseded' = superseded \cup cmpInputs
     \* Same first-supersession rule as PublishRewrite: an input a rewrite
     \* already superseded keeps that rewrite's clock, so this publish cannot
     \* push the input's protection horizon forward.
     /\ supersededAt' = [i \in SupersededCandidates |->
-                          IF i \in RawInputs /\ i \notin superseded
+                          IF i \in cmpInputs /\ i \notin superseded
                               THEN clock
                               ELSE supersededAt[i]]
     /\ objContent' = [objContent EXCEPT !["cmpA"] = RecordSetContent("cmpA")]
     /\ UNCHANGED <<head, headState, clock, heldBuckets, refreshFailed, query,
                    erasureRequested, tombRetiredAt, dreqHorizon, doneAt, sysgc,
-                   variantKey, leaseOwner, rwPhase, rwInputs>>
+                   variantKey, leaseOwner, rwPhase, rwInputs, cmpInputs>>
+    /\ NoGc
+
+\* A listed compaction whose recorded input vanished between listing and publish
+\* returns to idle. compact_bucket_scoped aborts the pass when an input it listed
+\* is gone at read time; the model mirrors that by dropping the pass rather than
+\* publishing over a missing object. Without this the presence guard on
+\* PublishCompaction would strand the pass in "listed" forever and, under
+\* SerializeCompactionAndRewrite, block every rewrite behind a stall the shipped
+\* driver does not have. A fresh StartCompaction may re-list afterwards if a raw
+\* input is still present.
+CancelCompaction ==
+    /\ cmpPhase = "listed"
+    /\ ~PresentObj("cmpA")
+    /\ \E o \in cmpInputs : ~PresentObj(o)
+    /\ cmpPhase' = "idle"
+    /\ cmpInputs' = {}
+    /\ UNCHANGED storeVars
+    /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets, refreshFailed,
+                   query, erasureRequested, tombRetiredAt, dreqHorizon, doneAt,
+                   sysgc, supersededAt, objContent, variantKey, leaseOwner,
+                   rwPhase, rwInputs>>
     /\ NoGc
 
 \* Switch the HEAD onto the live record sets, dropping the superseded objects (a
@@ -805,7 +843,7 @@ HeadAdvanceRewrite ==
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* Complete the erasure: write .done only when the served set no longer serves the
@@ -826,7 +864,7 @@ CompleteErasure ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ CompletionWitness
 
 --------------------------------------------------------------------------------
@@ -841,7 +879,7 @@ RetireBucket ==
     /\ tombRetiredAt' = [tombRetiredAt EXCEPT !["b1"] = clock]
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* Fold reconciles a retired bucket out of the HEAD; it may lag (a late fold) and
@@ -857,7 +895,7 @@ DropRetiredBucketFromHead ==
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
     /\ NoGc
 
 \* Retention physical sweep of one b1 data object. Gates on now >= retired_at +
@@ -892,7 +930,7 @@ RetentionSweep(o) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
 
 \* Final tombstone delete (finding 3, round four): physical_sweep deletes the
 \* bucket's data, verifies via bucket_is_empty_but_tombstone that only the
@@ -914,7 +952,7 @@ SweepTombstone ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
 
 --------------------------------------------------------------------------------
 \* Physical GC actor (maintainer): superseded-input sweep and .dreq sweep
@@ -945,7 +983,7 @@ SupersededSweep(o) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
 
 \* .dreq sweep: delete the .dreq when a matching .done exists, its completed
 \* timestamp is non-zero, the horizon has passed, no reader (the current HEAD or
@@ -971,7 +1009,7 @@ DreqSweep ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase>>
+                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
 
 --------------------------------------------------------------------------------
 Next ==
@@ -987,6 +1025,7 @@ Next ==
     \/ ExpireLease
     \/ StartCompaction
     \/ PublishCompaction
+    \/ CancelCompaction
     \/ HeadAdvanceRewrite
     \/ CompleteErasure
     \/ RetireBucket
@@ -1225,7 +1264,10 @@ RawInputContentAssumedImmutable ==
 \* because a pass that has already listed does finish; leaving it unfair would let
 \* a compaction sit in "listed" forever and, under
 \* SerializeCompactionAndRewrite, block every rewrite behind a stall the
-\* implementation does not have.
+\* implementation does not have. CancelCompaction is fair for the same reason:
+\* PublishCompaction is disabled once a recorded input is gone, so the abort is
+\* the action that finishes a pass whose input vanished, and leaving it unfair
+\* would reopen the same "listed" stall the publish fairness closes.
 FairSpec ==
     /\ Spec
     /\ WF_vars(\E o \in SupersededCandidates : SupersededSweep(o)) \* maintainer sweep tick
@@ -1238,6 +1280,7 @@ FairSpec ==
                  StartRewrite(id) /\ superseded = {})    \* the first rewrite lists
     /\ WF_vars(\E id \in RewriteIds : PublishRewrite(id)) \* a listed rewrite acks
     /\ WF_vars(PublishCompaction)                        \* a listed compaction acks
+    /\ WF_vars(CancelCompaction)                         \* a stale compaction aborts
 
 \* Every superseded input that becomes deletable is eventually swept, once its
 \* own SupersededSweep guard (legal hold clear, horizon elapsed, no blocking
