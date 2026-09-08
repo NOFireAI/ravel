@@ -57,6 +57,30 @@
 //! region, so swapping it cannot forge anything: the worst a caller can do by
 //! editing it is force its own token to read as expired.
 //!
+//! # An evidence reference past its pin redeems as unpinned
+//!
+//! A cursor whose pin is gone has nothing left to offer: page 2 of a
+//! paginated result means something only against page 1's snapshot, so
+//! [`Cursor::redeem`] reports [`CursorError::Expired`] for a passed deadline
+//! or a foreign nonce. An evidence reference is different. It names one row,
+//! and every field a fresh re-execution needs (the tenant, the tool, the
+//! argument hash, and the row digest to compare the re-read row against) is
+//! in the token itself. [`EvidenceRef::redeem`] therefore answers
+//! [`Redeemed::Unpinned`] instead of an error once the deadline has passed or
+//! the minting process is gone, and the caller re-runs the reference's own
+//! call and reports whether the digest still matches.
+//!
+//! [`Redeemed::Unpinned`] is the one outcome that does not rest on this
+//! process's MAC. A token minted under another process's key cannot verify
+//! under this one's, so its body is parsed unverified. That is sound because
+//! nothing pinned is being reused: the tenant is still compared against the
+//! authenticated caller's, and every other field the outcome carries is one
+//! the caller could have passed in directly, so a forged unpinned reference
+//! buys a caller nothing it could not ask for outright. Every malformed body
+//! is still [`CursorError::Invalid`]. [`Redeemed::Pinned`], the outcome that
+//! does reuse the pin, is returned only for a token carrying this process's
+//! nonce whose MAC verified under this process's key.
+//!
 //! # The wire length cap
 //!
 //! Both codecs refuse a token longer than [`MAX_TOKEN_BYTES`] before they
@@ -110,8 +134,10 @@ const CURSOR_MAGIC: [u8; 4] = *b"RMC1";
 /// deadline-bounded, so none survives the deploy that changes the number.
 const CURSOR_VERSION: u8 = 3;
 const EVIDENCE_MAGIC: [u8; 4] = *b"RME1";
-/// Version 2 adds the same plaintext process nonce [`CURSOR_VERSION`] 3 does.
-const EVIDENCE_VERSION: u8 = 2;
+/// Version 2 adds the same plaintext process nonce [`CURSOR_VERSION`] 3 does;
+/// version 3 adds the argument hash, which an unpinned redemption needs to
+/// re-execute the call the reference was minted by.
+const EVIDENCE_VERSION: u8 = 3;
 
 /// Length in bytes of the plaintext process nonce both tokens carry directly
 /// after their version byte.
@@ -152,7 +178,8 @@ pub enum CursorError {
     /// The token is structurally valid and tenant-correct but its
     /// `deadline_ns` has passed, or it was minted by a process whose key no
     /// longer exists (a nonce mismatch), which puts its pinned snapshot just
-    /// as far out of reach.
+    /// as far out of reach. Only cursors report this: an evidence reference
+    /// in either state redeems as [`Redeemed::Unpinned`] instead.
     #[error("cursor has expired")]
     Expired,
     /// The wire token is longer than [`MAX_TOKEN_BYTES`], refused before it is
@@ -209,11 +236,45 @@ pub struct Cursor {
 pub struct EvidenceRef {
     pub tenant: TenantHash,
     pub tool: String,
+    /// BLAKE3-256 hash of the tool's canonicalized argument set at mint time.
+    /// Unlike a cursor's, this is not bound against a redeeming call's own
+    /// hash: an evidence reference is redeemed by re-executing the call it
+    /// was minted by, so the hash is what a redeemer needs back, not
+    /// something it supplies.
+    pub argument_hash: [u8; 32],
     /// BLAKE3-256 hash of the referenced row. Wire field name `sha256`; see
     /// this module's "Deviation from the wire field name `sha256`" docs.
     pub sha256: [u8; 32],
     pub mint_ns: i64,
     pub deadline_ns: i64,
+}
+
+/// The outcome of [`EvidenceRef::redeem`].
+///
+/// Two states, not an error and a success: an evidence reference past its pin
+/// is still usable, just at a higher cost. See this module's "An evidence
+/// reference past its pin redeems as unpinned" docs for why, and for why
+/// [`Redeemed::Unpinned`] is not a MAC-authenticated outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Redeemed {
+    /// The pin is live: the reference was minted by this process, its MAC
+    /// verified, and its deadline has not passed. The pinned row can be read
+    /// back without re-executing anything.
+    Pinned(EvidenceRef),
+    /// The pin is gone -- the deadline has passed, or the minting process is
+    /// gone (its nonce is foreign). These are the fields a fresh re-execution of
+    /// the reference's own call needs; the redeemer re-runs it and reports
+    /// whether the row it reads still hashes to `digest`.
+    Unpinned {
+        /// BLAKE3-256 hash of the row as it was when the reference was
+        /// minted, to compare the re-read row against.
+        digest: [u8; 32],
+        tool: String,
+        argument_hash: [u8; 32],
+        /// Always equal to the redeeming caller's tenant: an unpinned
+        /// outcome is returned only after the tenant check passes.
+        tenant: TenantHash,
+    },
 }
 
 impl Cursor {
@@ -281,7 +342,12 @@ impl Cursor {
     /// [`CursorError::Expired`], and one over [`MAX_TOKEN_BYTES`] is
     /// [`CursorError::TokenTooLong`].
     pub fn decode(token: &str, key: &CursorKey) -> Result<Cursor, CursorError> {
-        let body = open_token(token, key, CURSOR_MAGIC, CURSOR_VERSION)?;
+        let body = match open_token(token, key, CURSOR_MAGIC, CURSOR_VERSION)? {
+            Opened::Local(body) => body,
+            // A cursor's whole value is its pin, and the process that pinned
+            // it is gone; there is nothing to answer with but `Expired`.
+            Opened::Foreign(_) => return Err(CursorError::Expired),
+        };
 
         let mut cur = ByteReader::new(&body);
         let tenant = TenantHash(cur.read_array::<16>()?);
@@ -397,6 +463,7 @@ impl EvidenceRef {
         buf.extend_from_slice(&process_nonce(key));
         buf.extend_from_slice(&self.tenant.0);
         write_len_prefixed(&mut buf, self.tool.as_bytes())?;
+        buf.extend_from_slice(&self.argument_hash);
         buf.extend_from_slice(&self.sha256);
         buf.extend_from_slice(&self.mint_ns.to_le_bytes());
         buf.extend_from_slice(&self.deadline_ns.to_le_bytes());
@@ -406,13 +473,25 @@ impl EvidenceRef {
         Ok(URL_SAFE_NO_PAD.encode(buf))
     }
 
-    /// See [`Cursor::decode`], including the nonce and length-cap outcomes.
+    /// See [`Cursor::decode`], including the nonce and length-cap outcomes: a
+    /// token from another process is [`CursorError::Expired`] here too.
+    /// [`EvidenceRef::redeem`] is the entry point that reads such a token as
+    /// [`Redeemed::Unpinned`] instead.
     pub fn decode(token: &str, key: &CursorKey) -> Result<EvidenceRef, CursorError> {
-        let body = open_token(token, key, EVIDENCE_MAGIC, EVIDENCE_VERSION)?;
+        match open_token(token, key, EVIDENCE_MAGIC, EVIDENCE_VERSION)? {
+            Opened::Local(body) => Self::parse(&body),
+            Opened::Foreign(_) => Err(CursorError::Expired),
+        }
+    }
 
-        let mut cur = ByteReader::new(&body);
+    /// Parses the header-stripped body. Shared by [`EvidenceRef::decode`] and
+    /// [`EvidenceRef::redeem`], which differ only in whether the bytes were
+    /// MAC-verified first.
+    fn parse(body: &[u8]) -> Result<EvidenceRef, CursorError> {
+        let mut cur = ByteReader::new(body);
         let tenant = TenantHash(cur.read_array::<16>()?);
         let tool = read_string(&mut cur)?;
+        let argument_hash = cur.read_array::<32>()?;
         let sha256 = cur.read_array::<32>()?;
         let mint_ns = i64::from_le_bytes(cur.read_array::<8>()?);
         let deadline_ns = i64::from_le_bytes(cur.read_array::<8>()?);
@@ -424,52 +503,81 @@ impl EvidenceRef {
         Ok(EvidenceRef {
             tenant,
             tool,
+            argument_hash,
             sha256,
             mint_ns,
             deadline_ns,
         })
     }
 
-    /// See [`Cursor::redeem`]: same wrong-tenant-decodes-as-Invalid rule, and
-    /// the same binding to the redeeming `tool`. An evidence reference carries
-    /// no argument hash (it pins one row, not a query), so the tool name is
-    /// the whole call binding here.
+    /// Redeem a reference: same wrong-tenant-decodes-as-Invalid rule as
+    /// [`Cursor::redeem`], and the same binding to the redeeming `tool`.
+    ///
+    /// Unlike a cursor this never reports [`CursorError::Expired`]. A live
+    /// pin answers [`Redeemed::Pinned`]; a passed deadline or a foreign
+    /// process nonce answers [`Redeemed::Unpinned`] with the fields a fresh
+    /// re-execution needs. The argument hash is returned rather than checked,
+    /// since the redeemer re-runs the minting call rather than supplying its
+    /// own arguments. Tampering under this process's own key, a wrong tenant,
+    /// a wrong tool, and any malformed body are all still
+    /// [`CursorError::Invalid`].
     pub fn redeem(
         token: &str,
         key: &CursorKey,
         caller_tenant: TenantHash,
         tool: &str,
         now_ns: i64,
-    ) -> Result<EvidenceRef, CursorError> {
-        let evidence = Self::decode(token, key)?;
+    ) -> Result<Redeemed, CursorError> {
+        let (evidence, pin_verified) =
+            match open_token(token, key, EVIDENCE_MAGIC, EVIDENCE_VERSION)? {
+                Opened::Local(body) => (Self::parse(&body)?, true),
+                Opened::Foreign(body) => (Self::parse(&body)?, false),
+            };
         if evidence.tenant != caller_tenant {
             return Err(CursorError::Invalid);
         }
         if evidence.tool != tool {
             return Err(CursorError::Invalid);
         }
-        if now_ns >= evidence.deadline_ns {
-            return Err(CursorError::Expired);
+        if pin_verified && now_ns < evidence.deadline_ns {
+            return Ok(Redeemed::Pinned(evidence));
         }
-        Ok(evidence)
+        Ok(Redeemed::Unpinned {
+            digest: evidence.sha256,
+            tool: evidence.tool,
+            argument_hash: evidence.argument_hash,
+            tenant: evidence.tenant,
+        })
     }
 }
 
+/// What [`open_token`] recovered: the header-stripped body, and whether the
+/// token's process nonce was this process's.
+enum Opened {
+    /// This process's nonce, and the MAC verified under this process's key.
+    Local(Vec<u8>),
+    /// Another process's nonce. The body is NOT MAC-verified -- it cannot be,
+    /// since the key that signed it is gone. Only an unpinned evidence
+    /// redemption may read these bytes; see the module docs.
+    Foreign(Vec<u8>),
+}
+
 /// Checks the length cap, base64-decodes, checks magic and version, compares
-/// the plaintext process nonce, verifies the MAC, and returns the body after
-/// the header.
+/// the plaintext process nonce, verifies the MAC when the nonce is this
+/// process's, and returns the body after the header.
 ///
 /// The nonce comparison sits before the MAC check on purpose: a token minted
-/// under another process's key fails both, and the nonce is what lets this
-/// report [`CursorError::Expired`] (the snapshot is gone with the process that
-/// pinned it) rather than the [`CursorError::Invalid`] a tampered token gets.
-/// The MAC still covers the nonce, so editing it forges nothing.
+/// under another process's key fails both, and the nonce is what separates
+/// "the process that pinned this is gone" from the [`CursorError::Invalid`] a
+/// tampered token gets. The MAC still covers the nonce, so editing it forges
+/// nothing: the worst it can do is downgrade the holder's own token to
+/// [`Opened::Foreign`], which no caller can pin against.
 fn open_token(
     token: &str,
     key: &CursorKey,
     magic: [u8; 4],
     version: u8,
-) -> Result<Vec<u8>, CursorError> {
+) -> Result<Opened, CursorError> {
     if token.len() > MAX_TOKEN_BYTES {
         return Err(CursorError::TokenTooLong {
             len: token.len(),
@@ -490,19 +598,21 @@ fn open_token(
     if head.read_u8()? != version {
         return Err(CursorError::Invalid);
     }
-    if head.read_array::<NONCE_LEN>()? != process_nonce(key) {
-        return Err(CursorError::Expired);
-    }
+    let foreign = head.read_array::<NONCE_LEN>()? != process_nonce(key);
 
     let split = bytes.len().saturating_sub(MAC_LEN);
     let (payload, stored) = bytes.split_at(split);
-    if !ct_eq(&mac(key, payload), stored) {
+    if !foreign && !ct_eq(&mac(key, payload), stored) {
         return Err(CursorError::Invalid);
     }
-    Ok(payload
+    let body = payload
         .get(HEADER_LEN..)
         .ok_or(CursorError::Invalid)?
-        .to_vec())
+        .to_vec();
+    if foreign {
+        return Ok(Opened::Foreign(body));
+    }
+    Ok(Opened::Local(body))
 }
 
 /// The plaintext nonce every token carries: a keyed BLAKE3 tag over a fixed
@@ -723,6 +833,7 @@ mod tests {
         EvidenceRef {
             tenant,
             tool: SAMPLE_TOOL.to_owned(),
+            argument_hash: SAMPLE_ARGS,
             sha256: [0x8Au8; 32],
             mint_ns: 1_700_000_000_000_000_000,
             deadline_ns: 1_700_000_030_000_000_000,
@@ -933,11 +1044,27 @@ mod tests {
         .expect_err("must be refused");
         assert_eq!(err, CursorError::Expired);
 
+        // The evidence leg is the exception: a foreign reference is unpinned,
+        // not refused. `NOW_NS` is inside its deadline, so the foreign nonce
+        // is the only thing that can produce this outcome.
         let evidence = sample_evidence(tenant)
             .encode(&minting_key)
             .expect("encodes");
-        let err = EvidenceRef::redeem(&evidence, &redeeming_key, tenant, SAMPLE_TOOL, NOW_NS)
-            .expect_err("must be refused");
+        let redeemed = EvidenceRef::redeem(&evidence, &redeeming_key, tenant, SAMPLE_TOOL, NOW_NS)
+            .expect("a foreign reference redeems unpinned");
+        assert_eq!(
+            redeemed,
+            Redeemed::Unpinned {
+                digest: [0x8Au8; 32],
+                tool: SAMPLE_TOOL.to_owned(),
+                argument_hash: SAMPLE_ARGS,
+                tenant,
+            }
+        );
+
+        // The lower-level `decode` still reports the process as gone; only
+        // `redeem` reads a foreign reference as unpinned.
+        let err = EvidenceRef::decode(&evidence, &redeeming_key).expect_err("must be refused");
         assert_eq!(err, CursorError::Expired);
     }
 
@@ -1068,8 +1195,9 @@ mod tests {
     }
 
     /// The evidence reference round-trips every field, and carries the same
-    /// bindings a cursor does: wrong tenant and wrong tool are `Invalid`, and
-    /// its own deadline is `Expired`.
+    /// bindings a cursor does: wrong tenant and wrong tool are `Invalid`. Past
+    /// its deadline it is not an error at all but `Unpinned`, carrying the
+    /// exact digest and the fields a fresh re-execution needs.
     #[test]
     fn evidence_ref_round_trips_and_binds_its_call() {
         let tenant = TenantHash([0x9Cu8; 16]);
@@ -1079,10 +1207,13 @@ mod tests {
         let deadline = evidence.deadline_ns;
         let token = evidence.encode(&key).expect("encodes");
 
-        let decoded = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, NOW_NS)
+        let redeemed = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, NOW_NS)
             .expect("round-trips through its own codec");
+        assert_eq!(redeemed, Redeemed::Pinned(evidence.clone()));
+        let decoded = EvidenceRef::decode(&token, &key).expect("decodes");
         assert_eq!(decoded, evidence);
         assert_eq!(decoded.sha256, [0x8Au8; 32]);
+        assert_eq!(decoded.argument_hash, SAMPLE_ARGS);
         assert_eq!(decoded.tool, SAMPLE_TOOL);
         assert_eq!(decoded.mint_ns, 1_700_000_000_000_000_000);
         assert_eq!(decoded.deadline_ns, deadline);
@@ -1095,8 +1226,68 @@ mod tests {
             .expect_err("wrong tool must be refused");
         assert_eq!(err, CursorError::Invalid);
 
-        let err = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, deadline)
-            .expect_err("must be expired at exactly the deadline");
-        assert_eq!(err, CursorError::Expired);
+        // At exactly the deadline the pin is gone, and the reference is
+        // unpinned rather than expired.
+        let redeemed = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, deadline)
+            .expect("past its pin, still redeemable");
+        assert_eq!(
+            redeemed,
+            Redeemed::Unpinned {
+                digest: [0x8Au8; 32],
+                tool: SAMPLE_TOOL.to_owned(),
+                argument_hash: SAMPLE_ARGS,
+                tenant,
+            }
+        );
+    }
+
+    /// The tenant check is not skipped on the unpinned path, in either of the
+    /// two ways a reference can become unpinned. An unpinned redemption is
+    /// the one outcome that reads bytes no MAC vouched for, so this is what
+    /// keeps it from being a cross-tenant read of a token someone else holds.
+    #[test]
+    fn unpinned_evidence_still_enforces_the_tenant_check() {
+        let tenant = TenantHash([0xA1u8; 16]);
+        let other = TenantHash([0xA2u8; 16]);
+        assert_ne!(tenant, other, "test must use two distinct tenants");
+        let key = test_key();
+        let foreign_key: CursorKey = [0x33u8; CURSOR_KEY_LEN];
+        let evidence = sample_evidence(tenant);
+        let deadline = evidence.deadline_ns;
+        let token = evidence.encode(&key).expect("encodes");
+
+        let err = EvidenceRef::redeem(&token, &key, other, SAMPLE_TOOL, deadline)
+            .expect_err("past the deadline, wrong tenant is still refused");
+        assert_eq!(err, CursorError::Invalid);
+
+        let err = EvidenceRef::redeem(&token, &foreign_key, other, SAMPLE_TOOL, NOW_NS)
+            .expect_err("foreign process, wrong tenant is still refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// A reference tampered with under this process's own key is `Invalid`,
+    /// not `Unpinned`: the unpinned path exists for a token this process
+    /// cannot verify, and must not become a way to launder a forged one that
+    /// it can. The edited byte is the row digest, which is the field an
+    /// unpinned outcome hands back and which nothing else re-checks.
+    #[test]
+    fn tampered_evidence_ref_is_invalid_not_unpinned() {
+        let tenant = TenantHash([0xA3u8; 16]);
+        let key = test_key();
+        let token = sample_evidence(tenant).encode(&key).expect("encodes");
+
+        let mut bytes = token_bytes(&token);
+        let digest_at = bytes.len() - MAC_LEN - 16 - 32;
+        assert_eq!(
+            bytes.get(digest_at),
+            Some(&0x8Au8),
+            "must edit the row digest itself"
+        );
+        bytes[digest_at] ^= 0x01;
+        let tampered = URL_SAFE_NO_PAD.encode(bytes);
+
+        let err = EvidenceRef::redeem(&tampered, &key, tenant, SAMPLE_TOOL, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
     }
 }
