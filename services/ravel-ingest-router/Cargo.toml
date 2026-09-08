@@ -1,0 +1,91 @@
+[package]
+name = "ravel-ingest-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ravel-ingest-router"
+path = "src/main.rs"
+
+[dependencies]
+# Ravel-native subset affinity (ADR-0080 decision 3): `rank` gives the full HRW
+# order, which the unready-member fallback walks past position S.
+ravel-affinity = { workspace = true }
+# Shared tenant resolution, used only to build the canonical-tenant resolver
+# chain (ADR-0080 decision 3): one resolver implementation shared with
+# ravel-server rather than a second copy that can drift.
+ravel-tenant-resolve = { workspace = true }
+# TenantId, whose bytes are the canonical-tenant hash input.
+ravel-types = { workspace = true }
+
+# EndpointSlice watch. kube pulls the client + rustls TLS stack; kube-runtime is
+# the streaming-watch helper; k8s-openapi carries the generated EndpointSlice
+# type. Same pins the operator already uses.
+kube = { workspace = true }
+kube-runtime = { workspace = true }
+k8s-openapi = { workspace = true }
+
+# `http2` is added on top of the workspace pin (axum 0.8's default feature set is
+# HTTP/1 only) so the gRPC listener can speak cleartext HTTP/2 (h2c); the gateway
+# pods serve gRPC over h2c internally, no TLS (#184).
+axum = { workspace = true, features = ["http2"] }
+tokio = { workspace = true }
+# StreamExt over the watcher event stream and the response byte stream.
+futures = { workspace = true }
+# The reverse-proxy HTTP client. `stream` adds streaming request/response bodies
+# (Body::wrap_stream / Response::bytes_stream) so the router proxies bytes
+# without buffering a whole ingest payload in memory. `http2` enables the
+# cleartext HTTP/2 client mode used by the gRPC proxy (built with
+# `http2_prior_knowledge()`); it is already in reqwest's default feature set, but
+# is named explicitly so a future default change cannot silently drop it (#184).
+# Unions with the workspace pin's `json` feature; the version is unchanged.
+reqwest = { workspace = true, features = ["stream", "http2"] }
+# gRPC status projection only: `tonic::Code`/`tonic::Status` map a RouteError to
+# a gRPC status and build the trailers-only reject response. No service codegen,
+# no `.proto` files: this is a byte-transparent HTTP/2 proxy, not a decoded gRPC
+# service, so the default server/transport/codegen features are turned off (#184).
+# Pinned directly rather than via `workspace = true` because a workspace-inherited
+# dependency cannot turn off `default-features` (cargo rejects the override); the
+# version matches the workspace `tonic` pin, the same convention this crate
+# already uses for `rustls` above.
+tonic = { version = "0.14", default-features = false }
+# blake3 keys the bounded round-robin map by a hash of the tenant key rather
+# than the raw bytes, so no raw bearer token is ever held as a map key.
+blake3 = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+humantime = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# rustls 0.23 crypto-provider selection, mirroring services/ravel-operator: the
+# kube client's rustls-tls feature pins `ring`, and ravel-tenant-resolve pulls
+# `aws-lc-rs` transitively via the workspace jsonwebtoken pin, so both providers
+# link into this binary and rustls refuses to guess between them. Pinned to
+# `ring` here (the operator's selection); the workspace root Cargo.toml is out
+# of this task's scope, so it is pinned directly, the same convention
+# ravel-server and ravel-operator use for rustls.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[dev-dependencies]
+# Build synthetic EndpointSlice objects for the injectable watch source, no real
+# cluster needed.
+serde_json = { workspace = true }
+# A local axum backend stands in for a gateway pod; the test client drives the
+# router over a real loopback socket.
+tokio = { workspace = true, features = ["test-util"] }
+# gRPC end-to-end tests: `channel` (a client) and the default server/transport
+# features let a real tonic gRPC server stand in for a gateway pod and a real
+# tonic gRPC client drive the router, proving the transparent proxy round-trips
+# status and trailers with an actual gRPC/HTTP2 stack rather than a byte double.
+tonic = { workspace = true, features = ["channel"] }
+# The OTLP metrics gRPC service definition (generated tonic server + client)
+# reused as the concrete gRPC surface the transparent-proxy tests exercise; it is
+# the real ingest gRPC surface the gateway serves, so no throwaway `.proto` is
+# needed.
+opentelemetry-proto = { workspace = true }
+
+[lints]
+workspace = true

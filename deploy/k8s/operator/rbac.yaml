@@ -1,0 +1,194 @@
+# RBAC for the Ravel operator (ADR-0034). Grants exactly the verbs the
+# reconcile loop actually calls and nothing broader. Every write goes through
+# server-side apply, which is a PATCH (creating an object that does not yet
+# exist needs `create` as well), so `update` (the PUT verb) is never issued and
+# is granted nowhere. Reads come from three mechanisms: an explicit `.get()`,
+# an informer (`Controller`/`.owns()`, which LIST+WATCH only), and RBAC
+# escalation prevention (creating a Role that grants a verb requires the
+# operator to already hold that verb). A resource the operator only writes and
+# deletes gets `create`/`patch`/`delete` and no read verbs.
+#   - Deployments: create/patch (apply), get (live replica reads,
+#     controller::live_replica_counts / live_deployment_exists), list/watch
+#     (the `.owns()` informer), delete (remove the maintain Deployment when
+#     maintain.enabled is false, and the router sweep).
+#   - Services: create/patch (apply), list/watch (the `.owns()` informer),
+#     get/list/watch (escalation: the router Role,
+#     reconcile::desired_router_role, grants `services get/list/watch`), delete
+#     (the router sweep). No `.get()` call, but get is required for escalation.
+#   - Ingresses: create/patch (apply), list/watch (the `.owns()` informer),
+#     delete (ADR-0076 decision 1: lets gateway.ingestAffinity.enabled go back
+#     to false without orphaning a route). No `.get()` and no informer beyond
+#     list/watch, so no bare `get`.
+#   - HTTPRoutes/GRPCRoutes (gateway.networking.k8s.io): create/patch (apply)
+#     and delete only, for the Gateway API exposure routes (ADR-0080 decision
+#     2). They are applied and swept, never read (no informer, no `.get()`).
+#   - PodDisruptionBudgets (policy): create/patch (apply) and delete only, for
+#     the per-tier PDBs (issue #126, ADR-0034 hardening amendment). Applied and
+#     swept, never read.
+#   - Jobs (batch): create/patch (apply), get (observe the qualify Job's
+#     terminal state, controller::observe_qualify_job), delete (recreate it with
+#     foreground propagation when the qualified inputs change; its pod template
+#     is immutable). Not watched by an informer, so no list/watch.
+#   - RavelCluster: list/watch only (the primary `Controller` informer; the
+#     reconcile object comes from the informer cache, never a `.get()`, and the
+#     spec is never patched). Its status subresource: patch only (patch_status
+#     is a merge PATCH; the status is never read back or replaced).
+#   - Secrets: get only, and NEVER granted by this cluster-wide ClusterRole
+#     (issue #126). The operator reads the credentials, tenant-token, and
+#     deployment-key Secrets to resolve tenant names; it never lists, writes, or
+#     watches them. The cluster-wide secrets rule is gone. The read is carried by
+#     a separate ravel-operator-secrets ClusterRole bound ONLY by namespaced
+#     RoleBindings (never a ClusterRoleBinding), so the grant is per namespace:
+#     the block at the bottom of this file binds it in ravel-system, and
+#     deploy/k8s/operator/secrets-rolebinding.yaml is the template to copy into
+#     every other namespace a served RavelCluster lives in. A RavelCluster in a
+#     namespace with no such RoleBinding 403s on Secret resolution and the
+#     operator reports a SecretsUnreadable condition on it (see
+#     crate::controller::secret_error).
+#   - ServiceAccounts, Roles, and RoleBindings: create/patch (apply) and delete
+#     only, for the ravel-native ingest router's own ServiceAccount and its
+#     namespaced, least-privilege Role/RoleBinding (ADR-0080 decision 3). The
+#     operator applies and sweeps these, never reads them, so no read verbs;
+#     delete is what lets backend: ravelNative be switched away without leaving
+#     the router's RBAC orphaned. (Creating the router Role is what forces the
+#     services and endpointslices read grants below, via escalation prevention.)
+#   - EndpointSlices (discovery.k8s.io): get/list/watch only. The operator never
+#     reads EndpointSlices itself; it needs this grant because Kubernetes RBAC
+#     escalation prevention forbids creating a Role that grants a permission the
+#     creator does not already hold, and the router's own Role
+#     (crate::reconcile::desired_router_role) grants exactly this on
+#     EndpointSlices. Without it every backend: ravelNative reconcile 403s when
+#     it tries to create the router's Role. Direct grant, not escalate/bind:
+#     least privilege.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ravel-operator
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ravel-operator
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+rules:
+  # apply (create+patch), explicit .get() reads, .owns() informer (list+watch),
+  # and delete (maintain teardown + router sweep).
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "patch", "get", "list", "watch", "delete"]
+  # apply, .owns() informer (list+watch), get/list/watch required by escalation
+  # prevention (the router Role grants services get/list/watch), and delete.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["create", "patch", "get", "list", "watch", "delete"]
+  # apply, .owns() informer (list+watch), delete. No explicit get, no escalation.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["create", "patch", "list", "watch", "delete"]
+  # applied and swept only, never read.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes", "grpcroutes"]
+    verbs: ["create", "patch", "delete"]
+  # applied and swept only, never read.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["create", "patch", "delete"]
+  # applied and swept only, never read.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "patch", "delete"]
+  # escalation-prevention grant for the router Role only; never read directly.
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  # primary informer only; the spec is never patched (only the status is).
+  - apiGroups: ["ravel.nofire.ai"]
+    resources: ["ravelclusters"]
+    verbs: ["list", "watch"]
+  # patch_status is a merge PATCH; status is never read back or replaced.
+  - apiGroups: ["ravel.nofire.ai"]
+    resources: ["ravelclusters/status"]
+    verbs: ["patch"]
+  # applied and swept only, never read.
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["create", "patch", "delete"]
+  # apply, explicit .get() (observe the qualify Job), delete (foreground
+  # recreate). Not watched by an informer, so no list/watch.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "patch", "get", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ravel-operator
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ravel-operator
+subjects:
+  - kind: ServiceAccount
+    name: ravel-operator
+    namespace: ravel-system
+---
+# Secrets: get only, granted per namespace and never cluster-wide (issue #126).
+# The operator reads the credentials, tenant-token, and deployment-key Secrets a
+# RavelCluster references (crate::controller resolves them via
+# Api::<Secret>::namespaced on the RavelCluster's OWN namespace) to resolve
+# tenant names and stamp resource versions; it never lists, writes, or watches
+# them. The Secret names are user-chosen CRD fields
+# (credentialsSecretRef/tenantTokensSecretRef/deploymentKeySecretRef and the
+# per-tier credential overrides), not a fixed set, so resourceNames cannot
+# enumerate them; a bare `secrets get` bound per namespace is the tightest grant
+# that still works.
+#
+# The rule lives in a ClusterRole so a single definition can be reused in every
+# served namespace (a RoleBinding cannot reference a Role in another namespace,
+# only a same-namespace Role or a ClusterRole). Binding it with a RoleBinding
+# grants the rule ONLY within that RoleBinding's namespace, so this ClusterRole
+# confers no cluster-wide reach on its own; a ClusterRoleBinding to it would, and
+# must never be created (the operator's own lint asserts this). The RoleBinding
+# below grants the read in ravel-system, the operator's own namespace, so a
+# default install works. Every other namespace a served RavelCluster lives in
+# needs a copy of deploy/k8s/operator/secrets-rolebinding.yaml with its
+# namespace filled in; without it that RavelCluster reports a SecretsUnreadable
+# condition instead of reconciling.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ravel-operator-secrets
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ravel-operator-secrets
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: ravel-operator
+    app.kubernetes.io/managed-by: ravel-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ravel-operator-secrets
+subjects:
+  - kind: ServiceAccount
+    name: ravel-operator
+    namespace: ravel-system

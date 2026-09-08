@@ -1,0 +1,278 @@
+// Metric index: catalog snapshot part and HEAD formats
+// (ADR-0020). Persistent contract: field
+// numbers are frozen; only additive changes are allowed.
+syntax = "proto3";
+
+package ravel.catalog.v1;
+
+message SnapshotPartHeader {
+  uint32 format_version = 1;  // 1; must match envelope version
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;          // same enum domain as CommitRecord
+  uint32 shard_count = 4;     // config at fold time (ADR-0010 §9)
+  uint32 watermark_hour = 5;  // unix hours; all entries <= this
+  uint64 entry_count = 6;
+  uint64 entries_uncompressed_len = 7;
+  // Additive, ADR-0063 (multi-part parallel fold). Lowest
+  // ingest_hour_bucket any entry in this part may have; the part's hour
+  // range is [min_hour, watermark_hour], both inclusive. Absent (proto3
+  // zero) means 0, the correct floor for every legacy single-part object:
+  // 0 is never itself an error, it is the epoch floor / "not
+  // hour-partitioned" sentinel. decode_part additionally validates
+  // entry.ingest_hour_bucket >= min_hour and min_hour <= watermark_hour.
+  uint32 min_hour = 8;
+}
+
+message SnapshotEntry {
+  // 0 = L0. Reserved for compaction outputs; readers reject levels they
+  // do not understand.
+  uint32 level = 1;
+  uint32 shard = 2;
+  uint32 ingest_hour_bucket = 3;
+  bytes writer_id = 4;  // 16 raw bytes
+  uint64 writer_epoch = 5;
+  uint64 writer_seq = 6;
+  bytes content_hash = 7;  // 32
+  uint64 object_size = 8;
+  sint64 min_event_ts_ns = 9;
+  sint64 max_event_ts_ns = 10;
+  uint64 sample_count = 11;
+  uint64 series_count = 12;
+  uint32 segment_format_version = 13;
+  sint64 created_unix_ns = 14;
+  // Exact whole-object min/max and null count per stamp-eligible declared
+  // typed attribute column, copied by the fold from the record it folds
+  // (ADR-0873 decision 4): CommitRecord.declared_column_stats (field 20) for
+  // a level-0 entry, CompactionPart.declared_column_stats (field 12) for a
+  // level-1 compaction or rewrite part. Only entries that passed the
+  // statistics validity predicate against the source record's own row count
+  // are copied, so a defective stamp never reaches a sealed part.
+  // Additive and permanently optional: an empty list means this segment is
+  // uncovered for every declared column, which is a normal state forever
+  // (every record written before ADR-0873, every metrics/spans entry, any
+  // column declared after the flush opened, and every part an older fold
+  // wrote), never an error and never a value to guess at.
+  // Neither the .csnap envelope version nor SnapshotPartHeader.format_version
+  // is bumped: an addition an old reader can safely ignore costs it the
+  // statistics shortcut and never a wrong answer, so raising the reader floor
+  // would force a flag day for a field whose absence is a permanently legal
+  // state (ADR-0873 decision 1; SnapshotPartHeader.min_hour, field 8, is the
+  // in-file precedent for an additive entry-side change with no bump).
+  repeated DeclaredColumnMinMax declared_column_stats = 15;
+}
+
+// The min or max of one declared column's non-null values in one object: a
+// same-file mirror of ravel.commit.v1.DeclaredColumnStatValue (ADR-0873
+// decision 1). This repository has no cross-file proto imports, so the
+// commit-side pair is redeclared here rather than imported, the same
+// convention ColumnStat.declared_type follows for the sys enum. The two
+// declarations are field-for-field identical and must stay so: a reader
+// converts one to the other to run the single shared validity predicate.
+//
+// ColumnValue (above) is deliberately NOT reused: its oneof admits
+// str_utf8/bytes_val, which are not stamp-eligible (ADR-0873 decision 2), and
+// a narrower value type makes an ineligible stamp unrepresentable rather than
+// merely rejected. A new eligible type adds a oneof arm here, additively.
+message DeclaredColumnStatValue {
+  oneof kind {
+    sint64 i64 = 1;
+    bool b = 2;
+  }
+}
+
+// Exact whole-object min/max (and null count) for one declared typed
+// attribute column (ADR-0090), as computed by the writer that encoded the
+// object and carried here verbatim by the fold. Mirror of
+// ravel.commit.v1.DeclaredColumnMinMax. min/max are message-typed for
+// presence: both absent means the column had zero non-null values in this
+// object, which is still an exact statement.
+message DeclaredColumnMinMax {
+  string name = 1;
+  // ravel.sys.v1.TypedAttrColumnType as i32 (no cross-file proto import in
+  // this repo; same convention as ColumnStat.declared_type). Only I64 (2) and
+  // BOOL (3) are stamp-eligible; any other tag is dropped by the reader.
+  uint32 declared_type = 2;
+  DeclaredColumnStatValue min = 3;
+  DeclaredColumnStatValue max = 4;
+  // Rows in this object where the declared column reads NULL (name absent, or
+  // the stored variant mismatches declared_type). non_null = the entry's
+  // sample_count (field 11) minus this.
+  uint64 null_count = 5;
+}
+
+message SnapshotHead {
+  uint32 format_version = 1;  // 1
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;
+  uint32 shard_count = 4;
+  uint32 watermark_hour = 5;  // max over parts
+  repeated SnapshotPartRef parts = 6;
+  bytes folder_id = 7;      // 16; UUIDv4 per folder process start
+  sint64 created_unix_ns = 8;  // informational
+  // Additive, phase P5a. Absent when no
+  // postings index has been built yet, or when the last fold's postings
+  // build failed; readers must never treat absence as an error.
+  SnapshotPostingsRef postings = 9;
+  // Additive, ADR-0052 section 5 (online resharding). Number of shard
+  // generations known at fold time. shard_count (field 4) is reinterpreted
+  // as the fan-out ceiling at fold time (max scan_count over hours up to the
+  // watermark); this field lets a reader tell an older, pre-reshard head
+  // (lower generation count, or absent/0 for a head written before ADR-0052)
+  // from one that claims more generations than the reader's own provisioning
+  // record view. Absent/0 = pre-reshard head; readers must never treat
+  // absence as an error.
+  uint32 shard_generation_count = 10;
+  // Additive, ADR-0850 (logs typed-column statistics). Absent when the
+  // tenant has no configured typed columns (ADR-0090), no eligible L0
+  // segment has been folded yet, or the last fold's column-stats build
+  // failed; readers must never treat absence as an error, and must fall
+  // back to scanning for any statistic this ref does not cover.
+  SnapshotColumnStatsRef column_stats = 11;
+  // Additive, ADR-0942 (re-key .cstat column statistics to snapshot-part
+  // binding). Points at a part-hash-keyed .cstat (envelope v2), joined to a
+  // resolved segment by the covered part's SnapshotPartRef.blake3 rather than
+  // the ADR-0850 five-field identity tuple field 11 carries. Field 12 is
+  // deliberately skipped: ADR-0913 has claimed it for
+  // SnapshotMaterializationRef. Absent means no part-bound statistics have
+  // been built; readers must never treat absence as an error, and must fall
+  // back to scanning for any statistic this ref does not cover. Field 11 is
+  // neither renumbered nor redefined and keeps its ADR-0850 meaning.
+  SnapshotColumnStatsPartRef column_stats_part = 13;
+}
+
+message SnapshotPartRef {
+  string key = 1;    // full object key of the part
+  bytes blake3 = 2;  // 32, of the part's full bytes
+  uint64 size = 3;
+  uint64 entry_count = 4;
+  uint32 watermark_hour = 5;
+  // Additive, ADR-0063 (multi-part parallel fold). Mirrors the covering
+  // part header's min_hour onto the HEAD-level reference so validate_head
+  // can check part ordering and range disjointness without fetching part
+  // bytes. Absent (proto3 zero) means 0, matching a legacy single-part
+  // ref. See SnapshotPartHeader.min_hour.
+  uint32 min_hour = 6;
+}
+
+// Reference to a name-postings object (RNP1 envelope), phase P5a.
+// Bound to the exact set of parts it was
+// built from: a postings object is only trustworthy against the parts
+// whose blake3 hashes it names here, in the same order as
+// `SnapshotHead.parts`.
+message SnapshotPostingsRef {
+  string key = 1;              // full object key of the postings object
+  bytes blake3 = 2;             // 32, of the postings object's full bytes
+  uint64 size = 3;
+  uint32 name_count = 4;
+  repeated bytes part_blake3 = 5;  // covered parts' blake3, same order as parts
+}
+
+message SnapshotPostingsHeader {
+  uint32 format_version = 1;  // 1; must match envelope version
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;
+  repeated bytes part_blake3 = 4;  // covered parts' blake3, binds this
+                                    // postings object to an exact part set
+  uint64 entry_count = 5;      // total entries across the covered parts
+  uint32 name_count = 6;
+  uint64 body_uncompressed_len = 7;
+}
+
+// Reference to a column-statistics object (RCST1 envelope), ADR-0850. Bound
+// to the exact set of parts it was built from, the same way
+// SnapshotPostingsRef binds a name-postings object: a column-stats object is
+// only trustworthy against the parts whose blake3 hashes it names here.
+message SnapshotColumnStatsRef {
+  string key = 1;              // full object key of the column-stats object
+  bytes blake3 = 2;             // 32, of the column-stats object's full bytes
+  uint64 size = 3;
+  uint32 segment_count = 4;     // number of segments with an entry in this object
+  repeated bytes part_blake3 = 5;  // covered parts' blake3, same order as parts
+}
+
+// Reference to a part-hash-keyed column-statistics object (RCST envelope,
+// v2), ADR-0942. Mirrors SnapshotColumnStatsRef (field 11) field-for-field;
+// the difference is semantic, not structural: the covered .cstat binds its
+// per-segment statistics to a part's blake3 rather than to the ADR-0850
+// five-field identity tuple, so it covers L1 (and rewrite-output) segments
+// that the tuple key cannot name uniquely. Like SnapshotColumnStatsRef it is
+// bound to the exact set of parts it was built from: it is only trustworthy
+// against the parts whose blake3 hashes it names here.
+message SnapshotColumnStatsPartRef {
+  string key = 1;              // full object key of the column-stats object
+  bytes blake3 = 2;             // 32, of the column-stats object's full bytes
+  uint64 size = 3;
+  uint32 segment_count = 4;     // number of segments with an entry in this object
+  repeated bytes part_blake3 = 5;  // covered parts' blake3, same order as parts
+}
+
+message ColumnStatsHeader {
+  uint32 format_version = 1;  // 1; must match envelope version
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;
+  repeated bytes part_blake3 = 4;  // covered parts' blake3, binds this
+                                    // object to an exact part set
+  uint64 segment_count = 5;
+  uint64 body_uncompressed_len = 6;
+}
+
+// A single dynamic-type scalar: exactly one of the typed-column value
+// domains (ADR-0090: Str, I64, Bool, Bytes). `str_utf8` and `bytes_val` are
+// distinct so a Str column's dictionary/min/max round-trip as UTF-8 text
+// even though both are wire-encoded as `bytes`.
+message ColumnValue {
+  oneof kind {
+    int64 i64 = 1;
+    bool b = 2;
+    string str_utf8 = 3;
+    bytes bytes_val = 4;
+  }
+}
+
+message DictEntry {
+  ColumnValue value = 1;
+  uint64 count = 2;
+}
+
+// Exact per-object statistics for one configured typed-attribute column,
+// computed by a genuine fold-time decode pass over the segment's declared
+// column (ADR-0850). `dictionary_present` false means the column's distinct
+// value count in this segment exceeded the fold's cardinality ceiling: the
+// dictionary is omitted outright, never truncated, and a reader must treat
+// this exactly as "no exact per-value counts available", not as "zero
+// distinct values".
+message ColumnStat {
+  string name = 1;
+  // ravel.sys.v1.TypedAttrColumnType as i32 (no cross-file proto import in
+  // this repo; same convention as SnapshotPartHeader.signal).
+  uint32 declared_type = 2;
+  uint64 non_null_count = 3;
+  uint64 null_count = 4;
+  // Present only when non_null_count > 0; absent (proto3 default) for an
+  // all-null or entirely-absent column in this segment.
+  ColumnValue min = 5;
+  ColumnValue max = 6;
+  bool dictionary_present = 7;
+  repeated DictEntry dictionary = 8;
+  // Exact per-object sum of the column's non-null values (ADR-0850, #861).
+  // Present only for an integer (I64) column; omitted for every other declared
+  // type, and omitted for an I64 column whose exact sum overflowed i64 during
+  // the fold. Absent (proto3 `optional`, no value) means "no exact sum
+  // available": a reader must fall back to scanning rather than treat it as
+  // zero. Float columns are deliberately never summed: a sequential float fold
+  // is order-dependent, and the reader would have no way to know it was inexact.
+  optional int64 sum = 9;
+}
+
+// One segment's exact column statistics, identified the same way
+// `fold::entry_identity` identifies a `SnapshotEntry`, so a reader can join
+// this record back onto a resolved `SegmentRef` without relying on ordinal
+// position.
+message ColumnStatsSegment {
+  uint32 ingest_hour_bucket = 1;
+  uint32 shard = 2;
+  bytes writer_id = 3;
+  uint64 writer_epoch = 4;
+  uint64 writer_seq = 5;
+  repeated ColumnStat columns = 6;
+}

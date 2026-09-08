@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a6e5ea26db99812df51debcf40b51cf69b8b7b9251b69481ddd4293daae2edfb # shrinks to tenants = ["a"], shards = [0], hours = [0, 1]

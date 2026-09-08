@@ -1,0 +1,45 @@
+[package]
+name = "ravel-object-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Ravel object store contract, reference in-memory backend, fault-injecting wrapper, and S3/MinIO adapter."
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+object_store = { workspace = true }
+futures = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+crc32c = { workspace = true }
+# Serde derive for the durable `sys/qualification` record (ADR-0050 section 6),
+# relocated here from ravel-cli so ravel-server and ravel-cli share one
+# definition, and for S3Config::credentials_file's rotating-credentials JSON
+# (ADR-0072 decision 1, crates/ravel-object-store/src/s3/credentials.rs).
+serde = { workspace = true }
+# JSON decode for S3Config::credentials_file (ADR-0072 decision 1): a
+# production dependency now, not just the dev-only JSON-shape regression test
+# serde_json was here for before.
+serde_json = { workspace = true }
+# HTTP client for the EC2 IMDSv2 instance-role credential provider (ADR-0106,
+# crates/ravel-object-store/src/s3/instance_role.rs): two plain-HTTP calls to
+# the link-local metadata endpoint. Version pinned once in the workspace so all
+# crates resolve the same reqwest.
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Test-only fake S3 HTTP endpoint (tests/s3_http_faults.rs): drives S3Store
+# through its endpoint override against a server that returns 503/429/SlowDown,
+# drops a connection mid-response, and fails one part of a multipart upload, so
+# the retry/backoff/multipart paths are exercised over real HTTP rather than
+# only through synthetic StoreError values.
+axum = { workspace = true }
+
+[lints]
+workspace = true
