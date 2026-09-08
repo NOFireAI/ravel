@@ -230,6 +230,7 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
                         entry_count,
                         watermark_hour,
                         min_hour,
+                        column_stats: None,
                     }
                 })
                 .collect();

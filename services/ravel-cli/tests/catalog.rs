@@ -302,6 +302,7 @@ async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
                 entry_count: 0,
                 watermark_hour: 0,
                 min_hour: 0,
+                column_stats: None,
             },
             SnapshotPartRef {
                 key: missing_key.clone(),
@@ -310,6 +311,7 @@ async fn inspect_preserves_partial_output_when_a_part_fetch_fails() {
                 entry_count: 0,
                 watermark_hour: 1,
                 min_hour: 1,
+                column_stats: None,
             },
         ],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),

@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! magic           "RCST" (4 bytes)
-//! version         u8 = 1 (ADR-0850, L0-tuple keyed) or 2 (ADR-0942, part-keyed)
+//! version         u8 = 1 (ADR-0850, L0-tuple keyed), 2 (ADR-0942, part-keyed)
+//!                      or 3 (ADR-1413, per-part, content-hash keyed)
 //! reserved        u8[3] = 0
 //! header_len      u32 LE
 //! header          protobuf ravel.catalog.v1.ColumnStatsHeader
@@ -13,19 +14,24 @@
 //!                                 sorted by (ingest_hour_bucket, shard,
 //!                                 writer_id, writer_epoch, writer_seq) in v1,
 //!                                 by writer_id (the part content hash) in v2
+//!                                 and v3
 //! body_crc32c     u32 LE          over the compressed body bytes
 //! header_crc32c   u32 LE          over magic..header inclusive
 //! ```
 //!
-//! Two envelope versions coexist during the ADR-0942 dual-publish window. The
+//! Three envelope versions coexist during the ADR-1413 dual-publish window
+//! (which itself extends the ADR-0942 dual-publish window). The
 //! `ColumnStatsSegment` record shape is frozen and shared; the key model is the
 //! version's. v1 keys each record by the five-field identity tuple (writer_id is
 //! the 16-byte flush-writer uuid) and covers L0 only. v2 keys by the covered
 //! part's content hash, which the writer carries in the `writer_id` slot as 32
 //! bytes (the same slot an L1 `SnapshotEntry` already repurposes for a 32-byte
-//! hash), and covers L0 and L1 uniformly. The keying is self-describing in the
-//! version byte, so an object read outside its head ref declares which key
-//! model it carries.
+//! hash), and covers L0 and L1 uniformly, over the WHOLE tenant/signal. v3
+//! reuses v2's content-hash keying exactly, but the header's `part_blake3`
+//! names exactly one part: the object covers only that part's segments, so its
+//! size scales with one part rather than the whole tenant. The keying is
+//! self-describing in the version byte, so an object read outside its head ref
+//! declares which key model it carries.
 //!
 //! Deliberately reuses `part.rs`'s plain length-delimited-protobuf body
 //! convention rather than `postings.rs`'s hand-rolled varint dictionary:
@@ -91,6 +97,41 @@ pub fn encode_column_stats_v2(
         part_blake3,
         segments,
     )
+}
+
+/// Encodes a **v3** (ADR-1413, per-part, content-hash-keyed) column-statistics
+/// object, referenced by `SnapshotPartRef.column_stats` (field 7). Unlike
+/// [`encode_column_stats_v2`], the header's `part_blake3` names exactly the
+/// one part this object covers, and `segments` must be exactly that part's
+/// segments (each still carrying its covered part's content hash in
+/// `writer_id`, v2 semantics).
+///
+/// Refuses to encode, returning
+/// [`SnapshotFormatError::ColumnStatsPartOverBound`], when the segments'
+/// concatenated uncompressed length would exceed `per_part_bound_bytes`
+/// (computed by [`super::per_part_column_stats_bound`]), checked before
+/// compression. This is the write-time enforcement ADR-1413 decision 4
+/// requires: the caller must treat this as a hard failure for the part, never
+/// publish a truncated or over-bound object, and never silently skip it.
+pub fn encode_column_stats_v3(
+    tenant_hash: [u8; 16],
+    signal: u32,
+    part_blake3: [u8; 32],
+    segments: &[ColumnStatsSegment],
+    per_part_bound_bytes: u64,
+) -> Result<Vec<u8>, SnapshotFormatError> {
+    validate_segments(segments, 3)?;
+    let declared: u64 = segments
+        .iter()
+        .map(|s| s.encode_length_delimited_to_vec().len() as u64)
+        .sum();
+    if declared > per_part_bound_bytes {
+        return Err(SnapshotFormatError::ColumnStatsPartOverBound {
+            declared,
+            bound: per_part_bound_bytes,
+        });
+    }
+    frame_column_stats(3, tenant_hash, signal, vec![part_blake3.to_vec()], segments)
 }
 
 /// Envelope framing shared by the public writers and the tests. Parameterised
@@ -227,6 +268,14 @@ pub fn decode_column_stats(
     if header.tenant_hash.len() != 16 {
         return Err(SnapshotFormatError::ColumnStatsBadTenantHashLen(
             header.tenant_hash.len(),
+        ));
+    }
+    // ADR-1413: a v3 object is scoped to exactly one part, so its header must
+    // name exactly one part_blake3 entry. v1/v2 carry no such constraint (v1
+    // ignores part_blake3 entirely, v2 names every part in the tenant).
+    if version == 3 && header.part_blake3.len() != 1 {
+        return Err(SnapshotFormatError::ColumnStatsV3PartBlake3CountMismatch(
+            header.part_blake3.len(),
         ));
     }
     if header.body_uncompressed_len > limits.max_column_stats_bytes {
@@ -574,6 +623,7 @@ fn take_u64_le(bytes: &[u8], pos: &mut usize) -> Result<u64, SnapshotFormatError
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use proptest::prelude::*;
     use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue, DictEntry};
 
     use super::*;
@@ -1106,10 +1156,10 @@ mod tests {
     /// error carrying the offending version, not merely "an error occurred".
     #[test]
     fn version_outside_accepted_set_rejected() {
-        for bad in [0u8, 3, 255] {
-            // A bad version selects the v2 (part) key model in the framing
-            // helper (version >= 2 for 3/255) or the v1 model (0), so use a
-            // 32-byte writer_id: it satisfies v2's width check for 3/255. 0 is
+        for bad in [0u8, 4, 255] {
+            // A bad version selects the v2/v3 (part) key model in the framing
+            // helper (version >= 2 for 4/255) or the v1 model (0), so use a
+            // 32-byte writer_id: it satisfies v2's width check for 4/255. 0 is
             // v1 mode (needs 16), handled by its own case below.
             let writer_id_len = if bad >= 2 { 32 } else { 16 };
             let mut seg = segment(1, 0, 1);
@@ -1127,18 +1177,19 @@ mod tests {
         }
     }
 
-    /// The accepted read set is exactly {1, 2} and nothing else across the whole
-    /// u8 domain. The expectation is a hardcoded `1 | 2`, deliberately NOT
-    /// `COLUMN_STATS_ACCEPTED_READ_VERSIONS.contains(..)`: adding a version to
-    /// the constant later cannot silently widen what is accepted without this
-    /// literal changing too.
+    /// The accepted read set is exactly {1, 2, 3} and nothing else across the
+    /// whole u8 domain. The expectation is a hardcoded `1 | 2 | 3`,
+    /// deliberately NOT `COLUMN_STATS_ACCEPTED_READ_VERSIONS.contains(..)`:
+    /// adding a version to the constant later cannot silently widen what is
+    /// accepted without this literal changing too.
     #[test]
-    fn accepted_read_set_is_exactly_v1_and_v2() {
+    fn accepted_read_set_is_exactly_v1_v2_and_v3() {
         for version in 0u8..=255 {
             // The framing helper validates in the version's key model, so give
             // writer_id the width that model requires (v1: 16, v2+: 32).
             // Acceptance is then decided by the decode version gate, which this
-            // test pins.
+            // test pins. part_blake3 has length 1, satisfying v3's own
+            // additional structural check so version alone decides acceptance.
             let writer_id_len = if version >= 2 { 32 } else { 16 };
             let mut seg = segment(1, 0, 1);
             seg.writer_id = vec![0x44; writer_id_len];
@@ -1146,11 +1197,11 @@ mod tests {
                 encode_column_stats_versioned(version, [0x11; 16], 3, vec![vec![0x22; 32]], &[seg])
                     .expect("framing encodes any version byte");
             let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default());
-            let expected_accept = matches!(version, 1 | 2);
+            let expected_accept = matches!(version, 1..=3);
             assert_eq!(
                 decoded.is_ok(),
                 expected_accept,
-                "version {version} acceptance must match the hardcoded {{1, 2}} set"
+                "version {version} acceptance must match the hardcoded {{1, 2, 3}} set"
             );
             if !expected_accept {
                 assert_eq!(
@@ -1263,5 +1314,168 @@ mod tests {
             err,
             SnapshotFormatError::ColumnStatsDecompressedTooLarge { .. }
         ));
+    }
+
+    /// ADR-1413: a v3 object round-trips like v2 (content-hash keying), and
+    /// its header names exactly the one part it covers.
+    #[test]
+    fn v3_stamped_object_round_trips() {
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x77; 32];
+        let part_blake3 = [0x22u8; 32];
+        let bytes = encode_column_stats_v3(
+            [0x11; 16],
+            3,
+            part_blake3,
+            std::slice::from_ref(&seg),
+            crate::snapshot_format::PER_SEGMENT_COLUMN_STATS_BOUND_BYTES,
+        )
+        .expect("fits the per-part bound");
+        assert_eq!(bytes[4], 3, "envelope version byte is v3");
+        let decoded =
+            decode_column_stats(&bytes, &ColumnStatsLimits::default()).expect("v3 decodes");
+        assert_eq!(decoded.header.format_version, 3);
+        assert_eq!(decoded.header.part_blake3, vec![part_blake3.to_vec()]);
+        assert_eq!(decoded.segments, vec![seg]);
+    }
+
+    /// The write-time enforcement ADR-1413 decision 4 requires: a segment set
+    /// whose concatenated uncompressed length exceeds the caller's per-part
+    /// bound is refused with the declared size and the bound, never truncated
+    /// or silently written over budget.
+    #[test]
+    fn encode_v3_refuses_a_segment_over_the_per_part_bound() {
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x88; 32];
+        let declared = seg.encode_length_delimited_to_vec().len() as u64;
+        let bound = declared - 1;
+        let err = encode_column_stats_v3([0x11; 16], 3, [0x66; 32], &[seg], bound)
+            .expect_err("a segment set over the bound is refused");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsPartOverBound { declared, bound }
+        );
+    }
+
+    /// A v3 header naming anything other than exactly one part is
+    /// structurally invalid: v3 is scoped to a single part by construction,
+    /// so a reader encountering more (or fewer) than one bound part is a
+    /// typed rejection, not a value it could partially trust.
+    #[test]
+    fn v3_decode_refuses_part_blake3_count_other_than_one() {
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x33; 32];
+        let bytes = encode_column_stats_versioned(
+            3,
+            [0x11; 16],
+            3,
+            vec![vec![0x22; 32], vec![0x33; 32]],
+            &[seg],
+        )
+        .expect("framing encodes any part_blake3 length");
+        let err = decode_column_stats(&bytes, &ColumnStatsLimits::default())
+            .expect_err("v3 with part_blake3 length != 1 is rejected");
+        assert_eq!(
+            err,
+            SnapshotFormatError::ColumnStatsV3PartBlake3CountMismatch(2)
+        );
+    }
+
+    /// The per-part bound and the decoder's whole-object `max_column_stats_bytes`
+    /// ceiling are independent knobs: a body that a tiny, stale whole-object
+    /// ceiling would reject still decodes once the caller sizes its limits to
+    /// the per-part bound instead (the read-time sizing ADR-1413 decision 4's
+    /// companion, T2/#1483, is expected to use).
+    #[test]
+    fn v3_object_over_the_whole_object_ceiling_but_inside_the_part_bound_decodes() {
+        let mut seg = segment(1, 0, 1);
+        seg.writer_id = vec![0x99; 32];
+        let part_blake3 = [0x55u8; 32];
+        let per_part_bound = crate::snapshot_format::PER_SEGMENT_COLUMN_STATS_BOUND_BYTES;
+        let bytes = encode_column_stats_v3(
+            [0x11; 16],
+            3,
+            part_blake3,
+            std::slice::from_ref(&seg),
+            per_part_bound,
+        )
+        .expect("segment fits the per-part bound");
+
+        let tiny_whole_object_ceiling = ColumnStatsLimits {
+            max_column_stats_bytes: 8,
+        };
+        let err = decode_column_stats(&bytes, &tiny_whole_object_ceiling)
+            .expect_err("a tiny whole-object ceiling rejects this body");
+        assert!(matches!(
+            err,
+            SnapshotFormatError::ColumnStatsDecompressedTooLarge { .. }
+        ));
+
+        let part_sized_limits = ColumnStatsLimits {
+            max_column_stats_bytes: per_part_bound,
+        };
+        let decoded = decode_column_stats(&bytes, &part_sized_limits)
+            .expect("decodes once limits are sized to the per-part bound");
+        assert_eq!(decoded.segments, vec![seg]);
+        assert_eq!(decoded.header.part_blake3, vec![part_blake3.to_vec()]);
+    }
+
+    /// A v3 segment set of arbitrary size (0..6 distinct part-hash-keyed
+    /// segments), tenant hash, signal, and part hash, encoded with no
+    /// per-part bound (`u64::MAX`, since the bound itself is covered by the
+    /// dedicated unit tests above): `decode_column_stats(encode_column_stats_v3(x))
+    /// == x`.
+    fn arb_v3_segments(n: usize) -> Vec<ColumnStatsSegment> {
+        (0..n)
+            .map(|i| {
+                let mut seg = segment(i as u32, 0, i as u64);
+                seg.writer_id = vec![i as u8; 32];
+                seg
+            })
+            .collect()
+    }
+
+    proptest! {
+        #[test]
+        fn v3_round_trips_for_arbitrary_valid_segment_sets(
+            tenant_hash in proptest::array::uniform16(any::<u8>()),
+            signal in any::<u32>(),
+            part_blake3 in proptest::array::uniform32(any::<u8>()),
+            n in 0usize..6,
+        ) {
+            let segments = arb_v3_segments(n);
+            let bytes = encode_column_stats_v3(tenant_hash, signal, part_blake3, &segments, u64::MAX)
+                .expect("a sorted, distinct segment set always fits an unbounded per-part bound");
+            let decoded = decode_column_stats(&bytes, &ColumnStatsLimits::default())
+                .expect("a freshly encoded v3 object always decodes");
+            prop_assert_eq!(decoded.header.format_version, 3);
+            prop_assert_eq!(decoded.header.tenant_hash, tenant_hash.to_vec());
+            prop_assert_eq!(decoded.header.signal, signal);
+            prop_assert_eq!(decoded.header.part_blake3, vec![part_blake3.to_vec()]);
+            prop_assert_eq!(decoded.segments, segments);
+        }
+
+        /// ADR-1413 / repo testing convention: a corrupt (here, truncated)
+        /// input must produce a typed error, never a panic and never a
+        /// successful decode of the wrong data. Any strict prefix of a
+        /// well-formed v3 object is missing bytes some length/CRC check in
+        /// the envelope depends on, so it must always be rejected.
+        #[test]
+        fn v3_truncated_input_never_panics_and_is_rejected(
+            n in 1usize..6,
+            cut_seed in 0usize..10_000,
+        ) {
+            let segments = arb_v3_segments(n);
+            let bytes = encode_column_stats_v3([0x11; 16], 3, [0x22; 32], &segments, u64::MAX)
+                .expect("a sorted, distinct segment set always fits an unbounded per-part bound");
+            prop_assume!(!bytes.is_empty());
+            let truncate_to = cut_seed % bytes.len();
+            let truncated = &bytes[..truncate_to];
+            let result = decode_column_stats(truncated, &ColumnStatsLimits::default());
+            prop_assert!(
+                result.is_err(),
+                "a strictly truncated v3 object must never decode successfully"
+            );
+        }
     }
 }

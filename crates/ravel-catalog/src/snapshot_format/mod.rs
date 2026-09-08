@@ -12,7 +12,7 @@ mod postings;
 
 pub use column_stats::{
     DecodedColumnStats, decode_column_stats, encode_column_stats, encode_column_stats_v2,
-    validate_min_max_presence,
+    encode_column_stats_v3, validate_min_max_presence,
 };
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
@@ -106,13 +106,15 @@ pub const COLUMN_STATS_WRITE_VERSION: u8 = 2;
 
 /// Column-statistics envelope ACCEPTED READ SET: the versions
 /// `decode_column_stats` accepts. v1 is ADR-0850's L0-tuple keying; v2 is
-/// ADR-0942's part-hash keying. The decoder checks MEMBERSHIP against this set,
-/// never equality against [`COLUMN_STATS_WRITE_VERSION`]: bumping the write
-/// version must not make the decoder reject the v1 objects the ADR-0942 L0
-/// reader rule still depends on. Single source for the accepted set so a later
-/// version is added in one place. v2 is accepted before anything writes one, so
-/// A2's writer and this decoder cannot disagree the moment v2 first appears.
-pub const COLUMN_STATS_ACCEPTED_READ_VERSIONS: [u8; 2] = [1, 2];
+/// ADR-0942's part-hash keying; v3 is ADR-1413's per-part keying (one part per
+/// object, same content-hash keying as v2). The decoder checks MEMBERSHIP
+/// against this set, never equality against [`COLUMN_STATS_WRITE_VERSION`]:
+/// bumping the write version must not make the decoder reject the older
+/// objects the dual-publish/reader-fallback rule still depends on. Single
+/// source for the accepted set so a later version is added in one place. Each
+/// new version is accepted before anything writes one, so a writer and this
+/// decoder cannot disagree the moment it first appears.
+pub const COLUMN_STATS_ACCEPTED_READ_VERSIONS: [u8; 3] = [1, 2, 3];
 
 /// Whether `version` is an accepted `.cstat` envelope read version. Membership,
 /// not equality against the write version (ADR-0942).
@@ -153,6 +155,32 @@ impl Default for ColumnStatsLimits {
     }
 }
 
+/// ADR-1413 per-(segment, column) byte allowance backing
+/// [`per_part_column_stats_bound`]. Measured on the ClickBench `hits` tenant
+/// (c6a.4xlarge): 703 column-statistics segments over 104 declared columns
+/// produced a v2 object whose uncompressed body worked out to 27,356 bytes
+/// per (segment, column) pair. This constant is that figure with the same 2x
+/// headroom convention [`DEFAULT_MAX_SNAPSHOT_PART_BYTES`] applies over
+/// `DEFAULT_BYTE_CACHE_MAX_BYTES`: 27_356 * 2 = 54_712.
+///
+/// Single-sourced so the fold (which enforces the bound at write time,
+/// ADR-1413 decision 4) and a future per-part reader (decision 2, which
+/// checks it before trusting a v3 object's declared size) can never disagree
+/// on what "over bound" means.
+pub const PER_SEGMENT_COLUMN_STATS_BOUND_BYTES: u64 = 54_712;
+
+/// The per-part column-statistics byte bound ADR-1413 decision 3 derives for
+/// a part with `entry_count` segments and `declared_column_count` configured
+/// typed columns: `entry_count * declared_column_count *
+/// PER_SEGMENT_COLUMN_STATS_BOUND_BYTES`. Saturates rather than overflows: an
+/// absurdly large part or column count yields `u64::MAX`, which only ever
+/// makes the bound check more permissive, never silently wraps to a tiny one.
+pub fn per_part_column_stats_bound(entry_count: u64, declared_column_count: u64) -> u64 {
+    entry_count
+        .saturating_mul(declared_column_count)
+        .saturating_mul(PER_SEGMENT_COLUMN_STATS_BOUND_BYTES)
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -169,6 +197,7 @@ mod tests {
             entry_count: 0,
             watermark_hour,
             min_hour,
+            column_stats: None,
         }
     }
 
@@ -400,9 +429,10 @@ mod tests {
         assert_eq!(DEFAULT_MAX_POSTINGS_BYTES, 256 << 20);
         assert_eq!(COLUMN_STATS_MAGIC, *b"RCST");
         assert_eq!(COLUMN_STATS_WRITE_VERSION, 2);
-        assert_eq!(COLUMN_STATS_ACCEPTED_READ_VERSIONS, [1, 2]);
+        assert_eq!(COLUMN_STATS_ACCEPTED_READ_VERSIONS, [1, 2, 3]);
         assert_eq!(COLUMN_STATS_RESERVED, [0, 0, 0]);
         assert_eq!(DEFAULT_MAX_COLUMN_STATS_BYTES, 256 << 20);
         assert_eq!(DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, 10_000);
+        assert_eq!(PER_SEGMENT_COLUMN_STATS_BOUND_BYTES, 54_712);
     }
 }

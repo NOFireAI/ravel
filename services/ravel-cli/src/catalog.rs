@@ -428,6 +428,7 @@ mod tests {
                 entry_count: 0,
                 watermark_hour: *watermark_hour,
                 min_hour: *min_hour,
+                column_stats: None,
             });
         }
 

@@ -190,6 +190,7 @@ async fn install_head_and_stats(store: &dyn ObjectStoreBackend, segments: &[Colu
             entry_count: 0,
             watermark_hour: 10,
             min_hour: 0,
+            column_stats: None,
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: 0,

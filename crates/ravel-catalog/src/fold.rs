@@ -41,6 +41,7 @@ use crate::error::CatalogError;
 use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
 use crate::snapshot_format::{
     self, HEAD_FORMAT_VERSION, NamePostings, PartLimits, SnapshotFormatError,
+    per_part_column_stats_bound,
 };
 use crate::tenant_config::DeclaredTypedColumn;
 
@@ -160,6 +161,16 @@ pub struct FoldReport {
     /// Encoded size of the v2 part-hash-keyed column-stats object, in bytes.
     /// `0` when `column_stats_part_built` is `false`.
     pub column_stats_part_bytes: u64,
+    /// Number of per-part (v3, ADR-1413) column-statistics objects this fold
+    /// built and PUT, one per newly written or rewritten part (never for a
+    /// part carried forward by reference: its existing
+    /// `SnapshotPartRef.column_stats` ref, if any, is forwarded unchanged).
+    /// `0` on a no-op fold or when the tenant has no configured typed
+    /// columns. Unlike [`Self::column_stats_part_built`], there is no
+    /// leniency counterpart here: a part whose statistics exceed the
+    /// per-part bound fails the whole fold (ADR-1413 decision 4) rather than
+    /// being silently skipped, so this counter is exact, never a lower bound.
+    pub column_stats_part_objects_built: u64,
     /// Number of commit-bucket entries this fold skipped rather than
     /// aborting on: an unrecognized bucket-key shape, or a commit record
     /// whose identity duplicates one already folded. Both are layout drift
@@ -1263,11 +1274,76 @@ impl Catalog {
                 _ => HashMap::new(),
             };
 
+            // ADR-1413 decision 1 (v2 semantics): reuse the previous fold's
+            // per-part v3 column-stats objects the same way the field-13 (v2)
+            // baseline below reuses its own predecessor, so a part that grows
+            // (e.g. an appended hour) does not re-derive every entry it
+            // already covered. Keyed by content hash, exactly as the v2
+            // baseline is (both key on `entry.content_hash`, the same join
+            // key); merged across every old part still valid for reuse
+            // (excluded: a part covering a dirty hour, whose old statistics
+            // cannot be trusted forward, mirroring `existing_by_blake3`
+            // above).
+            let v3_content_baseline: HashMap<Vec<u8>, ColumnStatsSegment> = if typed_attr_columns
+                .is_empty()
+                || rebuilt
+            {
+                HashMap::new()
+            } else if let HeadState::Valid { head, .. } = &head_state {
+                let mut baseline = HashMap::new();
+                for old_part in head
+                    .parts
+                    .iter()
+                    .filter(|p| !part_covers_dirty_hour(p, &dirty_hours))
+                {
+                    let Some(stats_ref) = &old_part.column_stats else {
+                        continue;
+                    };
+                    let Ok(old_part_hash) = <[u8; 32]>::try_from(old_part.blake3.as_slice()) else {
+                        continue;
+                    };
+                    match self.store().get(&stats_ref.key, GetRange::Full).await {
+                        Ok(got) => {
+                            counters.get_requests += 1;
+                            match column_stats_build::decode_previous_column_stats(
+                                &got.data,
+                                &[old_part_hash],
+                                &crate::snapshot_format::ColumnStatsLimits::default(),
+                            ) {
+                                Ok(segments) => {
+                                    for segment in segments {
+                                        baseline.insert(segment.writer_id.clone(), segment);
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        tenant = %tenant.to_hex(),
+                                        "previous per-part column-stats object failed to decode or bind to its owning part; rebuilding every segment's statistics for parts that reuse it"
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                tenant = %tenant.to_hex(),
+                                "previous per-part column-stats object GET failed; rebuilding every segment's statistics for parts that reuse it"
+                            );
+                        }
+                    }
+                }
+                baseline
+            } else {
+                HashMap::new()
+            };
+
             let single_part = spans.len() == 1;
             let mut part_refs: Vec<SnapshotPartRef> = Vec::with_capacity(spans.len());
             let mut part_hashes: Vec<[u8; 32]> = Vec::with_capacity(spans.len());
             let mut total_part_bytes: u64 = 0;
             let mut parts_reused: u64 = 0;
+            let mut column_stats_part_objects_built: u64 = 0;
             for (span_index, span) in spans.iter().enumerate() {
                 let is_tail = span_index + 1 == spans.len();
                 // Single-part fold keeps exact v1 semantics: min_hour 0 (the
@@ -1330,6 +1406,106 @@ impl Catalog {
                 counters.put_requests += 1;
                 total_part_bytes += part_bytes_len;
                 part_hashes.push(*part_hash.as_bytes());
+
+                // ADR-1413: a per-part (v3) column-statistics object, built
+                // only for a part this fold actually wrote (a carried-forward
+                // part above forwards its existing ref, if any, unchanged).
+                // Unlike the v1/v2 builds below, a failure here is never
+                // graceful: an over-bound part must fail the whole fold
+                // rather than publish a truncated object or silently carry
+                // on without one (decision 4).
+                let column_stats = if typed_attr_columns.is_empty() {
+                    None
+                } else {
+                    let mut v3_segments: Vec<ColumnStatsSegment> = Vec::new();
+                    for entry in part_entries.iter() {
+                        if let Some(existing) = v3_content_baseline.get(&entry.content_hash) {
+                            v3_segments.push(existing.clone());
+                            continue;
+                        }
+                        match column_stats_cache
+                            .segment_column_stats(self.store(), tenant, signal, entry)
+                            .await
+                        {
+                            Ok((mut segment, fetch)) => {
+                                if fetch == column_stats_build::StatsFetch::Issued {
+                                    counters.get_requests += 1;
+                                }
+                                // v2 semantics (ADR-1413): bind the record to
+                                // this part's content hash, uniform for L0 and
+                                // L1.
+                                segment.writer_id = entry.content_hash.clone();
+                                v3_segments.push(segment);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant = %tenant.to_hex(),
+                                    ingest_hour_bucket = entry.ingest_hour_bucket,
+                                    shard = entry.shard,
+                                    level = entry.level,
+                                    "per-part column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
+                                );
+                            }
+                        }
+                    }
+                    sort_and_dedup_part_segments(&mut v3_segments);
+
+                    let per_part_bound = per_part_column_stats_bound(
+                        part_entries.len() as u64,
+                        typed_attr_columns.len() as u64,
+                    );
+                    let stats_bytes = snapshot_format::encode_column_stats_v3(
+                        tenant.0,
+                        signal_num,
+                        *part_hash.as_bytes(),
+                        &v3_segments,
+                        per_part_bound,
+                    )
+                    .map_err(|err| match err {
+                        SnapshotFormatError::ColumnStatsPartOverBound { declared, bound } => {
+                            CatalogError::ColumnStatsPartOverBound {
+                                part_key: part_key.clone(),
+                                declared,
+                                bound,
+                            }
+                        }
+                        other => CatalogError::SnapshotFormat(other),
+                    })?;
+
+                    let stats_crc = crc32c::crc32c(&stats_bytes);
+                    let stats_hash = blake3::hash(&stats_bytes);
+                    let stats_key = column_stats_object_key(tenant, signal, part_watermark, hash16);
+                    let size = stats_bytes.len() as u64;
+                    let segment_count = v3_segments.len() as u32;
+                    match self
+                        .store()
+                        .put(
+                            &stats_key,
+                            Bytes::from(stats_bytes),
+                            PutOptions::create_if_absent()
+                                .with_checksum(UploadChecksum::Crc32c(stats_crc)),
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        // Content-addressed under the part's own hash: bytes
+                        // are identical by construction (mirrors the part
+                        // object's own PUT above).
+                        Err(StoreError::AlreadyExists) => {}
+                        Err(e) => return Err(CatalogError::Store(e)),
+                    }
+                    counters.put_requests += 1;
+                    column_stats_part_objects_built += 1;
+                    Some(SnapshotColumnStatsPartRef {
+                        key: stats_key,
+                        blake3: stats_hash.as_bytes().to_vec(),
+                        size,
+                        segment_count,
+                        part_blake3: vec![part_hash.as_bytes().to_vec()],
+                    })
+                };
+
                 part_refs.push(SnapshotPartRef {
                     key: part_key,
                     blake3: part_hash.as_bytes().to_vec(),
@@ -1337,6 +1513,7 @@ impl Catalog {
                     entry_count: part_entries.len() as u64,
                     watermark_hour: part_watermark,
                     min_hour: part_min_hour,
+                    column_stats,
                 });
             }
 
@@ -1936,6 +2113,7 @@ impl Catalog {
                         column_stats_bytes: column_stats_size,
                         column_stats_part_built,
                         column_stats_part_bytes: column_stats_part_size,
+                        column_stats_part_objects_built,
                         layout_drift_count,
                         frontier_hours_reconciled,
                         frontier_hours_deferred,
@@ -2695,6 +2873,7 @@ fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldR
         column_stats_bytes: 0,
         column_stats_part_built: false,
         column_stats_part_bytes: 0,
+        column_stats_part_objects_built: 0,
         layout_drift_count: 0,
         frontier_hours_reconciled: 0,
         frontier_hours_deferred: 0,
@@ -3400,6 +3579,189 @@ mod tests {
         // Neither collapsed onto the other: exact, per-part values.
         assert_status_column(rec0, 4, 0, 200, 500, &[(200, 2), (404, 1), (500, 1)], 1304);
         assert_status_column(rec1, 3, 0, 200, 500, &[(200, 1), (500, 2)], 1200);
+    }
+
+    async fn list_all_keys(store: &dyn ObjectStoreBackend, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut page_token = None;
+        loop {
+            let page = store.list(prefix, page_token).await.expect("list");
+            out.extend(page.objects.into_iter().map(|m| m.key));
+            match page.next {
+                Some(t) => page_token = Some(t),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// ADR-1413 (deliverables 1, 3, 4): a fold whose entry count crosses
+    /// `snapshot_part_max_entries` produces a multi-part HEAD, and EACH newly
+    /// written part gets its OWN v3 (field 7) column-statistics object, not
+    /// one shared whole-tenant object. The pre-existing v1 (field 11) and v2
+    /// (field 13) whole-tenant objects are unaffected: this is a
+    /// dual-publish addition, not a replacement.
+    #[tokio::test]
+    async fn fold_publishes_a_v3_object_per_part_and_keeps_field_13() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Two L0 segments in two distinct sealed hours: cap 1 seals hour 10
+        // into its own part and starts a fresh tail at hour 11.
+        publish_logs_segment(store.as_ref(), 0, 10, &[200, 404]).await;
+        publish_logs_segment(store.as_ref(), 1, 11, &[500, 500, 200]).await;
+
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            report.parts_total, 2,
+            "crossing the cap splits into two parts"
+        );
+        assert_eq!(
+            report.column_stats_part_objects_built, 2,
+            "one v3 object per newly written part"
+        );
+        assert!(
+            report.column_stats_part_built,
+            "field 13 (v2 whole-tenant) is still built alongside the per-part objects"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        assert_eq!(head.parts.len(), 2);
+        assert!(
+            head.column_stats_part.is_some(),
+            "field 13 present: dual-publish, not a replacement"
+        );
+
+        for part in &head.parts {
+            let part_stats = part
+                .column_stats
+                .clone()
+                .expect("every newly written part carries its own field 7 ref");
+            assert_eq!(
+                part_stats.part_blake3,
+                vec![part.blake3.clone()],
+                "the v3 object's own part_blake3 names exactly this part"
+            );
+            assert_eq!(
+                part_stats.segment_count, 1,
+                "one entry per part in this fixture"
+            );
+
+            let got = store
+                .get(&part_stats.key, GetRange::Full)
+                .await
+                .expect("v3 object present at its declared key");
+            assert_eq!(got.data.len() as u64, part_stats.size);
+            assert_eq!(
+                blake3::hash(&got.data).as_bytes().to_vec(),
+                part_stats.blake3
+            );
+            let decoded = snapshot_format::decode_column_stats(
+                &got.data,
+                &crate::snapshot_format::ColumnStatsLimits::default(),
+            )
+            .expect("v3 decodes");
+            assert_eq!(
+                decoded.header.format_version, 3,
+                "per-part object is envelope v3"
+            );
+            assert_eq!(decoded.segments.len(), 1);
+            assert_eq!(
+                decoded.header.part_blake3,
+                vec![part.blake3.clone()],
+                "decoded header's part_blake3 matches the ref"
+            );
+        }
+    }
+
+    /// ADR-1413 decision 4: a part whose per-part column-statistics object
+    /// would exceed `per_part_column_stats_bound` fails the WHOLE fold with a
+    /// typed error naming the part, the declared size, and the bound. It
+    /// never publishes a truncated v3 object, and it never silently drops v3
+    /// and carries on with only the v1/v2 whole-tenant objects.
+    #[tokio::test]
+    async fn fold_refuses_a_part_whose_stats_exceed_the_per_part_bound_and_writes_no_object() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        // One L0 segment (entry_count == 1) carrying enough distinct `status`
+        // values that its dictionary alone exceeds
+        // per_part_column_stats_bound(1, 1) ==
+        // PER_SEGMENT_COLUMN_STATS_BOUND_BYTES (54_712 bytes), while staying
+        // under DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES (10_000) so the
+        // dictionary stays present instead of degrading to min/max/sum only.
+        let statuses: Vec<i64> = (0..8_000).collect();
+        publish_logs_segment(store.as_ref(), 0, 10, &statuses).await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect_err("an over-bound part fails the whole fold");
+        match err {
+            CatalogError::ColumnStatsPartOverBound {
+                part_key,
+                declared,
+                bound,
+            } => {
+                assert!(
+                    part_key.contains(".csnap"),
+                    "error names the part object's own key, got {part_key}"
+                );
+                assert_eq!(
+                    bound,
+                    crate::snapshot_format::per_part_column_stats_bound(1, 1),
+                    "one entry, one declared column"
+                );
+                assert!(
+                    declared > bound,
+                    "declared {declared} must exceed bound {bound} for this to be the refusal path"
+                );
+            }
+            other => panic!("expected ColumnStatsPartOverBound, got {other:?}"),
+        }
+
+        // No column-stats object of any version was ever published: the
+        // fold bailed out of the per-part loop before it could reach the
+        // whole-tenant v1/v2 builds that run after it.
+        let keys = list_all_keys(store.as_ref(), &format!("t/{}/", tenant().to_hex())).await;
+        assert!(
+            keys.iter().all(|k| !k.ends_with(".cstat")),
+            "no column-stats object of any version was written, got {keys:?}"
+        );
+        // HEAD was never written either: a failed fold must not publish any
+        // catalog state.
+        assert!(
+            store
+                .get(&head_object_key(&tenant(), Signal::Logs), GetRange::Full)
+                .await
+                .is_err(),
+            "HEAD must not exist after a fold that failed before publishing"
+        );
     }
 
     /// ADR-0942: one bucket can hold two entries that cover a byte-identical

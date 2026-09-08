@@ -508,6 +508,7 @@ fn base_head() -> SnapshotHead {
             entry_count: 2,
             watermark_hour: 5,
             min_hour: 0,
+            column_stats: None,
         }],
         postings: None,
         folder_id: vec![0x33; 16],

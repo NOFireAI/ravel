@@ -24,7 +24,7 @@ t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm              idempot
 t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapshot part (immutable)
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable)
-t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942)
+t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942, ADR-1413)
 sys/qualification                                                       store qualification record (write-once, additive)
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
@@ -502,6 +502,69 @@ and the CAS read/write helpers.
   what bounds the writer race is the no-anchor rule plus the pre-delete HEAD
   re-verify. A HEAD present but undecodable fails the pass without deleting, so
   a corrupt HEAD can never make the live snapshot look unreferenced.
+
+### Per-part column statistics (ADR-1413)
+
+`SnapshotPartRef` carries an additive field 7, `column_stats:
+SnapshotColumnStatsPartRef`, alongside the existing whole-object refs at HEAD
+field 11 (v1, ADR-0850) and field 13 (v2, ADR-0942). It points at a `.cstat`
+envelope version 3: same `RCST` header/body/CRC shape as v1 and v2, keyed by
+content hash exactly as v2 is (`ColumnStatsSegment.writer_id` is the entry's
+own content hash), but scoped to exactly the one snapshot part that owns it
+-- `ColumnStatsHeader.part_blake3` has length one, the owning part's hash,
+and `ColumnStatsHeader.segment_count` is that part's segment count. Field 7
+is absent (proto3 default) for a part with no per-part statistics; the reader
+falls back to field 13, then field 11, then to scan (ADR-1413 decision 2).
+Absence is never an error.
+
+The fold writes one v3 object per part it actually re-encodes this fold
+(never for a part carried forward by reference, since that part's `.csnap`
+bytes, and therefore its existing field-7 ref, are unchanged), immediately
+after PUTting the part object itself and under the same content-addressed
+key scheme (`column_stats_object_key(tenant, signal, part_watermark,
+hash16)`, keyed by the PART's own hash, not the fold's overall watermark).
+Like the part object's own PUT, a `StoreError::AlreadyExists` on the v3
+object's PUT is treated as success (two folders racing the same input write
+the same content-addressed bytes).
+
+**Per-part bound and refusal (ADR-1413 decisions 3-4).** Before compressing,
+`encode_column_stats_v3` checks the concatenated uncompressed body against
+`per_part_column_stats_bound(entry_count, declared_column_count) =
+entry_count * declared_column_count * PER_SEGMENT_COLUMN_STATS_BOUND_BYTES`,
+where `PER_SEGMENT_COLUMN_STATS_BOUND_BYTES = 54,712` is the measured
+bytes-per-(segment, column) figure from the ADR's ClickBench `hits`
+reference tenant (a few hundred `DictEntry` messages per wide-table
+segment/column pair, comfortably inside ADR-0850 decision 3's 10,000-entry
+dictionary ceiling). The bound is a function of what the part itself holds,
+not of the tenant's history, so unlike the old whole-object 256 MiB ceiling
+(ADR-1413 decision 3) it does not grow as the tenant does. A part whose
+statistics would exceed the bound fails the whole fold for that (tenant,
+signal, part) with the declared size and the bound in the error
+(`SnapshotFormatError::ColumnStatsPartOverBound`/
+`CatalogError::ColumnStatsPartOverBound`) and writes no object -- there is no
+silent skip and no truncated object for a reader to silently drop.
+
+**Dual-publish window.** The fold keeps writing the v1 (field 11) and v2
+(field 13) whole-object statistics unchanged alongside the new v3 per-part
+objects: retiring field 13 at the first v3 publish would be the
+writers-before-readers change ADR-0066 decision 1 forbids, since an older
+reader that ignores field 7 must still find field 13. The accepted read set
+for `.cstat` envelope versions is `{1, 2, 3}` for this window; it narrows to
+`{2, 3}` and then `{3}` only as field 13's and field 11's own reviewed
+retirement changes, each citing the recorded format floors (ADR-0066
+decision 3), independently of each other.
+
+**Known GC-sweep gap (reported, not fixed by this change; out of
+`ravel-catalog`'s scope).** The sweep rule described above
+(`ravel_maintain::sweep::sweep_unreferenced_catalog_objects`) currently
+treats only HEAD's own `column_stats.key` (field 11) and
+`column_stats_part.key` (field 13) as referenced; it does not yet walk
+`parts[].column_stats.key` (field 7) into its referenced-keys set. Until
+that sweep rule is extended, a v3 per-part object is at risk of being swept
+as unreferenced once its owning part is superseded and the object's age
+exceeds `protection_horizon_ns`, even though HEAD's current parts list still
+names it via field 7. This must be fixed in `ravel-maintain` before v3
+objects are relied upon for query correctness under GC.
 
 ### Idempotency marker body layout
 
