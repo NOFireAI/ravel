@@ -297,6 +297,7 @@ export RAVEL_S3_BUCKET=ravel-dev
 export RAVEL_S3_REGION=us-east-1
 export RAVEL_S3_ACCESS_KEY=ravel
 export RAVEL_S3_SECRET_KEY=ravel-dev-secret
+export RAVEL_AUDIT_TOKEN_KEY=998626405d16aeca71f4fac7673b55213a774ba40401709022e81a27f050ffd8
 
 cargo run -p ravel-cli -- --store s3 store qualify
 
@@ -309,7 +310,10 @@ cargo run -p ravel-server --features sql -- \
 That binds the defaults, `127.0.0.1:4318` (HTTP) and `127.0.0.1:4317` (gRPC),
 and accepts requests carrying `Authorization: Bearer devtoken` for tenant
 `acme`. The environment variables stand in for the `--s3-*` flags, and both
-binaries read them the same way. `store qualify` is idempotent: on an
+binaries read them the same way. `RAVEL_AUDIT_TOKEN_KEY` is the same
+development key the compose stack uses, needed here for the same reason: this
+bucket is unkeyed, so there is no deployment key to derive one from.
+`store qualify` is idempotent: on an
 already-qualified bucket it reports the existing record and exits 0. Drop
 `--features sql` and the same command gives you the PromQL and ingest surfaces
 without the SQL endpoint.
