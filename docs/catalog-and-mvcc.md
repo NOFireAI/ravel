@@ -519,8 +519,8 @@ Absence is never an error.
 
 The fold writes one v3 object per part it actually re-encodes this fold
 (never for a part carried forward by reference, since that part's `.csnap`
-bytes, and therefore its existing field-7 ref, are unchanged), immediately
-after PUTting the part object itself and under the same
+bytes, and therefore its existing field-7 ref, are unchanged), before
+PUTting the part object itself (so a refusal writes nothing) and under the same
 `column_stats_object_key(tenant, signal, part_watermark, stats_hash16)`
 scheme v1 and v2 use: keyed by the hash of the v3 object's OWN bytes
 (`stats_hash16`), not the part's hash. Keying by the part's hash instead
@@ -538,17 +538,17 @@ bytes."
 **Per-part ceiling and degrade (ADR-1413 decisions 3-4, amended
 2026-09-08).** The per-part ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES` (256
 MiB), the same constant `ColumnStatsLimits` already enforces on the
-whole-object v1/v2 guard, not a separate per-part formula: the original
-`entry_count * declared_column_count * PER_SEGMENT_COLUMN_STATS_BOUND_BYTES`
-bound could refuse a legal part outright (a tenant with one or two
-high-cardinality typed attribute columns near the ADR-0850 decision 3 10,000-entry
-dictionary ceiling), and a refused fold stalls that tenant's catalog
-permanently. Before compressing, the fold measures the concatenated
-uncompressed body (`column_stats_segments_concat`, the same function the
-encoder's own ceiling check and the compressor's input use) and, while it
-exceeds the ceiling, drops the single largest remaining dictionary by its
-own encoded size (scanning every (segment, column) pair each pass and
-re-measuring from scratch), marking that (segment, column)
+whole-object v1/v2 guard, not a separate per-part formula (ADR-1413's
+rejected alternatives record the proportional bound and why it lost).
+Before compressing, the fold measures the concatenated uncompressed body
+once (`column_stats_segments_concat`, the same function the encoder's own
+ceiling check and the compressor's input use), measures every (segment,
+column) dictionary's exact contribution to it once into a max-heap, and,
+while the running total exceeds the ceiling, drops the single largest
+remaining dictionary by its own encoded size, adjusting the total by the
+bytes removed; the body is measured once more after the loop and the fold
+refuses on any disagreement between the two. Each drop marks that
+(segment, column)
 `dictionary_present = false` per ADR-0850 decision 3's omit-never-truncate
 rule -- min, max, count, and sum stay exact regardless of how many
 dictionaries are dropped. `FoldReport::column_stats_dictionaries_dropped`

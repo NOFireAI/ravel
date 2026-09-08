@@ -3794,8 +3794,8 @@ mod tests {
                 .expect("sweep must succeed");
 
         // Exact key set: only the unreferenced `.cstat` is deleted; both
-        // parts and both field-7-referenced v3 objects survive. Against
-        // c82f13d0 (pre-fix), this assertion fails: `outcome.deleted == 3`,
+        // parts and both field-7-referenced v3 objects survive. Without the
+        // field-7 walk this assertion fails: `outcome.deleted == 3`,
         // with `v3_stats_a` and `v3_stats_b` both gone, because
         // `read_head_reference` never walked `part.column_stats` -- only the
         // line adding it to `referenced` inside the `for part in &head.parts`

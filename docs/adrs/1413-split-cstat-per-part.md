@@ -153,8 +153,10 @@ that (segment, column) pair gets `dictionary_present = false` and an empty
 `dictionary`, the same omitted-dictionary shape ADR-0850 decision 3 already
 uses for a column over the cardinality ceiling. min, max, count, and sum are
 never touched; only the dictionary is dropped, never truncated. The fold
-re-measures after each drop and repeats until the part fits or no dictionary
-is left.
+measures each dictionary's contribution once, drops from a max-heap while
+adjusting a running total, measures the body once more at the end and
+refuses on any disagreement, or when no dictionary is left and the body is
+still over the ceiling.
 
 Only once no dictionary is left to drop, and the dictionary-free body (the
 fixed fields: name, declared_type, non_null_count, null_count, min, max,
