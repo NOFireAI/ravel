@@ -43,7 +43,6 @@ pub use crate::budget::MAX_RESPONSE_BYTES_FLOOR;
 /// failure (D4).
 pub const MAX_PROJECTION_COLUMNS: usize = 256;
 
-const MAX_COLUMNS: usize = 256;
 const MAX_PREDICATES_APPLIED: usize = 16;
 const MAX_ORDER_BY: usize = 16;
 const MAX_MIN_COMMIT_TOKENS: usize = 64;
@@ -152,7 +151,7 @@ const SKELETON_SLACK: usize = 512;
 
 /// What every metadata list can occupy together: each list at its count
 /// bound, each entry at its per-entry bound, plus one separator per entry.
-const LIST_ALLOWANCE: usize = MAX_COLUMNS * (COLUMN_ENTRY_BOUND + 1)
+const LIST_ALLOWANCE: usize = MAX_PROJECTION_COLUMNS * (COLUMN_ENTRY_BOUND + 1)
     + MAX_PREDICATES_APPLIED * (PREDICATE_ENTRY_BOUND + 1)
     + MAX_ORDER_BY * (ORDER_BY_ENTRY_BOUND + 1)
     + MAX_MIN_COMMIT_TOKENS * (MIN_COMMIT_TOKEN_ENTRY_BOUND + 1)
@@ -839,7 +838,7 @@ impl Envelope {
     /// The count bound runs first, so an over-long entry that is about to be
     /// dropped anyway is never cut.
     fn cap_metadata_lists(&mut self) -> MetadataCaps {
-        let elided = truncate_vec(&mut self.data.columns, MAX_COLUMNS)
+        let elided = truncate_vec(&mut self.data.columns, MAX_PROJECTION_COLUMNS)
             + truncate_vec(&mut self.scope.predicates_applied, MAX_PREDICATES_APPLIED)
             + truncate_vec(&mut self.scope.order_by, MAX_ORDER_BY)
             + truncate_vec(
@@ -1967,7 +1966,7 @@ mod tests {
         );
 
         let mut envelope = Envelope::default();
-        envelope.data.columns = (0..MAX_COLUMNS)
+        envelope.data.columns = (0..MAX_PROJECTION_COLUMNS)
             .map(|i| Column {
                 name: format!("{:0>4}{}", i, "n".repeat(105)),
                 r#type: "t".repeat(30),
@@ -2164,7 +2163,7 @@ mod tests {
             let mut row: Row = cells;
             row.extend((0..uncuttable).map(|i| Cell::Int(i as i64 * 1_000_000_009)));
             let mut envelope = Envelope::default();
-            envelope.data.columns = (0..row.len().min(MAX_COLUMNS))
+            envelope.data.columns = (0..row.len().min(MAX_PROJECTION_COLUMNS))
                 .map(|i| Column {
                     name: format!("c{i}"),
                     r#type: "string".to_string(),
