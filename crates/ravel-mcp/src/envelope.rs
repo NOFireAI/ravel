@@ -566,7 +566,6 @@ mod tests {
     #[test]
     fn zero_row_envelope_with_maximal_metadata_fits_under_the_floor() {
         let mut envelope = Envelope::default();
-        envelope.status = Status::Ok;
         envelope.data.columns = (0..MAX_COLUMNS)
             .map(|i| Column {
                 name: format!("{:0>4}{}", i, "n".repeat(100)),
