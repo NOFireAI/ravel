@@ -50,6 +50,7 @@ ravel-analytics = { path = "crates/ravel-analytics", version = "0.15.0" }
 ravel-tracing-export = { path = "crates/ravel-tracing-export", version = "0.15.0" }
 ravel-affinity = { path = "crates/ravel-affinity", version = "0.15.0" }
 ravel-memory = { path = "crates/ravel-memory", version = "0.15.0" }
+ravel-mcp = { path = "crates/ravel-mcp", version = "0.15.0" }
 
 # async runtime / rpc / http
 tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
@@ -170,6 +171,16 @@ kube = { version = "4.2", default-features = false, features = ["client", "deriv
 kube-runtime = { version = "4.2" }
 k8s-openapi = { version = "0.28", features = ["v1_34"] }
 schemars = { version = "1.2", features = ["derive"] }
+
+# MCP agent surface (ADR-1374). Pinned to the exact resolved patch, not a
+# caret range: `ravel-mcp` is a new, still-settling surface and a silent minor
+# bump changing tool-schema derivation or protocol framing should be a
+# reviewed version bump, not an incidental `cargo update`. Default features
+# only (`base64`, `macros`, `server`); the transport feature
+# (`transport-streamable-http-server`) and `tower` are left for the
+# `services/ravel-server` adapter (#1381), which is the only crate that mounts
+# a transport. `ravel-mcp` itself stays transport-independent.
+rmcp = { version = "=3.2.0" }
 
 # build
 prost-build = "0.14"
