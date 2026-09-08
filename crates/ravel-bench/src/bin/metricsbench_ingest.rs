@@ -28,8 +28,8 @@ use ravel_bench::harness::{
 use ravel_bench::metrics_gen::Generator;
 use ravel_bench::metrics_ingest::{
     FamilyRecord, HttpReplayConfig, LogicalSample, MetricsIngestReport, ProfileRecord,
-    RavelReplayConfig, Substrate, parse_logical_stream, query_after_replay, replay_into_ravel,
-    replay_over_http,
+    RavelReplayConfig, RunRecord, Substrate, parse_logical_stream, query_after_replay,
+    replay_into_ravel, replay_over_http,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_ingest::{Clock, SystemClock};
@@ -182,20 +182,41 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
             series_per_instance: workload.series_per_instance(family.kind),
         })
         .collect();
+    let steps_declared = profile.samples_per_series;
+    let truncated = steps < steps_declared;
+    // A truncated run is never that profile's figures, regardless of the
+    // profile's own comparability verdict.
+    let comparable = profile.is_publishable() && !truncated;
+    let comparability_reason = if truncated {
+        format!(
+            "this run generated {steps} of profile `{}`'s {steps_declared} steps, so it is not \
+             that profile and its figures cannot be published",
+            profile.name
+        )
+    } else {
+        profile.comparability.to_string()
+    };
+    let run_record = RunRecord {
+        steps,
+        total_series_created: gen_report.total_series_created,
+        logical_input_bytes,
+        total_samples_generated: gen_report.emitted_samples,
+    };
     let profile_record = ProfileRecord {
         name: profile.name.clone(),
-        comparable: profile.is_publishable(),
-        comparability_reason: profile.comparability.to_string(),
+        comparable,
+        comparability_reason,
         active_series: profile.active_series,
-        total_series_created: gen_report.total_series_created,
+        steps_run: steps,
+        steps_declared,
         samples_per_series: profile.samples_per_series,
         scrape_interval_secs: profile.scrape_interval_secs,
         duration_secs: profile.duration_secs,
         total_samples: profile.total_samples,
         label_cardinalities: workload.label_cardinalities(profile),
-        logical_input_bytes,
         churn_basis_points_per_hour: profile.churn_basis_points_per_hour,
         families,
+        run: run_record,
     };
 
     // The in-process Ravel path: strict, durable-on-ack, commit tokens.
