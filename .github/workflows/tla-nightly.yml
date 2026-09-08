@@ -8,6 +8,20 @@
 # state-count regression, never a retry: TLC is deterministic for a fixed
 # config.
 #
+# Areas run as a matrix, one job per area (issue #1358): every area used to
+# run sequentially inside one job, and a single slow area (maintenance)
+# exceeding its per-config budget put the whole job over its own
+# timeout-minutes. Each area now gets its own job and its own 110-minute
+# ceiling, and fail-fast is off so one area's failure or timeout does not
+# cancel the others mid-run. check-tla.sh's own per-config TLC budget still
+# applies inside each job (3600s default, overridable per cfg via bands.tsv's
+# budget_s column).
+#
+# The area list below is the same list scripts/check-tla.sh's discover_areas
+# would find under formal/tla (every directory carrying a smoke config);
+# scripts/check-tla.test.sh asserts the two stay in sync, so a new area
+# cannot be silently skipped by the nightly matrix.
+#
 # workflow_dispatch exists to verify the job on a pushed branch (no local gate
 # can execute a workflow) and to run it ad hoc.
 name: tla-nightly
@@ -26,8 +40,12 @@ permissions:
 
 jobs:
   exhaustive:
+    strategy:
+      fail-fast: false
+      matrix:
+        area: [catalog, commit, common, lifecycle, maintenance, resharding]
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -43,11 +61,11 @@ jobs:
         # the default of 2 is too slow for the exhaustive budget.
         env:
           RAVEL_TLA_WORKERS: auto
-        run: scripts/check-tla.sh exhaustive
+        run: scripts/check-tla.sh exhaustive -a ${{ matrix.area }}
       - name: Upload TLC logs on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: tla-nightly-logs
+          name: tla-nightly-logs-${{ matrix.area }}
           path: .cache/tla/logs
           if-no-files-found: ignore

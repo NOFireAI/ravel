@@ -139,12 +139,26 @@ the figures. `run-id` is a UTC timestamp joined to the working tree hash
 outside its band), or `VIOLATED` (a negative control that failed as intended).
 
 Bands are optional and live in each area's `bands.tsv`, one row per config
-(`cfg`, `min_distinct`, `max_distinct`, `min_depth`, `max_depth`). When a row
-exists the harness enforces it on a PASS run and fails outside it; a run
-outside the band is a regression to investigate, not a band to widen.
-Negative controls stop at the first counterexample TLC finds, which under
-multiple workers is not deterministic, so they carry no band. `results.md`
-records the figures a run produced and the bands they must stay in.
+(`cfg`, `min_distinct`, `max_distinct`, `min_depth`, `max_depth`, and an
+optional sixth column `budget_s`). When a row exists the harness enforces
+the distinct/depth band on a PASS run and fails outside it; a run outside
+the band is a regression to investigate, not a band to widen. Negative
+controls stop at the first counterexample TLC finds, which under multiple
+workers is not deterministic, so they carry no band. `results.md` records
+the figures a run produced and the bands they must stay in.
+
+`budget_s` overrides the exhaustive lane's per-configuration wall-clock
+budget (`check_one_model` reads it via `cfg_budget`, the same awk-by-cfg-name
+lookup the distinct/depth band uses): a row that sets it replaces
+`EXHAUSTIVE_BUDGET` (3600 s) for that one config; a row with no `budget_s`,
+or no row at all, keeps the 3600 s default. `budget_s` has no effect on
+smoke or live, which always run at `SMOKE_BUDGET` (300 s) regardless of
+`bands.tsv`. Use it when one configuration is measured to need more time
+than the rest of its area's configs on the lane's actual runner (see
+`formal/tla/maintenance/bands.tsv` and its `results.md` for the worked
+example: a hosted-runner timeout measurement projecting 4,000-4,200 s
+justifies `MCMaintenanceOwnership.exhaustive.cfg`'s `budget_s = 5400`),
+rather than raising `EXHAUSTIVE_BUDGET` for every config in the lane.
 
 ## Negative controls
 
