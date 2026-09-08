@@ -2,12 +2,12 @@
 //! shipping `ravel-server` binary's start path (issue #1378): a real
 //! [`ravel_server::start`] server, not a hand-built router, spawns one
 //! `ravel_maintain::AuditPipeline` in every query-serving mode and installs
-//! its sink on every query surface (SQL, PromQL, and -- by construction,
-//! since `Maintain`/`Gateway` mount none of them -- neither).
+//! its sink at every one of the nine places `start` installs one, on both
+//! listeners, and none at all in the modes that mount no query surface.
 //!
-//! The SQL test lives behind the `sql` feature; every other test uses PromQL,
-//! which is always compiled in, so the file builds and this suite's other
-//! four tests run under both the default feature set and `--features sql`.
+//! The tests that need SQL live behind the `sql` feature; every other test
+//! uses PromQL, which is always compiled in, so the file builds and the rest
+//! of this suite runs under both the default feature set and `--features sql`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -33,6 +33,11 @@ const TENANT: &str = "acme";
 /// distinct tenant id, so the two resolve to different `TenantHash`es.
 const TOKEN_B: &str = "beta-token";
 const TENANT_B: &str = "beta";
+/// The bearer token the mTLS listener's own resolver accepts. A distinct
+/// credential, because the two listeners authenticate against different
+/// resolvers, but mapped to the same tenant as [`TOKEN`] so one audit trail
+/// holds both listeners' records.
+const MTLS_TOKEN: &str = "acme-mtls-token";
 /// The audit tokenization key the redaction tests run under, in the hex
 /// spelling `RAVEL_AUDIT_TOKEN_KEY` takes: 32 bytes of `0x01`. A fixed key
 /// makes every token below a constant, so a pinned `query.text` catches a
@@ -492,9 +497,43 @@ async fn required_mode_fails_closed_on_audit_write_fault() {
         .text()
         .await
         .expect("metrics body readable");
-    assert!(
-        metrics.contains("ravel_query_queries_total"),
-        "usage must be recorded even though the audit write failed"
+    // Usage was recorded before the audit write was attempted (the T2a
+    // order), pinned as the accounting row itself: exactly one row, keyed
+    // `error`, carrying exactly one query. The `ravel_query_*` family folds
+    // only successful queries, so a failed query's usage record lives in the
+    // outcome split alone.
+    let outcomes = running.query_accounting.outcome_snapshot();
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "exactly one usage row for the one query that ran: {outcomes:?}"
+    );
+    // `success` is the execution outcome, not the response status: step 4
+    // folds the usage record before step 5 submits the audit event, so the
+    // row states that the query ran and what it spent. The 503 the client saw
+    // is the audit step's, recorded on `ravel_audit_write_failures_total` in
+    // best-effort mode and asserted from the response here.
+    assert_eq!(
+        outcomes[0].status,
+        ravel_server::metrics::QueryOutcomeStatus::Success,
+        "the query itself ran to completion before its audit write failed"
+    );
+    assert_eq!(
+        outcomes[0].counters.queries, 1,
+        "exactly one query counted, recorded even though its audit write \
+         failed"
+    );
+    // The same query must not also count as a completed one: the success
+    // family renders no sample at all here, which is why asserting on the
+    // family name alone proves nothing (its header renders unconditionally).
+    let usage_samples: Vec<&str> = metrics
+        .lines()
+        .filter(|line| line.starts_with("ravel_query_queries_total{"))
+        .collect();
+    assert_eq!(
+        usage_samples,
+        Vec::<&str>::new(),
+        "a query that failed closed must fold into no success sample"
     );
 
     running.shutdown().await.expect("graceful shutdown");
@@ -569,11 +608,16 @@ async fn best_effort_mode_serves_the_response_and_counts_the_failure() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// `Mode::Maintain` and `Mode::Gateway` serve no query surface, so `start`
-/// installs no `AuditPipeline` for them: a request either mode does serve
-/// writes no object into the query-audit shard.
+/// `Mode::Query` installs a pipeline and a real query route through it writes
+/// a record; `Mode::Maintain` and `Mode::Gateway` serve no query surface, so
+/// `start` installs no `AuditPipeline` for them and a request either mode does
+/// serve writes no object into the query-audit shard.
+///
+/// Both directions are here on purpose. The negative cases alone pass on a
+/// process that installs a pipeline nowhere, which is exactly the regression
+/// the positive case rules out.
 #[tokio::test]
-async fn maintain_and_gateway_modes_install_no_pipeline() {
+async fn query_mode_installs_a_pipeline_and_maintain_and_gateway_do_not() {
     for mode in [Mode::Maintain, Mode::Gateway] {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let running = start_server(store.clone(), mode, Default::default()).await;
@@ -605,8 +649,50 @@ async fn maintain_and_gateway_modes_install_no_pipeline() {
             "mode {mode:?} must write zero audit objects"
         );
 
+        // With no pipeline there is no failure counter to read, so the family
+        // is absent rather than reported as a zero for a subsystem this mode
+        // never ran.
+        let metrics = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request sent")
+            .text()
+            .await
+            .expect("metrics body readable");
+        assert!(
+            !metrics.contains("ravel_audit_write_failures_total"),
+            "mode {mode:?} installs no pipeline, so it must render no \
+             audit-failure family at all"
+        );
+
         running.shutdown().await.expect("graceful shutdown");
     }
+
+    // The positive case: a query-only process does install one, and a real
+    // route through its public listener writes a record through it.
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+    let running = start_server(store.clone(), Mode::Query, Default::default()).await;
+    assert!(
+        running.has_audit_pipeline(),
+        "Mode::Query serves query surfaces, so it must install a pipeline"
+    );
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let status = run_promql(&client, &base, "m").await;
+    assert_eq!(status, 200, "Mode::Query must serve the promql surface");
+
+    let records = query_audit_records(store.as_ref(), &TenantId::new(TENANT)).await;
+    assert_eq!(
+        records.len(),
+        1,
+        "the query-only mode's promql route must write exactly one record"
+    );
+    assert_eq!(attr(&records[0], "query.language"), Some("promql"));
+
+    running.shutdown().await.expect("graceful shutdown");
 }
 
 /// The shared body of the two per-tenant routing tests: two tenants each run
@@ -852,6 +938,240 @@ async fn plaintext_mode_writes_verbatim() {
         !text.contains("tok_"),
         "the plaintext posture must introduce no token: {text}"
     );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A `Mode::All` server for `TENANT` with both listeners bound, each on its
+/// own resolver over its own token. Every query surface is mounted twice, once
+/// per listener, and each mount installs the audit sink separately.
+async fn start_server_with_mtls(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
+    let mut mtls_tokens = HashMap::new();
+    mtls_tokens.insert(MTLS_TOKEN.to_string(), TenantId::new(TENANT));
+    let mut config = server_config(
+        tokens,
+        Mode::All,
+        Default::default(),
+        vec![TenantId::new(TENANT).hash()],
+        Default::default(),
+    );
+    config.mtls_listener = Some(ravel_server::MtlsListenerConfig {
+        addr: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        resolver: ravel_server::tenant::build_resolver(mtls_tokens, false),
+    });
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
+}
+
+/// Sends `request`, asserts it succeeded, and asserts `TENANT`'s audit trail
+/// grew by exactly one record. `written` carries the running total, so a
+/// surface that writes none and a surface that writes two both fail here, and
+/// `surface` names which one so a failure points at its install site.
+async fn one_request_writes_one_record(
+    store: &dyn ObjectStoreBackend,
+    surface: &str,
+    written: &mut usize,
+    request: reqwest::RequestBuilder,
+) {
+    let response = request.send().await.expect("request sent");
+    let status = response.status();
+    let body = response.text().await.expect("response body readable");
+    assert_eq!(status, 200, "{surface} should succeed: {body}");
+    *written += 1;
+    let records = query_audit_records(store, &TenantId::new(TENANT)).await;
+    assert_eq!(
+        records.len(),
+        *written,
+        "{surface} must write exactly one query-audit record"
+    );
+}
+
+/// The window every metadata surface below resolves over, as the query-string
+/// pairs those endpoints take (Unix seconds).
+fn window_params() -> Vec<(&'static str, String)> {
+    vec![
+        ("match[]", "m".to_string()),
+        ("start", "0".to_string()),
+        ("end", NOW_S.to_string()),
+    ]
+}
+
+/// Every audit-sink install site in `start` routes to the pipeline, exercised
+/// through what a deployment can actually reach.
+///
+/// `start` installs the sink at nine places: the primary `AppState` (PromQL,
+/// labels, label_values, series), `SqlState` (`/api/v1/sql`, its mTLS clone,
+/// and Flight SQL), the primary and mTLS `AnalyticsState`, the primary and
+/// mTLS `ExemplarsState`, the primary and mTLS `QueryService`, and the mTLS
+/// `AppState`. Each is a separate line of wiring, so each can independently
+/// regress to the `NoopQueryAuditSink` the state builders install by default,
+/// which drops the event and returns success: a surface wired that way serves
+/// queries with no trail and no error. One request per surface per listener,
+/// each asserted to add exactly one record, is what makes that regression
+/// visible at any one of the nine.
+#[tokio::test]
+async fn every_sink_install_site_is_the_pipeline() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+    let running = start_server_with_mtls(store.clone()).await;
+    let public_base = format!("http://{}", running.http_addr);
+    let mtls_base = format!(
+        "http://{}",
+        running
+            .mtls_addr
+            .expect("the mTLS listener was configured, so it is bound")
+    );
+    let client = reqwest::Client::new();
+    let mut written = 0usize;
+
+    for (listener, base, token) in [
+        ("public", &public_base, TOKEN),
+        ("mtls", &mtls_base, MTLS_TOKEN),
+    ] {
+        let auth = format!("Bearer {token}");
+
+        #[cfg(feature = "sql")]
+        one_request_writes_one_record(
+            store.as_ref(),
+            &format!("{listener} sql"),
+            &mut written,
+            client
+                .post(format!("{base}/api/v1/sql"))
+                .header("authorization", auth.as_str())
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "query": "SELECT ts, value FROM samples ORDER BY ts",
+                        "start": 0.0,
+                        "end": NOW_S as f64,
+                    })
+                    .to_string(),
+                ),
+        )
+        .await;
+
+        one_request_writes_one_record(
+            store.as_ref(),
+            &format!("{listener} promql instant"),
+            &mut written,
+            client
+                .get(format!("{base}/api/v1/query"))
+                .header("authorization", auth.as_str())
+                .query(&[("query", "m"), ("time", "0")]),
+        )
+        .await;
+
+        one_request_writes_one_record(
+            store.as_ref(),
+            &format!("{listener} labels"),
+            &mut written,
+            client
+                .get(format!("{base}/api/v1/labels"))
+                .header("authorization", auth.as_str())
+                .query(&window_params()),
+        )
+        .await;
+
+        one_request_writes_one_record(
+            store.as_ref(),
+            &format!("{listener} label_values"),
+            &mut written,
+            client
+                .get(format!("{base}/api/v1/label/__name__/values"))
+                .header("authorization", auth.as_str())
+                .query(&window_params()),
+        )
+        .await;
+
+        one_request_writes_one_record(
+            store.as_ref(),
+            &format!("{listener} series"),
+            &mut written,
+            client
+                .get(format!("{base}/api/v1/series"))
+                .header("authorization", auth.as_str())
+                .query(&window_params()),
+        )
+        .await;
+
+        one_request_writes_one_record(
+            store.as_ref(),
+            &format!("{listener} analytics"),
+            &mut written,
+            client
+                .post(format!("{base}/api/v1/analytics"))
+                .header("authorization", auth.as_str())
+                .header("content-type", "application/json")
+                .body(
+                    serde_json::json!({
+                        "query": "m",
+                        "start": 0.0,
+                        "end": NOW_S as f64,
+                        "step": 60.0,
+                        "op": {"type": "summary", "percentiles": [0.5]},
+                    })
+                    .to_string(),
+                ),
+        )
+        .await;
+
+        one_request_writes_one_record(
+            store.as_ref(),
+            &format!("{listener} exemplars"),
+            &mut written,
+            client
+                .get(format!("{base}/api/v1/query_exemplars"))
+                .header("authorization", auth.as_str())
+                .query(&[
+                    ("query", "m".to_string()),
+                    ("start", "0".to_string()),
+                    ("end", NOW_S.to_string()),
+                ]),
+        )
+        .await;
+    }
+
+    // The two `QueryService` instances are install sites of their own: the
+    // in-process transport (issue #1381) takes them off `Running` rather than
+    // through a route, so no request above reaches their sink.
+    let tenant_hash = TenantId::new(TENANT).hash();
+    let instant = ravel_query::http::service::InstantRequest {
+        query: "m".to_string(),
+        time_ms: 0,
+        min_tokens: Vec::new(),
+        deadline: std::time::Duration::from_secs(30),
+        allow_partial: false,
+        now_ns: NOW_NS,
+        budgets: None,
+    };
+    for (name, service) in [
+        ("public", &running.query_service),
+        ("mtls", &running.mtls_query_service),
+    ] {
+        let service = service
+            .as_ref()
+            .unwrap_or_else(|| panic!("a query-serving mode builds the {name} query service"));
+        service
+            .promql_instant(tenant_hash, &instant)
+            .await
+            .unwrap_or_else(|err| panic!("the {name} service should serve the query: {err:?}"));
+        written += 1;
+        let records = query_audit_records(store.as_ref(), &TenantId::new(TENANT)).await;
+        assert_eq!(
+            records.len(),
+            written,
+            "the {name} query service must write exactly one query-audit record"
+        );
+    }
 
     running.shutdown().await.expect("graceful shutdown");
 }
