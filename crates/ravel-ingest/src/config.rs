@@ -121,6 +121,34 @@ pub(crate) fn checked_ingest_hour_bucket(flush_open_ns: i64) -> Result<u32, Stri
     })
 }
 
+/// Upper bound on how far the per-writer monotonic floor (ADR-1307) may hold a
+/// flush-open stamp above the raw clock reading before the flush is refused
+/// rather than stamped.
+///
+/// A backwards clock step within this bound is absorbed: the stamp is held at
+/// the floor so duplicate resolution stays monotonic, the step is counted
+/// (`clock_regressions`), and the flush proceeds. A hold larger than this is
+/// refused with a typed error (counted as `clock_regressions_refused`) and the
+/// floor re-anchors to the raw reading, because a hold this large can only
+/// arise two ways, both of which must fail loud rather than be papered over:
+///
+/// - a genuine multi-minute backwards step, which the floor cannot absorb
+///   without drifting the stamp arbitrarily far from wall time and into a
+///   stale ingest-hour bucket; and
+/// - the tail of a spurious forward glitch that already ratcheted the floor
+///   ahead of wall time. Absorbing here would stamp every later flush into a
+///   future ingest hour that LIST-discovered resolve never scans
+///   (`window_hour_bounds` caps listing at `now + clock_skew_allowance`), so
+///   one glitch would silently strand all subsequent writes. Re-anchoring on
+///   refusal means exactly the one flush that crosses the bound fails; the
+///   next normal reading proceeds.
+///
+/// Sized as the catalog clock-skew allowance (5 min) plus the fold safety
+/// margin (15 min): a stamp held at most this far above wall time still lands
+/// within the unsealed recent-hours tail every query already scans, so an
+/// absorbed step stays discoverable.
+pub(crate) const MAX_FLUSH_CLOCK_HOLD_NS: i64 = 20 * 60 * 1_000_000_000;
+
 /// All fields are overridable; defaults match the dev-sizing table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestConfig {

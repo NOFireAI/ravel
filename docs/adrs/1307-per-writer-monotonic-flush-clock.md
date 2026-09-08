@@ -38,45 +38,73 @@ contracts; none of them changes here. Only the value stamped into the existing
 ## Decision
 
 Each shard actor keeps a per-writer monotonic floor, `last_flush_open_ns`, in
-memory. At the single flush-open read site, the stamp becomes the raw reading
-raised to that floor, and the floor advances to the result:
+memory. At the single flush-open read site the raw reading is first
+plausibility-checked, then raised to that floor, in these steps:
 
-```
-stamped_ns   = raw_ns.max(last_flush_open_ns)
-last_flush_open_ns = stamped_ns
-```
+1. Read the raw clock once (`raw_ns`).
+2. Validate `raw_ns` with `checked_ingest_hour_bucket` **before** the floor is
+   consulted. A sub-floor, non-positive, or non-representable reading fails the
+   flush with a typed error. This ordering matters: raising a garbage reading
+   to an already-armed floor would produce a valid-looking `created_unix_ns`
+   and defeat the existing fail-loud sub-floor check.
+3. If `raw_ns >= last_flush_open_ns` (forward or equal), stamp `raw_ns` and
+   advance the floor to it.
+4. Otherwise the clock stepped backwards by `held_ns = last_flush_open_ns -
+   raw_ns`:
+   - If `held_ns <= MAX_FLUSH_CLOCK_HOLD_NS`, absorb it: stamp the floor
+     (unchanged), increment `clock_regressions`, and log the delta at `warn`.
+   - If `held_ns > MAX_FLUSH_CLOCK_HOLD_NS`, refuse the flush with a typed
+     error, increment `clock_regressions_refused`, log at `warn`, and
+     re-anchor the floor to `raw_ns`.
 
-When the floor holds the stamp above the raw reading (a backwards step), the
-actor increments a counter, `clock_regressions`, once and logs the absorbed
-delta at `warn`. The counter is carried per signal on each ingest metrics
-snapshot (`IngestMetrics`, `LogIngestMetrics`, `SpanIngestMetrics`) and is
-intended for Prometheus export as `ravel_ingest_clock_regressions_total`.
+`MAX_FLUSH_CLOCK_HOLD_NS` is the catalog clock-skew allowance (5 min) plus the
+fold safety margin (15 min), 20 minutes total. A stamp held at most that far
+above wall time still lands within the unsealed recent-hours tail every query
+already scans, so an absorbed step stays discoverable. A hold larger than the
+bound can only be a genuine multi-minute backwards step (which the floor cannot
+absorb without drifting the stamp arbitrarily far from wall time) or the tail
+of a spurious forward glitch that already ratcheted the floor ahead of wall
+time. Both must fail loud rather than be papered over: absorbing the latter
+would stamp every later flush into a future ingest hour that LIST-discovered
+resolve never scans (`window_hour_bounds` caps listing at `now +
+clock_skew_allowance`), silently stranding all subsequent writes. Re-anchoring
+the floor to `raw_ns` on refusal means exactly the one flush that crosses the
+bound fails, and the next normal reading proceeds; one glitch cannot pin the
+writer forever.
+
+The flush's abandonment deadline (`max_flush_lifetime`) derives from `raw_ns`,
+not from the floor-raised stamp. The deadline bounds real elapsed time before a
+slow store call is abandoned; absorbing a backwards step must not extend that
+budget. The floor-raised value is used only for `created_unix_ns` and the
+ingest-hour bucket.
+
+Both counters are carried per signal on each ingest metrics snapshot
+(`IngestMetrics`, `LogIngestMetrics`, `SpanIngestMetrics`) and are intended for
+Prometheus export under the names `ravel_ingest_clock_regressions_total` and
+`ravel_ingest_clock_regressions_refused_total` (a follow-up wires the export,
+#1473).
 
 The change is mirrored identically at all three shard actors
 (`crates/ravel-ingest/src/shard.rs`, `log_shard.rs`, `span_shard.rs`), because
 each carries its own copy of the flush-open read and hour-bucket computation.
 
 The floor is in-process state only. It is never persisted and never read back
-after a restart. A restart mints a fresh `writer_id` (IngestRouter's
-per-generation writer factory), and because `writer_id` is a component of the
-dedup key, a restarted process's records order against a prior process's by
-identity, not by the floor. The floor resets to 0 on restart by construction,
-which is correct: the guarantee it provides is per-writer within one process
-lifetime, and cross-process order already rests on the identity rule that a
-crash retires its identity (commit/README.md, ADR-0002).
-
-The floor's default of 0 preserves the fail-loud behaviour for a non-positive
-flush clock: `max(0, 0) = 0` introduces no spurious regression, and the
-hour-bucket range check still rejects the flush.
+after a restart; a fresh actor starts it at 0 by construction. The floor's
+default of 0 needs no special case for a non-positive clock: the raw
+plausibility check in step 2 rejects such a reading before the floor is
+consulted.
 
 ```mermaid
-flowchart LR
-    A["clock.now_ns()<br/>raw_ns"] --> B{"raw_ns &lt; last_flush_open_ns?"}
-    B -- "no (forward or equal)" --> C["stamped_ns = raw_ns"]
-    B -- "yes (backwards step)" --> D["stamped_ns = last_flush_open_ns<br/>clock_regressions += 1<br/>warn(delta)"]
-    C --> E["last_flush_open_ns = stamped_ns"]
-    D --> E
-    E --> F["created_unix_ns = stamped_ns<br/>pinned into flush identity"]
+flowchart TD
+    A["clock.now_ns()<br/>raw_ns"] --> V{"raw_ns plausible?<br/>(checked_ingest_hour_bucket)"}
+    V -- "no" --> R1["refuse flush<br/>typed error"]
+    V -- "yes" --> B{"raw_ns &lt; last_flush_open_ns?"}
+    B -- "no (forward or equal)" --> C["stamped = raw_ns<br/>floor = raw_ns"]
+    B -- "yes (backwards step)" --> H{"held_ns &gt; MAX_FLUSH_CLOCK_HOLD_NS?"}
+    H -- "no (within bound)" --> D["stamped = floor<br/>clock_regressions += 1<br/>warn(delta)"]
+    H -- "yes (beyond bound)" --> G["refuse flush<br/>clock_regressions_refused += 1<br/>floor = raw_ns (re-anchor)"]
+    C --> F["created_unix_ns = stamped<br/>deadline from raw_ns"]
+    D --> F
 ```
 
 ## Rejected alternatives
@@ -89,18 +117,30 @@ flowchart LR
   clock. The floor instead tracks wall time exactly except across the rare
   backwards step it absorbs.
 
-- **Refuse the flush on a backwards step.** Rejected: it turns a transient
-  clock correction into an ingest outage. A backwards NTP step is a normal
+- **Refuse every backwards step.** Rejected: it turns a transient clock
+  correction into an ingest outage. A small backwards NTP step is a normal
   operational event; the correct response is to absorb it and count it, not to
-  fail acknowledged writes. The floor keeps ingest available and makes the
-  event observable through the counter and the log.
+  fail acknowledged writes. The floor keeps ingest available for the common
+  case and makes the event observable through the counter and the log. Only a
+  step beyond `MAX_FLUSH_CLOCK_HOLD_NS` is refused, because absorbing one that
+  large would either drift the stamp arbitrarily far from wall time or leave a
+  forward glitch ratcheted into the floor forever (see the Decision).
 
-- **Persist the floor and read it back on restart.** Rejected as both
-  unnecessary and contrary to the durability model: no durability may depend on
-  local disk (repository invariant), and cross-process order is already
-  established by the fresh `writer_id`. Persisting the floor would add a
-  local-disk read to the recovery path for a guarantee the identity rule
-  already provides.
+- **Bound forward jumps instead of backward holds.** Rejected: a forward-jump
+  bound has no correct value at the first flush (floor 0) or after an idle
+  shard, where a large legitimate gap between the previous stamp and a healthy
+  current reading is indistinguishable from a glitch. The defect this ADR
+  guards is a stamp that runs *backwards*; the bound therefore constrains how
+  far the floor may hold a stamp *above* the raw reading, which is well-defined
+  at every flush.
+
+- **Persist the floor and read it back on restart.** Rejected as contrary to
+  the durability model: no durability may depend on local disk (repository
+  invariant), and no recovery path may read state another process wrote
+  locally. Persisting the floor would add a local-disk read to the recovery
+  path. A persisted floor is the only mechanism that could extend the guarantee
+  across a restart (see Known limitation); it is deliberately out of scope here
+  and would need its own ADR against the durability invariant.
 
 ## Consequences
 
@@ -110,15 +150,50 @@ flowchart LR
   in the scenario above is stamped at the floor (equal to the original), and its
   strictly greater `writer_seq` carries the tiebreak, so its full dedup key
   outranks the stale sample.
-- Every absorbed backwards step is counted (`clock_regressions`) and logged, so
-  a misbehaving clock is visible rather than silent. Prometheus export of the
-  new counter as `ravel_ingest_clock_regressions_total` from `ravel-server` is a
-  follow-up; the counter is present in the ingest metrics snapshot now.
+- Every absorbed backwards step is counted (`clock_regressions`) and every
+  refused one (`clock_regressions_refused`), and both are logged, so a
+  misbehaving clock is visible rather than silent. Prometheus export of the two
+  counters as `ravel_ingest_clock_regressions_total` and
+  `ravel_ingest_clock_regressions_refused_total` from `ravel-server` is a
+  follow-up (#1473); the counters are present in the ingest metrics snapshot
+  now.
+- A backwards step larger than `MAX_FLUSH_CLOCK_HOLD_NS` fails that one flush
+  with a typed error (strict-mode waiters see it; buffered-mode data is not
+  lost, since the flush is retried on the next trigger once the floor has
+  re-anchored). This is a deliberate, bounded availability cost paid only for a
+  clock that moved more than 20 minutes, in exchange for never stranding a
+  writer in a future ingest hour.
 - No format, schema, or key layout changes. The stamp still lands in the
   existing `created_unix_ns` field; only its monotonicity within a process
   changes.
 - A forward clock step is unaffected: the raw reading exceeds the floor, is
-  stamped verbatim, and the counter does not move.
+  stamped verbatim, and neither counter moves.
+
+## Known limitation
+
+The floor is per-process. It resets to 0 on restart, so it does not order a
+restarted process's stamps against those of the process that preceded it. If
+the host clock steps backwards across a restart, the new process's first flush
+stamps the (lower) raw reading, and a duplicate written after the restart can
+be stamped below the value it supersedes, inverting query-time resolution
+exactly as the in-process defect would.
+
+This is not closed by writer identity. `writer_id` is **not** a component of the
+query-time duplicate-resolution comparator: that comparator is
+`(created_unix_ns, writer_epoch, writer_seq, in-page index)`
+(docs/catalog-and-mvcc.md "Cross-segment duplicate samples"). `writer_id`
+appears only as a final tiebreak in the catalog's segment sort, to make the
+resolved segment order a deterministic total order; it does not decide which of
+two duplicate samples wins. So a fresh `writer_id` after a restart does not
+rescue a stamp that ran backwards across that restart.
+
+Closing this limitation requires either persisting the floor (rejected here
+against the local-disk durability invariant; see Rejected alternatives) or
+changing the duplicate-resolution comparator so a restarted writer's newer data
+is preferred by something other than the wall-clock stamp. Both are larger
+decisions than this ADR and are out of scope; this ADR bounds the far more
+common in-process case and names the cross-restart case explicitly rather than
+claiming a guarantee it does not provide.
 
 ## Formal classification
 
@@ -146,7 +221,7 @@ Modelling this defect would require adding a backwards-clock action, a
 query that resolves duplicates by that order: a new sub-model of query-time
 dedup, not a guard on an existing variable. The invariant the fix establishes,
 stated in prose, is: within one writer's process lifetime the sequence of
-`created_unix_ns` stamps it issues is non-decreasing, and cross-process order
-rests on the distinct `writer_id` component of the dedup key.
+`created_unix_ns` stamps it issues is non-decreasing. It says nothing about
+order across a restart (see Known limitation).
 
 Refs: #1307
