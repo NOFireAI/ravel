@@ -419,6 +419,12 @@ impl<'a> Generator<'a> {
     /// (would double-count overlaps) and not a per-family max (would miss
     /// values a later epoch adds beyond another family's range).
     pub fn scaling_label_cardinality(&self, steps: u64) -> u64 {
+        // A zero-step run emits no series at all, so it carries no scaling
+        // label values; `epochs_spanned` reports one epoch for it, which is
+        // right for churn arithmetic and wrong for this count.
+        if steps == 0 {
+            return 0;
+        }
         let epochs = self.epochs_spanned(steps);
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for plan in &self.plans {
@@ -1751,6 +1757,27 @@ mod tests {
             distinct_instances.len(),
             34,
             "the ci profile's generator emits 34 distinct instance values: {distinct_instances:?}"
+        );
+    }
+
+    /// A zero-step run emits no series, so it carries no scaling-label
+    /// values. `epochs_spanned` reports one epoch for `steps == 0` (the
+    /// right answer for churn arithmetic, since epoch 0 is where a run
+    /// starts), so the cardinality has to special-case it or it reports the
+    /// first epoch's values for a run that emitted nothing.
+    #[test]
+    fn scaling_label_cardinality_is_zero_for_a_run_that_emits_nothing() {
+        let workload = workload(1, clean());
+        let profile = workload.profile("ci").expect("ci profile").clone();
+        let generator = Generator::for_profile(&workload, &profile, 0);
+        assert!(
+            generator.scaling_label_cardinality(1) > 0,
+            "the one-step run is the control: it does emit series"
+        );
+        assert_eq!(
+            generator.scaling_label_cardinality(0),
+            0,
+            "a run that generates no steps emits no scaling-label values"
         );
     }
 

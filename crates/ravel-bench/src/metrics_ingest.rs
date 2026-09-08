@@ -55,12 +55,13 @@
 //! this run's actual scope, and the comparability verdict:
 //! - `name`: the `--profile` name.
 //! - `comparable`: whether these figures may be published (decision 11).
-//!   Forced `false` when `steps_run < steps_declared`, regardless of the
-//!   profile's own verdict: a truncated run is never that profile.
+//!   Forced `false` when `steps_run != steps_declared`, regardless of the
+//!   profile's own verdict: a run that stopped short or ran long is not that
+//!   profile.
 //! - `comparability_reason`: why not, present exactly when `comparable` is
 //!   `false`, absent when `true`. The workload's own `Comparability` reason,
-//!   never a second hand-written copy of it, unless the run itself was
-//!   truncated, in which case this states that instead.
+//!   never a second hand-written copy of it, unless the run's step count is
+//!   off the profile's, in which case this states that instead.
 //! - `active_series`: series alive at any one instant, as declared.
 //! - `steps_run`: steps this run actually generated (the `--steps` flag, or
 //!   `steps_declared` when unset).
@@ -592,12 +593,12 @@ pub fn build_profile_record(
     let steps_declared = profile.samples_per_series;
     // Any step count other than the profile's own: a short run is not that
     // profile's figures, and an over-long one is not either.
-    let truncated = steps_run != steps_declared;
-    let comparable = profile.is_publishable() && !truncated;
-    let comparability_reason = if truncated {
+    let off_profile = steps_run != steps_declared;
+    let comparable = profile.is_publishable() && !off_profile;
+    let comparability_reason = if off_profile {
         Some(format!(
-            "this run generated {steps_run} of profile `{}`'s {steps_declared} steps, so it is \
-             not that profile and its figures cannot be published",
+            "this run generated {steps_run} steps against profile `{}`'s {steps_declared}, so it \
+             is not that profile and its figures cannot be published",
             profile.name
         ))
     } else {
@@ -2059,6 +2060,65 @@ mod tests {
         );
     }
 
+    /// The other direction: a run PAST the profile's declared step count is
+    /// not that profile either, and `--steps` takes any value. Without this
+    /// the rule would read `steps_run < steps_declared` and an over-long run
+    /// of a comparable profile would publish as that profile.
+    #[test]
+    fn profile_record_is_non_comparable_when_the_run_exceeds_the_declared_steps() {
+        use crate::metrics_gen::Generator;
+        use crate::metrics_workload::Comparability;
+
+        let workload = ci_workload();
+        let ci = workload.profile("ci").expect("ci profile declared");
+        let steps_declared = 10;
+        let steps_run = 12;
+        let profile = Profile {
+            comparability: Comparability::Comparable,
+            samples_per_series: steps_declared,
+            ..ci.clone()
+        };
+        assert!(
+            profile.is_publishable(),
+            "this test's premise is a profile that IS comparable"
+        );
+        assert!(
+            steps_run > steps_declared,
+            "this test's premise is a run PAST the declared step count"
+        );
+
+        let (bytes, gen_report) = Generator::new(&workload, "ci", 0)
+            .expect("generator builds")
+            .generate_bytes(steps_run)
+            .expect("generates steps");
+        let record = build_profile_record(
+            &workload,
+            &profile,
+            steps_run,
+            bytes.len() as u64,
+            &gen_report,
+        );
+
+        assert!(
+            !record.comparable,
+            "a run past the declared step count is never comparable, even when the profile is"
+        );
+        let expected_reason = format!(
+            "this run generated {steps_run} steps against profile `{}`'s {steps_declared}, so it \
+             is not that profile and its figures cannot be published",
+            profile.name
+        );
+        assert_eq!(
+            record.comparability_reason,
+            Some(expected_reason),
+            "the reason names both step counts"
+        );
+        assert_eq!(
+            record.run.steps, steps_run,
+            "run.steps is what this run generated, not the declared count"
+        );
+    }
+
     /// The mirror case: a profile whose own verdict IS comparable, but the
     /// run truncates it. `comparable` must still be `false`, and the reason
     /// must be the truncation message, not the (absent) profile reason --
@@ -2106,8 +2166,8 @@ mod tests {
             "a truncated run is never comparable, even when the profile itself is"
         );
         let expected_reason = format!(
-            "this run generated {steps_run} of profile `{}`'s {steps_declared} steps, so it is \
-             not that profile and its figures cannot be published",
+            "this run generated {steps_run} steps against profile `{}`'s {steps_declared}, so it \
+             is not that profile and its figures cannot be published",
             profile.name
         );
         assert_eq!(
