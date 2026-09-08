@@ -33,3 +33,4 @@ base64 = { workspace = true }
 # production path here, which is why they are dev-only.
 ravel-catalog = { workspace = true }
 uuid = { workspace = true }
+proptest = { workspace = true }
