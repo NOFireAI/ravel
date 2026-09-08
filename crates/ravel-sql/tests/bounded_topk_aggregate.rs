@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::array::{Array, Int64Array, TimestampNanosecondArray};
 use datafusion::physical_plan::displayable;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
@@ -77,10 +77,25 @@ fn tenant() -> TenantId {
 }
 
 fn log_record(ts: i64, gid: i64, val: i64) -> LogRecord {
+    log_record_with_attrs(ts, gid, Some(val))
+}
+
+/// A record whose declared `val` attribute is entirely absent, so the `val`
+/// column reads NULL for it: the fixture for
+/// [`a_nullable_ordering_input_does_not_fire`].
+fn log_record_no_val(ts: i64, gid: i64) -> LogRecord {
+    log_record_with_attrs(ts, gid, None)
+}
+
+fn log_record_with_attrs(ts: i64, gid: i64, val: Option<i64>) -> LogRecord {
     let resource = vec![(
         "service.name".to_string(),
         AttrValue::Str("api".to_string()),
     )];
+    let mut attrs = vec![(KEY_COL.to_string(), AttrValue::I64(gid))];
+    if let Some(val) = val {
+        attrs.push((VAL_COL.to_string(), AttrValue::I64(val)));
+    }
     LogRecord {
         stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
         stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
@@ -92,23 +107,26 @@ fn log_record(ts: i64, gid: i64, val: i64) -> LogRecord {
         trace_id: None,
         span_id: None,
         flags: 0,
-        attrs: vec![
-            (KEY_COL.to_string(), AttrValue::I64(gid)),
-            (VAL_COL.to_string(), AttrValue::I64(val)),
-        ],
+        attrs,
     }
 }
 
-/// `keys` groups of one row each, group `i` carrying `val = i`, in ascending
-/// `gid` order, followed by one extra row for [`LATE_KEY`] carrying
-/// [`LATE_VALUE`].
+/// `keys` groups of one row each, group `i` carrying `val = i` and `ts = i +
+/// 1`, in ascending `gid` order, followed by one extra row for [`LATE_KEY`]
+/// carrying `ts = keys + 1` and [`LATE_VALUE`].
 ///
-/// Two properties the assertions rest on, both hand-computable:
+/// Three properties the assertions rest on, all hand-computable:
 ///
 /// - `max(val)` per group is `gid`, except [`LATE_KEY`], whose maximum is
 ///   [`LATE_VALUE`]. Every group's maximum is therefore distinct, so the top-k
 ///   by `max(val) DESC` has no ties to break and a byte-identical row
-///   comparison is meaningful.
+///   comparison is meaningful. `val` is a declared column, so it is nullable
+///   (`ravel_sql::logs_schema`); the ordering-input nullability gate refuses
+///   it, which is what the negative test dedicated to that gate exercises.
+/// - `max(ts)` per group is `gid + 1`, except [`LATE_KEY`], whose maximum is
+///   `keys + 1`, the largest `ts` any group holds. Every group's maximum is
+///   therefore distinct here too. `ts` is a fixed, non-nullable column, so
+///   this is the ordering input the admitted (positive) tests use.
 /// - `count(*)` per group is 1, except [`LATE_KEY`], whose count is 2. So the
 ///   true top-1 by count is [`LATE_KEY`], and it is the LAST group any
 ///   count-ordered stream could learn about.
@@ -172,12 +190,12 @@ fn declared() -> Vec<DeclaredColumn> {
     ]
 }
 
-/// An executor over a fresh tenant holding [`records`]`(keys)`.
+/// An executor over a fresh tenant holding `records`.
 /// `max_limit` is [`SqlConfig::bounded_topk_max_limit`]: `None` is the rule-off
 /// side of every comparison here.
-async fn executor(keys: i64, max_limit: Option<usize>) -> SqlExecutor {
+async fn executor_with_records(records: Vec<LogRecord>, max_limit: Option<usize>) -> SqlExecutor {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    publish_logs(store.as_ref(), &tenant(), &records(keys)).await;
+    publish_logs(store.as_ref(), &tenant(), &records).await;
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let config = SqlConfig {
@@ -195,6 +213,11 @@ async fn executor(keys: i64, max_limit: Option<usize>) -> SqlExecutor {
     .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared())))
 }
 
+/// An executor over a fresh tenant holding [`records`]`(keys)`.
+async fn executor(keys: i64, max_limit: Option<usize>) -> SqlExecutor {
+    executor_with_records(records(keys), max_limit).await
+}
+
 fn request(sql: &str) -> SqlRequest {
     SqlRequest {
         sql: sql.to_string(),
@@ -205,6 +228,9 @@ fn request(sql: &str) -> SqlRequest {
         min_tokens: Vec::new(),
         now_ns: 1_000_000,
         deadline: Duration::from_secs(120),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
     }
 }
 
@@ -231,7 +257,24 @@ async fn physical_plan(executor: &SqlExecutor, sql: &str) -> String {
     format!("{}", displayable(plan.as_ref()).indent(false))
 }
 
-/// Every `(Int64, Int64)` row `sql` returns, in the order it returns them.
+/// `column`'s value at `row` as `i64`, whichever of the two integer-shaped
+/// arrow types this file's aggregates return: `Int64` for `count(*)` and the
+/// group key, `Timestamp(Nanosecond)` for `max(ts)`. Both are `i64` under the
+/// hood, so one comparison type serves every test in this file.
+fn value_as_i64(column: &dyn Array, row: usize) -> i64 {
+    if let Some(a) = column.as_any().downcast_ref::<Int64Array>() {
+        return a.value(row);
+    }
+    if let Some(a) = column.as_any().downcast_ref::<TimestampNanosecondArray>() {
+        return a.value(row);
+    }
+    panic!(
+        "unsupported column type for row extraction: {:?}",
+        column.data_type()
+    );
+}
+
+/// Every `(gid, value)` row `sql` returns, in the order it returns them.
 async fn rows(executor: &SqlExecutor, sql: &str) -> Vec<(i64, i64)> {
     let outcome = executor
         .execute(tenant().hash(), &request(sql))
@@ -244,13 +287,9 @@ async fn rows(executor: &SqlExecutor, sql: &str) -> Vec<(i64, i64)> {
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("group key is Int64");
-        let values = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("aggregate is Int64");
+        let values = batch.column(1).as_ref();
         for row in 0..batch.num_rows() {
-            out.push((keys.value(row), values.value(row)));
+            out.push((keys.value(row), value_as_i64(values, row)));
         }
     }
     out
@@ -266,22 +305,25 @@ async fn peak_intermediate_bytes(executor: &SqlExecutor, sql: &str) -> u64 {
 }
 
 /// The statement the gate admits: a high-cardinality group key, a
-/// value-selective ordering aggregate, a matching sort direction, a small
-/// `LIMIT`.
+/// value-selective ordering aggregate over a fixed non-nullable column, a
+/// matching sort direction, a small `LIMIT`. Orders by `ts`, not `val`: `val`
+/// is a declared column and every declared column is nullable
+/// (`ravel_sql::logs_schema`), which the ordering-input nullability gate now
+/// refuses regardless of whether any row's `val` is actually NULL.
 fn topk_sql(limit: usize) -> String {
     format!(
-        "SELECT {KEY_COL}, max({VAL_COL}) AS m FROM logs GROUP BY {KEY_COL} \
+        "SELECT {KEY_COL}, max(ts) AS m FROM logs GROUP BY {KEY_COL} \
          ORDER BY m DESC LIMIT {limit}"
     )
 }
 
 /// The hand-computed top-`TOP_K` of [`records`]: the late group first with its
-/// late value, then the highest `gid`s, each with `max(val) = gid`.
+/// late `ts`, then the highest `gid`s, each with `max(ts) = gid + 1`.
 fn expected_top_k() -> Vec<(i64, i64)> {
-    let mut expected = vec![(LATE_KEY, LATE_VALUE)];
+    let mut expected = vec![(LATE_KEY, KEYS + 1)];
     expected.extend((0..TOP_K as i64 - 1).map(|i| {
         let gid = KEYS - 1 - i;
-        (gid, gid)
+        (gid, gid + 1)
     }));
     expected
 }
@@ -336,8 +378,8 @@ async fn q33_shape_plans_to_a_sort_over_a_two_stage_aggregate() {
 // ---------------------------------------------------------------------------
 
 /// The rule changes no answer: the same rows, in the same order, with it on and
-/// off, over 20,000 distinct keys whose top-10 is hand-computable and has no
-/// ties.
+/// off, over 200,000 (`KEYS`) distinct keys whose top-10 is hand-computable
+/// and has no ties.
 #[tokio::test]
 async fn bounded_top_k_returns_the_same_rows_as_the_unbounded_plan() {
     let sql = topk_sql(TOP_K);
@@ -350,9 +392,10 @@ async fn bounded_top_k_returns_the_same_rows_as_the_unbounded_plan() {
 
 /// The eviction-soundness case the exactness argument rests on.
 ///
-/// [`LATE_KEY`]'s running maximum is 7 while 19,993 groups with larger maxima
-/// stream past it, so it is below the k-th best for all but the last row of the
-/// scan; that last row makes it the largest group of all. A bounded aggregate
+/// [`LATE_KEY`]'s running maximum is 8 (`ts` of its one row in the main loop)
+/// while 199,992 groups with larger maxima stream past it, so it is below the
+/// k-th best for all but the last row of the scan; that last row, carrying
+/// `ts = KEYS + 1`, makes it the largest group of all. A bounded aggregate
 /// that compared groups on partial state, or that could not readmit a group
 /// after dropping it, returns a top-k without it. Asserted at rank 1
 /// specifically, not merely present.
@@ -360,7 +403,7 @@ async fn bounded_top_k_returns_the_same_rows_as_the_unbounded_plan() {
 async fn a_group_overtaken_at_the_last_row_is_still_first_in_the_top_k() {
     let sql = topk_sql(TOP_K);
     let out = rows(&executor(KEYS, Some(TOP_K)).await, &sql).await;
-    assert_eq!(out[0], (LATE_KEY, LATE_VALUE), "full top-k: {out:?}");
+    assert_eq!(out[0], (LATE_KEY, KEYS + 1), "full top-k: {out:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +441,7 @@ async fn avg_ordering_does_not_fire() {
 #[tokio::test]
 async fn min_ordered_descending_does_not_fire() {
     let sql = format!(
-        "SELECT {KEY_COL}, min({VAL_COL}) AS m FROM logs GROUP BY {KEY_COL} \
+        "SELECT {KEY_COL}, min(ts) AS m FROM logs GROUP BY {KEY_COL} \
          ORDER BY m DESC LIMIT {TOP_K}"
     );
     assert_plan_unchanged(&sql, "a min-ordered descending top-k").await;
@@ -410,7 +453,7 @@ async fn min_ordered_descending_does_not_fire() {
 #[tokio::test]
 async fn ordering_by_the_group_key_does_not_fire() {
     let sql = format!(
-        "SELECT {KEY_COL}, max({VAL_COL}) AS m FROM logs GROUP BY {KEY_COL} \
+        "SELECT {KEY_COL}, max(ts) AS m FROM logs GROUP BY {KEY_COL} \
          ORDER BY {KEY_COL} DESC LIMIT {TOP_K}"
     );
     assert_plan_unchanged(&sql, "a group-key-ordered top-k").await;
@@ -429,9 +472,8 @@ async fn a_limit_above_the_threshold_does_not_fire() {
 /// group whatever any aggregate below it does, so there is no `k` to bound by.
 #[tokio::test]
 async fn no_limit_does_not_fire() {
-    let sql = format!(
-        "SELECT {KEY_COL}, max({VAL_COL}) AS m FROM logs GROUP BY {KEY_COL} ORDER BY m DESC"
-    );
+    let sql =
+        format!("SELECT {KEY_COL}, max(ts) AS m FROM logs GROUP BY {KEY_COL} ORDER BY m DESC");
     assert_plan_unchanged(&sql, "an unlimited sort").await;
 }
 
@@ -441,8 +483,8 @@ async fn no_limit_does_not_fire() {
 #[tokio::test]
 async fn a_having_clause_does_not_fire() {
     let sql = format!(
-        "SELECT {KEY_COL}, max({VAL_COL}) AS m FROM logs GROUP BY {KEY_COL} \
-         HAVING max({VAL_COL}) > 5 ORDER BY m DESC LIMIT {TOP_K}"
+        "SELECT {KEY_COL}, max(ts) AS m FROM logs GROUP BY {KEY_COL} \
+         HAVING max(ts) > to_timestamp_nanos(5) ORDER BY m DESC LIMIT {TOP_K}"
     );
     assert_plan_unchanged(&sql, "a HAVING-filtered top-k").await;
 }
@@ -482,6 +524,128 @@ async fn sum_ordering_does_not_fire() {
     assert_plan_unchanged(&sql, "a sum-ordered top-k").await;
 }
 
+/// Distinct group-key count for [`a_nullable_ordering_input_does_not_fire`]'s
+/// fixture. Small and separate from [`KEYS`]/[`SMALL_KEYS`]: this test is
+/// about one property, a NULL ordering input, not about scale.
+const NULL_FIXTURE_KEYS: i64 = 100;
+
+/// The group whose one row omits `val` entirely: the reviewer's probe. Under
+/// `ORDER BY max(val) DESC` (the default `NULLS FIRST`) it must rank first in
+/// both the unbounded answer and, because the gate refuses this ordering
+/// input, the "bounded" one too.
+const NULL_GROUP: i64 = 999_999;
+
+/// `keys` groups of one row each carrying `val = gid`, plus one more group,
+/// [`NULL_GROUP`], whose row has no `val` attribute at all.
+fn records_with_a_null_group(keys: i64) -> Vec<LogRecord> {
+    let mut out: Vec<LogRecord> = (0..keys).map(|i| log_record(i + 1, i, i)).collect();
+    out.push(log_record_no_val(keys + 1, NULL_GROUP));
+    out
+}
+
+/// Every `(gid, Option<value>)` row `sql` returns, in the order it returns
+/// them. Unlike [`rows`], this keeps NULL visible, because the property under
+/// test is which group ranks first and an all-NULL group has no `i64` to
+/// report.
+async fn rows_nullable(executor: &SqlExecutor, sql: &str) -> Vec<(i64, Option<i64>)> {
+    let outcome = executor
+        .execute(tenant().hash(), &request(sql))
+        .await
+        .expect("query runs");
+    let mut out = Vec::new();
+    for batch in outcome.output.batches() {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("group key is Int64");
+        let values = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("aggregate is Int64");
+        for row in 0..batch.num_rows() {
+            let value = if values.is_null(row) {
+                None
+            } else {
+                Some(values.value(row))
+            };
+            out.push((keys.value(row), value));
+        }
+    }
+    out
+}
+
+/// Conjunct: the ordering aggregate's own input must be a plain column the
+/// input schema marks non-nullable.
+///
+/// DataFusion's priority map never admits a group whose ordering value is
+/// NULL. [`NULL_GROUP`]'s only row omits `val`, so under the default `NULLS
+/// FIRST` it ranks first in the unbounded answer; a rule that let this
+/// ordering input through would silently drop it instead. That is the
+/// reviewer's probe: unbounded `[(999999, None), (99, Some(99)), (98,
+/// Some(98))]` against a would-be bounded `[(99, Some(99)), (98, Some(98)),
+/// (97, Some(97))]`.
+///
+/// Both halves are asserted here: the plan is the unbounded one, and the
+/// returned rows put the all-NULL group first regardless of which plan ran.
+#[tokio::test]
+async fn a_nullable_ordering_input_does_not_fire() {
+    let sql = format!(
+        "SELECT {KEY_COL}, max({VAL_COL}) AS m FROM logs GROUP BY {KEY_COL} \
+         ORDER BY m DESC LIMIT 3"
+    );
+    let on = physical_plan(
+        &executor_with_records(records_with_a_null_group(NULL_FIXTURE_KEYS), Some(3)).await,
+        &sql,
+    )
+    .await;
+    let off = physical_plan(
+        &executor_with_records(records_with_a_null_group(NULL_FIXTURE_KEYS), None).await,
+        &sql,
+    )
+    .await;
+    assert_eq!(on, off, "the rule fired on a nullable ordering input");
+
+    let out = rows_nullable(
+        &executor_with_records(records_with_a_null_group(NULL_FIXTURE_KEYS), Some(3)).await,
+        &sql,
+    )
+    .await;
+    assert_eq!(
+        out,
+        vec![
+            (NULL_GROUP, None),
+            (NULL_FIXTURE_KEYS - 1, Some(NULL_FIXTURE_KEYS - 1)),
+            (NULL_FIXTURE_KEYS - 2, Some(NULL_FIXTURE_KEYS - 2)),
+        ],
+        "full top-3: {out:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The rule actually fires
+// ---------------------------------------------------------------------------
+
+/// No test above this one asserts that the rule CHANGES the plan when it
+/// fires: a rule stubbed to `Transformed::no` on every node would still pass
+/// every negative test (plan unchanged is the point) and the answer-identity
+/// tests (an unbounded plan answers the same query correctly too). Only this
+/// test and the bytes test below would catch that stub, and this one names
+/// the mechanism directly: the rule-on plan differs from the rule-off plan,
+/// and it carries the aggregate's limit marker.
+#[tokio::test]
+async fn the_rule_rewrites_the_gated_shape() {
+    let sql = topk_sql(TOP_K);
+    let on = physical_plan(&executor(SMALL_KEYS, Some(TOP_K)).await, &sql).await;
+    let off = physical_plan(&executor(SMALL_KEYS, None).await, &sql).await;
+    assert_ne!(on, off, "the rule did not change the plan:\n{on}");
+    assert!(
+        on.contains(&format!("lim=[{TOP_K}]")),
+        "the rule-on plan carries no limit marker:\n{on}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The bound
 // ---------------------------------------------------------------------------
@@ -494,9 +658,9 @@ async fn sum_ordering_does_not_fire() {
 const PEAK_ON_SMALL: u64 = 1_050_112;
 
 /// The same statement over the 200,000-key fixture with the rule installed.
-/// Ten times the groups for 1.75 times the bytes, and the growth that is left
+/// Ten times the groups for 1.62 times the bytes, and the growth that is left
 /// is the scan's own batches, not aggregate state.
-const PEAK_ON_LARGE: u64 = 1_837_456;
+const PEAK_ON_LARGE: u64 = 1_706_120;
 
 /// The 20,000-key fixture with the rule uninstalled.
 const PEAK_OFF_SMALL: u64 = 1_143_552;
@@ -510,17 +674,17 @@ const PEAK_OFF_LARGE: u64 = 10_748_928;
 ///
 /// With the rule off, `peak_intermediate_bytes` for the admitted statement
 /// grows with the distinct-key count (9.4x for 10x the keys): the aggregate
-/// holds one accumulator per group. With the rule on it does not (1.75x, and
+/// holds one accumulator per group. With the rule on it does not (1.62x, and
 /// that residue is scan batches), because the aggregate holds `k` groups
 /// whatever the key count is. At the large fixture the ratio between the two
-/// is 5.85x.
+/// is 6.30x.
 ///
 /// All four figures are pinned, and the three ratios are asserted separately so
 /// a change that moved every figure by the same factor still has to explain
 /// itself. Changing `Some(TOP_K)` to `None` on the `on_large` line below is the
 /// demonstration that the bound assertion is load-bearing: `on_large` becomes
 /// `PEAK_OFF_LARGE` and the first assertion, `assert_eq!(on_large,
-/// PEAK_ON_LARGE, ...)`, fails with `10748928` against `1837456`.
+/// PEAK_ON_LARGE, ...)`, fails with `10748928` against `1706120`.
 #[tokio::test]
 async fn peak_intermediate_bytes_stops_scaling_with_the_key_count() {
     let sql = topk_sql(TOP_K);

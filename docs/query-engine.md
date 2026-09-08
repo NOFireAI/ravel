@@ -2752,7 +2752,7 @@ its 16-block, 41-column fixture phase 1 decodes 3 pages per block against the
 single-phase plan's 39 over the same 16 blocks, and un-cached, a `k = 10`
 statement moves 103,606 bytes in 14 GETs against a single pass's 29,645 in 4.
 
-#### Bounded top-k grouped aggregation (issue #1402)
+#### Bounded top-k grouped aggregation
 
 `BoundedTopKAggregate` is a physical optimizer rule (installed by
 `build_session` when `SqlConfig::bounded_topk_max_limit` is `Some`) that stops
@@ -2764,8 +2764,9 @@ every node between that sort and the aggregate is a coalesce, a repartition, a
 cooperative wrapper, or a renaming projection (a `HAVING` filter refuses, since
 it decides which groups reach the sort); the aggregate has exactly one group
 key, no `FILTER` clause, and exactly one aggregate expression; that aggregate is
-`max` under a descending sort or `min` under an ascending one; and its input
-type is not floating point. Under those conditions the aggregate is rebuilt with
+`max` under a descending sort or `min` under an ascending one; its input type
+is not floating point; and its input is a plain column that the input schema
+marks non-nullable. Under those conditions the aggregate is rebuilt with
 DataFusion's `LimitOptions`, which executes it as a bounded priority map of `k`
 groups. Outside them the plan is byte-identical to the one the uninstalled rule
 produces, which `crates/ravel-sql/tests/bounded_topk_aggregate.rs` asserts for
@@ -2781,18 +2782,37 @@ this treatment even though they are monotone non-decreasing, because
 monotonicity makes a running value a *lower* bound on the final one and pruning
 needs an upper bound: `ORDER BY count(*) DESC LIMIT 1` over the row sequence
 `A, B, B, B` would evict `B` three times at a running count of 1 and answer `A`
-with 1 instead of `B` with 3. The float exclusion is the ADR-0023 total order:
-the priority map compares values itself and never constructs ravel's
-total-order min/max accumulator, so a float input routed through it would answer
-under DataFusion's ordering of `-0.0` and NaN payloads rather than ravel's.
-DataFusion's own `TopKAggregation` rule, which admits both of those shapes and
-defaults on, is turned off in `session_config` for exactly this reason.
+with 1 instead of `B` with 3. The float exclusion keeps the answer provably
+ravel's: the priority map's heap orders floats with `total_cmp`, the same
+comparison ADR-0023 mandates, but its worse-than pre-check compares with
+`PartialOrd` instead, so whether `-0.0` against `0.0` and NaN payloads end up
+ordered the way ADR-0023 requires is not something this rule can prove.
+DataFusion's own `TopKAggregation` rule, which admits float input (and an
+unbounded `LIMIT`), defaults on and is turned off in `session_config` for
+exactly this reason.
 
-On the test fixture (200,000 distinct keys, `ORDER BY max(val) DESC LIMIT 10`)
-`peakIntermediateBytes` is 1,837,456 with the rule installed against 10,748,928
+The ordering-input nullability conjunct closes a separate hole: DataFusion's
+priority map never admits a group whose ordering value is NULL, so under the
+default `NULLS FIRST` such a group belongs first in the unbounded answer, and
+under `NULLS LAST` it still belongs whenever fewer than `k` non-null groups
+exist. A plain column the input schema marks non-nullable is the only input
+this rule can prove the map's NULL-blind admission exact for. Every typed
+attribute column is nullable by construction
+(`crates/ravel-sql/src/logs_schema.rs`), so today the conjunct only admits a
+fixed column such as `ts`, `severity_num`, or `flags`; widening it to a typed
+attribute column needs a statistics-derived proof that the column holds no
+NULLs, which is a separate change. At a tie on the k-th value the bounded map
+keeps the later-arriving group, and the unbounded sort's own tie-break is
+arrival-order dependent too; SQL leaves that order unspecified.
+
+On the test fixture (200,000 distinct keys, `ORDER BY max(ts) DESC LIMIT 10`)
+`peakIntermediateBytes` is 1,706,120 with the rule installed against 10,748,928
 without it. Across a tenfold increase in distinct keys the rule-off figure grows
-9.4x and the rule-on figure 1.75x, and the residual growth on the rule-on side
-is the scan's own batches rather than aggregate state.
+9.4x and the rule-on figure 1.62x, and the residual growth on the rule-on side
+is the scan's own batches rather than aggregate state. The statement orders by
+`ts`, a fixed non-nullable column, rather than a typed attribute column: a
+typed attribute column is always nullable and the ordering-input conjunct
+above refuses it regardless of whether any row's value is actually NULL.
 
 Both gaps ADR-0033 recorded are now closed. Both were deliberate, not
 oversights.
