@@ -1152,6 +1152,90 @@ mod tests {
         }
     }
 
+    /// A pin with every field set to a distinct non-default value, for
+    /// [`segment_pin_wire_bytes_are_pinned_inside_a_flight_ticket`].
+    fn golden_pin() -> SegmentPin {
+        SegmentPin {
+            data_object_key: "t/aa/metrics/l1/0002/w.7.8.abcdef.rseg".to_owned(),
+            object_size: 123_456,
+            min_event_ts_ns: 1_700_000_000_000_000_001,
+            max_event_ts_ns: 1_700_000_000_100_000_002,
+            ingest_hour_bucket: 472_183,
+            sample_count: 9_001,
+            series_count: 42,
+            shard: 7,
+            content_hash: [0xabu8; 32],
+            writer_id: Uuid::from_u128(0x0123_4567_89ab_cdef_0011_2233_4455_6677),
+            writer_epoch: 3,
+            writer_seq: 99,
+            created_unix_ns: 1_700_000_000_200_000_003,
+            level: SegmentLevel::L1 {
+                input_set_hash: [0xcdu8; 32],
+                part_index: 5,
+            },
+            segment_format_version: 4,
+        }
+    }
+
+    /// The frozen wire form of [`golden_pin`]: the exact bytes
+    /// `SegmentPin::encode_into` writes for it, as hex. This literal changes
+    /// only with an ADR and a version bump to the pin's wire layout
+    /// (ADR-1374 decision 9): a codec change that reorders, widens, or drops
+    /// a field must show up here as a diff a reviewer has to approve, not as
+    /// a silently different set of bytes an older worker can no longer read.
+    const GOLDEN_PIN_HEX: &str = "0300000000000000630000000000000003c21542fe9c971740e2010\
+        00000000001002a36fe9c971702e11f3cfe9c971729230000000000002a0000000000000077340700070\
+        00000abababababababababababababababababababababababababababababababab0123456789abcde\
+        f001122334455667726000000742f61612f6d6574726963732f6c312f303030322f772e372e382e616263\
+        6465662e7273656701cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd05000\
+        00004000000";
+
+    /// [`SegmentPin::encode_into`] must produce the same bytes
+    /// [`FlightTicket::encode`] writes for the identical pin inside a
+    /// ticket (both call the same private `write_segment_pin`, but this
+    /// checks the public API contract, not the implementation sharing), the
+    /// exact wire form is pinned as a golden hex literal so a drift in the
+    /// frozen layout is caught here, and [`SegmentPin::decode_from`] must
+    /// report a consumed length equal to the encoded pin's own length,
+    /// leaving trailing bytes for the caller rather than erroring on them.
+    #[test]
+    fn segment_pin_wire_bytes_are_pinned_inside_a_flight_ticket() {
+        let pin = golden_pin();
+
+        let mut pin_bytes = Vec::new();
+        pin.encode_into(&mut pin_bytes).expect("encode_into");
+        assert_eq!(hex::encode(&pin_bytes), GOLDEN_PIN_HEX);
+
+        let ticket = FlightTicket {
+            segments: vec![pin.clone()],
+            ..sample_ticket()
+        };
+        let encoded = ticket.encode(&test_key()).expect("ticket encode");
+        let offset = encoded
+            .windows(pin_bytes.len())
+            .position(|window| window == pin_bytes.as_slice())
+            .expect("the pin's own bytes appear verbatim inside the encoded ticket");
+        assert_eq!(
+            &encoded[offset..offset + pin_bytes.len()],
+            pin_bytes.as_slice()
+        );
+
+        let (decoded, consumed) = SegmentPin::decode_from(&pin_bytes).expect("decode_from");
+        assert_eq!(decoded, pin);
+        assert_eq!(consumed, pin_bytes.len());
+
+        let mut with_trailing_garbage = pin_bytes.clone();
+        with_trailing_garbage.extend_from_slice(&[0xffu8; 16]);
+        let (decoded_with_garbage, consumed_with_garbage) =
+            SegmentPin::decode_from(&with_trailing_garbage).expect("decode_from with trailing");
+        assert_eq!(decoded_with_garbage, pin);
+        assert_eq!(
+            consumed_with_garbage,
+            pin_bytes.len(),
+            "trailing garbage must not be consumed"
+        );
+    }
+
     /// A redeemed ticket reports no pruning of its own. The pin already holds
     /// the post-prune segment set from `GetFlightInfo`, so a nonzero count
     /// here would double-count segments the original resolve already dropped.
