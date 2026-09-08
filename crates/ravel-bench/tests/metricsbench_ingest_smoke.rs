@@ -184,10 +184,15 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     let report = run_lane_with_steps(STEPS);
     let profile = &report["profile"];
 
+    // This run truncates the profile (STEPS < samples_per_series, asserted
+    // below), so this only exercises the truncation branch of
+    // `build_profile_record`, not the `ci` profile's own non-comparable
+    // verdict -- a full, untruncated `ci` run is covered separately by
+    // `metrics_ingest::tests::profile_record_is_non_comparable_for_the_profiles_own_reason_when_not_truncated`.
     assert_eq!(
         profile["comparable"].as_bool(),
         Some(false),
-        "the `ci` profile is never comparable (ADR-0927 decision 11)"
+        "a truncated run is never comparable, regardless of the profile's own verdict"
     );
     let reason = profile["comparability_reason"]
         .as_str()
@@ -195,6 +200,10 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     assert!(
         !reason.is_empty(),
         "a non-comparable profile must state why, not leave the reason blank"
+    );
+    assert!(
+        reason.contains("steps"),
+        "a truncated run's reason must state the truncation, not the profile's own verdict: {reason}"
     );
     assert_eq!(profile["name"].as_str(), Some("ci"));
     assert_eq!(
