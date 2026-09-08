@@ -33,6 +33,12 @@ const TENANT: &str = "acme";
 /// distinct tenant id, so the two resolve to different `TenantHash`es.
 const TOKEN_B: &str = "beta-token";
 const TENANT_B: &str = "beta";
+/// The audit tokenization key the redaction tests run under, in the hex
+/// spelling `RAVEL_AUDIT_TOKEN_KEY` takes: 32 bytes of `0x01`. A fixed key
+/// makes every token below a constant, so a pinned `query.text` catches a
+/// changed token shape or a literal position that stopped being redacted.
+const AUDIT_TOKEN_KEY_HEX: &str =
+    "0101010101010101010101010101010101010101010101010101010101010101";
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// Small so `Catalog::resolve` issues few LISTs, matching `sql_endpoint.rs`
 /// and `otlp_trace_export_e2e.rs`.
@@ -125,10 +131,11 @@ fn server_config(
     mode: Mode,
     audit_pipeline: ravel_maintain::AuditPipelineConfig,
     fold_tenants: Vec<TenantHash>,
+    audit_text: ravel_maintain::AuditTextPolicy,
 ) -> ServerConfig {
     ServerConfig {
         audit_pipeline,
-        audit_text: Default::default(),
+        audit_text,
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,
@@ -191,8 +198,34 @@ async fn start_server(
         audit_pipeline,
         &[(TOKEN, TENANT)],
         vec![TenantId::new(TENANT).hash()],
+        Default::default(),
     )
     .await
+}
+
+/// The `--audit-text redacted` posture under a fixed tokenization key,
+/// resolved through the same `config` entry point `main` uses, so the tokens
+/// the redaction tests pin are constants rather than values discovered at run
+/// time.
+fn redacted_text_policy() -> ravel_maintain::AuditTextPolicy {
+    ravel_server::config::resolve_audit_text_policy(
+        ravel_server::config::AuditTextArg::Redacted,
+        Some(AUDIT_TOKEN_KEY_HEX),
+        None,
+    )
+    .expect("an explicit key resolves the redacted posture")
+}
+
+/// The `--audit-text plaintext` posture, resolved through the same entry point
+/// as [`redacted_text_policy`] so the flag-to-posture mapping is under test
+/// rather than assumed.
+fn plaintext_text_policy() -> ravel_maintain::AuditTextPolicy {
+    ravel_server::config::resolve_audit_text_policy(
+        ravel_server::config::AuditTextArg::Plaintext,
+        None,
+        None,
+    )
+    .expect("the plaintext posture resolves without a key")
 }
 
 /// [`start_server`] with an explicit bearer-token table and `fold_tenants`
@@ -204,13 +237,14 @@ async fn start_server_with(
     audit_pipeline: ravel_maintain::AuditPipelineConfig,
     token_pairs: &[(&str, &str)],
     fold_tenants: Vec<TenantHash>,
+    audit_text: ravel_maintain::AuditTextPolicy,
 ) -> ravel_server::Running {
     let mut tokens = HashMap::new();
     for (token, tenant) in token_pairs {
         tokens.insert((*token).to_string(), TenantId::new(*tenant));
     }
     ravel_server::start(
-        server_config(tokens, mode, audit_pipeline, fold_tenants),
+        server_config(tokens, mode, audit_pipeline, fold_tenants, audit_text),
         store.clone(),
         store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
@@ -579,6 +613,7 @@ async fn two_tenants_each_read_only_their_own_audit(fold_tenants: Vec<TenantHash
         Default::default(),
         &[(TOKEN, TENANT), (TOKEN_B, TENANT_B)],
         fold_tenants,
+        Default::default(),
     )
     .await;
     let base = format!("http://{}", running.http_addr);
@@ -688,4 +723,120 @@ async fn two_tenants_read_only_their_own_query_audit() {
 #[tokio::test]
 async fn empty_fold_tenants_still_routes_audit_per_tenant() {
     two_tenants_each_read_only_their_own_audit(Vec::new()).await;
+}
+
+/// [`start_server`] for `TENANT` alone under an explicit `--audit-text`
+/// posture, which is the only variable the three redaction tests below change.
+async fn start_server_text(
+    store: Arc<dyn ObjectStoreBackend>,
+    audit_text: ravel_maintain::AuditTextPolicy,
+) -> ravel_server::Running {
+    start_server_with(
+        store,
+        Mode::All,
+        Default::default(),
+        &[(TOKEN, TENANT)],
+        vec![TenantId::new(TENANT).hash()],
+        audit_text,
+    )
+    .await
+}
+
+/// Runs one PromQL instant query as `TOKEN` and returns the response status.
+async fn run_promql(client: &reqwest::Client, base: &str, query: &str) -> reqwest::StatusCode {
+    client
+        .get(format!("{base}/api/v1/query"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[("query", query), ("time", "0")])
+        .send()
+        .await
+        .expect("query request sent")
+        .status()
+}
+
+/// The single `query.text` attribute of the single `kind=query` record
+/// `TENANT`'s audit shard holds. Both counts are exact: a second record, or a
+/// record without the attribute, is a failure rather than a silent `None`.
+async fn only_audit_query_text(store: &dyn ObjectStoreBackend) -> String {
+    let records = query_audit_records(store, &TenantId::new(TENANT)).await;
+    assert_eq!(records.len(), 1, "exactly one query-audit record");
+    attr(&records[0], "query.text")
+        .expect("the record carries a string query.text")
+        .to_string()
+}
+
+/// `--audit-text redacted`: the `query.text` stored for a SQL statement is the
+/// structure-preserving keyed tokenization, pinned exactly. Table name, column
+/// names, the function name, the operator, and `ORDER BY` stay readable; both
+/// string literals become tokens; neither literal appears anywhere in the
+/// record.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn redacted_mode_tokenizes_sql_string_literals_and_keeps_structure() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+    let running = start_server_text(store.clone(), redacted_text_policy()).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let sql = "SELECT ts, value FROM samples WHERE label(labels, '__name__') = 'm' ORDER BY ts";
+    let (status, value) = run_sql(&client, &base, TOKEN, sql, 0, NOW_S).await;
+    assert_eq!(status, 200, "the sql query should succeed: {value}");
+
+    let text = only_audit_query_text(store.as_ref()).await;
+    assert_eq!(
+        text,
+        "SELECT ts, value FROM samples WHERE label(labels, 'tok_0d2d088dbe1acaea') \
+         = 'tok_784cf4b979581a8d' ORDER BY ts",
+        "the stored text must be the tokenized statement"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// `--audit-text redacted`: the `query.text` stored for a PromQL expression
+/// tokenizes the label-matcher value and leaves the metric name, the matcher's
+/// label name, and the operator readable.
+#[tokio::test]
+async fn redacted_mode_tokenizes_promql_matcher_values() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+    let running = start_server_text(store.clone(), redacted_text_policy()).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let status = run_promql(&client, &base, "m{job=\"checkout\"}").await;
+    assert_eq!(status, 200, "the promql query should succeed");
+
+    let text = only_audit_query_text(store.as_ref()).await;
+    assert_eq!(
+        text, "m{job=\"tok_f43bf8c54925b9cc\"}",
+        "the stored text must be the tokenized expression"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// `--audit-text plaintext`: the opt-in posture stores the expression the
+/// caller sent, byte for byte, with no token anywhere in it.
+#[tokio::test]
+async fn plaintext_mode_writes_verbatim() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_segment(store.as_ref(), "m", &[(100, 1.0), (200, 2.5)]).await;
+    let running = start_server_text(store.clone(), plaintext_text_policy()).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let query = "m{job=\"checkout\"}";
+    let status = run_promql(&client, &base, query).await;
+    assert_eq!(status, 200, "the promql query should succeed");
+
+    let text = only_audit_query_text(store.as_ref()).await;
+    assert_eq!(text, query, "the stored text must be verbatim");
+    assert!(
+        !text.contains("tok_"),
+        "the plaintext posture must introduce no token: {text}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
 }

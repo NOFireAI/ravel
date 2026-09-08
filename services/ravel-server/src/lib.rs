@@ -455,12 +455,16 @@ pub struct ServerConfig {
     /// surface and install [`ravel_maintain::NoopQueryAuditSink`] instead,
     /// ignoring this field.
     pub audit_pipeline: ravel_maintain::AuditPipelineConfig,
-    /// The expected posture of a query-audit record's `query.text`
-    /// (ADR-0062 decision 2e), from `--audit-text`. Not yet wired to redact
-    /// anything (see docs/guides/audit.md); carried on `ServerConfig` so a
-    /// deployment's chosen posture is visible in its resolved config even
-    /// though [`start`] does not act on it yet.
-    pub audit_text: crate::config::AuditTextArg,
+    /// How a query-audit record's `query.text` is recorded (ADR-0062 decision
+    /// 2e), resolved from `--audit-text` and the audit token key by
+    /// [`crate::config::resolve_audit_text_policy`]. [`start`] wraps the
+    /// pipeline's sink with it, so the posture applies to every query surface
+    /// at once and the pipeline itself only ever sees text this policy
+    /// allowed. Defaults to
+    /// [`AuditTextPolicy::Plaintext`](ravel_maintain::AuditTextPolicy::Plaintext)
+    /// for an embedding that configures no key; a `ravel-server` process
+    /// refuses to start under `--audit-text redacted` without one.
+    pub audit_text: ravel_maintain::AuditTextPolicy,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -1325,7 +1329,13 @@ pub async fn start(
             store.clone(),
             config.audit_pipeline.clone(),
         ));
-        let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> = audit_pipeline_handle.clone();
+        // ADR-0062 decision 2e: the `--audit-text` posture is applied here,
+        // once, by wrapping the sink every surface below installs. Under
+        // `redacted` the pipeline receives already-tokenized text, so no
+        // plaintext query text reaches the RLOG object or its commit record;
+        // under `plaintext` this hands back the pipeline itself unwrapped.
+        let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> =
+            config.audit_text.wrap(audit_pipeline_handle.clone());
         running_audit_pipeline = Some(audit_pipeline_handle);
 
         // The real query engine's deadline is the value `main` validated

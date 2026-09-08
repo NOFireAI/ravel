@@ -144,6 +144,15 @@ async fn main() -> anyhow::Result<()> {
     // into every ingest path.
     let deployment_key = resolved_tenancy.deployment_key;
 
+    // ADR-0062 decision 2e: how a query-audit record carries `query.text`.
+    // Resolved here, beside the deployment key its token key can be derived
+    // from, and refused outright under `redacted` with no key available: a
+    // process that cannot tokenize must not start recording verbatim text
+    // under a flag that says it does not.
+    let audit_text = cli
+        .resolve_audit_text_policy(deployment_key.as_deref())
+        .context("failed to resolve --audit-text")?;
+
     // Per-tenant SSE-KMS routing (ADR-0062 decision 1,
     // ADR-0072 decision 2). Deferred to here, not folded into `build_store`
     // above: registering a tenant's key needs `TenantId::hash()`, which is
@@ -502,7 +511,7 @@ async fn main() -> anyhow::Result<()> {
         audit_pipeline: cli
             .resolve_audit_pipeline_config()
             .context("failed to resolve --audit-mode/--audit-max-batch/--audit-max-age")?,
-        audit_text: cli.audit_text,
+        audit_text,
     };
 
     let running =
