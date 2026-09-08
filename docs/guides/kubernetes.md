@@ -194,6 +194,7 @@ A minimal example is in
 | `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
 | `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
+| `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set, or to let the operator generate and own one. See "Query-audit token key" below. |
 | `spec.gateway.replicas` | integer | `1` | |
 | `spec.gateway.resources` | object | none | `requests` / `limits` maps, as in a Pod spec. |
 | `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
@@ -274,6 +275,19 @@ For the `sys/auth` format itself and `ravel-cli tenant token`'s own
 subcommands, see
 [operations/configuration.md](operations/configuration.md#tenancy-setup) and
 the [CLI flag reference](../reference/ravel-cli-flags.md).
+
+### Query-audit token key
+
+The query Deployment reads `RAVEL_AUDIT_TOKEN_KEY` from a Secret's `key`
+field when audit logging is enabled.
+
+Set `spec.auditTokenKeySecretRef` to supply the key explicitly. Omit it
+when `spec.deploymentKeySecretRef` is set: the server derives the key from
+the deployment key.
+
+Omit both refs and the operator generates a Secret named
+`<cluster>-audit-token-key` and never regenerates it. Gateway and maintain
+Deployments never read this key.
 
 ### Managed objects
 
