@@ -53,6 +53,22 @@ const MAX_WARNINGS: usize = 16;
 const MAX_NEXT_STEPS: usize = 8;
 const MAX_EVIDENCE: usize = 16;
 
+/// The D4 per-entry serialized-size bounds. Each is a bound on one entry's
+/// own serialized JSON -- a string entry's quotes and escapes, or a struct
+/// entry's braces, keys, and separators -- not on its source characters, so
+/// the count bound above times the bound here is the field's real wire
+/// ceiling. Their sum with the scalar allowance is the 102 KiB the ADR
+/// states, which is what keeps the fixed part under half the 256 KiB floor.
+const COLUMN_ENTRY_BOUND: usize = 160;
+const PREDICATE_ENTRY_BOUND: usize = 512;
+const ORDER_BY_ENTRY_BOUND: usize = 512;
+const MIN_COMMIT_TOKEN_ENTRY_BOUND: usize = 128;
+const FRAGMENT_ENTRY_BOUND: usize = 160;
+const UNINDEXED_PREDICATE_ENTRY_BOUND: usize = 256;
+const WARNING_ENTRY_BOUND: usize = 512;
+const NEXT_STEP_ENTRY_BOUND: usize = 512;
+const EVIDENCE_ENTRY_BOUND: usize = 512;
+
 /// The D4 per-cell floor: a cell is never cut below this serialized size,
 /// even when the whole envelope still does not fit.
 const MIN_CELL_BUDGET: usize = 256;
@@ -234,7 +250,13 @@ pub struct Presentation {
     pub bytes_cap_hit: bool,
     pub rows_omitted: u64,
     pub cells_truncated: u64,
+    /// Metadata entries dropped because their list was over its count bound.
     pub metadata_elided: u64,
+    /// Metadata entries kept but cut because the entry was over its own
+    /// per-entry serialized-size bound. Distinct from `metadata_elided`: a
+    /// dropped entry is gone, a cut one is still there and still says so
+    /// through its truncation marker.
+    pub entries_truncated: u64,
     pub effective_max_response_bytes: u64,
     pub floor_applied: bool,
     pub cursor: Option<String>,
@@ -358,6 +380,104 @@ fn truncate_vec<T>(items: &mut Vec<T>, max: usize) -> u64 {
     }
 }
 
+/// Serialized size of one entry as JSON, whatever its shape.
+fn entry_serialized_len<T: Serialize>(entry: &T) -> usize {
+    serde_json::to_string(entry)
+        .map(|text| text.len())
+        .unwrap_or(usize::MAX)
+}
+
+/// Cuts every entry of a list of plain strings to `bound` serialized bytes,
+/// and returns how many were cut.
+fn bound_string_entries(items: &mut [String], bound: usize) -> u64 {
+    let mut truncated = 0u64;
+    for item in items.iter_mut() {
+        if serialized_str_len(item) > bound {
+            *item = truncate_to_budget(item, bound);
+            truncated += 1;
+        }
+    }
+    truncated
+}
+
+/// Cuts a struct entry's variable-length string fields until the entry's own
+/// serialized size fits `bound`, and reports whether anything was cut.
+///
+/// `overhead` is the entry's serialized size minus the serialized size of
+/// those fields: the braces, the keys, and the separators, all of which are
+/// fixed by the type. So `overhead + sum(fields)` is the entry's exact
+/// serialized size, and cutting the longest field by the overshoot lands the
+/// entry on the bound in one pass. The loop exists for the case where the
+/// longest field alone cannot cover the overshoot; it ends as soon as a pass
+/// stops making progress, so no field is cut below the marker.
+fn bound_entry_fields(fields: &mut [&mut String], overhead: usize, bound: usize) -> bool {
+    let mut truncated = false;
+    loop {
+        let fields_len: usize = fields.iter().map(|field| serialized_str_len(field)).sum();
+        let total = overhead.saturating_add(fields_len);
+        if total <= bound {
+            return truncated;
+        }
+        let over = total - bound;
+        let Some(index) = (0..fields.len()).max_by_key(|&i| serialized_str_len(fields[i])) else {
+            return truncated;
+        };
+        let longest = serialized_str_len(fields[index]);
+        if longest <= MARKER_SERIALIZED_LEN {
+            return truncated;
+        }
+        let budget = longest.saturating_sub(over).max(MARKER_SERIALIZED_LEN);
+        *fields[index] = truncate_to_budget(fields[index], budget);
+        truncated = true;
+    }
+}
+
+fn bound_columns(columns: &mut [Column]) -> u64 {
+    let mut truncated = 0u64;
+    for column in columns.iter_mut() {
+        let overhead = entry_serialized_len(column)
+            .saturating_sub(serialized_str_len(&column.name) + serialized_str_len(&column.r#type));
+        let Column { name, r#type } = column;
+        if bound_entry_fields(&mut [name, r#type], overhead, COLUMN_ENTRY_BOUND) {
+            truncated += 1;
+        }
+    }
+    truncated
+}
+
+fn bound_next_steps(steps: &mut [NextStep]) -> u64 {
+    let mut truncated = 0u64;
+    for step in steps.iter_mut() {
+        let overhead = entry_serialized_len(step)
+            .saturating_sub(serialized_str_len(&step.action) + serialized_str_len(&step.detail));
+        let NextStep { action, detail } = step;
+        if bound_entry_fields(&mut [action, detail], overhead, NEXT_STEP_ENTRY_BOUND) {
+            truncated += 1;
+        }
+    }
+    truncated
+}
+
+fn bound_evidence(entries: &mut [EvidenceEntry]) -> u64 {
+    let mut truncated = 0u64;
+    for entry in entries.iter_mut() {
+        let overhead = entry_serialized_len(entry).saturating_sub(
+            serialized_str_len(&entry.r#ref)
+                + serialized_str_len(&entry.covers)
+                + serialized_str_len(&entry.sha256),
+        );
+        let EvidenceEntry {
+            r#ref,
+            covers,
+            sha256,
+        } = entry;
+        if bound_entry_fields(&mut [r#ref, covers, sha256], overhead, EVIDENCE_ENTRY_BOUND) {
+            truncated += 1;
+        }
+    }
+    truncated
+}
+
 const TRUNCATION_MARKER: &str = "...[truncated]";
 
 /// Serialized size of the truncation marker alone as a JSON string: the two
@@ -446,11 +566,26 @@ fn shorten_row(row: &mut Row, budget_per_cell: usize) -> u64 {
     truncated
 }
 
+/// What [`Envelope::cap_metadata_lists`] did: the two D4 bounds are separate
+/// facts and are counted separately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetadataCaps {
+    /// Entries dropped because a list was over its count bound.
+    elided: u64,
+    /// Entries kept but cut because they were over their per-entry bound.
+    entries_truncated: u64,
+}
+
 impl Envelope {
-    /// Caps every variable-length metadata list to its D4 bound, keeping the
-    /// first entries and reporting the number dropped.
-    fn cap_metadata_lists(&mut self) -> u64 {
-        truncate_vec(&mut self.data.columns, MAX_COLUMNS)
+    /// Applies both D4 bounds to every variable-length field outside
+    /// `data.rows`: the count bound (keep the first entries, report the
+    /// number dropped) and the per-entry serialized-size bound (cut the
+    /// over-long entry, report the number cut).
+    ///
+    /// The count bound runs first, so an over-long entry that is about to be
+    /// dropped anyway is never cut.
+    fn cap_metadata_lists(&mut self) -> MetadataCaps {
+        let elided = truncate_vec(&mut self.data.columns, MAX_COLUMNS)
             + truncate_vec(&mut self.scope.predicates_applied, MAX_PREDICATES_APPLIED)
             + truncate_vec(&mut self.scope.order_by, MAX_ORDER_BY)
             + truncate_vec(
@@ -464,7 +599,28 @@ impl Envelope {
             )
             + truncate_vec(&mut self.warnings, MAX_WARNINGS)
             + truncate_vec(&mut self.next_steps, MAX_NEXT_STEPS)
-            + truncate_vec(&mut self.evidence, MAX_EVIDENCE)
+            + truncate_vec(&mut self.evidence, MAX_EVIDENCE);
+
+        let entries_truncated = bound_columns(&mut self.data.columns)
+            + bound_string_entries(&mut self.scope.predicates_applied, PREDICATE_ENTRY_BOUND)
+            + bound_string_entries(&mut self.scope.order_by, ORDER_BY_ENTRY_BOUND)
+            + bound_string_entries(
+                &mut self.visibility.min_commit_tokens_applied,
+                MIN_COMMIT_TOKEN_ENTRY_BOUND,
+            )
+            + bound_string_entries(&mut self.coverage.fragments, FRAGMENT_ENTRY_BOUND)
+            + bound_string_entries(
+                &mut self.coverage.unindexed_predicates,
+                UNINDEXED_PREDICATE_ENTRY_BOUND,
+            )
+            + bound_string_entries(&mut self.warnings, WARNING_ENTRY_BOUND)
+            + bound_next_steps(&mut self.next_steps)
+            + bound_evidence(&mut self.evidence);
+
+        MetadataCaps {
+            elided,
+            entries_truncated,
+        }
     }
 
     /// The D4 byte-cap algorithm. Floors `max_response_bytes` at
@@ -475,7 +631,9 @@ impl Envelope {
     /// empty while `rows_omitted` is positive and a retained row always
     /// fits.
     pub fn fit(mut self, requested_max_response_bytes: u64) -> Envelope {
-        self.presentation.metadata_elided = self.cap_metadata_lists();
+        let caps = self.cap_metadata_lists();
+        self.presentation.metadata_elided = caps.elided;
+        self.presentation.entries_truncated = caps.entries_truncated;
 
         let effective_cap = requested_max_response_bytes.max(MAX_RESPONSE_BYTES_FLOOR);
         self.presentation.effective_max_response_bytes = effective_cap;
@@ -659,9 +817,19 @@ mod tests {
     /// three tests detect a cut measured in source bytes: such a cut either
     /// overruns the cap or, once the re-measure loop has clamped it, lands on
     /// the 256 B floor instead of this figure.
-    const KEPT_CELL_SERIALIZED_LEN: usize = 261_292;
+    const KEPT_CELL_SERIALIZED_LEN: usize = 261_270;
     /// The whole envelope's exact serialized size for those same three cases.
     const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 262_138;
+
+    /// Serialized size of a zero-row envelope with every metadata field at
+    /// both its D4 bounds: the largest fixed part the bounds permit. The ADR
+    /// requires this to be under 106,496 B, which is what leaves a retained
+    /// row its 154 KiB under the 256 KiB floor.
+    const MAXIMAL_METADATA_ENVELOPE_LEN: usize = 102_116;
+    const _: () = assert!(
+        MAXIMAL_METADATA_ENVELOPE_LEN < 106_496,
+        "ADR-1374 D4 requires the maximal fixed part under 106,496 B"
+    );
 
     fn cell_len(envelope: &Envelope) -> usize {
         let row = envelope.data.rows.first().expect("one row");
@@ -798,14 +966,75 @@ mod tests {
         );
     }
 
-    /// Zero rows, every metadata list at its D4 bound: the fixed part alone
-    /// must serialize under 106,496 B.
+    /// A warning over its 512 B per-entry bound is cut to exactly the bound
+    /// and counted, while the warning next to it is left alone. The body is
+    /// quotes, so the bound has to be measured in serialized bytes: 248
+    /// quotes plus the marker is 512 serialized bytes, 262 source bytes.
+    #[test]
+    fn oversized_warning_is_cut_to_its_entry_bound() {
+        let mut envelope = Envelope {
+            warnings: vec!["\"".repeat(10_000), "short warning".to_string()],
+            ..Default::default()
+        };
+
+        let caps = envelope.cap_metadata_lists();
+
+        assert_eq!(caps.elided, 0, "two warnings are under the count bound");
+        assert_eq!(caps.entries_truncated, 1);
+        assert_eq!(envelope.warnings.len(), 2);
+        let cut = &envelope.warnings[0];
+        assert_eq!(serialized_str_len(cut), WARNING_ENTRY_BOUND);
+        assert_eq!(cut.chars().filter(|c| *c == '"').count(), 248);
+        assert_eq!(cut.len(), 248 + TRUNCATION_MARKER.len());
+        assert!(cut.ends_with(TRUNCATION_MARKER));
+        assert_eq!(envelope.warnings[1], "short warning");
+    }
+
+    /// A column name over the 160 B per-entry bound is cut so the whole entry
+    /// (both fields, the keys, the braces, the separators) lands on exactly
+    /// the bound. Only the longest field is cut: the type is untouched.
+    #[test]
+    fn oversized_column_name_is_cut() {
+        let mut envelope = Envelope::default();
+        envelope.data.columns = vec![
+            Column {
+                name: "n".repeat(10_000),
+                r#type: "map<string,string>".to_string(),
+            },
+            Column {
+                name: "ts".to_string(),
+                r#type: "timestamp".to_string(),
+            },
+        ];
+
+        let caps = envelope.cap_metadata_lists();
+
+        assert_eq!(caps.elided, 0, "two columns are under the count bound");
+        assert_eq!(caps.entries_truncated, 1);
+        let cut = &envelope.data.columns[0];
+        assert_eq!(entry_serialized_len(cut), COLUMN_ENTRY_BOUND);
+        assert_eq!(cut.name.len(), 107 + TRUNCATION_MARKER.len());
+        assert!(cut.name.ends_with(TRUNCATION_MARKER));
+        assert_eq!(cut.r#type, "map<string,string>");
+        assert_eq!(entry_serialized_len(&envelope.data.columns[1]), 32);
+    }
+
+    /// Zero rows, every metadata list at its count bound and every entry at
+    /// its per-entry bound: the fixed part alone must serialize to exactly
+    /// [`MAXIMAL_METADATA_ENVELOPE_LEN`], which the ADR requires to be under
+    /// 106,496 B.
+    ///
+    /// Each entry below is sized to land on its bound exactly, so the
+    /// envelope this builds is the largest one the D4 bounds permit, and
+    /// `cap_metadata_lists` must find nothing to do. A single 10 MiB warning
+    /// fed in afterwards is cut back to the same size, so no metadata a
+    /// caller or the engine can produce moves this figure.
     #[test]
     fn zero_row_envelope_with_maximal_metadata_fits_under_the_floor() {
         let mut envelope = Envelope::default();
         envelope.data.columns = (0..MAX_COLUMNS)
             .map(|i| Column {
-                name: format!("{:0>4}{}", i, "n".repeat(100)),
+                name: format!("{:0>4}{}", i, "n".repeat(105)),
                 r#type: "t".repeat(30),
             })
             .collect();
@@ -817,10 +1046,10 @@ mod tests {
             end_ns: "1700000003600000000000".to_string(),
         });
         envelope.scope.predicates_applied = (0..MAX_PREDICATES_APPLIED)
-            .map(|i| format!("predicate_{i}_{}", "p".repeat(480)))
+            .map(|i| format!("{i:0>2}_{}", "p".repeat(507)))
             .collect();
         envelope.scope.order_by = (0..MAX_ORDER_BY)
-            .map(|i| format!("order_{i}_{}", "o".repeat(480)))
+            .map(|i| format!("{i:0>2}_{}", "o".repeat(507)))
             .collect();
         envelope.ids.query_id = "q".repeat(64);
         envelope.ids.audit_ref = "a".repeat(64);
@@ -828,43 +1057,89 @@ mod tests {
         envelope.visibility.watermark_hour = "2026090800".to_string();
         envelope.visibility.pinned = true;
         envelope.visibility.min_commit_tokens_applied = (0..MAX_MIN_COMMIT_TOKENS)
-            .map(|i| format!("tok_{i}_{}", "m".repeat(100)))
+            .map(|i| format!("{i:0>2}_{}", "m".repeat(123)))
             .collect();
         envelope.coverage.complete = true;
         envelope.coverage.fragments = (0..MAX_FRAGMENTS)
-            .map(|i| format!("frag_{i}_{}", "f".repeat(130)))
+            .map(|i| format!("{i:0>2}_{}", "f".repeat(155)))
             .collect();
         envelope.coverage.unindexed_predicates = (0..MAX_UNINDEXED_PREDICATES)
-            .map(|i| format!("unindexed_{i}_{}", "u".repeat(220)))
+            .map(|i| format!("{i:0>2}_{}", "u".repeat(251)))
             .collect();
         envelope.accuracy.exact = true;
         envelope.presentation.max_rows = 200;
         envelope.presentation.cursor = Some("c".repeat(200));
         envelope.warnings = (0..MAX_WARNINGS)
-            .map(|i| format!("warning_{i}_{}", "w".repeat(480)))
+            .map(|i| format!("{i:0>2}_{}", "w".repeat(507)))
             .collect();
         envelope.next_steps = (0..MAX_NEXT_STEPS)
             .map(|i| NextStep {
                 action: format!("action_{i}"),
-                detail: "d".repeat(480),
+                detail: "d".repeat(479),
             })
             .collect();
         envelope.evidence = (0..MAX_EVIDENCE)
             .map(|i| EvidenceEntry {
-                r#ref: format!("ref_{i}_{}", "r".repeat(400)),
+                r#ref: format!("{i:0>2}_{}", "r".repeat(402)),
                 covers: "data.rows".to_string(),
                 sha256: "0".repeat(64),
             })
             .collect();
 
-        let elided = envelope.cap_metadata_lists();
-        assert_eq!(elided, 0, "every list is already at its bound, not over it");
+        for column in &envelope.data.columns {
+            assert_eq!(entry_serialized_len(column), COLUMN_ENTRY_BOUND);
+        }
+        for predicate in &envelope.scope.predicates_applied {
+            assert_eq!(serialized_str_len(predicate), PREDICATE_ENTRY_BOUND);
+        }
+        for order in &envelope.scope.order_by {
+            assert_eq!(serialized_str_len(order), ORDER_BY_ENTRY_BOUND);
+        }
+        for token in &envelope.visibility.min_commit_tokens_applied {
+            assert_eq!(serialized_str_len(token), MIN_COMMIT_TOKEN_ENTRY_BOUND);
+        }
+        for fragment in &envelope.coverage.fragments {
+            assert_eq!(serialized_str_len(fragment), FRAGMENT_ENTRY_BOUND);
+        }
+        for predicate in &envelope.coverage.unindexed_predicates {
+            assert_eq!(
+                serialized_str_len(predicate),
+                UNINDEXED_PREDICATE_ENTRY_BOUND
+            );
+        }
+        for warning in &envelope.warnings {
+            assert_eq!(serialized_str_len(warning), WARNING_ENTRY_BOUND);
+        }
+        for step in &envelope.next_steps {
+            assert_eq!(entry_serialized_len(step), NEXT_STEP_ENTRY_BOUND);
+        }
+        for entry in &envelope.evidence {
+            assert_eq!(entry_serialized_len(entry), EVIDENCE_ENTRY_BOUND);
+        }
 
-        let size = serialized_len(&envelope);
-        assert!(
-            size < 106_496,
-            "maximal-metadata envelope serialized to {size} bytes, must be < 106496"
+        let caps = envelope.cap_metadata_lists();
+        assert_eq!(
+            caps,
+            MetadataCaps::default(),
+            "every list is already at its bound, not over it"
         );
+
+        assert_eq!(serialized_len(&envelope), MAXIMAL_METADATA_ENVELOPE_LEN);
+
+        envelope.warnings[0] = "w".repeat(10 * 1024 * 1024);
+        let caps = envelope.cap_metadata_lists();
+        assert_eq!(
+            caps,
+            MetadataCaps {
+                elided: 0,
+                entries_truncated: 1,
+            }
+        );
+        assert_eq!(
+            serialized_str_len(&envelope.warnings[0]),
+            WARNING_ENTRY_BOUND
+        );
+        assert_eq!(serialized_len(&envelope), MAXIMAL_METADATA_ENVELOPE_LEN);
     }
 
     /// 2^53 + 1 does not round-trip through `f64`; the wire form must be a
