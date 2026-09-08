@@ -176,7 +176,8 @@ transition in that window), instead of re-folding the whole ever-growing alert
 history; the lease holder then rewrites the memo with a plain `Overwrite`
 (single writer per key, debounced so an unchanged tick writes nothing). The body
 carries its own `format_version`, and a reader that finds the memo absent,
-undecodable, or of an unsupported version falls back to a full fold and rewrites
+undecodable, of an unsupported version, or carrying duplicate `alert_id` entries
+falls back to a full fold and rewrites
 a valid memo, so the memo is **advisory and reconstructible**: losing, staling,
 or corrupting it costs at most one tick's full fold, never a wrong alert state.
 The non-optional tail LIST is what keeps a stale memo from being trusted: a
