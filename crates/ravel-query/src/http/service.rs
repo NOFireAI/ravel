@@ -597,7 +597,7 @@ pub async fn label_values(
     name: &str,
     include_log_metric_names: bool,
 ) -> Result<LabelValuesOutcome, ApiError> {
-    let outcome = metadata(controls, engine, tenant_hash, request, "labels").await?;
+    let outcome = metadata(controls, engine, tenant_hash, request, "label_values").await?;
     let mut values: BTreeSet<String> = BTreeSet::new();
     for (_, labels) in &outcome.series {
         if let Some(v) = labels.get(name) {

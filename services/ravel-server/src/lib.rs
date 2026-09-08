@@ -478,14 +478,17 @@ pub struct Running {
     /// The supervised background flush loop still owns the production cadence
     /// (`metadata_sink_task`); this handle shares the same `Arc`.
     pub metadata_sink: Option<Arc<ravel_ingest::MetadataSink>>,
-    /// The query service layer layered onto the public HTTP router, `Some` in
-    /// the query-serving modes that build one.
+    /// The query service backing the public HTTP router's query surfaces,
+    /// `Some` in the query-serving modes that build one. Not layered onto the
+    /// router itself: the MCP adapter (issue #1381) is the in-process
+    /// transport that receives it, through its own router state rather than
+    /// an axum route.
     pub query_service: Option<service::QueryService>,
-    /// The query service layer layered onto the mTLS router, `Some` exactly
-    /// when a query-serving mode was configured with an mTLS listener. A
-    /// separate instance from [`Running::query_service`] because the two
-    /// listeners authenticate against different resolvers; everything else the
-    /// controls need is shared between them.
+    /// The query service backing the mTLS router's query surfaces, `Some`
+    /// exactly when a query-serving mode was configured with an mTLS
+    /// listener. A separate instance from [`Running::query_service`] because
+    /// the two listeners authenticate against different resolvers; everything
+    /// else the controls need is shared between them.
     pub mtls_query_service: Option<service::QueryService>,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
     span_ingest_router: Option<Arc<SpanIngestRouter>>,
@@ -1540,9 +1543,9 @@ pub async fn start(
         // route's own state builds an equivalent facade per request out of the
         // same `Arc`s, so this instance and theirs share one admission
         // controller, one cost recorder, one usage sink, and one audit sink.
-        // Layered as an extension so an in-process transport that is not an
-        // axum route (the MCP adapter, issue #1381) has one place to take it
-        // from rather than reassembling the controls itself.
+        // Held on `Running::query_service` rather than layered onto the
+        // router: an in-process transport that is not an axum route (the MCP
+        // adapter, issue #1381) takes it from there instead.
         let query_service = service::QueryService::with_metrics(
             config.tenant_resolver.clone(),
             Arc::new(SystemClock),
@@ -1555,7 +1558,6 @@ pub async fn start(
         .with_exemplars(exemplars_state);
         #[cfg(feature = "sql")]
         let query_service = query_service.with_sql(sql_query_state);
-        http_router = http_router.layer(axum::Extension(query_service.clone()));
         query_service_handle = Some(query_service);
 
         // The mTLS listener gets its own instance. Everything a control needs
@@ -1589,7 +1591,6 @@ pub async fn start(
                 Some(state) => mtls_query_service.with_sql(state),
                 None => mtls_query_service,
             };
-            mtls_router = mtls_router.layer(axum::Extension(mtls_query_service.clone()));
             mtls_query_service_handle = Some(mtls_query_service);
         }
 
