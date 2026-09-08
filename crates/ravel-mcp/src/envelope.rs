@@ -53,6 +53,17 @@ const MAX_WARNINGS: usize = 16;
 const MAX_NEXT_STEPS: usize = 8;
 const MAX_EVIDENCE: usize = 16;
 
+/// The D4 per-cell floor: a cell is never cut below this serialized size,
+/// even when the whole envelope still does not fit.
+const MIN_CELL_BUDGET: usize = 256;
+
+/// How many times [`Envelope::shorten_first_row_to_fit`] re-cuts the kept row
+/// under a smaller per-cell budget before it stops. Two passes are enough for
+/// every shape measured (the first pass's residual is the row's own array
+/// structure and its under-budget cells); the rest is headroom so that
+/// termination is a property of the loop, not of the shrink step.
+const MAX_SHORTEN_PASSES: usize = 16;
+
 /// Byte-serialized cell payload of one table row. Every variant follows the
 /// D4 precision rules: [`Cell::Int`] and [`Cell::Timestamp`] serialize as
 /// JSON strings (nanosecond epochs exceed 2^53); [`Cell::Float`] follows
@@ -349,50 +360,85 @@ fn truncate_vec<T>(items: &mut Vec<T>, max: usize) -> u64 {
 
 const TRUNCATION_MARKER: &str = "...[truncated]";
 
-/// Cuts `s` so that its serialized JSON string form (including the
-/// surrounding quotes and the trailing marker) is at most `budget` bytes.
-/// Assumes `s` needs no JSON escaping in its kept prefix, which holds for
-/// the row content this function is applied to (query row cells); a cell
-/// containing characters that need escaping would only ever make the kept
-/// prefix shorter than this estimate, never longer, so the result still
-/// fits under `budget`.
+/// Serialized size of the truncation marker alone as a JSON string: the two
+/// quotes plus the marker, which needs no escaping. No cut can produce a
+/// value smaller than this.
+const MARKER_SERIALIZED_LEN: usize = TRUNCATION_MARKER.len() + 2;
+
+/// Serialized size of `s` as a JSON string value, quotes and every escape
+/// sequence included. This is the number every budget in this module is
+/// measured in: a source byte count is not it, because one source byte can
+/// serialize to two (`"`, `\`, `\n`) or six (` `) bytes.
+fn serialized_str_len(s: &str) -> usize {
+    escaped_len(s) + 2
+}
+
+/// Serialized length of `s` inside a JSON string, without the quotes.
+fn escaped_len(s: &str) -> usize {
+    s.chars().map(escaped_char_len).sum()
+}
+
+/// Serialized length of one character inside a JSON string, matching
+/// `serde_json`'s escaping exactly (see the test that compares the two over
+/// every character it can reach).
+fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{9}' | '\u{a}' | '\u{c}' | '\u{d}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Cuts `s` so that its serialized JSON string form -- the surrounding
+/// quotes, every escape sequence in the kept prefix, and the trailing marker
+/// -- is at most `budget` bytes.
+///
+/// The kept prefix is measured in serialized bytes, never in source bytes: a
+/// body of quotes serializes to two bytes per source byte and a body of
+/// control characters to six, so a source-byte cut overruns the budget by
+/// that factor. When `budget` is smaller than [`MARKER_SERIALIZED_LEN`] the
+/// result is the marker alone, which is the smallest value a cut can produce.
 fn truncate_to_budget(s: &str, budget: usize) -> String {
-    let quote_overhead = 2usize;
-    let available = budget.saturating_sub(quote_overhead);
-    let content_budget = available.saturating_sub(TRUNCATION_MARKER.len());
-    let mut end = content_budget.min(s.len());
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    let allowance = budget.saturating_sub(MARKER_SERIALIZED_LEN);
+    let mut used = 0usize;
+    let mut end = s.len();
+    for (idx, c) in s.char_indices() {
+        let next = used + escaped_char_len(c);
+        if next > allowance {
+            end = idx;
+            break;
+        }
+        used = next;
     }
     format!("{}{}", &s[..end], TRUNCATION_MARKER)
 }
 
-fn cell_json_len(cell: &Cell) -> usize {
-    serde_json::to_vec(&cell.to_value())
-        .map(|bytes| bytes.len())
-        .unwrap_or(usize::MAX)
-}
-
 /// Shortens every oversized cell in `row` to fit `budget_per_cell`, per the
-/// D4 rule: a string cell over budget is cut to the budget including the
-/// trailing marker; a map cell over budget is serialized to JSON text first,
-/// then cut the same way and returned as a string. Numbers, timestamps,
-/// booleans, and hex ids never exceed 64 B and are left untouched. Returns
-/// the count of cells actually shortened.
+/// D4 rule: a string cell whose serialized form is over budget is cut to the
+/// budget including the trailing marker; a map cell over budget is serialized
+/// to JSON text first, then cut the same way and returned as a string.
+/// Numbers, timestamps, booleans, and hex ids never exceed 64 B and are left
+/// untouched. Every comparison is against the cell's serialized size, so an
+/// escape-heavy cell is sized by what goes on the wire. Returns the count of
+/// cells actually shortened.
 fn shorten_row(row: &mut Row, budget_per_cell: usize) -> u64 {
     let mut truncated = 0u64;
     for cell in row.iter_mut() {
-        let is_candidate = matches!(cell, Cell::Str(_) | Cell::Map(_));
-        if !is_candidate {
-            continue;
-        }
-        if cell_json_len(cell) <= budget_per_cell {
-            continue;
-        }
         let text = match cell {
-            Cell::Str(s) => s.clone(),
-            Cell::Map(m) => serde_json::to_string(&Value::Object(m.clone())).unwrap_or_default(),
-            _ => unreachable!("is_candidate already restricted to Str and Map"),
+            Cell::Str(s) => {
+                if serialized_str_len(s) <= budget_per_cell {
+                    continue;
+                }
+                std::mem::take(s)
+            }
+            Cell::Map(m) => {
+                let text = serde_json::to_string(&Value::Object(m.clone())).unwrap_or_default();
+                if text.len() <= budget_per_cell {
+                    continue;
+                }
+                text
+            }
+            _ => continue,
         };
         *cell = Cell::Str(truncate_to_budget(&text, budget_per_cell));
         truncated += 1;
@@ -451,27 +497,71 @@ impl Envelope {
         }
         self.presentation.rows_omitted = rows_omitted;
 
-        let mut cells_truncated = 0u64;
-        if serialized_len(&self) > cap {
-            let saved_rows = std::mem::take(&mut self.data.rows);
-            let fixed_part = serialized_len(&self) as u64;
-            self.data.rows = saved_rows;
-            let column_count = self.data.columns.len().max(1) as u64;
-            // Reserve a few bytes for the row's own array brackets and the
-            // commas between cells, which `fixed_part` (computed with
-            // `data.rows` emptied to `[]`) does not itself account for.
-            const ROW_STRUCTURE_OVERHEAD: u64 = 8;
-            let available = (cap as u64)
-                .saturating_sub(fixed_part)
-                .saturating_sub(ROW_STRUCTURE_OVERHEAD);
-            let budget_per_cell =
-                available.checked_div(column_count).unwrap_or(0).max(256) as usize;
-            if let Some(row) = self.data.rows.first_mut() {
-                cells_truncated = shorten_row(row, budget_per_cell);
-            }
-        }
-        self.presentation.cells_truncated = cells_truncated;
+        self.presentation.cells_truncated = self.shorten_first_row_to_fit(cap);
         self
+    }
+
+    /// Cuts the cells of the one kept row until the whole envelope fits
+    /// `cap`, and returns the number of cells cut.
+    ///
+    /// The D4 per-cell budget is `max(256 B, (cap - fixed_part) /
+    /// column_count)`, where `fixed_part` is the envelope serialized without
+    /// `data.rows`. That budget is an estimate of what one cell may spend,
+    /// not a measurement of the envelope: it does not account for the row's
+    /// own array structure, nor for the cells that are already under budget
+    /// and keep their full size. So each pass re-cuts the pristine row under
+    /// a smaller budget and re-measures the whole envelope, until it fits or
+    /// the budget is at the D4 256 B floor.
+    fn shorten_first_row_to_fit(&mut self, cap: usize) -> u64 {
+        if serialized_len(self) <= cap {
+            return 0;
+        }
+        let Some(pristine_row) = self.data.rows.first().cloned() else {
+            return 0;
+        };
+
+        let saved_rows = std::mem::take(&mut self.data.rows);
+        let fixed_part = serialized_len(self) as u64;
+        self.data.rows = saved_rows;
+        let column_count = self.data.columns.len().max(1) as u64;
+        // Reserve a few bytes for the row's own array brackets and the commas
+        // between cells, which `fixed_part` (computed with `data.rows` emptied
+        // to `[]`) does not itself account for.
+        const ROW_STRUCTURE_OVERHEAD: u64 = 8;
+        let available = (cap as u64)
+            .saturating_sub(fixed_part)
+            .saturating_sub(ROW_STRUCTURE_OVERHEAD);
+        let mut budget_per_cell = available
+            .checked_div(column_count)
+            .unwrap_or(0)
+            .max(MIN_CELL_BUDGET as u64) as usize;
+
+        let mut truncated = 0u64;
+        let mut previous_size = usize::MAX;
+        // Bounded so termination never depends on the shrink step making
+        // progress: a pass that does not shrink the envelope drops straight
+        // to the floor budget, and the floor budget ends the loop.
+        for _ in 0..MAX_SHORTEN_PASSES {
+            let mut row = pristine_row.clone();
+            truncated = shorten_row(&mut row, budget_per_cell);
+            if let Some(first) = self.data.rows.first_mut() {
+                *first = row;
+            }
+            let size = serialized_len(self);
+            if size <= cap || truncated == 0 || budget_per_cell <= MIN_CELL_BUDGET {
+                break;
+            }
+            let over = (size - cap) as u64;
+            budget_per_cell = if size >= previous_size {
+                MIN_CELL_BUDGET
+            } else {
+                budget_per_cell
+                    .saturating_sub(over.div_ceil(truncated).max(1) as usize)
+                    .max(MIN_CELL_BUDGET)
+            };
+            previous_size = size;
+        }
+        truncated
     }
 }
 
@@ -559,6 +649,152 @@ mod tests {
         assert!(
             size <= MAX_RESPONSE_BYTES_FLOOR as usize,
             "serialized size {size} exceeds cap"
+        );
+    }
+
+    /// The single-column envelopes below all resolve to the same per-cell
+    /// budget (one column, the same fixed part), so the kept cell serializes
+    /// to the same exact size in each: `cap - fixed_part - 8` rounded down at
+    /// a character boundary of the source body. Pinning it is what makes the
+    /// three tests detect a cut measured in source bytes: such a cut either
+    /// overruns the cap or, once the re-measure loop has clamped it, lands on
+    /// the 256 B floor instead of this figure.
+    const KEPT_CELL_SERIALIZED_LEN: usize = 261_292;
+    /// The whole envelope's exact serialized size for those same three cases.
+    const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 262_138;
+
+    fn cell_len(envelope: &Envelope) -> usize {
+        let row = envelope.data.rows.first().expect("one row");
+        serde_json::to_string(&row[0])
+            .expect("cell serializes")
+            .len()
+    }
+
+    /// Every cell budget in this module is a serialized-byte budget, so the
+    /// per-character escape sizes it sums must be `serde_json`'s own. Checked
+    /// over every character with a distinct escaping rule (the C0 range, the
+    /// two escaped ASCII punctuation characters, the DEL boundary) plus one
+    /// character per UTF-8 length.
+    #[test]
+    fn escaped_char_len_matches_serde_json() {
+        let checked: Vec<char> = (0u32..0x300)
+            .chain([0x7f, 0x2028, 0x1F600, 0x10FFFF])
+            .filter_map(char::from_u32)
+            .collect();
+        assert_eq!(checked.len(), 768 + 4, "every probe must be a valid char");
+        for c in checked {
+            let serialized = serde_json::to_string(&c.to_string()).expect("char serializes");
+            assert_eq!(
+                escaped_char_len(c) + 2,
+                serialized.len(),
+                "escaped length of U+{:04X} disagrees with serde_json ({serialized})",
+                c as u32
+            );
+        }
+    }
+
+    /// A 1 MiB body of `"` characters: every source byte serializes to two
+    /// (`\"`), so a cut measured in source bytes overruns the cap by 2x. The
+    /// cut must be measured in serialized bytes instead.
+    #[test]
+    fn oversized_first_row_of_quotes_fits() {
+        let quotes = "\"".repeat(1024 * 1024);
+        let envelope = envelope_with_rows(1, |_| vec![Cell::Str(quotes.clone())]);
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.data.rows.len(), 1);
+        assert_eq!(fitted.presentation.rows_omitted, 0);
+        assert_eq!(fitted.presentation.cells_truncated, 1);
+        assert!(fitted.presentation.bytes_cap_hit);
+        assert_eq!(cell_len(&fitted), KEPT_CELL_SERIALIZED_LEN);
+        let size = serialized_len(&fitted);
+        assert_eq!(size, FITTED_ENVELOPE_SERIALIZED_LEN);
+        assert!(
+            size <= MAX_RESPONSE_BYTES_FLOOR as usize,
+            "serialized size {size} exceeds cap {MAX_RESPONSE_BYTES_FLOOR}"
+        );
+    }
+
+    /// A 1 MiB body of `\n` and spaces: `\n` serializes to two bytes, so the
+    /// body's serialized size is 1.5x its source size. The same rule as the
+    /// quote case, at a different expansion factor, and with a character that
+    /// is not the escape character itself.
+    #[test]
+    fn oversized_first_row_of_control_characters_fits() {
+        let body = "\n ".repeat(512 * 1024);
+        assert_eq!(body.len(), 1024 * 1024);
+        let envelope = envelope_with_rows(1, |_| vec![Cell::Str(body.clone())]);
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.data.rows.len(), 1);
+        assert_eq!(fitted.presentation.rows_omitted, 0);
+        assert_eq!(fitted.presentation.cells_truncated, 1);
+        assert!(fitted.presentation.bytes_cap_hit);
+        assert_eq!(cell_len(&fitted), KEPT_CELL_SERIALIZED_LEN);
+        let size = serialized_len(&fitted);
+        assert_eq!(size, FITTED_ENVELOPE_SERIALIZED_LEN);
+        assert!(
+            size <= MAX_RESPONSE_BYTES_FLOOR as usize,
+            "serialized size {size} exceeds cap {MAX_RESPONSE_BYTES_FLOOR}"
+        );
+    }
+
+    /// A map cell whose values are quotes: the map is serialized to JSON text
+    /// first (which escapes each quote once), and that text is then cut as a
+    /// string (which escapes the text's own quotes again). Both levels count
+    /// against the cap.
+    #[test]
+    fn oversized_first_row_map_of_quotes_fits() {
+        let mut big_map = Map::new();
+        big_map.insert("body".to_string(), Value::String("\"".repeat(1024 * 1024)));
+        big_map.insert("service".to_string(), Value::String("\"api\"".to_string()));
+        let envelope = envelope_with_rows(1, |_| vec![Cell::Map(big_map.clone())]);
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.data.rows.len(), 1);
+        assert_eq!(fitted.presentation.rows_omitted, 0);
+        assert_eq!(fitted.presentation.cells_truncated, 1);
+        assert!(fitted.presentation.bytes_cap_hit);
+        assert_eq!(cell_len(&fitted), KEPT_CELL_SERIALIZED_LEN);
+        let size = serialized_len(&fitted);
+        assert_eq!(size, FITTED_ENVELOPE_SERIALIZED_LEN);
+        assert!(
+            size <= MAX_RESPONSE_BYTES_FLOOR as usize,
+            "serialized size {size} exceeds cap {MAX_RESPONSE_BYTES_FLOOR}"
+        );
+    }
+
+    /// The per-cell budget is computed from the envelope with `data.rows`
+    /// emptied, so it accounts for neither the row's own array structure nor
+    /// the cells already under budget. With 64 columns the commas alone
+    /// overrun the cap, which only a re-measurement of the whole envelope
+    /// after the cut can see.
+    #[test]
+    fn oversized_first_row_of_many_columns_fits() {
+        const COLUMNS: usize = 64;
+        let big = "q".repeat(64 * 1024);
+        let mut envelope = Envelope::default();
+        envelope.data.columns = (0..COLUMNS)
+            .map(|i| Column {
+                name: format!("c{i}"),
+                r#type: "string".to_string(),
+            })
+            .collect();
+        envelope.data.rows = vec![(0..COLUMNS).map(|_| Cell::Str(big.clone())).collect()];
+        envelope.data.row_count = 1;
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.data.rows.len(), 1);
+        assert_eq!(fitted.presentation.rows_omitted, 0);
+        assert_eq!(fitted.presentation.cells_truncated, COLUMNS as u64);
+        let size = serialized_len(&fitted);
+        assert!(
+            size <= MAX_RESPONSE_BYTES_FLOOR as usize,
+            "serialized size {size} exceeds cap {MAX_RESPONSE_BYTES_FLOOR}"
         );
     }
 
