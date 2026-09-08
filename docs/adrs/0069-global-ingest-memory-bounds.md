@@ -159,19 +159,26 @@ this transient escaped: the flag overclaimed (issue #1297).
 The gzip inflate path charges the process-wide `IngestByteBudget` for the
 bytes it decompresses, **before it finishes inflating**, incrementally as each
 chunk is produced. A decompression whose running total would cross the ceiling
-is shed mid-inflate (HTTP 429, gRPC `RESOURCE_EXHAUSTED`, the existing shed
-counter) rather than being allocated in full and charged afterward. The charge
-is held as an RAII guard through protobuf decode and normalize, and dropped
-once the router has taken its own decision-1 buffered charge, so the peak
-decode-time bytes are accounted for their whole lifetime.
+is shed mid-inflate (OTLP HTTP 429 with `Retry-After`, the existing shed
+counter) rather than being allocated in full and charged afterward. This
+amendment covers OTLP HTTP gzip only; OTLP gRPC gzip decompression is unchanged
+and tracked separately (#1419), so no gRPC status is described here. The charge
+is held as an RAII guard through protobuf decode and released at the instant the
+raw inflate buffer is dropped -- once prost has copied it into owned structs,
+before the router takes its own decision-1 buffered charge. A single request's
+inflate charge and buffered charge therefore never coexist: the peak that one
+request contributes to the gauge is the larger of the two, not their sum.
 
 **What the gauge now means.** Before this amendment `ravel_ingest_buffer_bytes`
-measured buffered ingest state only. It now measures buffered state **plus the
-transient OTLP HTTP gzip decode state currently in flight**: for the window
-between a request starting to inflate and its router charge landing, both the
-decode charge and (once taken) the buffered charge are held, so the gauge can
-briefly exceed the buffered bytes alone. This is deliberate -- the ceiling
-bounds peak resident ingest memory, and the inflate buffer is part of that
+measured buffered ingest state only. It now also counts the transient OTLP HTTP
+gzip decode state currently in flight: a request that is mid-inflate holds a
+decode charge on the same gauge, alongside every other request's buffered
+charge, so the gauge reflects the concurrent inflate buffers that used to be
+invisible. A single request does not hold both charges at once -- it releases
+the decode charge when it drops the raw inflate buffer after decode, before the
+router takes its buffered charge -- so that one request's contribution is the
+larger of the two, never their sum. This is deliberate: the ceiling bounds peak
+resident ingest memory, and the concurrent inflate buffers are part of that
 peak. The identity (uncompressed) path allocates no inflate buffer and takes no
 gateway charge; the OTLP gRPC and Remote Write decode paths are out of scope
 here and remain bounded by `--max-inflight-ingest-requests` alone.
