@@ -224,7 +224,7 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let backend_bills_requests = backend_bills_requests(args.store);
     let substrate = Substrate {
         store_backend: args.store.to_string(),
-        endpoint_host: endpoint_host_from_env(),
+        endpoint_host: endpoint_host_from_env(args.store),
         backend_bills_requests,
     };
     let ravel_cfg = RavelReplayConfig {
