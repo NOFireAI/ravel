@@ -783,11 +783,15 @@ pub struct Cli {
     /// they inflate: each decompressed chunk is charged before it is retained,
     /// and the inflate is retained as those exactly-sized chunks rather than
     /// appended into one growing buffer, so the charge equals the bytes held at
-    /// every instant and the only uncharged allocations are one fixed 64 KiB
-    /// staging chunk the decoder reads into per in-flight inflate, plus
-    /// per-chunk bookkeeping -- a fixed cost, not a share of the charged
-    /// bytes, so it can exceed the charge itself on a small decompressed
-    /// body. A decompression whose running charge would
+    /// every instant. What stays uncharged is a fixed per-inflate overhead: one
+    /// fixed 64 KiB staging chunk the decoder reads into per in-flight
+    /// inflate, per-chunk bookkeeping, and flate2's own decoder state (tens of
+    /// KiB); the compressed request body itself also stays resident for the
+    /// whole inflate but is bounded by the request cap and already counted
+    /// against `--max-inflight-ingest-requests`. No uncharged allocation
+    /// scales with the decompressed size; each is a fixed cost, not a share
+    /// of the charged bytes, so together they can exceed the charge itself on
+    /// a small decompressed body. A decompression whose running charge would
     /// cross the ceiling is shed mid-inflate instead of being allocated in
     /// full. A request whose charge would push the gauge past this ceiling
     /// is shed before any buffering -- HTTP 429 with `Retry-After`, gRPC
@@ -4681,11 +4685,16 @@ mod tests {
     /// ravel-server-flags.md` is generated from, so the assertion tracks what
     /// an operator actually reads.
     ///
-    /// Non-vacuity: drop the `post-decompression` / `inflate` wording from
-    /// either flag's doc comment and this fails, because the doc still speaks
-    /// of a memory bound with no inflate term to qualify it.
+    /// This checks that the term is named, not that no unbounded claim
+    /// exists: a doc reading "bounds ALL resident ingest memory with no
+    /// exceptions, the gzip inflate included" still passes it.
+    ///
+    /// Non-vacuity: `max_inflight_ingest_requests`'s doc carries both
+    /// `post-decompression` and `gzip inflate` wording, so dropping either
+    /// one alone does not fail this test on that flag; both would have to go
+    /// at once.
     #[test]
-    fn ingest_flag_docs_do_not_claim_an_unbounded_memory_guarantee() {
+    fn ingest_flag_docs_name_the_inflate_term() {
         use clap::CommandFactory;
 
         let cmd = Cli::command();
