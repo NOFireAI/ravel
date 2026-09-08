@@ -536,6 +536,30 @@ fn query_tier_apply_target(spec: &RavelClusterSpec, rendered: Deployment) -> Opt
     }
 }
 
+/// The query tier's ready-replica count to report on `.status` this pass.
+///
+/// When [`query_tier_apply_target`] withheld the apply (`audit_key_missing`),
+/// this pass never touched the query Deployment, so `applied_ready` (which
+/// [`TierDeployments::apply_tier`] leaves `None` for a tier it never applied)
+/// says nothing about whether the cluster is actually serving; `live_ready`,
+/// read straight off the existing Deployment the same way
+/// `maintain_ready_before` is (a `get`, `None` when it does not exist yet),
+/// is what `Available` must reflect instead, so a cluster whose query pods
+/// keep running does not report `Available=False` only because this pass
+/// could not roll their spec. Otherwise `applied_ready` is exactly what this
+/// pass's own apply observed, as before #1487.
+fn effective_query_ready(
+    audit_key_missing: bool,
+    applied_ready: Option<i32>,
+    live_ready: Option<i32>,
+) -> Option<i32> {
+    if audit_key_missing {
+        live_ready
+    } else {
+        applied_ready
+    }
+}
+
 /// Read the shared `storage.s3.credentialsSecretRef` Secret's live
 /// `accessKeyId`/`secretAccessKey` values (UTF-8 strings), for building the
 /// `sys/auth` reconciliation's own S3 backend. Unlike
@@ -1763,9 +1787,23 @@ async fn reconcile_inner(
     let gateway_ready = tiers
         .applied(DeploymentTier::Gateway)
         .and_then(ready_replicas);
-    let query_ready = tiers
+    let applied_query_ready = tiers
         .applied(DeploymentTier::Query)
         .and_then(ready_replicas);
+    // The live GET only runs when the query tier's apply was withheld
+    // (`audit_key_missing`): every other pass already has its answer from
+    // the apply it just made, and paying for an extra round trip on every
+    // reconcile of every cluster for a case that only applies to unkeyed
+    // clusters missing their audit-token-key ref would be wasted cost.
+    let live_query_ready = if audit_key_missing {
+        live_replica_counts(&deployments, &child(instance, "query"))
+            .await?
+            .0
+    } else {
+        None
+    };
+    let query_ready =
+        effective_query_ready(audit_key_missing, applied_query_ready, live_query_ready);
     let waiting = plan.waiting_for_bootstrap(maintain_ready_before, request_serving_exists);
 
     // Bootstrap-wait stall tracking (#1097). The operator is disposable, so it
@@ -3498,6 +3536,53 @@ mod tests {
         assert!(
             query_tier_apply_target(&both, Deployment::default()).is_some(),
             "both refs set must let the query tier apply normally"
+        );
+    }
+
+    /// A cluster whose query tier apply was withheld this pass
+    /// (`audit_key_missing`) must report `Available` from the live query
+    /// Deployment's ready count, not from this pass's own apply (which never
+    /// touched it and so has nothing to report): `Available=True` when the
+    /// existing Deployment already reports 1 ready replica, `Available=False`
+    /// when no such Deployment exists at all. Flip [`effective_query_ready`]'s
+    /// `if audit_key_missing { live_ready }` branch to return `applied_ready`
+    /// instead and the first assertion fails: with no apply this pass,
+    /// `applied_ready` is `None`, so `Available` reports `False` even though
+    /// the cluster has a ready query pod.
+    #[test]
+    fn withheld_query_tier_keeps_available_from_the_live_deployment() {
+        let query_ready = effective_query_ready(true, None, Some(1));
+        assert_eq!(query_ready, Some(1));
+        let status = build_status(
+            Some(1),
+            Some(1),
+            query_ready,
+            None,
+            None,
+            PersistedStatus::default(),
+            Vec::new(),
+        );
+        assert_eq!(
+            find(&status.conditions, "Available").status,
+            "True",
+            "a live query Deployment reporting 1 ready must keep Available=True"
+        );
+
+        let query_ready_missing = effective_query_ready(true, None, None);
+        assert_eq!(query_ready_missing, None);
+        let status_missing = build_status(
+            Some(1),
+            Some(1),
+            query_ready_missing,
+            None,
+            None,
+            PersistedStatus::default(),
+            Vec::new(),
+        );
+        assert_eq!(
+            find(&status_missing.conditions, "Available").status,
+            "False",
+            "no live query Deployment at all must report Available=False"
         );
     }
 
