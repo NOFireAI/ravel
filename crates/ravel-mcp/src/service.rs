@@ -57,7 +57,11 @@ pub trait QueryBackend {
     ) -> Result<Envelope, Failure>;
 
     /// Mirrors `QueryService::labels`.
-    async fn labels(&self, tenant_hash: TenantHash, request: &MetadataRequest) -> Result<Envelope, Failure>;
+    async fn labels(
+        &self,
+        tenant_hash: TenantHash,
+        request: &MetadataRequest,
+    ) -> Result<Envelope, Failure>;
 
     /// Mirrors `QueryService::label_values`.
     async fn label_values(
@@ -69,21 +73,41 @@ pub trait QueryBackend {
     ) -> Result<Envelope, Failure>;
 
     /// Mirrors `QueryService::series`.
-    async fn series(&self, tenant_hash: TenantHash, request: &MetadataRequest) -> Result<Envelope, Failure>;
+    async fn series(
+        &self,
+        tenant_hash: TenantHash,
+        request: &MetadataRequest,
+    ) -> Result<Envelope, Failure>;
 
     /// Mirrors `QueryService::analytics`. Its native `AnalyticsRequest` is
     /// defined in `services/ravel-server`, unreachable from this crate (see
     /// the module doc); the caller-defined shape crosses as opaque JSON
     /// instead, for #1381's adapter to convert.
-    async fn analytics(&self, tenant_hash: TenantHash, request: &AnyJson) -> Result<Envelope, Failure>;
+    async fn analytics(
+        &self,
+        tenant_hash: TenantHash,
+        request: &AnyJson,
+    ) -> Result<Envelope, Failure>;
 
     /// Mirrors `QueryService::exemplars`. Same reachability note as
     /// `analytics`.
-    async fn exemplars(&self, tenant_hash: TenantHash, request: &AnyJson) -> Result<Envelope, Failure>;
+    async fn exemplars(
+        &self,
+        tenant_hash: TenantHash,
+        request: &AnyJson,
+    ) -> Result<Envelope, Failure>;
 
     /// Mirrors `QueryService::sql_execute`.
-    async fn sql_execute(&self, tenant_hash: TenantHash, request: &ravel_sql::SqlRequest) -> Result<Envelope, Failure>;
+    async fn sql_execute(
+        &self,
+        tenant_hash: TenantHash,
+        request: &ravel_sql::SqlRequest,
+    ) -> Result<Envelope, Failure>;
 
     /// Mirrors `QueryService::sql_explain`.
-    async fn sql_explain(&self, tenant_hash: TenantHash, request: &ravel_sql::SqlRequest) -> Result<Envelope, Failure>;
+    async fn sql_explain(
+        &self,
+        tenant_hash: TenantHash,
+        request: &ravel_sql::SqlRequest,
+    ) -> Result<Envelope, Failure>;
 }

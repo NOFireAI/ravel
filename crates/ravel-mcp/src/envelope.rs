@@ -464,7 +464,8 @@ impl Envelope {
             let available = (cap as u64)
                 .saturating_sub(fixed_part)
                 .saturating_sub(ROW_STRUCTURE_OVERHEAD);
-            let budget_per_cell = available.checked_div(column_count).unwrap_or(0).max(256) as usize;
+            let budget_per_cell =
+                available.checked_div(column_count).unwrap_or(0).max(256) as usize;
             if let Some(row) = self.data.rows.first_mut() {
                 cells_truncated = shorten_row(row, budget_per_cell);
             }
@@ -645,7 +646,9 @@ mod tests {
         let int_cell = cells[0].as_str().expect("int cell must be a JSON string");
         assert_eq!(int_cell.parse::<i64>().expect("round-trips"), big_int);
 
-        let ts_cell = cells[1].as_str().expect("timestamp cell must be a JSON string");
+        let ts_cell = cells[1]
+            .as_str()
+            .expect("timestamp cell must be a JSON string");
         assert_eq!(ts_cell.parse::<i64>().expect("round-trips"), ts_ns);
     }
 }

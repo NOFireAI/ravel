@@ -94,7 +94,11 @@ fn render_data_table(data: &Data, out: &mut String) {
     if data.columns.is_empty() {
         return;
     }
-    let header: Vec<&str> = data.columns.iter().map(|c: &Column| c.name.as_str()).collect();
+    let header: Vec<&str> = data
+        .columns
+        .iter()
+        .map(|c: &Column| c.name.as_str())
+        .collect();
     out.push_str(&header.join("\t"));
     out.push('\n');
 
@@ -115,17 +119,19 @@ fn render_data_table(data: &Data, out: &mut String) {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
-            .map(|(i, cell)| match (shared.get(i).and_then(Option::as_ref), cell) {
-                (Some(shared_map), Cell::Map(m)) => {
-                    let diff: Map<String, Value> = m
-                        .iter()
-                        .filter(|(k, v)| shared_map.get(k.as_str()) != Some(*v))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    serde_json::to_string(&Value::Object(diff)).unwrap_or_default()
-                }
-                _ => cell_display(cell),
-            })
+            .map(
+                |(i, cell)| match (shared.get(i).and_then(Option::as_ref), cell) {
+                    (Some(shared_map), Cell::Map(m)) => {
+                        let diff: Map<String, Value> = m
+                            .iter()
+                            .filter(|(k, v)| shared_map.get(k.as_str()) != Some(*v))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        serde_json::to_string(&Value::Object(diff)).unwrap_or_default()
+                    }
+                    _ => cell_display(cell),
+                },
+            )
             .collect();
         out.push_str(&cells.join("\t"));
         out.push('\n');

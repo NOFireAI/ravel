@@ -167,7 +167,11 @@ fn envelope_output_schema() -> Arc<JsonObject> {
     Arc::new(object)
 }
 
-fn tool<T: JsonSchema + 'static>(name: &'static str, title: &'static str, description: &'static str) -> Tool {
+fn tool<T: JsonSchema + 'static>(
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+) -> Tool {
     Tool::new_with_raw(name, Some(description.into()), JsonObject::default())
         .with_input_schema::<T>()
         .with_raw_output_schema(envelope_output_schema())
@@ -202,11 +206,7 @@ pub fn tool_catalog() -> Vec<Tool> {
             "Validate a SQL or PromQL statement, estimate its cost, and \
              return the plan shape. No scan runs.",
         ),
-        tool::<QuerySqlInput>(
-            "ravel_query_sql",
-            "Query SQL",
-            "One SELECT over one table",
-        ),
+        tool::<QuerySqlInput>("ravel_query_sql", "Query SQL", "One SELECT over one table"),
         tool::<QueryPromqlInput>(
             "ravel_query_promql",
             "Query PromQL",
