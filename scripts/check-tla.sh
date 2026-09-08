@@ -8,10 +8,12 @@
 #
 # Subcommands:
 #   smoke        [-a AREA]   fast reachability + safety (budget 300s per cfg)
+#   live         [-a AREA]   liveness under fairness, where a live.cfg exists
+#                            (budget 300s per cfg, same as smoke)
 #   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg)
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
 #   traceability [-a AREA]   check every traceability.md source ref resolves
-#   ci           [-a AREA]   smoke + negative + traceability under one run id
+#   ci           [-a AREA]   smoke + live + negative + traceability under one run id
 #   all          [-a AREA]   ci, then exhaustive, under one run id
 #
 # Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java
@@ -582,6 +584,10 @@ check_traceability() {
         done
     done < "$tfile"
 
+    if [ "$rc" -eq 0 ] && [ "$count" -eq 0 ]; then
+        note "$area traceability: FAIL (zero rows resolved)"
+        return 1
+    fi
     if [ "$rc" -eq 0 ]; then
         note "$area traceability: PASS ($count rows resolve)"
     fi
@@ -591,7 +597,7 @@ check_traceability() {
 # --- dispatch ---------------------------------------------------------------
 
 usage() {
-    sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
@@ -613,7 +619,7 @@ main() {
     done
 
     case "$cmd" in
-        smoke|exhaustive|negative|traceability|ci|all) : ;;
+        smoke|live|exhaustive|negative|traceability|ci|all) : ;;
         ""|-h|--help) usage 0 ;;
         *) die "unknown subcommand: $cmd" ;;
     esac
@@ -648,26 +654,29 @@ main() {
     RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse 'HEAD^{tree}')"
 
     local records_tsv=0
-    case "$cmd" in smoke|exhaustive|negative|ci|all) records_tsv=1 ;; esac
+    case "$cmd" in smoke|live|exhaustive|negative|ci|all) records_tsv=1 ;; esac
     [ "$records_tsv" -eq 1 ] && truncate_tsv
 
     # ci and all record every model under ONE run id, so last-run.tsv is a
-    # single coherent run: the smoke, negative, and (for all) exhaustive rows
-    # all carry the same run-id column.
+    # single coherent run: the smoke, live, negative, and (for all) exhaustive
+    # rows all carry the same run-id column.
     local rc=0 area
     for area in $areas; do
         case "$cmd" in
             smoke)        check_model "$area" smoke || rc=1 ;;
+            live)         check_model "$area" live || rc=1 ;;
             exhaustive)   check_model "$area" exhaustive || rc=1 ;;
             negative)     check_negative "$area" || rc=1 ;;
             traceability) check_traceability "$area" || rc=1 ;;
             ci)
                 check_model "$area" smoke || rc=1
+                check_model "$area" live || rc=1
                 check_negative "$area" || rc=1
                 check_traceability "$area" || rc=1
                 ;;
             all)
                 check_model "$area" smoke || rc=1
+                check_model "$area" live || rc=1
                 check_negative "$area" || rc=1
                 check_traceability "$area" || rc=1
                 check_model "$area" exhaustive || rc=1
