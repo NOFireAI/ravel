@@ -25,3 +25,11 @@ schemars = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 base64 = { workspace = true }
+
+[dev-dependencies]
+# Only the cursor round-trip test names these: it builds a `SegmentPin` with
+# every field non-default, which means naming `SegmentLevel::L1` and a
+# non-nil `Uuid`. Neither type appears in this crate's own API or in any
+# production path here, which is why they are dev-only.
+ravel-catalog = { workspace = true }
+uuid = { workspace = true }

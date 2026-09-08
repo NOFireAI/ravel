@@ -4855,6 +4855,7 @@ version = "0.14.0"
 dependencies = [
  "base64 0.23.0",
  "blake3",
+ "ravel-catalog",
  "ravel-query",
  "ravel-sql",
  "ravel-types",
@@ -4863,6 +4864,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
