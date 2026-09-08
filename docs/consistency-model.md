@@ -244,7 +244,8 @@ and no stronger; it does not promise a single stored copy per record.
   each absorbed step is counted (intended for export as
   `ravel_ingest_clock_regressions_total` once the Prometheus wiring lands). A
   backwards step larger than
-  a bounded hold (20 minutes) is refused with a typed error rather than
+  a bounded hold (the catalog clock-skew allowance, `DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`,
+  5 min) is refused with a typed, retryable error (`Abandoned`, 503) rather than
   absorbed, so a spurious forward glitch cannot ratchet the floor into a future
   ingest hour and strand every later flush. The floor is in-process state,
   reset to 0 on restart by construction; the guarantee is per-process, and a
