@@ -291,8 +291,11 @@ async fn measured_router_charge(points: usize) -> u64 {
 /// reads exactly 1. The body is a zeros bomb: it inflates well past the 1 MiB
 /// ceiling but is not valid OTLP, so if the charge did NOT happen during inflate
 /// the bytes would inflate in full and then fail protobuf decode with 400.
-/// Asserting 429 therefore proves the budget was charged as the bytes inflated,
-/// before decode ran at all.
+/// Asserting 429 therefore proves the budget was charged before decode ran,
+/// not that it was charged as each chunk inflated: that mid-inflate,
+/// chunk-by-chunk property is pinned separately by
+/// `over_cap_inflate_charge_peaks_at_the_cap_exactly` in
+/// `services/ravel-server/src/otlp_http.rs`.
 ///
 /// Non-vacuity: revert the per-chunk `budget.try_charge` in
 /// `decompress_gzip_capped_charged` and the bomb inflates fully and fails
