@@ -1450,7 +1450,11 @@ greatest wins. Values compare by f64 bit pattern (ADR-0010 §5). The primary
 key `created_unix_ns` is the flush-open clock reading; each writer raises every
 reading to a per-writer monotonic floor within its process lifetime, so a
 backwards wall-clock step cannot stamp a correction below the stale sample it
-supersedes (ADR-1307).
+supersedes (ADR-1307). A step larger than a bounded hold (20 minutes) is
+refused rather than absorbed. The floor is per-process and resets on restart;
+a backwards step spanning a restart can still invert resolution, and
+`writer_id` does not prevent it, being only the segment-order tiebreak below
+and not part of this comparator (ADR-1307 Known limitation).
 
 That provenance order is not total across segments: two same-shard segments
 from different writers can tie on (created_unix_ns, writer_epoch, writer_seq)
