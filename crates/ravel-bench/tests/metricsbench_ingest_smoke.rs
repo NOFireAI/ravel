@@ -163,7 +163,7 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     let expected = workload
         .profile("ci")
         .expect("manifest declares a `ci` profile");
-    let expected_label_cardinalities = workload.label_cardinalities();
+    let expected_label_cardinalities = workload.label_cardinalities(expected);
 
     // No `--steps` override: the generator-exact figures (`total_series_created`,
     // `logical_input_bytes`) are only comparable to the profile's declared

@@ -339,18 +339,10 @@ impl<'a> Generator<'a> {
         let mut plans = Vec::with_capacity(workload.families.len());
         for (index, family) in workload.families.iter().enumerate() {
             let instances = workload.family_instances(profile, family);
-            let mut fixed = Vec::with_capacity(family.labels.len());
+            let cardinalities = workload.family_dimension_cardinalities(family);
+            let mut fixed = Vec::with_capacity(cardinalities.len());
             let mut stride = 1u64;
-            for label in &family.labels {
-                // `gate_workload` already refused a family naming an
-                // undeclared dimension, so an absent one here would be a
-                // manifest that never passed the gate; treat it as a
-                // single-valued dimension rather than panicking.
-                let card = workload
-                    .dimension(label)
-                    .map(|d| d.values.len() as u64)
-                    .unwrap_or(1)
-                    .max(1);
+            for card in cardinalities {
                 fixed.push((card, stride));
                 stride *= card;
             }

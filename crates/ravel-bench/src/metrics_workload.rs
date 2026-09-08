@@ -266,16 +266,68 @@ impl WorkloadFile {
         self.label_dimensions.iter().find(|d| d.name == name)
     }
 
-    /// Distinct values each label dimension declares, name to count
-    /// (ADR-0927 decision 11). A direct read of the manifest: every label
-    /// value a generated series carries comes from exactly these dimensions
-    /// (`Generator::labels_for`), so this is the generator's own source, not
-    /// a re-derivation from generated output.
-    pub fn label_cardinalities(&self) -> BTreeMap<String, u64> {
-        self.label_dimensions
+    /// Distinct values each label carries under `profile` (ADR-0927 decision
+    /// 11): every declared label dimension's value count, plus the scaling
+    /// label ([`GeneratorConfig::scaling_label`]), which `Generator::labels_for`
+    /// stamps on every series but which the manifest never declares as an
+    /// ordinary dimension. The scaling label's cardinality varies by
+    /// profile (it depends on `family_instances`), so it is derived per
+    /// family and summed here from [`Self::family_scaling_label_cardinality`]
+    /// -- the same figures the generator itself computes -- never a formula
+    /// re-typed against the manifest.
+    pub fn label_cardinalities(&self, profile: &Profile) -> BTreeMap<String, u64> {
+        let mut out: BTreeMap<String, u64> = self
+            .label_dimensions
             .iter()
             .map(|d| (d.name.clone(), d.values.len() as u64))
+            .collect();
+        let scaling_total: u64 = self
+            .families
+            .iter()
+            .map(|family| self.family_scaling_label_cardinality(profile, family))
+            .sum();
+        out.insert(self.generator.scaling_label.clone(), scaling_total);
+        out
+    }
+
+    /// Cardinality of each of `family`'s fixed label dimensions, in
+    /// `family.labels` order. Falls back to a single-valued dimension for a
+    /// name `gate_workload` would have refused as undeclared, matching
+    /// [`crate::metrics_gen::Generator::new`]'s own fallback so the two never
+    /// disagree about a manifest that never passed the gate.
+    pub(crate) fn family_dimension_cardinalities(&self, family: &MetricFamily) -> Vec<u64> {
+        family
+            .labels
+            .iter()
+            .map(|label| {
+                self.dimension(label)
+                    .map(|d| d.values.len() as u64)
+                    .unwrap_or(1)
+                    .max(1)
+            })
             .collect()
+    }
+
+    /// Distinct label combinations one scaling-label ordinal spans before
+    /// `Generator::labels_for` advances it: the product of `family`'s fixed
+    /// label-dimension cardinalities.
+    pub fn family_fixed_product(&self, family: &MetricFamily) -> u64 {
+        self.family_dimension_cardinalities(family)
+            .into_iter()
+            .product()
+    }
+
+    /// Distinct scaling-label values `family` uses under `profile`:
+    /// `Generator::labels_for` assigns the scaling label
+    /// `global / fixed_product`, so this is `ceil(instances /
+    /// family_fixed_product)`.
+    pub fn family_scaling_label_cardinality(
+        &self,
+        profile: &Profile,
+        family: &MetricFamily,
+    ) -> u64 {
+        let instances = self.family_instances(profile, family);
+        instances.div_ceil(self.family_fixed_product(family).max(1))
     }
 
     /// Time series one instance of `kind` emits: one for a gauge, a counter, or

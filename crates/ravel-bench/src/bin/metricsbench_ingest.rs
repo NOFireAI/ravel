@@ -27,8 +27,9 @@ use ravel_bench::harness::{
 };
 use ravel_bench::metrics_gen::Generator;
 use ravel_bench::metrics_ingest::{
-    HttpReplayConfig, LogicalSample, MetricsIngestReport, ProfileRecord, RavelReplayConfig,
-    Substrate, parse_logical_stream, query_after_replay, replay_into_ravel, replay_over_http,
+    FamilyRecord, HttpReplayConfig, LogicalSample, MetricsIngestReport, ProfileRecord,
+    RavelReplayConfig, Substrate, parse_logical_stream, query_after_replay, replay_into_ravel,
+    replay_over_http,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_ingest::{Clock, SystemClock};
@@ -172,6 +173,15 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let profile = workload.profile(&args.profile).ok_or_else(|| {
         RunError::Generate(format!("manifest declares no profile `{}`", args.profile))
     })?;
+    let families = workload
+        .families
+        .iter()
+        .map(|family| FamilyRecord {
+            name: family.name.clone(),
+            instances: workload.family_instances(profile, family),
+            series_per_instance: workload.series_per_instance(family.kind),
+        })
+        .collect();
     let profile_record = ProfileRecord {
         name: profile.name.clone(),
         comparable: profile.is_publishable(),
@@ -182,9 +192,10 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         scrape_interval_secs: profile.scrape_interval_secs,
         duration_secs: profile.duration_secs,
         total_samples: profile.total_samples,
-        label_cardinalities: workload.label_cardinalities(),
+        label_cardinalities: workload.label_cardinalities(profile),
         logical_input_bytes,
         churn_basis_points_per_hour: profile.churn_basis_points_per_hour,
+        families,
     };
 
     // The in-process Ravel path: strict, durable-on-ack, commit tokens.

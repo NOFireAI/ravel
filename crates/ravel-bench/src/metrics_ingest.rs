@@ -453,13 +453,37 @@ pub struct ProfileRecord {
     pub duration_secs: u64,
     /// Total samples the profile declares over its full duration.
     pub total_samples: u64,
-    /// Distinct values per label dimension, name to count, straight from the
-    /// workload manifest (`WorkloadFile::label_cardinalities`).
+    /// Distinct values per label, name to count, straight from the workload
+    /// manifest (`WorkloadFile::label_cardinalities`) -- including the
+    /// scaling label (`instance`), whose total is the sum of `families`'
+    /// per-family instance cardinalities below.
     pub label_cardinalities: BTreeMap<String, u64>,
     /// Logical (uncompressed, pre-wire) input bytes the generator produced.
     pub logical_input_bytes: u64,
     /// Declared series churn, in basis points per hour.
     pub churn_basis_points_per_hour: u64,
+    /// Per-family instance counts, so `label_cardinalities`' `instance` total
+    /// is reconstructible: combined with the manifest's own label
+    /// dimensions and `family.labels`, a reader can recompute each family's
+    /// scaling-label cardinality (`WorkloadFile::family_scaling_label_
+    /// cardinality`) and its sum.
+    pub families: Vec<FamilyRecord>,
+}
+
+/// One metric family's exact instance count under the run's profile, and the
+/// series each instance emits (`WorkloadFile::family_instances`,
+/// `WorkloadFile::series_per_instance`) -- the generator's own counts, never a
+/// formula re-typed against the manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FamilyRecord {
+    /// The family name.
+    pub name: String,
+    /// Instances (histograms, or plain series) the family emits under this
+    /// profile.
+    pub instances: u64,
+    /// Series one instance emits: 1 for a gauge, a counter, or a native
+    /// histogram; bounds-plus-3 for a classic histogram.
+    pub series_per_instance: u64,
 }
 
 /// The storage backend a run replayed against, and whether it bills for
