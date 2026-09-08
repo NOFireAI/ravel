@@ -166,8 +166,8 @@ an upper envelope, never a prediction, and the field says so.
 ### `evidence`
 
 A list of references, each an opaque `ref` token plus a `sha256` of the
-exact row bytes it covers. Redeem a reference later to prove a row has not
-changed.
+canonical row bytes it covers. Redeem a reference later to prove a row has
+not changed.
 
 ### `warnings` and `next_steps`
 
@@ -177,8 +177,14 @@ ask for the bounded form of a listing, retry after a wait.
 
 ## Time inputs
 
-Every tool that reads data requires a time input. There is no default
-window: omit one and the call fails with `missing_argument`.
+Six tools take a required time input: `ravel_query_sql`,
+`ravel_search_logs`, `ravel_get_trace`, `ravel_find_labels`,
+`ravel_analyze_timeseries`, and `ravel_query_promql`. There is no default
+window: omit the time input and the call fails with `missing_argument`.
+
+`ravel_capabilities` takes no time input. `ravel_describe_data` takes none
+either, because it reports the coverage window and the freshness watermark
+itself.
 
 Pass a time as an RFC 3339 string or as an integer count of nanoseconds,
 given as a string. A raw JSON number cannot hold a nanosecond epoch exactly.
@@ -232,14 +238,22 @@ back for the wrong tenant, or altered, fails with `cursor_invalid`.
 
 `ravel_query_sql` mints a cursor only when the statement's `ORDER BY`,
 together with the tiebreak the tool appends, orders every row uniquely.
+When the tiebreak is not unique, the equal-group rule applies exactly
+as for `ravel_search_logs`. A page never ends inside a group of equal
+tuples. The cursor points at the last complete group. Cursor paging
+continues.
+
 `ravel_search_logs` orders by a tuple that is not always unique, since
-`logs` rows carry no row identity. `ravel_get_trace` orders by `start_ts`
-and `span_id`, and every span carries a `span_id`.
-When a page would end inside a group of equal rows, `ravel_search_logs`
-drops that whole group from the page rather than split it, and the next
-cursor starts after the group. If no complete group fits in one page, the
-call returns `ok_bounded` with no cursor, and `next_steps` names narrowing
-`time_range`.
+`logs` rows carry no row identity. When a page would end inside a group
+of equal rows, `ravel_search_logs` drops that whole group from the page
+rather than split it, and the next cursor starts after the group.
+
+`ravel_get_trace` orders by `start_ts` and `span_id`, and every span
+carries a `span_id`, so the equal-group rule never applies to it.
+
+When no complete group fits in the row cap, the server returns the
+rows it has, up to the row cap, with status `ok_bounded` and no cursor.
+`next_steps` names narrowing `time_range`.
 
 An evidence reference works the same way, with one difference: redeeming it
 after its pin expires re-runs the query fresh instead of failing, reports
@@ -270,7 +284,9 @@ name, or a credential.
 ## If the result is empty
 
 A `data.row_count` of zero and a call that failed are different signals.
-Work through these in order:
+A result with rows and `status` `ok_bounded` is a third: more rows
+exist and the server minted no cursor for them. Work through the
+empty case in order:
 
 1. **The call failed instead of returning zero rows.** Check `status`. If
    it is `error`, the empty `data` block is not the answer: read `failure`

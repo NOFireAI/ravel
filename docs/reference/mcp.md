@@ -17,7 +17,7 @@ the envelope, and the empty-result checklist.
 | --- | --- | --- | --- | --- | --- |
 | `ravel_capabilities` | Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `unauthorized`, `internal` |
 | `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal` | `data`, `scope`, `visibility`, `coverage` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `internal` |
-| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter; an unfiltered tenant-wide list is refused | `data`, `scope`, `coverage` | 2,000 segments admitted for resolution | `unauthorized`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter, `time_range` (required). An unfiltered tenant-wide list is refused | `data`, `scope`, `coverage` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
 | `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent | `data`, `scope`, `coverage`, `accuracy`, `budget` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
@@ -60,6 +60,16 @@ than dropping it. A number, a timestamp, a boolean, and a hex-encoded
 binary id never shorten; a string or a structured value that exceeds the
 per-cell budget is cut to that budget.
 
+The first-row guarantee applies to the byte cap. It does not apply to
+the row cap. When the equal-group rule leaves no complete group inside
+the row cap, the server returns the rows it has, up to the row cap.
+The status is `ok_bounded`. The server mints no cursor. `next_steps`
+names narrowing `time_range` as the fix.
+
+A result with rows and `ok_bounded` means more rows exist and the
+server minted no cursor. A genuinely empty result is `ok` with
+`row_count` 0.
+
 ## Failure classes
 
 | Class | Meaning |
@@ -100,16 +110,23 @@ sticky routing to a paging client.
 
 `ravel_query_sql` mints a cursor only when the statement's `ORDER BY`,
 plus a tiebreak the tool appends, is a total order over the projection.
-The same equal-group rule below applies when that tiebreak is not
-unique. `ravel_search_logs` orders by a tuple of timestamp, observed
-timestamp, trace id, span id, and a body hash. That tuple is not
-unique, because `logs` rows carry no row identity and ingest is
-at-least-once. When a page would end inside a group of equal tuples,
-the tool drops the whole group from the page instead of splitting it,
-and the cursor resumes after the group. `ravel_get_trace` orders by
-`(start_ts, span_id)`, which is unique, so the equal-group rule never
-applies to it. When no complete group fits in a page, the result is
-`ok_bounded` with no cursor.
+When the tiebreak is not unique, the equal-group rule applies exactly
+as for `ravel_search_logs`. A page never ends inside a group of equal
+tuples. The cursor points at the last complete group. Cursor paging
+continues.
+
+`ravel_search_logs` orders by a tuple of timestamp, observed timestamp,
+trace id, span id, and a body hash. That tuple is not unique, because
+`logs` rows carry no row identity and ingest is at-least-once. When a
+page would end inside a group of equal tuples, the tool drops the whole
+group from the page instead of splitting it, and the cursor resumes
+after the group.
+
+`ravel_get_trace` orders by `(start_ts, span_id)`, which is unique, so
+the equal-group rule never applies to it.
+
+When no complete group fits in the row cap, the server returns the
+rows it has, up to the row cap, with status `ok_bounded` and no cursor.
 
 An evidence reference is a token of the same family, with a `sha256` of the
 canonical row bytes added. Redeeming it while its pin is valid re-executes
