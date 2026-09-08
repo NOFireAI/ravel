@@ -12,7 +12,7 @@ use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
@@ -63,6 +63,12 @@ const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// allocated it (the same discipline as `ravel-otap`'s `decompress_capped`).
 const MAX_DECOMPRESSED_OTLP_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Size of the staging buffer the gzip decoder reads into, and so the upper
+/// bound on one retained inflate chunk. Fixed, stack-allocated, and reused for
+/// every read, so the only uncharged inflate allocation is this one buffer plus
+/// the per-chunk bookkeeping [`ChunkedBody`] documents.
+const INFLATE_CHUNK_BYTES: usize = 64 * 1024;
+
 /// The `Content-Encoding` a request declared, after RFC 9110 parsing. Only the
 /// codings Ravel actually decodes are named; everything else is
 /// [`ContentCoding::Unsupported`] and answered with 415 rather than being
@@ -108,6 +114,87 @@ fn parse_content_encoding(headers: &HeaderMap) -> ContentCoding {
     }
 }
 
+/// An OTLP request body as the exact chunks the ingest byte budget was charged
+/// for, read by prost as one non-contiguous [`Buf`].
+///
+/// The gzip path never concatenates its output. A `Vec<u8>` grown with
+/// `extend_from_slice` keeps spare capacity beyond its length and, while
+/// reallocating, holds the old and the new allocation at once, so a charge taken
+/// on the appended length undercounts what the process is holding; `reserve_exact`
+/// does not close that gap, because an allocator may return more than was asked
+/// for. Retaining each inflate chunk as its own exactly-sized [`Bytes`] instead
+/// makes the charge equal the retained bytes at every instant: each chunk is
+/// allocated once at its final size, and no chunk is ever copied into a larger
+/// one. What stays uncharged is the fixed [`INFLATE_CHUNK_BYTES`] staging buffer
+/// plus this struct's per-chunk bookkeeping (one `Bytes` handle and one charge
+/// guard per chunk, together under 0.1% of the bytes the chunk holds).
+///
+/// The identity path wraps its single body chunk here unchanged, so it still
+/// makes no copy and takes no charge.
+#[derive(Debug)]
+struct ChunkedBody {
+    chunks: Vec<Bytes>,
+    /// Index of the chunk [`Buf::chunk`] reads from. Every earlier chunk is
+    /// fully consumed, and `chunks[cursor]` is non-empty whenever `remaining`
+    /// is nonzero.
+    cursor: usize,
+    remaining: usize,
+}
+
+impl ChunkedBody {
+    fn new(chunks: Vec<Bytes>) -> Self {
+        let remaining = chunks.iter().map(Bytes::len).sum();
+        Self {
+            chunks,
+            cursor: 0,
+            remaining,
+        }
+    }
+
+    /// One contiguous body (the identity path), moved in without a copy.
+    fn single(body: Bytes) -> Self {
+        Self::new(vec![body])
+    }
+
+    /// Byte length of every retained chunk, for the accounting assertions: the
+    /// charged figure must equal this total, not merely the decompressed length.
+    #[cfg(test)]
+    fn chunk_lens(&self) -> Vec<usize> {
+        self.chunks.iter().map(Bytes::len).collect()
+    }
+}
+
+impl Buf for ChunkedBody {
+    fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.chunks
+            .get(self.cursor)
+            .map_or(&[][..], |chunk| chunk.as_ref())
+    }
+
+    /// `cnt` is clamped to what is left rather than panicking on an over-advance:
+    /// prost never advances past `remaining`, and an ingest path that mis-decoded
+    /// should return a 400 from the decoder, not abort the request task.
+    fn advance(&mut self, cnt: usize) {
+        let mut left = cnt.min(self.remaining);
+        while left > 0 {
+            let Some(current) = self.chunks.get_mut(self.cursor) else {
+                break;
+            };
+            let taken = left.min(current.len());
+            current.advance(taken);
+            left -= taken;
+            self.remaining -= taken;
+            if current.is_empty() {
+                self.cursor += 1;
+            }
+        }
+    }
+}
+
 /// Why a gzip body could not be turned into OTLP bytes, while charging the
 /// process-wide ingest byte budget for the bytes it inflates.
 #[derive(Debug)]
@@ -133,11 +220,17 @@ enum GzipDecodeError {
 /// [`MAX_DECOMPRESSED_OTLP_BODY_BYTES`] before any byte was charged, so
 /// `--max-inflight-ingest-requests` copies of a 64 MiB inflate sat outside the
 /// `--max-ingest-buffer-bytes` ceiling that claims to bound ingest memory. The
-/// charge now happens before the buffer grows: each read charges exactly the
-/// bytes it retained, so the returned guards' summed charge equals the
-/// decompressed length exactly (no over-charge), and a body whose inflate would
-/// cross the ceiling is shed mid-inflate ([`GzipDecodeError::Shed`]) rather than
-/// after the process has already grown by the full expansion.
+/// charge now happens while the body inflates, before each chunk is retained:
+/// every read charges exactly the bytes that chunk will hold, so the returned
+/// guards' summed charge equals the retained chunk total, which is the
+/// decompressed length exactly (no over-charge and no undercount), and a body
+/// whose inflate would cross the ceiling is shed mid-inflate
+/// ([`GzipDecodeError::Shed`]) rather than after the process has already grown
+/// by the full expansion.
+///
+/// The output is a list of exactly-sized chunks, never one growing `Vec<u8>`:
+/// see [`ChunkedBody`] for why an amortized-growth buffer cannot be charged
+/// honestly.
 ///
 /// The decoder is read through `take(cap + 1)` so the output buffer can never
 /// grow past `cap + 1` before the size check runs, which refuses a bomb as it
@@ -158,37 +251,42 @@ fn decompress_gzip_capped_charged(
     body: &[u8],
     cap: usize,
     budget: &Arc<IngestByteBudget>,
-) -> Result<(Vec<u8>, Vec<IngestByteCharge>), GzipDecodeError> {
+) -> Result<(Vec<Bytes>, Vec<IngestByteCharge>), GzipDecodeError> {
     use std::io::Read;
 
     use flate2::read::MultiGzDecoder;
 
     let cap_u64 = cap as u64;
     let mut decoder = MultiGzDecoder::new(body).take(cap_u64 + 1);
-    let mut out = Vec::new();
+    let mut chunks: Vec<Bytes> = Vec::new();
     let mut charges = Vec::new();
+    let mut produced: u64 = 0;
     // A fixed staging buffer so the charge granularity is bounded and the peak
     // uncharged allocation is at most one chunk.
-    let mut chunk = [0u8; 64 * 1024];
+    let mut staging = [0u8; INFLATE_CHUNK_BYTES];
     loop {
         let read = decoder
-            .read(&mut chunk)
+            .read(&mut staging)
             .map_err(|err| GzipDecodeError::Invalid(err.to_string()))?;
         if read == 0 {
             break;
         }
-        // Charge before retaining the bytes: if the ceiling is crossed, `out`
-        // stops growing here and every guard taken so far drops on return.
+        // Charge before the chunk is allocated: if the ceiling is crossed,
+        // nothing is retained here and every guard taken so far drops on return.
         match budget.try_charge(read as u64) {
             Ok(charge) => charges.push(charge),
             Err(_) => return Err(GzipDecodeError::Shed),
         }
-        out.extend_from_slice(&chunk[..read]);
+        // Exactly `read` bytes, allocated once at their final size: no spare
+        // capacity to leave uncharged, and no reallocation that would hold two
+        // copies of the inflate at the same instant.
+        chunks.push(Bytes::copy_from_slice(&staging[..read]));
+        produced += read as u64;
     }
-    if out.len() as u64 > cap_u64 {
+    if produced > cap_u64 {
         return Err(GzipDecodeError::TooLarge);
     }
-    Ok((out, charges))
+    Ok((chunks, charges))
 }
 
 /// HTTP 415 for an unsupported `Content-Encoding`, naming what is supported so
@@ -219,19 +317,19 @@ fn unsupported_encoding_response() -> Response {
 /// `/metrics` can report it alongside the charged (decompressed) size.
 ///
 /// On the gzip path the returned [`IngestByteCharge`] guards hold the
-/// process-wide ingest byte budget charge for the inflated bytes (ADR-0069 as
-/// amended by issue #1297); the caller keeps them alive through protobuf decode
-/// and drops them once prost has copied the buffer into owned structs, before
-/// the router takes its own buffered charge, so the two never coexist. The
-/// identity path allocates no transient inflate buffer, so it returns no
-/// guards.
+/// process-wide ingest byte budget charge for the retained inflate chunks
+/// (ADR-0069 as amended by issue #1297); the caller keeps them alive through
+/// protobuf decode and drops them once prost has copied the chunks into owned
+/// structs, before the router takes its own buffered charge, so the two never
+/// coexist. The identity path allocates no transient inflate buffer, so it
+/// returns no guards.
 fn admit_and_decode_body(
     state: &GatewayState,
     headers: &HeaderMap,
     tenant: &TenantId,
     signal: Signal,
     body: Bytes,
-) -> Result<(Bytes, Vec<IngestByteCharge>), Box<Response>> {
+) -> Result<(ChunkedBody, Vec<IngestByteCharge>), Box<Response>> {
     match parse_content_encoding(headers) {
         ContentCoding::Unsupported => Err(Box::new(unsupported_encoding_response())),
         ContentCoding::Identity => {
@@ -248,7 +346,7 @@ fn admit_and_decode_body(
             state
                 .ingest_byte_metrics
                 .record_wire_bytes(tenant, signal, wire_len);
-            Ok((body, Vec::new()))
+            Ok((ChunkedBody::single(body), Vec::new()))
         }
         ContentCoding::Gzip => {
             let wire_len = body.len() as u64;
@@ -271,7 +369,7 @@ fn admit_and_decode_body(
             // not just by --max-inflight-ingest-requests. A body whose inflate
             // would cross the ceiling is shed mid-inflate (429), before the
             // process grows by the full expansion.
-            let (decompressed, decode_charge) = match decompress_gzip_capped_charged(
+            let (chunks, decode_charge) = match decompress_gzip_capped_charged(
                 &body,
                 MAX_DECOMPRESSED_OTLP_BODY_BYTES,
                 &state.budget,
@@ -302,7 +400,8 @@ fn admit_and_decode_body(
                     ));
                 }
             };
-            let decompressed_len = decompressed.len() as u64;
+            let decompressed = ChunkedBody::new(chunks);
+            let decompressed_len = decompressed.remaining() as u64;
             // The real byte-rate charge: the decompressed size (ADR-0084
             // decision 4), so a compressing tenant and an uncompressing one
             // sending the same telemetry are charged the same. On rejection the
@@ -317,7 +416,7 @@ fn admit_and_decode_body(
             state
                 .ingest_byte_metrics
                 .record_wire_bytes(tenant, signal, wire_len);
-            Ok((Bytes::from(decompressed), decode_charge))
+            Ok((decompressed, decode_charge))
         }
     }
 }
@@ -347,12 +446,13 @@ pub struct GatewayState {
     /// The process-wide ingest buffer byte budget (ADR-0069 decision 1, amended
     /// by issue #1297). The same `Arc` the ingest routers hold via
     /// `with_budget`. The gzip inflate path (`admit_and_decode_body`) charges
-    /// the decompressed bytes into it *before* inflating, incrementally as they
-    /// are produced, and holds the charge through decode; it releases the charge
-    /// once prost has copied the buffer into owned structs, before the router
-    /// takes its own buffered charge, so the inflate charge and the buffered
-    /// charge never coexist and transient decode memory is bounded by
-    /// `--max-ingest-buffer-bytes` the same way buffered memory is.
+    /// the decompressed bytes into it *while* it inflates, one charge per chunk
+    /// taken before that chunk is retained, and holds the charge through decode;
+    /// it releases the charge once prost has copied the chunks into owned
+    /// structs, before the router takes its own buffered charge, so the inflate
+    /// charge and the buffered charge never coexist and transient decode memory
+    /// is bounded by `--max-ingest-buffer-bytes` the same way buffered memory
+    /// is.
     pub budget: Arc<IngestByteBudget>,
     /// The process-wide in-flight ingest-request ceiling, shared
     /// with every OTLP HTTP/gRPC service and Remote Write on this listener
@@ -549,17 +649,19 @@ async fn export_metrics(
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
     // byte rate and return the OTLP protobuf bytes, decompressing first when
     // the client sent gzip. Identity is unchanged from before. On the gzip path
-    // `decode_charge` holds the process-wide budget charge for the inflated
-    // bytes (empty on the identity path); it is released together with the raw
-    // inflate buffer once prost has decoded it, just below (ADR-0069 as amended
-    // by issue #1297).
+    // `decode_charge` holds the process-wide budget charge for the retained
+    // inflate chunks (empty on the identity path); it is released once prost has
+    // decoded and freed them, just below (ADR-0069 as amended by issue #1297).
     let (body, decode_charge) =
         match admit_and_decode_body(&state, &headers, &tenant, Signal::Metrics, body) {
             Ok(decoded) => decoded,
             Err(response) => return *response,
         };
 
-    let request = match ExportMetricsServiceRequest::decode(body.as_ref()) {
+    // `decode` consumes the chunked body, so prost's own return frees the
+    // retained inflate chunks: it copies them into owned protobuf structs and
+    // nothing borrows them afterwards.
+    let request = match ExportMetricsServiceRequest::decode(body) {
         Ok(request) => request,
         Err(err) => {
             return (
@@ -569,13 +671,10 @@ async fn export_metrics(
                 .into_response();
         }
     };
-    // prost decoded the wire bytes into owned protobuf structs (it copies out of
-    // the `&[u8]`; nothing borrows `body`), so the transient inflate buffer is
-    // dead here. Drop it and release its budget charge before the router takes
-    // its own charge for the normalized batch: the inflate charge and the
-    // router's buffered charge never coexist, so a request whose inflate and
-    // batch each fit the budget is not shed for their sum (issue #1297).
-    drop(body);
+    // Release the inflate charge here, with the chunks already freed, before the
+    // router takes its own charge for the normalized batch: the inflate charge
+    // and the router's buffered charge never coexist, so a request whose inflate
+    // and batch each fit the budget is not shed for their sum (issue #1297).
     drop(decode_charge);
 
     match crate::ingest::handle_export(&state.ingest, tenant, mode, request, now_ns()).await {
@@ -636,15 +735,15 @@ async fn export_logs(
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): charge the
     // byte rate and return the OTLP protobuf bytes, decompressing first when
     // the client sent gzip. Identity is unchanged from before.
-    // `decode_charge`: see `export_metrics`. Released with the inflate buffer
-    // right after decode, before the log write below.
+    // `decode_charge`: see `export_metrics`. Released once decode has consumed
+    // and freed the inflate chunks, before the log write below.
     let (body, decode_charge) =
         match admit_and_decode_body(&state, &headers, &tenant, Signal::Logs, body) {
             Ok(decoded) => decoded,
             Err(response) => return *response,
         };
 
-    let request = match ExportLogsServiceRequest::decode(body.as_ref()) {
+    let request = match ExportLogsServiceRequest::decode(body) {
         Ok(request) => request,
         Err(err) => {
             return (
@@ -654,10 +753,9 @@ async fn export_logs(
                 .into_response();
         }
     };
-    // See `export_metrics`: prost owns the decoded structs, so the inflate
-    // buffer is dead. Release it and its charge before the router charges the
+    // See `export_metrics`: decode consumed the chunks and prost owns the
+    // decoded structs, so release the charge before the router charges the
     // normalized batch, so the two never coexist (issue #1297).
-    drop(body);
     drop(decode_charge);
 
     let idempotency_key = idempotency_key_from_headers(&headers);
@@ -727,15 +825,15 @@ async fn export_traces(
     // Layer 2 (ADR-0051 section 2) plus gzip dispatch (ADR-0084): byte rate
     // applies uniformly to every signal including spans (even though spans get
     // no layer-4 admission), charged after decompression on the gzip path.
-    // `decode_charge`: see `export_metrics`. Released with the inflate buffer
-    // right after decode, before the span write below.
+    // `decode_charge`: see `export_metrics`. Released once decode has consumed
+    // and freed the inflate chunks, before the span write below.
     let (body, decode_charge) =
         match admit_and_decode_body(&state, &headers, &tenant, Signal::Spans, body) {
             Ok(decoded) => decoded,
             Err(response) => return *response,
         };
 
-    let request = match ExportTraceServiceRequest::decode(body.as_ref()) {
+    let request = match ExportTraceServiceRequest::decode(body) {
         Ok(request) => request,
         Err(err) => {
             return (
@@ -745,10 +843,9 @@ async fn export_traces(
                 .into_response();
         }
     };
-    // See `export_metrics`: prost owns the decoded structs, so the inflate
-    // buffer is dead. Release it and its charge before the router charges the
+    // See `export_metrics`: decode consumed the chunks and prost owns the
+    // decoded structs, so release the charge before the router charges the
     // normalized batch, so the two never coexist (issue #1297).
-    drop(body);
     drop(decode_charge);
 
     let idempotency_key = idempotency_key_from_headers(&headers);
@@ -1193,7 +1290,7 @@ pub(crate) mod tests {
             &unlimited,
         )
         .expect("decodes");
-        assert_eq!(round_trip, encoded, "both members must decompress");
+        assert_eq!(round_trip.concat(), encoded, "both members must decompress");
 
         let response = export_metrics(
             State(state.clone()),
@@ -1430,12 +1527,19 @@ pub(crate) mod tests {
     }
 
     /// ADR-0069 as amended by issue #1297: the gzip inflate path charges the
-    /// process-wide ingest byte budget the ACTUAL decompressed length, settled
-    /// exactly -- not the compressed length and not the 64 MiB inflate cap --
-    /// and releases it at the instant the raw inflate buffer is dropped after
-    /// decode, before the router takes its own buffered charge (finding 3), so
-    /// the two never coexist. Proven on `admit_and_decode_body` in isolation
-    /// plus the modelled drop point below.
+    /// process-wide ingest byte budget exactly what it retains -- the summed
+    /// length of the chunks it holds, which is the ACTUAL decompressed length,
+    /// not the compressed length and not the 64 MiB inflate cap -- and releases
+    /// it at the instant decode consumes and frees those chunks, before the
+    /// router takes its own buffered charge (finding 3), so the two never
+    /// coexist. Proven on `admit_and_decode_body` in isolation plus the modelled
+    /// drop point below.
+    ///
+    /// The charge is asserted against the retained chunk total, not only against
+    /// the decompressed length: those are the same figure only because the body
+    /// is retained as exactly-sized chunks. A growing `Vec<u8>` would hold spare
+    /// capacity (and, mid-reallocation, two allocations) that a length-based
+    /// charge would miss, and this assertion is what would catch that.
     ///
     /// Non-vacuity: change `decompress_gzip_capped_charged`'s per-chunk
     /// `budget.try_charge(read as u64)` to charge the compressed `body.len()`
@@ -1468,15 +1572,26 @@ pub(crate) mod tests {
         .expect("gzip body admitted under a generous budget");
 
         assert_eq!(
-            body.len(),
+            body.remaining(),
             encoded.len(),
             "the decoded body is the full inflate"
         );
+        let chunk_lens = body.chunk_lens();
+        let chunk_total: u64 = chunk_lens.iter().map(|len| *len as u64).sum();
         let charged: u64 = charges.iter().map(IngestByteCharge::bytes).sum();
         assert_eq!(
             charged,
             encoded.len() as u64,
             "the summed charge equals the decompressed length exactly"
+        );
+        assert_eq!(
+            charged, chunk_total,
+            "the summed charge equals the bytes actually retained, chunk for chunk"
+        );
+        assert!(
+            chunk_lens.iter().all(|len| *len <= INFLATE_CHUNK_BYTES),
+            "every retained chunk is bounded by the staging size, so none grew by \
+             reallocation: {chunk_lens:?}"
         );
         assert_ne!(
             charged,
@@ -1485,28 +1600,27 @@ pub(crate) mod tests {
         );
         assert_eq!(
             budget.in_flight_bytes(),
-            encoded.len() as u64,
-            "in-flight bytes settle to the actual inflated length while the charge is held"
+            chunk_total,
+            "in-flight bytes settle to the retained chunk total while the charge is held"
         );
 
-        // The handler decodes the inflate buffer into owned protobuf structs,
-        // then drops the buffer and releases this charge before the router takes
-        // its own (issue #1297). Model that drop point: decode, then drop the raw
-        // buffer and its charge together. The settled figure returns to zero at
-        // the instant the buffer is dropped, with no router charge ever
-        // coexisting with the inflate charge.
-        let request = ExportMetricsServiceRequest::decode(body.as_ref())
-            .expect("the inflate buffer decodes into an owned request");
-        drop(body);
+        // The handler decodes the inflate chunks into owned protobuf structs;
+        // `decode` consumes the chunked body, so the chunks are freed when it
+        // returns and the handler then releases this charge, before the router
+        // takes its own (issue #1297). Model that point: decode, then drop the
+        // charge. The settled figure returns to zero at the instant the charge is
+        // released, with no router charge ever coexisting with the inflate charge.
+        let request = ExportMetricsServiceRequest::decode(body)
+            .expect("the inflate chunks decode into an owned request");
         drop(charges);
         assert_eq!(
             budget.in_flight_bytes(),
             0,
-            "the inflate charge is released when the raw buffer is dropped, before any router charge"
+            "the inflate charge is released once decode has freed the chunks, before any router charge"
         );
-        // The decoded request owns its bytes, so it outlives the buffer it was
+        // The decoded request owns its bytes, so it outlives the chunks it was
         // copied from: the release above is sound precisely because nothing
-        // borrows the dropped buffer.
+        // borrows them.
         assert_eq!(
             request.resource_metrics.len(),
             1,
