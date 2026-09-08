@@ -67,8 +67,8 @@ never mistakes a non-comparable or unbilled run for a publishable result.
   (`samples_per_series`).
 - `samples_per_series`, `scrape_interval_secs`, `duration_secs`,
   `total_samples`, `churn_basis_points_per_hour`: as declared.
-- `label_cardinalities`: distinct values per label dimension, name to count,
-  including the scaling label.
+- `label_cardinalities`: distinct values per label, the scaling label
+  included.
 - `families`: one entry per metric family, each with `name`, `instances`,
   `series_per_instance`.
 - `run`: figures scoped to `steps_run`, never the declared full profile:
