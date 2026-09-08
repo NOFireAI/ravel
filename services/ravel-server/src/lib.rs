@@ -496,6 +496,15 @@ pub struct Running {
     /// The supervised background flush loop still owns the production cadence
     /// (`metadata_sink_task`); this handle shares the same `Arc`.
     pub metadata_sink: Option<Arc<ravel_ingest::MetadataSink>>,
+    /// The process's one query cost aggregator: the instance every query
+    /// surface records into and `/metrics` renders the `ravel_query_*` family
+    /// from. Public by design as a test seam, like [`Running::metadata_sink`]:
+    /// the per-query outcome split
+    /// ([`metrics::QueryAccountingMetrics::outcome_snapshot`]) is recorded on
+    /// every exit path, the failed ones included, but is not rendered on
+    /// `/metrics`, so an end-to-end test has no other way to assert that a
+    /// query which failed after execution still left a usage record.
+    pub query_accounting: Arc<metrics::QueryAccountingMetrics>,
     /// The query service backing the public HTTP router's query surfaces,
     /// `Some` in the query-serving modes that build one. Not layered onto the
     /// router itself: the MCP adapter (issue #1381) is the in-process
@@ -2300,6 +2309,7 @@ pub async fn start(
         fragment_task,
         ingest_router,
         metadata_sink,
+        query_accounting,
         query_service: query_service_handle,
         mtls_query_service: mtls_query_service_handle,
         log_ingest_router,
