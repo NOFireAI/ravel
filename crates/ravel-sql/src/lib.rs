@@ -35,6 +35,12 @@
 //! pinning the resolved snapshot into the ticket so `DoGet` never re-resolves
 //! and checking the metadata-resolved tenant against the
 //! ticket's own before redeeming it.
+//!
+//! `flight_ticket` alone is also reachable behind the narrower `pin-codec`
+//! feature, which `flight-sql` enables (ADR-1374 decision 9): it carries no
+//! `arrow-flight` dependency, so a crate that only needs the ticket codec
+//! (`ravel-mcp`'s cursor and evidence-reference tokens) does not have to link
+//! Flight to reuse it.
 
 mod alerts_provider;
 mod alerts_pushdown;
@@ -59,7 +65,7 @@ mod error;
 mod executor;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
-#[cfg(feature = "flight-sql")]
+#[cfg(feature = "pin-codec")]
 mod flight_ticket;
 mod group_keys;
 mod labels;
@@ -134,7 +140,7 @@ pub use executor::{
 pub use flight::{
     DEFAULT_GC_PROTECTION_HORIZON, FlightAuth, FlightClock, FlightSqlConfig, RavelFlightSqlService,
 };
-#[cfg(feature = "flight-sql")]
+#[cfg(feature = "pin-codec")]
 pub use flight_ticket::{
     FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, TICKET_KEY_LEN, TicketKey,
     derive_ticket_key,

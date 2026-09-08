@@ -142,11 +142,23 @@ hex = { workspace = true }
 ravel-proto = { workspace = true }
 
 [features]
+# The snapshot-pinning ticket codec alone (ADR-1374 decision 9): the
+# `flight_ticket` module (`FlightTicket`, `TicketKey`, `SegmentPin`, ...) with
+# no `arrow-flight` and no Flight transport at all. `ravel-mcp`'s cursor codec
+# (ADR-1374 D5) reuses this module's types and its keyed-MAC pattern, and an
+# `mcp` build must never pull in Flight (ADR-1374 D9's CI build check). Only
+# `uuid` (segment writer ids) and `blake3` (the MAC and `derive_ticket_key`)
+# are needed for that module; everything else it touches (ravel-catalog,
+# ravel-proto, ravel-query, ravel-types, this crate's own `declared` module)
+# is already an unconditional dependency.
+pin-codec = ["dep:uuid", "dep:blake3"]
+
 # Flight SQL transport. Off by default: it links arrow-flight and tonic on top
 # of datafusion, and the Flight surface is opt-in per deployment
 # (ADR-0013 structural isolation).
-# Gates the `flight` module (the future FlightSqlService) and the
-# `flight_ticket` module (the snapshot-pinning ticket codec).
+# Gates the `flight` module (the future FlightSqlService). `flight_ticket`
+# itself is gated by `pin-codec` above, which this feature enables so a
+# Flight build still gets the codec.
 #
 # The feature matrix writes this as "flight-sql implies sql". This
 # crate has no `sql` feature to imply: its SQL surface is unconditional
@@ -155,12 +167,11 @@ ravel-proto = { workspace = true }
 # `sql` feature actually exists, in services/ravel-server, whose `flight-sql`
 # enables its `sql`.
 flight-sql = [
+    "pin-codec",
     "dep:arrow-flight",
     "dep:tonic",
     "dep:prost",
     "dep:bytes",
-    "dep:uuid",
-    "dep:blake3",
     "dep:rand",
     "dep:ravel-maintain",
 ]
