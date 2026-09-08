@@ -1612,7 +1612,7 @@ impl Catalog {
                                 })
                                 .sum::<u64>();
                             let col_len_before = prost::Message::encoded_len(col) as u64;
-                            let col_len_after = col_len_before - dict_content_shrink;
+                            let col_len_after = col_len_before.saturating_sub(dict_content_shrink);
                             // The column's own embedding in `segment.columns`
                             // (tag + length-varint + content): the content
                             // shrink plus any varint-width drop in its own
@@ -1629,13 +1629,17 @@ impl Catalog {
                             break;
                         };
                         let seg_len_before = segment_len[seg_idx];
-                        let seg_len_after = seg_len_before - seg_reduction;
+                        let seg_len_after = seg_len_before.saturating_sub(seg_reduction);
                         // Any varint-width drop in the segment's own
                         // length-delimited framing shrinks the body by that
                         // much more than the column's own contribution.
                         let body_reduction = seg_reduction
                             + (varint_len(seg_len_before) - varint_len(seg_len_after));
-                        running_total -= body_reduction;
+                        // Saturating, like the two subtractions above: the
+                        // invariant makes these non-negative, and a broken
+                        // invariant must reach the drift check as a typed
+                        // error rather than wrap first.
+                        running_total = running_total.saturating_sub(body_reduction);
                         segment_len[seg_idx] = seg_len_after;
                         let col = &mut v3_segments[seg_idx].columns[col_idx];
                         col.dictionary_present = false;
@@ -4675,9 +4679,10 @@ mod tests {
         assert_eq!(
             column_stats_concat_calls_for_test(),
             2,
-            "the degrade loop measures the whole part's body exactly twice \
+            "the degrade loop itself concatenates the part's body exactly twice \
              (once before the drop loop, once after) no matter how many \
-             drops it takes -- not once per drop"
+             drops it takes -- not once per drop; the encoder's own passes \
+             are outside this count"
         );
 
         let head = read_logs_head(store.as_ref()).await;
