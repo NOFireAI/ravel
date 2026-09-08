@@ -861,6 +861,14 @@ pub(crate) struct ShardActor {
     writer_id: Uuid,
     epoch: u64,
     next_seq: u64,
+    /// Per-writer monotonic floor for the flush-open stamp (ADR-1307): the
+    /// largest `created_unix_ns` this actor has stamped. `flush_tenant` raises
+    /// each raw clock reading to this floor before stamping, so a backwards
+    /// wall-clock step never mints a `created_unix_ns` below one already
+    /// committed. In-process state only, never persisted: a restart mints a
+    /// fresh `writer_id`, so it resets to 0 by construction (see
+    /// [`ShardActor::monotonic_flush_open_ns`]).
+    last_flush_open_ns: i64,
     clock: Arc<dyn Clock>,
     config: IngestConfig,
     metrics: Arc<IngestMetrics>,
@@ -918,6 +926,7 @@ impl ShardActor {
             writer_id,
             epoch,
             next_seq: 0,
+            last_flush_open_ns: 0,
             clock,
             config,
             metrics,
@@ -1198,6 +1207,37 @@ impl ShardActor {
         }
     }
 
+    /// The flush-open stamp for this flush, raised to this writer's monotonic
+    /// floor (ADR-1307). The raw clock reading is a plausibility-checked value
+    /// (`checked_ingest_hour_bucket`) but carries no ordering guarantee: a
+    /// backwards wall-clock step (an NTP correction, a manual set) can read
+    /// below a stamp this writer already committed. Stamping that raw reading
+    /// as `created_unix_ns` would let a stale duplicate sample outrank its own
+    /// correction under the query-time dedup order (docs/catalog-and-mvcc.md
+    /// "Cross-segment duplicate samples"), because that order takes
+    /// `created_unix_ns` first. Raising each reading to `last_flush_open_ns`
+    /// keeps stamps non-decreasing within this writer's process lifetime and
+    /// counts every step it absorbs. The floor is in-process state, never read
+    /// back after a restart: a restart mints a fresh `writer_id`, so it resets
+    /// to 0 by construction, and cross-process order rests on that identity
+    /// rule (commit/README.md "a crash retires its identity"), not on the
+    /// floor.
+    fn monotonic_flush_open_ns(&mut self) -> i64 {
+        let raw_ns = self.clock.now_ns();
+        let stamped_ns = raw_ns.max(self.last_flush_open_ns);
+        if stamped_ns != raw_ns {
+            let regression_ns = stamped_ns - raw_ns;
+            self.metrics.record_clock_regression();
+            tracing::warn!(
+                shard = self.shard,
+                regression_ns,
+                "ravel-ingest: flush clock stepped backwards; held flush-open stamp to per-writer monotonic floor"
+            );
+        }
+        self.last_flush_open_ns = stamped_ns;
+        stamped_ns
+    }
+
     /// Pins `buf`'s flush identity, then moves `buf`'s payload and waiters
     /// into a task spawned onto [`FlushCtx::run_flush`] (ADR-0067 decision
     /// 1). Everything up to and including the semaphore acquire runs here,
@@ -1255,7 +1295,7 @@ impl ShardActor {
         let tenant_hash = tenant.hash();
         let seq = self.next_seq;
         self.next_seq += 1;
-        let flush_open_ns = self.clock.now_ns();
+        let flush_open_ns = self.monotonic_flush_open_ns();
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
             Err(msg) => {
