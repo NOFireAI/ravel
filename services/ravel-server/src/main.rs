@@ -499,6 +499,9 @@ async fn main() -> anyhow::Result<()> {
             .parse_distrib_settings()
             .context("failed to resolve --distributed-query settings")?,
         remote_clusters,
+        shutdown_timeout: cli
+            .parse_shutdown_timeout()
+            .context("failed to parse --shutdown-timeout")?,
     };
 
     let running =

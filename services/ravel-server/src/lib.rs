@@ -447,7 +447,38 @@ pub struct ServerConfig {
     /// configured here, never the calling client's. Independent of `distrib`
     /// above: federation is coordinator-side and needs no local fragment surface.
     pub remote_clusters: Vec<crate::config::RemoteClusterConfig>,
+    /// Upper bound on how long [`Running::shutdown`] spends draining ingest
+    /// buffers and joining background tasks, from `--shutdown-timeout` (default
+    /// [`DEFAULT_SHUTDOWN_TIMEOUT`]). Graceful shutdown flips readiness to
+    /// draining, waits a short settle interval so probes observe 503, then
+    /// bounds the whole drain by this value; if the drain overruns, shutdown
+    /// logs a warning and returns so the process still exits before Kubernetes
+    /// escalates to SIGKILL. The default is deliberately below the Kubernetes
+    /// default `terminationGracePeriodSeconds` ([`K8S_DEFAULT_GRACE_PERIOD`]),
+    /// leaving headroom for the pod's preStop hook and the SIGTERM-to-exit path
+    /// (the operator half of issue #1291 sets the pod grace period and preStop).
+    pub shutdown_timeout: Duration,
 }
+
+/// Default `--shutdown-timeout`: the ceiling on the graceful-shutdown drain.
+/// Kept below [`K8S_DEFAULT_GRACE_PERIOD`] so the process finishes draining and
+/// exits on its own before Kubernetes escalates SIGTERM to SIGKILL, leaving
+/// headroom for the preStop hook and final flush that the operator half of
+/// issue #1291 configures.
+pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The Kubernetes default `terminationGracePeriodSeconds` (30s). Not read at
+/// runtime: it pins the invariant that [`DEFAULT_SHUTDOWN_TIMEOUT`] stays below
+/// the grace period, so the drain cannot be cut off mid-flight by a SIGKILL the
+/// process could have beaten. A test asserts the ordering numerically.
+pub const K8S_DEFAULT_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// How long [`Running::shutdown`] waits, after flipping readiness to draining,
+/// before it begins closing listeners. This gives an in-flight readiness probe
+/// time to observe 503 while the process is still routing, so Kubernetes stops
+/// sending new connections before the listeners actually close. Small and fixed:
+/// it is a settle delay, not part of the bounded drain budget.
+const DRAIN_SETTLE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
 /// leaves the background listener tasks detached; always shut down explicitly.
@@ -503,87 +534,225 @@ pub struct Running {
     lifecycle_refresh_task: lifecycle_refresh::LifecycleRefreshTask,
     idle_tenant_state_task: idle_tenant_state::IdleTenantStateTask,
     metadata_sink_task: metadata_sink_task::MetadataSinkTask,
+    /// The readiness handle, so [`Running::shutdown`] can flip it to draining
+    /// before any listener closes. The `/readyz` handler holds a clone; both
+    /// observe the same one-way drain latch.
+    readiness: health::Readiness,
+    /// The upper bound on the graceful-shutdown drain, copied from
+    /// [`ServerConfig::shutdown_timeout`].
+    shutdown_timeout: Duration,
+    /// The ADR-0071 query-worker heartbeat handle, `Some` exactly when this
+    /// process spawned one (a `--distributed-query` query-serving mode with a
+    /// bound gRPC listener). [`Running::shutdown`] stops it before draining the
+    /// routers so a draining process stops advertising itself to sibling
+    /// coordinators.
+    query_worker_heartbeat: Option<QueryWorkerHeartbeat>,
+}
+
+/// Handle to the ADR-0071 query-worker heartbeat loop, held on [`Running`] so
+/// graceful shutdown stops it deterministically rather than leaving it detached.
+/// [`QueryWorkerHeartbeat::shutdown`] signals the loop, which deletes this
+/// process's `sys/query/workers/<uuid>` record before returning, then joins the
+/// task.
+struct QueryWorkerHeartbeat {
+    shutdown: oneshot::Sender<()>,
+    handle: JoinHandle<()>,
+}
+
+impl QueryWorkerHeartbeat {
+    /// Stop the heartbeat loop and wait for it to delete its record and exit.
+    async fn shutdown(self) {
+        // The receiver is dropped only when the loop exits, so a send error
+        // means it already stopped; either way we then join it.
+        let _ = self.shutdown.send(());
+        if let Err(err) = self.handle.await {
+            tracing::warn!(error = %err, "query-worker heartbeat task panicked during shutdown");
+        }
+    }
+}
+
+/// Flatten a listener task's `JoinHandle` result: a task that returned `Err`
+/// and a task that panicked (a `JoinError`) both become the `Err`, so neither a
+/// listener error nor a listener panic is silently swallowed.
+fn flatten_join(joined: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<()> {
+    match joined {
+        Ok(inner) => inner,
+        Err(join_err) => Err(anyhow::Error::new(join_err)),
+    }
+}
+
+/// Await every (already-signalled) listener task, run `drain` to completion, and
+/// only THEN propagate the first listener error. The drain runs unconditionally:
+/// a listener that failed while closing must never cause the ingest buffers to
+/// go undrained (issue #1291 deliverable 4). Listener results are captured as
+/// locals rather than propagated with `?` at the await point precisely so the
+/// early return cannot jump over the drain.
+async fn drain_and_propagate<F>(
+    listener_tasks: Vec<JoinHandle<anyhow::Result<()>>>,
+    drain: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let mut results = Vec::with_capacity(listener_tasks.len());
+    for task in listener_tasks {
+        results.push(flatten_join(task.await));
+    }
+    drain.await;
+    for result in results {
+        result?;
+    }
+    Ok(())
 }
 
 impl Running {
-    /// Stops accepting new connections, waits for both listeners to drain,
-    /// then flushes and joins every ingest shard actor: metrics, logs, and
-    /// spans alike.
+    /// Gracefully stop the server: flip readiness to draining so a probe sees
+    /// 503 before any listener closes, wait a short settle interval, then close
+    /// the listeners and flush and join every ingest shard actor (metrics, logs,
+    /// and spans alike) and the background tasks, all bounded by
+    /// `--shutdown-timeout`. A listener error is surfaced only after the drain
+    /// runs, never in place of it; a drain that overruns the timeout logs a
+    /// warning and returns so the process still exits before Kubernetes escalates
+    /// to SIGKILL.
     pub async fn shutdown(self) -> anyhow::Result<()> {
-        let _ = self.http_shutdown.send(());
-        self.http_task.await??;
+        let Running {
+            http_shutdown,
+            http_task,
+            grpc_shutdown,
+            grpc_task,
+            mtls_shutdown,
+            mtls_task,
+            fragment_shutdown,
+            fragment_task,
+            ingest_router,
+            log_ingest_router,
+            span_ingest_router,
+            fold_tasks,
+            maintenance_tasks,
+            alert_tasks,
+            jwks_refresh_task,
+            store_probe_task,
+            admission_reconcile_task,
+            query_admission_reconcile_task,
+            scrub_task,
+            lifecycle_refresh_task,
+            idle_tenant_state_task,
+            metadata_sink_task,
+            readiness,
+            shutdown_timeout,
+            query_worker_heartbeat,
+            // The public address/handle fields carry no shutdown behavior; the
+            // struct has no Drop, so they are simply released here.
+            ..
+        } = self;
 
-        if let Some(tx) = self.grpc_shutdown {
+        // Flip readiness to draining FIRST, before any listener closes, then
+        // wait a short settle interval so an in-flight `/readyz` probe observes
+        // 503 while the process is still routing. Kubernetes then stops sending
+        // new connections before the listeners actually close.
+        readiness.begin_drain();
+        tokio::time::sleep(DRAIN_SETTLE_INTERVAL).await;
+
+        // Signal every listener to stop. These sends are synchronous; the tasks
+        // close their sockets and finish on their own, awaited below.
+        let _ = http_shutdown.send(());
+        if let Some(tx) = grpc_shutdown {
             let _ = tx.send(());
         }
-        if let Some(task) = self.grpc_task {
-            task.await??;
-        }
-
-        if let Some(tx) = self.mtls_shutdown {
+        if let Some(tx) = mtls_shutdown {
             let _ = tx.send(());
         }
-        if let Some(task) = self.mtls_task {
-            task.await??;
-        }
-
-        if let Some(tx) = self.fragment_shutdown {
+        if let Some(tx) = fragment_shutdown {
             let _ = tx.send(());
         }
-        if let Some(task) = self.fragment_task {
-            task.await??;
-        }
 
-        if let Some(router) = self.ingest_router {
-            match Arc::try_unwrap(router) {
-                Ok(router) => router.shutdown().await,
-                Err(_) => {
-                    tracing::warn!(
-                        "ingest router still has outstanding references; shard actors not drained"
-                    );
+        let mut listener_tasks: Vec<JoinHandle<anyhow::Result<()>>> = vec![http_task];
+        listener_tasks.extend(grpc_task);
+        listener_tasks.extend(mtls_task);
+        listener_tasks.extend(fragment_task);
+
+        // The drain: everything that must run regardless of a listener error,
+        // in dependency order. Wrapped in `drain_and_propagate` so it runs
+        // before any listener error is surfaced, and the whole thing is bounded
+        // by `--shutdown-timeout`.
+        let drain = async move {
+            // First: stop the ADR-0071 heartbeat. Its shutdown deletes this
+            // process's worker record and joins the loop, so a draining process
+            // stops advertising itself to sibling coordinators before we spend
+            // the drain budget on buffers.
+            if let Some(heartbeat) = query_worker_heartbeat {
+                heartbeat.shutdown().await;
+            }
+
+            // Then stop the idle-tenant sweep, BEFORE the router block. The
+            // sweep holds a strong clone of each ingest router; releasing those
+            // clones here is what lets the best-effort `try_unwrap` join below
+            // actually succeed. The durable flush is not gated on it
+            // (`flush_all` takes `&self`), but joining the shard actors is.
+            idle_tenant_state_task.shutdown().await;
+
+            // Flush every router's shard actors unconditionally (durable), then
+            // `try_unwrap` only as a best-effort JOIN. The flush persists
+            // buffered records even if another task still holds a router clone;
+            // if a clone outlives shutdown the actors are flushed but not
+            // joined, which is safe (their buffers are already durable).
+            if let Some(router) = ingest_router {
+                router.flush_all().await;
+                match Arc::try_unwrap(router) {
+                    Ok(router) => router.shutdown().await,
+                    Err(_) => tracing::warn!(
+                        "ingest router still has outstanding references; shard actors flushed but \
+                         not joined"
+                    ),
                 }
             }
-        }
-
-        if let Some(router) = self.log_ingest_router {
-            match Arc::try_unwrap(router) {
-                Ok(router) => router.shutdown().await,
-                Err(_) => {
-                    tracing::warn!(
-                        "log ingest router still has outstanding references; shard actors not \
-                         drained"
-                    );
+            if let Some(router) = log_ingest_router {
+                router.flush_all().await;
+                match Arc::try_unwrap(router) {
+                    Ok(router) => router.shutdown().await,
+                    Err(_) => tracing::warn!(
+                        "log ingest router still has outstanding references; shard actors flushed \
+                         but not joined"
+                    ),
                 }
             }
-        }
-
-        if let Some(router) = self.span_ingest_router {
-            match Arc::try_unwrap(router) {
-                Ok(router) => router.shutdown().await,
-                Err(_) => {
-                    tracing::warn!(
-                        "span ingest router still has outstanding references; shard actors not \
-                         drained"
-                    );
+            if let Some(router) = span_ingest_router {
+                router.flush_all().await;
+                match Arc::try_unwrap(router) {
+                    Ok(router) => router.shutdown().await,
+                    Err(_) => tracing::warn!(
+                        "span ingest router still has outstanding references; shard actors flushed \
+                         but not joined"
+                    ),
                 }
             }
+
+            fold_tasks.shutdown().await;
+            maintenance_tasks.shutdown().await;
+            alert_tasks.shutdown().await;
+            jwks_refresh_task.shutdown().await;
+            store_probe_task.shutdown().await;
+            admission_reconcile_task.shutdown().await;
+            query_admission_reconcile_task.shutdown().await;
+            scrub_task.shutdown().await;
+            lifecycle_refresh_task.shutdown().await;
+            // Last: its final flush writes whatever the in-progress window
+            // observed, and it must not race the ingest surfaces that feed it.
+            metadata_sink_task.shutdown().await;
+        };
+
+        match tokio::time::timeout(shutdown_timeout, drain_and_propagate(listener_tasks, drain))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = shutdown_timeout.as_secs(),
+                    "graceful shutdown drain exceeded --shutdown-timeout; proceeding to exit"
+                );
+                Ok(())
+            }
         }
-
-        self.fold_tasks.shutdown().await;
-        self.maintenance_tasks.shutdown().await;
-        self.alert_tasks.shutdown().await;
-        self.jwks_refresh_task.shutdown().await;
-        self.store_probe_task.shutdown().await;
-        self.admission_reconcile_task.shutdown().await;
-        self.query_admission_reconcile_task.shutdown().await;
-        self.scrub_task.shutdown().await;
-        self.lifecycle_refresh_task.shutdown().await;
-        self.idle_tenant_state_task.shutdown().await;
-        // Last: its final flush writes whatever the in-progress window
-        // observed, and it must not race the ingest surfaces that feed it.
-        self.metadata_sink_task.shutdown().await;
-
-        Ok(())
     }
 }
 
@@ -1993,30 +2162,42 @@ pub async fn start(
     // heartbeat loop then writes `sys/query/workers/<uuid>` and refreshes the
     // live set on its cadence. Spawned detached: it runs for the process's life
     // and needs no join at shutdown (a stale record ages out on its own).
-    let _query_worker_heartbeat: Option<JoinHandle<()>> = match (distributed.as_ref(), grpc_addr) {
-        (Some(_), Some(addr)) => {
-            // Advertise the dedicated TLS fragment listener as the endpoint
-            // remote coordinators dial (ADR-0071 amendment decision 1 and section
-            // 3: `fragment_endpoint` now names the dedicated TLS listener). When
-            // no dedicated listener is configured, fall back to the public gRPC
-            // address, the pre-amendment behavior.
-            let fragment_endpoint = fragment_addr.unwrap_or(addr);
-            let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
-                fragment_endpoint.to_string(),
-                ravel_query::distrib::codec::PROTOCOL_VERSION,
-            ));
-            // Ignore a set() race: `start` sets this exactly once, so the
-            // first (only) write wins and any later call is a no-op.
-            let _ = distrib_self_id.set(workers.process_id());
-            Some(distrib::spawn_heartbeat(
-                workers,
-                store.clone(),
-                Arc::new(SystemClock),
-                distrib_live_workers.clone(),
-            ))
-        }
-        _ => None,
-    };
+    // ADR-0071 query-worker heartbeat. Its handle and a shutdown sender live on
+    // `Running` (not detached) so graceful shutdown can stop the loop, which
+    // deletes this process's worker record before returning; a draining process
+    // must stop advertising itself to sibling coordinators, not linger in their
+    // live set until its stamp ages past the staleness window.
+    let query_worker_heartbeat: Option<QueryWorkerHeartbeat> =
+        match (distributed.as_ref(), grpc_addr) {
+            (Some(_), Some(addr)) => {
+                // Advertise the dedicated TLS fragment listener as the endpoint
+                // remote coordinators dial (ADR-0071 amendment decision 1 and section
+                // 3: `fragment_endpoint` now names the dedicated TLS listener). When
+                // no dedicated listener is configured, fall back to the public gRPC
+                // address, the pre-amendment behavior.
+                let fragment_endpoint = fragment_addr.unwrap_or(addr);
+                let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
+                    fragment_endpoint.to_string(),
+                    ravel_query::distrib::codec::PROTOCOL_VERSION,
+                ));
+                // Ignore a set() race: `start` sets this exactly once, so the
+                // first (only) write wins and any later call is a no-op.
+                let _ = distrib_self_id.set(workers.process_id());
+                let (hb_shutdown, hb_rx) = oneshot::channel::<()>();
+                let handle = distrib::spawn_heartbeat(
+                    workers,
+                    store.clone(),
+                    Arc::new(SystemClock),
+                    distrib_live_workers.clone(),
+                    hb_rx,
+                );
+                Some(QueryWorkerHeartbeat {
+                    shutdown: hb_shutdown,
+                    handle,
+                })
+            }
+            _ => None,
+        };
 
     // The dedicated mTLS listener (ADR-0050 section 1): bound only when
     // `--mtls-listener` was configured, serving `mtls_router` built up above.
@@ -2231,5 +2412,88 @@ pub async fn start(
         lifecycle_refresh_task,
         idle_tenant_state_task,
         metadata_sink_task,
+        // Clone the readiness handle onto `Running` so `shutdown` can flip it to
+        // draining; the `/readyz` route holds the other clone.
+        readiness: readiness.clone(),
+        shutdown_timeout: config.shutdown_timeout,
+        query_worker_heartbeat,
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod shutdown_drain_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// A listener task that failed while closing must NOT skip the ingest
+    /// drain: `drain_and_propagate` runs the drain to completion first, and only
+    /// then surfaces the first listener error. The witness is an `AtomicBool`
+    /// the drain sets; the test asserts the drain ran (`true`) even though a
+    /// listener errored, and that the error is still returned.
+    #[tokio::test]
+    async fn listener_error_does_not_skip_the_drain() {
+        let drained = Arc::new(AtomicBool::new(false));
+
+        // Two listener tasks: the first fails while closing, the second closes
+        // cleanly. `http_task` is always position 0, so putting the failure
+        // first also proves an early error cannot jump over the drain.
+        let failing: JoinHandle<anyhow::Result<()>> =
+            tokio::spawn(async { Err(anyhow::anyhow!("listener boom")) });
+        let ok: JoinHandle<anyhow::Result<()>> = tokio::spawn(async { Ok(()) });
+
+        let drained_in = drained.clone();
+        let result = drain_and_propagate(vec![failing, ok], async move {
+            drained_in.store(true, Ordering::SeqCst);
+        })
+        .await;
+
+        assert!(
+            drained.load(Ordering::SeqCst),
+            "the drain must run even when a listener task returned an error"
+        );
+        let err = result.expect_err("the first listener error must be propagated");
+        assert!(
+            err.to_string().contains("listener boom"),
+            "the propagated error must be the listener's, got: {err}"
+        );
+    }
+
+    /// With no listener error the drain still runs and the result is `Ok`.
+    #[tokio::test]
+    async fn clean_listeners_run_the_drain_and_return_ok() {
+        let drained = Arc::new(AtomicBool::new(false));
+        let ok: JoinHandle<anyhow::Result<()>> = tokio::spawn(async { Ok(()) });
+        let drained_in = drained.clone();
+        let result = drain_and_propagate(vec![ok], async move {
+            drained_in.store(true, Ordering::SeqCst);
+        })
+        .await;
+        assert!(drained.load(Ordering::SeqCst), "the drain must run");
+        result.expect("clean shutdown returns Ok");
+    }
+
+    /// The default shutdown timeout must stay strictly below the Kubernetes
+    /// default `terminationGracePeriodSeconds`, so the process finishes draining
+    /// and exits on its own before the kubelet escalates SIGTERM to SIGKILL. The
+    /// operator half of issue #1291 owns the pod grace period; this pins the
+    /// server-side default against the number it must stay under.
+    #[test]
+    fn default_shutdown_timeout_is_below_the_kubernetes_grace_period() {
+        assert!(
+            DEFAULT_SHUTDOWN_TIMEOUT < K8S_DEFAULT_GRACE_PERIOD,
+            "default --shutdown-timeout ({:?}) must be below the Kubernetes default \
+             terminationGracePeriodSeconds ({:?}), leaving headroom for preStop and final exit",
+            DEFAULT_SHUTDOWN_TIMEOUT,
+            K8S_DEFAULT_GRACE_PERIOD,
+        );
+        // The settle interval must fit inside the timeout too: the drain budget
+        // must not be entirely consumed by the pre-close readiness settle.
+        assert!(
+            DRAIN_SETTLE_INTERVAL < DEFAULT_SHUTDOWN_TIMEOUT,
+            "the readiness settle interval must be smaller than the drain timeout"
+        );
+    }
 }

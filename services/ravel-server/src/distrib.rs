@@ -30,7 +30,9 @@
 //!   through: it is never retried and never masked by a local fallback.
 //! * [`spawn_heartbeat`] -- the membership loop. It writes this process's
 //!   `sys/query/workers/<uuid>` heartbeat every interval and refreshes the
-//!   shared live-worker set the router reads.
+//!   shared live-worker set the router reads. On graceful shutdown it deletes
+//!   its own record so a draining process drops out of every coordinator's live
+//!   set immediately.
 //!
 //! # Observability
 //!
@@ -1493,11 +1495,19 @@ fn decode_tenant_hash(bytes: &[u8]) -> Option<TenantHash> {
 /// the [`RoutingSliceFetcher`] always reads a recent membership view. The first
 /// write/read happens before the first sleep, so membership converges promptly
 /// after startup.
+///
+/// The loop stops when `shutdown` fires (graceful shutdown holds the sender on
+/// `Running`). On stop it DELETES its own `sys/query/workers/<uuid>` record
+/// before returning, so a draining process drops out of every sibling
+/// coordinator's live set at once rather than lingering until its stamp ages
+/// past the `3 * H` staleness window. Without this a coordinator keeps dialing
+/// a worker that has already stopped serving for up to the staleness window.
 pub fn spawn_heartbeat(
     workers: Arc<QueryWorkers>,
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<dyn Clock>,
     live_workers: Arc<RwLock<Arc<Vec<QueryWorkerRecord>>>>,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = workers.heartbeat_interval();
@@ -1512,7 +1522,18 @@ pub fn spawn_heartbeat(
                     tracing::warn!(error = %err, "query worker live_set read failed; keeping prior membership")
                 }
             }
-            tokio::time::sleep(interval).await;
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = &mut shutdown => {
+                    // Draining: remove our own record so coordinators stop
+                    // dialing us immediately. A failed delete self-corrects as
+                    // the stamp ages out, so it is a warning, not fatal.
+                    if let Err(err) = workers.delete_heartbeat(store.as_ref()).await {
+                        tracing::warn!(error = %err, "query worker heartbeat delete on shutdown failed");
+                    }
+                    return;
+                }
+            }
         }
     })
 }
