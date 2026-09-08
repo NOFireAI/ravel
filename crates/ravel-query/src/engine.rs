@@ -1530,7 +1530,8 @@ impl QueryEngine {
         // `log_plan_class`): the catalog resolve passes no name filter to
         // prune against. Adding it anyway keeps a future resolve-side prune
         // from being silently dropped.
-        let log_segments_pruned = log_snapshot.segments.len() as u64 - log_segments_fetched;
+        let log_segments_pruned =
+            (log_snapshot.segments.len() as u64).saturating_sub(log_segments_fetched);
         stats.segments_fetched += log_segments_fetched;
         stats.segments_pruned += log_segments_pruned + log_snapshot.segments_pruned;
         stats.phase_accounting =
