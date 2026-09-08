@@ -30,7 +30,7 @@ use ravel_mcp::budget::{McpBudgetConfig, McpEffectiveBudgets, McpRequestBudgets}
 use ravel_mcp::catalog::tool_catalog;
 use ravel_mcp::compact;
 use ravel_mcp::cursor::{CURSOR_KEY_LEN, CursorKey};
-use ravel_mcp::envelope::{Envelope, Status};
+use ravel_mcp::envelope::{Envelope, NextStep, Status};
 use ravel_mcp::tools::{ToolContext, ToolError, dispatch};
 use ravel_query::{ByteLimit, EngineConfig, RequestBudgets, RequestLimit};
 use ravel_types::TenantHash;
@@ -43,13 +43,13 @@ use rmcp::service::{NotificationContext, RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData as McpError, ServerHandler};
-use serde::Deserialize;
 use serde_json::Value;
 use tower::Service as _;
 
 use crate::service::QueryService;
 
 use super::auth::{self, AuthenticatedTenant, McpAuth};
+use super::envelope as d4;
 use super::service_impl::{ProgressReporter, ServiceBackend};
 
 /// The one path this adapter serves. D7 mounts no GET stream and no DELETE:
@@ -215,7 +215,17 @@ impl ServerHandler for RavelMcp {
     ) -> Result<CallToolResponse, McpError> {
         let tenant_hash = tenant(&context)?;
         let args = Value::Object(request.arguments.unwrap_or_default());
-        let budgets = requested_budgets(&args).clamp(&self.engine_config, &self.budget_config);
+        let budgets = match requested_budgets(&args) {
+            Ok(requested) => requested.clamp(&self.engine_config, &self.budget_config),
+            // Nothing runs on a budget block this layer could not read. The
+            // refusal is serialized under the deployment's own default
+            // response cap, since the caller's cap is part of what failed.
+            Err(message) => {
+                let default =
+                    McpRequestBudgets::default().clamp(&self.engine_config, &self.budget_config);
+                return tool_result(&invalid_budget(message, &default));
+            }
+        };
         let now_ns = self.clock.now_ns();
         let ctx = ToolContext {
             tenant_hash,
@@ -294,36 +304,64 @@ fn tenant(context: &RequestContext<RoleServer>) -> Result<TenantHash, McpError> 
         })
 }
 
-/// The six lowerable budget knobs, as every data-returning tool's input
-/// schema declares them (docs/reference/mcp.md).
+/// One optional budget field, by name, out of arguments whose remaining
+/// fields belong to the tool.
 ///
-/// Deserialized permissively on purpose: this reads the budget fields out of
-/// arguments whose remaining fields belong to the tool, and a tool's own
-/// strict deserialize is what reports a malformed argument. A value here that
-/// does not parse leaves the whole set at its defaults, and the tool body
-/// then names the offending field.
-#[derive(Debug, Default, Deserialize)]
-struct BudgetArgs {
-    max_rows: Option<u32>,
-    max_response_bytes: Option<u64>,
-    deadline_ms: Option<u64>,
-    max_bytes_scanned: Option<u64>,
-    max_store_requests: Option<u64>,
-    max_segments: Option<usize>,
+/// An absent or null field is the caller declining to lower that budget. A
+/// field that is present but not of the declared type is named and refused,
+/// never dropped: running the call at a default the caller did not ask for
+/// and then reporting that default as `budget.effective` is a silent
+/// substitution the caller has no way to notice.
+fn budget_field<T: serde::de::DeserializeOwned>(
+    args: &Value,
+    name: &str,
+) -> Result<Option<T>, String> {
+    match args.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| format!("{name}: {error}")),
+    }
 }
 
-fn requested_budgets(args: &Value) -> McpRequestBudgets {
-    let args = BudgetArgs::deserialize(args).unwrap_or_default();
-    McpRequestBudgets {
-        max_rows: args.max_rows,
-        max_response_bytes: args.max_response_bytes,
-        deadline_ms: args.deadline_ms,
+/// The six lowerable budget knobs, as every data-returning tool's input
+/// schema declares them (docs/reference/mcp.md). The first field that does
+/// not parse is the reported one.
+fn requested_budgets(args: &Value) -> Result<McpRequestBudgets, String> {
+    Ok(McpRequestBudgets {
+        max_rows: budget_field(args, "max_rows")?,
+        max_response_bytes: budget_field(args, "max_response_bytes")?,
+        deadline_ms: budget_field(args, "deadline_ms")?,
         query: RequestBudgets {
-            max_bytes_scanned: args.max_bytes_scanned.map(ByteLimit::Bounded),
-            max_store_requests: args.max_store_requests.map(RequestLimit::Bounded),
-            max_segments: args.max_segments,
+            max_bytes_scanned: budget_field::<u64>(args, "max_bytes_scanned")?
+                .map(ByteLimit::Bounded),
+            max_store_requests: budget_field::<u64>(args, "max_store_requests")?
+                .map(RequestLimit::Bounded),
+            max_segments: budget_field(args, "max_segments")?,
         },
-    }
+    })
+}
+
+/// A budget block this adapter could not read, as a D4 `invalid_argument`
+/// envelope.
+///
+/// The `budget` block stays null rather than reporting the defaults: no
+/// budget was resolved and no operation ran, so a ceiling there would claim
+/// the call was allowed something. The response is still serialized under the
+/// default response cap, which is the cap actually in force for it.
+fn invalid_budget(message: String, budgets: &McpEffectiveBudgets) -> Envelope {
+    let envelope = Envelope {
+        status: Status::Error,
+        failure: Some(d4::invalid_argument(format!("budget argument {message}"))),
+        next_steps: vec![NextStep {
+            action: "correct_the_budget_argument".to_string(),
+            detail: "send the named field with the type this tool's input schema declares, or \
+                     omit it to run at the server's effective ceiling"
+                .to_string(),
+        }],
+        ..Envelope::default()
+    };
+    envelope.fit(budgets.max_response_bytes).finish(false)
 }
 
 /// The deadline as a nanosecond offset. A duration too large for an `i64` is
