@@ -1,7 +1,7 @@
 # ADR-1413: split `.cstat` column statistics per part
 
-Status: accepted (owner approval 2026-09-08). Epic: #1413. Supersedes nothing; extends ADR-0850 and
-ADR-0942.
+Status: Accepted (2026-09-08). Epic: #1413. Supersedes nothing; extends
+ADR-0850 and ADR-0942.
 
 ## Context
 
@@ -36,16 +36,17 @@ of a few hundred `DictEntry` messages, well inside ADR-0850 decision 3's
 10,000-entry ceiling. The size is what the design produces on a wide table.
 It is 7.5x the reader's guard.
 
-So `decode_column_stats` rejects it, `column_stats_resolve.rs:250` returns
-`Ok(None)`, and the tenant has run with no column statistics since it was
-loaded, silently. Every query still pays HEAD plus the 500 MB download and
-then discards the bytes. A single-`CounterID` `COUNT(*)` issues 7,645 GETs
+So `decode_column_stats` rejects it, `column_stats_resolve.rs` surfaces
+the refusal as `FetchOutcome::DecodeRefused`, `Catalog::load_column_stats`
+degrades that to `Ok(None)`, and the tenant has run with no column
+statistics since it was loaded, silently. Every query still pays HEAD plus
+the 500 MB download and then discards the bytes. A single-`CounterID` `COUNT(*)` issues 7,645 GETs
 over the full 2,617-segment estimate: a full scan where statistics would
 prune.
 
 ### Why the two obvious fixes are wrong
 
-Two fix rounds were dispatched on #1400 and withdrawn the same day:
+Two fixes were tried on #1400 and rejected:
 
 - **Raise the cache budget** (`ColumnStatsCache`, 64 MiB). Unreachable: the
   object never reaches the cache, because decode rejects it first.
@@ -54,10 +55,11 @@ Two fix rounds were dispatched on #1400 and withdrawn the same day:
   the catalog byte cache, the SQL pools and the fetch reservations). A
   raised ceiling admits a multi-GB `HashMap` into unaccounted memory on a
   host whose non-cache demand ADR-1170's sweep measured at 17-21 GB
-  regardless of cache sizing. ADR-1170 decision 3 forbids exactly that
-  shape. `ColumnStatsCache` is a byte-budgeted LRU that does evict, but
-  eviction is whole-entry, so a single 2 GB entry cannot be shed once
-  admitted.
+  regardless of cache sizing. ADR-1170 (proposed) decision 3 leaves no
+  budget term for it. `ColumnStatsCache` is a byte-budgeted LRU that does
+  evict, but eviction is whole-entry: today an entry over the budget is
+  refused rather than admitted, and under a raised budget a single 2 GB
+  entry, once admitted, could not be shed.
 
 The object's shape is the defect: a monolithic blob consumed piecewise,
 whose size grows with the tenant's whole history rather than with what any
@@ -120,7 +122,8 @@ The reader's guard is retained and re-derived: a v3 object may declare at
 most `part.entry_count x per_segment_stats_bound` uncompressed bytes, where
 `per_segment_stats_bound` is a fold-time constant sized from the measured
 27,356 bytes per (segment, column) times the tenant's declared column count,
-with the same 2x headroom convention `PartLimits` uses. It is a function of
+with the 2x headroom `DEFAULT_BYTE_CACHE_MAX_BYTES` takes over
+`DEFAULT_MAX_SNAPSHOT_PART_BYTES`. It is a function of
 what the part holds, not of the tenant's history, so it does not grow as the
 tenant does. The hostile-size purpose survives: a header declaring more than
 the part could possibly hold is refused before inflating.
@@ -145,8 +148,8 @@ The decoded per-part statistics live in `ColumnStatsCache` as today, now
 holding per-part entries rather than one entry per tenant, so eviction has
 a unit smaller than "everything". The cache's budget is the third hard
 carve in ADR-1170's derivation and its resident bytes are the
-`column_stats_resident` term in `unique`, which store-bb's M4 follow-up adds
-(this ADR names that home; it does not create a second one). A tenant whose
+`column_stats_resident` term in `unique`, which PR #1436 (the carve
+rework) adds; this ADR names that home and does not create a second one. A tenant whose
 per-part entries exceed the carve is evicted per part, in LRU order, exactly
 as the fetcher and catalog caches evict.
 
@@ -201,6 +204,13 @@ extended by one version:
   unreferenced and the existing `sweep_unreferenced_catalog_objects`
   lifecycle GCs them. No new sweep rule.
 - **Dual-read spans the same window**, per decision 2's fallback order.
+  The accepted read set becomes {1, 2, 3} for that window. ADR-0942's
+  pending retirement of v1 (field 11) is independent of this change and
+  its own reviewed change citing the recorded floors, whether it lands
+  before or after this one; the three-version set is what Class B's
+  rolling-upgrade window costs (a reader is cheap to keep, and the objects
+  are rebuilt by the fold), and it shrinks to {2, 3} and then {3} by those
+  two retirements in turn.
 - **This tenant's 2.0 GB object stays unreadable until its next fold**,
   which is what makes the per-part path reachable for it. The WARN from the
   observability half names it until then.
@@ -214,8 +224,8 @@ extended by one version:
 - The 500 MB-per-query download stops for the same reason.
 - `ColumnStatsCache` gains a useful eviction unit. Its metrics, WARN-once
   set, idle-tenant sweep and the `build_catalog_with_column_stats_budget`
-  start path from the withdrawn #1400 rounds (`38b83371`, `8f8fefb3`) are
-  reviewed plumbing this implementation reuses.
+  start path from the two rejected #1400 fixes (their branches are named
+  on that issue) are reviewed plumbing this implementation reuses.
 - One more version byte to keep readable (v1, v2, v3) for the dual-read
   window, and one more field on `SnapshotPartRef`. Additive only; no
   renumbering.
@@ -234,7 +244,7 @@ flowchart LR
   subgraph query["query"]
     R[resolve window] --> C{covered parts}
     C -->|per part| L[load v3 object<br/>under per-part ceiling]
-    C -->|no field 7| F[fallback: field 13 v2 -> field 11 v1 -> scan]
+    C -->|no field 7| F["fallback: field 13 v2, then field 11 v1, then scan"]
     L --> M[LoadedColumnStats<br/>content-hash keyed]
     F --> M
     M --> U[unique_column_stat per segment]
