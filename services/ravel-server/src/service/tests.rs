@@ -135,6 +135,21 @@ struct Harness {
     cost: Arc<RecordingCost>,
     admission: Arc<QueryAdmissionController>,
     tenant_hash: TenantHash,
+    /// Each transport's own state, so a test can drive its router end to end
+    /// rather than call the service layer directly. What a handler does before
+    /// it reaches the service call is invisible from the service call itself,
+    /// and the order of authentication against admission is exactly that.
+    transports: Transports,
+}
+
+/// The router states of the four query transports this crate serves, all over
+/// the harness's one store, one resolver, and one admission controller.
+struct Transports {
+    promql: ravel_query::http::AppState,
+    analytics: crate::analytics::AnalyticsState,
+    exemplars: crate::exemplars::ExemplarsState,
+    #[cfg(feature = "sql")]
+    sql: crate::sql::SqlState,
 }
 
 /// The `SqlConfig` every harness here builds its executor with. The three
@@ -240,6 +255,26 @@ fn harness_with_sql_deadline(
         query_admission: Arc::clone(&admission),
     };
 
+    let transports = Transports {
+        promql: crate::query::build_app_state(
+            Arc::clone(&catalog),
+            Arc::clone(&store),
+            Arc::clone(&resolver),
+            None,
+            config,
+            Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+            default_query_accounting(),
+            Arc::clone(&admission),
+            None,
+            None,
+            None,
+        ),
+        analytics: analytics.clone(),
+        exemplars: exemplars.clone(),
+        #[cfg(feature = "sql")]
+        sql: sql.clone(),
+    };
+
     let service = QueryService::new(
         resolver,
         clock,
@@ -261,6 +296,7 @@ fn harness_with_sql_deadline(
         cost,
         admission,
         tenant_hash: tenant().hash(),
+        transports,
     }
 }
 
@@ -659,12 +695,8 @@ async fn promql_routes_record_usage_through_the_wired_sink() {
         None,
     );
 
-    let start_s = NOW_MS / 1_000 - 60;
-    let end_s = NOW_MS / 1_000;
     let request = Request::builder()
-        .uri(format!(
-            "/api/v1/query_range?query=up&start={start_s}&end={end_s}&step=60"
-        ))
+        .uri(range_uri())
         .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
         .body(Body::empty())
         .expect("request");
@@ -725,22 +757,120 @@ async fn usage_is_recorded_on_cancel_for_exemplars() {
     assert_eq!(h.cost.records().len(), 0);
 }
 
+/// Drive one router with one request and answer with the status it produced.
+async fn route_status(
+    router: axum::Router,
+    request: axum::http::Request<axum::body::Body>,
+) -> StatusCode {
+    use tower::ServiceExt;
+
+    router
+        .oneshot(request)
+        .await
+        .expect("the route answers")
+        .status()
+}
+
+/// The PromQL range URI every ordering test drives, over the fixed clock's now.
+fn range_uri() -> String {
+    let start_s = NOW_MS / 1_000 - 60;
+    let end_s = NOW_MS / 1_000;
+    format!("/api/v1/query_range?query=up&start={start_s}&end={end_s}&step=60")
+}
+
 /// Authentication is outside the seven steps and runs before step 1, so an
-/// anonymous caller cannot take a permit from the fleet-global ceiling. With a
-/// ceiling of one, a rejected request followed by a valid one both succeed at
-/// what they are supposed to do.
+/// anonymous caller cannot take a permit from the fleet-global ceiling.
+///
+/// Calling `QueryService::authenticate` on its own cannot show this: that
+/// method takes no permit by construction, whatever order the handler that
+/// wraps it uses. What shows it is a saturated ceiling. With the one permit
+/// held, admission can only reject, so a handler that admitted before it
+/// authenticated would answer 503 to an anonymous request. Every transport
+/// answers 401 instead, and the positive control below proves 503 was the
+/// reachable alternative rather than an impossible one.
 #[tokio::test]
 async fn unauthenticated_request_consumes_no_permit() {
+    use axum::body::Body;
+    use axum::http::Request;
+
     let h = memory_harness(QueryConcurrencyLimit::Bounded(1));
 
-    let err = h
-        .service
-        .authenticate(&bearer("not-a-token"))
-        .expect_err("an unknown token resolves to no tenant");
-    assert_eq!(err.status, StatusCode::UNAUTHORIZED);
-    assert_eq!(err.kind, ServiceErrorKind::Unauthorized);
+    let held = h.admission.try_admit().expect("the ceiling's one permit");
+    assert_eq!(h.admission.in_flight(), 1);
+
+    let anonymous = |uri: String, body: &'static str| {
+        Request::builder()
+            .method(if body.is_empty() { "GET" } else { "POST" })
+            .uri(uri)
+            .header(axum::http::header::AUTHORIZATION, "Bearer not-a-token")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("request")
+    };
+
+    assert_eq!(
+        route_status(
+            ravel_query::http::router(h.transports.promql.clone()),
+            anonymous(range_uri(), ""),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "promql",
+    );
+    assert_eq!(
+        route_status(
+            crate::analytics::router(h.transports.analytics.clone()),
+            anonymous("/api/v1/analytics".to_string(), "{}"),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "analytics",
+    );
+    assert_eq!(
+        route_status(
+            crate::exemplars::router(h.transports.exemplars.clone()),
+            anonymous("/api/v1/query_exemplars?query=up".to_string(), ""),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "exemplars",
+    );
+    #[cfg(feature = "sql")]
+    assert_eq!(
+        route_status(
+            crate::sql::router(h.transports.sql.clone()),
+            anonymous("/api/v1/sql".to_string(), "{}"),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "sql",
+    );
+
+    // None of them reached admission, so the stock is still exactly the one
+    // permit this test holds.
+    assert_eq!(h.admission.in_flight(), 1);
     assert_eq!(h.usage.records().len(), 0);
 
+    // The positive control: the same route, the same saturated ceiling, a token
+    // that does resolve. This is the answer the assertions above would have got
+    // had authentication run second.
+    let authenticated = Request::builder()
+        .uri(range_uri())
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("request");
+    assert_eq!(
+        route_status(
+            ravel_query::http::router(h.transports.promql.clone()),
+            authenticated,
+        )
+        .await,
+        StatusCode::SERVICE_UNAVAILABLE,
+    );
+
+    // And once the ceiling frees up, the same authenticated request is served.
+    drop(held);
+    assert_eq!(h.admission.in_flight(), 0);
     let tenant_hash = h
         .service
         .authenticate(&bearer(TOKEN))
@@ -749,6 +879,6 @@ async fn unauthenticated_request_consumes_no_permit() {
     h.service
         .analytics(tenant_hash, &analytics_request("up", false))
         .await
-        .expect("the ceiling still has its one permit");
+        .expect("the ceiling has its permit back");
     assert_eq!(h.usage.records().len(), 1);
 }
