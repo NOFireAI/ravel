@@ -40,6 +40,35 @@ fn run_lane() -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout is a JSON report")
 }
 
+/// Run the bin over the `ci` profile's FULL step count (no `--steps`
+/// override): the two decision-11 figures sourced from the generator's exact
+/// output (`total_series_created`, `logical_input_bytes`) are only
+/// comparable to the profile's declared figures over a complete run, not a
+/// truncated one.
+fn run_lane_full_profile() -> serde_json::Value {
+    let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
+    let output = Command::new(bin)
+        .args([
+            "--profile",
+            "ci",
+            "--store",
+            "memory",
+            "--shards",
+            "2",
+            "--batch-size",
+            "4096",
+        ])
+        .output()
+        .expect("spawn metricsbench_ingest");
+    assert!(
+        output.status.success(),
+        "metricsbench_ingest exited non-zero: status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout is a JSON report")
+}
+
 #[test]
 fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
     let report = run_lane();
@@ -114,4 +143,104 @@ fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
         ravel_query["eval_ts_ms"].as_i64().is_some(),
         "the query records the instant it evaluated at (the replay's newest sample)"
     );
+}
+
+/// ADR-0927 decision 11: the artifact carries a top-level `profile` block
+/// naming the `ci` profile as non-comparable, with its reason, and the nine
+/// pre-registered/generator-exact figures -- not a set of numbers a reader
+/// could mistake for a comparable result.
+///
+/// TO SEE THIS FAIL against the pre-fix binary: drop `.with_profile(profile_record)`
+/// in `metricsbench_ingest`'s `run`; the top-level `profile` key is then absent
+/// and the first assertion below fails.
+#[test]
+fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures() {
+    let workload = ravel_bench::metrics_workload::load_workload(std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/metrics/workload.json"
+    )))
+    .expect("load the same workload manifest the binary loads");
+    let expected = workload
+        .profile("ci")
+        .expect("manifest declares a `ci` profile");
+    let expected_label_cardinalities = workload.label_cardinalities();
+
+    // No `--steps` override: the generator-exact figures (`total_series_created`,
+    // `logical_input_bytes`) are only comparable to the profile's declared
+    // figures over a full run.
+    let report = run_lane_full_profile();
+    let profile = &report["profile"];
+
+    assert_eq!(
+        profile["comparable"].as_bool(),
+        Some(false),
+        "the `ci` profile is never comparable (ADR-0927 decision 11)"
+    );
+    let reason = profile["comparability_reason"]
+        .as_str()
+        .expect("comparability_reason is a string");
+    assert!(
+        !reason.is_empty(),
+        "a non-comparable profile must state why, not leave the reason blank"
+    );
+    assert_eq!(profile["name"].as_str(), Some("ci"));
+    assert_eq!(
+        profile["active_series"].as_u64(),
+        Some(expected.active_series)
+    );
+    assert_eq!(
+        profile["samples_per_series"].as_u64(),
+        Some(expected.samples_per_series)
+    );
+    assert_eq!(
+        profile["scrape_interval_secs"].as_u64(),
+        Some(expected.scrape_interval_secs)
+    );
+    assert_eq!(
+        profile["duration_secs"].as_u64(),
+        Some(expected.duration_secs)
+    );
+    assert_eq!(
+        profile["total_samples"].as_u64(),
+        Some(expected.total_samples)
+    );
+    assert_eq!(
+        profile["churn_basis_points_per_hour"].as_u64(),
+        Some(expected.churn_basis_points_per_hour)
+    );
+    // `ci` declares zero churn, so the generator creates exactly the active
+    // set and no churned-in cohorts: the generator's exact count and the
+    // manifest's declared count coincide, and either is the correct
+    // expectation here.
+    assert_eq!(
+        profile["total_series_created"].as_u64(),
+        Some(expected.active_series),
+        "with zero churn, total series created must equal the declared active set"
+    );
+    assert!(
+        profile["logical_input_bytes"]
+            .as_u64()
+            .is_some_and(|b| b > 0),
+        "the generator produced a non-empty logical input stream"
+    );
+    let label_cardinalities = profile["label_cardinalities"]
+        .as_object()
+        .expect("label_cardinalities is present");
+    assert_eq!(
+        label_cardinalities.len(),
+        expected_label_cardinalities.len(),
+        "every label dimension the manifest declares must be reported"
+    );
+    for (name, count) in &expected_label_cardinalities {
+        assert_eq!(
+            label_cardinalities.get(name).and_then(|v| v.as_u64()),
+            Some(*count),
+            "label dimension `{name}`'s distinct-value count must match the manifest"
+        );
+    }
+
+    // The substrate block: an in-process MemoryStore never bills.
+    let substrate = &report["substrate"];
+    assert_eq!(substrate["store_backend"].as_str(), Some("memory"));
+    assert_eq!(substrate["backend_bills_requests"].as_bool(), Some(false));
 }

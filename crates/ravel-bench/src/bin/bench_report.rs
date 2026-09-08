@@ -6,8 +6,9 @@
 //! `--store memory|s3` selects the backend (`ravel_bench::harness`); the `s3`
 //! store reads `RAVEL_S3_*` env vars. The emitted `environment.store_backend`
 //! records which backend actually ran, and `s3_requests.backend_bills_requests`
-//! records whether its requests are billed -- true only for S3, per ADR-0075
-//! decision 3.
+//! records whether its requests are billed -- true only for real S3 with no
+//! `RAVEL_S3_ENDPOINT` override (`harness::backend_bills_requests`; a
+//! MinIO-backed S3 endpoint bills nothing, per ADR-0927 decision 10).
 //!
 //! Provenance (`git_commit`, `toolchain`) is gathered here, not in the library:
 //! `git rev-parse HEAD` (overridable via `GITHUB_SHA`, which CI sets) and
@@ -19,7 +20,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use clap::Parser;
-use ravel_bench::harness::{StoreKind, store_and_metrics_from_env};
+use ravel_bench::harness::{StoreKind, backend_bills_requests, store_and_metrics_from_env};
 use ravel_bench::report::{ReportRunConfig, WorkloadShape, run};
 use ravel_types::cost_profile::StoreCostProfile;
 
@@ -92,7 +93,7 @@ fn toolchain() -> String {
 async fn main() {
     let args = Args::parse();
 
-    let bills = matches!(args.store, StoreKind::S3);
+    let bills = backend_bills_requests(args.store);
     let region = match args.store {
         StoreKind::Memory => "n/a-memory".to_string(),
         StoreKind::S3 => std::env::var("RAVEL_S3_REGION").unwrap_or_else(|_| "unknown".to_string()),

@@ -45,6 +45,36 @@
 //!
 //! Report-only: like the rest of `ravel-bench`, this lane never changes library
 //! behaviour, it only measures it.
+//!
+//! ## `profile` and `substrate` (ADR-0927 decision 11, issue #1352)
+//!
+//! [`MetricsIngestReport`] carries two blocks so a reader never mistakes a
+//! non-comparable or unbilled run for a publishable result:
+//!
+//! [`ProfileRecord`] (`profile`), the workload's own pre-registered figures
+//! and comparability verdict:
+//! - `name`: the `--profile` name.
+//! - `comparable`: whether these figures may be published (decision 11).
+//! - `comparability_reason`: why not, when `comparable` is `false`; the
+//!   workload's own `Comparability` reason, never a second hand-written copy.
+//! - `active_series`: series alive at any one instant, as declared.
+//! - `total_series_created`: distinct series the generator actually created,
+//!   the generator's exact count.
+//! - `samples_per_series`, `scrape_interval_secs`, `duration_secs`,
+//!   `total_samples`, `churn_basis_points_per_hour`: as declared.
+//! - `label_cardinalities`: distinct values per label dimension, name to
+//!   count, read from the manifest.
+//! - `logical_input_bytes`: uncompressed input bytes the generator produced,
+//!   the generator's exact count.
+//!
+//! [`Substrate`] (`substrate`), the storage backend a run replayed against:
+//! - `store_backend`: the `--store` kind (`memory` or `s3`).
+//! - `endpoint_host`: the configured S3 endpoint's host, when
+//!   `RAVEL_S3_ENDPOINT` is set; absent otherwise. Host only, never
+//!   credentials.
+//! - `backend_bills_requests`: true only for real S3 with no endpoint
+//!   override (decision 10); false on `MemoryStore` and on any store behind a
+//!   configured endpoint, such as the nightly lane's local MinIO.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -394,10 +424,73 @@ pub struct SystemQueryResult {
     pub elapsed_secs: f64,
 }
 
+/// The nine ADR-0927 decision-11 profile figures, plus the workload's own
+/// comparability verdict. Every figure here is the profile's pre-registered
+/// value or the generator's exact count -- never derived from the offered
+/// sample count, so a reader can compare this row against the workload
+/// definition directly instead of trusting the run that produced it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProfileRecord {
+    /// The `--profile` name (`cardinality`, `history`, `churn`, `ci`, ...).
+    pub name: String,
+    /// Whether this profile's figures may be compared across runs or
+    /// systems (ADR-0927 decision 11). `ci` is `false`: it exists for
+    /// reachability, not for a performance or cost claim.
+    pub comparable: bool,
+    /// The stated reason when `comparable` is `false`, or `"comparable"`
+    /// otherwise -- [`crate::metrics_workload::Comparability`]'s own
+    /// `Display`, never a second, hand-written copy of it.
+    pub comparability_reason: String,
+    /// Active series the profile declares.
+    pub active_series: u64,
+    /// Total series the generator actually created over the run.
+    pub total_series_created: u64,
+    /// Samples per series per scrape, as declared.
+    pub samples_per_series: u64,
+    /// Scrape interval, as declared.
+    pub scrape_interval_secs: u64,
+    /// Run duration, as declared.
+    pub duration_secs: u64,
+    /// Total samples the profile declares over its full duration.
+    pub total_samples: u64,
+    /// Distinct values per label dimension, name to count, straight from the
+    /// workload manifest (`WorkloadFile::label_cardinalities`).
+    pub label_cardinalities: BTreeMap<String, u64>,
+    /// Logical (uncompressed, pre-wire) input bytes the generator produced.
+    pub logical_input_bytes: u64,
+    /// Declared series churn, in basis points per hour.
+    pub churn_basis_points_per_hour: u64,
+}
+
+/// The storage backend a run replayed against, and whether it bills for
+/// requests (ADR-0927 decision 10): named at the top level so a reader never
+/// mistakes a MinIO-backed `ci` run's request counts for a real S3 cost.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Substrate {
+    /// The `--store` kind (`memory` or `s3`), as `StoreKind`'s `Display`.
+    pub store_backend: String,
+    /// The configured S3 endpoint's host, when `RAVEL_S3_ENDPOINT` is set.
+    /// Host only: never the scheme, path, or embedded credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_host: Option<String>,
+    /// Whether this substrate bills for requests: false on `MemoryStore` and
+    /// on any store behind a configured endpoint, true only for real S3 with
+    /// no endpoint override (`harness::backend_bills_requests`).
+    pub backend_bills_requests: bool,
+}
+
 /// The whole ingest-lane report: one row per participating system, plus the
 /// separately-recorded query-phase rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MetricsIngestReport {
+    /// The profile this run replayed, and its ADR-0927 decision-11 figures.
+    /// Absent only for the internal unit-test rows built directly from
+    /// `SystemIngestResult`s with no profile context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileRecord>,
+    /// The storage substrate this run replayed against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub substrate: Option<Substrate>,
     /// Report rows, in the order the systems were replayed.
     pub systems: Vec<SystemIngestResult>,
     /// Query-phase rows, recorded separately from ingest (ADR-0927 decision 9).
@@ -407,9 +500,12 @@ pub struct MetricsIngestReport {
 }
 
 impl MetricsIngestReport {
-    /// Assemble a report from its ingest rows, with no query phase yet.
+    /// Assemble a report from its ingest rows, with no query phase, profile,
+    /// or substrate attached yet.
     pub fn new(systems: Vec<SystemIngestResult>) -> Self {
         MetricsIngestReport {
+            profile: None,
+            substrate: None,
             systems,
             queries: Vec::new(),
         }
@@ -419,6 +515,18 @@ impl MetricsIngestReport {
     /// figures in separate columns.
     pub fn with_query(mut self, query: SystemQueryResult) -> Self {
         self.queries.push(query);
+        self
+    }
+
+    /// Attach the ADR-0927 decision-11 profile record (builder style).
+    pub fn with_profile(mut self, profile: ProfileRecord) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Attach the storage substrate record (builder style).
+    pub fn with_substrate(mut self, substrate: Substrate) -> Self {
+        self.substrate = Some(substrate);
         self
     }
 

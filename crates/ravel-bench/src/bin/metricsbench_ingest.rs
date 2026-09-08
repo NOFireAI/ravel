@@ -22,11 +22,13 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use ravel_bench::harness::{StoreKind, store_and_metrics_from_env};
+use ravel_bench::harness::{
+    StoreKind, backend_bills_requests, endpoint_host_from_env, store_and_metrics_from_env,
+};
 use ravel_bench::metrics_gen::Generator;
 use ravel_bench::metrics_ingest::{
-    HttpReplayConfig, LogicalSample, MetricsIngestReport, RavelReplayConfig, parse_logical_stream,
-    query_after_replay, replay_into_ravel, replay_over_http,
+    HttpReplayConfig, LogicalSample, MetricsIngestReport, ProfileRecord, RavelReplayConfig,
+    Substrate, parse_logical_stream, query_after_replay, replay_into_ravel, replay_over_http,
 };
 use ravel_bench::metrics_workload::{WorkloadFile, load_workload};
 use ravel_ingest::{Clock, SystemClock};
@@ -155,16 +157,44 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
     let now_ms = SystemClock.now_ns() / 1_000_000;
     let base_ts_ms = now_ms - steps as i64 * scrape_ms;
 
-    let (bytes, _report) = Generator::new(&workload, &args.profile, base_ts_ms)
+    let (bytes, gen_report) = Generator::new(&workload, &args.profile, base_ts_ms)
         .map_err(|e| RunError::Generate(e.to_string()))?
         .generate_bytes(steps)
         .map_err(|e| RunError::Generate(e.to_string()))?;
+    let logical_input_bytes = bytes.len() as u64;
     let text = String::from_utf8(bytes).map_err(|e| RunError::Generate(e.to_string()))?;
     let stream: Vec<LogicalSample> = parse_logical_stream(&text);
 
+    // ADR-0927 decision 11: the profile's own pre-registered figures, plus the
+    // generator's exact counts for the two figures that are not directly
+    // declared (total series created, logical input bytes) -- never derived
+    // from the offered sample count.
+    let profile = workload.profile(&args.profile).ok_or_else(|| {
+        RunError::Generate(format!("manifest declares no profile `{}`", args.profile))
+    })?;
+    let profile_record = ProfileRecord {
+        name: profile.name.clone(),
+        comparable: profile.is_publishable(),
+        comparability_reason: profile.comparability.to_string(),
+        active_series: profile.active_series,
+        total_series_created: gen_report.total_series_created,
+        samples_per_series: profile.samples_per_series,
+        scrape_interval_secs: profile.scrape_interval_secs,
+        duration_secs: profile.duration_secs,
+        total_samples: profile.total_samples,
+        label_cardinalities: workload.label_cardinalities(),
+        logical_input_bytes,
+        churn_basis_points_per_hour: profile.churn_basis_points_per_hour,
+    };
+
     // The in-process Ravel path: strict, durable-on-ack, commit tokens.
     let (store, store_metrics) = store_and_metrics_from_env(args.store);
-    let backend_bills_requests = matches!(args.store, StoreKind::S3);
+    let backend_bills_requests = backend_bills_requests(args.store);
+    let substrate = Substrate {
+        store_backend: args.store.to_string(),
+        endpoint_host: endpoint_host_from_env(),
+        backend_bills_requests,
+    };
     let ravel_cfg = RavelReplayConfig {
         store,
         store_metrics,
@@ -232,7 +262,10 @@ async fn run(args: &Args) -> Result<MetricsIngestReport, RunError> {
         rows.push(row);
     }
 
-    Ok(MetricsIngestReport::new(rows).with_query(query))
+    Ok(MetricsIngestReport::new(rows)
+        .with_query(query)
+        .with_profile(profile_record)
+        .with_substrate(substrate))
 }
 
 #[tokio::main]

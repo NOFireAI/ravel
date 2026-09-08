@@ -15,7 +15,7 @@
 //! [`Profile::is_publishable`] is that check, and [`gate_workload`] refuses a
 //! manifest that marks `ci` comparable at all.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,19 @@ impl Comparability {
         match self {
             Comparability::Comparable => None,
             Comparability::NonComparable { reason } => Some(reason),
+        }
+    }
+}
+
+impl std::fmt::Display for Comparability {
+    /// `"comparable"` for [`Comparability::Comparable`], the stated reason
+    /// for [`Comparability::NonComparable`]. The single formatting a reader
+    /// of an artifact's `comparability_reason` field is built from, so that
+    /// field is never a second, hand-written copy of this reason.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Comparability::Comparable => write!(f, "comparable"),
+            Comparability::NonComparable { reason } => write!(f, "{reason}"),
         }
     }
 }
@@ -251,6 +264,18 @@ impl WorkloadFile {
     /// The label dimension named `name`, or `None`.
     pub fn dimension(&self, name: &str) -> Option<&LabelDimension> {
         self.label_dimensions.iter().find(|d| d.name == name)
+    }
+
+    /// Distinct values each label dimension declares, name to count
+    /// (ADR-0927 decision 11). A direct read of the manifest: every label
+    /// value a generated series carries comes from exactly these dimensions
+    /// (`Generator::labels_for`), so this is the generator's own source, not
+    /// a re-derivation from generated output.
+    pub fn label_cardinalities(&self) -> BTreeMap<String, u64> {
+        self.label_dimensions
+            .iter()
+            .map(|d| (d.name.clone(), d.values.len() as u64))
+            .collect()
     }
 
     /// Time series one instance of `kind` emits: one for a gauge, a counter, or
