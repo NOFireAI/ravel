@@ -336,6 +336,16 @@ impl<'a> Generator<'a> {
                     name: profile_name.to_string(),
                     available: workload.profiles.iter().map(|p| p.name.clone()).collect(),
                 })?;
+        Ok(Self::for_profile(workload, profile, base_ts_ms))
+    }
+
+    /// Build a generator for an explicit `profile`, bypassing the by-name
+    /// lookup [`Self::new`] does. Lets a caller compute generator-exact
+    /// figures for a [`Profile`] value it holds directly (for example one
+    /// mutated from the manifest's own, as `build_profile_record`'s callers
+    /// do), without requiring it to be stored in `workload` under its own
+    /// name.
+    pub fn for_profile(workload: &'a WorkloadFile, profile: &'a Profile, base_ts_ms: i64) -> Self {
         let mut plans = Vec::with_capacity(workload.families.len());
         for (index, family) in workload.families.iter().enumerate() {
             let instances = workload.family_instances(profile, family);
@@ -357,12 +367,12 @@ impl<'a> Generator<'a> {
                 state: BTreeMap::new(),
             });
         }
-        Ok(Generator {
+        Generator {
             workload,
             profile,
             base_ts_ms,
             plans,
-        })
+        }
     }
 
     /// The profile this generator runs.
@@ -388,6 +398,42 @@ impl<'a> Generator<'a> {
         }
         let last_secs = (steps - 1) * self.profile.scrape_interval_secs;
         last_secs / CHURN_EPOCH_SECS + 1
+    }
+
+    /// Distinct scaling-label values (`instance` in the checked-in manifest)
+    /// the run emits across every family, over the churn epochs `steps`
+    /// spans. Derived from the same variables `generate_into`/`labels_for`
+    /// read, not a re-typed formula: at epoch `e`, a family's global instance
+    /// ordinals range over `[churned_per_epoch * e, churned_per_epoch * e +
+    /// instances)` (`generate_into`'s `base`/`local`/`global`), and
+    /// `labels_for` stamps each ordinal's scaling-label value as the ordinal
+    /// divided by the family's `fixed_product`. That division maps each
+    /// epoch's ordinal range onto one closed value range `[lo, hi]`.
+    ///
+    /// Every family shares one label-value prefix (`labels_for` never mixes
+    /// in a family id), so two families', or one family's own across two
+    /// epochs, value ranges can collide or overlap: `gate_workload` does not
+    /// bound `churn_basis_points_per_hour`, so a family's later-epoch range
+    /// can even extend past its own epoch-0 range. The true count is
+    /// therefore the union of every (family, epoch) value range, not a sum
+    /// (would double-count overlaps) and not a per-family max (would miss
+    /// values a later epoch adds beyond another family's range).
+    pub fn scaling_label_cardinality(&self, steps: usize) -> u64 {
+        let steps = steps as u64;
+        let epochs = self.epochs_spanned(steps);
+        let mut ranges: Vec<(u64, u64)> = Vec::new();
+        for plan in &self.plans {
+            if plan.instances == 0 {
+                continue;
+            }
+            for epoch in 0..epochs {
+                let base = plan.churned_per_epoch * epoch;
+                let lo = base / plan.fixed_product;
+                let hi = (base + plan.instances - 1) / plan.fixed_product;
+                ranges.push((lo, hi));
+            }
+        }
+        union_size(ranges)
     }
 
     /// Generate `steps` scrapes into `sink`, returning the run's exact figures.
@@ -794,6 +840,29 @@ impl<'a> Generator<'a> {
 /// churn-free stays clean.
 fn fires(one_in: u64, seed: u64, tag: u64, family: u64, instance: u64, step: u64) -> bool {
     one_in != 0 && mix(seed, &[tag, family, instance, step]).is_multiple_of(one_in)
+}
+
+/// Total count of distinct integers covered by the union of closed ranges
+/// `[lo, hi]`. Exact via a sort-and-merge sweep, regardless of whether the
+/// input ranges are disjoint, overlapping, adjacent, or nested.
+fn union_size(mut ranges: Vec<(u64, u64)>) -> u64 {
+    if ranges.is_empty() {
+        return 0;
+    }
+    ranges.sort_unstable();
+    let mut total = 0u64;
+    let (mut cur_lo, mut cur_hi) = ranges[0];
+    for &(lo, hi) in &ranges[1..] {
+        if lo <= cur_hi + 1 {
+            cur_hi = cur_hi.max(hi);
+        } else {
+            total += cur_hi - cur_lo + 1;
+            cur_lo = lo;
+            cur_hi = hi;
+        }
+    }
+    total += cur_hi - cur_lo + 1;
+    total
 }
 
 #[cfg(test)]
@@ -1632,49 +1701,126 @@ mod tests {
         })
     }
 
-    /// `WorkloadFile::label_cardinalities`' `instance` figure must be the
-    /// UNION of distinct scaling-label values the generator actually emits,
-    /// never the sum of the families' per-family counts: every family shares
-    /// one `scaling_label_value_prefix`
+    /// [`Generator::scaling_label_cardinality`] must equal the distinct
+    /// scaling-label values the generator actually emits, one churn epoch
+    /// (the checked-in manifest's `ci` profile, no churn): the UNION of the
+    /// families' per-family, single-epoch ranges, never their sum -- every
+    /// family shares one `scaling_label_value_prefix`
     /// (`benchmarks/metrics/workload.json`'s `"metricsbench-instance-"`), so
     /// two families routinely emit the same value.
     ///
-    /// Under the checked-in manifest's `ci` profile (1,000 active series),
-    /// `WorkloadFile::family_scaling_label_cardinality` per family is:
+    /// Under the checked-in manifest's `ci` profile (1,000 active series,
+    /// churn-free so `base == 0` for every family), each family's range is
+    /// `[0, instances / fixed_product]`:
     /// `metricsbench_gauge_cpu_percent`: 400 instances / 12 (job x region)
-    /// fixed combos = ceil(400/12) = 34, values 0..33.
-    /// `metricsbench_requests_total`: 300 / 64 (job x method x status) =
-    /// ceil(300/64) = 5, values 0..4.
+    /// fixed combos, values 0..33, 34 distinct.
+    /// `metricsbench_requests_total`: 300 / 64 (job x method x status),
+    /// values 0..4, 5 distinct.
     /// `metricsbench_request_duration_seconds`: 15 instances (150 series / 10
-    /// series-per-classic-histogram-instance) / 4 (job) = ceil(15/4) = 4,
-    /// values 0..3.
-    /// `metricsbench_latency_native`: 100 / 4 (job) = ceil(100/4) = 25, values
-    /// 0..24.
-    /// `metricsbench_build_info`: 50 instances / 8 (job x version) =
-    /// ceil(50/8) = 7, values 0..6.
-    /// Every one of those ranges starts at 0 (`Generator::labels_for` assigns
-    /// `global / fixed_product`, and `global` itself starts at 0 for every
-    /// family), so their union is exactly the widest range: 34 distinct
-    /// values, not the sum of the five counts (34 + 5 + 4 + 25 + 7 = 75).
-    ///
-    /// TO SEE THIS FAIL against the pre-fix `label_cardinalities` (summing
-    /// the per-family counts): change its `.max().unwrap_or(0)` back to
-    /// `.sum()`; this test then observes 75 != 34.
+    /// series-per-classic-histogram-instance) / 4 (job), values 0..3, 4
+    /// distinct.
+    /// `metricsbench_latency_native`: 100 / 4 (job), values 0..24, 25
+    /// distinct.
+    /// `metricsbench_build_info`: 50 instances / 8 (job x version), values
+    /// 0..6, 7 distinct.
+    /// Every one of those ranges starts at 0, so their union is exactly the
+    /// widest range: 34 distinct values, not the sum of the five counts
+    /// (34 + 5 + 4 + 25 + 7 = 75).
     #[test]
-    fn scaling_label_cardinality_equals_the_distinct_values_the_generator_emits() {
+    fn scaling_label_cardinality_matches_the_generators_distinct_emitted_values_for_ci() {
         let workload = load_workload(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../benchmarks/metrics/workload.json"
         )))
         .expect("load the checked-in workload manifest");
-        let profile = workload.profile("ci").expect("ci profile declared");
 
-        let (bytes, _report) = Generator::new(&workload, "ci", 0)
-            .expect("generator builds")
-            .generate_bytes(1)
-            .expect("generates one step");
+        let mut generator = Generator::new(&workload, "ci", 0).expect("generator builds");
+        assert_eq!(
+            generator.scaling_label_cardinality(1),
+            34,
+            "the ci profile's one-epoch scaling-label cardinality is 34 (see derivation above)"
+        );
+
+        let (bytes, _report) = generator.generate_bytes(1).expect("generates one step");
         let text = String::from_utf8(bytes).expect("utf8");
+        let distinct_instances: std::collections::BTreeSet<&str> = text
+            .lines()
+            .filter_map(|line| line.split('\t').nth(1))
+            .filter_map(instance_label)
+            .collect();
+        assert_eq!(
+            distinct_instances.len(),
+            34,
+            "the ci profile's generator emits 34 distinct instance values: {distinct_instances:?}"
+        );
+    }
 
+    /// The churn case: churn epochs must grow the distinct scaling-label set
+    /// past one epoch's worth, which a single-epoch, manifest-only formula
+    /// cannot see (issue #1352). The pre-fix formula this issue replaces
+    /// (`bfb501ea`'s `crates/ravel-bench/src/metrics_workload.rs:330`,
+    /// `WorkloadFile::family_scaling_label_cardinality`, `ceil(instances /
+    /// family_fixed_product)`, maxed over families with no notion of an
+    /// epoch at `metrics_workload.rs:287`) reports one number for the whole
+    /// run regardless of how many epochs it spans. But
+    /// `Generator::generate_into` offsets every family's instance ordinal by
+    /// `churned_per_epoch * epoch` each epoch, so the true distinct-value
+    /// set grows every epoch: the union of every (family, epoch) range.
+    ///
+    /// A local profile tunes the shared 4-family test manifest (job x region
+    /// = 4 fixed combos, job = 2, family permilles 300/150/500/50) to 400
+    /// active series and 50%/hour churn, fast enough to generate here.
+    /// `STEPS = 481` (`(2 * CHURN_EPOCH_SECS) / scrape_interval_secs + 1` =
+    /// `(2 * 3_600) / 15 + 1`) spans exactly 3 churn epochs (0, 1, 2).
+    ///
+    /// Per family, `instances` (churn-free, so this count itself does not
+    /// change across epochs) and `churned_per_epoch` (`instances *
+    /// churn_basis_points_per_hour / 10_000`):
+    /// gauge: 400*300/1000 = 120 series / 1 = 120 instances, `fixed_product`
+    /// = 2 (job) x 2 (region) = 4, `churned_per_epoch` = 120*5_000/10_000 =
+    /// 60.
+    /// counter: 400*150/1000 = 60 instances, `fixed_product` = 2 (job),
+    /// `churned_per_epoch` = 30.
+    /// classic: 400*500/1000 = 200 series / 10 (7 bounds + 3) = 20
+    /// instances, `fixed_product` = 2 (job), `churned_per_epoch` = 10.
+    /// native: 400*50/1000 = 20 instances, `fixed_product` = 2 (job),
+    /// `churned_per_epoch` = 10.
+    ///
+    /// Each family's per-epoch value range is `[base/fixed_product, (base +
+    /// instances - 1)/fixed_product]` with `base = churned_per_epoch *
+    /// epoch`:
+    /// gauge: epoch 0 `[0,29]`, epoch 1 `[15,44]`, epoch 2 `[30,59]`, union
+    /// `[0,59]`, 60 values.
+    /// counter: epoch 0 `[0,29]`, epoch 1 `[15,44]`, epoch 2 `[30,59]`,
+    /// union `[0,59]`, a subset of gauge's.
+    /// classic and native: epoch 0 `[0,9]`, epoch 1 `[5,14]`, epoch 2
+    /// `[10,19]`, union `[0,19]`, a subset of gauge's.
+    /// Grand union across all four families: `[0,59]`, 60 distinct values.
+    ///
+    /// The pre-fix formula instead reports, per family, `ceil(instances /
+    /// fixed_product)` at epoch 0 only: gauge `ceil(120/4)=30`, counter
+    /// `ceil(60/2)=30`, classic `ceil(20/2)=10`, native `ceil(20/2)=10`,
+    /// maxed to 30, half the true 60.
+    ///
+    /// TO SEE THIS FAIL against the pre-fix formula: reintroduce
+    /// `WorkloadFile::family_scaling_label_cardinality` and
+    /// `WorkloadFile::family_fixed_product` (deleted by this fix) and assert
+    /// `workload.label_cardinalities(&profile)["instance"] == 60` in their
+    /// place below; that formula reports 30, not 60.
+    #[test]
+    fn scaling_label_cardinality_unions_every_family_and_epoch_under_churn() {
+        let w = workload(1, clean());
+        let base = w.profile("churn").expect("churn profile declared").clone();
+        let profile = Profile {
+            active_series: 400,
+            churn_basis_points_per_hour: 5_000,
+            ..base
+        };
+        const STEPS: u64 = 481;
+
+        let mut generator = Generator::for_profile(&w, &profile, 0);
+        let (bytes, _report) = generator.generate_bytes(STEPS).expect("generates");
+        let text = String::from_utf8(bytes).expect("utf8");
         let distinct_instances: std::collections::BTreeSet<&str> = text
             .lines()
             .filter_map(|line| line.split('\t').nth(1))
@@ -1683,14 +1829,14 @@ mod tests {
 
         assert_eq!(
             distinct_instances.len(),
-            34,
-            "the ci profile's generator emits 34 distinct instance values: {distinct_instances:?}"
+            60,
+            "3 churn epochs must grow the distinct instance-value set past one epoch's \
+             (see derivation above): {distinct_instances:?}"
         );
         assert_eq!(
-            workload.label_cardinalities(profile)["instance"],
+            generator.scaling_label_cardinality(STEPS as usize),
             distinct_instances.len() as u64,
-            "label_cardinalities must report the distinct values the generator emits, not a sum \
-             that double-counts values shared across families"
+            "scaling_label_cardinality must equal the generator's own distinct emitted values"
         );
     }
 }

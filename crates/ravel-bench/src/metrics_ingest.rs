@@ -68,8 +68,16 @@
 //!   (`samples_per_series`).
 //! - `samples_per_series`, `scrape_interval_secs`, `duration_secs`,
 //!   `total_samples`, `churn_basis_points_per_hour`: as declared.
-//! - `label_cardinalities`: distinct values per label dimension, name to
-//!   count, read from the manifest, including the scaling label.
+//! - `label_cardinalities`: distinct values per FIXED label dimension, name
+//!   to count, read from the manifest. The scaling label is not a dimension
+//!   (the manifest gate refuses to let it be declared as one) and is never
+//!   in this map; its cardinality depends on the run's churn epochs, so it
+//!   is reported separately below.
+//! - `scaling_label`: the scaling label's name and its declared cardinality:
+//!   - `name`: the scaling label ([`crate::metrics_workload::GeneratorConfig::scaling_label`]).
+//!   - `cardinality_declared`: distinct scaling-label values the profile's
+//!     full declared run (`steps_declared`) would emit, the generator's
+//!     exact count.
 //! - `families`: one [`FamilyRecord`] per metric family (`name`, `instances`,
 //!   `series_per_instance`), as declared.
 //! - `run`: a [`RunRecord`], scoped to `steps_run`, never the declared full
@@ -81,6 +89,8 @@
 //!     produced over these steps, the generator's exact count.
 //!   - `total_samples_generated`: samples the generator emitted over these
 //!     steps, the generator's exact count.
+//!   - `scaling_label_cardinality`: distinct scaling-label values this run
+//!     actually emitted over `steps_run`, the generator's exact count.
 //!
 //! [`Substrate`] (`substrate`), the storage backend a run replayed against:
 //! - `store_backend`: the `--store` kind (`memory` or `s3`).
@@ -479,20 +489,17 @@ pub struct ProfileRecord {
     pub duration_secs: u64,
     /// Total samples the profile declares over its full duration.
     pub total_samples: u64,
-    /// Distinct values per label, name to count, straight from the workload
-    /// manifest (`WorkloadFile::label_cardinalities`) -- including the
-    /// scaling label (`instance`), whose count is the UNION of `families`'
-    /// per-family instance cardinalities below, not their sum: every family
-    /// shares one scaling-label value prefix, so two families' instance
-    /// ranges (each contiguous from 0) routinely overlap.
+    /// Distinct values per FIXED label dimension, name to count, straight
+    /// from the workload manifest (`WorkloadFile::label_cardinalities`). The
+    /// scaling label is never in this map -- the manifest gate refuses to
+    /// let it be declared as an ordinary dimension -- and is reported
+    /// instead under `scaling_label` and `run.scaling_label_cardinality`.
     pub label_cardinalities: BTreeMap<String, u64>,
+    /// The scaling label's name and its declared (full-run) cardinality.
+    pub scaling_label: ScalingLabelRecord,
     /// Declared series churn, in basis points per hour.
     pub churn_basis_points_per_hour: u64,
-    /// Per-family instance counts, so `label_cardinalities`' `instance` count
-    /// is reconstructible: combined with the manifest's own label
-    /// dimensions and `family.labels`, a reader can recompute each family's
-    /// scaling-label cardinality (`WorkloadFile::family_scaling_label_
-    /// cardinality`) and take their maximum.
+    /// Per-family instance counts, as declared.
     pub families: Vec<FamilyRecord>,
     /// Figures scoped to this run's actual `steps_run`, never the declared
     /// full profile: the generator's exact counts over exactly the steps
@@ -515,6 +522,25 @@ pub struct RunRecord {
     /// Samples the generator emitted over these steps (after omissions and
     /// stale markers; the generator's exact count).
     pub total_samples_generated: u64,
+    /// Distinct scaling-label values the generator actually emitted over
+    /// these steps (`Generator::scaling_label_cardinality`), across every
+    /// family and every churn epoch these steps span.
+    pub scaling_label_cardinality: u64,
+}
+
+/// The scaling label's identity and its cardinality over a profile's full
+/// declared run. Named separately from `label_cardinalities` because the
+/// scaling label is not a dimension: the manifest gate refuses to let it be
+/// declared as one, and its cardinality depends on churn epochs rather than
+/// being a fixed, manifest-only count.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScalingLabelRecord {
+    /// The scaling label's name (`GeneratorConfig::scaling_label`).
+    pub name: String,
+    /// Distinct scaling-label values the profile's full declared run
+    /// (`steps_declared`) would emit, across every family and every churn
+    /// epoch it spans (`Generator::scaling_label_cardinality`).
+    pub cardinality_declared: u64,
 }
 
 /// One metric family's exact instance count under the run's profile, and the
@@ -574,6 +600,7 @@ pub fn build_profile_record(
     } else {
         profile.comparability.reason().map(String::from)
     };
+    let generator = crate::metrics_gen::Generator::for_profile(workload, profile, 0);
     ProfileRecord {
         name: profile.name.clone(),
         comparable,
@@ -585,7 +612,11 @@ pub fn build_profile_record(
         scrape_interval_secs: profile.scrape_interval_secs,
         duration_secs: profile.duration_secs,
         total_samples: profile.total_samples,
-        label_cardinalities: workload.label_cardinalities(profile),
+        label_cardinalities: workload.label_cardinalities(),
+        scaling_label: ScalingLabelRecord {
+            name: workload.generator.scaling_label.clone(),
+            cardinality_declared: generator.scaling_label_cardinality(steps_declared as usize),
+        },
         churn_basis_points_per_hour: profile.churn_basis_points_per_hour,
         families,
         run: RunRecord {
@@ -593,6 +624,7 @@ pub fn build_profile_record(
             total_series_created: gen_report.total_series_created,
             logical_input_bytes,
             total_samples_generated: gen_report.emitted_samples,
+            scaling_label_cardinality: generator.scaling_label_cardinality(steps_run as usize),
         },
     }
 }
@@ -2006,6 +2038,22 @@ mod tests {
             "the reason must be the manifest's own reason, not a truncation message, since \
              this run was not truncated"
         );
+
+        assert_eq!(
+            record.scaling_label.name, workload.generator.scaling_label,
+            "scaling_label.name must name the manifest's own scaling label"
+        );
+        let generator = Generator::for_profile(&workload, &profile, 0);
+        assert_eq!(
+            record.scaling_label.cardinality_declared,
+            generator.scaling_label_cardinality(record.steps_declared as usize),
+            "cardinality_declared must be the generator's own figure at steps_declared"
+        );
+        assert_eq!(
+            record.run.scaling_label_cardinality,
+            generator.scaling_label_cardinality(steps as usize),
+            "run.scaling_label_cardinality must be the generator's own figure at steps_run"
+        );
     }
 
     /// The mirror case: a profile whose own verdict IS comparable, but the
@@ -2063,6 +2111,23 @@ mod tests {
             record.comparability_reason,
             Some(expected_reason),
             "the truncation reason must state the run's actual vs declared step counts"
+        );
+
+        let generator = Generator::for_profile(&workload, &profile, 0);
+        assert_eq!(
+            record.scaling_label.name, workload.generator.scaling_label,
+            "scaling_label.name must name the manifest's own scaling label"
+        );
+        assert_eq!(
+            record.scaling_label.cardinality_declared,
+            generator.scaling_label_cardinality(steps_declared as usize),
+            "cardinality_declared must be the generator's own figure at steps_declared"
+        );
+        assert_eq!(
+            record.run.scaling_label_cardinality,
+            generator.scaling_label_cardinality(steps_run as usize),
+            "run.scaling_label_cardinality must be the generator's own figure at steps_run, \
+             not steps_declared"
         );
     }
 }

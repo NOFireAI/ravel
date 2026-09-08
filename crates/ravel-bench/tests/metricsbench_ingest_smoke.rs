@@ -171,7 +171,7 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
     let expected = workload
         .profile("ci")
         .expect("manifest declares a `ci` profile");
-    let expected_label_cardinalities = workload.label_cardinalities(expected);
+    let expected_label_cardinalities = workload.label_cardinalities();
 
     // A deliberate truncation: far under the profile's declared
     // `samples_per_series` (120), so the run finishes fast regardless of host
@@ -277,6 +277,26 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
             "label dimension `{name}`'s distinct-value count must match the manifest"
         );
     }
+    assert!(
+        !label_cardinalities.contains_key(&workload.generator.scaling_label),
+        "the scaling label is not a fixed dimension and must not appear in label_cardinalities"
+    );
+
+    let scaling_label = &profile["scaling_label"];
+    assert_eq!(
+        scaling_label["name"].as_str(),
+        Some(workload.generator.scaling_label.as_str())
+    );
+    assert_eq!(
+        scaling_label["cardinality_declared"].as_u64(),
+        Some(generator.scaling_label_cardinality(expected.samples_per_series as usize)),
+        "cardinality_declared must match the generator's own figure at the declared step count"
+    );
+    assert_eq!(
+        run["scaling_label_cardinality"].as_u64(),
+        Some(generator.scaling_label_cardinality(STEPS as usize)),
+        "run.scaling_label_cardinality must match the generator's own figure at steps_run"
+    );
 
     // The substrate block: an in-process MemoryStore never bills.
     let substrate = &report["substrate"];
