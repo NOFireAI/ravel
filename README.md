@@ -288,14 +288,10 @@ foldable until the sealing window behind it has elapsed. See
 
 ## Agents (MCP)
 
-Ravel exposes a Model Context Protocol (MCP) surface for an AI agent host,
-alongside the HTTP query API. It answers the same read-only queries an
-agent needs to investigate an incident: what data exists, a bounded query
-with a known cost, and a result a person can check again.
-
-The surface is off by default. It ships behind the `mcp` cargo feature and
-the `--mcp` flag: a build must compile the feature and an operator must
-pass the flag to serve it. See the [agents guide](docs/guides/agents.md).
+The MCP agent surface is designed and documented in
+[docs/guides/agents.md](docs/guides/agents.md). It will land behind the
+`mcp` cargo feature and the `--mcp` flag, both off by default. Until then
+neither the feature nor the flag exists in a build.
 
 ## Kubernetes
 
