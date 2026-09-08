@@ -149,3 +149,4 @@ the reservation commit that used to work around it.
 | [1199](1199-bounded-query-io-and-tail-checkpoints.md) | Bounded query I/O accounting, and a pre-registered measured gate deciding whether an L0.5 tail checkpoint gets built at all | Proposed |
 | [1294](1294-alert-state-memo.md) | A durable, derived alert-state memo per tenant that bounds each alert evaluation tick to a memo GET, a lease GET, one tail LIST, and the transitions since the memo, instead of re-folding the whole `Signal::Alerts` history every tick | Proposed |
 | [1374](1374-agent-mcp-server.md) | A first-party MCP server behind a shared query service layer, with a bounded, evidence-bearing agent result contract | Proposed |
+| [1413](1413-split-cstat-per-part.md) | Split `.cstat` column statistics per snapshot part, so a wide table's statistics fit the reader's guard and the process memory budget, with a per-part ceiling the writer also enforces | Accepted |
