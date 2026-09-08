@@ -8,7 +8,7 @@
 # guard-test cases (the doc-scripts job in .github/workflows/ci.yml) is out
 # of scope for the change that added this file. Run by hand:
 #   bash scripts/tests/flag-doc-guard.test.sh
-set -uo pipefail
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 GATES="${SCRIPT_DIR}/gates.sh"
@@ -46,9 +46,18 @@ if [[ ! -d "${tmproot}" ]]; then
 fi
 trap 'rm -rf "${tmproot}"' EXIT
 bad_config="${tmproot}/config.rs"
-cp "${REAL_CONFIG}" "${bad_config}"
+cp "${REAL_CONFIG}" "${bad_config}" || exit 1
+if [[ ! -f "${bad_config}" ]]; then
+  echo "FAIL  cp did not produce the fixture at ${bad_config}" >&2
+  exit 1
+fi
 sed -i.bak 's/OTLP HTTP gzip inflate, which/OTLP HTTP transient, which/' "${bad_config}"
 rm -f "${bad_config}.bak"
+if cmp -s "${REAL_CONFIG}" "${bad_config}"; then
+  echo "FAIL  fixture is identical to ${REAL_CONFIG}; the sed edit did not \
+strip the gzip qualification, so the known-bad case would test nothing" >&2
+  exit 1
+fi
 
 rc=0
 bash "${GATES}" --flag-doc-guard-only "${bad_config}" >/dev/null 2>&1 || rc=$?

@@ -204,15 +204,16 @@ makes the summed charge equal the actual decompressed length exactly: the
 over-charge bound for an admitted request is **zero**, and the uncharged
 allocations are a fixed per-inflate overhead: one staging chunk (64 KiB) per
 in-flight inflate, per-chunk bookkeeping (a `Bytes` handle and a charge guard
-for each retained chunk), and flate2's own decoder state (tens of KiB). The
+for each retained chunk, about 48 bytes per 64 KiB chunk, held in two vectors
+that grow by doubling), and flate2's own decoder state (tens of KiB). The
 compressed request body itself also stays resident for the whole inflate, but
 it is bounded by the wire-body cap (`MAX_REQUEST_BODY_BYTES`, 16 MiB,
-ADR-0051 section 2) and already counted under `--max-inflight-ingest-requests`
-(docs/ingest.md, "Worst-case resident memory", term 2), not left uncharged
-here. No uncharged allocation on this path scales with the decompressed size;
-each is a fixed cost, not a share of the charged bytes, so together they can
-exceed the charge itself on a small decompressed body. A shed request refunds
-every partial chunk on the spot.
+ADR-0051 section 1 and section 3) and already counted against
+`--max-inflight-ingest-requests`, not left uncharged here. No uncharged
+allocation holds a copy of the decompressed bytes; the staging chunk and
+decoder state are a fixed cost that alone can exceed the charge itself on a
+small decompressed body. A shed request refunds every partial chunk on the
+spot.
 
 ### Rejected alternatives
 

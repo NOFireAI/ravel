@@ -583,14 +583,15 @@ allocation at once, so a charge taken on the appended length would undercount
 the buffer the ceiling claims to bound (and `reserve_exact` does not fix it,
 since an allocator may return more than was asked for). What stays outside the
 charge is a fixed per-inflate overhead: one 64 KiB staging buffer that the
-decoder reads into, plus a `Bytes` handle and a charge guard per chunk, plus
+decoder reads into, plus a `Bytes` handle and a charge guard per chunk (about
+48 bytes per 64 KiB chunk, held in two vectors that grow by doubling), plus
 flate2's own decoder state (tens of KiB). The compressed request body itself
 also stays resident for the whole inflate, but it is bounded by the request
-cap (`MAX_REQUEST_BODY_BYTES`, 16 MiB) and already counted under term 2, not
-left uncharged here. No uncharged allocation on this path scales with the
-decompressed size; the fixed overhead is a flat cost, not a share of the
-bytes charged, so it can exceed the charge itself on a small decompressed
-body.
+cap (`MAX_REQUEST_BODY_BYTES`, 16 MiB) and already counted against
+`--max-inflight-ingest-requests`, not left uncharged here. No uncharged
+allocation on this path holds a copy of the decompressed bytes; the staging
+buffer and decoder state are a flat cost that alone can exceed the charge
+itself on a small decompressed body.
 
 The gateway holds that charge through protobuf decode and releases it once decode
 has consumed and freed the chunks -- prost copies them into owned structs -- before
