@@ -561,12 +561,13 @@ pub struct FamilyRecord {
 
 /// Builds the ADR-0927 decision-11 profile block for one run.
 ///
-/// `comparable` is forced `false` whenever `steps_run` truncates `profile`'s
-/// declared `samples_per_series`, regardless of the profile's own verdict --
-/// a truncated run is never that profile's figures. `comparability_reason`
-/// then states the truncation, not the profile's own (possibly `None`)
-/// reason. When the run is not truncated, `comparable` and
-/// `comparability_reason` come straight from `profile.comparability`.
+/// `comparable` is forced `false` whenever `steps_run` differs from
+/// `profile`'s declared `samples_per_series`, regardless of the profile's
+/// own verdict: a run that stopped short or ran long is not that profile's
+/// figures either way. `comparability_reason` then states the step counts,
+/// not the profile's own (possibly `None`) reason. When the run matches the
+/// declared count, `comparable` and `comparability_reason` come straight
+/// from `profile.comparability`.
 ///
 /// A caller passes `steps_run` and `logical_input_bytes` separately from
 /// `gen_report` because both are known before the report is built: the
@@ -589,7 +590,9 @@ pub fn build_profile_record(
         })
         .collect();
     let steps_declared = profile.samples_per_series;
-    let truncated = steps_run < steps_declared;
+    // Any step count other than the profile's own: a short run is not that
+    // profile's figures, and an over-long one is not either.
+    let truncated = steps_run != steps_declared;
     let comparable = profile.is_publishable() && !truncated;
     let comparability_reason = if truncated {
         Some(format!(
