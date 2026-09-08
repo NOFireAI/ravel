@@ -1381,31 +1381,84 @@ mod tests {
         );
     }
 
+    /// One segment with a single string-typed column whose dictionary holds
+    /// one large, highly compressible value. `PAYLOAD_LEN` is chosen so
+    /// `SEGMENT_COUNT` copies of it push the object's declared *uncompressed*
+    /// body past [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]
+    /// while its on-the-wire (compressed) size, and the memory needed to
+    /// build it, stay tiny -- the point is to exercise the real
+    /// `body_uncompressed_len` size check, not to allocate 256+ MiB of
+    /// incompressible data.
+    const OVERSIZED_PAYLOAD_LEN: usize = 45_000;
+    const OVERSIZED_SEGMENT_COUNT: u32 = 6_500;
+
+    fn big_string_segment(index: u32, payload_len: usize) -> ColumnStatsSegment {
+        let mut writer_id = vec![0u8; 32];
+        writer_id[24..].copy_from_slice(&u64::from(index).to_be_bytes());
+        let small = ColumnValue {
+            kind: Some(ravel_proto::catalog::v1::column_value::Kind::StrUtf8(
+                "a".to_string(),
+            )),
+        };
+        let big = ColumnValue {
+            kind: Some(ravel_proto::catalog::v1::column_value::Kind::StrUtf8(
+                "x".repeat(payload_len),
+            )),
+        };
+        ColumnStatsSegment {
+            ingest_hour_bucket: index,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: u64::from(index),
+            columns: vec![ColumnStat {
+                name: "big_col".to_string(),
+                declared_type: 1, // StrUtf8 (see is_kind_for_type)
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(small.clone()),
+                max: Some(small),
+                dictionary_present: true,
+                dictionary: vec![DictEntry {
+                    value: Some(big),
+                    count: 1,
+                }],
+                sum: None,
+            }],
+        }
+    }
+
     /// The per-part bound and the decoder's whole-object `max_column_stats_bytes`
-    /// ceiling are independent knobs: a body that a tiny, stale whole-object
-    /// ceiling would reject still decodes once the caller sizes its limits to
-    /// the per-part bound instead (the read-time sizing ADR-1413 decision 4's
-    /// companion, T2/#1483, is expected to use).
+    /// ceiling are independent knobs. This builds a v3 object whose declared,
+    /// uncompressed body genuinely exceeds
+    /// [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`] (256 MiB) --
+    /// `OVERSIZED_SEGMENT_COUNT` segments of `OVERSIZED_PAYLOAD_LEN` bytes each,
+    /// about 279 MiB total -- but still fits comfortably inside
+    /// `per_part_column_stats_bound` for its own actual segment/column counts
+    /// (one declared column, `OVERSIZED_SEGMENT_COUNT` entries: ~339 MiB). A
+    /// reader sized to the stale whole-object default rejects it; one sized to
+    /// the per-part bound (the read-time sizing ADR-1413 decision 4's
+    /// companion, T2/#1483, is expected to use) decodes it clean.
     #[test]
     fn v3_object_over_the_whole_object_ceiling_but_inside_the_part_bound_decodes() {
-        let mut seg = segment(1, 0, 1);
-        seg.writer_id = vec![0x99; 32];
+        let segments: Vec<ColumnStatsSegment> = (0..OVERSIZED_SEGMENT_COUNT)
+            .map(|i| big_string_segment(i, OVERSIZED_PAYLOAD_LEN))
+            .collect();
         let part_blake3 = [0x55u8; 32];
-        let per_part_bound = crate::snapshot_format::PER_SEGMENT_COLUMN_STATS_BOUND_BYTES;
-        let bytes = encode_column_stats_v3(
-            [0x11; 16],
-            3,
-            part_blake3,
-            std::slice::from_ref(&seg),
-            per_part_bound,
-        )
-        .expect("segment fits the per-part bound");
+        let per_part_bound = crate::snapshot_format::per_part_column_stats_bound(
+            u64::from(OVERSIZED_SEGMENT_COUNT),
+            1,
+        );
+        assert!(
+            per_part_bound > crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+            "the fixture's own per-part bound must exceed the whole-object default \
+             for this test to distinguish the two ceilings"
+        );
+        let bytes = encode_column_stats_v3([0x11; 16], 3, part_blake3, &segments, per_part_bound)
+            .expect("fixture is sized to fit the per-part bound");
 
-        let tiny_whole_object_ceiling = ColumnStatsLimits {
-            max_column_stats_bytes: 8,
-        };
-        let err = decode_column_stats(&bytes, &tiny_whole_object_ceiling)
-            .expect_err("a tiny whole-object ceiling rejects this body");
+        let err = decode_column_stats(&bytes, &ColumnStatsLimits::default())
+            .expect_err("the whole-object default ceiling (256 MiB) rejects this body");
         assert!(matches!(
             err,
             SnapshotFormatError::ColumnStatsDecompressedTooLarge { .. }
@@ -1416,7 +1469,7 @@ mod tests {
         };
         let decoded = decode_column_stats(&bytes, &part_sized_limits)
             .expect("decodes once limits are sized to the per-part bound");
-        assert_eq!(decoded.segments, vec![seg]);
+        assert_eq!(decoded.segments, segments);
         assert_eq!(decoded.header.part_blake3, vec![part_blake3.to_vec()]);
     }
 
@@ -1475,6 +1528,38 @@ mod tests {
             prop_assert!(
                 result.is_err(),
                 "a strictly truncated v3 object must never decode successfully"
+            );
+        }
+
+        /// Every byte of a v3 object is protected against a single-bit flip
+        /// by one of two independently sufficient guards: `header_crc`
+        /// covers magic/version/reserved/header_len/header_bytes, and
+        /// `body_crc` covers the compressed body -- crc32c is guaranteed to
+        /// detect any single-bit error within the range it covers, and both
+        /// checks run before the header is decoded or the body is
+        /// decompressed. The bytes neither CRC covers -- the `body_len`
+        /// length prefix and the two stored CRC words themselves -- are not
+        /// silently trusted either: a flipped `body_len` desyncs the
+        /// remaining reads into a `ColumnStatsTrailingBytes` or CRC mismatch,
+        /// and a flipped stored CRC word simply fails the comparison it feeds.
+        /// So a single-bit flip anywhere always surfaces a typed error, never
+        /// a panic and never a different-but-plausible decode.
+        #[test]
+        fn v3_single_bit_flip_never_panics_and_is_rejected(
+            n in 1usize..6,
+            byte_seed in 0usize..10_000,
+            bit in 0u8..8,
+        ) {
+            let segments = arb_v3_segments(n);
+            let mut bytes = encode_column_stats_v3([0x11; 16], 3, [0x22; 32], &segments, u64::MAX)
+                .expect("a sorted, distinct segment set always fits an unbounded per-part bound");
+            prop_assume!(!bytes.is_empty());
+            let flip_at = byte_seed % bytes.len();
+            bytes[flip_at] ^= 1 << bit;
+            let result = decode_column_stats(&bytes, &ColumnStatsLimits::default());
+            prop_assert!(
+                result.is_err(),
+                "a single-bit-flipped v3 object must never decode successfully"
             );
         }
     }
