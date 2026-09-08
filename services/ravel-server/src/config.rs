@@ -783,19 +783,21 @@ pub struct Cli {
     /// they inflate: each decompressed chunk is charged before it is retained,
     /// and the inflate is retained as those exactly-sized chunks rather than
     /// appended into one growing buffer, so the charge equals the bytes held at
-    /// every instant. What stays uncharged is a fixed per-inflate overhead: one
-    /// fixed 64 KiB staging chunk the decoder reads into per in-flight
-    /// inflate, per-chunk bookkeeping (about 48 bytes per 64 KiB chunk, held
-    /// in two vectors that grow by doubling), and flate2's own decoder state
-    /// (tens of KiB); the compressed request body itself also stays resident
-    /// for the whole inflate but is bounded by the request cap and already
-    /// counted against `--max-inflight-ingest-requests`. No uncharged
-    /// allocation holds a copy of the decompressed bytes; the staging chunk
-    /// and decoder state are a fixed cost that alone can exceed the charge
-    /// itself on a small decompressed body. A decompression whose running
-    /// charge would cross the ceiling is shed mid-inflate instead of being
-    /// allocated in full. A request whose charge would push the gauge past
-    /// this ceiling is shed before any buffering -- HTTP 429 with
+    /// every instant. What stays uncharged is a fixed staging-and-decoder cost
+    /// plus per-chunk bookkeeping that scales with chunk count: one fixed 64
+    /// KiB staging chunk the decoder reads into per in-flight inflate, which
+    /// transiently holds one chunk of decompressed bytes; per-chunk bookkeeping
+    /// (about 48 bytes per 64 KiB chunk, held in two vectors that grow by
+    /// doubling); and flate2's own decoder state (tens of KiB); the compressed
+    /// request body itself also stays resident for the whole inflate but is
+    /// bounded by the request cap and already counted against
+    /// `--max-inflight-ingest-requests`. No uncharged allocation holds a copy
+    /// of the full decompressed body; the staging chunk holds only one chunk at
+    /// a time, and it and the decoder state are a fixed cost that alone can
+    /// exceed the charge itself on a small decompressed body. A decompression
+    /// whose running charge would cross the ceiling is shed mid-inflate instead
+    /// of being allocated in full. A request whose charge would push the gauge
+    /// past this ceiling is shed before any buffering -- HTTP 429 with
     /// `Retry-After`, gRPC `RESOURCE_EXHAUSTED` -- so a burst of active
     /// tenants can no longer grow resident memory without bound (the
     /// per-tenant buffer caps bound each tenant, not their sum). It does NOT
