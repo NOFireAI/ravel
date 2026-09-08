@@ -128,8 +128,8 @@ impl AuditModeArg {
 }
 
 /// The `--audit-text` values (ADR-0062 decision 2e). Selects how a query's
-/// text is expected to be carried on its audit record's `query.text`
-/// attribute.
+/// text is recorded on its audit record's `query.text` attribute;
+/// [`resolve_audit_text_policy`] turns it into the policy `start` installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum AuditTextArg {
     /// The structure-preserving keyed-tokenization posture ADR-0062 decision
@@ -142,6 +142,151 @@ pub enum AuditTextArg {
     /// requires it (ADR-0062 decision 2e), storing PII under the audit
     /// retention window.
     Plaintext,
+}
+
+/// Environment variable holding the audit tokenization key (ADR-0062 decision
+/// 2e): 64 hex characters, the 32-byte key `blake3::keyed_hash` is taken under.
+///
+/// Hex only, and deliberately not "hex or base64": a 64-character string is
+/// simultaneously valid hex for 32 bytes and valid base64 for 48, so accepting
+/// both would make one spelling of a key decode to two different keys
+/// depending on which branch ran first, and every record written under the
+/// wrong branch would carry uncorrelatable tokens. Hex matches the
+/// `--tenant-hash-key-file` form an operator already handles.
+pub const AUDIT_TOKEN_KEY_ENV: &str = "RAVEL_AUDIT_TOKEN_KEY";
+
+/// Context string for deriving the audit token key from the deployment key.
+/// Key separation: the deployment key already keys the tenant hash and the
+/// recovery manifest's AEAD, so the audit tokenizer takes a distinct derived
+/// key rather than the deployment key itself.
+const AUDIT_TOKEN_KEY_CONTEXT: &str = "ravel audit query-text token key v1";
+
+/// The `--audit-text redacted` redactor (ADR-0062 decision 2e): keyed,
+/// structure-preserving tokenization of a query's text, per query language.
+///
+/// SQL statements go through `ravel_sql::redact` (sqlparser AST, literal
+/// values tokenized) and everything else through `ravel_promql::redact`
+/// (PromQL AST, label-matcher values and string literals tokenized). Both call
+/// the same `ravel_promql::audit_token` generator, so one value tokenizes
+/// identically whichever surface queried it.
+pub struct AuditQueryTextRedactor {
+    token_key: Box<[u8; 32]>,
+}
+
+impl AuditQueryTextRedactor {
+    /// A redactor tokenizing under `token_key`.
+    pub fn new(token_key: [u8; 32]) -> Self {
+        AuditQueryTextRedactor {
+            token_key: Box::new(token_key),
+        }
+    }
+
+    /// The fail-safe form for text no parser accepted: one token over the
+    /// whole text.
+    ///
+    /// ADR-0062 decision 2e rejects whole-text hashing as the *posture*,
+    /// because it destroys the trail's evidential structure. It is still the
+    /// right answer for one record whose text did not parse: the alternatives
+    /// are storing the text (the plaintext leak the posture exists to prevent)
+    /// or storing nothing (a record that no longer says a query ran). A
+    /// non-parsing query is a query that failed, and its record still carries
+    /// the tenant, language, status, window, and timestamp.
+    fn whole_text_token(&self, query_text: &str) -> String {
+        ravel_promql::audit_token(&self.token_key, query_text.as_bytes())
+    }
+
+    /// Redact one PromQL expression, or the `"; "`-joined selector list the
+    /// metadata surfaces record. Each selector is redacted on its own, so one
+    /// unparseable selector costs only its own structure.
+    fn redact_promql(&self, query_text: &str) -> String {
+        query_text
+            .split("; ")
+            .map(|selector| {
+                ravel_promql::redact(selector, &self.token_key)
+                    .unwrap_or_else(|_| self.whole_text_token(selector))
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Redact one SQL statement. Without the `sql` feature this process serves
+    /// no SQL surface and therefore records no `sql`-language event; the arm
+    /// still fails safe rather than echoing the text.
+    #[cfg(feature = "sql")]
+    fn redact_sql(&self, query_text: &str) -> String {
+        ravel_sql::redact(query_text, &self.token_key)
+            .unwrap_or_else(|_| self.whole_text_token(query_text))
+    }
+
+    #[cfg(not(feature = "sql"))]
+    fn redact_sql(&self, query_text: &str) -> String {
+        self.whole_text_token(query_text)
+    }
+}
+
+impl ravel_maintain::QueryTextRedactor for AuditQueryTextRedactor {
+    fn redact(&self, language: &str, query_text: &str) -> String {
+        match language {
+            "sql" => self.redact_sql(query_text),
+            // Every other surface records PromQL: one expression for `promql`
+            // and `analytics`, a selector for `exemplars`, and the joined
+            // selector list for `labels`, `label_values`, and `series`.
+            _ => self.redact_promql(query_text),
+        }
+    }
+}
+
+/// Resolve `--audit-text` into the policy [`crate::start`] installs, given the
+/// raw `RAVEL_AUDIT_TOKEN_KEY` value and the deployment key (ADR-0062 decision
+/// 2e).
+///
+/// `redacted` needs a key. It comes from `RAVEL_AUDIT_TOKEN_KEY` when set, and
+/// otherwise from a key derived from the deployment key, which a keyed-tenancy
+/// deployment already holds outside the bucket. With neither available this
+/// fails startup naming the variable: falling back to verbatim text would make
+/// the default posture silently store the PII it exists to tokenize, and
+/// nothing about the running process would say so.
+pub fn resolve_audit_text_policy(
+    audit_text: AuditTextArg,
+    raw_token_key: Option<&str>,
+    deployment_key: Option<&[u8; 32]>,
+) -> anyhow::Result<ravel_maintain::AuditTextPolicy> {
+    if audit_text == AuditTextArg::Plaintext {
+        return Ok(ravel_maintain::AuditTextPolicy::Plaintext);
+    }
+    let token_key = match raw_token_key.map(str::trim).filter(|raw| !raw.is_empty()) {
+        Some(raw) => parse_audit_token_key(raw)?,
+        None => match deployment_key {
+            Some(key) => blake3::derive_key(AUDIT_TOKEN_KEY_CONTEXT, key),
+            None => anyhow::bail!(
+                "--audit-text redacted needs a tokenization key and none is configured: set \
+                 {AUDIT_TOKEN_KEY_ENV} to 64 hex characters (32 bytes), or configure \
+                 --tenant-hash-key-file so the key can be derived from the deployment key, or \
+                 pass --audit-text plaintext to record query text verbatim."
+            ),
+        },
+    };
+    Ok(ravel_maintain::AuditTextPolicy::Redacted(
+        std::sync::Arc::new(AuditQueryTextRedactor::new(token_key)),
+    ))
+}
+
+/// Parse a `RAVEL_AUDIT_TOKEN_KEY` value: exactly 64 hex characters. A
+/// wrong-length key is refused rather than padded or truncated, because a key
+/// that is not the operator's key tokenizes every value differently and makes
+/// the records written under it uncorrelatable with the rest of the trail.
+fn parse_audit_token_key(raw: &str) -> anyhow::Result<[u8; 32]> {
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "{AUDIT_TOKEN_KEY_ENV} must be 64 hex characters (a 32-byte key); got {} characters",
+            raw.len()
+        );
+    }
+    let bytes = hex::decode(raw)
+        .map_err(|e| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} is not valid hex: {e}"))?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{AUDIT_TOKEN_KEY_ENV} did not decode to 32 bytes"))
 }
 
 /// Dev binary wiring gateway + ingest + query into one process.
@@ -213,10 +358,11 @@ pub struct Cli {
     )]
     pub audit_mode: AuditModeArg,
 
-    /// Expected posture of `query.text` on a query-audit record (ADR-0062
-    /// decision 2e): `redacted` (default) is the keyed-tokenization posture;
-    /// `plaintext` is an explicit opt-in for a compliance regime that
-    /// requires verbatim text.
+    /// How `query.text` is recorded on a query-audit record (ADR-0062 decision
+    /// 2e): `redacted` (default) tokenizes every literal and label-matcher
+    /// value under the key in RAVEL_AUDIT_TOKEN_KEY, or one derived from the
+    /// deployment key, and refuses to start with neither; `plaintext` is an
+    /// explicit opt-in to storing verbatim text.
     #[arg(
         long = "audit-text",
         value_enum,
@@ -2880,8 +3026,9 @@ impl Cli {
     /// defaults, exactly as omitting `--store-probe-interval` does; a zero of
     /// either is rejected the same way (a zero batch size or age would flush
     /// every submitted event as its own single-record batch, defeating group
-    /// commit). `--audit-text` is not part of this config: it is not yet
-    /// wired to redact anything (see docs/guides/audit.md).
+    /// commit). `--audit-text` is not part of this config: it selects how
+    /// `query.text` is recorded on the way into the pipeline, resolved
+    /// separately by [`Cli::resolve_audit_text_policy`].
     pub fn resolve_audit_pipeline_config(
         &self,
     ) -> anyhow::Result<ravel_maintain::AuditPipelineConfig> {
@@ -2915,6 +3062,20 @@ impl Cli {
             audit_mode: self.audit_mode.mode(),
             ..ravel_maintain::AuditPipelineConfig::default()
         })
+    }
+
+    /// Resolve `--audit-text` into the policy [`crate::start`] installs
+    /// (ADR-0062 decision 2e), reading the token key from
+    /// [`AUDIT_TOKEN_KEY_ENV`] and falling back to a key derived from
+    /// `deployment_key`. Fails startup under `redacted` when neither is
+    /// available; see [`resolve_audit_text_policy`], which holds the logic and
+    /// takes both inputs explicitly.
+    pub fn resolve_audit_text_policy(
+        &self,
+        deployment_key: Option<&[u8; 32]>,
+    ) -> anyhow::Result<ravel_maintain::AuditTextPolicy> {
+        let raw = std::env::var(AUDIT_TOKEN_KEY_ENV).ok();
+        resolve_audit_text_policy(self.audit_text, raw.as_deref(), deployment_key)
     }
 
     /// Parse `--max-concurrent-queries` into a [`ravel_query::QueryConcurrencyLimit`]
@@ -5200,6 +5361,45 @@ mod tests {
             .resolve_audit_pipeline_config()
             .expect("best-effort must resolve");
         assert_eq!(resolved.audit_mode, ravel_maintain::AuditMode::BestEffort);
+    }
+
+    /// `--audit-text redacted` (the default) with no tokenization key anywhere
+    /// fails startup. The alternative a caller might expect -- recording
+    /// verbatim query text because tokenization is unavailable -- would store
+    /// PII the operator asked not to store, so the process must refuse to
+    /// start and the message must name the variable that fixes it.
+    #[test]
+    fn redacted_without_a_key_fails_startup() {
+        let err = resolve_audit_text_policy(AuditTextArg::Redacted, None, None)
+            .expect_err("the redacted posture without a key must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains(AUDIT_TOKEN_KEY_ENV),
+            "the error must name {AUDIT_TOKEN_KEY_ENV}, got: {message}"
+        );
+    }
+
+    /// With no `RAVEL_AUDIT_TOKEN_KEY` but a configured deployment key, the
+    /// tokenization key is derived from it, so a tenancy-configured deployment
+    /// gets the redacted posture without a second secret to distribute.
+    #[test]
+    fn redacted_derives_its_key_from_the_deployment_key() {
+        let deployment_key = [7u8; 32];
+        let policy = resolve_audit_text_policy(AuditTextArg::Redacted, None, Some(&deployment_key))
+            .expect("a deployment key must resolve the redacted posture");
+        assert!(matches!(
+            policy,
+            ravel_maintain::AuditTextPolicy::Redacted(_)
+        ));
+    }
+
+    /// `--audit-text plaintext` is the explicit opt-in to verbatim text, so it
+    /// needs no key at all and must not be blocked by the check above.
+    #[test]
+    fn plaintext_needs_no_tokenization_key() {
+        let policy = resolve_audit_text_policy(AuditTextArg::Plaintext, None, None)
+            .expect("plaintext must resolve without a key");
+        assert!(matches!(policy, ravel_maintain::AuditTextPolicy::Plaintext));
     }
 
     /// ADR-0075 reachability: the S3 request budget the running binary
