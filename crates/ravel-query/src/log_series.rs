@@ -322,14 +322,8 @@ pub struct LogSeriesOutput {
     pub segments_pruned: usize,
     /// Indexes into the `segments` slice this call was given, one per
     /// segment that reached a Scan-phase fetch (the same segments
-    /// `segments_fetched` counts). Indexes, not `SegmentRef`/data-object-key
-    /// values: every caller in this crate re-walks the SAME slice
-    /// (`log_snapshot.segments`) for every plan in a log lane, so an index
-    /// identifies a segment within that shared slice at the cost of a
-    /// `usize` copy, with no `String` clone or hash. A caller fetching more
-    /// than one selector against that slice (`QueryEngine::prefetch`'s log
-    /// lane) unions these across plans to get the lane's true fetched-set
-    /// size, rather than summing or maxing each plan's own count.
+    /// `segments_fetched` counts). A caller that runs several selectors over
+    /// one slice unions these to get the set of segments any of them fetched.
     pub fetched_segments: Vec<usize>,
     /// Blocks the reader decoded, from its own per-object `ScanStats`, summed
     /// over every segment this call actually opened a scan for. Zero for a
