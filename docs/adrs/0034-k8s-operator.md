@@ -293,7 +293,7 @@ an OTLP round trip, not that a missing capability is rejected.
 serves (issue #36).** Every `ravel-server` mode refuses to start on a
 non-Memory store whose `sys/qualification` marker is absent (ADR-0050
 section 6, EC7), and that marker is only ever written by an explicit
-`ravel store qualify` run. The operator described in decision 3 never made
+`ravel-cli store qualify` run. The operator described in decision 3 never made
 that run, so a RavelCluster pointed at a backend that fails the object-store
 contract (docs/object-store-contract.md) came up as three tiers of pods all
 crash-looping on the same startup refusal, with the reason buried in pod
@@ -305,7 +305,7 @@ loop as everything else:
 - Before it creates any serving Deployment, the reconcile loop renders and
   applies a one-shot Job named `<cluster>-qualify` in the cluster's
   namespace, with the server image, credentials Secret, bucket, region, and
-  endpoint of the tiers it gates, running `ravel store qualify`. The
+  endpoint of the tiers it gates, running `ravel-cli store qualify`. The
   gateway, query, and maintain Deployments are created only once that Job
   reports `Complete`. `restartPolicy: Never`, a small `backoffLimit`, an
   `activeDeadlineSeconds`, and a `ttlSecondsAfterFinished` keep a finished
@@ -319,7 +319,7 @@ loop as everything else:
   active time summed across every retry, and it takes precedence over
   `backoffLimit`. So the two knobs are sized together, or a slow-but-healthy
   first attempt plus a retry would trip `DeadlineExceeded` before the retry
-  budget was ever spent. `ravel store qualify` runs 28 sequential object
+  budget was ever spent. `ravel-cli store qualify` runs 28 sequential object
   operations (create-if-absent probe 3, CAS-version probe 4, read-after-write
   probe 10 = 5 cycles of put+get, list-after-write probe 10 = 5 cycles of
   put+list, and the final `sys/qualification` write 1; the two informational
@@ -410,6 +410,41 @@ RavelCluster, so it now waits for `StoreQualified=True` at
 `observedGeneration == .metadata.generation` before `Available=True`: a
 re-qualification in flight cannot let the wait return on the previous
 generation's readiness.
+
+**Amendment (2026-09-08): qualify-Job recreations are bounded, and the Secret
+change-detection checksum moved to blake3.** Two follow-ups from review of the
+qualification gate.
+
+First, a store that keeps failing qualification no longer recreates its Job
+without bound. The prior behavior deleted a `Failed` Job, requeued on the
+failure backoff, saw it Absent, and recreated it, forever: the Job's own
+`backoffLimit` and `activeDeadlineSeconds` bound attempts within one Job, never
+the number of Jobs. The gate now recreates on a capped exponential backoff (base
+30 s doubling to a 480 s ceiling over the first five failures) and, after 6
+consecutive failures, holds in a one-hour terminal cooldown. The failure count
+and the next-retry instant are persisted in status (`status.qualifyFailureCount`,
+`status.qualifyNextRetryTime`); both are serialized even when absent so a status
+merge patch clears them, and neither enters the qualified-input hash, so counting
+failures never re-runs a qualification that would otherwise pass. The `Failed`
+Job is kept in place during the backoff as the record of which inputs are
+failing, so an input change during a long cooldown reads as a stale Job
+(`recreate`), resets the count, and recreates at once rather than waiting the
+cooldown out. The count resets on a successful qualification. The
+`StoreQualified=False` condition names the consecutive-failure count and the next
+retry time. This supersedes the earlier "requeues on the existing failure backoff
+rather than spinning" note: the requeue is now the computed backoff, and past the
+threshold the gate holds instead of recreating.
+
+Second, the operator's Secret change-detection checksum
+(`SECRETS_CHECKSUM_ANNOTATION`, and the qualified-input hash) is now a `blake3`
+digest rendered as 64 hex characters, replacing a 16-character standard-hasher
+value that was not stable across Rust toolchain versions. An unstable hash could
+silently miss a Secret change (or spuriously roll on a toolchain bump). Because
+the annotation value itself changes, the first reconcile after upgrading the
+operator rolls every rendered gateway, query, and enabled maintain Deployment
+once even when the referenced Secrets are unchanged; subsequent reconciles are
+stable. Operators should schedule the operator upgrade in a maintenance window
+that tolerates one rolling restart of each serving tier.
 
 ## Rejected alternatives
 
