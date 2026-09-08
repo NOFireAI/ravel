@@ -591,12 +591,13 @@ impl AlertEvaluator {
             // The watermark is the seal bound, not `hour_bucket(now_ns)`. The
             // alert lease permits a two-holder overlap (see `acquire_lease`): a
             // prior holder can still publish one in-flight transition after this
-            // holder's tail LIST, stamped at the prior holder's own clock. If
-            // that stamp lands in an hour below the watermark, the tail would
-            // exclude it from every future tick and the memo would omit it
-            // permanently. `seal_bound_hour` holds the watermark back to the
-            // newest hour no overlapping holder can still write into, so the tail
-            // always re-reads such a late transition (ADR-1294 decision 5).
+            // holder's tail LIST, stamped at that holder's clock reading at its
+            // own publish (`evaluate_rule`). If that stamp lands in an hour below
+            // the watermark, the tail would exclude it from every future tick and
+            // the memo would omit it permanently. `seal_bound_hour` holds the
+            // watermark back far enough that a stamp taken on a clock disagreeing
+            // with this one still lands at or above it, so the tail always
+            // re-reads such a late transition (ADR-1294 decision 5).
             let watermark_hour = self.seal_bound_hour(now_ns);
             let unchanged = memo
                 .as_ref()
@@ -638,18 +639,20 @@ impl AlertEvaluator {
     ///
     /// The alert lease documents a two-holder overlap (see [`Self::acquire_lease`]):
     /// a prior holder whose lease has expired can still finish an in-flight tick
-    /// and publish one transition. That transition is stamped at the prior
-    /// holder's own tick-start clock reading. The prior holder held the lease at
-    /// its tick start, so its lease had to expire before this holder could take
-    /// over, which puts its stamp at least one lease lifetime ([`Self::lease_ttl`],
-    /// `LEASE_TTL_TICKS` times the eval interval) behind the reading this holder
-    /// took over with. It can lag further by the in-flight tick's own duration
-    /// and by clock skew between the two holders; [`DEFAULT_QUERY_DEADLINE`] (this
-    /// evaluator's `query_deadline`) is the only wall-clock tolerance the
-    /// alerting path defines, so it stands in for that second term. The seal
-    /// margin is therefore `lease_ttl + query_deadline`, and the watermark is the
-    /// ingest hour of `now_ns - seal_margin`. A deployment whose inter-node clock
-    /// skew exceeds the query deadline would need to widen this margin.
+    /// and publish one transition. [`Self::evaluate_rule`] reads the clock
+    /// immediately before that write, so the margin has to bound the prior
+    /// holder's *stamp*, not the duration of its tick: a tick of any length
+    /// stamps at the reading it holds when it publishes, which on one clock is at
+    /// or after the reading this holder computed its own watermark from. What is
+    /// left for the margin to absorb is disagreement between the two holders'
+    /// clocks. [`DEFAULT_QUERY_DEADLINE`] (this evaluator's `query_deadline`) is
+    /// the only wall-clock tolerance the alerting path defines, so it stands in
+    /// for a cross-node skew constant the path does not have; [`Self::lease_ttl`]
+    /// (`LEASE_TTL_TICKS` times the eval interval) is carried on top of it
+    /// because a holder that fell that far behind is already the case a handover
+    /// produces. The seal margin is therefore `lease_ttl + query_deadline`, and
+    /// the watermark is the ingest hour of `now_ns - seal_margin`. A deployment
+    /// whose inter-node clock skew exceeds that margin would need to widen it.
     fn seal_bound_hour(&self, now_ns: i64) -> u32 {
         let seal_margin_ns = i64::try_from(
             self.lease_ttl
@@ -870,20 +873,33 @@ impl AlertEvaluator {
             return Ok(false);
         }
 
-        // guard against a backward wall-clock step (an NTP correction can
-        // move `now_ns` behind the prior record's `ts_ns`).
-        // `load_latest_records` orders records by `(ts_ns, epoch, seq)` with
-        // `ts_ns` first, so a record stamped at or before its predecessor sorts
-        // behind it and never becomes the folded "latest" -- the evaluator would
-        // then re-transition from the same stale state every tick instead of
-        // converging. Stamp the new record strictly after the prior one so the
-        // per-alert sequence is monotonic regardless of clock jitter. The
-        // transition decision above still uses the true `now_ns`; pending-
-        // duration elapse already clamps a backward step to zero, so only the
-        // durable stamp needs correcting here.
+        // The durable stamp is read here, immediately before the write, not at
+        // tick start. A tick evaluates its rules sequentially under a per-rule
+        // query deadline and has no tick-level cap, so a slow tick can outlive
+        // the lease it started under and publish long after `now_ns`. The memo
+        // watermark a successor holder writes is a seal bound strictly below
+        // that successor's own clock reading, so a stamp taken at publish time
+        // is always at or above any watermark any holder can have written by
+        // then, and the transition stays inside the tail the next fold re-reads.
+        // A tick-start stamp carries no such bound: it can land in an hour below
+        // the watermark, which the tail never descends to, and the transition is
+        // then lost from the memo for good.
+        //
+        // The `max` over the prior record guards a backward wall-clock step (an
+        // NTP correction can move the reading behind the prior record's
+        // `ts_ns`). `load_latest_records` orders records by `(ts_ns, epoch, seq)`
+        // with `ts_ns` first, so a record stamped at or before its predecessor
+        // sorts behind it and never becomes the folded "latest" -- the evaluator
+        // would then re-transition from the same stale state every tick instead
+        // of converging.
+        //
+        // The transition decision above still uses the tick's own `now_ns`:
+        // pending-duration elapse is a property of when the rule was evaluated,
+        // not of when its record reached the store.
+        let publish_ns = self.clock.now_ns();
         let stamp_ns = match prior.as_ref() {
-            Some(p) => now_ns.max(p.ts_ns.saturating_add(1)),
-            None => now_ns,
+            Some(p) => publish_ns.max(p.ts_ns.saturating_add(1)),
+            None => publish_ns,
         };
 
         let seq = self.next_seq;
@@ -1935,7 +1951,7 @@ mod tests {
 mod tick_tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use ravel_alerting::build_transition_record;
@@ -3087,6 +3103,404 @@ mod tick_tests {
             via_memo.get(&alert_id).map(|r| r.state),
             Some(AlertState::Resolved),
             "the late Resolved from the overlapping prior holder is not lost"
+        );
+    }
+
+    /// A holder whose tick outlives its own lease stamps its transition at the
+    /// clock reading it holds when it publishes, not at its tick start, so the
+    /// transition lands at or above the watermark a successor wrote while that
+    /// tick was still in flight (issue #1294, review finding 1).
+    ///
+    /// A tick evaluates its rules sequentially under a per-rule query deadline
+    /// and has no tick-level cap, so it can run far longer than the seal margin
+    /// (`lease_ttl + query_deadline`); a slow tick is exactly what causes the
+    /// handover in the first place. The flip is stamping with the tick-start
+    /// reading, which carries no such bound: the transition lands in an hour
+    /// below the watermark, the tail never descends there, and every later memo
+    /// re-seeds from the last, so the record is lost from the memo path for good.
+    #[tokio::test]
+    async fn a_slow_prior_holder_publishing_after_handover_stays_inside_the_tail() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let tenant = TenantId::new(TENANT).hash();
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Both holders read one clock, so this is about the tick outliving the
+        // seal margin, not about clock skew between nodes.
+        let clock = TestClock::at(NOW_NS);
+        let mut a = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        let mut b = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert_ne!(
+            a.writer_id, b.writer_id,
+            "A and B are distinct lease holders"
+        );
+
+        // A metric above the threshold at A's tick start, so A's in-flight tick
+        // decides a Firing onset.
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        // A starts its tick at NOW: it takes the lease and folds an empty
+        // history.
+        assert!(
+            a.acquire_lease(NOW_NS).await.expect("lease store ok"),
+            "A holds the lease at its tick start"
+        );
+        let mut a_latest = a
+            .load_latest_records()
+            .await
+            .expect("A folds at its tick start");
+        assert!(
+            a_latest.is_empty(),
+            "no prior transition: A's tick decides the onset"
+        );
+
+        // A's tick is slow: two hours pass before it reaches its write. That is
+        // past A's lease and far past the seal margin.
+        let slow_ns = 2 * NS_PER_HOUR;
+        let seal_margin_ns = i64::try_from(a.lease_ttl.saturating_add(a.query_deadline).as_nanos())
+            .expect("seal margin fits an i64");
+        assert!(
+            slow_ns > seal_margin_ns,
+            "the tick must outlast the seal margin ({slow_ns} ns vs {seal_margin_ns} ns) or the \
+             margin alone would cover the stamp"
+        );
+        let handover_ns = NOW_NS + slow_ns;
+        clock.set(handover_ns);
+
+        // B takes over the expired lease, folds (A has still written nothing),
+        // and writes a memo at its own seal-bound watermark W.
+        let report = b.run_tick().await;
+        assert!(!report.lease_not_held, "B took over A's expired lease");
+        assert_eq!(
+            report.records_written, 0,
+            "the only sample is two hours stale: B decides no transition"
+        );
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("B wrote a memo");
+        let watermark = memo.watermark_hour;
+        assert_eq!(
+            watermark,
+            b.seal_bound_hour(handover_ns),
+            "B's watermark is its own seal bound"
+        );
+        assert!(
+            watermark > hour_bucket(NOW_NS),
+            "the watermark (hour {watermark}) has advanced past A's tick-start hour (hour {}), \
+             which is what makes a tick-start stamp fall out of the tail",
+            hour_bucket(NOW_NS)
+        );
+        assert!(
+            memo.records.is_empty(),
+            "B memoized an empty state: A's transition does not exist yet"
+        );
+
+        // Only now does A's in-flight tick reach its write.
+        assert!(
+            a.evaluate_rule(&rule, &mut a_latest, NOW_NS)
+                .await
+                .expect("A publishes its transition"),
+            "A writes the onset transition its tick decided at NOW"
+        );
+
+        // B's next fold over the memo it just wrote still sees that transition:
+        // seed plus tail equals a full fold, record for record.
+        let before = metrics.snapshot();
+        let via_memo = b
+            .fold_latest(Some(&memo), handover_ns)
+            .await
+            .expect("memo fold");
+        let after = metrics.snapshot();
+        let full = b.load_latest_records().await.expect("full fold");
+        assert_eq!(
+            full.len(),
+            1,
+            "the durable history holds exactly A's one transition"
+        );
+        assert_eq!(
+            via_memo, full,
+            "the late transition is inside the tail, so the memo fold equals the full fold"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "A's late Firing is not lost from the memo path"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2,
+            "the tail read A's transition: one commit GET and one data GET"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+
+        // The mechanism: the stamp is the publish-time reading, so its ingest
+        // hour is at or above the watermark B wrote.
+        let history = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(history.len(), 1, "A published exactly one transition");
+        assert_eq!(
+            history[0].ts_ns, handover_ns,
+            "stamped at publish, not at NOW"
+        );
+        assert!(
+            hour_bucket(history[0].ts_ns) >= watermark,
+            "the transition's ingest hour ({}) must be at or above the watermark ({watermark})",
+            hour_bucket(history[0].ts_ns)
+        );
+    }
+
+    /// Store calls split by keyspace: the tenant's alert keyspace
+    /// (`t/<hash>/a/`, holding the memo, the lease, and the commit and data
+    /// objects the fold reads) against everything else, which for an evaluation
+    /// tick is the rule query's own reads. A single pooled counter cannot say
+    /// which layer a per-tick figure belongs to, and the tick's cost claim is
+    /// about the alerting layer only.
+    struct KeyspaceCountingStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        alert_prefix: String,
+        alert: OpCounts,
+        other: OpCounts,
+    }
+
+    #[derive(Default)]
+    struct OpCounts {
+        gets: AtomicU64,
+        puts: AtomicU64,
+        lists: AtomicU64,
+    }
+
+    /// A `Copy` reading of both counters, so a test can bracket one call.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyspaceCounts {
+        alert_gets: u64,
+        alert_puts: u64,
+        alert_lists: u64,
+        other_gets: u64,
+        other_puts: u64,
+        other_lists: u64,
+    }
+
+    impl KeyspaceCountingStore {
+        fn new(inner: Arc<dyn ObjectStoreBackend>, tenant: &TenantHash) -> Self {
+            KeyspaceCountingStore {
+                inner,
+                alert_prefix: format!("t/{}/{}/", tenant.to_hex(), Signal::Alerts.key_prefix()),
+                alert: OpCounts::default(),
+                other: OpCounts::default(),
+            }
+        }
+
+        fn counts_for(&self, key: &str) -> &OpCounts {
+            if key.starts_with(&self.alert_prefix) {
+                &self.alert
+            } else {
+                &self.other
+            }
+        }
+
+        fn snapshot(&self) -> KeyspaceCounts {
+            KeyspaceCounts {
+                alert_gets: self.alert.gets.load(Ordering::SeqCst),
+                alert_puts: self.alert.puts.load(Ordering::SeqCst),
+                alert_lists: self.alert.lists.load(Ordering::SeqCst),
+                other_gets: self.other.gets.load(Ordering::SeqCst),
+                other_puts: self.other.puts.load(Ordering::SeqCst),
+                other_lists: self.other.lists.load(Ordering::SeqCst),
+            }
+        }
+    }
+
+    impl KeyspaceCounts {
+        /// This reading minus `before`, so a test states one tick's own cost.
+        fn since(self, before: KeyspaceCounts) -> KeyspaceCounts {
+            KeyspaceCounts {
+                alert_gets: self.alert_gets - before.alert_gets,
+                alert_puts: self.alert_puts - before.alert_puts,
+                alert_lists: self.alert_lists - before.alert_lists,
+                other_gets: self.other_gets - before.other_gets,
+                other_puts: self.other_puts - before.other_puts,
+                other_lists: self.other_lists - before.other_lists,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for KeyspaceCountingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.counts_for(key).puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.counts_for(key).gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The whole cost of one steady-state `run_tick`, bracketed end to end
+    /// (issue #1294, review finding 2). The fold tests above pin the fold's own
+    /// reads; nothing pinned the lease and memo calls a tick makes around them,
+    /// and `acquire_lease` in steady state is three calls, not one.
+    ///
+    /// Two consecutive quiet ticks at one clock reading, differing only in
+    /// whether the memo write is debounced:
+    ///
+    /// - not debounced (the watermark hour advanced since the last memo): 4
+    ///   alert GETs (memo, lease, and a commit plus data GET for the one
+    ///   transition the tail still covers), 3 alert PUTs (the lease's
+    ///   `CreateIfAbsent` attempt, its CAS renewal, and the memo `Overwrite`),
+    ///   1 alert LIST.
+    /// - debounced, and the tail now covers no transition: 2 alert GETs, 2 alert
+    ///   PUTs (the lease only), 1 alert LIST.
+    ///
+    /// The LIST is one call only because the tail fits in a single page; a tail
+    /// spanning more pages costs one LIST per page.
+    ///
+    /// The figures outside the alert keyspace are the rule query's own reads of
+    /// the metrics it evaluates, pinned here so they cannot drift into the
+    /// alerting figures unnoticed. They are not identical across the two ticks
+    /// (the second reads one object fewer, from a warm query-engine cache), which
+    /// is exactly why the two keyspaces are counted apart.
+    #[tokio::test]
+    async fn one_steady_state_tick_costs_its_lease_memo_and_tail_calls_exactly() {
+        let tenant = TenantId::new(TENANT).hash();
+        let counting = Arc::new(KeyspaceCountingStore::new(
+            Arc::new(MemoryStore::new()),
+            &tenant,
+        ));
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+
+        // One sample per hour, each 30s before the tick that reads it, so the
+        // alert fires on the first tick and stays Firing across the hour
+        // boundary without any further transition.
+        let hour_one_ns = NOW_NS + NS_PER_HOUR;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(hour_one_ns - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        // Tick 1 is the cold path: no memo, a full fold, and the Firing onset.
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+        assert_eq!(
+            hour_bucket(NOW_NS),
+            0,
+            "the onset transition is written in hour 0"
+        );
+
+        // An hour on, so the seal-bound watermark has moved to hour 1 and the
+        // memo write is not debounced. The memo still says hour 0, so the tail
+        // covers the onset transition.
+        clock.set(hour_one_ns);
+        assert_eq!(
+            ev.seal_bound_hour(hour_one_ns),
+            1,
+            "the tick's seal-bound watermark is hour 1"
+        );
+
+        let before = counting.snapshot();
+        let report = ev.run_tick().await;
+        let refresh = counting.snapshot().since(before);
+        assert_eq!(
+            report.records_written, 0,
+            "already firing on a fresh sample: no transition this tick"
+        );
+        assert!(!report.lease_not_held, "the sole replica holds the lease");
+        assert_eq!(
+            refresh,
+            KeyspaceCounts {
+                alert_gets: 4,
+                alert_puts: 3,
+                alert_lists: 1,
+                other_gets: 3,
+                other_puts: 0,
+                other_lists: 2,
+            },
+            "a steady-state tick whose memo write is not debounced"
+        );
+
+        // Tick 3 at the same reading: the watermark and the records are both
+        // unchanged, so the memo write is debounced, and the tail now starts at
+        // hour 1, above the onset transition, so it reads no commit or data
+        // object at all.
+        let before = counting.snapshot();
+        let report = ev.run_tick().await;
+        let debounced = counting.snapshot().since(before);
+        assert_eq!(report.records_written, 0, "still no transition");
+        assert_eq!(
+            debounced,
+            KeyspaceCounts {
+                alert_gets: 2,
+                alert_puts: 2,
+                alert_lists: 1,
+                other_gets: 2,
+                other_puts: 0,
+                other_lists: 2,
+            },
+            "a debounced steady-state tick over an empty tail"
         );
     }
 

@@ -122,22 +122,58 @@ transitions written since the memo rather than the whole history.
    The seal-bound hour, not `hour_bucket(now_ns)`, is what the watermark may
    advance to. The alert lease permits a two-holder overlap (`acquire_lease`):
    a prior holder whose lease has expired can still finish one in-flight tick and
-   publish a transition after this holder's tail LIST, stamped at the prior
-   holder's own clock. If that stamp lands in an hour below the watermark, the
-   tail excludes it from every future tick and the memo omits it permanently,
-   breaking the staleness invariant below by a legal interleaving. The seal bound
-   is the newest ingest hour no overlapping holder can still write into: the
-   ingest hour of `now_ns - (lease_ttl + query_deadline)`. `lease_ttl` is
-   `LEASE_TTL_TICKS` (3) times the evaluation interval; a prior holder held the
-   lease at its own tick start, so its lease had to expire before this holder
-   took over, which puts its transition stamp at least `lease_ttl` behind this
-   holder's reading. `query_deadline` (`DEFAULT_QUERY_DEADLINE`, 30s) is added as
-   the only wall-clock tolerance the alerting path defines, covering the in-flight
-   tick's own duration and modest inter-node clock skew; the alerting path
-   defines no dedicated cross-node skew constant, and a deployment whose skew
-   exceeds the query deadline would need to widen this margin. Holding the
-   watermark back never loses correctness, only re-reads a bounded tail; the tail
-   is still a single LIST over a `start-after` marker range.
+   publish a transition after this holder's tail LIST. If that stamp lands in an
+   hour below the watermark, the tail excludes it from every future tick and the
+   memo omits it permanently, breaking the staleness invariant below by a legal
+   interleaving. The seal bound is the ingest hour of
+   `now_ns - (lease_ttl + query_deadline)`, where `lease_ttl` is
+   `LEASE_TTL_TICKS` (3) times the evaluation interval and `query_deadline` is
+   `DEFAULT_QUERY_DEADLINE` (30s).
+
+   **The margin bounds the stamp, not the tick.** `evaluate_rule` reads the clock
+   immediately before it writes a transition and stamps the record with that
+   reading (raised to `prior.ts_ns + 1` when a backward clock step would otherwise
+   put it behind its predecessor), and `publish` derives the commit key's ingest
+   hour from the same value. A tick's duration is therefore not a term in this
+   margin at all, which matters because a tick has no cap on its duration: it
+   evaluates its rules sequentially under a per-rule `query_deadline`, so a tick's
+   worst case is about `rules.len()` deadlines plus publish and flush, and eight
+   rules at the defaults already exceed `lease_ttl + query_deadline`. A margin
+   sized against tick-start readings would be wrong for exactly the slow ticks
+   that cause handovers in the first place. With a publish-time stamp, a late
+   transition is stamped at a reading at or after the one a successor computed its
+   watermark from, and a watermark is always strictly below its own writer's
+   reading, so the transition lands at or above it.
+
+   What is left for the margin to absorb is disagreement between the two holders'
+   clocks: the prior holder stamps on its clock, the successor computed its
+   watermark on a different one. The alerting path defines no cross-node skew
+   constant, so `query_deadline` stands in for one, and `lease_ttl` is carried on
+   top of it because a holder that has fallen a whole lease lifetime behind is
+   already the case a handover produces. A deployment whose inter-node skew
+   exceeds `lease_ttl + query_deadline` would need to widen this margin. Holding
+   the watermark back never loses correctness, only re-reads a bounded tail; the
+   tail is still a single LIST over a `start-after` marker range.
+
+   Refusing the write instead (re-read the clock before publishing and drop the
+   transition when `hour_bucket(stamp_ns)` is below `seal_bound_hour(now)`, for
+   the next tick to redo) was rejected. It turns a bounded re-read into a dropped
+   notification and a delayed transition on the exact path where the alert is
+   most likely to matter, and it buys nothing that publish-time stamping does not
+   already give: the stamp being at or above the watermark is what the refusal
+   would be checking for. Nothing consumes transition stamps as monotonic across
+   rules within one tick, so nothing depends on every rule of a tick sharing a
+   stamp: the fold orders on `(ts_ns, epoch, seq)` per `alert_id`, the `alerts`
+   SQL table (ADR-1101) filters `ts_ns` by range, and per-`alert_id` monotonicity
+   is what the `prior.ts_ns + 1` raise preserves.
+
+   One consumer does read the stamp as a time rather than an order:
+   `pending_elapsed` (ravel-alerting) measures a rule's `for:` duration from the
+   `Pending` record's own `ts_ns` to the deciding tick's `now_ns`. Under a
+   publish-time stamp that window is measured from when the `Pending` record was
+   written rather than from when the tick that decided it began, so a rule with a
+   `for:` duration fires at most one publish lag later than it would have. It
+   never fires earlier, which is the direction that matters for a `for:` clause.
 
 6. **The memo is a derived cache, never a source of truth.** ADR-0040
    decision 3 stands unchanged: current state is still defined as the fold over
@@ -207,6 +243,24 @@ must keep these invariants:
 Issue #1438 is the tracked implementation of that pruning; this ADR only states
 the bound and freezes the contract the implementation must meet.
 
+### Erasure
+
+The memo mirrors each folded record's `labels`, `annotations` and `body`
+verbatim, so it holds a copy of whatever a rule's labels and rendered body
+carry, and nothing in the tree deletes `t/<tenant_hash>/a/state/latest`. That is
+not a regression: the erasure rewrite driver has an arm for metrics, logs and
+spans and rejects every other signal ("erasure rewrite scopes metrics/logs/spans
+only", ravel-maintain), and `Signal::Alerts` is absent from
+`MAINTAINED_SIGNALS`, so the transition history the memo summarizes is itself
+outside every erasure path today. The memo is exactly as
+reachable, and exactly as un-erased, as the records it derives from, and a
+derived cache that outlived its source would be the only real defect here. If
+alerts ever enter an erasure path, the memo must be deleted alongside the
+history the erasure touches, in the same pass: it is reconstructible from
+whatever records survive, so deletion is always safe, and leaving it behind
+would keep erased label and body content readable at a key no erasure predicate
+scans.
+
 ### Data flow
 
 ```mermaid
@@ -259,19 +313,21 @@ tail covers) is not automatic, and it fails in two distinct ways.
 
 The first is the writer's choice of watermark: a `watermark_hour` at
 `hour_bucket(now_ns)` is broken by the alert lease's documented two-holder
-overlap. A prior holder whose lease
-has expired can still finish an in-flight tick and publish a transition after
-this holder's tail LIST, stamped at the prior holder's own clock. That stamp can
-fall in an hour strictly below `hour_bucket(now_ns)` (the prior holder's clock
-reads behind, and its transition is stamped at a tick-start reading at least one
-`lease_ttl` behind this holder's), so a watermark at `hour_bucket(now_ns)` would
-exclude that hour from every future tail and drop the record permanently: a
+overlap. A prior holder whose lease has expired can still finish an in-flight
+tick and publish a transition after this holder's tail LIST, stamped at the
+reading its own clock gives at that publish (decision 5). That stamp can fall in
+an hour strictly below `hour_bucket(now_ns)` whenever the prior holder's clock
+reads behind this one's, so a watermark at `hour_bucket(now_ns)` would exclude
+that hour from every future tail and drop the record permanently: a
 below-watermark record written *after* the memo, which the "no such record is
 written after the memo" step above assumed away. The seal-bound watermark
 (decision 5) restores the precondition: it is the ingest hour of
-`now_ns - (lease_ttl + query_deadline)`, older than any hour an overlapping
-holder can still stamp into, so every late transition lands at an hour at or
-above the watermark and is re-read by the tail.
+`now_ns - (lease_ttl + query_deadline)`, and because the stamp is taken at
+publish, the only way a late transition can land below it is a clock
+disagreement wider than that whole margin. Short of that, every late transition
+lands at an hour at or above the watermark and is re-read by the tail. Note what
+this argument does not rest on: the duration of the prior holder's tick, which is
+unbounded and so could not have carried it.
 
 The second is the reader's trust in what it read. A seal-bound watermark is only
 seal-bound against the clock of the process that computed it. A persisted
@@ -334,26 +390,51 @@ within `alerting.rs`, so it is preferred here.
 
 ## Consequences
 
-- A steady-state tick costs a memo GET, a lease GET, one tail LIST (a single
-  `start-after` call over a marker range), and `2T` GETs where `T` is the number
-  of transitions in the hours the tail covers, down from `ceil(N / page)` LISTs
-  and `2N` GETs. The cost stops growing with history. Because the seal-bound
-  watermark holds back by `lease_ttl + query_deadline` (a few minutes at the
-  defaults), the tail covers not just the current hour but every hour within that
-  seal margin, so `T` counts transitions in that trailing window rather than only
-  the current hour. For a quiet tenant whose last transition is older than the
-  seal margin, `T` is 0 and the tick is exactly 2 GETs and 1 LIST. The watermark
-  advances only at hour granularity (it is `seal_bound_hour(now_ns)`, an ingest
-  hour), so a transition written near the start of an hour H stays in the tail
-  until the watermark passes H entirely, not merely for a few ticks: the re-read
-  duration approaches a whole hour plus the seal margin (three evaluation
-  intervals plus thirty seconds at the defaults). So `T` can cover nearly the
-  whole current hour, not just the last few ticks' worth of transitions. The
-  per-tick bound is unchanged regardless: each such tick still costs one memo
-  GET, one lease GET, one tail LIST, and `2T` GETs for the `T` transitions the
-  tail covers. This is the honest bound after the seal-bound watermark; the
-  earlier "current hour only" figure did not account for the lease overlap and
-  could lose a late transition.
+- A steady-state tick's whole cost in the tenant's alert keyspace, split by the
+  layer that issues each call, is:
+
+  | Layer | GET | PUT | LIST |
+  |---|---|---|---|
+  | Memo read (start of tick) | 1 | 0 | 0 |
+  | Tail fold | `2T` | 0 | 1 per page |
+  | `acquire_lease` | 1 | 2 | 0 |
+  | Memo refresh (when not debounced) | 0 | 1 | 0 |
+
+  `T` is the number of transitions in the hours the tail covers. The fold's own
+  reads (the first two rows) are what this ADR bounds, down from
+  `ceil(N / page)` LISTs and `2N` GETs over the whole history; the lease and memo
+  writes are a fixed per-tick surcharge that does not grow with anything. So a
+  quiet tenant's tick is 2 GETs, 2 PUTs, and 1 LIST when the memo write is
+  debounced, and one PUT more when it is not. The test
+  `one_steady_state_tick_costs_its_lease_memo_and_tail_calls_exactly`
+  (services/ravel-server/src/alerting.rs) brackets one whole `run_tick` and
+  asserts exactly these figures for both cases. The earlier wording here said "a
+  memo GET, a lease GET, one tail LIST" and "exactly 2 GETs and 1 LIST", which
+  omitted every PUT: `acquire_lease` is three calls, not one, being a
+  `CreateIfAbsent` PUT that fails `AlreadyExists` in steady state, then a GET of
+  the existing lease, then a CAS PUT to renew it.
+
+  "One tail LIST" holds only while the tail's keys fit in one page; a tail
+  spanning more pages costs one `list_after` call per page, which is what
+  `MAX_LIST_PAGES` bounds.
+
+  The rule query's own reads are outside the alert keyspace and outside these
+  figures. They are a property of the rules configured, not of the fold, and the
+  bracketing test counts them separately so they cannot drift into the alerting
+  figures unnoticed.
+
+  Because the seal-bound watermark holds back by `lease_ttl + query_deadline` (a
+  few minutes at the defaults), the tail covers not just the current hour but
+  every hour within that seal margin, so `T` counts transitions in that trailing
+  window rather than only the current hour. The watermark advances only at hour
+  granularity (it is `seal_bound_hour(now_ns)`, an ingest hour), so a transition
+  written near the start of an hour H stays in the tail until the watermark
+  passes H entirely, not merely for a few ticks: the re-read duration approaches
+  a whole hour plus the seal margin (three evaluation intervals plus thirty
+  seconds at the defaults). So `T` can cover nearly the whole current hour. The
+  per-tick bound is unchanged regardless. This is the honest bound after the
+  seal-bound watermark; the earlier "current hour only" figure did not account
+  for the lease overlap and could lose a late transition.
 - A cold, absent, corrupt, or unsupported-version memo pays a one-time full fold
   and then rewrites a valid memo, so the expensive path is self-healing and
   bounded to the tick that hit it.
