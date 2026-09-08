@@ -780,9 +780,12 @@ pub struct Cli {
     /// ingest bytes held across every tenant and signal (metrics, logs,
     /// traces) at once, plus the transient bytes an OTLP HTTP gzip request
     /// inflates during decode -- those are charged against this same gauge as
-    /// they inflate, before any buffer is touched, so a decompression that
-    /// would cross the ceiling is shed mid-inflate instead of being allocated
-    /// in full. A request whose charge would push the gauge past this ceiling
+    /// they inflate: each decompressed chunk is charged before it is retained in
+    /// the growing ingest buffer, so that buffer never grows by an uncharged
+    /// byte and the only uncharged allocation is the bounded 64 KiB staging
+    /// chunk the decoder reads into. A decompression whose running charge would
+    /// cross the ceiling is shed mid-inflate instead of being allocated in
+    /// full. A request whose charge would push the gauge past this ceiling
     /// is shed before any buffering -- HTTP 429 with `Retry-After`, gRPC
     /// `RESOURCE_EXHAUSTED` -- so a burst of active tenants can no longer grow
     /// resident memory without bound (the per-tenant buffer caps bound each
