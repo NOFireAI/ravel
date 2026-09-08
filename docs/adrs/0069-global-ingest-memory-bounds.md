@@ -202,18 +202,19 @@ traffic under a tight budget. Charging a compressed-size estimate would either
 over- or under-charge depending on the ratio. Charging each produced chunk
 makes the summed charge equal the actual decompressed length exactly: the
 over-charge bound for an admitted request is **zero**, and the uncharged
-allocations are a fixed per-inflate overhead: one staging chunk (64 KiB) per
-in-flight inflate, per-chunk bookkeeping (a `Bytes` handle and a charge guard
-for each retained chunk, about 48 bytes per 64 KiB chunk, held in two vectors
-that grow by doubling), and flate2's own decoder state (tens of KiB). The
-compressed request body itself also stays resident for the whole inflate, but
-it is bounded by the wire-body cap (`MAX_REQUEST_BODY_BYTES`, 16 MiB,
-ADR-0051 section 1 and section 3) and already counted against
-`--max-inflight-ingest-requests`, not left uncharged here. No uncharged
-allocation holds a copy of the decompressed bytes; the staging chunk and
-decoder state are a fixed cost that alone can exceed the charge itself on a
-small decompressed body. A shed request refunds every partial chunk on the
-spot.
+allocations are a fixed staging-and-decoder cost plus per-chunk bookkeeping
+that scales with chunk count: one staging chunk (64 KiB) per in-flight inflate,
+which transiently holds one chunk of decompressed bytes; per-chunk bookkeeping
+(a `Bytes` handle and a charge guard for each retained chunk, about 48 bytes
+per 64 KiB chunk, held in two vectors that grow by doubling); and flate2's own
+decoder state (tens of KiB). The compressed request body itself also stays
+resident for the whole inflate, but it is bounded by the wire-body cap
+(`MAX_REQUEST_BODY_BYTES`, 16 MiB, ADR-0051 section 1 and section 3) and
+already counted against `--max-inflight-ingest-requests`, not left uncharged
+here. No uncharged allocation holds a copy of the full decompressed body; the
+staging chunk holds only one chunk at a time, and it and the decoder state are
+a fixed cost that alone can exceed the charge itself on a small decompressed
+body. A shed request refunds every partial chunk on the spot.
 
 ### Rejected alternatives
 

@@ -582,16 +582,18 @@ capacity past its length, and while reallocating it holds the old and the new
 allocation at once, so a charge taken on the appended length would undercount
 the buffer the ceiling claims to bound (and `reserve_exact` does not fix it,
 since an allocator may return more than was asked for). What stays outside the
-charge is a fixed per-inflate overhead: one 64 KiB staging buffer that the
-decoder reads into, plus a `Bytes` handle and a charge guard per chunk (about
-48 bytes per 64 KiB chunk, held in two vectors that grow by doubling), plus
+charge is a fixed staging-and-decoder cost plus per-chunk bookkeeping that
+scales with chunk count: one 64 KiB staging buffer that the decoder reads into,
+which between the read and the retained copy transiently holds one chunk of
+decompressed bytes; a `Bytes` handle and a charge guard per chunk (about 48
+bytes per 64 KiB chunk, held in two vectors that grow by doubling); plus
 flate2's own decoder state (tens of KiB). The compressed request body itself
 also stays resident for the whole inflate, but it is bounded by the request
 cap (`MAX_REQUEST_BODY_BYTES`, 16 MiB) and already counted against
 `--max-inflight-ingest-requests`, not left uncharged here. No uncharged
-allocation on this path holds a copy of the decompressed bytes; the staging
-buffer and decoder state are a flat cost that alone can exceed the charge
-itself on a small decompressed body.
+allocation on this path holds a copy of the full decompressed body; the staging
+buffer holds only one chunk at a time, and it and the decoder state are a flat
+cost that alone can exceed the charge itself on a small decompressed body.
 
 The gateway holds that charge through protobuf decode and releases it once decode
 has consumed and freed the chunks -- prost copies them into owned structs -- before
@@ -643,10 +645,13 @@ terms:
    which used to inflate up to 64 MiB per request entirely outside any byte
    ceiling, is now charged against `--max-ingest-buffer-bytes` as it inflates,
    so `--max-inflight-ingest-requests` copies of it can no longer sum past that
-   ceiling. What remains in term 2 is the *uncharged* transient decode memory:
-   the identity-path OTLP HTTP body (bounded by the 16 MiB body limit), and the
-   OTLP gRPC and Remote Write decode/decompression buffers, none of which the
-   buffer budget charges. So the worst-case transient decode memory bounded
+   ceiling. Only the decompressed output moved under term 1; the compressed
+   gzip request body that produces it stays in term 2. What remains in term 2
+   is the *uncharged* transient decode memory: the identity-path OTLP HTTP body
+   (bounded by the 16 MiB body limit), the compressed OTLP HTTP gzip request
+   body itself (resident for the whole inflate, bounded by the same 16 MiB
+   `MAX_REQUEST_BODY_BYTES` cap), and the OTLP gRPC and Remote Write
+   decode/decompression buffers, none of which the buffer budget charges. So the worst-case transient decode memory bounded
    only by `--max-inflight-ingest-requests` is that ceiling times the largest
    *uncharged* decoded body (Remote Write's 64 MiB, or OTLP gRPC / identity
    HTTP's 16 MiB); the OTLP HTTP gzip inflate is bounded by
