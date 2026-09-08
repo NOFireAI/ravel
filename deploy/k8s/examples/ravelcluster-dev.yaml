@@ -1,7 +1,8 @@
 # A minimal RavelCluster for local/dev use (ADR-0034 decision 6). Points at an
-# S3-compatible endpoint (MinIO/floci) and references two Secrets the platform
-# owner creates: one with keys accessKeyId/secretAccessKey, one whose keys are
-# tenant names and whose values are bearer tokens.
+# S3-compatible endpoint (MinIO/floci) and references three Secrets the
+# platform owner creates: one with keys accessKeyId/secretAccessKey, one whose
+# keys are tenant names and whose values are bearer tokens, and one with a
+# single key `key` holding the query-audit token key.
 apiVersion: ravel.nofire.ai/v1alpha1
 kind: RavelCluster
 metadata:
@@ -20,8 +21,10 @@ spec:
         name: ravel-s3-credentials
   tenantTokensSecretRef:
     name: ravel-tenant-tokens
-  # No deploymentKeySecretRef or auditTokenKeySecretRef: this cluster is
-  # unkeyed, so the operator generates and owns a query-audit token key Secret.
+  # The platform owner creates this Secret too, with one key `key` holding
+  # 64 lowercase hex characters (32 bytes).
+  auditTokenKeySecretRef:
+    name: ravel-audit-token-key
   gateway:
     replicas: 1
     # Ingest affinity (ADR-0076 decision 1) is off here and in every existing

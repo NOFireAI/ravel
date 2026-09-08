@@ -60,6 +60,7 @@ TENANT_NAME="${RAVEL_TENANT_NAME:-demo-tenant}"
 TENANT_TOKEN="${RAVEL_TENANT_TOKEN:-demo-token}"
 S3_CREDENTIALS_SECRET="ravel-s3-credentials"
 TENANT_TOKENS_SECRET="ravel-tenant-tokens"
+AUDIT_TOKEN_KEY_SECRET="ravel-audit-token-key"
 
 log() {
   echo "[kind-up] $*" >&2
@@ -153,7 +154,7 @@ case "$BACKEND" in
     ;;
 esac
 
-for tool in docker kind kubectl; do
+for tool in docker kind kubectl openssl; do
   command -v "$tool" >/dev/null 2>&1 || die "${tool} is required but not on PATH"
 done
 
@@ -198,7 +199,7 @@ kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -
 # Secrets are created by the script, not committed as manifests: committing a
 # Secret manifest -- even a dev one -- puts credentials in git and invites
 # copying into a real cluster.
-log "creating Secrets ${S3_CREDENTIALS_SECRET} and ${TENANT_TOKENS_SECRET}"
+log "creating Secrets ${S3_CREDENTIALS_SECRET}, ${TENANT_TOKENS_SECRET}, and ${AUDIT_TOKEN_KEY_SECRET}"
 kubectl create secret generic "$S3_CREDENTIALS_SECRET" \
   --namespace "$NAMESPACE" \
   --from-literal="accessKeyId=${S3_ACCESS_KEY}" \
@@ -209,6 +210,14 @@ kubectl create secret generic "$S3_CREDENTIALS_SECRET" \
 kubectl create secret generic "$TENANT_TOKENS_SECRET" \
   --namespace "$NAMESPACE" \
   --from-literal="${TENANT_NAME}=${TENANT_TOKEN}" \
+  --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# The operator does not generate this Secret (#1487: its RBAC grants
+# `secrets get` only), so the same platform-owner-provisions-it pattern as
+# the two Secrets above applies here too. One key, 64 lowercase hex
+# characters (32 bytes).
+kubectl create secret generic "$AUDIT_TOKEN_KEY_SECRET" \
+  --namespace "$NAMESPACE" \
+  --from-literal="key=$(openssl rand -hex 32)" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 
 # ---- 4. fake S3 backend ------------------------------------------------------
@@ -278,6 +287,8 @@ spec:
         name: ${S3_CREDENTIALS_SECRET}
   tenantTokensSecretRef:
     name: ${TENANT_TOKENS_SECRET}
+  auditTokenKeySecretRef:
+    name: ${AUDIT_TOKEN_KEY_SECRET}
   gateway:
     replicas: 1
   query:
