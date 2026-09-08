@@ -762,13 +762,17 @@ async fn probe_consistent_list_after_write(
         {
             return ProbeResult::fail(property, format!("put {key} failed: {err}"));
         }
+        // Over `list`, the method `S3Store` implements separately and every
+        // catalog scan issues, so the suite exercises it and not only
+        // `list_after`.
+        //
         // A membership probe, deliberately order-tolerant: an unsorted backend
         // loses no key, so this must still observe the just-written one and
         // leave the ordering verdict to `probe_lexicographic_listing_order`.
         // `list_all` now rejects an out-of-order key with a typed error, which
         // would collapse membership into an ordering failure, so drain the raw
         // pages here instead.
-        match drain_pages(store, &list_prefix, None).await {
+        match drain_probe_pages(store, &list_prefix, ProbeListing::List).await {
             Ok((keys, _pages)) => {
                 if !keys.contains(&key) {
                     return ProbeResult::fail(
@@ -780,12 +784,9 @@ async fn probe_consistent_list_after_write(
                     );
                 }
             }
-            Err(detail) => {
-                return ProbeResult::fail(
-                    property,
-                    format!("listing {list_prefix} failed: {detail}"),
-                );
-            }
+            // Already a reportable detail naming the prefix and the backend's
+            // own error, like the sibling drains below.
+            Err(detail) => return ProbeResult::fail(property, detail),
         }
     }
     ProbeResult::pass(
@@ -1041,27 +1042,42 @@ async fn probe_concurrent_create_if_absent(
 /// qualification run that hangs.
 const MAX_PROBE_PAGES: usize = 64;
 
-/// Drain every page of `prefix` (from `start_after`, when given) and return
-/// the keys in delivery order together with the number of pages served.
+/// Which listing method a probe drain issues. A probe has to say: the two
+/// methods are implemented separately (`S3Store` has a native override for
+/// each, and `list_after`'s default is `list` plus a client-side filter), so a
+/// suite that only ever drained one qualified a backend on the strength of the
+/// other.
+#[derive(Clone, Copy)]
+enum ProbeListing<'a> {
+    /// [`ObjectStoreBackend::list`]: what every catalog scan issues.
+    List,
+    /// [`ObjectStoreBackend::list_after`], from `start_after` when given: how
+    /// callers skip a key sub-range server-side.
+    After(Option<&'a str>),
+}
+
+/// Drain every page of `prefix` through `listing` and return the keys in
+/// delivery order together with the number of pages served.
 ///
-/// Deliberately not [`crate::list_all`]: that helper deduplicates and discards both
-/// the delivery order and the page count, which are exactly what the two
-/// listing probes below examine. Errors come back as a ready-to-report detail
-/// string so a misbehaving backend produces a failed [`ProbeResult`] rather
-/// than an error the suite has to interpret twice.
-async fn drain_pages(
+/// Deliberately not [`crate::list_all`] or [`crate::drain_pages`]: those
+/// deduplicate and discard both the delivery order and the page count, which
+/// are exactly what the listing probes below examine. Errors come back as a
+/// ready-to-report detail string so a misbehaving backend produces a failed
+/// [`ProbeResult`] rather than an error the suite has to interpret twice.
+async fn drain_probe_pages(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
-    start_after: Option<&str>,
+    listing: ProbeListing<'_>,
 ) -> Result<(Vec<String>, usize), String> {
     let mut delivered: Vec<String> = Vec::new();
     let mut pages = 0usize;
     let mut token = None;
     loop {
-        let page = store
-            .list_after(prefix, start_after, token)
-            .await
-            .map_err(|err| format!("listing {prefix} failed: {err}"))?;
+        let result = match listing {
+            ProbeListing::List => store.list(prefix, token).await,
+            ProbeListing::After(start_after) => store.list_after(prefix, start_after, token).await,
+        };
+        let page = result.map_err(|err| format!("listing {prefix} failed: {err}"))?;
         pages += 1;
         delivered.extend(page.objects.into_iter().map(|meta| meta.key));
         match page.next {
@@ -1078,8 +1094,9 @@ async fn drain_pages(
 }
 
 /// Keys in delivery order, with the repeats the cross-page guarantee allows
-/// collapsed, keeping first-delivery order so an ordering violation survives
-/// the deduplication.
+/// collapsed, keeping first-delivery order. For the set comparisons only: the
+/// order verdict is taken on the raw sequence, which the contract requires to
+/// be non-decreasing.
 fn distinct_in_delivery_order(delivered: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     delivered
@@ -1089,7 +1106,8 @@ fn distinct_in_delivery_order(delivered: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The first pair of adjacent deliveries that goes backwards, if any.
+/// The first pair of adjacent deliveries that goes backwards, if any. Equal
+/// adjacent keys are the repeat the contract permits and pass.
 fn first_order_violation(delivered: &[String]) -> Option<(&str, &str)> {
     delivered
         .windows(2)
@@ -1142,17 +1160,18 @@ async fn probe_lexicographic_listing_order(
         .collect();
     expected.sort();
 
-    let (delivered, _pages) = match drain_pages(store, &list_prefix, None).await {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
-    // Deduplicate before checking order, never after: the contract lets a key
-    // appear more than once, so a compliant backend that re-delivers an
-    // already-delivered key at a page boundary produces a raw sequence that
-    // goes backwards. Deduplication keeps first-delivery order, so a real
-    // ordering violation still shows up in the distinct sequence.
-    let distinct = distinct_in_delivery_order(&delivered);
-    if let Some((before, after)) = first_order_violation(&distinct) {
+    let (delivered, _pages) =
+        match drain_probe_pages(store, &list_prefix, ProbeListing::After(None)).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
+    // Check the order on the RAW delivery sequence, before deduplication: the
+    // contract's sequence never decreases, and the repeat it permits
+    // re-delivers the last key already delivered (equal adjacent keys pass
+    // here). A backend that re-delivers an EARLIER key is out of order, and
+    // `drain_pages` hard-fails every drain over it, so qualifying it here
+    // would admit a backend that no caller can list.
+    if let Some((before, after)) = first_order_violation(&delivered) {
         return ProbeResult::fail(
             property,
             format!(
@@ -1162,6 +1181,7 @@ async fn probe_lexicographic_listing_order(
             ),
         );
     }
+    let distinct = distinct_in_delivery_order(&delivered);
     if distinct != expected {
         return ProbeResult::fail(
             property,
@@ -1178,10 +1198,11 @@ async fn probe_lexicographic_listing_order(
     // exactly the last three, still in order.
     let marker = expected[1].clone();
     let expected_tail: Vec<String> = expected[2..].to_vec();
-    let (tail_delivered, _pages) = match drain_pages(store, &list_prefix, Some(&marker)).await {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
+    let (tail_delivered, _pages) =
+        match drain_probe_pages(store, &list_prefix, ProbeListing::After(Some(&marker))).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
     if let Some(key) = tail_delivered.iter().find(|key| *key <= &marker) {
         return ProbeResult::fail(
             property,
@@ -1192,10 +1213,9 @@ async fn probe_lexicographic_listing_order(
             ),
         );
     }
-    // Same order as the full drain above, and for the same reason: the raw
-    // tail may repeat a key across a page boundary and stay compliant.
-    let distinct_tail = distinct_in_delivery_order(&tail_delivered);
-    if let Some((before, after)) = first_order_violation(&distinct_tail) {
+    // Same raw sequence, same reason as the full drain above: a compliant tail
+    // never decreases, and a repeat re-delivers its last key.
+    if let Some((before, after)) = first_order_violation(&tail_delivered) {
         return ProbeResult::fail(
             property,
             format!(
@@ -1204,6 +1224,7 @@ async fn probe_lexicographic_listing_order(
             ),
         );
     }
+    let distinct_tail = distinct_in_delivery_order(&tail_delivered);
     if distinct_tail != expected_tail {
         return ProbeResult::fail(
             property,
@@ -1257,10 +1278,11 @@ async fn probe_cross_page_listing(store: &dyn ObjectStoreBackend, prefix: &str) 
     }
     expected.sort();
 
-    let (delivered, pages) = match drain_pages(store, &list_prefix, None).await {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
+    let (delivered, pages) =
+        match drain_probe_pages(store, &list_prefix, ProbeListing::After(None)).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
     let mut distinct = distinct_in_delivery_order(&delivered);
     distinct.sort();
     if distinct != expected {
@@ -1336,10 +1358,11 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
     }
 
     let expected = vec![kept.clone()];
-    let (delivered, _pages) = match drain_pages(store, &list_prefix, None).await {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
+    let (delivered, _pages) =
+        match drain_probe_pages(store, &list_prefix, ProbeListing::After(None)).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
     let distinct = distinct_in_delivery_order(&delivered);
     if distinct != expected {
         return ProbeResult::fail(
@@ -1362,10 +1385,11 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
             ),
         );
     }
-    let (delivered, _pages) = match drain_pages(store, &list_prefix, None).await {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
+    let (delivered, _pages) =
+        match drain_probe_pages(store, &list_prefix, ProbeListing::After(None)).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
     let distinct = distinct_in_delivery_order(&delivered);
     if distinct != expected {
         return ProbeResult::fail(
@@ -1628,6 +1652,192 @@ mod tests {
             .find(|r| r.property == Property::ConsistentListAfterWrite)
             .expect("listing probe result present");
         assert!(failure.detail.contains("not strongly consistent"));
+    }
+
+    /// [`WeakListStore`]'s defect confined to [`ObjectStoreBackend::list`]:
+    /// `list_after` delegates to the oracle and is strongly consistent, so a
+    /// probe that reaches `list` only through `list_after` sees nothing wrong.
+    /// `S3Store` implements the two separately, which is why the suite has to
+    /// drain `list` itself somewhere.
+    struct WeakOnlyOnListStore {
+        inner: MemoryStore,
+        hidden_from_next_list: Mutex<HashSet<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for WeakOnlyOnListStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            let outcome = self.inner.put(key, data, opts).await?;
+            self.hidden_from_next_list.lock().insert(key.to_string());
+            Ok(outcome)
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let mut page_result = self.inner.list(prefix, page).await?;
+            let mut hidden = self.hidden_from_next_list.lock();
+            page_result.objects.retain(|meta| !hidden.remove(&meta.key));
+            Ok(page_result)
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// #1448 finding 3: the membership probe must issue
+    /// [`ObjectStoreBackend::list`], not reach it through `list_after`. This
+    /// backend's `list_after` is the oracle's, so every other listing probe
+    /// passes and only `ConsistentListAfterWrite` names the defect. A suite
+    /// whose every listing probe went through `list_after` would qualify it.
+    #[tokio::test]
+    async fn a_backend_weak_only_on_list_fails_qualification() {
+        let store = WeakOnlyOnListStore {
+            inner: MemoryStore::new(),
+            hidden_from_next_list: Mutex::new(HashSet::new()),
+        };
+        let report = run_conformance_suite(&store, "sys/qualify/weak-list-only/").await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(
+            failed,
+            vec![Property::ConsistentListAfterWrite],
+            "only the probe that drains `list` itself can see this defect"
+        );
+        let failure = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::ConsistentListAfterWrite)
+            .expect("listing probe result present");
+        assert!(
+            failure.detail.contains("not strongly consistent"),
+            "got {:?}",
+            failure.detail
+        );
+    }
+
+    /// Hands out a fresh continuation token on every `list` page forever, so
+    /// the membership probe's drain trips [`MAX_PROBE_PAGES`]. `list_after` is
+    /// the oracle's, so only the probe that drains `list` sees it.
+    struct EndlessTokenListStore {
+        inner: MemoryStore,
+        pages: Mutex<u64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for EndlessTokenListStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let mut page_result = self.inner.list(prefix, page).await?;
+            let mut pages = self.pages.lock();
+            *pages += 1;
+            page_result.next = Some(PageToken(format!("endless-{pages}")));
+            Ok(page_result)
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// #1448 finding 4: the drain hands back a detail that already names the
+    /// prefix and the defect, so the membership probe reports it verbatim like
+    /// its three sibling drains, not wrapped in a second "listing ... failed"
+    /// sentence.
+    #[tokio::test]
+    async fn a_probe_drain_failure_is_reported_verbatim() {
+        let prefix = "sys/qualify/endless-token/";
+        let store = EndlessTokenListStore {
+            inner: MemoryStore::new(),
+            pages: Mutex::new(0),
+        };
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(failed, vec![Property::ConsistentListAfterWrite]);
+        let failure = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::ConsistentListAfterWrite)
+            .expect("listing probe result present");
+        assert_eq!(
+            failure.detail,
+            format!(
+                "listing {prefix}law/ still returned a continuation token after \
+                 {MAX_PROBE_PAGES} pages over far fewer keys; this backend's pagination does \
+                 not terminate"
+            )
+        );
     }
 
     /// Wraps `MemoryStore` and drops every conditional-write precondition:
@@ -2401,16 +2611,25 @@ mod tests {
     #[derive(Clone, Copy)]
     enum PageBoundary {
         /// Re-delivers the previous page's first key as the first entry of the
-        /// next page: `[a, b]` then `[a, c, d]`. This is a permitted delivery
-        /// (docs/object-store-contract.md: "a key MAY appear more than once
-        /// and callers MUST dedup by key") and loses no key, so the only
-        /// thing wrong with it is the raw delivery order.
+        /// next page: `[a, b]` then `[a, c, d]`. It loses no key, but the
+        /// repeat is of a key that sorts before the page boundary, so the raw
+        /// delivery sequence decreases and the contract's permitted repeat is
+        /// the last key delivered, not an earlier one
+        /// (docs/object-store-contract.md, "Listing"). Every `list_all` over
+        /// this backend hard-fails with `ListOrderViolation`, so the suite
+        /// must not qualify it.
         ///
-        /// Re-delivering the page's own last key instead (`[a, b]` then
-        /// `[b, c]`) is permitted too, but its raw sequence never decreases,
-        /// so it cannot exercise an order check at all. The repeat has to be
-        /// of a key that sorts before the page boundary.
+        /// Re-delivering the page's own last key instead is the permitted
+        /// form: see [`PageBoundary::RepeatLastKey`].
         RepeatEarlierKey,
+        /// Re-delivers the page's own last key as the first entry of the next
+        /// page: `[a, b]` then `[b, c, d]`. This is the repeat the cross-page
+        /// guarantee permits ("a key MAY appear more than once and callers
+        /// MUST dedup by key"): the raw sequence never decreases, because the
+        /// repeat is of the last key delivered. It must qualify, and every
+        /// drain over it must return the same keys a non-repeating backend
+        /// returns.
+        RepeatLastKey,
         /// Holds each continued page's last key back and delivers it after the
         /// next page's first key: `[a]` then `[c, b]`. Every key arrives
         /// exactly once, so deduplication changes nothing and the distinct
@@ -2494,6 +2713,7 @@ mod tests {
             // always names a key this page really delivered.
             let held = match self.boundary {
                 PageBoundary::RepeatEarlierKey => result.objects.first().cloned(),
+                PageBoundary::RepeatLastKey => result.objects.last().cloned(),
                 PageBoundary::SwapAcrossBoundary => {
                     // Only a continued page can hand its last key to a later
                     // page; holding one back on the final page would lose it.
@@ -2506,7 +2726,7 @@ mod tests {
             };
             if let Some(meta) = carried {
                 let at = match self.boundary {
-                    PageBoundary::RepeatEarlierKey => 0,
+                    PageBoundary::RepeatEarlierKey | PageBoundary::RepeatLastKey => 0,
                     // After this page's own first key, so the two distinct
                     // keys arrive in the wrong order.
                     PageBoundary::SwapAcrossBoundary => 1.min(result.objects.len()),
@@ -2553,19 +2773,19 @@ mod tests {
             .expect("the ordering probe ran")
     }
 
-    /// A backend that re-delivers an already-delivered key across a page
-    /// boundary is compliant (docs/object-store-contract.md: "a key MAY appear
-    /// more than once and callers MUST dedup by key"), so it must qualify. The
-    /// probe therefore has to deduplicate before it judges order: the raw
-    /// delivery sequence here goes backwards while the distinct one does not.
+    /// The repeat the contract permits: a backend that re-delivers its own
+    /// last key across a page boundary keeps the raw sequence non-decreasing,
+    /// so it must qualify, and a drain over it must return the same five keys
+    /// once each. Qualification and the drain agree here too.
     #[tokio::test]
-    async fn listing_order_probe_accepts_a_contract_permitted_cross_page_repeat() {
-        let store = PageBoundaryStore::new(PageBoundary::RepeatEarlierKey, ListingPass::Full);
-        let prefix = "sys/qualify/order-repeat-full/";
+    async fn listing_order_probe_accepts_a_repeat_of_the_last_delivered_key() {
+        let store = PageBoundaryStore::new(PageBoundary::RepeatLastKey, ListingPass::Full);
+        let prefix = "sys/qualify/order-repeat-last-full/";
         let report = run_conformance_suite(&store, prefix).await;
         assert!(
             report.passed(),
-            "a cross-page repeat is a permitted delivery, so every probe must pass, got: {:?}",
+            "a repeat of the last delivered key is a permitted delivery, so every probe must \
+             pass, got: {:?}",
             report.failures().collect::<Vec<_>>()
         );
         let list_prefix = format!("{prefix}order/");
@@ -2574,10 +2794,90 @@ mod tests {
             expected_order_pass_detail(&list_prefix)
         );
 
+        // The repeat really fired: seven deliveries of five keys, never
+        // decreasing, with the two repeats adjacent to the key they repeat.
+        let (delivered, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+            .await
+            .expect("draining the probe's own prefix");
+        assert_eq!(
+            delivered,
+            vec![
+                format!("{list_prefix}a"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}e"),
+            ]
+        );
+        assert_eq!(pages, 3, "5 keys at page size 2 is exactly 3 pages");
+        assert_eq!(first_order_violation(&delivered), None);
+
+        // And the verdict a caller gets: the same five keys, once each.
+        let mut keys: Vec<String> = Vec::new();
+        let prefix_ref = list_prefix.as_str();
+        let store_ref = &store;
+        crate::drain_pages(
+            &list_prefix,
+            None,
+            crate::MAX_LIST_PAGES,
+            |start_after: Option<String>, token| async move {
+                store_ref
+                    .list_after(prefix_ref, start_after.as_deref(), token)
+                    .await
+            },
+            |meta| {
+                keys.push(meta.key);
+                Ok::<_, StoreError>(crate::DrainStep::Continue)
+            },
+        )
+        .await
+        .expect("a drain over a permitted repeat must succeed");
+        assert_eq!(
+            keys,
+            vec![
+                format!("{list_prefix}a"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}e"),
+            ]
+        );
+    }
+
+    /// A backend that re-delivers an EARLIER key across a page boundary loses
+    /// no key, but its raw delivery sequence decreases, and the contract's
+    /// permitted repeat is the last key already delivered
+    /// (docs/object-store-contract.md, "Listing"). Every drain over it fails
+    /// with `ListOrderViolation`, so the suite must refuse to qualify it:
+    /// qualification and the drain agree on one rule.
+    #[tokio::test]
+    async fn listing_order_probe_rejects_a_cross_page_repeat_of_an_earlier_key() {
+        let store = PageBoundaryStore::new(PageBoundary::RepeatEarlierKey, ListingPass::Full);
+        let prefix = "sys/qualify/order-repeat-full/";
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(
+            failed,
+            vec![Property::LexicographicListingOrder],
+            "no key is lost here, so only the ordering property may fail"
+        );
+        let list_prefix = format!("{prefix}order/");
+        assert_eq!(
+            order_probe_result(&report).detail,
+            format!(
+                "listing {list_prefix} delivered {list_prefix}a after {list_prefix}b, which sorts \
+                 before it; this backend's listing is not in lexicographic key order, so a \
+                 continuation token does not name a position in the key space"
+            )
+        );
+
         // The repeat really fired, and on the pass under test: the raw
         // sequence holds seven deliveries of five keys, and its first
         // backwards step is the repeated key after a larger one.
-        let (delivered, pages) = drain_pages(&store, &list_prefix, None)
+        let (delivered, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
             .await
             .expect("draining the probe's own prefix");
         assert_eq!(
@@ -2597,8 +2897,10 @@ mod tests {
             first_order_violation(&delivered)
                 .map(|(before, after)| (before.to_string(), after.to_string())),
             Some((format!("{list_prefix}b"), format!("{list_prefix}a"))),
-            "the raw sequence goes backwards; only the deduplicated one does not"
+            "the raw sequence goes backwards, which is what the probe judges"
         );
+        // Deduplicating would have hidden it: the distinct sequence is in
+        // order, which is how this backend used to qualify.
         assert_eq!(
             distinct_in_delivery_order(&delivered),
             vec![
@@ -2609,14 +2911,43 @@ mod tests {
                 format!("{list_prefix}e"),
             ]
         );
+
+        // The verdict a caller gets over the same backend, which is why
+        // qualifying it would be wrong: the bounded drain rejects the same
+        // pair the probe reported. Last, because the drain aborts mid-listing
+        // and leaves this fixture's carried key behind.
+        let prefix_ref = list_prefix.as_str();
+        let store_ref = &store;
+        let err = crate::drain_pages(
+            &list_prefix,
+            None,
+            crate::MAX_LIST_PAGES,
+            |start_after: Option<String>, token| async move {
+                store_ref
+                    .list_after(prefix_ref, start_after.as_deref(), token)
+                    .await
+            },
+            |_meta| Ok::<_, StoreError>(crate::DrainStep::Continue),
+        )
+        .await
+        .expect_err("a drain over an earlier-key repeat must fail");
+        assert!(
+            matches!(
+                &err,
+                StoreError::ListOrderViolation { previous, offending, .. }
+                    if *previous == format!("{list_prefix}b")
+                        && *offending == format!("{list_prefix}a")
+            ),
+            "got {err:?}"
+        );
     }
 
-    /// Deduplicating first must not weaken the check: a backend whose distinct
-    /// delivery sequence goes backwards still fails, on the ordering property
-    /// and with the ordering message, even though it loses no key and repeats
-    /// nothing.
+    /// The other backward shape: a backend that delivers every key exactly
+    /// once in a swapped order fails too, on the ordering property and with
+    /// the ordering message. Nothing here repeats, so this one would fail
+    /// under either reading of the contract.
     #[tokio::test]
-    async fn listing_order_probe_still_rejects_backward_order_after_dedup() {
+    async fn listing_order_probe_rejects_a_swap_across_a_page_boundary() {
         let store = PageBoundaryStore::new(PageBoundary::SwapAcrossBoundary, ListingPass::Full);
         let prefix = "sys/qualify/order-swap-full/";
         let report = run_conformance_suite(&store, prefix).await;
@@ -2639,9 +2970,10 @@ mod tests {
 
         // Five keys, each delivered exactly once, in a swapped order: nothing
         // for deduplication to collapse.
-        let (delivered, _pages) = drain_pages(&store, &list_prefix, None)
-            .await
-            .expect("draining the probe's own prefix");
+        let (delivered, _pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+                .await
+                .expect("draining the probe's own prefix");
         assert_eq!(
             delivered,
             vec![
@@ -2656,30 +2988,32 @@ mod tests {
     }
 
     /// The `start_after` tail is the probe's second order check, so it needs
-    /// the same proof: a cross-page repeat confined to the tail listing is
-    /// permitted and must qualify.
+    /// the same rule: a repeat of an earlier key confined to the tail listing
+    /// decreases the raw sequence there, and must be refused there too.
     #[tokio::test]
-    async fn list_after_tail_accepts_a_contract_permitted_cross_page_repeat() {
+    async fn list_after_tail_rejects_a_cross_page_repeat_of_an_earlier_key() {
         let store = PageBoundaryStore::new(PageBoundary::RepeatEarlierKey, ListingPass::Tail);
         let prefix = "sys/qualify/order-repeat-tail/";
         let report = run_conformance_suite(&store, prefix).await;
-        assert!(
-            report.passed(),
-            "a cross-page repeat in the tail listing is a permitted delivery, got: {:?}",
-            report.failures().collect::<Vec<_>>()
-        );
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(failed, vec![Property::LexicographicListingOrder]);
         let list_prefix = format!("{prefix}order/");
         assert_eq!(
             order_probe_result(&report).detail,
-            expected_order_pass_detail(&list_prefix)
+            format!(
+                "list_after({list_prefix}, start_after={list_prefix}b) delivered {list_prefix}c \
+                 after {list_prefix}d, which sorts before it"
+            )
         );
 
         // The repeat fired in the tail pass only: four deliveries of the three
         // keys after the marker, going backwards once.
         let marker = format!("{list_prefix}b");
-        let (tail_delivered, pages) = drain_pages(&store, &list_prefix, Some(&marker))
-            .await
-            .expect("draining the probe's own tail");
+        let (tail_delivered, pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::After(Some(&marker)))
+                .await
+                .expect("draining the probe's own tail");
         assert_eq!(
             tail_delivered,
             vec![
@@ -2703,16 +3037,19 @@ mod tests {
                 format!("{list_prefix}e"),
             ]
         );
-        // The full drain was left alone, so this test's evidence is the tail.
-        let (delivered, _pages) = drain_pages(&store, &list_prefix, None)
-            .await
-            .expect("draining the probe's own prefix");
+        // The full drain was left alone, so this test's evidence is the tail:
+        // the full pass is in order and the probe still failed.
+        let (delivered, _pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::After(None))
+                .await
+                .expect("draining the probe's own prefix");
+        assert_eq!(first_order_violation(&delivered), None);
         assert_eq!(delivered, distinct_in_delivery_order(&delivered));
     }
 
-    /// The tail's order check keeps its teeth after deduplication too.
+    /// The tail's order check catches a swap as well as a repeat.
     #[tokio::test]
-    async fn list_after_tail_still_rejects_backward_order_after_dedup() {
+    async fn list_after_tail_rejects_a_swap_across_a_page_boundary() {
         let store = PageBoundaryStore::new(PageBoundary::SwapAcrossBoundary, ListingPass::Tail);
         let prefix = "sys/qualify/order-swap-tail/";
         let report = run_conformance_suite(&store, prefix).await;
@@ -2729,9 +3066,10 @@ mod tests {
         );
 
         let marker = format!("{list_prefix}b");
-        let (tail_delivered, _pages) = drain_pages(&store, &list_prefix, Some(&marker))
-            .await
-            .expect("draining the probe's own tail");
+        let (tail_delivered, _pages) =
+            drain_probe_pages(&store, &list_prefix, ProbeListing::After(Some(&marker)))
+                .await
+                .expect("draining the probe's own tail");
         assert_eq!(
             tail_delivered,
             vec![
