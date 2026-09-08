@@ -20,7 +20,10 @@
 //! ran under and no `actual` block; and no outcome carries the resolved
 //! snapshot id or watermark hour, so `visibility` reports only the commit
 //! tokens the caller required. A zero in either place would read as a
-//! measurement.
+//! measurement. D4 types the identity fields as strings, so the unmeasured
+//! ones cannot be left out of the JSON at all: [`super::envelope::finish`]
+//! names each of them in `warnings` instead, and an empty string there is
+//! never a value the caller has to interpret.
 
 use std::time::Duration;
 

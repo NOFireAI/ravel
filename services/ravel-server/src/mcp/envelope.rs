@@ -168,7 +168,12 @@ fn published_accounting(stats: &Value) -> Option<Value> {
 /// `presentation.row_cap_hit` is folded in rather than assigned, because a
 /// caller may already have set it from a cap of its own: the SQL executor
 /// stops its own stream at a row cap this layer never sees.
+///
+/// Every identity field the operation left unmeasured is named in `warnings`
+/// first (see [`warn_unreported_identity`]), so the empty string D4's typing
+/// forces there is never read as a value.
 pub(crate) fn finish(mut envelope: Envelope, budgets: &McpEffectiveBudgets) -> Envelope {
+    warn_unreported_identity(&mut envelope);
     let produced_rows = envelope.data.row_count;
     let max_rows = budgets.max_rows as usize;
     let row_cap_omitted = envelope.data.rows.len().saturating_sub(max_rows) as u64;
@@ -179,6 +184,39 @@ pub(crate) fn finish(mut envelope: Envelope, budgets: &McpEffectiveBudgets) -> E
     fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
     fitted.data.row_count = produced_rows;
     fitted.finish(false)
+}
+
+/// The four identity fields D4 declares as strings, in the order they are
+/// warned about.
+const IDENTITY_FIELDS: [&str; 4] = [
+    "visibility.snapshot_id",
+    "visibility.watermark_hour",
+    "ids.query_id",
+    "ids.audit_ref",
+];
+
+/// Name every identity field this operation did not measure.
+///
+/// D4 types all four as strings, so an operation that does not resolve one
+/// serializes `""`. An empty string is a value: a caller cannot tell it apart
+/// from an id that really is empty, and a reader collecting snapshot ids
+/// across calls would collect blanks as if they were measurements. Saying in
+/// `warnings` that the field is not reported by this operation is the honest
+/// form, and it runs before `fit` so the warnings are inside the byte cap.
+fn warn_unreported_identity(envelope: &mut Envelope) {
+    let reported = [
+        !envelope.visibility.snapshot_id.is_empty(),
+        !envelope.visibility.watermark_hour.is_empty(),
+        !envelope.ids.query_id.is_empty(),
+        !envelope.ids.audit_ref.is_empty(),
+    ];
+    for (field, reported) in IDENTITY_FIELDS.iter().zip(reported) {
+        if !reported {
+            envelope
+                .warnings
+                .push(format!("{field} is not reported by this operation"));
+        }
+    }
 }
 
 /// The D4 failure class of a service error. Every service kind has one, so
@@ -764,6 +802,61 @@ mod tests {
         assert_eq!(fitted.data.row_count, 2);
         assert_eq!(fitted.presentation.rows_omitted, 0);
         assert!(!fitted.presentation.row_cap_hit);
+    }
+
+    /// A metadata operation measures none of the four identity fields, so all
+    /// four are named in `warnings` rather than emitted as empty strings.
+    ///
+    /// The list is asserted whole and in order: a field dropped from it would
+    /// go back to serializing `""`, which reads as a measured value, and this
+    /// is the one place that says so.
+    #[test]
+    fn unmeasured_identity_fields_are_warned_not_empty() {
+        let budgets = budgets();
+        let mut envelope = base("metrics", "labels", &budgets);
+        window(&mut envelope, 0, 3_600_000_000_000);
+        envelope.data = string_list_data("label", vec!["up".to_string()]);
+        coverage(&mut envelope, false, Vec::new());
+
+        let fitted = finish(envelope, &budgets);
+
+        assert_eq!(
+            fitted.warnings,
+            vec![
+                "visibility.snapshot_id is not reported by this operation".to_string(),
+                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "ids.query_id is not reported by this operation".to_string(),
+                "ids.audit_ref is not reported by this operation".to_string(),
+            ]
+        );
+        // The fields themselves are still the empty strings D4's typing
+        // forces; the warnings are what makes them readable as absent.
+        assert!(fitted.visibility.snapshot_id.is_empty());
+        assert!(fitted.visibility.watermark_hour.is_empty());
+        assert!(fitted.ids.query_id.is_empty());
+        assert!(fitted.ids.audit_ref.is_empty());
+    }
+
+    /// An identity field the operation did measure is reported and not warned
+    /// about, so the warning list is exactly the fields still missing.
+    #[test]
+    fn a_measured_identity_field_is_not_warned_about() {
+        let budgets = budgets();
+        let mut envelope = base("metrics", "labels", &budgets);
+        envelope.visibility.snapshot_id = "snap-7".to_string();
+        envelope.data = string_list_data("label", vec!["up".to_string()]);
+
+        let fitted = finish(envelope, &budgets);
+
+        assert_eq!(fitted.visibility.snapshot_id, "snap-7");
+        assert_eq!(
+            fitted.warnings,
+            vec![
+                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "ids.query_id is not reported by this operation".to_string(),
+                "ids.audit_ref is not reported by this operation".to_string(),
+            ]
+        );
     }
 
     /// A service failure carries its D4 class and the service layer's
