@@ -69,6 +69,58 @@ const WARNING_ENTRY_BOUND: usize = 512;
 const NEXT_STEP_ENTRY_BOUND: usize = 512;
 const EVIDENCE_ENTRY_BOUND: usize = 512;
 
+/// D4 bounds "the scalar fields together" at 4 KiB. This is that allowance,
+/// measured the same way every other bound in this module is: the serialized
+/// JSON size of the payloads, not their source characters.
+///
+/// It covers every non-list, non-row payload a caller or the engine supplies:
+/// `plan`, `failure.message`, `failure.counter`, the three `budget` values,
+/// `accuracy.approximation`, both `ids` fields, both `visibility` strings,
+/// `scope.signal`, `scope.table`, both `scope.time_range` bounds, and
+/// `presentation.cursor`. The envelope's own bookkeeping (the booleans, the
+/// counters, the status word) is skeleton rather than payload and is covered
+/// by [`SKELETON_SLACK`] instead.
+const SCALAR_ALLOWANCE: usize = 4096;
+
+/// The per-scalar sub-bounds. Every scalar with a natural size has one, so
+/// no single field can eat the whole allowance and no cut is needed on a
+/// field that is already the size its content implies.
+const SIGNAL_BOUND: usize = 64;
+const TABLE_BOUND: usize = 128;
+const TIME_RANGE_BOUND: usize = 32;
+const QUERY_ID_BOUND: usize = 128;
+const AUDIT_REF_BOUND: usize = 128;
+const SNAPSHOT_ID_BOUND: usize = 128;
+const WATERMARK_HOUR_BOUND: usize = 32;
+const APPROXIMATION_BOUND: usize = 256;
+const FAILURE_COUNTER_BOUND: usize = 128;
+const CURSOR_BOUND: usize = 2048;
+
+/// What the sub-bounded scalars can occupy together.
+const FIXED_SCALAR_BOUNDS: usize = SIGNAL_BOUND
+    + TABLE_BOUND
+    + 2 * TIME_RANGE_BOUND
+    + QUERY_ID_BOUND
+    + AUDIT_REF_BOUND
+    + SNAPSHOT_ID_BOUND
+    + WATERMARK_HOUR_BOUND
+    + APPROXIMATION_BOUND
+    + FAILURE_COUNTER_BOUND
+    + CURSOR_BOUND;
+
+/// The rest of the allowance, for the five scalars with no natural size:
+/// `plan`, `failure.message`, and the three `budget` values.
+/// [`Envelope::cap_scalars`] cuts them in that order.
+const VARIABLE_SCALAR_ALLOWANCE: usize = SCALAR_ALLOWANCE - FIXED_SCALAR_BOUNDS;
+
+/// Cutting the five variable scalars to their floor always lands the scalars
+/// inside the allowance, which is why `cap_scalars` needs no failure channel:
+/// its last stage cannot leave the envelope over the bound.
+const _: () = assert!(
+    5 * MARKER_SERIALIZED_LEN <= VARIABLE_SCALAR_ALLOWANCE,
+    "the five variable scalars must fit the allowance at their marker floor"
+);
+
 /// The D4 per-cell floor: a cell is never cut below this serialized size,
 /// even when the whole envelope still does not fit.
 const MIN_CELL_BUDGET: usize = 256;
@@ -79,6 +131,48 @@ const MIN_CELL_BUDGET: usize = 256;
 /// structure and its under-budget cells); the rest is headroom so that
 /// termination is a property of the loop, not of the shrink step.
 const MAX_SHORTEN_PASSES: usize = 16;
+
+/// Serialized size of an envelope with no rows, no list entries, and every
+/// scalar empty: the keys, the braces, the separators, the shortest status
+/// word, and the zeroed counters. Pinned by
+/// `zero_row_envelope_with_maximal_metadata_fits_under_the_floor`, which
+/// fails if a field is added or renamed without revisiting the arithmetic
+/// below.
+const EMPTY_ENVELOPE_SERIALIZED_LEN: usize = 852;
+
+/// Room for the skeleton parts that grow without being payload: the counters
+/// widening from `0` to their full decimal form, `status` from `ok` to
+/// `ok_bounded`, and the `failure` and `time_range` blocks appearing with
+/// their own keys and class instead of `null`. Measured at 195 B for the
+/// widest shape; the rest is headroom.
+const SKELETON_SLACK: usize = 512;
+
+/// What every metadata list can occupy together: each list at its count
+/// bound, each entry at its per-entry bound, plus one separator per entry.
+const LIST_ALLOWANCE: usize = MAX_COLUMNS * (COLUMN_ENTRY_BOUND + 1)
+    + MAX_PREDICATES_APPLIED * (PREDICATE_ENTRY_BOUND + 1)
+    + MAX_ORDER_BY * (ORDER_BY_ENTRY_BOUND + 1)
+    + MAX_MIN_COMMIT_TOKENS * (MIN_COMMIT_TOKEN_ENTRY_BOUND + 1)
+    + MAX_FRAGMENTS * (FRAGMENT_ENTRY_BOUND + 1)
+    + MAX_UNINDEXED_PREDICATES * (UNINDEXED_PREDICATE_ENTRY_BOUND + 1)
+    + MAX_WARNINGS * (WARNING_ENTRY_BOUND + 1)
+    + MAX_NEXT_STEPS * (NEXT_STEP_ENTRY_BOUND + 1)
+    + MAX_EVIDENCE * (EVIDENCE_ENTRY_BOUND + 1);
+
+/// The largest fixed part -- the whole envelope but `data.rows` -- that can
+/// survive [`Envelope::cap_metadata_lists`] and [`Envelope::cap_scalars`].
+const MAXIMAL_FIXED_PART: usize =
+    EMPTY_ENVELOPE_SERIALIZED_LEN + SKELETON_SLACK + LIST_ALLOWANCE + SCALAR_ALLOWANCE;
+
+/// What makes [`Envelope::fit`] total. `fit` floors its cap at
+/// [`MAX_RESPONSE_BYTES_FLOOR`] and, as a last resort, empties `data.rows`;
+/// the result is the fixed part alone, which the caps hold under
+/// [`MAXIMAL_FIXED_PART`]. So a zero-row envelope over the cap is
+/// arithmetically impossible and `fit` needs no failure channel.
+const _: () = assert!(
+    MAXIMAL_FIXED_PART < MAX_RESPONSE_BYTES_FLOOR as usize,
+    "a zero-row envelope must fit the smallest cap fit can be given"
+);
 
 /// Largest a hex id may be, in characters: a 32-byte trace id is 64
 /// characters of hex, the widest id any signal carries. D4 states a hex id
@@ -318,6 +412,13 @@ pub struct Presentation {
     /// dropped entry is gone, a cut one is still there and still says so
     /// through its truncation marker.
     pub entries_truncated: u64,
+    /// Scalar fields cut, replaced by the truncation marker, or (for the
+    /// cursor, which is a MAC'd token a cut would corrupt) dropped, because
+    /// the scalars together were over the D4 4 KiB allowance. Counted apart
+    /// from `entries_truncated` because a scalar is not a list entry: one
+    /// oversized `plan` says something different about a result than sixteen
+    /// cut warnings do.
+    pub scalars_truncated: u64,
     pub effective_max_response_bytes: u64,
     pub floor_applied: bool,
     pub cursor: Option<String>,
@@ -539,6 +640,28 @@ fn bound_evidence(entries: &mut [EvidenceEntry]) -> u64 {
     truncated
 }
 
+/// Cuts one scalar to its own sub-bound, and reports whether it was cut.
+fn bound_scalar(field: &mut String, bound: usize) -> bool {
+    if serialized_str_len(field) <= bound {
+        return false;
+    }
+    *field = truncate_to_budget(field, bound);
+    true
+}
+
+/// Cuts one variable scalar by `over` serialized bytes, down to the marker
+/// but never below it, and reports whether it was cut. A field already at the
+/// marker has nothing left to give and is left alone.
+fn shrink_scalar(field: &mut String, over: usize) -> bool {
+    let len = serialized_str_len(field);
+    if len <= MARKER_SERIALIZED_LEN {
+        return false;
+    }
+    let budget = len.saturating_sub(over).max(MARKER_SERIALIZED_LEN);
+    *field = truncate_to_budget(field, budget);
+    true
+}
+
 const TRUNCATION_MARKER: &str = "...[truncated]";
 
 /// Serialized size of the truncation marker alone as a JSON string: the two
@@ -693,17 +816,152 @@ impl Envelope {
         }
     }
 
+    /// Serialized size of the scalar fields the [`SCALAR_ALLOWANCE`] covers.
+    ///
+    /// The three `budget` values are JSON of a shape D6 owns, so they are
+    /// measured as serialized JSON rather than as strings; every other scalar
+    /// is a string and is measured with its quotes and escapes.
+    fn scalar_serialized_len(&self) -> usize {
+        let mut total = serialized_str_len(&self.scope.signal)
+            + serialized_str_len(&self.scope.table)
+            + serialized_str_len(&self.ids.query_id)
+            + serialized_str_len(&self.ids.audit_ref)
+            + serialized_str_len(&self.visibility.snapshot_id)
+            + serialized_str_len(&self.visibility.watermark_hour)
+            + entry_serialized_len(&self.budget.effective)
+            + entry_serialized_len(&self.budget.actual)
+            + entry_serialized_len(&self.budget.estimate);
+        if let Some(range) = &self.scope.time_range {
+            total += serialized_str_len(&range.start_ns) + serialized_str_len(&range.end_ns);
+        }
+        if let Some(approximation) = &self.accuracy.approximation {
+            total += serialized_str_len(approximation);
+        }
+        if let Some(failure) = &self.failure {
+            total += serialized_str_len(&failure.message);
+            if let Some(counter) = &failure.counter {
+                total += serialized_str_len(counter);
+            }
+        }
+        if let Some(plan) = &self.plan {
+            total += serialized_str_len(plan);
+        }
+        if let Some(cursor) = &self.presentation.cursor {
+            total += serialized_str_len(cursor);
+        }
+        total
+    }
+
+    /// Applies the D4 scalar bound, and returns how many scalars it cut.
+    ///
+    /// Two stages. Every scalar with a natural size is cut to its own
+    /// sub-bound first, so one field cannot eat the allowance. Then, if the
+    /// scalars are still over it together, the five with no natural size are
+    /// cut in the D4 order -- `plan`, `failure.message`, then the three
+    /// `budget` values -- each by the current overshoot and none below the
+    /// truncation marker.
+    ///
+    /// The cursor is the exception to cutting: it is a MAC'd token, so a cut
+    /// one is not a shorter cursor but a corrupt one that redeems as invalid.
+    /// Over its bound it is dropped whole, and the caller sees `ok_bounded`
+    /// rather than a page it cannot turn.
+    ///
+    /// The last stage cannot leave the scalars over the allowance: with every
+    /// variable scalar at the marker the total is at most
+    /// `FIXED_SCALAR_BOUNDS + 5 * MARKER_SERIALIZED_LEN`, which the const
+    /// assertion beside [`VARIABLE_SCALAR_ALLOWANCE`] holds under the bound.
+    fn cap_scalars(&mut self) -> u64 {
+        let mut cut = 0u64;
+        cut += u64::from(bound_scalar(&mut self.scope.signal, SIGNAL_BOUND));
+        cut += u64::from(bound_scalar(&mut self.scope.table, TABLE_BOUND));
+        if let Some(range) = &mut self.scope.time_range {
+            cut += u64::from(bound_scalar(&mut range.start_ns, TIME_RANGE_BOUND));
+            cut += u64::from(bound_scalar(&mut range.end_ns, TIME_RANGE_BOUND));
+        }
+        cut += u64::from(bound_scalar(&mut self.ids.query_id, QUERY_ID_BOUND));
+        cut += u64::from(bound_scalar(&mut self.ids.audit_ref, AUDIT_REF_BOUND));
+        cut += u64::from(bound_scalar(
+            &mut self.visibility.snapshot_id,
+            SNAPSHOT_ID_BOUND,
+        ));
+        cut += u64::from(bound_scalar(
+            &mut self.visibility.watermark_hour,
+            WATERMARK_HOUR_BOUND,
+        ));
+        if let Some(approximation) = &mut self.accuracy.approximation {
+            cut += u64::from(bound_scalar(approximation, APPROXIMATION_BOUND));
+        }
+        if let Some(failure) = &mut self.failure
+            && let Some(counter) = &mut failure.counter
+        {
+            cut += u64::from(bound_scalar(counter, FAILURE_COUNTER_BOUND));
+        }
+        if let Some(cursor) = &self.presentation.cursor
+            && serialized_str_len(cursor) > CURSOR_BOUND
+        {
+            self.presentation.cursor = None;
+            cut += 1;
+        }
+
+        let over = self
+            .scalar_serialized_len()
+            .saturating_sub(SCALAR_ALLOWANCE);
+        if over > 0
+            && let Some(plan) = &mut self.plan
+        {
+            cut += u64::from(shrink_scalar(plan, over));
+        }
+        let over = self
+            .scalar_serialized_len()
+            .saturating_sub(SCALAR_ALLOWANCE);
+        if over > 0
+            && let Some(failure) = &mut self.failure
+        {
+            cut += u64::from(shrink_scalar(&mut failure.message, over));
+        }
+        // A budget value is JSON of a shape this module does not own, so an
+        // over-allowance one is replaced whole by the marker string rather
+        // than cut into JSON that no longer parses. A value already smaller
+        // than the marker is left alone: replacing it would grow the
+        // envelope.
+        for index in 0..3 {
+            if self.scalar_serialized_len() <= SCALAR_ALLOWANCE {
+                break;
+            }
+            let value = match index {
+                0 => &mut self.budget.effective,
+                1 => &mut self.budget.actual,
+                _ => &mut self.budget.estimate,
+            };
+            if entry_serialized_len(value) > MARKER_SERIALIZED_LEN {
+                *value = AnyJson(Value::String(TRUNCATION_MARKER.to_string()));
+                cut += 1;
+            }
+        }
+        cut
+    }
+
     /// The D4 byte-cap algorithm. Floors `max_response_bytes` at
     /// [`MAX_RESPONSE_BYTES_FLOOR`], caps every metadata list to its bound,
-    /// then drops rows from the end of `data.rows` until the envelope fits.
-    /// If a single remaining row still does not fit, keeps it and shortens
-    /// its oversized cells instead of dropping it, so `data.rows` is never
-    /// empty while `rows_omitted` is positive and a retained row always
-    /// fits.
+    /// caps the scalars to their allowance, then drops rows from the end of
+    /// `data.rows` until the envelope fits. If a single remaining row still
+    /// does not fit, keeps it and shortens its oversized cells instead of
+    /// dropping it, so `data.rows` is never empty while `rows_omitted` is
+    /// positive and a retained row always fits.
+    ///
+    /// The one case that overrides the first-row guarantee is a row nothing
+    /// can shorten enough: a row of cells that are all at their own type's
+    /// floor (numbers, booleans, hex ids) can still be wider than the cap,
+    /// and no cut reclaims a byte of it. Rather than return an envelope over
+    /// the cap, `fit` drops that row too and counts it. This is what makes
+    /// `fit` total, and it needs no failure channel because the fixed part
+    /// that remains is under [`MAXIMAL_FIXED_PART`], which is under the
+    /// smallest cap `fit` can be given.
     pub fn fit(mut self, requested_max_response_bytes: u64) -> Envelope {
         let caps = self.cap_metadata_lists();
         self.presentation.metadata_elided = caps.elided;
         self.presentation.entries_truncated = caps.entries_truncated;
+        self.presentation.scalars_truncated = self.cap_scalars();
 
         let effective_cap = requested_max_response_bytes.max(MAX_RESPONSE_BYTES_FLOOR);
         self.presentation.effective_max_response_bytes = effective_cap;
@@ -726,6 +984,15 @@ impl Envelope {
         self.presentation.rows_omitted = rows_omitted;
 
         self.presentation.cells_truncated = self.shorten_first_row_to_fit(cap);
+
+        if serialized_len(&self) > cap {
+            rows_omitted += self.data.rows.len() as u64;
+            self.data.rows.clear();
+            self.presentation.rows_omitted = rows_omitted;
+            // The cut cells left with the row they were in, so nothing in
+            // what is returned was truncated.
+            self.presentation.cells_truncated = 0;
+        }
         self
     }
 
@@ -844,6 +1111,8 @@ impl Envelope {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn envelope_with_rows(row_count: usize, cell: impl Fn(usize) -> Row) -> Envelope {
@@ -935,23 +1204,32 @@ mod tests {
     /// three tests detect a cut measured in source bytes: such a cut either
     /// overruns the cap or, once the re-measure loop has clamped it, lands on
     /// the 256 B floor instead of this figure.
-    const KEPT_CELL_SERIALIZED_LEN: usize = 261_270;
-    /// The whole envelope's exact serialized size for those same three cases.
+    const KEPT_CELL_SERIALIZED_LEN: usize = 261_248;
+    /// The whole envelope's exact serialized size for those same cases.
     const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 262_138;
+
+    /// The one body that lands a byte short of [`KEPT_CELL_SERIALIZED_LEN`]:
+    /// `\n ` alternates a character that serializes to two bytes with one
+    /// that serializes to one, so the last character the budget could hold is
+    /// the two-byte one and it does not fit. A cut never spends a partial
+    /// character to reach the figure exactly.
+    const KEPT_CONTROL_CELL_SERIALIZED_LEN: usize = 261_247;
+    const FITTED_CONTROL_ENVELOPE_SERIALIZED_LEN: usize = 262_137;
 
     /// Serialized size of a 200-row page of one hex id column, every id at
     /// the 64-character bound: 13,801 B of rows (200 cells of 68 B, their
-    /// commas, and the array brackets) plus 867 B of envelope fields, far
+    /// commas, and the array brackets) plus 889 B of envelope fields, far
     /// under the 256 KiB floor. Pinned so a hex id that grew past its bound
     /// shows up here as a size change rather than as a cell `fit` silently
     /// skipped.
-    const HEX_ID_PAGE_SERIALIZED_LEN: usize = 14_668;
+    const HEX_ID_PAGE_SERIALIZED_LEN: usize = 14_690;
 
     /// Serialized size of a zero-row envelope with every metadata field at
-    /// both its D4 bounds: the largest fixed part the bounds permit. The ADR
-    /// requires this to be under 106,496 B, which is what leaves a retained
-    /// row its 154 KiB under the 256 KiB floor.
-    const MAXIMAL_METADATA_ENVELOPE_LEN: usize = 102_116;
+    /// both its D4 bounds and every scalar filling the D4 scalar allowance:
+    /// the largest fixed part the bounds permit. The ADR requires this to be
+    /// under 106,496 B, which is what leaves a retained row its 152 KiB under
+    /// the 256 KiB floor.
+    const MAXIMAL_METADATA_ENVELOPE_LEN: usize = 105_806;
     const _: () = assert!(
         MAXIMAL_METADATA_ENVELOPE_LEN < 106_496,
         "ADR-1374 D4 requires the maximal fixed part under 106,496 B"
@@ -1026,9 +1304,9 @@ mod tests {
         assert_eq!(fitted.presentation.rows_omitted, 0);
         assert_eq!(fitted.presentation.cells_truncated, 1);
         assert!(fitted.presentation.bytes_cap_hit);
-        assert_eq!(cell_len(&fitted), KEPT_CELL_SERIALIZED_LEN);
+        assert_eq!(cell_len(&fitted), KEPT_CONTROL_CELL_SERIALIZED_LEN);
         let size = serialized_len(&fitted);
-        assert_eq!(size, FITTED_ENVELOPE_SERIALIZED_LEN);
+        assert_eq!(size, FITTED_CONTROL_ENVELOPE_SERIALIZED_LEN);
         assert!(
             size <= MAX_RESPONSE_BYTES_FLOOR as usize,
             "serialized size {size} exceeds cap {MAX_RESPONSE_BYTES_FLOOR}"
@@ -1207,18 +1485,127 @@ mod tests {
         assert_eq!(entry_serialized_len(&envelope.data.columns[1]), 32);
     }
 
-    /// Zero rows, every metadata list at its count bound and every entry at
-    /// its per-entry bound: the fixed part alone must serialize to exactly
+    /// The D4 scalar allowance, over the fields that have no natural size.
+    ///
+    /// A 1 MiB `plan` is cut first and all the way to the marker, because the
+    /// overshoot is larger than the plan; the failure message is cut next, by
+    /// exactly what is still over; and the budget values are then already
+    /// inside the allowance and are left alone. Every scalar with a natural
+    /// size is cut to it first, and the cursor is dropped whole rather than
+    /// cut into a token that cannot redeem.
+    #[test]
+    fn oversized_plan_is_cut_to_the_scalar_allowance() {
+        let mut envelope = Envelope {
+            plan: Some("p".repeat(1024 * 1024)),
+            failure: Some(Failure {
+                class: FailureClass::Internal,
+                message: "m".repeat(4096),
+                counter: Some("c".repeat(4096)),
+            }),
+            ..Default::default()
+        };
+        envelope.scope.signal = "s".repeat(4096);
+        envelope.scope.table = "t".repeat(4096);
+        envelope.scope.time_range = Some(TimeRange {
+            start_ns: "1".repeat(100),
+            end_ns: "2".repeat(100),
+        });
+        envelope.ids.query_id = "q".repeat(4096);
+        envelope.ids.audit_ref = "a".repeat(4096);
+        envelope.visibility.snapshot_id = "v".repeat(4096);
+        envelope.visibility.watermark_hour = "2026090800".to_string();
+        envelope.accuracy.approximation = Some("x".repeat(4096));
+        envelope.presentation.cursor = Some("k".repeat(4096));
+        envelope.budget.effective = AnyJson(Value::String("b".repeat(1000)));
+        envelope.budget.estimate = AnyJson(Value::Number(7.into()));
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        // Nine scalars cut to their own sub-bound, the cursor dropped, the
+        // plan cut to the marker, the failure message cut to what was left.
+        assert_eq!(fitted.presentation.scalars_truncated, 12);
+        assert_eq!(fitted.scalar_serialized_len(), SCALAR_ALLOWANCE);
+
+        assert_eq!(fitted.plan.as_deref(), Some(TRUNCATION_MARKER));
+        assert_eq!(fitted.presentation.cursor, None);
+        let failure = fitted.failure.as_ref().expect("the failure is kept");
+        assert_eq!(serialized_str_len(&failure.message), 2_037);
+        assert!(failure.message.ends_with(TRUNCATION_MARKER));
+        assert_eq!(
+            serialized_str_len(failure.counter.as_deref().expect("a counter")),
+            FAILURE_COUNTER_BOUND
+        );
+        assert_eq!(serialized_str_len(&fitted.scope.signal), SIGNAL_BOUND);
+        assert_eq!(serialized_str_len(&fitted.scope.table), TABLE_BOUND);
+        let range = fitted.scope.time_range.as_ref().expect("a time range");
+        assert_eq!(serialized_str_len(&range.start_ns), TIME_RANGE_BOUND);
+        assert_eq!(serialized_str_len(&range.end_ns), TIME_RANGE_BOUND);
+        assert_eq!(serialized_str_len(&fitted.ids.query_id), QUERY_ID_BOUND);
+        assert_eq!(serialized_str_len(&fitted.ids.audit_ref), AUDIT_REF_BOUND);
+        assert_eq!(
+            serialized_str_len(&fitted.visibility.snapshot_id),
+            SNAPSHOT_ID_BOUND
+        );
+        assert_eq!(
+            serialized_str_len(
+                fitted
+                    .accuracy
+                    .approximation
+                    .as_deref()
+                    .expect("an approximation")
+            ),
+            APPROXIMATION_BOUND
+        );
+        // Already inside their bounds, so untouched by the cut.
+        assert_eq!(fitted.visibility.watermark_hour, "2026090800");
+        assert_eq!(
+            fitted.budget.effective,
+            AnyJson(Value::String("b".repeat(1000)))
+        );
+        assert_eq!(fitted.budget.estimate, AnyJson(Value::Number(7.into())));
+    }
+
+    /// The last stage of the scalar cut: three budget values that are over
+    /// the allowance together are replaced whole by the marker string, in
+    /// order, and only until the scalars fit. A budget value is JSON of a
+    /// shape D6 owns, so cutting it as text would produce something that no
+    /// longer parses.
+    #[test]
+    fn oversized_budget_values_are_replaced_by_the_marker() {
+        let mut envelope = Envelope::default();
+        let big = AnyJson(serde_json::json!({ "scanned_bytes": "b".repeat(4096) }));
+        envelope.budget.effective = big.clone();
+        envelope.budget.actual = big.clone();
+        envelope.budget.estimate = big;
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.presentation.scalars_truncated, 3);
+        let marker = AnyJson(Value::String(TRUNCATION_MARKER.to_string()));
+        assert_eq!(fitted.budget.effective, marker);
+        assert_eq!(fitted.budget.actual, marker);
+        assert_eq!(fitted.budget.estimate, marker);
+        assert_eq!(fitted.scalar_serialized_len(), 60);
+    }
+
+    /// Zero rows, every metadata list at its count bound, every entry at its
+    /// per-entry bound, and every scalar filling the D4 scalar allowance
+    /// exactly: the fixed part alone must serialize to exactly
     /// [`MAXIMAL_METADATA_ENVELOPE_LEN`], which the ADR requires to be under
     /// 106,496 B.
     ///
     /// Each entry below is sized to land on its bound exactly, so the
     /// envelope this builds is the largest one the D4 bounds permit, and
-    /// `cap_metadata_lists` must find nothing to do. A single 10 MiB warning
-    /// fed in afterwards is cut back to the same size, so no metadata a
-    /// caller or the engine can produce moves this figure.
+    /// neither `cap_metadata_lists` nor `cap_scalars` may find anything to
+    /// do. A 10 MiB warning and a 1 MiB plan fed in afterwards are cut back,
+    /// so nothing a caller or the engine can produce moves this figure up.
     #[test]
     fn zero_row_envelope_with_maximal_metadata_fits_under_the_floor() {
+        assert_eq!(
+            serialized_len(&Envelope::default()),
+            EMPTY_ENVELOPE_SERIALIZED_LEN
+        );
+
         let mut envelope = Envelope::default();
         envelope.data.columns = (0..MAX_COLUMNS)
             .map(|i| Column {
@@ -1227,11 +1614,11 @@ mod tests {
             })
             .collect();
         envelope.data.row_count = 0;
-        envelope.scope.signal = "logs".to_string();
-        envelope.scope.table = "logs".to_string();
+        envelope.scope.signal = "s".repeat(SIGNAL_BOUND - 2);
+        envelope.scope.table = "t".repeat(TABLE_BOUND - 2);
         envelope.scope.time_range = Some(TimeRange {
-            start_ns: "1700000000000000000".to_string(),
-            end_ns: "1700000003600000000000".to_string(),
+            start_ns: "1".repeat(TIME_RANGE_BOUND - 2),
+            end_ns: "2".repeat(TIME_RANGE_BOUND - 2),
         });
         envelope.scope.predicates_applied = (0..MAX_PREDICATES_APPLIED)
             .map(|i| format!("{i:0>2}_{}", "p".repeat(507)))
@@ -1239,10 +1626,10 @@ mod tests {
         envelope.scope.order_by = (0..MAX_ORDER_BY)
             .map(|i| format!("{i:0>2}_{}", "o".repeat(507)))
             .collect();
-        envelope.ids.query_id = "q".repeat(64);
-        envelope.ids.audit_ref = "a".repeat(64);
-        envelope.visibility.snapshot_id = "s".repeat(64);
-        envelope.visibility.watermark_hour = "2026090800".to_string();
+        envelope.ids.query_id = "q".repeat(QUERY_ID_BOUND - 2);
+        envelope.ids.audit_ref = "a".repeat(AUDIT_REF_BOUND - 2);
+        envelope.visibility.snapshot_id = "v".repeat(SNAPSHOT_ID_BOUND - 2);
+        envelope.visibility.watermark_hour = "h".repeat(WATERMARK_HOUR_BOUND - 2);
         envelope.visibility.pinned = true;
         envelope.visibility.min_commit_tokens_applied = (0..MAX_MIN_COMMIT_TOKENS)
             .map(|i| format!("{i:0>2}_{}", "m".repeat(123)))
@@ -1255,8 +1642,20 @@ mod tests {
             .map(|i| format!("{i:0>2}_{}", "u".repeat(251)))
             .collect();
         envelope.accuracy.exact = true;
+        envelope.accuracy.approximation = Some("x".repeat(APPROXIMATION_BOUND - 2));
         envelope.presentation.max_rows = 200;
-        envelope.presentation.cursor = Some("c".repeat(200));
+        envelope.presentation.cursor = Some("k".repeat(CURSOR_BOUND - 2));
+        // The longest failure class, so the block's own keys and value are at
+        // their widest too.
+        envelope.failure = Some(Failure {
+            class: FailureClass::BudgetEstimateExceedsCeiling,
+            message: "m".repeat(298),
+            counter: Some("c".repeat(FAILURE_COUNTER_BOUND - 2)),
+        });
+        envelope.plan = Some("p".repeat(498));
+        envelope.budget.effective = AnyJson(Value::String("b".repeat(62)));
+        envelope.budget.actual = AnyJson(Value::String("a".repeat(62)));
+        envelope.budget.estimate = AnyJson(Value::String("e".repeat(62)));
         envelope.warnings = (0..MAX_WARNINGS)
             .map(|i| format!("{i:0>2}_{}", "w".repeat(507)))
             .collect();
@@ -1305,16 +1704,31 @@ mod tests {
             assert_eq!(entry_serialized_len(entry), EVIDENCE_ENTRY_BOUND);
         }
 
+        assert_eq!(
+            envelope.scalar_serialized_len(),
+            SCALAR_ALLOWANCE,
+            "the scalars fill the allowance exactly"
+        );
+
         let caps = envelope.cap_metadata_lists();
         assert_eq!(
             caps,
             MetadataCaps::default(),
             "every list is already at its bound, not over it"
         );
+        assert_eq!(
+            envelope.cap_scalars(),
+            0,
+            "every scalar is already at its bound, not over it"
+        );
 
         assert_eq!(serialized_len(&envelope), MAXIMAL_METADATA_ENVELOPE_LEN);
+        const {
+            assert!(MAXIMAL_METADATA_ENVELOPE_LEN <= MAXIMAL_FIXED_PART);
+        }
 
         envelope.warnings[0] = "w".repeat(10 * 1024 * 1024);
+        envelope.plan = Some("p".repeat(1024 * 1024));
         let caps = envelope.cap_metadata_lists();
         assert_eq!(
             caps,
@@ -1323,11 +1737,85 @@ mod tests {
                 entries_truncated: 1,
             }
         );
+        assert_eq!(envelope.cap_scalars(), 1, "the plan alone was over");
         assert_eq!(
             serialized_str_len(&envelope.warnings[0]),
             WARNING_ENTRY_BOUND
         );
+        let plan = envelope.plan.as_deref().expect("the plan is kept");
+        assert!(plan.ends_with(TRUNCATION_MARKER));
+        assert_eq!(serialized_str_len(plan), 500);
+        // The plan is cut by exactly the overshoot, so it lands back on the
+        // 500 B it occupied before: neither the 10 MiB warning nor the 1 MiB
+        // plan moves the figure at all.
         assert_eq!(serialized_len(&envelope), MAXIMAL_METADATA_ENVELOPE_LEN);
+    }
+
+    /// One cell of every kind D4 defines, at sizes from empty to far past the
+    /// cap. The three string shapes are the three escaping regimes: a plain
+    /// body, a body of quotes (two serialized bytes per source byte), and a
+    /// body of control characters (six).
+    fn cell_strategy() -> impl Strategy<Value = Cell> {
+        prop_oneof![
+            Just(Cell::Null),
+            any::<bool>().prop_map(Cell::Bool),
+            any::<i64>().prop_map(Cell::Int),
+            any::<i64>().prop_map(Cell::Timestamp),
+            any::<f64>().prop_map(Cell::Float),
+            (0usize..=MAX_HEX_ID_LEN)
+                .prop_map(|len| Cell::HexId(HexId::new("a".repeat(len)).expect("a hex id"))),
+            (0usize..3, 0usize..30_000).prop_map(|(shape, len)| {
+                let body = match shape {
+                    0 => "x",
+                    1 => "\"",
+                    _ => "\u{1}",
+                };
+                Cell::Str(body.repeat(len))
+            }),
+            (0usize..8, 0usize..8_000).prop_map(|(keys, len)| {
+                let mut map = Map::new();
+                for key in 0..keys {
+                    map.insert(format!("k{key}"), Value::String("\"".repeat(len)));
+                }
+                Cell::Map(map)
+            }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// `fit` is total: whatever the one row holds, the envelope it
+        /// returns is inside the cap it reports. The generated row includes
+        /// the shape no cut can reach -- a run of integer cells, each already
+        /// at its own type's floor -- which is over the cap by width alone
+        /// and can only be fitted by dropping the row.
+        #[test]
+        fn fit_never_returns_over_cap_for_any_single_row(
+            cells in prop::collection::vec(cell_strategy(), 0..8),
+            uncuttable in 0usize..30_000,
+            requested_cap in 0u64..(400 * 1024),
+        ) {
+            let mut row: Row = cells;
+            row.extend((0..uncuttable).map(|i| Cell::Int(i as i64 * 1_000_000_009)));
+            let mut envelope = Envelope::default();
+            envelope.data.columns = (0..row.len().min(MAX_COLUMNS))
+                .map(|i| Column {
+                    name: format!("c{i}"),
+                    r#type: "string".to_string(),
+                })
+                .collect();
+            envelope.data.rows = vec![row];
+            envelope.data.row_count = 1;
+
+            let fitted = envelope.fit(requested_cap);
+
+            let cap = fitted.presentation.effective_max_response_bytes as usize;
+            prop_assert!(cap >= MAX_RESPONSE_BYTES_FLOOR as usize);
+            prop_assert!(fitted.data.rows.len() <= 1);
+            let size = serialized_len(&fitted);
+            prop_assert!(size <= cap, "serialized size {size} exceeds cap {cap}");
+        }
     }
 
     /// `floor_applied` reports whether the floor changed the caller's cap, so
