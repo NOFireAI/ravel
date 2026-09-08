@@ -60,10 +60,14 @@ unchanged; only the state count grew.
 new `live` harness lane (issue #1357) and from `MaxTicks=3` to
 `MaxTicks=4`, the smallest bound at which `Expired` is reachable; see the
 comment in `live.cfg` itself. Its figures also moved, from
-42119/15812/depth 13 to 2696/1616/depth 11, because `MaxTicks=4` reaches
-one more tick per behaviour but `Fairness` now includes
-`WF_vars(Abandon(f))`, which prunes the non-fair stutter-after-expiry
-paths TLC previously had to enumerate before finding the property held.
+42119/15812/depth 13 to 2696/1616/depth 11, but the two runs are not
+comparable: TLC generates the reachable state graph from `Init` and
+`Next`, fairness only feeds the liveness check and never restricts state
+generation, and a new state variable plus one more tick cannot shrink
+that graph. The retired figures were measured before `live.cfg` gained
+`CheckQuery = FALSE` and `CheckToken = FALSE`; 2696/1616/depth 11 is the
+current measurement against the shipped config, on tla2tools 1.7.4
+(fleet executor host, `-workers 2 -Xmx2g`, per the table above).
 
 The negative rows are the required outcome: each config disables a guard,
 flips a broken-behaviour switch, or (the three new `*-reachable.cfg` rows)
@@ -196,15 +200,15 @@ whether full safety plus liveness fits the script's 3600s
 `EXHAUSTIVE_BUDGET`. Safety alone completes in 114s at these bounds (see
 above); with liveness added, the run had not completed after 590s (no
 result, no partial-progress line yet from TLC, process cleanly
-terminated) — the host's practical foreground observation window for
-this session, well short of the 3600s budget itself. Whether the run
-would complete somewhere between 590s and 3600s is not known; extending
-the observation window would need a background TLC run, which this task
-avoids by rule (TLC runs the full foreground window, never backgrounded).
-`exhaustive.cfg` is left unchanged (safety-only, `SPECIFICATION Spec`, no
-`PROPERTY`); liveness is now checked at the `live` kind's bounds instead
-(`live.cfg`, see above), matching the fallback the task originally
-allowed for this case.
+terminated), which was the host's practical foreground observation
+window for this session, well short of the 3600s budget itself. Whether
+the run would complete somewhere between 590s and 3600s is not known;
+extending the observation window would need a background TLC run, which
+this task avoids by rule (TLC runs the full foreground window, never
+backgrounded). `exhaustive.cfg` is left unchanged (safety-only,
+`SPECIFICATION Spec`, no `PROPERTY`); liveness is now checked at the
+`live` kind's bounds instead (`live.cfg`, see above), matching the
+fallback the task originally allowed for this case.
 
 ## By-hand runs
 

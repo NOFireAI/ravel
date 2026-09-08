@@ -428,10 +428,9 @@ else
 fi
 
 # --- (n) traceability: zero resolved rows fails, naming the area (issue #1356)
-# check_traceability used to report PASS on a table with only a header row
-# and no data rows, since it asserted rc -eq 0 without checking count > 0. An
-# area whose table lost every row (a bad edit, a rebase) would then pass
-# silently.
+# A traceability.md with only a header row and no data rows must fail, not
+# pass: a table that lost every row (a bad edit, a rebase) is otherwise
+# indistinguishable from one that legitimately has nothing left to check.
 echo "--- (n) traceability: zero resolved rows fails, naming the area"
 nrepo="$(mktemp -d)"
 mkdir -p "$nrepo/crates" "$nrepo/formal/tla/emptyarea"
@@ -450,15 +449,122 @@ FORMAL_DIR="$nrepo/formal/tla"
 nout="$(check_traceability emptyarea 2>&1)"
 ncode=$?
 if [ "$ncode" -ne 0 ]; then ok; else bad "n: expected nonzero exit on zero resolved rows, got 0; output: $nout"; fi
-if printf '%s' "$nout" | grep -qF "emptyarea traceability"; then
+if printf '%s' "$nout" | grep -qF "emptyarea traceability: FAIL (zero rows resolved)"; then
     ok
 else
-    bad "n: expected the failure message to name the area 'emptyarea'; output: $nout"
+    bad "n: expected 'emptyarea traceability: FAIL (zero rows resolved)'; output: $nout"
 fi
 
 REPO_ROOT="$orig_repo_root2"
 FORMAL_DIR="$orig_formal_dir2"
 rm -rf "$nrepo"
+
+# --- (o)-(p) issue #1356/#1357 finding 1: live gated by bands.tsv ----------
+# check_model must not run an area's live.cfg unless bands.tsv carries a row
+# for it (a measured band is the opt-in): unbanded reports SKIP and never
+# launches TLC, banded runs it. A java shim that writes a canned TLC-shaped
+# log and a marker file (instead of the real jar) proves both which path ran
+# and whether TLC was actually launched.
+build_fake_live_area() {
+    # build_fake_live_area <with-band: yes|no> -> sets FAKE_TMP, FAKE_SHIM.
+    local with_band="$1"
+    local tmp area_dir shim
+    tmp="$(mktemp -d)"
+    area_dir="$tmp/formal/tla/fakelive"
+    mkdir -p "$area_dir"
+    cat > "$area_dir/MCFake.tla" <<'EOF'
+---- MODULE MCFake ----
+====
+EOF
+    cat > "$area_dir/smoke.cfg" <<'EOF'
+SPECIFICATION Spec
+EOF
+    cat > "$area_dir/live.cfg" <<'EOF'
+SPECIFICATION Spec
+PROPERTY Prop
+EOF
+    if [ "$with_band" = yes ]; then
+        printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nlive.cfg\t50\t50\t5\t5\n' \
+            > "$area_dir/bands.tsv"
+    fi
+    shim="$tmp/java"
+    cat > "$shim" <<EOF
+#!/usr/bin/env bash
+touch "$tmp/java-ran"
+cat <<'LOG'
+100 states generated, 50 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 5.
+Model checking completed. No error has been found.
+LOG
+exit 0
+EOF
+    chmod +x "$shim"
+    FAKE_TMP="$tmp"
+}
+
+orig_formal_dir3="$FORMAL_DIR"
+orig_cache_dir3="$CACHE_DIR"
+orig_log_dir3="$LOG_DIR"
+orig_last_run3="$LAST_RUN"
+orig_java3="${JAVA:-}"
+orig_jar3="${JAR:-}"
+
+echo "--- (o) live: no bands.tsv row -> SKIP, TLC never invoked, exit 0"
+build_fake_live_area no
+FORMAL_DIR="$FAKE_TMP/formal/tla"
+CACHE_DIR="$FAKE_TMP/cache"
+LOG_DIR="$CACHE_DIR/logs"
+LAST_RUN="$CACHE_DIR/last-run.tsv"
+JAVA="$FAKE_TMP/java"
+JAR="/dev/null"
+resolve_timeout
+resolve_tla_resources
+oout="$(check_model fakelive live 2>&1)"; ocode=$?
+echo "    measured: exit=$ocode"
+if [ "$ocode" -eq 0 ]; then ok; else bad "o: expected exit 0 on an unbanded live skip, got $ocode; output: $oout"; fi
+if printf '%s' "$oout" | grep -qF "fakelive live: SKIP (unbanded live.cfg; add a bands.tsv row to enrol)"; then
+    ok
+else
+    bad "o: expected the SKIP message; output: $oout"
+fi
+if [ -e "$FAKE_TMP/java-ran" ]; then
+    bad "o: java shim ran despite the cfg being unbanded"
+else
+    ok
+fi
+rm -rf "$FAKE_TMP"
+
+echo "--- (p) live: bands.tsv carries a matching row -> runs and PASSes"
+build_fake_live_area yes
+FORMAL_DIR="$FAKE_TMP/formal/tla"
+CACHE_DIR="$FAKE_TMP/cache"
+LOG_DIR="$CACHE_DIR/logs"
+LAST_RUN="$CACHE_DIR/last-run.tsv"
+JAVA="$FAKE_TMP/java"
+JAR="/dev/null"
+resolve_timeout
+resolve_tla_resources
+pout="$(check_model fakelive live 2>&1)"; pcode=$?
+echo "    measured: exit=$pcode"
+if [ "$pcode" -eq 0 ]; then ok; else bad "p: expected exit 0 on a banded live pass, got $pcode; output: $pout"; fi
+if [ -e "$FAKE_TMP/java-ran" ]; then
+    ok
+else
+    bad "p: expected the java shim to be launched once the cfg is banded; output: $pout"
+fi
+if printf '%s' "$pout" | grep -qF "fakelive/MCFake live: PASS"; then
+    ok
+else
+    bad "p: expected a PASS line for fakelive/MCFake; output: $pout"
+fi
+rm -rf "$FAKE_TMP"
+
+FORMAL_DIR="$orig_formal_dir3"
+CACHE_DIR="$orig_cache_dir3"
+LOG_DIR="$orig_log_dir3"
+LAST_RUN="$orig_last_run3"
+JAVA="$orig_java3"
+JAR="$orig_jar3"
 
 rm -f "$LIB_SRC"
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
