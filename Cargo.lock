@@ -4835,6 +4835,7 @@ dependencies = [
 name = "ravel-operator"
 version = "0.14.0"
 dependencies = [
+ "blake3",
  "clap",
  "futures",
  "hex",
