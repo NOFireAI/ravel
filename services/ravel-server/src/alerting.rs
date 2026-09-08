@@ -81,7 +81,7 @@ use ravel_commit::{keys, publish, record};
 use ravel_ingest::{Clock, LOG_SEGMENT_FORMAT_VERSION};
 use ravel_logseg::{ObjectIdentity, Predicate, RlogConfig, RlogReader};
 use ravel_object_store::{
-    GetRange, ObjectMeta, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all,
+    GetRange, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions, StoreError,
 };
 use ravel_promql::Value as PromqlValue;
 use ravel_query::{Coverage, QueryEngine};
@@ -1106,7 +1106,7 @@ impl AlertEvaluator {
     /// Full fold over the whole alert commit history, keyed by fold order.
     async fn full_fold(&self) -> anyhow::Result<FoldedByOrder> {
         let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
-        let entries = list_all(self.store.as_ref(), &prefix).await?;
+        let entries = list_all_after(self.store.as_ref(), &prefix, None).await?;
         let mut best = HashMap::new();
         self.fold_commit_entries(entries, &mut best).await?;
         Ok(best)
@@ -1122,7 +1122,7 @@ impl AlertEvaluator {
     async fn fold_tail(&self, best: &mut FoldedByOrder, watermark_hour: u32) -> anyhow::Result<()> {
         let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
         let start_after = format!("{prefix}{}", keys::ingest_hour_string(watermark_hour));
-        let entries = list_all_after(self.store.as_ref(), &prefix, &start_after).await?;
+        let entries = list_all_after(self.store.as_ref(), &prefix, Some(&start_after)).await?;
         self.fold_commit_entries(entries, best).await
     }
 
@@ -1240,28 +1240,84 @@ fn flatten_fold(best: FoldedByOrder) -> HashMap<AlertId, AlertRecord> {
         .collect()
 }
 
-/// Drain every page of a `start-after` listing, the [`list_all`] analogue for
-/// [`ObjectStoreBackend::list_after`]. Every returned key sorts strictly after
-/// `start_after`.
+/// Page ceiling for one listing drain over the alert commit prefix.
+///
+/// The prefix is a single shard per tenant, and at the object store's 1000-key
+/// page size this bounds one drain to 100 million keys, far above any tenant's
+/// cumulative alert-transition count (the history grows without maintenance,
+/// but not that fast). It only ever trips on a backend that never terminates.
+/// The repeated-token guard below catches the common spin (a backend returning
+/// the same continuation token) on the second page; this ceiling is the
+/// backstop for a token that keeps changing without advancing.
+const MAX_LIST_PAGES: usize = 100_000;
+
+/// A paged listing failed to terminate. Both variants mean the backend kept
+/// reporting "another page" without making progress; draining returns the
+/// error rather than spinning forever (the seen-set would suppress the
+/// duplicate keys but never break the loop).
+#[derive(Debug, thiserror::Error)]
+enum ListDrainError {
+    #[error("listing under {prefix:?} repeated its continuation token; refusing to spin")]
+    RepeatedToken { prefix: String },
+    #[error("listing under {prefix:?} exceeded the {ceiling}-page ceiling")]
+    PageCeiling { prefix: String, ceiling: usize },
+}
+
+/// Drain every page of a listing under `prefix`, deduplicating by key. With
+/// `start_after` set, every returned key sorts strictly after it (`list_after`
+/// with `None` is identical to `list`, per the object-store contract), so this
+/// serves both the full fold (`None`) and the tail fold (`Some(cursor)`).
+///
+/// The loop terminates on `page.next == None`, on a repeated continuation
+/// token, or at [`MAX_LIST_PAGES`]; the last two are typed errors, never a
+/// spin.
 async fn list_all_after(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
-    start_after: &str,
+    start_after: Option<&str>,
+) -> anyhow::Result<Vec<ObjectMeta>> {
+    drain_pages(store, prefix, start_after, MAX_LIST_PAGES).await
+}
+
+/// [`list_all_after`] with an explicit page ceiling, so a test can exercise the
+/// [`ListDrainError::PageCeiling`] path without draining 100 000 pages.
+async fn drain_pages(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    start_after: Option<&str>,
+    max_pages: usize,
 ) -> anyhow::Result<Vec<ObjectMeta>> {
     let mut out: Vec<ObjectMeta> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut page_token = None;
+    let mut page_token: Option<PageToken> = None;
+    let mut prev_token: Option<PageToken> = None;
+    let mut pages = 0usize;
     loop {
-        let page = store
-            .list_after(prefix, Some(start_after), page_token)
-            .await?;
+        if pages >= max_pages {
+            return Err(ListDrainError::PageCeiling {
+                prefix: prefix.to_string(),
+                ceiling: max_pages,
+            }
+            .into());
+        }
+        pages += 1;
+        let page = store.list_after(prefix, start_after, page_token).await?;
         for meta in page.objects {
             if seen.insert(meta.key.clone()) {
                 out.push(meta);
             }
         }
         match page.next {
-            Some(next) => page_token = Some(next),
+            Some(next) => {
+                if prev_token.as_ref() == Some(&next) {
+                    return Err(ListDrainError::RepeatedToken {
+                        prefix: prefix.to_string(),
+                    }
+                    .into());
+                }
+                prev_token = Some(next.clone());
+                page_token = Some(next);
+            }
             None => break,
         }
     }
@@ -1818,8 +1874,9 @@ mod tests {
 mod tick_tests {
     use super::*;
 
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
+    use async_trait::async_trait;
     use ravel_alerting::build_transition_record;
     use ravel_catalog::{Catalog, CatalogConfig};
     use ravel_object_store::InstrumentedStore;
@@ -1827,6 +1884,7 @@ mod tick_tests {
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule as FaultRule, ScriptedFault,
     };
     use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{Capabilities, DelimitedList, GetOutcome, ListPage, PutOutcome};
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
     use ravel_types::{Label, LabelSet, Sample, SeriesId};
@@ -2020,7 +2078,7 @@ mod tick_tests {
             keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
         let cfg = RlogConfig::default();
         let mut out = Vec::new();
-        for meta in list_all(store, &prefix).await.expect("list") {
+        for meta in list_all_after(store, &prefix, None).await.expect("list") {
             // Skip anything that is not an L0 commit record (e.g. the
             // compaction-record test injects one under this prefix).
             if !matches!(
@@ -2932,6 +2990,222 @@ mod tick_tests {
             via_memo.get(&alert_id).map(|r| r.state),
             Some(AlertState::Resolved),
             "the late Resolved from the overlapping prior holder is not lost"
+        );
+    }
+
+    /// A failed encode never overwrites the prior memo (finding 1, issue #1294).
+    /// The old `encode` returned an empty `Vec` on a serialize failure, so the
+    /// writer put a zero-byte object over a good memo; now the write path
+    /// propagates the encode error and issues no `put` at all.
+    #[tokio::test]
+    async fn a_failed_encode_writes_nothing_and_leaves_the_prior_memo() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+
+        // Seed a good, readable memo.
+        let prior = AlertStateMemo {
+            watermark_hour: 5,
+            records: HashMap::new(),
+        };
+        write_alert_state_memo(&store, &tenant, &prior)
+            .await
+            .expect("seed prior memo");
+        assert_eq!(
+            store.metrics().snapshot().put.calls,
+            1,
+            "the seeding write issued exactly one put"
+        );
+
+        // A write whose encode fails must short-circuit before the put.
+        let err = crate::alert_state_memo::write_with_failing_encode_for_test(&store, &tenant)
+            .await
+            .expect_err("a failing encode is propagated");
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::alert_state_memo::MemoError>(),
+                Some(crate::alert_state_memo::MemoError::Encode(_))
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.metrics().snapshot().put.calls,
+            1,
+            "the failed encode issued no additional put"
+        );
+
+        // The prior memo is untouched and still readable.
+        let surviving = read_alert_state_memo(&store, &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the failed encode left the prior memo in place");
+        assert_eq!(surviving.watermark_hour, 5, "the prior watermark is intact");
+    }
+
+    /// A store whose `list_after` never signals a last page: it always reports
+    /// another page. With `distinct` it hands back a fresh continuation token
+    /// each call (exercising the page ceiling); otherwise it repeats one token
+    /// (exercising the repeated-token guard). Every call is counted.
+    struct NeverEndingList {
+        inner: MemoryStore,
+        calls: AtomicUsize,
+        distinct: bool,
+    }
+
+    impl NeverEndingList {
+        fn new(distinct: bool) -> Self {
+            NeverEndingList {
+                inner: MemoryStore::new(),
+                calls: AtomicUsize::new(0),
+                distinct,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for NeverEndingList {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let token = if self.distinct {
+                PageToken(format!("tok-{n}"))
+            } else {
+                PageToken("stuck".to_string())
+            };
+            Ok(ListPage {
+                objects: Vec::new(),
+                next: Some(token),
+            })
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A backend that repeats one continuation token is a typed error on the
+    /// second page, never an infinite loop (finding 2, issue #1294).
+    #[tokio::test]
+    async fn a_repeated_continuation_token_is_a_typed_error_after_two_pages() {
+        let store = NeverEndingList::new(false);
+        let err = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect_err("a repeated token must not spin");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::RepeatedToken { .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the repeat is detected on exactly the second page"
+        );
+    }
+
+    /// A backend whose token keeps changing without ever ending trips the page
+    /// ceiling at exactly `max_pages` pages (finding 2, issue #1294).
+    #[tokio::test]
+    async fn an_ever_advancing_token_trips_the_page_ceiling_exactly() {
+        let store = NeverEndingList::new(true);
+        let err = drain_pages(&store, "p/", None, 3)
+            .await
+            .expect_err("an unbounded listing must stop at the ceiling");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::PageCeiling { ceiling: 3, .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            3,
+            "exactly three pages are drained before the ceiling fires"
+        );
+    }
+
+    /// The shared helper dedupes by key and returns keys in order across pages,
+    /// through both the `None` (full) and `Some` (tail) cursor modes.
+    #[tokio::test]
+    async fn list_all_after_dedupes_and_orders_through_both_cursor_modes() {
+        // Page size 2 forces three pages over five keys.
+        let store = MemoryStore::with_page_size(2);
+        for key in ["p/a", "p/b", "p/c", "p/d", "p/e"] {
+            store
+                .put(
+                    key,
+                    Bytes::from_static(b"x"),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("seed key");
+        }
+
+        let all: Vec<String> = list_all_after(&store, "p/", None)
+            .await
+            .expect("full drain")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            all,
+            vec!["p/a", "p/b", "p/c", "p/d", "p/e"],
+            "the full drain returns every key once, in order"
+        );
+
+        let tail: Vec<String> = list_all_after(&store, "p/", Some("p/c"))
+            .await
+            .expect("tail drain")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            tail,
+            vec!["p/d", "p/e"],
+            "the tail drain skips keys at or before the cursor"
         );
     }
 }
