@@ -4269,6 +4269,21 @@ mod tests {
         TenantHash([0xab; 16])
     }
 
+    /// A `(range, now_ns)` pair whose [`Catalog::window_hour_bounds`] covers
+    /// hours `[0, 50]`: wide enough to intersect every single-part fixture
+    /// `install_stats` builds (`min_hour: 0, watermark_hour: 10`), for tests
+    /// that only care about column-stats reuse/fallback behavior and not
+    /// window-scoped part selection itself.
+    fn full_window() -> (TimeRange, i64) {
+        (
+            TimeRange {
+                start_ns: 0,
+                end_ns: 50 * NS_PER_HOUR,
+            },
+            50 * NS_PER_HOUR,
+        )
+    }
+
     fn content_hash_for(payload: &[u8]) -> [u8; 32] {
         *blake3::hash(payload).as_bytes()
     }
@@ -7597,8 +7612,9 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
         let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
         let loaded = catalog
-            .load_column_stats(&tenant(), signal, &acc)
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -7991,9 +8007,10 @@ mod tests {
         };
         let _default = tracing::subscriber::set_default(subscriber);
 
+        let (range, now_ns) = full_window();
         for _ in 0..3 {
             let got = catalog
-                .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+                .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
                 .await
                 .expect("load ok");
             assert!(got.is_none(), "a refused decode degrades to Ok(None)");
@@ -8054,8 +8071,9 @@ mod tests {
         };
         let _default = tracing::subscriber::set_default(subscriber);
 
+        let (range, now_ns) = full_window();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok");
         assert!(first.is_none());
@@ -8100,7 +8118,7 @@ mod tests {
         }
 
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok");
         assert!(second.is_none());
@@ -8138,8 +8156,9 @@ mod tests {
         };
         let _default = tracing::subscriber::set_default(subscriber);
 
+        let (range, now_ns) = full_window();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok");
         assert!(first.is_none());
@@ -8158,7 +8177,7 @@ mod tests {
         .await;
 
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok");
         assert!(second.is_none());
@@ -8186,8 +8205,9 @@ mod tests {
         };
         let _default = tracing::subscriber::set_default(subscriber);
 
+        let (range, now_ns) = full_window();
         let got = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok");
         assert!(got.is_none(), "no HEAD means no statistics");
@@ -8215,9 +8235,10 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
+        let (range, now_ns) = full_window();
         let acc1 = QueryAccounting::new();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc1)
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc1)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -8229,7 +8250,7 @@ mod tests {
 
         let acc2 = QueryAccounting::new();
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc2)
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc2)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -8263,9 +8284,10 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
+        let (range, now_ns) = full_window();
         let acc1 = QueryAccounting::new();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc1)
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc1)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -8277,7 +8299,7 @@ mod tests {
 
         let acc2 = QueryAccounting::new();
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc2)
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &acc2)
             .await
             .expect("load ok")
             .expect("stats present");
@@ -8316,6 +8338,7 @@ mod tests {
         let part_blake3 = (0..parts).map(|i| [i as u8; 32]).collect();
         Arc::new(LoadedColumnStats {
             segments,
+            by_content_hash: HashMap::new(),
             part_blake3,
         })
     }
@@ -8344,7 +8367,11 @@ mod tests {
         );
 
         let cache = ColumnStatsCache::new(1 << 20);
-        cache.insert((tenant(), Signal::Logs), [1u8; 32], Arc::clone(&loaded));
+        cache.insert(
+            (tenant(), Signal::Logs, 0, 50),
+            [1u8; 32],
+            Arc::clone(&loaded),
+        );
         assert_eq!(
             cache.held_bytes(),
             expected,
@@ -8365,9 +8392,9 @@ mod tests {
         let b = entry.heap_bytes();
         let cache = ColumnStatsCache::new(2 * b);
 
-        let ka = (tenant_n(1), Signal::Logs);
-        let kb = (tenant_n(2), Signal::Logs);
-        let kc = (tenant_n(3), Signal::Logs);
+        let ka = (tenant_n(1), Signal::Logs, 0, 50);
+        let kb = (tenant_n(2), Signal::Logs, 0, 50);
+        let kc = (tenant_n(3), Signal::Logs, 0, 50);
         // Lookups still verify the part binding against the loaded object's
         // own copy; the cache stores no duplicate.
         let parts = entry.part_blake3.clone();
@@ -8410,14 +8437,26 @@ mod tests {
         let b = entry.heap_bytes();
 
         let cache = ColumnStatsCache::new(b);
-        cache.insert((tenant_n(1), Signal::Logs), [1u8; 32], Arc::clone(&entry));
-        cache.insert((tenant_n(2), Signal::Logs), [1u8; 32], Arc::clone(&entry));
+        cache.insert(
+            (tenant_n(1), Signal::Logs, 0, 50),
+            [1u8; 32],
+            Arc::clone(&entry),
+        );
+        cache.insert(
+            (tenant_n(2), Signal::Logs, 0, 50),
+            [1u8; 32],
+            Arc::clone(&entry),
+        );
         assert_eq!(cache.evictions(), 1, "one eviction, counted once");
         assert_eq!(cache.refusals(), 0, "an eviction is not a refusal");
 
         // An object larger than the whole budget: refused, not evicted.
         let refuse_cache = ColumnStatsCache::new(b - 1);
-        refuse_cache.insert((tenant_n(1), Signal::Logs), [1u8; 32], Arc::clone(&entry));
+        refuse_cache.insert(
+            (tenant_n(1), Signal::Logs, 0, 50),
+            [1u8; 32],
+            Arc::clone(&entry),
+        );
         assert_eq!(refuse_cache.refusals(), 1, "oversized object refused once");
         assert_eq!(
             refuse_cache.evictions(),
@@ -8459,8 +8498,9 @@ mod tests {
             },
         )
         .expect("catalog");
+        let (range, now_ns) = full_window();
         let fresh_a = disabled
-            .load_column_stats(&ta, Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&ta, Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok")
             .expect("stats present");
@@ -8483,7 +8523,7 @@ mod tests {
         .expect("catalog");
 
         catalog
-            .load_column_stats(&ta, Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&ta, Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok")
             .expect("stats present");
@@ -8494,7 +8534,7 @@ mod tests {
         );
 
         catalog
-            .load_column_stats(&tb, Signal::Logs, &QueryAccounting::new())
+            .load_column_stats(&tb, Signal::Logs, range, now_ns, &QueryAccounting::new())
             .await
             .expect("load ok")
             .expect("stats present");
@@ -8507,7 +8547,7 @@ mod tests {
         // Reload A: its entry was evicted, so this re-fetches (two GETs).
         let acc_reload = QueryAccounting::new();
         let reloaded_a = catalog
-            .load_column_stats(&ta, Signal::Logs, &acc_reload)
+            .load_column_stats(&ta, Signal::Logs, range, now_ns, &acc_reload)
             .await
             .expect("load ok")
             .expect("stats present");
