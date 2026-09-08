@@ -107,6 +107,51 @@ pub fn store_and_metrics_from_env(
     }
 }
 
+/// Whether a request against `kind`'s backend is billed: false on
+/// `MemoryStore` and on any store behind a configured endpoint (a local
+/// MinIO reached over `RAVEL_S3_ENDPOINT`; ADR-0927 decision 10 is exactly
+/// this -- MinIO is valid for correctness, conformance and CI, never for a
+/// performance or cost claim, because removing per-request fees is what
+/// makes a request-count defect invisible), true only for real S3 with no
+/// endpoint override. The one place every `--store`-driven bin derives this
+/// instead of re-deriving it from `StoreKind` alone (issue #1352: two sites,
+/// `metricsbench_ingest` and `bench_report`, derived it as `matches!(store,
+/// StoreKind::S3)`, which is also true against a billed-nothing MinIO
+/// endpoint).
+pub fn backend_bills_requests(kind: StoreKind) -> bool {
+    backend_bills_requests_from_lookup(kind, |key| std::env::var(key).ok())
+}
+
+/// [`backend_bills_requests`]'s logic over an injected lookup, for the same
+/// reason [`s3_config_from_lookup`] exists: testable without
+/// `std::env::set_var` (`unsafe` under the 2024 edition) and without racing
+/// other tests over global process env state.
+fn backend_bills_requests_from_lookup(
+    kind: StoreKind,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> bool {
+    match kind {
+        StoreKind::Memory => false,
+        StoreKind::S3 => lookup("RAVEL_S3_ENDPOINT").is_none(),
+    }
+}
+
+/// The configured S3 endpoint's host, when `RAVEL_S3_ENDPOINT` is set. Host
+/// only: never the scheme, path, or any embedded userinfo credentials, so a
+/// report can name the substrate without ever carrying a secret.
+pub fn endpoint_host_from_env() -> Option<String> {
+    endpoint_host_from_lookup(|key| std::env::var(key).ok())
+}
+
+/// [`endpoint_host_from_env`]'s logic over an injected lookup; see
+/// [`backend_bills_requests_from_lookup`].
+fn endpoint_host_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let raw = lookup("RAVEL_S3_ENDPOINT")?;
+    reqwest::Url::parse(&raw)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +219,32 @@ mod tests {
     fn unrecognized_auth_value_defaults_to_static() {
         let cfg = s3_config_from_lookup(lookup(&[("RAVEL_S3_AUTH", "Instance-Role")]));
         assert_eq!(cfg.auth, S3AuthMode::Static);
+    }
+
+    /// Issue #1352: `matches!(args.store, StoreKind::S3)` alone reported the
+    /// nightly MinIO lane (S3 protocol, `RAVEL_S3_ENDPOINT=http://
+    /// localhost:9000`) as billing requests, when MinIO bills nothing.
+    /// `backend_bills_requests` is true only for real S3 with no endpoint
+    /// override; a configured endpoint or a `MemoryStore` are both false.
+    #[test]
+    fn backend_bills_requests_is_false_behind_a_configured_endpoint() {
+        assert!(
+            !backend_bills_requests_from_lookup(
+                StoreKind::S3,
+                lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
+            ),
+            "S3 behind a configured endpoint (MinIO) must not report billing"
+        );
+        assert!(
+            backend_bills_requests_from_lookup(StoreKind::S3, lookup(&[])),
+            "S3 with no endpoint override is real S3 and must report billing"
+        );
+        assert!(
+            !backend_bills_requests_from_lookup(
+                StoreKind::Memory,
+                lookup(&[("RAVEL_S3_ENDPOINT", "http://localhost:9000")]),
+            ),
+            "MemoryStore requests are free regardless of any configured S3 endpoint"
+        );
     }
 }
