@@ -99,6 +99,12 @@ CONSTANTS
                                 \* (erasure_seal_wait_bound_ns): the single open
                                 \* bucket, opened at clock 0, may only be sealed once
                                 \* the clock has reached this bound (issue #1290).
+                                \* ASSUME SealBound =< MaxClock (below) keeps the
+                                \* seal reachable: at SealBound > MaxClock SealBucket
+                                \* is never enabled, so the open-bucket guard would
+                                \* hold vacuously and the invariant would pass by
+                                \* absence. The ASSUME makes TLC fail closed on such
+                                \* a configuration instead.
     CompletionIgnoresOpenBucket \* negative control (base FALSE): completion drops
                                 \* the ack-open-bucket guard, so a .done can land
                                 \* while a bucket open at the acknowledgement is still
@@ -108,6 +114,10 @@ ASSUME ProtectionHorizon \in Nat /\ Grace \in Nat
 ASSUME SealBound \in Nat
 ASSUME MaxQueryDuration \in Nat /\ ClockSkew \in Nat
 ASSUME MaxClock \in Nat
+\* Keep the seal reachable inside the clock bound: at SealBound > MaxClock the
+\* SealBucket guard (clock >= SealBound) is never enabled, so the open-bucket
+\* completion guard would hold vacuously. This fails closed on such a config.
+ASSUME SealBound =< MaxClock
 \* The GC startup inequality (gc_config.rs::satisfies_constraint) is a precondition
 \* on the configuration the maintainer runs with, enforced at startup and never
 \* re-checked per state. It is an ASSUME here, not a state invariant (finding 9):
