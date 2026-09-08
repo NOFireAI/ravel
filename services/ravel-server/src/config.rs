@@ -783,9 +783,11 @@ pub struct Cli {
     /// they inflate: each decompressed chunk is charged before it is retained,
     /// and the inflate is retained as those exactly-sized chunks rather than
     /// appended into one growing buffer, so the charge equals the bytes held at
-    /// every instant and the only uncharged allocations are the bounded 64 KiB
-    /// staging chunk the decoder reads into and per-chunk bookkeeping under
-    /// 0.1% of the charged bytes. A decompression whose running charge would
+    /// every instant and the only uncharged allocations are one fixed 64 KiB
+    /// staging chunk the decoder reads into per in-flight inflate, plus
+    /// per-chunk bookkeeping -- a fixed cost, not a share of the charged
+    /// bytes, so it can exceed the charge itself on a small decompressed
+    /// body. A decompression whose running charge would
     /// cross the ceiling is shed mid-inflate instead of being allocated in
     /// full. A request whose charge would push the gauge past this ceiling
     /// is shed before any buffering -- HTTP 429 with `Retry-After`, gRPC
