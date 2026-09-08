@@ -40,12 +40,9 @@ fn run_lane() -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("stdout is a JSON report")
 }
 
-/// Run the bin over the `ci` profile's FULL step count (no `--steps`
-/// override): the two decision-11 figures sourced from the generator's exact
-/// output (`total_series_created`, `logical_input_bytes`) are only
-/// comparable to the profile's declared figures over a complete run, not a
-/// truncated one.
-fn run_lane_full_profile() -> serde_json::Value {
+/// Run the bin over the `ci` profile for exactly `steps` scrapes (no
+/// assumption that `steps` covers the profile's full declared step count).
+fn run_lane_with_steps(steps: u64) -> serde_json::Value {
     let bin = env!("CARGO_BIN_EXE_metricsbench_ingest");
     let output = Command::new(bin)
         .args([
@@ -53,6 +50,8 @@ fn run_lane_full_profile() -> serde_json::Value {
             "ci",
             "--store",
             "memory",
+            "--steps",
+            &steps.to_string(),
             "--shards",
             "2",
             "--batch-size",
@@ -146,9 +145,18 @@ fn the_ingest_lane_is_reachable_from_the_bin_and_ravel_is_durable_on_ack() {
 }
 
 /// ADR-0927 decision 11: the artifact carries a top-level `profile` block
-/// naming the `ci` profile as non-comparable, with its reason, and the nine
-/// pre-registered/generator-exact figures -- not a set of numbers a reader
-/// could mistake for a comparable result.
+/// naming the `ci` profile as non-comparable, with its reason, the
+/// pre-registered declared figures, and (under `run`) the generator-exact
+/// figures for the steps this run actually generated -- not a set of numbers
+/// a reader could mistake for a comparable result.
+///
+/// The `ci` profile's full declared run (120 steps, `samples_per_series`)
+/// measures ~64s unoptimized on this host, over the 60s this test must stay
+/// under, so this drives the bin over a short, deliberately truncated
+/// `--steps` count instead and asserts `run`'s figures against the
+/// generator's own [`ravel_bench::metrics_gen::Generator::total_series_created`]
+/// for that exact step count -- never a re-typed formula -- while the
+/// declared figures are still asserted against the manifest.
 ///
 /// TO SEE THIS FAIL against the pre-fix binary: drop `.with_profile(profile_record)`
 /// in `metricsbench_ingest`'s `run`; the top-level `profile` key is then absent
@@ -165,10 +173,15 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         .expect("manifest declares a `ci` profile");
     let expected_label_cardinalities = workload.label_cardinalities(expected);
 
-    // No `--steps` override: the generator-exact figures (`total_series_created`,
-    // `logical_input_bytes`) are only comparable to the profile's declared
-    // figures over a full run.
-    let report = run_lane_full_profile();
+    // A deliberate truncation: far under the profile's declared
+    // `samples_per_series` (120), so the run finishes fast regardless of host
+    // load.
+    const STEPS: u64 = 5;
+    let generator = ravel_bench::metrics_gen::Generator::new(&workload, "ci", 0)
+        .expect("generator builds for the ci profile");
+    let expected_total_series_created = generator.total_series_created(STEPS);
+
+    let report = run_lane_with_steps(STEPS);
     let profile = &report["profile"];
 
     assert_eq!(
@@ -208,16 +221,16 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         profile["churn_basis_points_per_hour"].as_u64(),
         Some(expected.churn_basis_points_per_hour)
     );
-    // A full, untruncated run: steps_run equals the profile's own declared
-    // step count.
+    // A deliberately truncated run: steps_run is this test's short STEPS, not
+    // the profile's full declared step count.
     assert_eq!(
         profile["steps_declared"].as_u64(),
         Some(expected.samples_per_series)
     );
-    assert_eq!(
-        profile["steps_run"].as_u64(),
-        profile["steps_declared"].as_u64(),
-        "run_lane_full_profile() takes no --steps override, so the run is complete"
+    assert_eq!(profile["steps_run"].as_u64(), Some(STEPS));
+    assert!(
+        STEPS < expected.samples_per_series,
+        "STEPS must actually truncate the profile for this test to exercise that path"
     );
     let run = &profile["run"];
     assert_eq!(
@@ -225,14 +238,10 @@ fn ci_profile_artifact_is_marked_non_comparable_and_carries_the_profile_figures(
         profile["steps_run"].as_u64(),
         "run.steps must name the same basis as steps_run"
     );
-    // `ci` declares zero churn, so the generator creates exactly the active
-    // set and no churned-in cohorts: the generator's exact count and the
-    // manifest's declared count coincide, and either is the correct
-    // expectation here.
     assert_eq!(
         run["total_series_created"].as_u64(),
-        Some(expected.active_series),
-        "with zero churn, total series created must equal the declared active set"
+        Some(expected_total_series_created),
+        "total series created must match the generator's own count for this run's steps"
     );
     assert!(
         run["logical_input_bytes"].as_u64().is_some_and(|b| b > 0),
