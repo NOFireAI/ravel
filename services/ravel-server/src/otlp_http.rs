@@ -292,7 +292,7 @@ fn decompress_gzip_capped_charged(
     let mut charges = Vec::new();
     let mut produced: u64 = 0;
     // A fixed staging buffer so the charge granularity is bounded and the peak
-    // uncharged allocation is at most one chunk.
+    // uncharged allocation of decompressed bytes is at most one chunk.
     let mut staging = [0u8; INFLATE_CHUNK_BYTES];
     loop {
         let read = decoder
