@@ -232,10 +232,23 @@ enum GzipDecodeError {
 /// see [`ChunkedBody`] for why an amortized-growth buffer cannot be charged
 /// honestly.
 ///
-/// The decoder is read through `take(cap + 1)` so the output buffer can never
-/// grow past `cap + 1` before the size check runs, which refuses a bomb as it
-/// inflates rather than after the allocation the attack targets has already
-/// happened (`ravel-otap`'s `decompress_capped` discipline).
+/// Each read is handled in a fixed order, and the order is load-bearing:
+///
+/// 1. **Cap**: the projected size (bytes produced so far plus this read) is
+///    checked against `cap` first, so a body that inflates past the cap is
+///    refused with [`GzipDecodeError::TooLarge`] at the first byte past it. An
+///    over-cap body is therefore never charged for the crossing chunk, which is
+///    what keeps it a 413 rather than a 429 the budget happens to raise first,
+///    and it stops inflating instead of expanding to `cap + 1`.
+/// 2. **Budget**: only a within-cap chunk is charged against `budget`, so the
+///    charge for an over-cap body peaks at `cap` exactly.
+/// 3. **Retain**: only a chunk that is both within the cap and charged for is
+///    copied into the returned list, so no retained byte is ever uncharged and
+///    no over-cap byte is ever retained.
+///
+/// The decoder is additionally read through `take(cap + 1)`, so even a decoder
+/// that returned one huge read could not expand past `cap + 1` before step 1
+/// runs (`ravel-otap`'s `decompress_capped` discipline).
 ///
 /// Uses [`MultiGzDecoder`], not `GzDecoder`: a concatenated multi-member stream
 /// is legal gzip that ordinary tooling produces, and a plain `GzDecoder` would
@@ -271,6 +284,13 @@ fn decompress_gzip_capped_charged(
         if read == 0 {
             break;
         }
+        // Cap first, on the projected size: an over-cap body is refused at the
+        // first byte past the cap, before that chunk is charged or retained, so
+        // it cannot be answered 429 by a budget rejection on a chunk the cap
+        // already condemns.
+        if produced + read as u64 > cap_u64 {
+            return Err(GzipDecodeError::TooLarge);
+        }
         // Charge before the chunk is allocated: if the ceiling is crossed,
         // nothing is retained here and every guard taken so far drops on return.
         match budget.try_charge(read as u64) {
@@ -282,9 +302,6 @@ fn decompress_gzip_capped_charged(
         // copies of the inflate at the same instant.
         chunks.push(Bytes::copy_from_slice(&staging[..read]));
         produced += read as u64;
-    }
-    if produced > cap_u64 {
-        return Err(GzipDecodeError::TooLarge);
     }
     Ok((chunks, charges))
 }
@@ -1237,9 +1254,10 @@ pub(crate) mod tests {
     /// expanding, without the process allocating the full expansion (the decoder
     /// is read through `take(cap + 1)`, so at most 64 MiB + 1 is ever buffered).
     ///
-    /// Non-vacuity: revert `decompress_gzip_capped_charged`'s `if out.len() as u64 >
-    /// cap_u64 { return Err(TooLarge) }` and the oversized body flows on to
-    /// prost as a truncated buffer, turning the 413 into a 400.
+    /// Non-vacuity: delete `decompress_gzip_capped_charged`'s projected-size cap
+    /// check (`if produced + read as u64 > cap_u64 { return Err(TooLarge) }`) and
+    /// the oversized body flows on to prost as a truncated buffer, turning the
+    /// 413 into a 400.
     #[tokio::test]
     async fn gzip_bomb_over_cap_is_rejected_413() {
         let state = state_with_limits(AdmissionLimits::default());
@@ -1258,6 +1276,104 @@ pub(crate) mod tests {
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "an over-cap decompression must be 413"
+        );
+    }
+
+    /// Issue #1297 review finding 1: the decompressed cap is checked BEFORE the
+    /// budget charge, so a body inflating one byte past the cap is answered with
+    /// the documented 413 even when the budget has exactly the cap of headroom
+    /// and the crossing byte would not fit. The shed counter stays at zero (the
+    /// request was refused by the cap, not by backpressure) and every partial
+    /// charge taken while inflating is refunded, so the in-flight gauge returns
+    /// to zero.
+    ///
+    /// The ceiling is deliberately the cap exactly: that is the configuration in
+    /// which charging the crossing byte first is observable, because the byte
+    /// past the cap is also the byte past the ceiling.
+    ///
+    /// Non-vacuity: move the cap check back after the loop (charge and retain
+    /// every chunk, then `if produced > cap_u64 { return Err(TooLarge) }`) and
+    /// the crossing byte is charged before the cap is consulted, so the budget
+    /// rejects it and the handler answers 429 where 413 is asserted.
+    #[tokio::test]
+    async fn over_cap_gzip_body_is_413_even_when_the_ceiling_equals_the_cap() {
+        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(
+            MAX_DECOMPRESSED_OTLP_BODY_BYTES as u64,
+        ));
+        let state = state_with_store_and_budget(
+            Arc::new(MemoryStore::new()),
+            AdmissionLimits::default(),
+            budget.clone(),
+        );
+        // Exactly one byte past the cap: zeros, so the compressed body stays
+        // small and the cap (not the wire-body limit) is what trips.
+        let one_past_cap = vec![0u8; MAX_DECOMPRESSED_OTLP_BODY_BYTES + 1];
+        let compressed = gzip(&one_past_cap);
+
+        let response = export_metrics(State(state), gzip_headers(), Bytes::from(compressed)).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an over-cap inflate is refused by the cap, so 413 and never the budget's 429"
+        );
+        assert_eq!(
+            budget.shed_total(),
+            0,
+            "the cap rejection is not a budget shed, so the shed counter is untouched"
+        );
+        assert_eq!(
+            budget.in_flight_bytes(),
+            0,
+            "every chunk charged while inflating is refunded on the cap rejection"
+        );
+    }
+
+    /// Issue #1297 review finding 1, the accounting half: the charge taken for a
+    /// body that inflates past the cap peaks at the cap EXACTLY. The budget's own
+    /// gate is the sampler, since a rejected inflate returns no charge guards to
+    /// read: at a ceiling of exactly `cap` the call is `TooLarge`, so no charge
+    /// ever exceeded the cap, and at one byte less it sheds, so the charge did
+    /// reach the cap. The two together pin the peak to `cap`.
+    ///
+    /// A small cap (four staging chunks) rather than the 64 MiB constant, so the
+    /// crossing read is the single last byte of a `cap + 1` body.
+    ///
+    /// Non-vacuity: move the cap check back after the loop and the crossing byte
+    /// is charged, pushing the charge to `cap + 1`; the ceiling-equals-cap case
+    /// then sheds and this observes `Shed` where `TooLarge` is asserted.
+    #[test]
+    fn over_cap_inflate_charge_peaks_at_the_cap_exactly() {
+        const CAP: usize = 4 * INFLATE_CHUNK_BYTES;
+        let one_past_cap = vec![0u8; CAP + 1];
+        let compressed = gzip(&one_past_cap);
+
+        let at_cap = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(CAP as u64));
+        let err = decompress_gzip_capped_charged(&compressed, CAP, &at_cap)
+            .expect_err("a body inflating past the cap is refused");
+        assert!(
+            matches!(err, GzipDecodeError::TooLarge),
+            "with the cap of headroom available the charge never crosses it, so this is \
+             TooLarge, not Shed: {err:?}"
+        );
+        assert_eq!(at_cap.shed_total(), 0, "no shed on the cap rejection");
+        assert_eq!(
+            at_cap.in_flight_bytes(),
+            0,
+            "the cap rejection refunds every charge it took"
+        );
+
+        let one_short = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(CAP as u64 - 1));
+        let err = decompress_gzip_capped_charged(&compressed, CAP, &one_short)
+            .expect_err("one byte less headroom than the cap cannot hold the inflate");
+        assert!(
+            matches!(err, GzipDecodeError::Shed),
+            "the charge reaches the cap exactly, so a ceiling one byte under it sheds: {err:?}"
+        );
+        assert_eq!(one_short.shed_total(), 1, "exactly one shed is counted");
+        assert_eq!(
+            one_short.in_flight_bytes(),
+            0,
+            "the shed refunds every chunk charged before it"
         );
     }
 
