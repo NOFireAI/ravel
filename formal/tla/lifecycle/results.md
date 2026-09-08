@@ -1346,3 +1346,109 @@ probe's depth. The `ci` and `exhaustive` lanes and the probe are confirmed by
 the PR's TLA lane, which provisions temurin 21 and runs `scripts/check-tla.sh`
 over the same constants. `python3 scripts/check_docs.py` exit 0, `docs gate:
 clean.`, was run locally.
+
+## Round eleven: a compaction publish stamps only inputs still present (review of round eight)
+
+`StartCompaction` moved the pass to `"listed"` but recorded nothing about which
+L0 inputs it resolved. `PublishCompaction` then superseded a static `RawInputs`
+and stamped `supersededAt` for it, with no check that the input was still there.
+`RetentionSweep` consults the tombstone and the HEAD, never `cmpPhase`, so a
+sweep firing while the pass sat in `"listed"` could delete the raw input; the
+later publish then superseded and stamped an object no longer present. The
+shipped compactor cannot do that: `compact_bucket_scoped` reads every input to
+build its output, so an input swept between listing and publish fails the pass
+rather than publishing over the gap.
+
+### The fix
+
+`StartCompaction` snapshots the live inputs it resolved into a new variable
+`cmpInputs`:
+
+```tla
+cmpInputs' = { o \in RawInputs : PresentObj(o) }
+```
+
+`PublishCompaction` guards on that snapshot and applies `superseded'` and
+`supersededAt'` over `cmpInputs`, not `RawInputs`, only after the check:
+
+```tla
+/\ \A o \in cmpInputs : PresentObj(o)
+...
+/\ superseded' = superseded \cup cmpInputs
+```
+
+A stale pass whose recorded input vanished must not strand the model in
+`"listed"`, so `CancelCompaction` returns such a pass to idle:
+
+```tla
+CancelCompaction ==
+    /\ cmpPhase = "listed"
+    /\ ~PresentObj("cmpA")
+    /\ \E o \in cmpInputs : ~PresentObj(o)
+    /\ cmpPhase' = "idle"
+    /\ cmpInputs' = {}
+    ...
+```
+
+`TypeOK` gains `cmpInputs \subseteq RawInputs`, `Init` sets `cmpInputs = {}`,
+and `FairSpec` adds `WF_vars(CancelCompaction)` so a compaction whose input was
+swept always aborts rather than stalling `EventuallyCompleted`. Adding a
+weak-fairness conjunct only removes behaviors, so the round-eight liveness
+properties `EventuallySwept` and `EventuallyCompleted` still hold; the
+exhaustive lane confirms both under `FairSpec`.
+
+### The probe
+
+An action property asserting that the `"listed"` to `"done"` transition (which
+is `PublishCompaction` and nothing else) only fires with every `RawInputs`
+object present, run against a scratch `MCLifecycleGC` under `/tmp` with
+`smoke.cfg`'s constants, `SPECIFICATION Spec`, `VIEW View`, and exactly one
+`PROPERTY`:
+
+```tla
+ProbeCompactionStampsPresentInput ==
+    [][ (cmpPhase = "listed" /\ cmpPhase' = "done")
+          => (\A o \in RawInputs : PresentObj(o)) ]_vars
+```
+
+Before the fix it is VIOLATED (TLC exit 13): `18989 states generated, 6862
+distinct states found`, depth 8. The 8-state trace is `Tick`, `StartCompaction`,
+`RetireBucket`, `Tick`, `DropRetiredBucketFromHead`, `RetentionSweep` (deletes
+`raw1`), `PublishCompaction`; at the last step `superseded` becomes `{"raw1"}`
+and `supersededAt["raw1"]` moves 0 to 1 while `raw1` is absent. This is the
+shipped configuration, every switch at its base value, not a switch-off branch.
+After the fix it holds over the complete graph (exit 0): `24004521 states
+generated, 3587643 distinct states found`, depth 30, because the guarded publish
+is disabled in that state and `CancelCompaction` fires instead. Full reasoning
+in `counterexamples/compaction-publish-presence-probe.md`.
+
+### Figures and the bands
+
+The snapshot removes the reachable states where a compaction published over an
+absent input and adds the `CancelCompaction` recovery states, and the net moves
+the complete graph down: both configs now reach `3587643` distinct states at
+depth 30, from round ten's `3786411` distinct at depth 30. `bands.tsv` moves to
+`3583300`-`3592000` for both `smoke.cfg` and `exhaustive.cfg`, the observed
+`3587643` with the same +/-0.12% margin the prior band carried. Depth is
+unchanged at 30.
+
+### Documentation reconciled
+
+`README.md`'s maintenance-pass description, its compaction paragraph, and its
+Liveness section now record the `cmpInputs` snapshot, the `PublishCompaction`
+presence guard, and `CancelCompaction` with its fairness. README, `results.md`
+and `bands.tsv` agree on the current figures: `3587643` distinct, depth `30`,
+band `3583300`-`3592000`.
+
+### Execution note
+
+TLC ran this round. The fleet executor carried no Java runtime, so a Temurin
+JRE 21 was fetched from Adoptium into `/tmp` and passed through
+`RAVEL_TLA_JAVA`; nothing from `/tmp` or `.cache` is committed. `scripts/check-tla.sh
+ci -a lifecycle` PASS (smoke `states=24004521 distinct=3587643 depth=30`, 84s;
+all eight negative controls VIOLATED as expected; traceability 20 rows resolve)
+and `scripts/check-tla.sh exhaustive -a lifecycle` PASS (`states=24004521
+distinct=3587643 depth=30`, 1103s, liveness under `FairSpec` included). The
+before/after probe figures above were measured on the same runtime with
+`-workers 2 -Xmx2g`. `python3 scripts/check_docs.py` exit 0, `docs gate:
+clean.`.

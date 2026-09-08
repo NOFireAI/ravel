@@ -38,6 +38,13 @@ as such and not checked here.
   between them. That split is what makes a decision taken against a listing
   observable as stale by the time it is acted on; a single atomic action cannot
   express it, and an invariant checked only over such an action holds vacuously.
+  Each publish is held to the input set its own listing resolved, not to a
+  static input set: `StartRewrite`/`StartCompaction` snapshot the live inputs
+  (`rwInputs`, `cmpInputs`), and `PublishRewrite`/`PublishCompaction` supersede
+  and stamp exactly that snapshot. `PublishCompaction` additionally requires
+  every recorded input still present, and `CancelCompaction` returns a pass
+  whose input vanished between listing and publish to idle, so a compaction can
+  never stamp or supersede an object retention swept after it listed.
 - A witness, `lastGc`, that records what a delete (or, for `CompleteErasure`,
   a completion write) OBSERVED at its own step: the hold state, the refresh
   state, the permitted-query needs, the HEAD-named subset, and whether a held
@@ -86,6 +93,19 @@ serialising the two passes per bucket. That serialisation is the
 it `FALSE` opens the residual window `cdce1722` names as an open gap closable
 only by a compare-and-swap or a claim on the bucket. See
 `counterexamples/compaction-ignores-rewrite.md` for both traces.
+
+`StartCompaction` records the live L0 inputs it resolved in `cmpInputs`, and
+`PublishCompaction` supersedes and stamps exactly that snapshot only after
+checking every recorded input is still present. This mirrors the shipped
+compactor, which reads each input to build its output and so fails a pass whose
+input was swept between listing and publish rather than publishing over the gap.
+An earlier draft superseded a static `RawInputs` unconditionally, so a
+`RetentionSweep` that deleted the raw input while the pass sat in `"listed"` let
+the publish stamp and supersede an object no longer present.
+`CancelCompaction` returns such a stale pass to idle so the presence guard does
+not strand it. `counterexamples/compaction-publish-presence-probe.md` records
+the probe: an action property that a compaction publish stamps only present
+inputs, violated before the guard and holding after.
 
 `TombstoneNotDeletedBeforeBucketEmpty` pins the last step of
 `physical_sweep`: the tombstone itself is only deleted once a fresh listing
@@ -277,8 +297,9 @@ what the invariants read, collapsing the space to a size TLC finishes quickly.
 `FairSpec` adds weak fairness to the maintainer sweeps, the fold's HEAD advance,
 erasure completion, the clock (`Tick`), pinned-query expiry (`ExpireQuery`), the
 first superseding rewrite's listing step (`StartRewrite`, restricted to firing
-while `superseded = {}`), and both publish steps (`PublishRewrite`,
-`PublishCompaction`). `PlaceHold`, `ReleaseHold`, `SetHeadState`, `SetRefresh`,
+while `superseded = {}`), both publish steps (`PublishRewrite`,
+`PublishCompaction`), and the compaction abort (`CancelCompaction`).
+`PlaceHold`, `ReleaseHold`, `SetHeadState`, `SetRefresh`,
 `ExpireLease`, and `StartCompaction` stay unfair: a legal hold is a business
 decision with no code-side release guarantee, nothing in the implementation
 guarantees a HEAD read recovers, a refresh eventually succeeds, or a lease
@@ -303,7 +324,10 @@ the whole reason its acknowledgement can land after its lease has moved, which
 is the behaviour issue #1221 asks about. Leaving `PublishCompaction` unfair
 would additionally let a compaction sit in `"listed"` forever and, under
 `SerializeCompactionAndRewrite`, block every rewrite behind a stall the
-implementation does not have.
+implementation does not have. `CancelCompaction` is fair for the same reason:
+once a recorded input is gone `PublishCompaction` is disabled, so the abort is
+the step that finishes a stale pass, and leaving it unfair would reopen the same
+`"listed"` stall the publish fairness closes.
 
 An earlier draft of `EventuallySwept` and `EventuallyCompleted` stated their
 hypothesis as "the environment eventually goes quiet" on the four unfair
@@ -378,5 +402,5 @@ steps and brought the complete search to depth 30, still deeper than the depth
 22 the previous bound reached, because the two-step passes and the lease expiry
 add steps to every behaviour. That is the same clock bound `smoke.cfg` uses, so
 the two lanes now explore the same state graph and what `exhaustive.cfg` adds is
-the liveness lane alone; `results.md`, "Round nine", records the current
+the liveness lane alone; `results.md`, "Round eleven", records the current
 figures.
