@@ -782,9 +782,8 @@ fn install_pipeline_sink(
         audit_mode: mode,
         channel_capacity: 64,
     };
-    let sink: Arc<dyn ravel_maintain::QueryAuditSink> = Arc::new(
-        ravel_maintain::AuditPipeline::spawn(store, tenant.hash(), config),
-    );
+    let sink: Arc<dyn ravel_maintain::QueryAuditSink> =
+        Arc::new(ravel_maintain::AuditPipeline::spawn(store, config));
     harness.service = RavelFlightSqlService::new(
         Arc::clone(&harness.executor),
         TestAuth::new(&[("acme", tenant)]),

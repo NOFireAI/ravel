@@ -231,6 +231,15 @@ records and cannot reach another tenant's. `attrs['query.tenant']` on a record
 is the hash of the tenant Ravel resolved for the audited request, which is the
 same tenant reading it back.
 
+That holds on the write side too. One process serves every tenant it
+authenticates, and one group-commit pipeline writes their query-audit records,
+but the tenant travels on each record rather than being fixed when the pipeline
+starts: a write groups the records it is flushing by tenant and stores each
+group under that tenant's own audit prefix. A deployment with no static tenant
+list, which is the usual OIDC and mTLS case, routes exactly the same way, and a
+batch that somehow mixed tenants is refused rather than filed under one of
+them.
+
 ## Cost
 
 An `audit` query reads through the same fetcher a `logs` query reads through, so
