@@ -36,12 +36,40 @@ struct KeyHash {
     g2: u64,
 }
 
+/// Test-only instrument: counts `key_hash` (BLAKE3) invocations on the current
+/// thread. Compiled only under `cfg(test)`, so it is present when the count
+/// test runs in the release test profile (unlike a `debug_assert` guard, which
+/// that profile strips). Thread-local, so parallel tests do not race a shared
+/// counter.
+#[cfg(test)]
+mod hash_calls {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn bump() {
+        CALLS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(super) fn reset() {
+        CALLS.with(|c| c.set(0));
+    }
+
+    pub(super) fn count() -> u64 {
+        CALLS.with(Cell::get)
+    }
+}
+
 /// `h = blake3(seed_le || column_id_le || token)`. `block` is bytes 0..8 LE,
 /// `g1` is bytes 8..16 LE, `g2` is bytes 16..24 LE with the low bit forced
 /// set. Using disjoint digest bytes for the block and the offsets keeps the
 /// first probe from being congruent to the block index (which would collapse
 /// most set bits onto two offsets and wreck the false-positive rate).
 fn key_hash(seed: u64, column_id: u32, token: &[u8]) -> KeyHash {
+    #[cfg(test)]
+    hash_calls::bump();
     let mut hasher = blake3::Hasher::new();
     hasher.update(&seed.to_le_bytes());
     hasher.update(&column_id.to_le_bytes());
@@ -78,9 +106,26 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 
 /// Accumulates distinct `(column_id, token)` keys, then sizes and serializes a
 /// blocked bloom filter for them.
+///
+/// The staged key is the raw `column_id_le || token` bytes, deduplicated
+/// before any BLAKE3 is computed. Ingest calls `insert` 20x-349x more often
+/// than there are distinct keys (issue #1518), so hashing on insert spent most
+/// of its work on tokens the staging set was about to discard. Staging the raw
+/// key first defers `key_hash` to `finish`, which runs it exactly once per
+/// distinct key. The emitted bytes are unchanged: `finish` reconstructs the
+/// same `(block, g1, g2)` triple set the old insert-time hashing produced (it
+/// even re-deduplicates by triple, so a BLAKE3 collision between two distinct
+/// raw keys still collapses to one, matching the old distinct-triple count that
+/// sizes the filter).
 pub struct BloomBuilder {
     seed: u64,
-    staged: HashSet<(u64, u64, u64)>,
+    /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
+    /// `Box<[u8]>: Borrow<[u8]>`, so a duplicate insert probes without
+    /// allocating.
+    staged: HashSet<Box<[u8]>>,
+    /// Reused `column_id_le || token` buffer for the membership probe, so a
+    /// duplicate insert copies bytes but allocates nothing.
+    scratch: Vec<u8>,
 }
 
 impl BloomBuilder {
@@ -88,14 +133,20 @@ impl BloomBuilder {
         BloomBuilder {
             seed,
             staged: HashSet::new(),
+            scratch: Vec::new(),
         }
     }
 
     /// Stages one field-scoped token. Duplicates collapse; the staged
-    /// distinct count sizes the filter.
+    /// distinct count sizes the filter. No BLAKE3 here: only distinct keys
+    /// reach `key_hash`, in `finish`.
     pub fn insert(&mut self, column_id: u32, token: &[u8]) {
-        let h = key_hash(self.seed, column_id, token);
-        self.staged.insert((h.block, h.g1, h.g2));
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&column_id.to_le_bytes());
+        self.scratch.extend_from_slice(token);
+        if !self.staged.contains(self.scratch.as_slice()) {
+            self.staged.insert(self.scratch.as_slice().into());
+        }
     }
 
     /// Sizes the filter for a ~1% false-positive rate at the staged distinct
@@ -103,12 +154,23 @@ impl BloomBuilder {
     /// returns the serialized entry bytes: `m_bits` uvarint, `k` u8, `seed`
     /// u64 LE, then the bit array (`m_bits / 8` bytes).
     pub fn finish(self) -> Vec<u8> {
-        let n = self.staged.len() as f64;
+        // Hash each distinct raw key once, then dedup by triple exactly as the
+        // old insert-time path did (idempotent for bit-setting, but the
+        // distinct-triple count is what sizes the filter).
+        let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(self.staged.len());
+        for key in &self.staged {
+            let mut col = [0u8; 4];
+            col.copy_from_slice(&key[..4]);
+            let column_id = u32::from_le_bytes(col);
+            let h = key_hash(self.seed, column_id, &key[4..]);
+            triples.insert((h.block, h.g1, h.g2));
+        }
+        let n = triples.len() as f64;
         let target = (n * BITS_PER_ELEM).ceil() as u64;
         let m_bits = target.max(BLOCK_BITS).next_power_of_two();
         let block_count = m_bits / BLOCK_BITS;
         let mut bits = vec![0u8; (m_bits / 8) as usize];
-        for (block, g1, g2) in &self.staged {
+        for (block, g1, g2) in &triples {
             let h = KeyHash {
                 block: *block,
                 g1: *g1,
@@ -232,6 +294,38 @@ mod tests {
     }
 
     #[test]
+    fn blake3_scales_with_distinct_keys_not_inserts() {
+        // Many duplicates of one key: BLAKE3 runs exactly once, in finish.
+        let mut b = BloomBuilder::new(9);
+        hash_calls::reset();
+        for _ in 0..10_000 {
+            b.insert(5, b"same-token");
+        }
+        assert_eq!(hash_calls::count(), 0, "insert must not hash");
+        let _ = b.finish();
+        assert_eq!(
+            hash_calls::count(),
+            1,
+            "one distinct key must hash exactly once"
+        );
+
+        // M distinct keys: exactly M invocations, still none on insert.
+        let m: u32 = 500;
+        let mut b = BloomBuilder::new(9);
+        hash_calls::reset();
+        for i in 0..m {
+            b.insert(5, format!("token-{i}").as_bytes());
+        }
+        assert_eq!(hash_calls::count(), 0, "insert must not hash");
+        let _ = b.finish();
+        assert_eq!(
+            u32::try_from(hash_calls::count()).expect("count fits u32"),
+            m,
+            "distinct-key count must equal BLAKE3 invocations"
+        );
+    }
+
+    #[test]
     fn parse_rejects_corrupt_entries() {
         // Truncated: empty buffer.
         assert!(matches!(
@@ -277,6 +371,73 @@ mod tests {
 mod proptests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The pre-#1518 algorithm: hash on every insert, stage the triple, size
+    /// and serialize from the distinct-triple set. The new builder must emit
+    /// bytes identical to this for every input and every insert order.
+    fn reference_filter(seed: u64, inserts: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut staged: HashSet<(u64, u64, u64)> = HashSet::new();
+        for (col, tok) in inserts {
+            let h = key_hash(seed, *col, tok);
+            staged.insert((h.block, h.g1, h.g2));
+        }
+        let n = staged.len() as f64;
+        let target = (n * BITS_PER_ELEM).ceil() as u64;
+        let m_bits = target.max(BLOCK_BITS).next_power_of_two();
+        let block_count = m_bits / BLOCK_BITS;
+        let mut bits = vec![0u8; (m_bits / 8) as usize];
+        for (block, g1, g2) in &staged {
+            let h = KeyHash {
+                block: *block,
+                g1: *g1,
+                g2: *g2,
+            };
+            for bit in probe_bits(&h, K, block_count) {
+                set_bit(&mut bits, bit);
+            }
+        }
+        let mut out = Vec::new();
+        put_uvarint(&mut out, m_bits);
+        out.push(K);
+        out.extend_from_slice(&seed.to_le_bytes());
+        out.extend_from_slice(&bits);
+        out
+    }
+
+    fn build(seed: u64, inserts: &[(u32, Vec<u8>)]) -> Vec<u8> {
+        let mut b = BloomBuilder::new(seed);
+        for (col, tok) in inserts {
+            b.insert(*col, tok);
+        }
+        b.finish()
+    }
+
+    proptest! {
+        // Byte-for-byte identical to the pre-#1518 output, over random column
+        // ids, token lengths (including empty and >64 bytes), seeds, insert
+        // orders, and high duplicate densities (a small key pool picked many
+        // times). Insert order must not change the bytes.
+        #[test]
+        fn byte_identical_to_reference(
+            pool in proptest::collection::vec(
+                (0u32..8u32, proptest::collection::vec(any::<u8>(), 0..80usize)),
+                1..24usize),
+            picks in proptest::collection::vec(any::<usize>(), 0..800usize),
+            seed in any::<u64>(),
+        ) {
+            let inserts: Vec<(u32, Vec<u8>)> = picks
+                .iter()
+                .map(|&i| pool[i % pool.len()].clone())
+                .collect();
+            let reference = reference_filter(seed, &inserts);
+            let mine = build(seed, &inserts);
+            prop_assert_eq!(&mine, &reference);
+
+            // Insert order independence: reversed inserts, same bytes.
+            let reversed: Vec<(u32, Vec<u8>)> = inserts.iter().rev().cloned().collect();
+            prop_assert_eq!(build(seed, &reversed), mine);
+        }
+    }
 
     proptest! {
         #[test]
