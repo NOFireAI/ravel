@@ -8,8 +8,18 @@
 //! durability guarantee while decoupling the PUT rate from the query rate: it
 //! batches submitted [`AuditEvent`]s and flushes on `max_batch` records or
 //! `max_age` (default 25 ms), whichever comes first, as one
-//! [`write_audit_batch`] call - one object, one commit record, for the whole
-//! batch.
+//! [`write_audit_batch`] call - one object, one commit record, per tenant
+//! represented in the batch.
+//!
+//! # Tenancy
+//!
+//! One pipeline serves every tenant the process answers queries for, and the
+//! tenant is carried on each [`AuditEvent`], never fixed when the pipeline is
+//! constructed. A flush groups its batch by that field and issues one write
+//! per group, so every record lands under the audit prefix of the tenant whose
+//! query produced it. This is not a cosmetic detail: the `audit` SQL table
+//! resolves per tenant hash, so a record filed under the wrong tenant's prefix
+//! discloses its `query.text` to that other tenant.
 //!
 //! # Non-lossy by construction
 //!
@@ -69,8 +79,9 @@ use crate::config::{AuditMode, AuditPipelineConfig};
 use crate::error::{MaintainError, Result};
 
 /// The submitter-facing event of the audit pipeline: exactly the record content
-/// a query surface hands over. The pipeline owns the shard (from its config),
-/// mints one `record_id` per batch, and performs the flush, so a submitter
+/// a query surface hands over, including the tenant it is attributed to. The
+/// pipeline owns the shard (from its config), mints one `record_id` per
+/// per-tenant group of a batch, and performs the flush, so a submitter
 /// supplies only the record's own fields. This is [`AuditRecord`] under the
 /// pipeline's name.
 pub use crate::audit_write::AuditRecord as AuditEvent;
@@ -148,14 +159,12 @@ pub struct AuditPipeline {
 }
 
 impl AuditPipeline {
-    /// Spawn the flush task and return a pipeline writing every batch for
-    /// `tenant` to `store`. The task runs until [`shutdown`](Self::shutdown) is
+    /// Spawn the flush task and return a pipeline writing to `store`. Every
+    /// tenant the process serves shares this one pipeline; each batch is
+    /// grouped by the tenant carried on its events, so the pipeline itself
+    /// holds no tenant. The task runs until [`shutdown`](Self::shutdown) is
     /// called or the pipeline is dropped.
-    pub fn spawn(
-        store: Arc<dyn ObjectStoreBackend>,
-        tenant: TenantHash,
-        config: AuditPipelineConfig,
-    ) -> Self {
+    pub fn spawn(store: Arc<dyn ObjectStoreBackend>, config: AuditPipelineConfig) -> Self {
         let audit_mode = config.audit_mode;
         let (tx, rx) = mpsc::channel(config.channel_capacity.max(1));
         let shutdown = Arc::new(Notify::new());
@@ -164,7 +173,6 @@ impl AuditPipeline {
         let handle = tokio::spawn(run_flush_loop(
             rx,
             store,
-            tenant,
             config,
             shutdown.clone(),
             flush_failures.clone(),
@@ -296,7 +304,6 @@ impl QueryAuditSink for AuditPipeline {
 async fn run_flush_loop(
     mut rx: mpsc::Receiver<Submission>,
     store: Arc<dyn ObjectStoreBackend>,
-    tenant: TenantHash,
     config: AuditPipelineConfig,
     shutdown: Arc<Notify>,
     flush_failures: Arc<AtomicU64>,
@@ -313,7 +320,7 @@ async fn run_flush_loop(
                     batch.push(submission);
                 }
                 if !batch.is_empty() {
-                    flush_batch(store.as_ref(), &tenant, &config, &flush_failures, batch).await;
+                    flush_batch(store.as_ref(), &config, &flush_failures, batch).await;
                 }
                 return;
             }
@@ -353,63 +360,72 @@ async fn run_flush_loop(
             }
         }
 
-        flush_batch(store.as_ref(), &tenant, &config, &flush_failures, batch).await;
+        flush_batch(store.as_ref(), &config, &flush_failures, batch).await;
         if stop {
             return;
         }
     }
 }
 
-/// Flush one accumulated batch as a single object+commit write and signal every
-/// submitter with the outcome, per the configured [`AuditMode`].
+/// Flush one accumulated batch and signal every submitter with the outcome of
+/// its own write, per the configured [`AuditMode`].
+///
+/// The batch is grouped by each event's tenant and written one group at a
+/// time, each as a single object+commit pair under that tenant's own audit
+/// prefix with its own fresh `record_id`. A group's outcome reaches only the
+/// submitters whose events were in it, so one tenant's failed write neither
+/// fails nor silently releases another tenant's queries.
 async fn flush_batch(
     store: &dyn ObjectStoreBackend,
-    tenant: &TenantHash,
     config: &AuditPipelineConfig,
     flush_failures: &AtomicU64,
     batch: Vec<Submission>,
 ) {
-    if batch.is_empty() {
-        return;
-    }
-    let mut records = Vec::with_capacity(batch.len());
-    let mut dones = Vec::with_capacity(batch.len());
+    // `BTreeMap` rather than a hash map so a multi-tenant batch flushes in a
+    // deterministic tenant order, which keeps a test's PUT sequence stable.
+    let mut groups: std::collections::BTreeMap<TenantHash, (Vec<AuditRecord>, Vec<_>)> =
+        std::collections::BTreeMap::new();
     for submission in batch {
-        records.push(submission.record);
-        dones.push(submission.done);
+        let entry = groups.entry(submission.record.tenant).or_default();
+        entry.0.push(submission.record);
+        entry.1.push(submission.done);
     }
 
-    let record_id = Uuid::new_v4();
-    let outcome = write_audit_batch(store, tenant, config.shard, record_id, records).await;
+    for (tenant, (records, dones)) in groups {
+        let record_id = Uuid::new_v4();
+        let outcome = write_audit_batch(store, config.shard, record_id, records).await;
 
-    match outcome {
-        Ok(()) => {
-            for done in dones {
-                let _ = done.send(Ok(()));
-            }
-        }
-        Err(error) => {
-            let message = error.to_string();
-            match config.audit_mode {
-                AuditMode::Required => {
-                    tracing::error!(
-                        error = %message,
-                        batch_size = dones.len(),
-                        "audit batch flush failed; failing every awaiting query (audit_mode=required)"
-                    );
-                    for done in dones {
-                        let _ = done.send(Err(MaintainError::AuditFlush(message.clone())));
-                    }
+        match outcome {
+            Ok(()) => {
+                for done in dones {
+                    let _ = done.send(Ok(()));
                 }
-                AuditMode::BestEffort => {
-                    flush_failures.fetch_add(1, Ordering::Relaxed);
-                    tracing::error!(
-                        error = %message,
-                        batch_size = dones.len(),
-                        "audit batch flush failed; releasing every awaiting query anyway (audit_mode=best-effort)"
-                    );
-                    for done in dones {
-                        let _ = done.send(Ok(()));
+            }
+            Err(error) => {
+                let message = error.to_string();
+                match config.audit_mode {
+                    AuditMode::Required => {
+                        tracing::error!(
+                            error = %message,
+                            tenant = %tenant.to_hex(),
+                            batch_size = dones.len(),
+                            "audit batch flush failed; failing every awaiting query (audit_mode=required)"
+                        );
+                        for done in dones {
+                            let _ = done.send(Err(MaintainError::AuditFlush(message.clone())));
+                        }
+                    }
+                    AuditMode::BestEffort => {
+                        flush_failures.fetch_add(1, Ordering::Relaxed);
+                        tracing::error!(
+                            error = %message,
+                            tenant = %tenant.to_hex(),
+                            batch_size = dones.len(),
+                            "audit batch flush failed; releasing every awaiting query anyway (audit_mode=best-effort)"
+                        );
+                        for done in dones {
+                            let _ = done.send(Ok(()));
+                        }
                     }
                 }
             }
@@ -456,9 +472,10 @@ mod tests {
         (id, blob)
     }
 
-    fn test_event(now_ns: i64, stream_seed: u32) -> AuditEvent {
+    fn test_event(tenant: TenantHash, now_ns: i64, stream_seed: u32) -> AuditEvent {
         let (stream_id, stream_attrs) = test_stream(stream_seed);
         AuditEvent {
+            tenant,
             now_ns,
             stream_id,
             stream_attrs,
@@ -499,7 +516,7 @@ mod tests {
         let tenant = TenantHash([1u8; 16]);
         // max_batch=3, a very long max_age: only reaching the count can flush.
         let config = pipeline_config(3, Duration::from_secs(3600));
-        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), tenant, config));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
         // Submit exactly max_batch events concurrently; the batch fills and
         // flushes, so all three submits return without the timer elapsing.
@@ -507,7 +524,7 @@ mod tests {
         for i in 0..3 {
             let pipeline = pipeline.clone();
             handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(1_000 + i, 7)).await
+                pipeline.submit(test_event(tenant, 1_000 + i, 7)).await
             }));
         }
         for handle in handles {
@@ -534,10 +551,10 @@ mod tests {
         // Large max_batch, short max_age: one event must flush on the timer
         // without waiting for more events.
         let config = pipeline_config(1000, Duration::from_millis(20));
-        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), tenant, config));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
         pipeline
-            .submit(test_event(5_000, 7))
+            .submit(test_event(tenant, 5_000, 7))
             .await
             .expect("submit flushes on max_age");
 
@@ -559,13 +576,13 @@ mod tests {
         let store = Arc::new(FaultStore::new(mem, plan));
         let tenant = TenantHash([3u8; 16]);
         let config = pipeline_config(3, Duration::from_secs(3600));
-        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), tenant, config));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
         let mut handles = Vec::new();
         for i in 0..3 {
             let pipeline = pipeline.clone();
             handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(9_000 + i, 7)).await
+                pipeline.submit(test_event(tenant, 9_000 + i, 7)).await
             }));
         }
         for handle in handles {
@@ -601,13 +618,13 @@ mod tests {
             audit_mode: AuditMode::BestEffort,
             channel_capacity: 1024,
         };
-        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), tenant, config));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
         let mut handles = Vec::new();
         for i in 0..3 {
             let pipeline = pipeline.clone();
             handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(11_000 + i, 7)).await
+                pipeline.submit(test_event(tenant, 11_000 + i, 7)).await
             }));
         }
         for handle in handles {
@@ -640,7 +657,7 @@ mod tests {
         // Large max_batch and max_age, so nothing flushes on its own: only the
         // shutdown drain can flush the two buffered events.
         let config = pipeline_config(1000, Duration::from_secs(3600));
-        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), tenant, config));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
         // Both events must be queued before the shutdown drain runs, or the
         // drain has nothing to flush and this test asserts nothing. `submit`
@@ -650,7 +667,7 @@ mod tests {
         // this test needs, established by construction rather than by giving
         // two spawned tasks 50 ms of wall clock to get there.
         let mut submissions: Vec<_> = (0..2)
-            .map(|i| Box::pin(pipeline.submit(test_event(13_000 + i, 7))))
+            .map(|i| Box::pin(pipeline.submit(test_event(tenant, 13_000 + i, 7))))
             .collect();
         for submission in &mut submissions {
             let first = std::future::poll_fn(|cx| Poll::Ready(submission.as_mut().poll(cx))).await;
@@ -688,11 +705,10 @@ mod tests {
         let tenant = TenantHash([6u8; 16]);
         let pipeline = AuditPipeline::spawn(
             store.clone(),
-            tenant,
             pipeline_config(1000, Duration::from_secs(3600)),
         );
         pipeline.shutdown().await.expect("shutdown");
-        let result = pipeline.submit(test_event(1, 7)).await;
+        let result = pipeline.submit(test_event(tenant, 1, 7)).await;
         assert!(
             matches!(result, Err(MaintainError::AuditFlush(_))),
             "a submit after shutdown must error, got {result:?}"
@@ -715,10 +731,10 @@ mod tests {
             audit_mode: AuditMode::BestEffort,
             channel_capacity: 1024,
         };
-        let pipeline = AuditPipeline::spawn(store.clone(), tenant, config);
+        let pipeline = AuditPipeline::spawn(store.clone(), config);
         pipeline.shutdown().await.expect("shutdown");
 
-        let result = pipeline.submit(test_event(1, 7)).await;
+        let result = pipeline.submit(test_event(tenant, 1, 7)).await;
         assert!(
             result.is_ok(),
             "best-effort must release a submit after shutdown with Ok, not fail closed \
@@ -734,6 +750,122 @@ mod tests {
     #[tokio::test]
     async fn noop_sink_is_object_safe_and_always_ok() {
         let sink: Arc<dyn QueryAuditSink> = Arc::new(NoopQueryAuditSink);
-        sink.submit(test_event(1, 7)).await.expect("noop is ok");
+        sink.submit(test_event(TenantHash([8u8; 16]), 1, 7))
+            .await
+            .expect("noop is ok");
+    }
+
+    /// The blocking finding this fix round closes: one pipeline serves every
+    /// tenant, so a batch that mixes two tenants' events must produce one
+    /// object under each tenant's own prefix, never both under one. Filed
+    /// wrongly, tenant one's `query.text` becomes readable by tenant two,
+    /// because the `audit` SQL table resolves per tenant hash.
+    #[tokio::test]
+    async fn one_batch_spanning_two_tenants_writes_one_object_under_each() {
+        let store = Arc::new(MemoryStore::new());
+        let one = TenantHash([31u8; 16]);
+        let two = TenantHash([32u8; 16]);
+        // max_batch=4 with a long max_age: the four events below fill one
+        // batch and flush together, so the grouping runs on a genuinely mixed
+        // batch rather than on four separate single-tenant flushes.
+        let config = pipeline_config(4, Duration::from_secs(3600));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
+
+        let mut handles = Vec::new();
+        for (i, tenant) in [one, two, one, two].into_iter().enumerate() {
+            let pipeline = pipeline.clone();
+            let now_ns = 17_000 + i as i64;
+            handles.push(tokio::spawn(async move {
+                pipeline.submit(test_event(tenant, now_ns, 7)).await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("submit task").expect("submit ok");
+        }
+
+        for tenant in [one, two] {
+            assert_eq!(
+                data_object_count(store.as_ref(), &tenant).await,
+                1,
+                "exactly one data object under {}'s own audit prefix",
+                tenant.to_hex()
+            );
+            assert_eq!(
+                commit_record_count(store.as_ref(), &tenant).await,
+                1,
+                "exactly one commit record under {}'s own audit prefix",
+                tenant.to_hex()
+            );
+        }
+        // Two objects total, so neither tenant's group leaked into the other's
+        // prefix and no third prefix was written.
+        assert_eq!(
+            list_all(store.as_ref(), "t/").await.unwrap().len(),
+            4,
+            "two data objects and two commit records, one pair per tenant"
+        );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// A per-tenant group's flush outcome reaches only that group's
+    /// submitters: one tenant's failed write must not fail the other tenant's
+    /// query, and must not release its own.
+    #[tokio::test]
+    async fn a_failed_group_fails_only_its_own_tenants_submitters() {
+        let one = TenantHash([33u8; 16]);
+        let two = TenantHash([34u8; 16]);
+        // Fail only the data PUT under tenant `one`'s prefix. Keyed on that
+        // tenant's hex prefix, so tenant `two`'s group in the same batch
+        // writes normally.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Timeout)
+                .with_key_contains(&format!("t/{}/u/l0/", one.to_hex())),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let config = pipeline_config(2, Duration::from_secs(3600));
+        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
+
+        let mut handles = Vec::new();
+        for (i, tenant) in [one, two].into_iter().enumerate() {
+            let pipeline = pipeline.clone();
+            let now_ns = 19_000 + i as i64;
+            handles.push(tokio::spawn(async move {
+                (tenant, pipeline.submit(test_event(tenant, now_ns, 7)).await)
+            }));
+        }
+        let mut failed = 0usize;
+        let mut released = 0usize;
+        for handle in handles {
+            let (tenant, result) = handle.await.expect("submit task");
+            if tenant == one {
+                assert!(
+                    matches!(result, Err(MaintainError::AuditFlush(_))),
+                    "the tenant whose write was faulted must fail closed, got {result:?}"
+                );
+                failed += 1;
+            } else {
+                result.expect("the other tenant's group wrote successfully");
+                released += 1;
+            }
+        }
+        assert_eq!(failed, 1, "exactly one submitter failed closed");
+        assert_eq!(released, 1, "exactly one submitter was released");
+
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Timeout),
+            1,
+            "the injected fault fired exactly once, on the faulted tenant's data PUT"
+        );
+        assert_eq!(
+            commit_record_count(store.as_ref(), &one).await,
+            0,
+            "the faulted tenant has no commit record"
+        );
+        assert_eq!(
+            commit_record_count(store.as_ref(), &two).await,
+            1,
+            "the other tenant's record is durable despite the sibling group's failure"
+        );
+        pipeline.shutdown().await.expect("shutdown");
     }
 }

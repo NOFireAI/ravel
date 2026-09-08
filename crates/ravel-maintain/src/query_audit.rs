@@ -145,10 +145,12 @@ impl QueryStatus {
 /// is the degenerate direct-write path built on this same event, kept for the
 /// callers that write a single record per call without a pipeline.
 ///
-/// The event carries the record content only; the pipeline owns the shard and
-/// mints the per-batch object identity (`record_id`). The `query.tenant` attr
-/// records `tenant` so the record is attributed to the resolved tenant, never
-/// to a client-supplied identity.
+/// The event carries the record content and the tenant it belongs to; the
+/// pipeline owns the shard and mints the per-batch object identity
+/// (`record_id`). `tenant` appears twice on purpose: as the event's `tenant`
+/// field, which routes the record to that tenant's own audit prefix when the
+/// pipeline flushes, and as the `query.tenant` attr, so a reader sees the
+/// tenant Ravel resolved rather than any identity the client claimed.
 pub fn query_audit_event(
     tenant: &TenantHash,
     now_ns: i64,
@@ -180,6 +182,7 @@ pub fn query_audit_event(
     ];
     let body = format!("{language} query {}", status.as_str());
     AuditEvent {
+        tenant: *tenant,
         now_ns,
         stream_id,
         stream_attrs,
