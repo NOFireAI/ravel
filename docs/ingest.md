@@ -557,18 +557,30 @@ The router charge above happens after decode/normalize, so on its own it left
 one transient buffer outside the ceiling: the OTLP HTTP gzip decompression
 buffer, which inflates ahead of decode and can reach
 `MAX_DECOMPRESSED_OTLP_BODY_BYTES` (64 MiB). The gateway now charges that gauge
-too, before it inflates (the ADR-0069 amendment). On the gzip path
-`services/ravel-server/src/otlp_http.rs` charges the decompressed bytes into the
-same `IngestByteBudget` *as they are produced*, chunk by chunk, so a
-decompression whose running total would cross the ceiling is shed mid-inflate
+too, while it inflates, before retaining each chunk (the ADR-0069 amendment). On
+the gzip path `services/ravel-server/src/otlp_http.rs` charges the decompressed
+bytes into the same `IngestByteBudget` *as they are produced*, chunk by chunk, so
+a decompression whose running total would cross the ceiling is shed mid-inflate
 (HTTP 429, the same `ravel_ingest_buffer_shed_total`) instead of allocating the
 full expansion first. Charging the produced bytes, not the 64 MiB cap and not a
 compressed-size estimate, keeps the charge equal to the actual inflated length
-(no over-charge of a well-compressing request). The gateway holds that charge
-through protobuf decode and releases it at the instant it drops the raw inflate
-buffer -- once prost has copied it into owned structs, before the router takes
-its own buffered charge -- so a single request's inflate charge and buffered
-charge never coexist (the gauge counts concurrent inflate buffers, not one
+(no over-charge of a well-compressing request).
+
+The decompressed body is kept as the list of exactly-sized chunks it was charged
+for, never appended into one growing `Vec<u8>`, and prost decodes it through
+that chunk list as a non-contiguous `Buf`. That is what makes the charge equal
+the retained bytes at every instant: an amortized-growth buffer keeps spare
+capacity past its length, and while reallocating it holds the old and the new
+allocation at once, so a charge taken on the appended length would undercount
+the buffer the ceiling claims to bound (and `reserve_exact` does not fix it,
+since an allocator may return more than was asked for). What stays outside the
+charge is the fixed 64 KiB staging buffer the decoder reads into, plus a `Bytes`
+handle and a charge guard per chunk -- together under 0.1% of the bytes charged.
+
+The gateway holds that charge through protobuf decode and releases it once decode
+has consumed and freed the chunks -- prost copies them into owned structs -- before
+the router takes its own buffered charge, so a single request's inflate charge and
+buffered charge never coexist (the gauge counts concurrent inflate buffers, not one
 request's bytes twice). The identity (uncompressed) path allocates
 no transient inflate buffer
 and takes no gateway charge; its decoded body is bounded by the 16 MiB body
