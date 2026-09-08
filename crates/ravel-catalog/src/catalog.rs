@@ -17,7 +17,10 @@ use ravel_cache::{
 };
 use ravel_commit::keys::BucketEntry;
 use ravel_commit::{erasure, keys, record, signal};
-use ravel_object_store::{GetOutcome, GetRange, ObjectMeta, ObjectStoreBackend, StoreError};
+use ravel_object_store::{
+    DrainStep, GetOutcome, GetRange, MAX_LIST_PAGES, ObjectMeta, ObjectStoreBackend, StoreError,
+    drain_pages,
+};
 use ravel_proto::commit::v1::{
     CommitRecord, CompactionPart, CompactionRecord, ErasureRequest, RewriteRecord,
 };
@@ -864,6 +867,14 @@ impl Catalog {
     /// returned key must begin with `tenant`'s prefix, or this is a hard
     /// isolation-breach `CatalogError::FieldMismatch`, never a silently
     /// dropped or served foreign key.
+    ///
+    /// The drain itself is [`ravel_object_store::drain_pages`], so a backend
+    /// that repeats a continuation token or exceeds
+    /// [`ravel_object_store::MAX_LIST_PAGES`] fails with a typed
+    /// [`StoreError`] instead of spinning here. Dedup is the contract's
+    /// constant-memory form: the raw delivery sequence never decreases, a
+    /// repeat re-delivers the last key delivered, and anything below it is a
+    /// typed order violation.
     async fn guarded_list_all(
         &self,
         tenant: &TenantHash,
@@ -872,36 +883,33 @@ impl Catalog {
     ) -> Result<Vec<ObjectMeta>, CatalogError> {
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         let mut out: Vec<ObjectMeta> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut page_token = None;
-        loop {
-            let page = {
+        drain_pages(
+            prefix,
+            None,
+            MAX_LIST_PAGES,
+            |_start_after, page_token| async move {
                 let _permit = self.request_semaphore.acquire().await.map_err(|_| {
                     StoreError::Transient("catalog request semaphore closed".to_string())
                 })?;
                 let page = self.store.list(prefix, page_token).await;
                 accounting.record_s3_request(AccountedOp::List);
-                page?
-            };
-            for meta in page.objects {
+                Ok(page?)
+            },
+            |meta: ObjectMeta| {
                 if !meta.key.starts_with(&tenant_prefix) {
                     self.record_isolation_breach();
                     return Err(CatalogError::FieldMismatch {
                         key: prefix.to_string(),
                         field: "list_prefix",
-                        expected: tenant_prefix,
+                        expected: tenant_prefix.clone(),
                         actual: meta.key,
                     });
                 }
-                if seen.insert(meta.key.clone()) {
-                    out.push(meta);
-                }
-            }
-            match page.next {
-                Some(next) => page_token = Some(next),
-                None => break,
-            }
-        }
+                out.push(meta);
+                Ok(DrainStep::Continue)
+            },
+        )
+        .await?;
         Ok(out)
     }
 
@@ -2156,35 +2164,46 @@ impl Catalog {
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
         let cap = self.config.max_catalog_list_requests;
-        let mut lists_issued: u64 = 0;
+        // Shared rather than a plain local because the fetch hook's future
+        // cannot borrow from the hook itself (see `drain_pages`), and the
+        // counter spans every probe of this shard. An atomic, not a Cell, so
+        // the resolve future this sits inside stays `Send`.
+        let lists_issued = AtomicU64::new(0);
+        let prefix_ref = prefix.as_str();
         for width_hours in Self::LATEST_HOUR_PROBE_WINDOWS_HOURS {
             let floor_hour = max_hour.saturating_sub(width_hours);
             let start_after = keys::commit_shard_hour_prefix(tenant, signal, shard, floor_hour)?;
             let mut latest: Option<(u32, bool)> = None;
-            let mut page_token = None;
-            'pages: loop {
-                // Refuse before issuing a page that would exceed the
-                // ceiling, so at most `cap` LISTs are ever issued for this
-                // shard across all its probes (the request bound).
-                if lists_issued >= cap {
-                    return Err(CatalogError::WindowTooWide {
-                        estimate: lists_issued.saturating_add(1),
-                        limit: cap,
-                    });
-                }
-                let page = {
-                    let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                        StoreError::Transient("catalog request semaphore closed".to_string())
-                    })?;
-                    let page = self
-                        .store
-                        .list_after(&prefix, Some(&start_after), page_token)
-                        .await;
-                    accounting.record_s3_request(AccountedOp::List);
-                    lists_issued += 1;
-                    page?
-                };
-                for meta in &page.objects {
+            drain_pages(
+                prefix_ref,
+                Some(&start_after),
+                MAX_LIST_PAGES,
+                |start_after: Option<String>, page_token| {
+                    let lists_issued = &lists_issued;
+                    async move {
+                        // Refuse before issuing a page that would exceed the
+                        // ceiling, so at most `cap` LISTs are ever issued for
+                        // this shard across all its probes (the request bound).
+                        let issued = lists_issued.load(Ordering::Relaxed);
+                        if issued >= cap {
+                            return Err(CatalogError::WindowTooWide {
+                                estimate: issued.saturating_add(1),
+                                limit: cap,
+                            });
+                        }
+                        let _permit = self.request_semaphore.acquire().await.map_err(|_| {
+                            StoreError::Transient("catalog request semaphore closed".to_string())
+                        })?;
+                        let page = self
+                            .store
+                            .list_after(prefix_ref, start_after.as_deref(), page_token)
+                            .await;
+                        accounting.record_s3_request(AccountedOp::List);
+                        lists_issued.fetch_add(1, Ordering::Relaxed);
+                        Ok(page?)
+                    }
+                },
+                |meta: ObjectMeta| {
                     // ADR-0050 §2 isolation assertion, identical to
                     // `list_shard_hours` and `list_window_by_prefix`: every
                     // returned key is under this tenant's prefix or the scan
@@ -2194,7 +2213,7 @@ impl Catalog {
                         return Err(CatalogError::FieldMismatch {
                             key: prefix.clone(),
                             field: "list_prefix",
-                            expected: tenant_prefix,
+                            expected: tenant_prefix.clone(),
                             actual: meta.key.clone(),
                         });
                     }
@@ -2209,7 +2228,7 @@ impl Catalog {
                     // paging on would spend the budget on the future tail at
                     // every probe width, the same stop `list_shard_hours` takes.
                     if hour > max_hour {
-                        break 'pages;
+                        return Ok(DrainStep::Stop);
                     }
                     latest = Some(match latest {
                         None => (hour, !is_tombstone),
@@ -2219,12 +2238,10 @@ impl Catalog {
                         }
                         Some(existing) => existing,
                     });
-                }
-                match page.next {
-                    Some(next) => page_token = Some(next),
-                    None => break,
-                }
-            }
+                    Ok(DrainStep::Continue)
+                },
+            )
+            .await?;
             if latest.is_some() {
                 return Ok(latest);
             }
@@ -2386,21 +2403,23 @@ impl Catalog {
         let start_after =
             keys::commit_shard_hour_prefix(tenant, signal, shard, listing_start_hour)?;
         let mut grouped: ShardBuckets = HashMap::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut page_token = None;
-        'pages: loop {
-            let page = {
+        let prefix_ref = prefix.as_str();
+        drain_pages(
+            prefix_ref,
+            Some(&start_after),
+            MAX_LIST_PAGES,
+            |start_after: Option<String>, page_token| async move {
                 let _permit = self.request_semaphore.acquire().await.map_err(|_| {
                     StoreError::Transient("catalog request semaphore closed".to_string())
                 })?;
                 let page = self
                     .store
-                    .list_after(&prefix, Some(&start_after), page_token)
+                    .list_after(prefix_ref, start_after.as_deref(), page_token)
                     .await;
                 accounting.record_s3_request(AccountedOp::List);
-                page?
-            };
-            for meta in page.objects {
+                Ok(page?)
+            },
+            |meta: ObjectMeta| {
                 // ADR-0050 §2 isolation assertion, identical to
                 // `guarded_list_all`: every returned key is under this tenant's
                 // prefix or the scan hard-fails.
@@ -2409,15 +2428,9 @@ impl Catalog {
                     return Err(CatalogError::FieldMismatch {
                         key: prefix.clone(),
                         field: "list_prefix",
-                        expected: tenant_prefix,
+                        expected: tenant_prefix.clone(),
                         actual: meta.key,
                     });
-                }
-                // Dedup by key across pages (a key MAY repeat across pages),
-                // matching `guarded_list_all` so the grouped key set is
-                // identical to the per-bucket loop's.
-                if !seen.insert(meta.key.clone()) {
-                    continue;
                 }
                 let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
                     BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
@@ -2428,21 +2441,19 @@ impl Catalog {
                 // Past the window's top hour: every later key in this shard is
                 // also past it, so stop paging (do not request the next page).
                 if bhour > window_end_hour {
-                    break 'pages;
+                    return Ok(DrainStep::Stop);
                 }
                 // `start_after` already excluded everything strictly below
                 // `listing_start_hour`; this guard is a belt for a marker key
                 // that shares the first page with in-window keys.
                 if bhour < listing_start_hour {
-                    continue;
+                    return Ok(DrainStep::Continue);
                 }
                 grouped.entry((bshard, bhour)).or_default().push(meta);
-            }
-            match page.next {
-                Some(next) => page_token = Some(next),
-                None => break,
-            }
-        }
+                Ok(DrainStep::Continue)
+            },
+        )
+        .await?;
         Ok(grouped)
     }
 
@@ -2739,8 +2750,10 @@ impl Catalog {
     /// That page-by-page ceiling, and the `list_after` start marker, are why
     /// this path records its own `AccountedOp::List` per page instead of
     /// calling [`Catalog::guarded_list_all`], which takes no start marker and
-    /// drains unconditionally. The permit, the accounting, and the ADR-0050
-    /// section 2 tenant-prefix assertion are the same either way
+    /// drains unconditionally. Both share the page loop itself
+    /// ([`ravel_object_store::drain_pages`]), so the permit, the accounting,
+    /// the ADR-0050 section 2 tenant-prefix assertion, the cross-page dedup,
+    /// and the typed refusal of a spinning backend are the same either way
     /// (docs/catalog-and-mvcc.md "Query cost accounting").
     #[allow(clippy::too_many_arguments)]
     async fn list_window_by_prefix(
@@ -2761,8 +2774,11 @@ impl Catalog {
         // the expensive per-bucket record GETs are what run concurrently below,
         // mirroring the per-bucket loop's concurrency model.
         let mut grouped: HashMap<(u32, u32), Vec<ObjectMeta>> = HashMap::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut lists_issued: u64 = 0;
+        // Shared rather than a plain local because the fetch hook's future
+        // cannot borrow from the hook itself (see `drain_pages`), and the
+        // counter spans every shard's drain. An atomic, not a Cell, so the
+        // resolve future this sits inside stays `Send`.
+        let lists_issued = AtomicU64::new(0);
         let cap = self.config.max_catalog_list_requests;
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         // Shard bound is the union scan set over every hour in the listing
@@ -2791,29 +2807,37 @@ impl Catalog {
             // key at or above it, so `list_after` resumes strictly past it.
             let start_after =
                 keys::commit_shard_hour_prefix(tenant, signal, shard, listing_start_hour)?;
-            let mut page_token = None;
-            loop {
-                // Refuse before issuing a page that would exceed the ceiling,
-                // so at most `cap` LISTs are ever issued (the request bound).
-                if lists_issued >= cap {
-                    return Err(CatalogError::WindowTooWide {
-                        estimate: lists_issued.saturating_add(1),
-                        limit: cap,
-                    });
-                }
-                let page = {
-                    let _permit = self.request_semaphore.acquire().await.map_err(|_| {
-                        StoreError::Transient("catalog request semaphore closed".to_string())
-                    })?;
-                    let page = self
-                        .store
-                        .list_after(&prefix, Some(&start_after), page_token)
-                        .await;
-                    accounting.record_s3_request(AccountedOp::List);
-                    lists_issued += 1;
-                    page?
-                };
-                for meta in page.objects {
+            let prefix_ref = prefix.as_str();
+            drain_pages(
+                prefix_ref,
+                Some(&start_after),
+                MAX_LIST_PAGES,
+                |start_after: Option<String>, page_token| {
+                    let lists_issued = &lists_issued;
+                    async move {
+                        // Refuse before issuing a page that would exceed the
+                        // ceiling, so at most `cap` LISTs are ever issued (the
+                        // request bound).
+                        let issued = lists_issued.load(Ordering::Relaxed);
+                        if issued >= cap {
+                            return Err(CatalogError::WindowTooWide {
+                                estimate: issued.saturating_add(1),
+                                limit: cap,
+                            });
+                        }
+                        let _permit = self.request_semaphore.acquire().await.map_err(|_| {
+                            StoreError::Transient("catalog request semaphore closed".to_string())
+                        })?;
+                        let page = self
+                            .store
+                            .list_after(prefix_ref, start_after.as_deref(), page_token)
+                            .await;
+                        accounting.record_s3_request(AccountedOp::List);
+                        lists_issued.fetch_add(1, Ordering::Relaxed);
+                        Ok(page?)
+                    }
+                },
+                |meta: ObjectMeta| {
                     // ADR-0050 §2 isolation assertion, identical to
                     // `guarded_list_all`: every returned key is under this
                     // tenant's prefix or the scan hard-fails.
@@ -2822,16 +2846,9 @@ impl Catalog {
                         return Err(CatalogError::FieldMismatch {
                             key: prefix.clone(),
                             field: "list_prefix",
-                            expected: tenant_prefix,
+                            expected: tenant_prefix.clone(),
                             actual: meta.key,
                         });
-                    }
-                    // Dedup by key across pages (the cross-page listing
-                    // guarantee: a key MAY repeat across pages), matching
-                    // `guarded_list_all` so the grouped key set is identical to
-                    // the per-bucket loop's.
-                    if !seen.insert(meta.key.clone()) {
-                        continue;
                     }
                     let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
                         BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
@@ -2840,15 +2857,13 @@ impl Catalog {
                         BucketEntry::Tombstone(k) => (k.shard, k.ingest_hour_bucket),
                     };
                     if bhour < listing_start_hour || bhour > window_end_hour {
-                        continue;
+                        return Ok(DrainStep::Continue);
                     }
                     grouped.entry((bshard, bhour)).or_default().push(meta);
-                }
-                match page.next {
-                    Some(next) => page_token = Some(next),
-                    None => break,
-                }
-            }
+                    Ok(DrainStep::Continue)
+                },
+            )
+            .await?;
         }
 
         // Resolve each surviving bucket through the shared per-bucket path,
@@ -4520,8 +4535,8 @@ mod tests {
     /// and issue exactly 4 list calls, not 3: `MemoryStore::list_after`
     /// reports `next: Some` on any page that comes back completely full,
     /// even when that page happened to hold the last object, so a 4th,
-    /// empty page is required before the per-shard loop's `match page.next
-    /// { ... None => break }` can conclude the listing is exhausted. A
+    /// empty page is required before the shared drain sees a page with no
+    /// continuation token and concludes the listing is exhausted. A
     /// budget of 3 refuses on the would-be 4th call (that is exactly
     /// `latest_ingest_hour_refuses_past_the_list_request_budget`, one
     /// object fewer into the same scan); 4 is the true boundary.
@@ -7102,6 +7117,111 @@ mod tests {
             other => panic!("expected FieldMismatch, got {other:?}"),
         }
         assert_eq!(catalog.isolation_breaches(), 1);
+    }
+
+    /// Hands out the same continuation token on every `list` call, with one
+    /// in-order key per page: the spinning backend `guarded_list_all` used to
+    /// page against forever before it drained through
+    /// [`ravel_object_store::drain_pages`].
+    struct RepeatingTokenStore {
+        calls: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RepeatingTokenStore {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            Err(StoreError::Permanent("put not supported".to_string()))
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            Err(StoreError::NotFound)
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            _page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            let seq = self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ravel_object_store::ListPage {
+                objects: vec![ObjectMeta {
+                    key: format!("{prefix}{seq:08}"),
+                    size: 0,
+                    etag: ravel_object_store::Etag(String::new()),
+                    version: ravel_object_store::Version(String::new()),
+                    last_modified_unix_ms: 0,
+                }],
+                next: Some(ravel_object_store::PageToken("stuck".to_string())),
+            })
+        }
+
+        async fn list_delimited(
+            &self,
+            _prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            Err(StoreError::Permanent(
+                "list_delimited not supported".to_string(),
+            ))
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            ravel_object_store::Capabilities::mandatory()
+        }
+    }
+
+    impl RepeatingTokenStore {
+        fn list_calls(&self) -> u64 {
+            self.calls.load(Ordering::Relaxed)
+        }
+    }
+
+    /// #1448 finding 2: `guarded_list_all` is the sole LIST funnel for every
+    /// query (ADR-0044 decision 2), and it drained with no bound of its own.
+    /// A backend that repeats its continuation token must now stop it after
+    /// exactly two pages with the typed store error, having credited
+    /// `accounting` exactly one LIST per page issued.
+    #[tokio::test]
+    async fn guarded_list_all_refuses_a_repeated_continuation_token() {
+        let prefix = format!("t/{}/m/c/", tenant().to_hex());
+        let store = Arc::new(RepeatingTokenStore {
+            calls: AtomicU64::new(0),
+        });
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let accounting = QueryAccounting::new();
+
+        let err = catalog
+            .guarded_list_all(&tenant(), &prefix, &accounting)
+            .await
+            .expect_err("a repeated continuation token must be a typed error");
+        match err {
+            CatalogError::Store(StoreError::ListRepeatedToken { prefix: p }) => {
+                assert_eq!(p, prefix);
+            }
+            other => panic!("expected Store(ListRepeatedToken), got {other:?}"),
+        }
+        assert_eq!(
+            store.list_calls(),
+            2,
+            "the drain detects the repeat on the second page and issues no third"
+        );
+        assert_eq!(
+            accounting.snapshot().s3_requests(AccountedOp::List),
+            2,
+            "the per-page accounting hook fired once per page issued"
+        );
     }
 
     /// ADR-0050 §2: a commit record and a compaction record whose
