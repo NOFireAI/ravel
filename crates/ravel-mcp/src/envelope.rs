@@ -809,7 +809,7 @@ fn rows_fitting_prefix(fixed: usize, cap: usize, row_lens: &[usize]) -> usize {
     let mut kept = 0usize;
     for (index, &len) in row_lens.iter().enumerate() {
         let separator = usize::from(index > 0);
-        let next_total = total + len + separator;
+        let next_total = total.saturating_add(len).saturating_add(separator);
         if next_total > cap && kept >= 1 {
             break;
         }
