@@ -22,6 +22,12 @@
 # is fetched once into .cache/tla (gitignored). A checksum mismatch refuses to
 # run. Java is taken from RAVEL_TLA_JAVA if set, else the `java` on PATH;
 # version 17 or newer is required.
+#
+# TLC's worker count and JVM heap cap come from RAVEL_TLA_WORKERS (default 2)
+# and RAVEL_TLA_XMX (default 2g). Both are validated (a positive integer; a
+# size matching the JVM's -Xmx grammar: digits then k, m, or g) and refused
+# with a one-line message otherwise; the resolved values are printed once
+# per run.
 set -u
 
 TLA_VERSION="1.7.4"
@@ -65,6 +71,26 @@ resolve_java() {
     fi
     JAVA="$java"
     note "java: $java (version $ver)"
+}
+
+# resolve_tla_resources: read the TLC worker count and JVM heap cap from
+# RAVEL_TLA_WORKERS / RAVEL_TLA_XMX (defaults 2 / 2g). `-workers auto` claims
+# every core on the host, and an uncapped heap on a loaded or shared machine
+# is the failure this guards: both are fixed and small unless overridden, and
+# both are validated so a typo fails closed instead of reaching TLC as a
+# silently wrong flag.
+resolve_tla_resources() {
+    TLA_WORKERS="${RAVEL_TLA_WORKERS:-2}"
+    if ! printf '%s' "$TLA_WORKERS" | grep -qE '^[0-9]+$' || [ "$TLA_WORKERS" -eq 0 ]; then
+        note "RAVEL_TLA_WORKERS must be a positive integer, got '$TLA_WORKERS'"
+        exit 2
+    fi
+    TLA_XMX="${RAVEL_TLA_XMX:-2g}"
+    if ! printf '%s' "$TLA_XMX" | grep -qE '^[0-9]+[kKmMgG]$'; then
+        note "RAVEL_TLA_XMX must match the JVM -Xmx grammar (digits then k, m, or g), got '$TLA_XMX'"
+        exit 2
+    fi
+    note "resources: workers=$TLA_WORKERS xmx=$TLA_XMX"
 }
 
 # resolve_timeout: pick GNU timeout(1) once, before any lane launches
@@ -222,8 +248,8 @@ run_tlc() {
     local libpath="$FORMAL_DIR/common:$area_dir"
     local code=0
     ( cd "$area_dir" && "$TIMEOUT_BIN" "--kill-after=$TIMEOUT_KILL_AFTER" "$budget" \
-        "$JAVA" -XX:+UseParallelGC -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
-        -config "$cfg" -metadir "$metadir" -workers auto $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
+        "$JAVA" -XX:+UseParallelGC -Xmx"$TLA_XMX" -DTLA-Library="$libpath" -cp "$JAR" tlc2.TLC \
+        -config "$cfg" -metadir "$metadir" -workers "$TLA_WORKERS" $deadlock "$module" ) > "$logfile" 2>&1 || code=$?
     if [ "$code" -eq 137 ]; then
         note "$area/$module: ignored TERM at the ${budget}s budget, needed the ${TIMEOUT_KILL_AFTER}s kill-after grace period"
         code=124
@@ -582,7 +608,7 @@ main() {
     # at all.
     case "$cmd" in
         traceability) : ;;
-        *) resolve_timeout; resolve_java ;;
+        *) resolve_timeout; resolve_java; resolve_tla_resources ;;
     esac
 
     local areas
