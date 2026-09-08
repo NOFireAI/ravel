@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# check-tla usage: begin
 # TLA+ verification harness (ADR-1113 task T1).
 #
 # Runs TLC over every formal/tla area, or one named area. An "area" is any
@@ -8,13 +9,17 @@
 #
 # Subcommands:
 #   smoke        [-a AREA]   fast reachability + safety (budget 300s per cfg)
-#   live         [-a AREA]   liveness under fairness, where a live.cfg exists
-#                            (budget 300s per cfg, same as smoke)
+#   live         [-a AREA]   liveness under fairness; runs an area's live.cfg
+#                            only when bands.tsv carries a row for it (a
+#                            measured band is the opt-in), same 300s budget
+#                            as smoke; an unbanded live.cfg is reported SKIP
+#                            and does not fail the lane
 #   exhaustive   [-a AREA]   full safety + liveness (budget 3600s per cfg)
 #   negative     [-a AREA]   run negative/*.cfg, assert the expected violation
 #   traceability [-a AREA]   check every traceability.md source ref resolves
 #   ci           [-a AREA]   smoke + live + negative + traceability under one run id
 #   all          [-a AREA]   ci, then exhaustive, under one run id
+# check-tla usage: end
 #
 # Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java
 # or no GNU timeout(1)).
@@ -341,6 +346,19 @@ check_bands() {
     return $rc
 }
 
+# band_row_exists <area> <cfg-name>
+# True if bands.tsv carries a row for this cfg. The `live` kind uses this as
+# its opt-in gate: a live.cfg with no measured band is not run at all, rather
+# than running under check_bands's after-the-fact enforcement.
+band_row_exists() {
+    local area="$1" cfg_name="$2"
+    local bands="$FORMAL_DIR/$area/bands.tsv"
+    [ -f "$bands" ] || return 1
+    local row
+    row="$(awk -F'\t' -v c="$cfg_name" '$1==c {print; exit}' "$bands")"
+    [ -n "$row" ]
+}
+
 # check_one_model <area> <module> <kind> <cfg>
 check_one_model() {
     local area="$1" module="$2" kind="$3" cfg="$4"
@@ -402,6 +420,14 @@ check_model() {
                 note "$area/$module: no ${kind} cfg, skipping"
             fi
             continue
+        fi
+        if [ "$kind" = live ]; then
+            local cfg_name
+            cfg_name="$(basename "$cfg")"
+            if ! band_row_exists "$area" "$cfg_name"; then
+                note "$area live: SKIP (unbanded live.cfg; add a bands.tsv row to enrol)"
+                continue
+            fi
         fi
         check_one_model "$area" "$module" "$kind" "$cfg" || rc=1
     done <<< "$modules"
@@ -597,7 +623,11 @@ check_traceability() {
 # --- dispatch ---------------------------------------------------------------
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    # Marker-delimited, not a line-number slice: a line-number range goes
+    # stale the moment the banner between the markers grows or shrinks by a
+    # different amount than whoever last edited the range accounted for.
+    sed -n '/^# check-tla usage: begin$/,/^# check-tla usage: end$/p' "$0" \
+        | sed '1d;$d;s/^# \{0,1\}//'
     exit "${1:-1}"
 }
 
