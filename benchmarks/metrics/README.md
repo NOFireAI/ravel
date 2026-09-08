@@ -50,6 +50,39 @@ refusal: it exits non-zero for a non-comparable profile, and also for a run
 that covers only part of a comparable profile, because a truncated run is not
 that profile. The gate refuses a manifest that marks `ci` comparable at all.
 
+## Ingest artifact (`metricsbench_ingest`, ADR-0927 decision 11)
+
+The bin's JSON report carries a `profile` and a `substrate` block so a reader
+never mistakes a non-comparable or unbilled run for a publishable result.
+
+`profile`:
+- `name`: the `--profile` name.
+- `comparable`: whether these figures may be published. Forced `false` when
+  `steps_run` is less than `steps_declared`, regardless of the profile's own
+  verdict.
+- `comparability_reason`: why not, present only when `comparable` is `false`.
+- `active_series`: series alive at any one instant, as declared.
+- `steps_run`: steps this run actually generated.
+- `steps_declared`: the profile's full declared step count
+  (`samples_per_series`).
+- `samples_per_series`, `scrape_interval_secs`, `duration_secs`,
+  `total_samples`, `churn_basis_points_per_hour`: as declared.
+- `label_cardinalities`: distinct values per label dimension, name to count,
+  including the scaling label.
+- `families`: one entry per metric family, each with `name`, `instances`,
+  `series_per_instance`.
+- `run`: figures scoped to `steps_run`, never the declared full profile:
+  `steps`, `total_series_created`, `logical_input_bytes`,
+  `total_samples_generated`, all the generator's exact counts for this run.
+
+`substrate`:
+- `store_backend`: the `--store` kind (`memory` or `s3`).
+- `endpoint_host`: the configured S3 endpoint's host, when `--store s3` and
+  `RAVEL_S3_ENDPOINT` is set; absent for `memory` regardless of the env var.
+- `backend_bills_requests`: true only for real S3 with no endpoint override
+  (decision 10); false on `memory` and on any store behind a configured
+  endpoint, such as the nightly lane's local MinIO.
+
 ## Determinism
 
 One seed (`927000933`) drives everything. Every value and every injected

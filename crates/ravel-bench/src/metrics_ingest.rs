@@ -51,27 +51,44 @@
 //! [`MetricsIngestReport`] carries two blocks so a reader never mistakes a
 //! non-comparable or unbilled run for a publishable result:
 //!
-//! [`ProfileRecord`] (`profile`), the workload's own pre-registered figures
-//! and comparability verdict:
+//! [`ProfileRecord`] (`profile`), the workload's own pre-registered figures,
+//! this run's actual scope, and the comparability verdict:
 //! - `name`: the `--profile` name.
 //! - `comparable`: whether these figures may be published (decision 11).
-//! - `comparability_reason`: why not, when `comparable` is `false`; the
-//!   workload's own `Comparability` reason, never a second hand-written copy.
+//!   Forced `false` when `steps_run < steps_declared`, regardless of the
+//!   profile's own verdict: a truncated run is never that profile.
+//! - `comparability_reason`: why not, present exactly when `comparable` is
+//!   `false`, absent when `true`. The workload's own `Comparability` reason,
+//!   never a second hand-written copy of it, unless the run itself was
+//!   truncated, in which case this states that instead.
 //! - `active_series`: series alive at any one instant, as declared.
-//! - `total_series_created`: distinct series the generator actually created,
-//!   the generator's exact count.
+//! - `steps_run`: steps this run actually generated (the `--steps` flag, or
+//!   `steps_declared` when unset).
+//! - `steps_declared`: the profile's full declared step count
+//!   (`samples_per_series`).
 //! - `samples_per_series`, `scrape_interval_secs`, `duration_secs`,
 //!   `total_samples`, `churn_basis_points_per_hour`: as declared.
 //! - `label_cardinalities`: distinct values per label dimension, name to
-//!   count, read from the manifest.
-//! - `logical_input_bytes`: uncompressed input bytes the generator produced,
-//!   the generator's exact count.
+//!   count, read from the manifest, including the scaling label.
+//! - `families`: one [`FamilyRecord`] per metric family (`name`, `instances`,
+//!   `series_per_instance`), as declared.
+//! - `run`: a [`RunRecord`], scoped to `steps_run`, never the declared full
+//!   profile:
+//!   - `steps`: equal to `steps_run`.
+//!   - `total_series_created`: distinct series the generator actually
+//!     created over these steps, the generator's exact count.
+//!   - `logical_input_bytes`: uncompressed input bytes the generator
+//!     produced over these steps, the generator's exact count.
+//!   - `total_samples_generated`: samples the generator emitted over these
+//!     steps, the generator's exact count.
 //!
 //! [`Substrate`] (`substrate`), the storage backend a run replayed against:
 //! - `store_backend`: the `--store` kind (`memory` or `s3`).
-//! - `endpoint_host`: the configured S3 endpoint's host, when
-//!   `RAVEL_S3_ENDPOINT` is set; absent otherwise. Host only, never
-//!   credentials.
+//! - `endpoint_host`: the configured S3 endpoint's host, when `--store s3`
+//!   and `RAVEL_S3_ENDPOINT` is set; absent for `MemoryStore` regardless of
+//!   the env var, and absent when the var is unset. A scheme-less endpoint
+//!   (`localhost:9000`) still resolves to its host. Host only, never the
+//!   scheme, path, or credentials.
 //! - `backend_bills_requests`: true only for real S3 with no endpoint
 //!   override (decision 10); false on `MemoryStore` and on any store behind a
 //!   configured endpoint, such as the nightly lane's local MinIO.
