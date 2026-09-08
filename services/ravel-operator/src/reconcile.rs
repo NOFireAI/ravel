@@ -2049,10 +2049,22 @@ pub fn qualify_job_input_hash(
     spec: &RavelClusterSpec,
     credentials_resource_version: Option<&str>,
 ) -> String {
+    // Endpoint presence is significant (finding 3, issue #36): common_store_args
+    // and desired_qualify_job emit the endpoint flag/env only when Some, so
+    // endpoint: null and endpoint: "" select different stores, yet
+    // as_deref().unwrap_or("") fed the hasher the same "" for both and hashed
+    // them identically. A distinct presence byte in front of the value keeps the
+    // two forms apart, so editing between them re-qualifies: 0x01 then the value
+    // for Some, a lone 0x00 for None. The 0xff field separator fixes the field
+    // boundary; this byte fixes presence, which the separator alone cannot.
+    let endpoint = match spec.storage.s3.endpoint.as_deref() {
+        Some(value) => format!("\u{1}{value}"),
+        None => "\u{0}".to_string(),
+    };
     blake3_hex(&[
         spec.storage.s3.bucket.as_str(),
         spec.storage.s3.region.as_str(),
-        spec.storage.s3.endpoint.as_deref().unwrap_or(""),
+        endpoint.as_str(),
         spec.image.as_str(),
         spec.storage.s3.credentials_secret_ref.name.as_str(),
         credentials_resource_version.unwrap_or(""),
@@ -5788,11 +5800,12 @@ mod tests {
 
     /// Finding 1 verb sweep. Every operator write is server-side apply (a PATCH,
     /// with `create` for objects that do not yet exist) or a delete, never a
-    /// PUT, so no rule grants the `update` verb. The `batch`/`jobs` rule is
-    /// exactly the verbs the reconcile loop calls: `create`/`patch` (apply),
-    /// `get` (observe the qualify Job), and `delete` (foreground recreate); it is
-    /// not watched by an informer, so no `list`/`watch`. A text scan so a rule
-    /// that reintroduces a dead verb fails the gate.
+    /// PUT, so no rule grants the `update` verb. Each rule grants exactly the
+    /// verbs the reconcile loop calls (or that RBAC escalation prevention forces
+    /// for the router Role): the table below pins the exact verbs line for every
+    /// rule in rbac.yaml, so any verb change to any rule (a reintroduced dead
+    /// verb, a dropped read, a widened grant) fails the gate, not only the
+    /// batch/jobs rule.
     #[test]
     fn rbac_grants_only_the_verbs_the_reconcile_loop_calls() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -5807,17 +5820,72 @@ mod tests {
             "server-side apply is a PATCH, not a PUT: no rule may grant the update verb"
         );
 
-        // The jobs rule grants exactly create/patch/get/delete.
-        let jobs_verbs = manifest
-            .lines()
-            .skip_while(|l| l.trim() != "resources: [\"jobs\"]")
-            .nth(1)
-            .map(str::trim)
-            .expect("rbac.yaml defines a batch/jobs rule with a verbs line");
-        assert_eq!(
-            jobs_verbs, "verbs: [\"create\", \"patch\", \"get\", \"delete\"]",
-            "the jobs rule grants only create/patch (apply), get (observe), and delete"
-        );
+        // Every rule's resources line paired with the exact verbs line that must
+        // follow it. The `resources:` line uniquely identifies each rule (the two
+        // ClusterRoles never repeat one), and the `verbs:` line is always the next
+        // line, matching rbac.yaml's apiGroups/resources/verbs ordering.
+        let rules: &[(&str, &str)] = &[
+            (
+                "resources: [\"deployments\"]",
+                "verbs: [\"create\", \"patch\", \"get\", \"list\", \"watch\", \"delete\"]",
+            ),
+            (
+                "resources: [\"services\"]",
+                "verbs: [\"create\", \"patch\", \"get\", \"list\", \"watch\", \"delete\"]",
+            ),
+            (
+                "resources: [\"ingresses\"]",
+                "verbs: [\"create\", \"patch\", \"list\", \"watch\", \"delete\"]",
+            ),
+            (
+                "resources: [\"httproutes\", \"grpcroutes\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
+                "resources: [\"serviceaccounts\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
+                "resources: [\"roles\", \"rolebindings\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
+                "resources: [\"endpointslices\"]",
+                "verbs: [\"get\", \"list\", \"watch\"]",
+            ),
+            (
+                "resources: [\"ravelclusters\"]",
+                "verbs: [\"list\", \"watch\"]",
+            ),
+            (
+                "resources: [\"ravelclusters/status\"]",
+                "verbs: [\"patch\"]",
+            ),
+            (
+                "resources: [\"poddisruptionbudgets\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
+                "resources: [\"jobs\"]",
+                "verbs: [\"create\", \"patch\", \"get\", \"delete\"]",
+            ),
+            ("resources: [\"secrets\"]", "verbs: [\"get\"]"),
+        ];
+
+        for (resources_line, expected_verbs) in rules {
+            let verbs = manifest
+                .lines()
+                .skip_while(|l| l.trim() != *resources_line)
+                .nth(1)
+                .map(str::trim)
+                .unwrap_or_else(|| {
+                    panic!("rbac.yaml defines a rule for {resources_line} with a verbs line")
+                });
+            assert_eq!(
+                verbs, *expected_verbs,
+                "the {resources_line} rule must grant exactly {expected_verbs}"
+            );
+        }
     }
 
     /// A job condition of the given type/status, the shape
@@ -5913,6 +5981,20 @@ mod tests {
             base,
             qualify_job_input_hash(&replicas, Some("rv-1")),
             "an unrelated spec edit (replica count) does not re-qualify"
+        );
+
+        // Endpoint presence is significant (finding 3): endpoint: null and
+        // endpoint: "" emit a different qualify Job and run the servers against a
+        // different store (the flag/env is omitted only for None), so the two must
+        // hash differently. as_deref().unwrap_or("") fed the hasher "" for both.
+        let mut endpoint_none = spec.clone();
+        endpoint_none.storage.s3.endpoint = None;
+        let mut endpoint_empty = spec.clone();
+        endpoint_empty.storage.s3.endpoint = Some(String::new());
+        assert_ne!(
+            qualify_job_input_hash(&endpoint_none, Some("rv-1")),
+            qualify_job_input_hash(&endpoint_empty, Some("rv-1")),
+            "endpoint: null and endpoint: \"\" are different stores and must hash differently"
         );
     }
 
@@ -6115,10 +6197,14 @@ mod tests {
         // excluding both knobs, through the same `blake3_hex` composition the
         // production hasher uses. If it folded either knob in, this reference
         // would diverge and the assertion would fail.
+        let endpoint = match spec.storage.s3.endpoint.as_deref() {
+            Some(value) => format!("\u{1}{value}"),
+            None => "\u{0}".to_string(),
+        };
         let expected = blake3_hex(&[
             spec.storage.s3.bucket.as_str(),
             spec.storage.s3.region.as_str(),
-            spec.storage.s3.endpoint.as_deref().unwrap_or(""),
+            endpoint.as_str(),
             spec.image.as_str(),
             spec.storage.s3.credentials_secret_ref.name.as_str(),
             "rv-1",
@@ -6165,12 +6251,14 @@ mod tests {
     /// Golden value for [`qualify_job_input_hash`] (finding 3): the six
     /// store-identity inputs of [`base_spec`] plus a fixed credentials
     /// `resourceVersion` hash to a fixed literal, stable by construction across
-    /// Rust releases.
+    /// Rust releases. The literal changed when the endpoint slot gained a
+    /// presence byte (0x01 before a Some value) so endpoint: null and
+    /// endpoint: "" no longer collide.
     #[test]
     fn qualify_job_input_hash_golden_is_stable_by_construction() {
         assert_eq!(
             qualify_job_input_hash(&base_spec(), Some("rv-golden")),
-            "adfd6df5df66464b2bdfa458c3af84ae1011a0c445d2e4823dfd02adda76bbf8",
+            "492577362c8a6c9f6057e4281937d8b7a90289116e21e496c0acc7ed55d3784d",
         );
     }
 
@@ -6435,10 +6523,14 @@ mod tests {
     #[test]
     fn qualify_input_hash_excludes_retry_state() {
         let spec = base_spec();
+        let endpoint = match spec.storage.s3.endpoint.as_deref() {
+            Some(value) => format!("\u{1}{value}"),
+            None => "\u{0}".to_string(),
+        };
         let expected = blake3_hex(&[
             spec.storage.s3.bucket.as_str(),
             spec.storage.s3.region.as_str(),
-            spec.storage.s3.endpoint.as_deref().unwrap_or(""),
+            endpoint.as_str(),
             spec.image.as_str(),
             spec.storage.s3.credentials_secret_ref.name.as_str(),
             "rv",

@@ -999,6 +999,33 @@ fn degraded_store_qualified_hash(
     proceed_hash.or(persisted)
 }
 
+/// The `extra_conditions` to PATCH onto the degraded status (finding 1).
+/// [`reconcile_inner`] takes `extra_conditions` by clone and pushes
+/// `StoreQualified=True` onto that local copy in the `Proceed` arm, so the
+/// mutation never reaches the outer error path here, and
+/// [`write_degraded_status`] replaces the whole `conditions` array. When a pass
+/// qualified before a later step failed (`qualification_passed`), re-add the
+/// condition so the degraded object still carries `StoreQualified=True` for as
+/// long as that step keeps failing; otherwise a stage-one wait keyed on the
+/// condition burns its full bound instead of failing on the `Degraded` reason.
+/// Reconstructed from the same `proceed_hash` signal the persisted hash reads.
+fn degraded_extra_conditions(
+    mut base: Vec<Condition>,
+    qualification_passed: bool,
+    generation: Option<i64>,
+) -> Vec<Condition> {
+    if qualification_passed {
+        base.push(condition(
+            "StoreQualified",
+            true,
+            generation,
+            STORE_QUALIFIED_SUCCEEDED_REASON,
+            STORE_QUALIFIED_MESSAGE,
+        ));
+    }
+    base
+}
+
 /// Reconcile one `RavelCluster` to its desired Deployments and Services.
 ///
 /// Wraps [`reconcile_inner`] so that any failure before the success-path status
@@ -1051,6 +1078,11 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
             // pass's proof and re-run qualification once the Job's TTL collected
             // it; using it when the pass never qualified is correct.
             let qualification_passed = proceed_hash.is_some();
+            let degraded_conditions = degraded_extra_conditions(
+                extra_conditions,
+                qualification_passed,
+                obj.metadata.generation,
+            );
             let store_qualified_hash = degraded_store_qualified_hash(
                 proceed_hash,
                 obj.status
@@ -1092,7 +1124,7 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                     qualify_next_retry_time,
                     qualify_retry_hash,
                 },
-                extra_conditions,
+                degraded_conditions,
                 obj.status
                     .as_ref()
                     .map(|s| s.conditions.as_slice())
@@ -2979,6 +3011,44 @@ mod tests {
         );
         // Never qualified and nothing persisted: None.
         assert_eq!(degraded_store_qualified_hash(None, None), None);
+    }
+
+    /// The degraded error path re-adds StoreQualified=True when the pass reached
+    /// Proceed before a later step failed (finding 1), exact condition. The
+    /// Proceed arm pushes it onto reconcile_inner's cloned copy, which never
+    /// reaches this writer, and the writer PATCHes the whole conditions array; so
+    /// without the re-add the degraded object drops StoreQualified entirely and a
+    /// stage-one wait keyed on it burns its full bound. When the pass failed
+    /// before the gate (`qualification_passed` false), the base conditions pass
+    /// through untouched and StoreQualified stays absent.
+    #[test]
+    fn degraded_status_keeps_store_qualified_after_a_post_proceed_failure() {
+        let base = vec![condition(
+            "SpecValid",
+            true,
+            Some(7),
+            "Accepted",
+            "spec accepted",
+        )];
+
+        // Reached Proceed, then a later apply failed: StoreQualified=True is
+        // re-added with the exact success reason and message, generation carried.
+        let after = degraded_extra_conditions(base.clone(), true, Some(7));
+        let store_qualified = after
+            .iter()
+            .find(|c| c.r#type == "StoreQualified")
+            .expect("StoreQualified re-added on the degraded write after Proceed");
+        assert_eq!(store_qualified.status, "True");
+        assert_eq!(store_qualified.reason, STORE_QUALIFIED_SUCCEEDED_REASON);
+        assert_eq!(store_qualified.message, STORE_QUALIFIED_MESSAGE);
+        assert_eq!(store_qualified.observed_generation, Some(7));
+        // The base conditions are preserved, not replaced.
+        assert!(after.iter().any(|c| c.r#type == "SpecValid"));
+
+        // Failed before the gate: base passes through, StoreQualified absent.
+        let untouched = degraded_extra_conditions(base.clone(), false, Some(7));
+        assert!(!untouched.iter().any(|c| c.r#type == "StoreQualified"));
+        assert_eq!(untouched.len(), base.len());
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and
