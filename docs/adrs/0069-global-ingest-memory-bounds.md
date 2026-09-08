@@ -202,9 +202,11 @@ traffic under a tight budget. Charging a compressed-size estimate would either
 over- or under-charge depending on the ratio. Charging each produced chunk
 makes the summed charge equal the actual decompressed length exactly: the
 over-charge bound for an admitted request is **zero**, and the peak *uncharged*
-allocation is one staging chunk (64 KiB) plus per-chunk bookkeeping (a `Bytes`
-handle and a charge guard for each retained chunk, under 0.1% of the charged
-bytes). A shed request refunds every partial chunk on the spot.
+allocation is one fixed staging chunk (64 KiB) per in-flight inflate, plus
+per-chunk bookkeeping (a `Bytes` handle and a charge guard for each retained
+chunk) -- a fixed cost, not a share of the charged bytes, so it can exceed the
+charge itself on a small decompressed body. A shed request refunds every
+partial chunk on the spot.
 
 ### Rejected alternatives
 
