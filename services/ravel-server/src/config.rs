@@ -785,20 +785,22 @@ pub struct Cli {
     /// appended into one growing buffer, so the charge equals the bytes held at
     /// every instant. What stays uncharged is a fixed per-inflate overhead: one
     /// fixed 64 KiB staging chunk the decoder reads into per in-flight
-    /// inflate, per-chunk bookkeeping, and flate2's own decoder state (tens of
-    /// KiB); the compressed request body itself also stays resident for the
-    /// whole inflate but is bounded by the request cap and already counted
-    /// against `--max-inflight-ingest-requests`. No uncharged allocation
-    /// scales with the decompressed size; each is a fixed cost, not a share
-    /// of the charged bytes, so together they can exceed the charge itself on
-    /// a small decompressed body. A decompression whose running charge would
-    /// cross the ceiling is shed mid-inflate instead of being allocated in
-    /// full. A request whose charge would push the gauge past this ceiling
-    /// is shed before any buffering -- HTTP 429 with `Retry-After`, gRPC
-    /// `RESOURCE_EXHAUSTED` -- so a burst of active tenants can no longer grow
-    /// resident memory without bound (the per-tenant buffer caps bound each
-    /// tenant, not their sum). It does NOT cover the identity-path decoded
-    /// body or the gRPC and Remote Write inflate; those stay bounded by
+    /// inflate, per-chunk bookkeeping (about 48 bytes per 64 KiB chunk, held
+    /// in two vectors that grow by doubling), and flate2's own decoder state
+    /// (tens of KiB); the compressed request body itself also stays resident
+    /// for the whole inflate but is bounded by the request cap and already
+    /// counted against `--max-inflight-ingest-requests`. No uncharged
+    /// allocation holds a copy of the decompressed bytes; the staging chunk
+    /// and decoder state are a fixed cost that alone can exceed the charge
+    /// itself on a small decompressed body. A decompression whose running
+    /// charge would cross the ceiling is shed mid-inflate instead of being
+    /// allocated in full. A request whose charge would push the gauge past
+    /// this ceiling is shed before any buffering -- HTTP 429 with
+    /// `Retry-After`, gRPC `RESOURCE_EXHAUSTED` -- so a burst of active
+    /// tenants can no longer grow resident memory without bound (the
+    /// per-tenant buffer caps bound each tenant, not their sum). It does NOT
+    /// cover the identity-path decoded body or the gRPC and Remote Write
+    /// inflate; those stay bounded by
     /// `--max-inflight-ingest-requests` (docs/ingest.md, "Worst-case resident
     /// memory"). Like `--max-inflight-ingest-requests` this is a per-process
     /// local bound, never fleet-reconciled. Default 512 MiB; `0` disables the
