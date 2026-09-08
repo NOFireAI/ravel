@@ -39,11 +39,12 @@ use crate::reconcile::{
     DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_STALL_AFTER,
     GC_BOOTSTRAP_STALLED_REASON, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE, GC_BOOTSTRAP_UNAVAILABLE_REASON,
     GcBootstrapGate, QUALIFY_COMPONENT, QUALIFY_SPEC_HASH_ANNOTATION, QualificationDecision,
-    QualifyJobObservation, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
-    STORE_QUALIFIED_FAILED_REASON, STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON,
-    STORE_QUALIFIED_SUCCEEDED_REASON, STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
-    WAITING_FOR_GC_BOOTSTRAP_REASON, desired_objects, desired_qualify_job, grpcroute_api_resource,
-    httproute_api_resource, possible_gateway_route_names, possible_ingest_ingress_names,
+    QualifyJobAction, QualifyJobObservation, QualifyStoreReason, RenderCtx, RenderError,
+    S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY, STORE_QUALIFIED_FAILED_REASON,
+    STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON, STORE_QUALIFIED_SUCCEEDED_REASON,
+    STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
+    desired_objects, desired_qualify_job, grpcroute_api_resource, httproute_api_resource,
+    plan_qualify_gate, possible_gateway_route_names, possible_ingest_ingress_names,
     possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
     qualify_job_input_hash, qualify_job_phase,
 };
@@ -958,96 +959,28 @@ async fn delete_stale_qualify_job(api: &Api<Job>, name: &str) -> Result<(), Erro
     Ok(())
 }
 
-/// What a non-Proceed qualification pass must do to the qualify Job.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum QualifyJobAction {
-    /// Create the qualify Job for the current inputs: none exists yet.
-    Create,
-    /// Delete the existing Job with foreground propagation, so a later pass
-    /// observes it absent and creates a fresh one. Used both when a config edit
-    /// made the Job's inputs stale and when the current-hash Job Failed (finding
-    /// 4): the controller does not watch Jobs, so a Failed Job left in place
-    /// would block Deployments until its TTL collected it about an hour later.
-    DeleteStale,
-    /// Leave the Job untouched: it is running the current inputs.
-    None,
-}
-
-/// The plan for a reconcile pass that did NOT reach
-/// [`QualificationDecision::Proceed`]: the Job mutation to perform, the
-/// `StoreQualified` condition to record, the reason/message to carry onto
-/// `Available`, and how soon to requeue. Pure, so every arm's action and timing
-/// is pinned by a unit test; the caller performs the Job create/delete named by
-/// `job_action` and requeues after `requeue`.
-struct QualifyGatePlan {
-    job_action: QualifyJobAction,
-    store_qualified_condition: Condition,
-    unavailable_reason: (&'static str, String),
-    requeue: Duration,
-}
-
-/// Map a non-Proceed [`QualificationDecision`] to its [`QualifyGatePlan`].
-///
-/// A Failed Job is deleted, not left to sit until its TTL: the controller does
-/// not watch Jobs, so nothing else recreates it, and a fresh cluster would
-/// otherwise have no Deployments for about an hour after two failed attempts.
-/// The Failed hold requeues at [`RETRY`], the failure backoff, not
-/// [`BOOTSTRAP_POLL`]. Deleting the Job rewrites `.status`, and the primary
-/// watch drops that status-only write ([`predicates::generation`]), so nothing
-/// re-enqueues the object before the requeue delay; a shorter poll here would
-/// only rebuild-and-refail the Job faster. The `StoreQualified=False` condition
-/// still carries the Job's failure reason and message across the gap, so the
-/// operator's user still sees why qualification did not finish.
-fn qualify_gate_plan(decision: &QualificationDecision, generation: Option<i64>) -> QualifyGatePlan {
-    match decision {
-        QualificationDecision::Qualify { recreate } => QualifyGatePlan {
-            job_action: if *recreate {
-                QualifyJobAction::DeleteStale
-            } else {
-                QualifyJobAction::Create
-            },
-            store_qualified_condition: condition(
-                "StoreQualified",
-                false,
-                generation,
-                STORE_QUALIFIED_PENDING_REASON,
-                STORE_QUALIFYING_MESSAGE,
-            ),
-            unavailable_reason: (
-                STORE_QUALIFIED_PENDING_REASON,
-                STORE_QUALIFYING_MESSAGE.to_string(),
-            ),
-            requeue: BOOTSTRAP_POLL,
-        },
-        QualificationDecision::Waiting => QualifyGatePlan {
-            job_action: QualifyJobAction::None,
-            store_qualified_condition: condition(
-                "StoreQualified",
-                false,
-                generation,
-                STORE_QUALIFIED_PENDING_REASON,
-                STORE_QUALIFYING_MESSAGE,
-            ),
-            unavailable_reason: (
-                STORE_QUALIFIED_PENDING_REASON,
-                STORE_QUALIFYING_MESSAGE.to_string(),
-            ),
-            requeue: BOOTSTRAP_POLL,
-        },
-        QualificationDecision::Failed(message) => QualifyGatePlan {
-            job_action: QualifyJobAction::DeleteStale,
-            store_qualified_condition: condition(
-                "StoreQualified",
-                false,
-                generation,
-                STORE_QUALIFIED_FAILED_REASON,
-                message,
-            ),
-            unavailable_reason: (STORE_QUALIFIED_FAILED_REASON, message.clone()),
-            requeue: RETRY,
-        },
-        QualificationDecision::Proceed => {
-            unreachable!("Proceed is handled on the success path, never planned as a hold")
+/// The `StoreQualified=False` message for a Failed qualification hold (finding
+/// 3), naming the consecutive-failure count and, when the plan set one, the next
+/// retry instant, plus the Job's own failure message when it carried one. Kept
+/// terse so `kubectl describe` shows the attempt count and when the next attempt
+/// is due without scrolling.
+fn qualify_failed_message(
+    count: i32,
+    next_retry_unix: Option<i64>,
+    job_message: Option<&str>,
+) -> String {
+    let cause = job_message
+        .map(|m| format!(": {m}"))
+        .unwrap_or_else(|| ".".to_string());
+    match next_retry_unix {
+        Some(due) => format!(
+            "store qualification failed after {count} consecutive attempt(s){cause} next retry at {}",
+            format_rfc3339_utc(due)
+        ),
+        None => {
+            format!(
+                "store qualification failed after {count} consecutive attempt(s){cause} retrying now"
+            )
         }
     }
 }
@@ -1117,12 +1050,30 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
             // the old hash after a successful qualification would discard the
             // pass's proof and re-run qualification once the Job's TTL collected
             // it; using it when the pass never qualified is correct.
+            let qualification_passed = proceed_hash.is_some();
             let store_qualified_hash = degraded_store_qualified_hash(
                 proceed_hash,
                 obj.status
                     .as_ref()
                     .and_then(|status| status.store_qualified_hash.clone()),
             );
+            // Qualify retry state on the degraded write (issue #36, finding 3): if
+            // this pass qualified before the later step failed, reset it (the
+            // qualification succeeded); otherwise the failure is before the gate,
+            // so carry the persisted retry state through unchanged rather than
+            // resetting a real backoff on an unrelated error.
+            let (qualify_failure_count, qualify_next_retry_time) = if qualification_passed {
+                (None, None)
+            } else {
+                (
+                    obj.status
+                        .as_ref()
+                        .and_then(|status| status.qualify_failure_count),
+                    obj.status
+                        .as_ref()
+                        .and_then(|status| status.qualify_next_retry_time.clone()),
+                )
+            };
             if let Err(status_err) = write_degraded_status(
                 client,
                 &namespace,
@@ -1133,6 +1084,8 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                 PersistedStatus {
                     gc_bootstrap_waiting_since: waiting_since,
                     store_qualified_hash,
+                    qualify_failure_count,
+                    qualify_next_retry_time,
                 },
                 extra_conditions,
                 obj.status
@@ -1184,7 +1137,7 @@ async fn reconcile_inner(
     // Store qualification gate (issue #36). Before anything that would read or
     // write the object store is created -- the sys/auth token map, the ingest
     // router, and above all the serving Deployments -- prove the store passes
-    // `ravel store qualify`. A cluster brought up on a backend that fails the
+    // `ravel-cli store qualify`. A cluster brought up on a backend that fails the
     // object-store contract (docs/object-store-contract.md) would otherwise
     // crash-loop every server pod with an opaque runtime error; here it fails
     // once, visibly, on a one-shot Job, and the `StoreQualified` condition says
@@ -1225,22 +1178,37 @@ async fn reconcile_inner(
             Some(desired_hash.clone())
         }
         _ => {
-            // Not qualified for the current inputs: create, recreate, or delete
-            // the Job per the plan, record a `StoreQualified` condition, and
+            // Not qualified for the current inputs: create, recreate, delete, or
+            // hold the Job per the plan, record a `StoreQualified` condition, and
             // return WITHOUT touching any Deployment. A fresh cluster gets none;
             // a running cluster re-qualifying after a config edit keeps the ones
             // it has (this pass never reaches the Deployment apply/sweep below),
             // so a pending config change does not tear a serving cluster down.
             //
-            // `plan.unavailable_reason` carries the qualification state onto the
-            // `Available=False` condition (finding 4), so a fresh cluster held for
-            // qualification says why -- Pending with the qualifying message, or
-            // Failed with the Job's failure message -- instead of the generic
-            // MinimumReplicasUnavailable. `build_status` ignores it when prior
-            // ready replicas keep the cluster Available, so a serving cluster under
+            // The plan bounds cross-Job churn (finding 3): a store that keeps
+            // failing qualification is recreated on a capped exponential backoff
+            // and, past a threshold, held in a terminal cooldown, with the failure
+            // count and next-retry instant persisted in status. The chosen reason
+            // and message carry the qualification state onto the `Available=False`
+            // condition, so a fresh cluster held for qualification says why --
+            // Pending with the qualifying message, or Failed naming the attempt
+            // count and the next retry time -- instead of the generic
+            // MinimumReplicasUnavailable. `build_status` ignores it when prior ready
+            // replicas keep the cluster Available, so a serving cluster under
             // re-qualification stays Available=True.
-            let plan = qualify_gate_plan(&decision, obj.metadata.generation);
-            match plan.job_action {
+            let prior = obj.status.as_ref();
+            let failure_count = prior.and_then(|s| s.qualify_failure_count).unwrap_or(0);
+            let next_retry_unix = prior
+                .and_then(|s| s.qualify_next_retry_time.as_deref())
+                .and_then(parse_rfc3339_utc);
+            let plan = plan_qualify_gate(
+                &decision,
+                failure_count,
+                next_retry_unix,
+                now_unix_secs(),
+                i64::try_from(BOOTSTRAP_POLL.as_secs()).unwrap_or(10),
+            );
+            match plan.action {
                 QualifyJobAction::Create => {
                     let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
                     let mut job = desired_qualify_job(&obj.spec, instance, shared_rv);
@@ -1260,14 +1228,33 @@ async fn reconcile_inner(
                 }
                 QualifyJobAction::None => {}
             }
-            extra_conditions.push(plan.store_qualified_condition);
+            let (reason, message) = match plan.reason {
+                QualifyStoreReason::Pending => (
+                    STORE_QUALIFIED_PENDING_REASON,
+                    STORE_QUALIFYING_MESSAGE.to_string(),
+                ),
+                QualifyStoreReason::Failed => (
+                    STORE_QUALIFIED_FAILED_REASON,
+                    qualify_failed_message(
+                        plan.failure_count.unwrap_or(failure_count),
+                        plan.next_retry_unix,
+                        plan.job_message.as_deref(),
+                    ),
+                ),
+            };
+            extra_conditions.push(condition(
+                "StoreQualified",
+                false,
+                obj.metadata.generation,
+                reason,
+                &message,
+            ));
 
             // Report the readiness a prior pass recorded, so a cluster already
             // serving through a re-qualification keeps `Available=True` instead of
             // flipping to "waiting for tiers" on every poll while the new inputs
             // qualify. A fresh cluster has none of these and reports Available=False
             // with the qualification reason.
-            let prior = obj.status.as_ref();
             write_status(
                 client,
                 namespace,
@@ -1276,20 +1263,21 @@ async fn reconcile_inner(
                 prior.and_then(|s| s.gateway_ready_replicas),
                 prior.and_then(|s| s.query_ready_replicas),
                 prior.and_then(|s| s.maintain_ready_replicas),
-                Some((
-                    plan.unavailable_reason.0,
-                    plan.unavailable_reason.1.as_str(),
-                )),
+                Some((reason, message.as_str())),
                 PersistedStatus {
                     gc_bootstrap_waiting_since: prior
                         .and_then(|s| s.gc_bootstrap_waiting_since.clone()),
                     store_qualified_hash: qualified_hash,
+                    qualify_failure_count: plan.failure_count,
+                    qualify_next_retry_time: plan.next_retry_unix.map(format_rfc3339_utc),
                 },
                 extra_conditions,
                 prior.map(|s| s.conditions.as_slice()).unwrap_or_default(),
             )
             .await?;
-            return Ok(Action::requeue(plan.requeue));
+            return Ok(Action::requeue(Duration::from_secs(
+                u64::try_from(plan.requeue_seconds).unwrap_or(30),
+            )));
         }
     };
 
@@ -1694,6 +1682,11 @@ async fn reconcile_inner(
         PersistedStatus {
             gc_bootstrap_waiting_since,
             store_qualified_hash,
+            // Qualification passed for these inputs this pass, so clear the retry
+            // budget (issue #36, finding 3): the next failure, if any, starts a
+            // fresh backoff from one rather than resuming a stale count.
+            qualify_failure_count: None,
+            qualify_next_retry_time: None,
         },
         extra_conditions,
         obj.status
@@ -1938,6 +1931,12 @@ struct PersistedStatus {
     /// `status.storeQualifiedHash`: the inputs the store last qualified
     /// against (issue #36), or `None` before the first qualification.
     store_qualified_hash: Option<String>,
+    /// `status.qualifyFailureCount`: consecutive qualify-Job failures for the
+    /// current inputs (issue #36, finding 3), or `None` when not in a retry hold.
+    qualify_failure_count: Option<i32>,
+    /// `status.qualifyNextRetryTime`: the RFC3339 instant before which no new
+    /// qualify Job is created after a failure, or `None` when not holding.
+    qualify_next_retry_time: Option<String>,
 }
 
 /// Build the success-path status: observed generation, per-mode ready replicas,
@@ -1987,6 +1986,8 @@ fn build_status(
         maintain_ready_replicas: maintain_ready,
         gc_bootstrap_waiting_since: persisted.gc_bootstrap_waiting_since,
         store_qualified_hash: persisted.store_qualified_hash,
+        qualify_failure_count: persisted.qualify_failure_count,
+        qualify_next_retry_time: persisted.qualify_next_retry_time,
         conditions,
     }
 }
@@ -2016,6 +2017,8 @@ fn build_degraded_status(
         maintain_ready_replicas: None,
         gc_bootstrap_waiting_since: persisted.gc_bootstrap_waiting_since,
         store_qualified_hash: persisted.store_qualified_hash,
+        qualify_failure_count: persisted.qualify_failure_count,
+        qualify_next_retry_time: persisted.qualify_next_retry_time,
         conditions,
     }
 }
@@ -2656,6 +2659,7 @@ mod tests {
             PersistedStatus {
                 gc_bootstrap_waiting_since: Some(since.clone()),
                 store_qualified_hash: Some("qhash-9".to_string()),
+                ..PersistedStatus::default()
             },
             Vec::new(),
         );
@@ -2866,7 +2870,7 @@ mod tests {
         );
         assert_ne!(available.reason, "MinimumReplicasUnavailable");
         assert!(
-            available.message.contains("ravel store qualify"),
+            available.message.contains("ravel-cli store qualify"),
             "Available carries the qualifying message: {}",
             available.message
         );
@@ -2917,67 +2921,25 @@ mod tests {
         assert_eq!(available.reason, "MinimumReplicasAvailable");
     }
 
-    /// A Failed qualify Job is deleted (foreground, via
-    /// [`QualifyJobAction::DeleteStale`]) so the next pass observes it Absent and
-    /// creates a fresh Job, and the hold requeues at [`RETRY`], the failure
-    /// backoff, not [`BOOTSTRAP_POLL`]: the primary watch drops the status-only
-    /// write that the delete produces, so nothing re-enqueues the object before
-    /// the delay, and a shorter poll would only rebuild-and-refail the Job
-    /// faster. The `StoreQualified=False` condition still carries the Job's
-    /// failure reason and message across that gap.
+    /// The Failed hold message names the consecutive-failure count and the next
+    /// retry instant, and carries the Job's own failure message when it had one.
     #[test]
-    fn failed_qualification_deletes_the_job_and_requeues_on_retry() {
-        let message = "backend rejected CAS".to_string();
-        let plan = qualify_gate_plan(&QualificationDecision::Failed(message.clone()), Some(7));
-        assert_eq!(plan.job_action, QualifyJobAction::DeleteStale);
-        assert_eq!(plan.requeue, RETRY);
-        assert_ne!(plan.requeue, BOOTSTRAP_POLL);
-        assert_eq!(plan.store_qualified_condition.status, "False");
+    fn qualify_failed_message_names_count_and_next_retry() {
+        let with_retry =
+            qualify_failed_message(3, Some(1_700_000_000), Some("backend rejected CAS"));
         assert_eq!(
-            plan.store_qualified_condition.reason,
-            STORE_QUALIFIED_FAILED_REASON
+            with_retry,
+            "store qualification failed after 3 consecutive attempt(s): backend rejected CAS next retry at 2023-11-14T22:13:20Z"
         );
-        assert_eq!(plan.store_qualified_condition.message, message);
+        let no_cause = qualify_failed_message(1, Some(1_700_000_000), None);
         assert_eq!(
-            plan.unavailable_reason,
-            (STORE_QUALIFIED_FAILED_REASON, message)
+            no_cause,
+            "store qualification failed after 1 consecutive attempt(s). next retry at 2023-11-14T22:13:20Z"
         );
-    }
-
-    /// The gate plan maps each non-Proceed decision to its Job action: an absent
-    /// Job is created, a stale or Failed Job is deleted, a running Job is left
-    /// untouched. A precondition hold (Create/Recreate/Waiting) requeues at
-    /// [`BOOTSTRAP_POLL`]; a Failed hold requeues at [`RETRY`], the failure
-    /// backoff.
-    #[test]
-    fn gate_plan_maps_each_hold_to_its_job_action() {
+        let retrying_now = qualify_failed_message(2, None, Some("still failing"));
         assert_eq!(
-            qualify_gate_plan(&QualificationDecision::Qualify { recreate: false }, None).job_action,
-            QualifyJobAction::Create
-        );
-        assert_eq!(
-            qualify_gate_plan(&QualificationDecision::Qualify { recreate: true }, None).job_action,
-            QualifyJobAction::DeleteStale
-        );
-        assert_eq!(
-            qualify_gate_plan(&QualificationDecision::Waiting, None).job_action,
-            QualifyJobAction::None
-        );
-        for decision in [
-            QualificationDecision::Qualify { recreate: false },
-            QualificationDecision::Qualify { recreate: true },
-            QualificationDecision::Waiting,
-        ] {
-            assert_eq!(
-                qualify_gate_plan(&decision, None).requeue,
-                BOOTSTRAP_POLL,
-                "{decision:?} requeues at BOOTSTRAP_POLL"
-            );
-        }
-        assert_eq!(
-            qualify_gate_plan(&QualificationDecision::Failed("m".to_string()), None).requeue,
-            RETRY,
-            "Failed requeues at RETRY"
+            retrying_now,
+            "store qualification failed after 2 consecutive attempt(s): still failing retrying now"
         );
     }
 
@@ -3735,8 +3697,16 @@ mod tests {
     /// (which is what the primary watch would otherwise see as a change).
     #[test]
     fn repeated_failed_pass_keeps_last_transition_time() {
-        let message = "backend rejected CAS".to_string();
-        let plan = qualify_gate_plan(&QualificationDecision::Failed(message.clone()), Some(7));
+        let message = "store qualification failed after 3 consecutive attempt(s): \
+                       backend rejected CAS retrying now"
+            .to_string();
+        let store_qualified = condition(
+            "StoreQualified",
+            false,
+            Some(7),
+            STORE_QUALIFIED_FAILED_REASON,
+            &message,
+        );
         // The Failed hold's status: Available=False plus StoreQualified=False,
         // exactly as `reconcile_inner` assembles it.
         let built = build_status(
@@ -3744,12 +3714,9 @@ mod tests {
             None,
             None,
             None,
-            Some((
-                plan.unavailable_reason.0,
-                plan.unavailable_reason.1.as_str(),
-            )),
+            Some((STORE_QUALIFIED_FAILED_REASON, message.as_str())),
             PersistedStatus::default(),
-            vec![plan.store_qualified_condition.clone()],
+            vec![store_qualified.clone()],
         );
 
         // The previous status: the same conditions with a fixed, distinctive

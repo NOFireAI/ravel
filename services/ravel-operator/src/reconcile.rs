@@ -1973,7 +1973,7 @@ pub const QUALIFY_JOB_TTL_SECONDS: i32 = 3600;
 /// `DeadlineExceeded` before the retry budget ([`QUALIFY_JOB_BACKOFF_LIMIT`])
 /// was ever spent.
 ///
-/// Arithmetic. `ravel store qualify` runs 28 sequential object operations
+/// Arithmetic. `ravel-cli store qualify` runs 28 sequential object operations
 /// against the bucket: probe create-if-absent (put, put, get = 3), probe CAS
 /// version (put, put, put, get = 4), probe read-after-write ([`super`]'s
 /// `CONSISTENCY_CYCLES` = 5 put+get = 10), probe list-after-write (5 put+list
@@ -2008,13 +2008,13 @@ pub const STORE_QUALIFIED_SUCCEEDED_REASON: &str = "Succeeded";
 pub const STORE_QUALIFIED_FAILED_REASON: &str = "Failed";
 
 /// Message paired with [`STORE_QUALIFIED_PENDING_REASON`].
-pub const STORE_QUALIFYING_MESSAGE: &str = "running store qualification (ravel store qualify) against the cluster's bucket; the \
+pub const STORE_QUALIFYING_MESSAGE: &str = "running store qualification (ravel-cli store qualify) against the cluster's bucket; the \
      gateway, query, and maintain Deployments are held until it succeeds so the cluster never \
      serves on a backend that fails the object-store contract (docs/object-store-contract.md)";
 
 /// Message paired with [`STORE_QUALIFIED_SUCCEEDED_REASON`].
 pub const STORE_QUALIFIED_MESSAGE: &str =
-    "the object store passed ravel store qualify; serving Deployments may be created";
+    "the object store passed ravel-cli store qualify; serving Deployments may be created";
 
 /// A deterministic change-detection hash over the inputs store qualification
 /// proves against (issue #36): the bucket, region, endpoint, server image, the
@@ -2061,7 +2061,7 @@ pub fn qualify_job_input_hash(
 
 /// The one-shot store-qualification Job for a cluster (issue #36).
 ///
-/// Runs `ravel store qualify` (the same `ravel-cli` binary the server image
+/// Runs `ravel-cli store qualify` (the same `ravel-cli` binary the server image
 /// ships) against the cluster's bucket before any serving Deployment is created,
 /// so a backend that fails the object-store contract is caught at deploy time
 /// rather than crash-looping every server pod on a fresh bucket. Image and
@@ -2244,6 +2244,227 @@ pub fn qualification_decision(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Base delay of the qualify-Job recreation backoff (issue #36, finding 3): the
+/// first consecutive failure holds this long before a fresh Job is created. Equal
+/// to the controller's failure requeue, so a single failure behaves as it did
+/// before the backoff existed.
+pub const QUALIFY_RETRY_BASE_SECONDS: i64 = 30;
+
+/// Ceiling of the capped exponential qualify-Job recreation backoff: the
+/// per-failure hold doubles from [`QUALIFY_RETRY_BASE_SECONDS`] but never exceeds
+/// this, so a persistently failing store is retried at most this often before the
+/// terminal cooldown takes over.
+pub const QUALIFY_RETRY_CEILING_SECONDS: i64 = 480;
+
+/// Consecutive failures after which the gate stops recreating on the exponential
+/// backoff and holds in the terminal cooldown ([`QUALIFY_RETRY_COOLDOWN_SECONDS`])
+/// instead. Bounds cross-Job churn: `backoffLimit` and `activeDeadlineSeconds`
+/// bound attempts WITHIN one Job only, so without this an unchanged store that
+/// keeps failing qualification would be re-Jobbed forever on the backoff.
+pub const QUALIFY_RETRY_TERMINAL_THRESHOLD: i32 = 6;
+
+/// Terminal-cooldown hold once [`QUALIFY_RETRY_TERMINAL_THRESHOLD`] consecutive
+/// failures are reached: one hour. During it the gate creates no Job; only an
+/// input change (the qualified-input hash moving, which resets the count) or the
+/// cooldown's own expiry lets qualification run again. Equal to the qualify Job's
+/// [`QUALIFY_JOB_TTL_SECONDS`], so the Failed Job that records which inputs are
+/// failing survives most of the hold and a config edit during the cooldown is
+/// seen as a stale Job and resets at once.
+pub const QUALIFY_RETRY_COOLDOWN_SECONDS: i64 = 3600;
+
+/// Seconds to hold before the next qualify-Job recreation after `failure_count`
+/// consecutive failures (issue #36, finding 3).
+///
+/// Capped exponential for the first [`QUALIFY_RETRY_TERMINAL_THRESHOLD`] - 1
+/// failures: [`QUALIFY_RETRY_BASE_SECONDS`] doubling each failure, clamped to
+/// [`QUALIFY_RETRY_CEILING_SECONDS`]. At or beyond the threshold the hold is the
+/// terminal cooldown [`QUALIFY_RETRY_COOLDOWN_SECONDS`]. `failure_count` is the
+/// number of failures INCLUDING the one just observed (1 for the first). The
+/// exact sequence for counts 1..=7 is 30, 60, 120, 240, 480, 3600, 3600.
+pub fn qualify_retry_backoff_seconds(failure_count: i32) -> i64 {
+    if failure_count >= QUALIFY_RETRY_TERMINAL_THRESHOLD {
+        return QUALIFY_RETRY_COOLDOWN_SECONDS;
+    }
+    let doublings = u32::try_from(failure_count - 1).unwrap_or(0).min(31);
+    let scaled = QUALIFY_RETRY_BASE_SECONDS
+        .checked_shl(doublings)
+        .unwrap_or(QUALIFY_RETRY_CEILING_SECONDS);
+    scaled.clamp(QUALIFY_RETRY_BASE_SECONDS, QUALIFY_RETRY_CEILING_SECONDS)
+}
+
+/// The qualify-Job mutation a non-Proceed pass performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualifyJobAction {
+    /// Create the qualify Job for the current inputs: none exists and the backoff
+    /// (if any) has elapsed.
+    Create,
+    /// Delete the existing Job with foreground propagation. Used when a config
+    /// edit made the Job's inputs stale, and when a Failed Job's backoff has
+    /// elapsed and it must be recreated.
+    DeleteStale,
+    /// Leave the Job untouched: it is running, or it is the Failed record kept in
+    /// place during the backoff hold.
+    None,
+}
+
+/// The `StoreQualified` reason a non-Proceed pass records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QualifyStoreReason {
+    /// Qualification is in progress (creating or running the Job).
+    Pending,
+    /// The last attempt failed; the gate is holding on the retry backoff or the
+    /// terminal cooldown.
+    Failed,
+}
+
+/// The retry-aware plan for a reconcile pass that did NOT reach
+/// [`QualificationDecision::Proceed`] (issue #36, finding 3). Pure over the
+/// persisted retry state and an injected `now_unix`, so the backoff schedule, the
+/// terminal cooldown, and the input-change reset are unit-tested without a clock.
+/// The controller performs `action`, records a `StoreQualified=False` condition
+/// from `reason`/`job_message`, persists `failure_count`/`next_retry_unix`, and
+/// requeues after `requeue_seconds`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifyGatePlan {
+    /// The Job mutation to perform.
+    pub action: QualifyJobAction,
+    /// The `StoreQualified` reason.
+    pub reason: QualifyStoreReason,
+    /// The failed Job's terminal message when this pass observed it, carried onto
+    /// the condition; `None` on the Pending arms and while holding without a Job
+    /// to read.
+    pub job_message: Option<String>,
+    /// Failure count to persist (`None` clears the field, on the input-change
+    /// reset and on a fresh cluster).
+    pub failure_count: Option<i32>,
+    /// Next-retry instant to persist as RFC3339 (`None` clears the field).
+    pub next_retry_unix: Option<i64>,
+    /// Requeue delay in seconds.
+    pub requeue_seconds: i64,
+}
+
+/// Map a non-Proceed [`QualificationDecision`] plus the persisted retry state to
+/// its [`QualifyGatePlan`], bounding cross-Job churn (issue #36, finding 3).
+///
+/// The naive gate deleted a Failed Job, requeued on the failure backoff, saw the
+/// Job Absent next pass, and created a fresh one, forever: the Job's own
+/// `backoffLimit`/`activeDeadlineSeconds` bound attempts WITHIN one Job, never the
+/// number of Jobs. This function bounds the recreations. Each consecutive failure
+/// schedules the next recreation on a capped exponential backoff
+/// ([`qualify_retry_backoff_seconds`]); after [`QUALIFY_RETRY_TERMINAL_THRESHOLD`]
+/// failures the gate holds in a terminal cooldown that only an input change (which
+/// resets the count) or the cooldown's expiry clears.
+///
+/// The Failed Job is KEPT in place during the backoff hold as the record of which
+/// inputs are failing, so a config edit during a long cooldown reads as a stale
+/// Job ([`QualificationDecision::Qualify`] `recreate: true`) and resets at once;
+/// the Job is deleted only once its backoff elapses and it must be recreated.
+/// Deleting the Job clears no retry state: the count is cleared only on the
+/// success path (in the controller) or on an input change, and `next_retry_unix`
+/// is cleared only when the replacement Job is actually created (the Absent
+/// recreation arm), never in the delete arm, so a failed Job that lingers under
+/// foreground deletion is not counted twice.
+pub fn plan_qualify_gate(
+    decision: &QualificationDecision,
+    failure_count: i32,
+    next_retry_unix: Option<i64>,
+    now_unix: i64,
+    poll_seconds: i64,
+) -> QualifyGatePlan {
+    let kept_count = (failure_count > 0).then_some(failure_count);
+    match decision {
+        // A Job for stale inputs is present: a config edit landed. Delete it and
+        // reset the retry budget so the fresh inputs qualify from a clean slate,
+        // at once (the next pass sees Absent with a zero count and creates one).
+        QualificationDecision::Qualify { recreate: true } => QualifyGatePlan {
+            action: QualifyJobAction::DeleteStale,
+            reason: QualifyStoreReason::Pending,
+            job_message: None,
+            failure_count: None,
+            next_retry_unix: None,
+            requeue_seconds: poll_seconds,
+        },
+        // No Job exists: a fresh cluster (count 0) creates one now; after a failure
+        // this is the recreation point, gated on the backoff having elapsed.
+        QualificationDecision::Qualify { recreate: false } => match next_retry_unix {
+            Some(due) if now_unix < due => QualifyGatePlan {
+                action: QualifyJobAction::None,
+                reason: QualifyStoreReason::Failed,
+                job_message: None,
+                failure_count: kept_count,
+                next_retry_unix: Some(due),
+                requeue_seconds: (due - now_unix).max(1),
+            },
+            // Backoff elapsed (or never set): create the replacement Job and clear
+            // next_retry so the new attempt's failure is counted afresh. The count
+            // is kept; only success or an input change resets it.
+            _ => QualifyGatePlan {
+                action: QualifyJobAction::Create,
+                reason: if failure_count > 0 {
+                    QualifyStoreReason::Failed
+                } else {
+                    QualifyStoreReason::Pending
+                },
+                job_message: None,
+                failure_count: kept_count,
+                next_retry_unix: None,
+                requeue_seconds: poll_seconds,
+            },
+        },
+        // The Job is still running: hold, touch neither the Job nor the retry
+        // state.
+        QualificationDecision::Waiting => QualifyGatePlan {
+            action: QualifyJobAction::None,
+            reason: QualifyStoreReason::Pending,
+            job_message: None,
+            failure_count: kept_count,
+            next_retry_unix,
+            requeue_seconds: poll_seconds,
+        },
+        // The Job for the current inputs Failed and is Present.
+        QualificationDecision::Failed(message) => match next_retry_unix {
+            // A newly-observed failure (no backoff scheduled): count it once and
+            // schedule the backoff. Keep the Job as the failure record.
+            None => {
+                let count = failure_count.saturating_add(1);
+                let delay = qualify_retry_backoff_seconds(count);
+                QualifyGatePlan {
+                    action: QualifyJobAction::None,
+                    reason: QualifyStoreReason::Failed,
+                    job_message: Some(message.clone()),
+                    failure_count: Some(count),
+                    next_retry_unix: Some(now_unix + delay),
+                    requeue_seconds: delay,
+                }
+            }
+            // Still holding: keep the Job and the count, do not re-count.
+            Some(due) if now_unix < due => QualifyGatePlan {
+                action: QualifyJobAction::None,
+                reason: QualifyStoreReason::Failed,
+                job_message: Some(message.clone()),
+                failure_count: kept_count,
+                next_retry_unix: Some(due),
+                requeue_seconds: (due - now_unix).max(1),
+            },
+            // Backoff elapsed: delete the Failed Job so a later pass sees Absent
+            // and recreates. Keep next_retry set (the Absent arm clears it on the
+            // actual create) so a Job lingering under foreground deletion is not
+            // counted a second time.
+            Some(due) => QualifyGatePlan {
+                action: QualifyJobAction::DeleteStale,
+                reason: QualifyStoreReason::Failed,
+                job_message: Some(message.clone()),
+                failure_count: kept_count,
+                next_retry_unix: Some(due),
+                requeue_seconds: poll_seconds,
+            },
+        },
+        QualificationDecision::Proceed => {
+            unreachable!("Proceed is handled on the success path, never planned as a hold")
         }
     }
 }
@@ -5913,6 +6134,190 @@ mod tests {
             qualify_job_input_hash(&base_spec(), Some("rv-golden")),
             "adfd6df5df66464b2bdfa458c3af84ae1011a0c445d2e4823dfd02adda76bbf8",
         );
+    }
+
+    /// The qualify retry backoff is a capped exponential for the first
+    /// [`QUALIFY_RETRY_TERMINAL_THRESHOLD`] - 1 consecutive failures and the
+    /// terminal cooldown at or past the threshold (issue #36, finding 3). The
+    /// exact per-failure sequence is asserted, not a monotonicity band.
+    #[test]
+    fn qualify_retry_backoff_sequence_is_exact() {
+        let sequence: Vec<i64> = (1..=7).map(qualify_retry_backoff_seconds).collect();
+        assert_eq!(sequence, vec![30, 60, 120, 240, 480, 3600, 3600]);
+        // The ceiling caps the exponential region: the fifth failure is 480, the
+        // sixth crosses into the cooldown, never a doubled 960.
+        assert_eq!(
+            qualify_retry_backoff_seconds(5),
+            QUALIFY_RETRY_CEILING_SECONDS
+        );
+        assert_eq!(
+            qualify_retry_backoff_seconds(QUALIFY_RETRY_TERMINAL_THRESHOLD),
+            QUALIFY_RETRY_COOLDOWN_SECONDS
+        );
+    }
+
+    /// A newly-observed failure (no backoff scheduled) is counted exactly once,
+    /// schedules the next retry at `now + backoff(count)`, keeps the Failed Job in
+    /// place (no Job mutation), and requeues at the backoff. A second pass still
+    /// inside the window does not re-count.
+    #[test]
+    fn plan_first_failure_counts_once_and_schedules_backoff() {
+        let msg = "backend rejected CAS".to_string();
+        let first = plan_qualify_gate(
+            &QualificationDecision::Failed(msg.clone()),
+            0,
+            None,
+            1_000,
+            10,
+        );
+        assert_eq!(first.action, QualifyJobAction::None);
+        assert_eq!(first.reason, QualifyStoreReason::Failed);
+        assert_eq!(first.failure_count, Some(1));
+        assert_eq!(first.next_retry_unix, Some(1_030));
+        assert_eq!(first.requeue_seconds, 30);
+        assert_eq!(first.job_message.as_deref(), Some("backend rejected CAS"));
+
+        // Still holding at count 1: no re-count, requeue shrinks to time remaining.
+        let holding = plan_qualify_gate(
+            &QualificationDecision::Failed(msg),
+            1,
+            Some(1_030),
+            1_020,
+            10,
+        );
+        assert_eq!(holding.action, QualifyJobAction::None);
+        assert_eq!(holding.failure_count, Some(1));
+        assert_eq!(holding.next_retry_unix, Some(1_030));
+        assert_eq!(holding.requeue_seconds, 10);
+    }
+
+    /// Once the backoff elapses, the Failed Job is deleted (foreground) so a later
+    /// pass sees it Absent and recreates it; `next_retry_unix` is NOT cleared on
+    /// the delete, so a Job lingering under foreground deletion is not counted a
+    /// second time. The Absent recreation then creates the Job and clears
+    /// `next_retry_unix`, keeping the count.
+    #[test]
+    fn plan_recreates_after_backoff_without_double_counting() {
+        let msg = "still failing".to_string();
+        // Backoff elapsed with the Failed Job still present: delete it, keep the
+        // retry state so the recreation is not re-counted.
+        let deleting = plan_qualify_gate(
+            &QualificationDecision::Failed(msg),
+            2,
+            Some(1_030),
+            1_030,
+            10,
+        );
+        assert_eq!(deleting.action, QualifyJobAction::DeleteStale);
+        assert_eq!(deleting.failure_count, Some(2));
+        assert_eq!(deleting.next_retry_unix, Some(1_030));
+
+        // Next pass, Job Absent, backoff elapsed: create and clear next_retry so the
+        // new attempt's failure counts afresh; count is kept, reason stays Failed.
+        let creating = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            2,
+            Some(1_030),
+            1_030,
+            10,
+        );
+        assert_eq!(creating.action, QualifyJobAction::Create);
+        assert_eq!(creating.reason, QualifyStoreReason::Failed);
+        assert_eq!(creating.failure_count, Some(2));
+        assert_eq!(creating.next_retry_unix, None);
+        assert_eq!(creating.requeue_seconds, 10);
+    }
+
+    /// At the terminal threshold the gate holds in the cooldown: it creates NO Job
+    /// before the cooldown expires and DOES recreate one at (and after) expiry. The
+    /// hold is expressed on both the Failed-present and Absent arms.
+    #[test]
+    fn plan_terminal_hold_blocks_recreation_until_cooldown_expiry() {
+        let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
+
+        // Failed Job present, before expiry: no mutation.
+        let held_present = plan_qualify_gate(
+            &QualificationDecision::Failed("terminal".to_string()),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            1_000,
+            10,
+        );
+        assert_eq!(held_present.action, QualifyJobAction::None);
+
+        // Job Absent, before expiry: still no Create.
+        let held_absent = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            due - 1,
+            10,
+        );
+        assert_eq!(held_absent.action, QualifyJobAction::None);
+        assert_eq!(held_absent.reason, QualifyStoreReason::Failed);
+
+        // Job Absent, at expiry: recreate.
+        let released = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            due,
+            10,
+        );
+        assert_eq!(released.action, QualifyJobAction::Create);
+    }
+
+    /// An input change during any hold (a `recreate: true` decision, meaning a Job
+    /// for stale inputs is present) resets the retry budget and deletes the stale
+    /// Job at once: `failure_count` and `next_retry_unix` are cleared, so the next
+    /// pass creates a fresh Job immediately rather than waiting out the cooldown.
+    #[test]
+    fn plan_input_change_resets_count_and_recreates_at_once() {
+        let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
+        let reset = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: true },
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            1_000,
+            10,
+        );
+        assert_eq!(reset.action, QualifyJobAction::DeleteStale);
+        assert_eq!(reset.reason, QualifyStoreReason::Pending);
+        assert_eq!(reset.failure_count, None);
+        assert_eq!(reset.next_retry_unix, None);
+
+        // Next pass sees the fresh inputs' Job Absent with a zero count: create now.
+        let fresh = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            0,
+            None,
+            1_000,
+            10,
+        );
+        assert_eq!(fresh.action, QualifyJobAction::Create);
+        assert_eq!(fresh.reason, QualifyStoreReason::Pending);
+        assert_eq!(fresh.failure_count, None);
+        assert_eq!(fresh.requeue_seconds, 10);
+    }
+
+    /// The persisted retry bookkeeping (failure count, next-retry time) is NOT part
+    /// of the qualified-input hash (issue #36, finding 3): the hash is recomputed
+    /// here over exactly the store-identity inputs, so folding either retry field
+    /// into it would diverge from this reconstruction and fail the test. Keeping
+    /// them out is what lets a retry converge instead of reading every backoff pass
+    /// as a new input.
+    #[test]
+    fn qualify_input_hash_excludes_retry_state() {
+        let spec = base_spec();
+        let expected = blake3_hex(&[
+            spec.storage.s3.bucket.as_str(),
+            spec.storage.s3.region.as_str(),
+            spec.storage.s3.endpoint.as_deref().unwrap_or(""),
+            spec.image.as_str(),
+            spec.storage.s3.credentials_secret_ref.name.as_str(),
+            "rv",
+        ]);
+        assert_eq!(qualify_job_input_hash(&spec, Some("rv")), expected);
     }
 
     /// A cluster already qualified for the current inputs proceeds without

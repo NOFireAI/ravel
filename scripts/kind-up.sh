@@ -82,14 +82,22 @@ die() {
 wait_cluster_condition() {
   local ctype="$1" want="$2" timeout="$3" desc="$4"
   local deadline=$(( SECONDS + timeout ))
-  local gen obsgen cstatus
+  local snap rest gen obsgen cstatus
   while (( SECONDS < deadline )); do
-    gen="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
-      -o jsonpath='{.metadata.generation}' 2>/dev/null || true)"
-    cstatus="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
-      -o jsonpath="{.status.conditions[?(@.type==\"${ctype}\")].status}" 2>/dev/null || true)"
-    obsgen="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
-      -o jsonpath="{.status.conditions[?(@.type==\"${ctype}\")].observedGeneration}" 2>/dev/null || true)"
+    # One GET per iteration: read .metadata.generation, the condition status, and
+    # its observedGeneration from a SINGLE object snapshot. Reading them in three
+    # separate kubectl calls let a spec change land between reads, matching an old
+    # condition against an old generation and returning success early. A single
+    # jsonpath template applied to one fetched object is an atomic read of all
+    # three, joined by a literal '|' none of the values can contain (an integer,
+    # a True/False/Unknown status, an integer).
+    snap="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
+      -o jsonpath="{.metadata.generation}|{.status.conditions[?(@.type==\"${ctype}\")].status}|{.status.conditions[?(@.type==\"${ctype}\")].observedGeneration}" \
+      2>/dev/null || true)"
+    gen="${snap%%|*}"
+    rest="${snap#*|}"
+    cstatus="${rest%%|*}"
+    obsgen="${rest##*|}"
     if [[ -n "$gen" && "$cstatus" == "$want" && "$obsgen" == "$gen" ]]; then
       return 0
     fi

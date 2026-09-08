@@ -8,6 +8,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The operator's Secret change-detection checksum is now a `blake3` digest, 64
+  hex characters** (issue #36). It replaces a 16-character standard-hasher value
+  that was not stable across Rust toolchain versions. Because the annotation
+  value changes, the first reconcile after upgrading the operator rolls every
+  rendered gateway, query, and enabled maintain Deployment once, even when their
+  referenced Secrets are unchanged; subsequent reconciles are stable. Schedule
+  the operator upgrade in a maintenance window that tolerates one rolling restart
+  of each serving tier.
+- **The operator now bounds qualify-Job recreations for a store that keeps
+  failing qualification** (issue #36). A failing `ravel-cli store qualify` Job is
+  recreated on a capped exponential backoff (30 s doubling to a 480 s ceiling)
+  and, after 6 consecutive failures, held in a one-hour terminal cooldown that
+  only an input change or the cooldown's expiry clears, rather than looping
+  delete/recreate every retry interval. The failure count and next-retry instant
+  are persisted in `RavelCluster` status, and the `StoreQualified=False`
+  condition names the attempt count and the next retry time.
 - **`latency-first`'s published trade is re-measured and now names the commit it
   was taken on** (issue #1316). Over 3 reps on the reference corpus,
   42-statement basis, true cold in the warm-up-empty state, at concurrency 256:
