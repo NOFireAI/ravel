@@ -32,6 +32,8 @@ pub mod ingest_concurrency;
 pub mod lifecycle_refresh;
 pub mod logs_ingest;
 pub mod maintain;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod mem_stats;
 pub mod metadata_sink_task;
 pub mod metrics;
@@ -735,6 +737,36 @@ fn remote_write_state(
         ingest_concurrency: ingest_concurrency.clone(),
         clock: Arc::new(SystemClock),
         metadata_sink: metadata_sink.clone(),
+    })
+}
+
+/// The MCP route's settings, for one listener (ADR-1374 decision 3).
+///
+/// `engine_config` is the engine's own resolved ceilings, which is what every
+/// tool call's budgets clamp down to; the MCP-layer ceilings stay at their D6
+/// defaults, because the flags configure the request body cap and the origin
+/// allowlist, not the response-byte ceiling. `protection_horizon_ns` is the
+/// deployment's GC horizon as a duration; the adapter subtracts it from each
+/// call's own instant to get the oldest instant a cursor may still name.
+#[cfg(feature = "mcp")]
+fn mcp_settings(
+    config: &ServerConfig,
+    engine_config: &ravel_query::EngineConfig,
+) -> anyhow::Result<mcp::McpSettings> {
+    let mcp_config = &config.query_budgets.mcp;
+    let max_body_bytes = usize::try_from(mcp_config.max_body_bytes).map_err(|_| {
+        anyhow::anyhow!(
+            "--mcp-max-body-bytes {} exceeds this platform's addressable size",
+            mcp_config.max_body_bytes
+        )
+    })?;
+    Ok(mcp::McpSettings {
+        allowed_origins: mcp_config.allowed_origins.clone(),
+        max_body_bytes,
+        engine_config: *engine_config,
+        budget_config: ravel_mcp::budget::McpBudgetConfig::default(),
+        protection_horizon_ns: config.gc.protection_horizon_ns,
+        clock: Arc::new(SystemClock),
     })
 }
 
@@ -1684,6 +1716,18 @@ pub async fn start(
         .with_exemplars(exemplars_state);
         #[cfg(feature = "sql")]
         let query_service = query_service.with_sql(sql_query_state);
+        // `POST /mcp` (ADR-1374 decision 7), on the same listener and behind
+        // the same tenant resolver as the HTTP query routes above. Mounted
+        // from the query service just built rather than from a facade of its
+        // own, so an MCP tool call and an HTTP query share one admission
+        // controller, one cost recorder, one usage sink, and one audit sink.
+        #[cfg(feature = "mcp")]
+        if config.query_budgets.mcp.enabled {
+            http_router = http_router.merge(mcp::router(
+                query_service.clone(),
+                mcp_settings(&config, app_state.engine.config())?,
+            )?);
+        }
         query_service_handle = Some(query_service);
 
         // The mTLS listener gets its own instance. Everything a control needs
@@ -1717,6 +1761,17 @@ pub async fn start(
                 Some(state) => mtls_query_service.with_sql(state),
                 None => mtls_query_service,
             };
+            // The mTLS listener's own MCP route, from the instance built just
+            // above: a certificate-identified caller must be authenticated by
+            // `mtls.resolver`, not by the primary listener's bearer-token
+            // resolver.
+            #[cfg(feature = "mcp")]
+            if config.query_budgets.mcp.enabled {
+                mtls_router = mtls_router.merge(mcp::router(
+                    mtls_query_service.clone(),
+                    mcp_settings(&config, app_state.engine.config())?,
+                )?);
+            }
             mtls_query_service_handle = Some(mtls_query_service);
         }
 
