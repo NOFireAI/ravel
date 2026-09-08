@@ -1073,6 +1073,13 @@ impl Envelope {
     /// - `ok`: no cap stopped the result. A zero-row match and an unfilled
     ///   `LIMIT` are both complete results and both `ok`.
     ///
+    /// "A cap stopped the result" means the cap took something away, not that
+    /// a cap was consulted. `bytes_cap_hit` says the envelope was over the
+    /// byte cap when `fit` measured it; if the caps that followed dropped no
+    /// row and cut no cell, nothing is missing and the result is `ok`.
+    /// Reporting `ok_bounded` there would tell the caller more rows match
+    /// than came back, which is a claim about the data and would be false.
+    ///
     /// `has_total_order` is the statement-level fact that decides whether a
     /// cursor may be handed out at all: D5 mints one only when the ordering
     /// plus its tiebreak is a total order, because a cursor over a partial
@@ -1092,7 +1099,10 @@ impl Envelope {
             return self;
         }
 
-        let capped = self.presentation.row_cap_hit || self.presentation.bytes_cap_hit;
+        let bytes_cap_took_something =
+            self.presentation.rows_omitted > 0 || self.presentation.cells_truncated > 0;
+        let capped = self.presentation.row_cap_hit
+            || (self.presentation.bytes_cap_hit && bytes_cap_took_something);
         if !has_total_order || !capped {
             self.presentation.cursor = None;
         }
@@ -2001,6 +2011,36 @@ mod tests {
 
         assert_eq!(finished.status, Status::Ok);
         assert_eq!(finished.presentation.cursor, None);
+    }
+
+    /// `bytes_cap_hit` alone is not a bounded result. The flag says the
+    /// envelope was over the byte cap when `fit` measured it; when the caps
+    /// that followed dropped no row and cut no cell, every matching row came
+    /// back and the status is `ok`. A cursor set on such a result points at
+    /// no next page and is dropped with it.
+    ///
+    /// One dropped row or one cut cell is enough to make the same envelope
+    /// bounded, which is what keeps the flag from being decoration.
+    #[test]
+    fn finish_is_ok_when_the_cap_was_hit_but_nothing_was_dropped() {
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.bytes_cap_hit = true;
+        envelope.presentation.cursor = Some("cursor-token".to_string());
+
+        let finished = envelope.finish(true);
+
+        assert_eq!(finished.status, Status::Ok);
+        assert_eq!(finished.presentation.cursor, None);
+
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.bytes_cap_hit = true;
+        envelope.presentation.rows_omitted = 1;
+        assert_eq!(envelope.finish(false).status, Status::OkBounded);
+
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.bytes_cap_hit = true;
+        envelope.presentation.cells_truncated = 1;
+        assert_eq!(envelope.finish(false).status, Status::OkBounded);
     }
 
     /// A failure is never a page: an `Error` envelope keeps its status even
