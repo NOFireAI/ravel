@@ -619,6 +619,20 @@ fn live_input_event_bounds(live: &LiveInputs) -> (i64, i64) {
     (min_event_ts_ns, max_event_ts_ns)
 }
 
+/// Whether the bucket's live input set is an empty RawL0 set: zero L0 commit
+/// records and nothing ever compacted or rewritten. This is the one shape that
+/// would feed an empty `inputs` with no `superseded_record_key` into
+/// [`erasure::compute_rewrite_input_set_hash`], which panics on that caller
+/// contract violation. A windowless request overlaps every bucket with any
+/// live record ([`bucket_may_overlap`] short-circuits to `true` before its
+/// `min > max` empty sentinel), so without this check such a request against an
+/// empty RawL0 bucket reaches the hash with nothing to erase. A
+/// [`LiveInputs::Existing`] set always supersedes a non-empty record key, so it
+/// never hits that panic regardless of how many parts it carries.
+fn is_empty_raw_l0(live: &LiveInputs) -> bool {
+    matches!(live, LiveInputs::RawL0(inputs) if inputs.is_empty())
+}
+
 /// The set of `request_id`s a bucket's live record already names in its
 /// `drops`, when that live record is a [`RewriteRecord`]; `None` when the live
 /// record is raw L0 or a compaction record (nothing has been rewritten yet, so
@@ -1690,7 +1704,9 @@ pub enum ErasureRewriteOutcome {
     /// there is nothing left to erase from it.
     Tombstoned,
     /// No pending request's [`bucket_may_overlap`] prefilter overlapped this
-    /// bucket; nothing to do.
+    /// bucket, or the bucket is an empty RawL0 set (zero L0 commits, never
+    /// compacted) that a windowless request would otherwise select with nothing
+    /// to erase ([`is_empty_raw_l0`]); nothing to do.
     NoApplicableRequests,
     /// The bucket (or some object still listed in it) is under legal hold
     /// ([`bucket_is_held`]); skipped, every applicable `.dreq` stays pending,
@@ -1808,6 +1824,17 @@ pub async fn erasure_rewrite_bucket(
         .filter(|p| bucket_may_overlap(min_event_ts_ns, max_event_ts_ns, &p.request))
         .collect();
     if overlapping.is_empty() {
+        return Ok(ErasureRewriteOutcome::NoApplicableRequests);
+    }
+
+    // Empty-bucket guard: a windowless request's `bucket_may_overlap` returns
+    // `true` before the `min > max` empty sentinel, so an empty RawL0 bucket
+    // (zero L0 commits, never compacted) survives the overlap filter above with
+    // no inputs to rewrite. Building a rewrite here would call
+    // `compute_rewrite_input_set_hash` with an empty `inputs` and no superseded
+    // key, which panics. There is nothing to erase, so report it as no
+    // applicable request and write nothing.
+    if is_empty_raw_l0(&live) {
         return Ok(ErasureRewriteOutcome::NoApplicableRequests);
     }
 
@@ -3230,6 +3257,172 @@ mod tests {
         assert_eq!(
             alpha_after, expected,
             "surviving samples must re-encode bit-identically, including the NaN payload"
+        );
+    }
+
+    /// The exact set of object keys in the store, for the before/after
+    /// unchanged-store assertions the empty-bucket tests make (an exact set,
+    /// not a count, so a delete-plus-insert that keeps the count could not
+    /// pass).
+    async fn key_set(store: &dyn ObjectStoreBackend) -> std::collections::BTreeSet<String> {
+        list_all(store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|m| m.key)
+            .collect()
+    }
+
+    /// A metrics bucket on a tenant distinct from [`bucket`]'s `acme`, for the
+    /// empty-bucket tests (which never seed, so they must not collide with any
+    /// other test's tenant).
+    fn empty_bucket(tenant: &str) -> Bucket {
+        Bucket::new(TenantId::new(tenant).hash(), Signal::Metrics, SHARD, HOUR)
+    }
+
+    /// Issue #1410: a windowless request (both window bounds zero) against an
+    /// empty RawL0 bucket -- zero L0 commits, never compacted -- must return
+    /// `NoApplicableRequests` and write nothing, not panic. `bucket_may_overlap`
+    /// returns `true` unconditionally for a windowless request before its
+    /// `min > max` empty sentinel, so such a request reaches the build with an
+    /// empty input set, and `compute_rewrite_input_set_hash` panics on an empty
+    /// `inputs` with no superseded key.
+    ///
+    /// Flip-line proof: removing the `if is_empty_raw_l0(&live) { return ... }`
+    /// guard in `erasure_rewrite_bucket` makes this test panic with
+    /// `compute_rewrite_input_set_hash: exactly one of `inputs` (non-empty) or
+    /// `superseded_record_key` (non-empty) must be set (inputs_present=false,
+    /// superseded_present=false)`.
+    #[tokio::test]
+    async fn windowless_request_empty_bucket_returns_no_applicable_requests() {
+        let store = MemoryStore::new();
+        let b = empty_bucket("erasure-empty-windowless");
+
+        // Windowless (both bounds zero): erasure_request already builds this.
+        let request = erasure_request(1, "alpha");
+        assert_eq!(request.window_start_ns, 0, "request must be windowless");
+        assert_eq!(request.window_end_ns, 0, "request must be windowless");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let before = key_set(&store).await;
+        assert!(before.is_empty(), "an empty bucket has no objects");
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome =
+            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &b, &pending, &mut memo)
+                .await
+                .expect("rewrite must not error");
+
+        assert_eq!(outcome, ErasureRewriteOutcome::NoApplicableRequests);
+
+        let after = key_set(&store).await;
+        assert_eq!(
+            before, after,
+            "an empty-bucket rewrite must write nothing: exact key set unchanged"
+        );
+    }
+
+    /// Issue #1410 characterization guard: a WINDOWED request against the same
+    /// empty bucket returns exactly what it returns today
+    /// (`NoApplicableRequests`, via `bucket_may_overlap`'s `min > max` empty
+    /// sentinel), so the empty-RawL0 guard does not perturb the windowed path.
+    ///
+    /// This outcome is now guarded by two independent checks (the windowed
+    /// overlap sentinel AND the empty-RawL0 guard), so no single production line
+    /// flip changes it; see the report for the pre-fix panic when both are
+    /// bypassed.
+    #[tokio::test]
+    async fn windowed_request_empty_bucket_unchanged_outcome() {
+        let store = MemoryStore::new();
+        let b = empty_bucket("erasure-empty-windowed");
+
+        let mut request = erasure_request(2, "alpha");
+        request.window_start_ns = 10;
+        request.window_end_ns = 20;
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let before = key_set(&store).await;
+        assert!(before.is_empty(), "an empty bucket has no objects");
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome =
+            erasure_rewrite_bucket(&store, &clock, &config, &NoLeases, &b, &pending, &mut memo)
+                .await
+                .expect("rewrite must not error");
+
+        assert_eq!(outcome, ErasureRewriteOutcome::NoApplicableRequests);
+
+        let after = key_set(&store).await;
+        assert_eq!(
+            before, after,
+            "a windowed empty-bucket rewrite writes nothing"
+        );
+    }
+
+    /// Issue #1410 regression guard: the empty-RawL0 guard must not suppress a
+    /// windowless request against a NON-empty bucket. Alpha's two samples both
+    /// match the windowless (whole-series) predicate, so the bucket is rewritten
+    /// to zero output parts with `dropped_count: 2` and a real rewrite record is
+    /// published.
+    ///
+    /// Flip-line proof: broadening `is_empty_raw_l0` from
+    /// `LiveInputs::RawL0(inputs) if inputs.is_empty()` to
+    /// `LiveInputs::RawL0(_)` makes this bucket short-circuit to
+    /// `NoApplicableRequests`, failing the `Rewritten` match below.
+    #[tokio::test]
+    async fn windowless_request_nonempty_bucket_still_rewrites() {
+        let store = MemoryStore::new();
+        seed(&store, 1, vec![series("alpha", &[(10, 1.0), (20, 2.0)])]).await;
+
+        let request = erasure_request(1, "alpha");
+        assert_eq!(request.window_start_ns, 0, "request must be windowless");
+        assert_eq!(request.window_end_ns, 0, "request must be windowless");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(
+            parts, 0,
+            "alpha is the only series and both samples match the windowless \
+             predicate, so nothing survives to write"
+        );
+        assert_eq!(publish, PublishOutcome::Published);
+
+        let record = read_rewrite_record(&store).await;
+        assert_eq!(record.drops.len(), 1);
+        assert_eq!(
+            record.drops[0].dropped_count, 2,
+            "both alpha samples dropped by the windowless request"
         );
     }
 
