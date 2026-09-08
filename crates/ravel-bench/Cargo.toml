@@ -505,5 +505,10 @@ harness = false
 name = "series_id_hash"
 harness = false
 
+[[bin]]
+name = "page_codec_bakeoff"
+path = "src/bin/page_codec_bakeoff.rs"
+bench = false
+
 [lints]
 workspace = true
