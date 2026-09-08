@@ -112,8 +112,8 @@ bounds, so the inflate qualification below has nothing to qualify (issue \
     # looser pattern while the gzip qualification was gone.
     if ! grep -qiE '(gzip[^.]*(inflate|decompress)|(inflate|decompress)[^.]*gzip)' "${tmp}"; then
       echo "gates.sh: ${flag}'s doc claims an ingest memory bound without \
-naming the gzip inflate/decompression term (issue #1297); the flag overclaims a \
-ceiling that excludes the gzip inflate" >&2
+naming the gzip inflate/decompression term (issue #1297); the doc block \
+lacks the inflate or decompress term" >&2
       failed=1
     fi
     rm -f "${tmp}"

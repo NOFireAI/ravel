@@ -201,12 +201,18 @@ cap up front would over-charge every well-compressing request and shed real
 traffic under a tight budget. Charging a compressed-size estimate would either
 over- or under-charge depending on the ratio. Charging each produced chunk
 makes the summed charge equal the actual decompressed length exactly: the
-over-charge bound for an admitted request is **zero**, and the peak *uncharged*
-allocation is one fixed staging chunk (64 KiB) per in-flight inflate, plus
-per-chunk bookkeeping (a `Bytes` handle and a charge guard for each retained
-chunk) -- a fixed cost, not a share of the charged bytes, so it can exceed the
-charge itself on a small decompressed body. A shed request refunds every
-partial chunk on the spot.
+over-charge bound for an admitted request is **zero**, and the uncharged
+allocations are a fixed per-inflate overhead: one staging chunk (64 KiB) per
+in-flight inflate, per-chunk bookkeeping (a `Bytes` handle and a charge guard
+for each retained chunk), and flate2's own decoder state (tens of KiB). The
+compressed request body itself also stays resident for the whole inflate, but
+it is bounded by the wire-body cap (`MAX_REQUEST_BODY_BYTES`, 16 MiB,
+ADR-0051 section 2) and already counted under `--max-inflight-ingest-requests`
+(docs/ingest.md, "Worst-case resident memory", term 2), not left uncharged
+here. No uncharged allocation on this path scales with the decompressed size;
+each is a fixed cost, not a share of the charged bytes, so together they can
+exceed the charge itself on a small decompressed body. A shed request refunds
+every partial chunk on the spot.
 
 ### Rejected alternatives
 
