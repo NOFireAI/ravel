@@ -36,6 +36,7 @@ use crate::crd::{
     RavelClusterSpec, RavelClusterStatus, ShardOverridesSpec,
 };
 use crate::reconcile::{
+    AUDIT_TOKEN_KEY_SECRET_KEY, AuditTokenKeySecretAction, AuditTokenKeySecretObservation,
     DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, GC_BOOTSTRAP_STALL_AFTER,
     GC_BOOTSTRAP_STALLED_REASON, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE, GC_BOOTSTRAP_UNAVAILABLE_REASON,
     GcBootstrapGate, QUALIFY_COMPONENT, QUALIFY_SPEC_HASH_ANNOTATION, QualificationDecision,
@@ -43,8 +44,9 @@ use crate::reconcile::{
     S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY, STORE_QUALIFIED_FAILED_REASON,
     STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON, STORE_QUALIFIED_SUCCEEDED_REASON,
     STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
-    desired_objects, desired_qualify_job, grpcroute_api_resource, httproute_api_resource,
-    plan_qualify_gate, possible_gateway_route_names, possible_ingest_ingress_names,
+    audit_token_key_secret_name, desired_objects, desired_qualify_job, grpcroute_api_resource,
+    httproute_api_resource, plan_audit_token_key_secret, plan_qualify_gate,
+    possible_gateway_route_names, possible_ingest_ingress_names,
     possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
     qualify_job_input_hash, qualify_job_phase,
 };
@@ -430,6 +432,96 @@ async fn resolve_deployment_key(
         key: Some(key),
         resource_version,
     })
+}
+
+/// Resolve the `resourceVersion` the query tier's checksum folds in for the
+/// audit-token-key Secret (#1487), creating the operator-generated Secret
+/// `<instance>-audit-token-key` the first time it is observed absent.
+///
+/// Three cases, matching [`crate::reconcile::audit_token_key_env`]:
+/// - `spec.audit_token_key_secret_ref` set: read that Secret's
+///   `resourceVersion` directly, the same as [`resolve_deployment_key`] does
+///   for its own ref.
+/// - Unset, but `spec.deployment_key_secret_ref` set: nothing to read, the
+///   server derives the key from the deployment key. Returns `None` without
+///   any Secret access, matching [`crate::reconcile::plan_audit_token_key_secret`]'s
+///   `NotGenerated`.
+/// - Both unset: the operator owns Secret `<instance>-audit-token-key`.
+///   [`plan_audit_token_key_secret`] decides `Reuse` (already present, return
+///   its `resourceVersion` unchanged) or `Create` (absent: generate 32 random
+///   bytes, hex-encode them, and apply the Secret once). The random bytes are
+///   generated only on the `Create` branch, never on `Reuse`, so an
+///   already-provisioned cluster's key is never touched by this call.
+async fn resolve_audit_token_key(
+    client: &Client,
+    namespace: &str,
+    instance: &str,
+    spec: &RavelClusterSpec,
+    owner: Option<&[OwnerReference]>,
+) -> Result<Option<String>, Error> {
+    if let Some(explicit) = spec.audit_token_key_secret_ref.as_ref() {
+        return secret_resource_version(
+            client,
+            namespace,
+            &explicit.name,
+            "auditTokenKeySecretRef",
+        )
+        .await;
+    }
+    if spec.deployment_key_secret_ref.is_some() {
+        return Ok(None);
+    }
+
+    let name = audit_token_key_secret_name(instance);
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+    let existing = match secrets.get(&name).await {
+        Ok(secret) => Some(secret),
+        Err(err) if is_not_found(&err) => None,
+        Err(err) => {
+            return Err(secret_error(
+                err,
+                &name,
+                namespace,
+                "auditTokenKeySecretRef",
+            ));
+        }
+    };
+    let observation = if existing.is_some() {
+        AuditTokenKeySecretObservation::Present
+    } else {
+        AuditTokenKeySecretObservation::Absent
+    };
+    // Generated lazily, only on the Absent branch: a `Reuse` or
+    // `NotGenerated` decision must never consume randomness or touch the
+    // existing value.
+    let fresh_key = if observation == AuditTokenKeySecretObservation::Absent {
+        let mut raw = [0u8; 32];
+        rand::fill(&mut raw);
+        hex::encode(raw)
+    } else {
+        String::new()
+    };
+
+    match plan_audit_token_key_secret(spec, observation, &fresh_key) {
+        AuditTokenKeySecretAction::NotGenerated => Ok(None),
+        AuditTokenKeySecretAction::Reuse => {
+            Ok(existing.and_then(|secret| secret.resource_version()))
+        }
+        AuditTokenKeySecretAction::Create { key } => {
+            let mut secret = Secret {
+                string_data: Some(BTreeMap::from([(
+                    AUDIT_TOKEN_KEY_SECRET_KEY.to_string(),
+                    key,
+                )])),
+                ..Default::default()
+            };
+            secret.metadata.name = Some(name.clone());
+            secret.metadata.namespace = Some(namespace.to_string());
+            secret.metadata.owner_references = owner.map(<[OwnerReference]>::to_vec);
+            let applied = apply(&secrets, &name, &secret).await?;
+            Ok(applied.resource_version())
+        }
+    }
 }
 
 /// Read the shared `storage.s3.credentialsSecretRef` Secret's live
@@ -1378,14 +1470,18 @@ async fn reconcile_inner(
     // one Secret its tier resolves to, so a per-role credential rotation rolls
     // only the Deployment(s) that consume it. The shared credential is always
     // referenced (some tier falls back to it unless all three override).
+    let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
+
+    let audit_token_key_resource_version =
+        resolve_audit_token_key(client, namespace, instance, &obj.spec, owner.as_deref()).await?;
+
     let render_ctx = RenderCtx {
         tenant_names: token_secret.tenant_names,
         token_resource_version: token_secret.resource_version,
         credential_resource_versions,
         deployment_key_resource_version: deployment_key_secret.resource_version,
+        audit_token_key_resource_version,
     };
-
-    let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
@@ -2539,6 +2635,7 @@ mod tests {
             },
             tenant_tokens_secret_ref: None,
             deployment_key_secret_ref: None,
+            audit_token_key_secret_ref: None,
             gateway: GatewaySpec {
                 ingest_affinity: affinity,
                 ..GatewaySpec::default()
@@ -3898,6 +3995,7 @@ mod tests {
                 },
                 tenant_tokens_secret_ref: None,
                 deployment_key_secret_ref: None,
+                audit_token_key_secret_ref: None,
                 gateway: Default::default(),
                 query: Default::default(),
                 maintain: Default::default(),
