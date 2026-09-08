@@ -217,13 +217,18 @@ pub enum SnapshotFormatError {
     /// parts.
     #[error("v3 column-stats header part_blake3 must have exactly one entry, got {0}")]
     ColumnStatsV3PartBlake3CountMismatch(usize),
-    /// ADR-1413: the fold refuses to write a per-part column-stats object
-    /// whose uncompressed body would exceed the part's own byte bound
-    /// (`per_part_column_stats_bound`), checked before compression. Never a
-    /// silent skip: the caller must fail the whole fold for this part rather
-    /// than publish no v3 object for it.
-    #[error("column-stats part object body {declared} bytes exceeds the per-part bound {bound}")]
-    ColumnStatsPartOverBound { declared: u64, bound: u64 },
+    /// ADR-1413 (amended): the fold degrades a per-part column-stats object
+    /// that would exceed the ceiling by dropping its largest dictionaries
+    /// first, re-measuring after each drop. This error fires only once no
+    /// dictionary is left to drop and the dictionary-free body (fixed fields:
+    /// min/max/count/sum, never truncated) is still over the fixed ceiling
+    /// (`DEFAULT_MAX_COLUMN_STATS_BYTES`), checked before compression. Never
+    /// a silent skip: the caller must fail the whole fold for this part
+    /// rather than publish no v3 object for it.
+    #[error(
+        "column-stats part object body {declared} bytes exceeds the ceiling {ceiling} with no dictionary left to drop"
+    )]
+    ColumnStatsPartOverBound { declared: u64, ceiling: u64 },
     #[error("column-stats segment carries duplicate column name {name:?}")]
     ColumnStatsDuplicateColumnName { name: String },
     #[error("column-stats column {name:?} has an unknown declared_type {declared_type}")]

@@ -11,8 +11,8 @@ mod part;
 mod postings;
 
 pub use column_stats::{
-    DecodedColumnStats, decode_column_stats, encode_column_stats, encode_column_stats_v2,
-    encode_column_stats_v3, validate_min_max_presence,
+    DecodedColumnStats, column_stats_segments_concat, decode_column_stats, encode_column_stats,
+    encode_column_stats_v2, encode_column_stats_v3, validate_min_max_presence,
 };
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};
@@ -153,32 +153,6 @@ impl Default for ColumnStatsLimits {
             max_column_stats_bytes: DEFAULT_MAX_COLUMN_STATS_BYTES,
         }
     }
-}
-
-/// ADR-1413 per-(segment, column) byte allowance backing
-/// [`per_part_column_stats_bound`]. Measured on the ClickBench `hits` tenant
-/// (c6a.4xlarge): 703 column-statistics segments over 104 declared columns
-/// produced a v2 object whose uncompressed body worked out to 27,356 bytes
-/// per (segment, column) pair. This constant is that figure with the same 2x
-/// headroom convention `DEFAULT_BYTE_CACHE_MAX_BYTES` applies over
-/// [`DEFAULT_MAX_SNAPSHOT_PART_BYTES`]: 27_356 * 2 = 54_712.
-///
-/// Single-sourced so the fold (which enforces the bound at write time,
-/// ADR-1413 decision 4) and a future per-part reader (decision 2, which
-/// checks it before trusting a v3 object's declared size) can never disagree
-/// on what "over bound" means.
-pub const PER_SEGMENT_COLUMN_STATS_BOUND_BYTES: u64 = 54_712;
-
-/// The per-part column-statistics byte bound ADR-1413 decision 3 derives for
-/// a part with `entry_count` segments and `declared_column_count` configured
-/// typed columns: `entry_count * declared_column_count *
-/// PER_SEGMENT_COLUMN_STATS_BOUND_BYTES`. Saturates rather than overflows: an
-/// absurdly large part or column count yields `u64::MAX`, which only ever
-/// makes the bound check more permissive, never silently wraps to a tiny one.
-pub fn per_part_column_stats_bound(entry_count: u64, declared_column_count: u64) -> u64 {
-    entry_count
-        .saturating_mul(declared_column_count)
-        .saturating_mul(PER_SEGMENT_COLUMN_STATS_BOUND_BYTES)
 }
 
 #[cfg(test)]
@@ -433,6 +407,5 @@ mod tests {
         assert_eq!(COLUMN_STATS_RESERVED, [0, 0, 0]);
         assert_eq!(DEFAULT_MAX_COLUMN_STATS_BYTES, 256 << 20);
         assert_eq!(DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, 10_000);
-        assert_eq!(PER_SEGMENT_COLUMN_STATS_BOUND_BYTES, 54_712);
     }
 }

@@ -479,6 +479,14 @@ pub struct Catalog {
     /// not it logged, so a metric can show the condition persisting after the
     /// single WARN. Surfaced by [`Catalog::column_stats_decode_refusals`].
     column_stats_decode_refusals: AtomicU64,
+    /// Test-only override of the per-part column-statistics ceiling
+    /// (ADR-1413 decision 3, normally
+    /// [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]), so a fold
+    /// test can exercise the degrade loop at a few kilobytes instead of 256
+    /// MiB. `None` in every non-test build path; read through
+    /// [`Catalog::column_stats_part_ceiling`].
+    #[cfg(test)]
+    column_stats_part_ceiling_override: Option<u64>,
 }
 
 /// Adapts [`Catalog::guarded_get`] to the provisioning module's
@@ -565,6 +573,8 @@ impl Catalog {
             column_stats_cache,
             warned_decode_failures: Mutex::new(HashSet::new()),
             column_stats_decode_refusals: AtomicU64::new(0),
+            #[cfg(test)]
+            column_stats_part_ceiling_override: None,
         })
     }
 
@@ -1342,6 +1352,29 @@ impl Catalog {
     #[cfg(test)]
     pub(crate) fn set_tiered_byte_cache_for_test(&mut self, tiered: TieredCache<Arc<StoreError>>) {
         self.byte_cache = Some(ByteCache::Tiered(tiered));
+    }
+
+    /// The per-part column-statistics ceiling (ADR-1413 decision 3): the
+    /// fixed bound the fold degrades a part's statistics down to, and the
+    /// same bound the v3 reader enforces
+    /// ([`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]). A test
+    /// build may override it via [`Catalog::set_column_stats_part_ceiling_for_test`]
+    /// to exercise the degrade loop at a few kilobytes.
+    pub(crate) fn column_stats_part_ceiling(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(ceiling) = self.column_stats_part_ceiling_override {
+            return ceiling;
+        }
+        crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES
+    }
+
+    /// `#[cfg(test)]`: override the per-part column-statistics ceiling this
+    /// catalog's fold enforces, so a test can force the degrade loop (or the
+    /// no-dictionary-left refusal) at a size far below the real 256 MiB
+    /// constant without a multi-hundred-megabyte fixture.
+    #[cfg(test)]
+    pub(crate) fn set_column_stats_part_ceiling_for_test(&mut self, ceiling: u64) {
+        self.column_stats_part_ceiling_override = Some(ceiling);
     }
 
     /// Resolve a query-time snapshot (docs/catalog-and-mvcc.md "Snapshot
