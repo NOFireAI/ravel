@@ -77,7 +77,10 @@ reach a rewrite-of-rewrite predecessor. No shipped action produces a
 second rewrite object for a further rewrite to consume, so the model
 cannot reach that case. Issue 1221 tracks this gap. The maintenance
 model checks the two-worker ownership race for safety only. No lane in
-the suite checks liveness at two workers.
+the suite checks liveness at two workers. The commit model's exhaustive
+configuration checks safety only. Its liveness property is checked at
+the `live` lane's smaller bounds instead, since adding it to the
+exhaustive configuration did not finish inside that lane's time budget.
 
 One lifecycle case from an earlier retention decision stays open on the
 shipped retention path. The proposed compaction-claims design sits on a
@@ -108,17 +111,20 @@ missing, the harness exits with code 2 and prints the reason. The
 traceability lane runs without Java or GNU timeout.
 
 Run `scripts/check-tla.sh smoke` to check safety in every area, at a
-300-second budget per configuration. Run `scripts/check-tla.sh negative`
-to check that every negative control fails the way its `.expect` file
+300-second budget per configuration. Run `scripts/check-tla.sh live` to
+check liveness under fairness, at the same 300-second budget, in each
+area that defines a `live.cfg`. Run `scripts/check-tla.sh negative` to
+check that every negative control fails the way its `.expect` file
 states. Run `scripts/check-tla.sh traceability` to check that every Rust
 path and symbol in every traceability table exists. Run
-`scripts/check-tla.sh exhaustive` to check full safety and liveness, at
-a 3600-second budget per configuration. Add `-a <area>` to any of these
-commands to scope the check to one area.
+`scripts/check-tla.sh exhaustive` to check full safety and liveness
+where a configuration states a `PROPERTY`, at a 3600-second budget per
+configuration. Add `-a <area>` to any of these commands to
+scope the check to one area.
 
-Run `scripts/check-tla.sh ci` to run smoke, negative, and traceability
-under one run ID. Run `scripts/check-tla.sh all` to run `ci`, then
-`exhaustive`, under one run ID.
+Run `scripts/check-tla.sh ci` to run smoke, live, negative, and
+traceability under one run ID. Run `scripts/check-tla.sh all` to run
+`ci`, then `exhaustive`, under one run ID.
 
 Each command exits 0 on a pass. When a check fails, it exits 1. When no
 usable Java or GNU timeout exists, it exits 2. A single TLC run reports
@@ -185,8 +191,8 @@ the same commit as the model.
 Add one traceability row for the property, naming one Rust path and
 symbol. Never write a line number in a markdown file.
 
-Run the smoke, negative, traceability, and exhaustive lanes before you
-commit. See the [suite README](../../formal/tla/README.md) for the file
+Run the smoke, live, negative, traceability, and exhaustive lanes before
+you commit. See the [suite README](../../formal/tla/README.md) for the file
 layout.
 
 ## Background

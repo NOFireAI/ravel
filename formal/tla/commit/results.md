@@ -13,11 +13,17 @@ and are not banded. Run id
 otherwise, from a single `scripts/check-tla.sh all -a commit` invocation
 covering smoke, negative, traceability and exhaustive together.
 
+Rows marked "fleet executor" below are from a later session (issues #1356,
+#1357) on a different host: tla2tools 1.7.4 unchanged, `-workers 2`
+`-Xmx2g` throughout (this host's fixed resource cap, never `-workers
+auto`), 8 GB RAM / 4 cores.
+
 ## Configuration runs
 
 | Config | States generated | Distinct | Depth | Seconds | Result |
 |---|---|---|---|---|---|
-| smoke.cfg | 305165 | 76212 | 21 | 5 | PASS |
+| smoke.cfg | 1757215 | 426976 | 25 | 9 | PASS (fleet executor) |
+| live.cfg | 2696 | 1616 | 11 | 1 | PASS (fleet executor) |
 | negative/ack-before-commit.cfg | 2 | 2 | n/a | 1 | VIOLATED as required (StrictAckImpliesDurable) |
 | negative/at-least-once-duplicate-reachable.cfg | 64817 | 26486 | n/a | 2 | VIOLATED as required (DuplicateUnreachable) |
 | negative/commit-before-data.cfg | 44 | 41 | n/a | 1 | VIOLATED as required (NoCommitWithoutData) |
@@ -31,6 +37,33 @@ covering smoke, negative, traceability and exhaustive together.
 | negative/transient-failure-reachable.cfg | 2 | 2 | n/a | 1 | VIOLATED as required (TransientFailureUnreachable) |
 | traceability | n/a | n/a | n/a | n/a | PASS, 21 rows resolve |
 | exhaustive.cfg | 17892751 | 5466239 | 36 | 131 | PASS |
+
+`smoke.cfg` and `live.cfg` were re-verified on the fleet executor host
+after issues #1356 and #1357 (see below); the other rows are unchanged
+from the prior session and were not re-run there. `exhaustive.cfg` was
+re-run on the fleet executor host too, at `-workers 2`: 17892751
+generated, 5466239 distinct, depth 36, 114s, byte-identical to the row
+above. `faultFired` (added for #1356, see below) never becomes non-empty
+at `exhaustive.cfg`'s `MaxRetries=0`, since each of the three actions it
+records requires `retries[f] < MaxRetries`, so the reachable state graph,
+and `bands.tsv`'s row for it, are unaffected.
+
+`smoke.cfg`'s distinct-state count and depth grew (76212/21 to
+426976/25, `bands.tsv` updated to match) after issue #1356 added the
+`faultFired` history variable: `smoke.cfg` runs at `MaxRetries=1`, where
+the three fault actions this variable records are reachable, so
+`faultFired` taking on distinct values is itself new state, not
+regression. The safety invariants and their pass/fail outcomes are
+unchanged; only the state count grew.
+
+`live.cfg` moved from a by-hand run (see the retired row below) to the
+new `live` harness lane (issue #1357) and from `MaxTicks=3` to
+`MaxTicks=4`, the smallest bound at which `Expired` is reachable; see the
+comment in `live.cfg` itself. Its figures also moved, from
+42119/15812/depth 13 to 2696/1616/depth 11, because `MaxTicks=4` reaches
+one more tick per behaviour but `Fairness` now includes
+`WF_vars(Abandon(f))`, which prunes the non-fair stutter-after-expiry
+paths TLC previously had to enumerate before finding the property held.
 
 The negative rows are the required outcome: each config disables a guard,
 flips a broken-behaviour switch, or (the three new `*-reachable.cfg` rows)
@@ -155,12 +188,33 @@ carried over: `negative/deadline-reachable.cfg`, which pins these same
 constants, still reports `AbandonUnreachable` VIOLATED (exit 12) after the
 `CheckToken` change, at unchanged bounds.
 
+## Exhaustive liveness (issue #1357, not adopted)
+
+`exhaustive.cfg` was probed with `SPECIFICATION FairSpec` and `PROPERTY
+EveryPinnedFlushSettles` added, on the fleet executor host, to see
+whether full safety plus liveness fits the script's 3600s
+`EXHAUSTIVE_BUDGET`. Safety alone completes in 114s at these bounds (see
+above); with liveness added, the run had not completed after 590s (no
+result, no partial-progress line yet from TLC, process cleanly
+terminated) — the host's practical foreground observation window for
+this session, well short of the 3600s budget itself. Whether the run
+would complete somewhere between 590s and 3600s is not known; extending
+the observation window would need a background TLC run, which this task
+avoids by rule (TLC runs the full foreground window, never backgrounded).
+`exhaustive.cfg` is left unchanged (safety-only, `SPECIFICATION Spec`, no
+`PROPERTY`); liveness is now checked at the `live` kind's bounds instead
+(`live.cfg`, see above), matching the fallback the task originally
+allowed for this case.
+
 ## By-hand runs
 
 | Run | Spec/Invariant | States generated | Distinct | Depth | Result |
 |---|---|---|---|---|---|
 | dedup-mutant.cfg | DuplicateUnreachable only, RetryDedups=TRUE | 14974258 | 3443658 | 32 | PASS (exit 0), 1m24s |
-| live.cfg | FairSpec / EveryPinnedFlushSettles | 42119 | 15812 | 13 | PASS (exit 0), under 1s |
+
+`live.cfg` is retired from this table: it now runs through `scripts/
+check-tla.sh live -a commit` (see the configuration table above), not by
+hand.
 
 `dedup-mutant.cfg` used to complete in 25 minutes (433,976,430 generated,
 81,903,514 distinct, depth 34). After the `RunQuery` action and its

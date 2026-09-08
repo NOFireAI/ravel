@@ -121,9 +121,10 @@ are load-bearing:
 
 ```sh
 scripts/check-tla.sh smoke -a commit
+scripts/check-tla.sh live -a commit
 scripts/check-tla.sh negative -a commit
 scripts/check-tla.sh traceability -a commit
 ```
 
-`exhaustive.cfg`, `live.cfg` and `dedup-mutant.cfg` carry the remaining
-configurations; `results.md` records what each produced.
+`exhaustive.cfg` and `dedup-mutant.cfg` carry the remaining configurations;
+`results.md` records what each produced.
