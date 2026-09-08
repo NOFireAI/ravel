@@ -210,8 +210,15 @@ struct ColumnStatsCache {
     refusals: AtomicU64,
 }
 
+/// `ColumnStatsCache` entry key: tenant, signal, and the query window's hour
+/// bounds (ADR-1413). A per-part-scoped load answers only for the parts its
+/// own window covers, so two queries over the same HEAD but different windows
+/// must never share an entry -- the window bounds are part of the key for
+/// exactly the same reason a resolved snapshot itself is window-scoped.
+type ColumnStatsCacheKey = (TenantHash, Signal, u32, u32);
+
 struct ColumnStatsCacheState {
-    entries: HashMap<(TenantHash, Signal), CachedColumnStats>,
+    entries: HashMap<ColumnStatsCacheKey, CachedColumnStats>,
     /// Sum of every live entry's `bytes`; the invariant this cache bounds.
     held_bytes: u64,
     /// Monotonic access counter; the next recency stamp. Incremented on every
@@ -239,7 +246,7 @@ impl ColumnStatsCache {
     /// `None`, and the caller re-fetches; nothing stale is ever handed back.
     fn get(
         &self,
-        key: (TenantHash, Signal),
+        key: ColumnStatsCacheKey,
         stats_blake3: &[u8; 32],
         part_blake3: &[[u8; 32]],
     ) -> Option<Arc<LoadedColumnStats>> {
@@ -262,7 +269,7 @@ impl ColumnStatsCache {
     /// `load_column_stats`, so refusing to cache never changes an answer.
     fn insert(
         &self,
-        key: (TenantHash, Signal),
+        key: ColumnStatsCacheKey,
         stats_blake3: [u8; 32],
         stats: Arc<LoadedColumnStats>,
     ) {
@@ -323,7 +330,7 @@ impl ColumnStatsCache {
     fn evict_tenants(&self, idle: &[TenantHash]) {
         let mut state = self.state.lock();
         let mut freed = 0u64;
-        state.entries.retain(|(tenant, _), entry| {
+        state.entries.retain(|(tenant, _, _, _), entry| {
             if idle.contains(tenant) {
                 freed += entry.bytes;
                 false
@@ -1027,26 +1034,40 @@ impl Catalog {
     }
 
     /// Resolve exact per-segment column statistics for `(tenant, signal)`
-    /// from the current folded snapshot HEAD (ADR-0850), for a query engine
-    /// to join against its own resolved snapshot by identity. `Ok(None)`
-    /// means no usable column-stats object exists right now (nothing folded
-    /// yet, no configured typed columns, or the last fold's column-stats
-    /// build/PUT failed): the caller must fall back to scanning, never treat
-    /// this as "zero columns configured means zero rows". See
-    /// [`column_stats_resolve::load_column_stats`] for the full
-    /// degrade-to-`Ok(None)` contract.
+    /// over the query window `[range, now_ns]` (ADR-0850, ADR-1413), for a
+    /// query engine to join against its own resolved snapshot's live segments
+    /// via [`LoadedColumnStats::stat_for`]. `Ok(None)` means no usable
+    /// column-stats object covers any part this window touches (nothing
+    /// folded yet, no configured typed columns, or the last fold's
+    /// column-stats build/PUT failed): the caller must fall back to
+    /// scanning, never treat this as "zero columns configured means zero
+    /// rows".
     ///
-    /// The `Ok(None)` cases split into two kinds. A STORE READ that fails (no
-    /// HEAD, no stats object at the referenced key) is a legitimate "no
-    /// statistics" and stays silent. A DECODE that fails on an object HEAD
-    /// actually references is not: the fold wrote it and HEAD points at it, so a
-    /// reader that cannot open it emits one `tracing::warn!` per object key and
-    /// increments [`Catalog::column_stats_decode_refusals`] before degrading
-    /// (issue #1400). Only the decode case logs.
+    /// Only parts whose `[min_hour, watermark_hour]` intersects the window
+    /// are read at all -- the same predicate `resolve` itself applies via
+    /// [`crate::snapshot_resolve::parts_intersecting`] -- so a query over a
+    /// narrow window against a many-part tenant issues per-part GETs for
+    /// exactly those parts, never the whole tenant.
+    ///
+    /// Fallback per covered part (ADR-1413 decision 2, extending ADR-0942's
+    /// reader rule): the part's own v3 object (`parts[i].column_stats`, field
+    /// 7) is tried first. A part with no such ref, or whose object fails to
+    /// load (blake3 mismatch, decode refusal, missing object), needs the
+    /// whole-tenant v2 object (`column_stats_part`, field 13), then the
+    /// whole-tenant v1 object (`column_stats`, field 11); a part answered by
+    /// none of the three is simply left uncovered and the caller scans it.
+    /// The whole-object fallback is fetched at most once per call, and only
+    /// when at least one covered part actually needs it. Every failure
+    /// degrades silently EXCEPT a decode refusal, which emits one
+    /// `tracing::warn!` per object key and increments
+    /// [`Catalog::column_stats_decode_refusals`] before degrading (issue
+    /// #1400).
     pub async fn load_column_stats(
         &self,
         tenant: &TenantHash,
         signal: Signal,
+        range: TimeRange,
+        now_ns: i64,
         accounting: &QueryAccounting,
     ) -> Result<Option<Arc<LoadedColumnStats>>, LoadColumnStatsError> {
         // Route every GET through the same semaphore-bounded, accounted funnel
@@ -1057,48 +1078,170 @@ impl Catalog {
             catalog: self,
             accounting,
         };
-        // Always read HEAD (one GET): the stats object is bound to the CURRENT
-        // folded HEAD, not the pinned snapshot, so this is the only way to
-        // detect a fold that superseded a cached object (ADR-0850, issue #888).
-        let Some(resolved) =
-            column_stats_resolve::resolve_stats_ref(&getter, tenant, signal).await?
+
+        let Some((window_start_hour, window_end_hour)) = self.window_hour_bounds(range, now_ns)
         else {
             return Ok(None);
         };
-        // Reuse the cached object only when its content hash AND the HEAD's
-        // covered part set both still match `resolved`: a changed fold produces
-        // a different `blake3` (a rebuilt object) or a different part set (the
-        // binding a stale object fails), and either misses. This skips the
-        // second GET, the stats-object fetch, and nothing else. An entry the
-        // byte budget evicted also misses here and re-fetches, never returning a
-        // partial or stale statistic.
-        let cache_hit = self.column_stats_cache.as_ref().and_then(|cache| {
-            cache.get(
-                (*tenant, signal),
-                &resolved.blake3,
-                &resolved.expected_part_blake3,
-            )
-        });
+
+        // Always read HEAD (one GET): statistics are bound to the CURRENT
+        // folded HEAD, not a pinned snapshot, so this is the only way to
+        // detect a fold that superseded a cached object (ADR-0850, issue #888).
+        let Some(head) = column_stats_resolve::resolve_stats_head(&getter, tenant, signal).await?
+        else {
+            return Ok(None);
+        };
+
+        let covered = crate::snapshot_resolve::parts_intersecting(
+            &head.parts,
+            window_start_hour,
+            window_end_hour,
+        );
+        if covered.is_empty() {
+            return Ok(None);
+        }
+        let covered_part_blake3: Vec<[u8; 32]> = covered
+            .iter()
+            .filter_map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()).ok())
+            .collect();
+        if covered_part_blake3.len() != covered.len() {
+            return Ok(None);
+        }
+
+        // The composite identity a cache entry is valid against: every
+        // object a fully-resolved load for this exact covered-part set would
+        // consult, by its DECLARED blake3 (derivable from `head` alone, no
+        // extra GET). A re-fold that rewrites any one of those objects
+        // changes this fingerprint, so a stale entry always misses -- the
+        // same guarantee issue #888 gives the single-whole-object case,
+        // extended per part.
+        let fingerprint = Self::column_stats_fingerprint(&covered, head.v2.as_ref(), head.v1.as_ref());
+        let cache_key: ColumnStatsCacheKey = (*tenant, signal, window_start_hour, window_end_hour);
+        let cache_hit = self
+            .column_stats_cache
+            .as_ref()
+            .and_then(|cache| cache.get(cache_key, &fingerprint, &covered_part_blake3));
         if let Some(stats) = cache_hit {
             return Ok(Some(stats));
         }
-        let loaded =
-            match column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved).await? {
-                column_stats_resolve::FetchOutcome::Loaded(loaded) => loaded,
-                // Store read or stale binding: the ordinary "no statistics" case.
-                column_stats_resolve::FetchOutcome::Absent => return Ok(None),
-                // HEAD references an object the reader refused to decode: log once
-                // per key and count every occurrence, then scan (issue #1400).
-                column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
-                    self.note_column_stats_decode_refusal(tenant, signal, &resolved.key, &err);
-                    return Ok(None);
+
+        let mut segments: HashMap<crate::EntryIdentity, ravel_proto::catalog::v1::ColumnStatsSegment> =
+            HashMap::new();
+        let mut by_content_hash: HashMap<[u8; 32], ravel_proto::catalog::v1::ColumnStatsSegment> =
+            HashMap::new();
+        let mut needs_fallback: Vec<&ravel_proto::catalog::v1::SnapshotPartRef> = Vec::new();
+
+        for part in &covered {
+            match column_stats_resolve::resolve_part_stats_ref(part) {
+                Some(resolved) => {
+                    match column_stats_resolve::fetch_stats_object(&getter, tenant, &resolved)
+                        .await?
+                    {
+                        column_stats_resolve::FetchOutcome::Loaded(decoded) => {
+                            segments.extend(decoded.segments);
+                            by_content_hash.extend(decoded.by_content_hash);
+                        }
+                        // Store read or stale binding: subtract this part's
+                        // coverage and fall back below, silently.
+                        column_stats_resolve::FetchOutcome::Absent => needs_fallback.push(part),
+                        // The part's own ref points at an object the reader
+                        // refused to decode: log once per key, count, and
+                        // fall back below (issue #1400).
+                        column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
+                            self.note_column_stats_decode_refusal(
+                                tenant,
+                                signal,
+                                &resolved.key,
+                                &err,
+                            );
+                            needs_fallback.push(part);
+                        }
+                    }
                 }
-            };
-        let stats = Arc::new(loaded);
+                None => needs_fallback.push(part),
+            }
+        }
+
+        if !needs_fallback.is_empty() {
+            // Insert-if-absent only: a part already answered by its own v3
+            // object above must never be overwritten by a whole-object
+            // record for the same key, so v3 always wins on collision.
+            let mut whole_loaded = false;
+            if let Some(v2) = &head.v2 {
+                match column_stats_resolve::fetch_stats_object(&getter, tenant, v2).await? {
+                    column_stats_resolve::FetchOutcome::Loaded(decoded) => {
+                        for (k, v) in decoded.segments {
+                            segments.entry(k).or_insert(v);
+                        }
+                        for (k, v) in decoded.by_content_hash {
+                            by_content_hash.entry(k).or_insert(v);
+                        }
+                        whole_loaded = true;
+                    }
+                    column_stats_resolve::FetchOutcome::Absent => {}
+                    column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
+                        self.note_column_stats_decode_refusal(tenant, signal, &v2.key, &err);
+                    }
+                }
+            }
+            if !whole_loaded && let Some(v1) = &head.v1 {
+                match column_stats_resolve::fetch_stats_object(&getter, tenant, v1).await? {
+                    column_stats_resolve::FetchOutcome::Loaded(decoded) => {
+                        for (k, v) in decoded.segments {
+                            segments.entry(k).or_insert(v);
+                        }
+                        for (k, v) in decoded.by_content_hash {
+                            by_content_hash.entry(k).or_insert(v);
+                        }
+                    }
+                    column_stats_resolve::FetchOutcome::Absent => {}
+                    column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
+                        self.note_column_stats_decode_refusal(tenant, signal, &v1.key, &err);
+                    }
+                }
+            }
+        }
+
+        if segments.is_empty() && by_content_hash.is_empty() {
+            return Ok(None);
+        }
+
+        let stats = Arc::new(LoadedColumnStats {
+            segments,
+            by_content_hash,
+            part_blake3: covered_part_blake3,
+        });
         if let Some(cache) = self.column_stats_cache.as_ref() {
-            cache.insert((*tenant, signal), resolved.blake3, Arc::clone(&stats));
+            cache.insert(cache_key, fingerprint, Arc::clone(&stats));
         }
         Ok(Some(stats))
+    }
+
+    /// The declared-blake3 fingerprint [`Catalog::load_column_stats`] keys its
+    /// reuse cache on: each covered part's v3 ref blake3 (or a zero sentinel
+    /// when the part carries none), in `covered`'s order, followed by the
+    /// whole-tenant v2 and v1 ref blake3 (each zero-sentinel when absent).
+    /// Computed entirely from HEAD-derived refs, with no object GET, so a
+    /// cache check costs nothing beyond the HEAD read already paid for.
+    fn column_stats_fingerprint(
+        covered: &[ravel_proto::catalog::v1::SnapshotPartRef],
+        v2: Option<&column_stats_resolve::ResolvedStatsRef>,
+        v1: Option<&column_stats_resolve::ResolvedStatsRef>,
+    ) -> [u8; 32] {
+        let mut buf = Vec::with_capacity((covered.len() + 2) * 32);
+        for part in covered {
+            match column_stats_resolve::resolve_part_stats_ref(part) {
+                Some(resolved) => buf.extend_from_slice(&resolved.blake3),
+                None => buf.extend_from_slice(&[0u8; 32]),
+            }
+        }
+        for whole in [v2, v1] {
+            match whole {
+                Some(resolved) => buf.extend_from_slice(&resolved.blake3),
+                None => buf.extend_from_slice(&[0u8; 32]),
+            }
+        }
+        *blake3::hash(&buf).as_bytes()
     }
 
     /// Record a decode refusal on the column-stats object HEAD references for

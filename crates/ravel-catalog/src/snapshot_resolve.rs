@@ -391,7 +391,7 @@ impl Catalog {
         // longer covers exactly the loaded parts, so `postings_bind_all_parts`
         // declines pruning (safe: unpruned scan) -- and `load_snapshot_postings`
         // already returns `None` on the resulting entry-count mismatch.
-        let refs = parts_intersecting(&head, window_start_hour, window_end_hour);
+        let refs = parts_intersecting(&head.parts, window_start_hour, window_end_hour);
         match self.load_snapshot_parts(tenant, &refs, accounting).await {
             PartLoadOutcome::Loaded(parts) => {
                 let postings = if want_postings {
@@ -433,7 +433,7 @@ impl Catalog {
                 // back to the first read's if the re-read validated under the
                 // passed-in view.
                 let revalidated = fresh_revalidated.or(revalidated);
-                let refs = parts_intersecting(&fresh_head, window_start_hour, window_end_hour);
+                let refs = parts_intersecting(&fresh_head.parts, window_start_hour, window_end_hour);
                 match self.load_snapshot_parts(tenant, &refs, accounting).await {
                     PartLoadOutcome::Loaded(parts) => {
                         let postings = if want_postings {
@@ -1071,12 +1071,12 @@ fn hex16(hash: &[u8; 32]) -> String {
 /// could return, so skipping their GETs is free of correctness cost; a legacy
 /// single-part head (one part, min_hour 0) always intersects any window at or
 /// below its watermark, so it is unaffected.
-fn parts_intersecting(
-    head: &SnapshotHead,
+pub(crate) fn parts_intersecting(
+    parts: &[ravel_proto::catalog::v1::SnapshotPartRef],
     window_start_hour: u32,
     window_end_hour: u32,
 ) -> Vec<ravel_proto::catalog::v1::SnapshotPartRef> {
-    head.parts
+    parts
         .iter()
         .filter(|p| p.min_hour <= window_end_hour && p.watermark_hour >= window_start_hour)
         .cloned()
