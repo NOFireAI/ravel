@@ -17,7 +17,7 @@ use crate::envelope::{
     AnyJson, Budget, Cell, Column, Envelope, Failure, FailureClass, Row, Status,
 };
 
-use super::ToolContext;
+use super::{SERVED_TOOLS, ToolContext};
 
 /// The signals a Ravel deployment answers agent queries over. Audit is a
 /// tenant's own trail rather than a queryable telemetry signal, so it is not
@@ -81,10 +81,8 @@ fn capability_rows(ctx: &ToolContext<'_>) -> Vec<Row> {
         row(
             "tools",
             json!({
-                "enabled": tool_catalog()
-                    .iter()
-                    .map(|tool| tool.name.to_string())
-                    .collect::<Vec<_>>(),
+                "enabled": catalog_names(true),
+                "catalogued": catalog_names(false),
             }),
         ),
         row("budgets", budget_ceilings(ctx)),
@@ -100,6 +98,20 @@ fn capability_rows(ctx: &ToolContext<'_>) -> Vec<Row> {
             }),
         ),
     ]
+}
+
+/// The catalog names this build serves (`served`) or merely declares.
+///
+/// `enabled` is what [`dispatch`](super::dispatch) will actually run today;
+/// `catalogued` is present in the catalog and answers `NotShipped`. Reporting
+/// one merged list would tell a caller it may call eight tools that refuse
+/// every call, which is worse than telling it nothing.
+fn catalog_names(served: bool) -> Vec<String> {
+    tool_catalog()
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .filter(|name| SERVED_TOOLS.contains(&name.as_str()) == served)
+        .collect()
 }
 
 /// A `(capability, value)` row. A value that is not a JSON object cannot be
@@ -218,9 +230,16 @@ mod tests {
             .expect("rows is an array")
             .clone();
         assert_eq!(rows[0][1]["revisions"], json!(["2026-07-28", "2025-11-25"]));
+        // Served and catalogued are separate lists, and the exact split is
+        // what this build does today: one body, eight declared names that
+        // refuse every call.
+        assert_eq!(rows[1][1]["enabled"], json!(["ravel_capabilities"]));
         assert_eq!(
-            rows[1][1]["enabled"].as_array().expect("tool list").len(),
-            9
+            rows[1][1]["catalogued"]
+                .as_array()
+                .expect("catalogued tool list")
+                .len(),
+            8
         );
         assert_eq!(rows[3][1]["hash"], json!(ctx.tenant_hash.to_hex()));
         assert_eq!(rows[4][1]["enabled"], json!(["metrics", "logs", "traces"]));

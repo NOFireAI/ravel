@@ -1,10 +1,15 @@
 # MCP tools reference
 
-> This page describes the surface as designed. The tools ship behind the
-> `mcp` cargo feature and the `--mcp` flag, both off by default. The
-> `POST /mcp` route does not exist until the feature ships.
+> The `POST /mcp` route exists in builds compiled with the `mcp` cargo
+> feature, and is mounted when `--mcp` is passed; both are off by default.
+> One tool is served today, `ravel_capabilities`. The other eight are in the
+> catalog (so `tools/list` returns them) and refuse every call with a
+> `method_not_found` protocol error until their bodies land; their entries
+> below describe the surface as designed. `ravel_capabilities` reports the
+> split at runtime: `tools.enabled` is what this deployment will actually
+> run, `tools.catalogued` is what it declares but does not yet serve.
 
-Every route below will be served over `POST /mcp`, using the Model Context
+Every tool below is served over `POST /mcp`, using the Model Context
 Protocol. A reader who knows which tool they want comes here for its exact
 shape: what it takes, what it returns, its bounds, and the failure classes
 it can produce. See [the agents guide](../guides/agents.md) for the
@@ -16,7 +21,7 @@ the envelope, and the empty-result checklist.
 <!-- mcp-tools:begin -->
 | Tool | Purpose | Inputs | Output blocks used | Bounds | Failure classes |
 | --- | --- | --- | --- | --- | --- |
-| `ravel_capabilities` | Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `unauthorized`, `internal` |
+| `ravel_capabilities` | Protocol and server version, served tools (`tools.enabled`) and declared-but-unserved ones (`tools.catalogued`), effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `unauthorized`, `invalid_argument`, `internal` |
 | `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal`, an optional `cursor` | `data`, `scope`, `visibility`, `coverage`, `presentation` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter, `time_range` (required), an optional `evidence_ref`, `deadline_ms`, `max_response_bytes`. An unfiltered tenant-wide list is refused | `data`, `scope`, `coverage`, `evidence` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range`, `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |

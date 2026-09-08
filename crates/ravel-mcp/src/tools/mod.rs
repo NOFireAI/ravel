@@ -53,6 +53,16 @@ pub enum ToolError {
     UnknownTool(String),
 }
 
+/// The catalog names [`dispatch`] routes to a body in this build.
+///
+/// Every other catalog name is declared but answers [`ToolError::NotShipped`],
+/// so `ravel_capabilities` reports the two sets under separate keys: a caller
+/// that reads one list of names cannot tell which of them it can actually
+/// call. `dispatch_routes_every_catalog_name_and_refuses_unknown_names` pins
+/// this list against what `dispatch` does, so adding a body without adding it
+/// here fails the test rather than under-reporting the surface.
+pub const SERVED_TOOLS: &[&str] = &["ravel_capabilities"];
+
 /// Route one tool call to its body.
 ///
 /// `backend` is the port the query-serving bodies execute through; the two
@@ -245,6 +255,24 @@ mod tests {
 
         assert_eq!(served, vec!["ravel_capabilities".to_string()]);
         assert_eq!(not_shipped.len(), 8);
+
+        // What `ravel_capabilities` reports is the same split, name for name:
+        // `enabled` is what dispatch runs, `catalogued` is what it refuses. A
+        // body added to dispatch without being added to `SERVED_TOOLS` is
+        // reported as unavailable while answering calls, and one removed
+        // without the reverse edit is advertised as callable; either way this
+        // assertion fails rather than the report drifting.
+        let capabilities = block_on(dispatch(
+            "ravel_capabilities",
+            serde_json::json!({}),
+            &ctx,
+            &NoBackend,
+        ))
+        .expect("ravel_capabilities answers an envelope");
+        let reported = serde_json::to_value(&capabilities).expect("envelope serializes");
+        let tools = &reported["data"]["rows"][1][1];
+        assert_eq!(tools["enabled"], serde_json::json!(served));
+        assert_eq!(tools["catalogued"], serde_json::json!(not_shipped));
 
         let unknown = block_on(dispatch(
             "ravel_drop_tenant",
