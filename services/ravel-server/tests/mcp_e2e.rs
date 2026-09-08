@@ -354,6 +354,65 @@ mod with_mcp {
         running.shutdown().await.expect("server stops");
     }
 
+    /// A budget field of the wrong type refuses the call and names the field,
+    /// rather than dropping the caller's whole budget block and running at the
+    /// server defaults.
+    ///
+    /// `max_rows` is well formed here and `deadline_ms` is not, which is the
+    /// case a permissive deserialize of the block as a whole loses: the call
+    /// would run at 200 rows, report that ceiling as `budget.effective`, and
+    /// give the caller nothing to notice. The tool body cannot catch it
+    /// either, because `ravel_capabilities` takes no arguments and accepts any
+    /// object. So the envelope must carry the failure, `budget.effective` must
+    /// stay empty rather than state a ceiling nothing ran under, and the store
+    /// counters must show exactly zero calls.
+    #[tokio::test]
+    async fn a_malformed_budget_field_is_invalid_argument_not_a_silent_default() {
+        let (store, metrics) = instrumented_memory();
+        let running = start_server(store, Arc::clone(&metrics), mcp_on()).await;
+
+        let client =
+            ().serve_with_lifecycle(transport(&running), current_revision())
+                .await
+                .expect("the client reaches the server");
+
+        let before = total_store_calls(&metrics);
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("max_rows".to_string(), serde_json::json!(1));
+        arguments.insert("deadline_ms".to_string(), serde_json::json!("oops"));
+        let result = client
+            .call_tool(CallToolRequestParams::new("ravel_capabilities").with_arguments(arguments))
+            .await
+            .expect("the refusal comes back as a tool result, not a protocol error");
+        assert_eq!(total_store_calls(&metrics) - before, 0);
+
+        assert_eq!(result.is_error, Some(true));
+        let envelope = result
+            .structured_content
+            .as_ref()
+            .expect("the tool result carries the envelope as structured content");
+        assert_eq!(envelope["status"], serde_json::json!("error"));
+        assert_eq!(
+            envelope["failure"]["class"],
+            serde_json::json!("invalid_argument")
+        );
+        let message = envelope["failure"]["message"]
+            .as_str()
+            .expect("the failure carries a message");
+        assert!(
+            message.contains("deadline_ms"),
+            "the message must name the offending field, got {message:?}"
+        );
+        // No budget was resolved, so none is reported: a ceiling here would
+        // state what the call was allowed when the call never ran.
+        assert_eq!(envelope["budget"]["effective"], serde_json::Value::Null);
+        assert_eq!(envelope["data"]["row_count"], serde_json::json!(0));
+        assert_eq!(envelope["data"]["rows"].as_array().expect("rows").len(), 0);
+
+        client.cancel().await.expect("client stops");
+        running.shutdown().await.expect("server stops");
+    }
+
     /// A request with no resolvable credential is refused before the protocol
     /// layer sees it, and before this process touches object storage at all.
     /// The store counters are the proof: exactly zero calls over the request.
