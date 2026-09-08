@@ -515,7 +515,10 @@ own content hash), but scoped to exactly the one snapshot part that owns it
 and `ColumnStatsHeader.segment_count` is that part's segment count. Field 7
 is absent (proto3 default) for a part with no per-part statistics; the reader
 falls back to field 13, then field 11, then to scan (ADR-1413 decision 2).
-Absence is never an error.
+Absence is never an error. Field 7 is writer-only until the reader half of
+ADR-1413 lands: no query path loads a v3 object yet, and queries keep
+reading field 13, then field 11, as before; the fallback order above is the
+contract that reader will implement.
 
 The fold writes one v3 object per part it actually re-encodes this fold
 (never for a part carried forward by reference, since that part's `.csnap`
@@ -563,8 +566,10 @@ truncated object for a reader to silently trust.
 (field 13) whole-object statistics unchanged alongside the new v3 per-part
 objects: retiring field 13 at the first v3 publish would be the
 writers-before-readers change ADR-0066 decision 1 forbids, since an older
-reader that ignores field 7 must still find field 13. The accepted read set
-for `.cstat` envelope versions is `{1, 2, 3}` for this window; it narrows to
+reader that ignores field 7 must still find field 13. The decoder's accepted
+set of `.cstat` envelope versions is `{1, 2, 3}` for this window (version 3
+is decodable today; it is loaded by a query only once the reader half
+lands); the set narrows to
 `{2, 3}` and then `{3}` only as field 13's and field 11's own reviewed
 retirement changes, each citing the recorded format floors (ADR-0066
 decision 3), independently of each other.

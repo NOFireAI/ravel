@@ -137,14 +137,24 @@ pub fn encode_column_stats_v3(
     ceiling_bytes: u64,
 ) -> Result<Vec<u8>, SnapshotFormatError> {
     validate_segments(segments, 3)?;
-    let declared = column_stats_segments_concat(segments).len() as u64;
+    // Concatenated once: measured for the ceiling, then handed to the
+    // framing step as the body it compresses.
+    let segments_raw = column_stats_segments_concat(segments);
+    let declared = segments_raw.len() as u64;
     if declared > ceiling_bytes {
         return Err(SnapshotFormatError::ColumnStatsPartOverBound {
             declared,
             ceiling: ceiling_bytes,
         });
     }
-    frame_column_stats(3, tenant_hash, signal, vec![part_blake3.to_vec()], segments)
+    frame_column_stats_body(
+        3,
+        tenant_hash,
+        signal,
+        vec![part_blake3.to_vec()],
+        segments.len() as u64,
+        &segments_raw,
+    )
 }
 
 /// Envelope framing shared by the public writers and the tests. Parameterised
@@ -177,9 +187,31 @@ fn frame_column_stats(
     segments: &[ColumnStatsSegment],
 ) -> Result<Vec<u8>, SnapshotFormatError> {
     let segments_raw = column_stats_segments_concat(segments);
+    frame_column_stats_body(
+        version,
+        tenant_hash,
+        signal,
+        part_blake3,
+        segments.len() as u64,
+        &segments_raw,
+    )
+}
+
+/// The framing step proper, over an already-concatenated body (the bytes
+/// [`column_stats_segments_concat`] produces for `segment_count` segments),
+/// so a caller that measured the body for a ceiling check hands those same
+/// bytes over instead of encoding the segments a second time.
+fn frame_column_stats_body(
+    version: u8,
+    tenant_hash: [u8; 16],
+    signal: u32,
+    part_blake3: Vec<Vec<u8>>,
+    segment_count: u64,
+    segments_raw: &[u8],
+) -> Result<Vec<u8>, SnapshotFormatError> {
     let body_uncompressed_len = segments_raw.len() as u64;
 
-    let body = zstd::bulk::compress(&segments_raw, ZSTD_LEVEL)
+    let body = zstd::bulk::compress(segments_raw, ZSTD_LEVEL)
         .map_err(|e| SnapshotFormatError::Compress(e.to_string()))?;
 
     let header = ColumnStatsHeader {
@@ -187,7 +219,7 @@ fn frame_column_stats(
         tenant_hash: tenant_hash.to_vec(),
         signal,
         part_blake3,
-        segment_count: segments.len() as u64,
+        segment_count,
         body_uncompressed_len,
     };
     let header_bytes = header.encode_to_vec();
