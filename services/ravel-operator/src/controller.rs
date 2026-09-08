@@ -1062,18 +1062,22 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
             // qualification succeeded); otherwise the failure is before the gate,
             // so carry the persisted retry state through unchanged rather than
             // resetting a real backoff on an unrelated error.
-            let (qualify_failure_count, qualify_next_retry_time) = if qualification_passed {
-                (None, None)
-            } else {
-                (
-                    obj.status
-                        .as_ref()
-                        .and_then(|status| status.qualify_failure_count),
-                    obj.status
-                        .as_ref()
-                        .and_then(|status| status.qualify_next_retry_time.clone()),
-                )
-            };
+            let (qualify_failure_count, qualify_next_retry_time, qualify_retry_hash) =
+                if qualification_passed {
+                    (None, None, None)
+                } else {
+                    (
+                        obj.status
+                            .as_ref()
+                            .and_then(|status| status.qualify_failure_count),
+                        obj.status
+                            .as_ref()
+                            .and_then(|status| status.qualify_next_retry_time.clone()),
+                        obj.status
+                            .as_ref()
+                            .and_then(|status| status.qualify_retry_hash.clone()),
+                    )
+                };
             if let Err(status_err) = write_degraded_status(
                 client,
                 &namespace,
@@ -1086,6 +1090,7 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                     store_qualified_hash,
                     qualify_failure_count,
                     qualify_next_retry_time,
+                    qualify_retry_hash,
                 },
                 extra_conditions,
                 obj.status
@@ -1201,8 +1206,11 @@ async fn reconcile_inner(
             let next_retry_unix = prior
                 .and_then(|s| s.qualify_next_retry_time.as_deref())
                 .and_then(parse_rfc3339_utc);
+            let retry_hash = prior.and_then(|s| s.qualify_retry_hash.as_deref());
             let plan = plan_qualify_gate(
                 &decision,
+                &desired_hash,
+                retry_hash,
                 failure_count,
                 next_retry_unix,
                 now_unix_secs(),
@@ -1270,6 +1278,7 @@ async fn reconcile_inner(
                     store_qualified_hash: qualified_hash,
                     qualify_failure_count: plan.failure_count,
                     qualify_next_retry_time: plan.next_retry_unix.map(format_rfc3339_utc),
+                    qualify_retry_hash: plan.retry_hash.clone(),
                 },
                 extra_conditions,
                 prior.map(|s| s.conditions.as_slice()).unwrap_or_default(),
@@ -1684,9 +1693,11 @@ async fn reconcile_inner(
             store_qualified_hash,
             // Qualification passed for these inputs this pass, so clear the retry
             // budget (issue #36, finding 3): the next failure, if any, starts a
-            // fresh backoff from one rather than resuming a stale count.
+            // fresh backoff from one rather than resuming a stale count. The retry
+            // hash is cleared with it; there is no live count for it to key.
             qualify_failure_count: None,
             qualify_next_retry_time: None,
+            qualify_retry_hash: None,
         },
         extra_conditions,
         obj.status
@@ -1937,6 +1948,10 @@ struct PersistedStatus {
     /// `status.qualifyNextRetryTime`: the RFC3339 instant before which no new
     /// qualify Job is created after a failure, or `None` when not holding.
     qualify_next_retry_time: Option<String>,
+    /// `status.qualifyRetryHash`: the qualified-input hash the persisted retry
+    /// count and next-retry time were recorded against (issue #36, finding 3), or
+    /// `None` when not in a retry hold.
+    qualify_retry_hash: Option<String>,
 }
 
 /// Build the success-path status: observed generation, per-mode ready replicas,
@@ -1988,6 +2003,7 @@ fn build_status(
         store_qualified_hash: persisted.store_qualified_hash,
         qualify_failure_count: persisted.qualify_failure_count,
         qualify_next_retry_time: persisted.qualify_next_retry_time,
+        qualify_retry_hash: persisted.qualify_retry_hash,
         conditions,
     }
 }
@@ -2019,6 +2035,7 @@ fn build_degraded_status(
         store_qualified_hash: persisted.store_qualified_hash,
         qualify_failure_count: persisted.qualify_failure_count,
         qualify_next_retry_time: persisted.qualify_next_retry_time,
+        qualify_retry_hash: persisted.qualify_retry_hash,
         conditions,
     }
 }

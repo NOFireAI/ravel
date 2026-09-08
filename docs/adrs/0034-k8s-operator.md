@@ -421,15 +421,21 @@ failure backoff, saw it Absent, and recreated it, forever: the Job's own
 `backoffLimit` and `activeDeadlineSeconds` bound attempts within one Job, never
 the number of Jobs. The gate now recreates on a capped exponential backoff (base
 30 s doubling to a 480 s ceiling over the first five failures) and, after 6
-consecutive failures, holds in a one-hour terminal cooldown. The failure count
-and the next-retry instant are persisted in status (`status.qualifyFailureCount`,
-`status.qualifyNextRetryTime`); both are serialized even when absent so a status
-merge patch clears them, and neither enters the qualified-input hash, so counting
-failures never re-runs a qualification that would otherwise pass. The `Failed`
-Job is kept in place during the backoff as the record of which inputs are
-failing, so an input change during a long cooldown reads as a stale Job
-(`recreate`), resets the count, and recreates at once rather than waiting the
-cooldown out. The count resets on a successful qualification. The
+consecutive failures, holds in a one-hour terminal cooldown. The failure count,
+the next-retry instant, and the qualified-input hash the failures were recorded
+against are persisted in status (`status.qualifyFailureCount`,
+`status.qualifyNextRetryTime`, `status.qualifyRetryHash`); all three are
+serialized even when absent so a status merge patch clears them, and none enters
+the qualified-input hash, so counting failures never re-runs a qualification that
+would otherwise pass. The retry state is keyed by that recorded hash: whenever the
+desired inputs no longer hash to it the operator drops the count and the
+next-retry and qualifies the new inputs at once, whether or not the `Failed` Job
+still exists. This is what makes an input change during a long cooldown reset and
+recreate at once rather than waiting the cooldown out, even after the `Failed`
+Job's TTL garbage-collected it (once the Job is gone, both a changed and an
+unchanged pass observe it absent, so only the recorded hash distinguishes them);
+the terminal cooldown is kept only while the hashes match. The count resets on a
+successful qualification. The
 `StoreQualified=False` condition names the consecutive-failure count and the next
 retry time. This supersedes the earlier "requeues on the existing failure backoff
 rather than spinning" note: the requeue is now the computed backoff, and past the

@@ -2343,6 +2343,11 @@ pub struct QualifyGatePlan {
     pub failure_count: Option<i32>,
     /// Next-retry instant to persist as RFC3339 (`None` clears the field).
     pub next_retry_unix: Option<i64>,
+    /// The qualified-input hash the persisted retry state is keyed to (`None`
+    /// clears the field). Set whenever `failure_count` is, so a later pass can
+    /// tell whether the desired inputs still match the ones the failures were
+    /// recorded against.
+    pub retry_hash: Option<String>,
     /// Requeue delay in seconds.
     pub requeue_seconds: i64,
 }
@@ -2359,10 +2364,19 @@ pub struct QualifyGatePlan {
 /// failures the gate holds in a terminal cooldown that only an input change (which
 /// resets the count) or the cooldown's expiry clears.
 ///
-/// The Failed Job is KEPT in place during the backoff hold as the record of which
-/// inputs are failing, so a config edit during a long cooldown reads as a stale
-/// Job ([`QualificationDecision::Qualify`] `recreate: true`) and resets at once;
-/// the Job is deleted only once its backoff elapses and it must be recreated.
+/// The persisted retry state is keyed by `retry_hash`, the qualified-input hash
+/// the failures were recorded against. An input change resets the budget and
+/// qualifies the new inputs at once whether or not the failing Job still exists:
+/// when `desired_hash` differs from `retry_hash` the count and next-retry are
+/// dropped before the decision is planned, so a config edit made AFTER the Failed
+/// Job's TTL collected it (both a changed and an unchanged pass then observe the
+/// Job absent, so the Job's presence cannot distinguish them) qualifies at once
+/// rather than waiting out the old inputs' cooldown and inheriting their count.
+/// The cooldown is kept only while the hashes match. A stale Job that is still
+/// present ([`QualificationDecision::Qualify`] `recreate: true`) is deleted on the
+/// same pass. The retry hash is set in the plan whenever the failure count is, so
+/// the controller persists the two together.
+///
 /// Deleting the Job clears no retry state: the count is cleared only on the
 /// success path (in the controller) or on an input change, and `next_retry_unix`
 /// is cleared only when the replacement Job is actually created (the Absent
@@ -2370,13 +2384,24 @@ pub struct QualifyGatePlan {
 /// foreground deletion is not counted twice.
 pub fn plan_qualify_gate(
     decision: &QualificationDecision,
+    desired_hash: &str,
+    retry_hash: Option<&str>,
     failure_count: i32,
     next_retry_unix: Option<i64>,
     now_unix: i64,
     poll_seconds: i64,
 ) -> QualifyGatePlan {
+    // The persisted retry budget was recorded against `retry_hash`. If the desired
+    // inputs have moved since, that budget belongs to inputs no longer desired:
+    // drop it so the new inputs qualify from a clean slate at once, independent of
+    // whether the failing Job survives. Keep it only when the hashes match.
+    let (failure_count, next_retry_unix) = if retry_hash == Some(desired_hash) {
+        (failure_count, next_retry_unix)
+    } else {
+        (0, None)
+    };
     let kept_count = (failure_count > 0).then_some(failure_count);
-    match decision {
+    let mut plan = match decision {
         // A Job for stale inputs is present: a config edit landed. Delete it and
         // reset the retry budget so the fresh inputs qualify from a clean slate,
         // at once (the next pass sees Absent with a zero count and creates one).
@@ -2386,6 +2411,7 @@ pub fn plan_qualify_gate(
             job_message: None,
             failure_count: None,
             next_retry_unix: None,
+            retry_hash: None,
             requeue_seconds: poll_seconds,
         },
         // No Job exists: a fresh cluster (count 0) creates one now; after a failure
@@ -2397,6 +2423,7 @@ pub fn plan_qualify_gate(
                 job_message: None,
                 failure_count: kept_count,
                 next_retry_unix: Some(due),
+                retry_hash: None,
                 requeue_seconds: (due - now_unix).max(1),
             },
             // Backoff elapsed (or never set): create the replacement Job and clear
@@ -2412,6 +2439,7 @@ pub fn plan_qualify_gate(
                 job_message: None,
                 failure_count: kept_count,
                 next_retry_unix: None,
+                retry_hash: None,
                 requeue_seconds: poll_seconds,
             },
         },
@@ -2423,6 +2451,7 @@ pub fn plan_qualify_gate(
             job_message: None,
             failure_count: kept_count,
             next_retry_unix,
+            retry_hash: None,
             requeue_seconds: poll_seconds,
         },
         // The Job for the current inputs Failed and is Present.
@@ -2438,6 +2467,7 @@ pub fn plan_qualify_gate(
                     job_message: Some(message.clone()),
                     failure_count: Some(count),
                     next_retry_unix: Some(now_unix + delay),
+                    retry_hash: None,
                     requeue_seconds: delay,
                 }
             }
@@ -2448,6 +2478,7 @@ pub fn plan_qualify_gate(
                 job_message: Some(message.clone()),
                 failure_count: kept_count,
                 next_retry_unix: Some(due),
+                retry_hash: None,
                 requeue_seconds: (due - now_unix).max(1),
             },
             // Backoff elapsed: delete the Failed Job so a later pass sees Absent
@@ -2460,13 +2491,20 @@ pub fn plan_qualify_gate(
                 job_message: Some(message.clone()),
                 failure_count: kept_count,
                 next_retry_unix: Some(due),
+                retry_hash: None,
                 requeue_seconds: poll_seconds,
             },
         },
         QualificationDecision::Proceed => {
             unreachable!("Proceed is handled on the success path, never planned as a hold")
         }
-    }
+    };
+    // Key the persisted retry state to the inputs it was recorded against: set the
+    // hash exactly when a failure count is persisted, so a later pass can compare
+    // the desired hash against it and reset on an input change even after the
+    // Failed Job's TTL collected it.
+    plan.retry_hash = plan.failure_count.map(|_| desired_hash.to_string());
+    plan
 }
 
 /// The [`QualifyJobPhase`] a live Job reports, read from its status conditions:
@@ -6165,6 +6203,8 @@ mod tests {
         let msg = "backend rejected CAS".to_string();
         let first = plan_qualify_gate(
             &QualificationDecision::Failed(msg.clone()),
+            "h",
+            Some("h"),
             0,
             None,
             1_000,
@@ -6180,6 +6220,8 @@ mod tests {
         // Still holding at count 1: no re-count, requeue shrinks to time remaining.
         let holding = plan_qualify_gate(
             &QualificationDecision::Failed(msg),
+            "h",
+            Some("h"),
             1,
             Some(1_030),
             1_020,
@@ -6203,6 +6245,8 @@ mod tests {
         // retry state so the recreation is not re-counted.
         let deleting = plan_qualify_gate(
             &QualificationDecision::Failed(msg),
+            "h",
+            Some("h"),
             2,
             Some(1_030),
             1_030,
@@ -6216,6 +6260,8 @@ mod tests {
         // new attempt's failure counts afresh; count is kept, reason stays Failed.
         let creating = plan_qualify_gate(
             &QualificationDecision::Qualify { recreate: false },
+            "h",
+            Some("h"),
             2,
             Some(1_030),
             1_030,
@@ -6238,6 +6284,8 @@ mod tests {
         // Failed Job present, before expiry: no mutation.
         let held_present = plan_qualify_gate(
             &QualificationDecision::Failed("terminal".to_string()),
+            "h",
+            Some("h"),
             QUALIFY_RETRY_TERMINAL_THRESHOLD,
             Some(due),
             1_000,
@@ -6248,6 +6296,8 @@ mod tests {
         // Job Absent, before expiry: still no Create.
         let held_absent = plan_qualify_gate(
             &QualificationDecision::Qualify { recreate: false },
+            "h",
+            Some("h"),
             QUALIFY_RETRY_TERMINAL_THRESHOLD,
             Some(due),
             due - 1,
@@ -6259,6 +6309,8 @@ mod tests {
         // Job Absent, at expiry: recreate.
         let released = plan_qualify_gate(
             &QualificationDecision::Qualify { recreate: false },
+            "h",
+            Some("h"),
             QUALIFY_RETRY_TERMINAL_THRESHOLD,
             Some(due),
             due,
@@ -6276,6 +6328,8 @@ mod tests {
         let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
         let reset = plan_qualify_gate(
             &QualificationDecision::Qualify { recreate: true },
+            "h",
+            Some("h"),
             QUALIFY_RETRY_TERMINAL_THRESHOLD,
             Some(due),
             1_000,
@@ -6289,6 +6343,8 @@ mod tests {
         // Next pass sees the fresh inputs' Job Absent with a zero count: create now.
         let fresh = plan_qualify_gate(
             &QualificationDecision::Qualify { recreate: false },
+            "h",
+            Some("h"),
             0,
             None,
             1_000,
@@ -6298,6 +6354,76 @@ mod tests {
         assert_eq!(fresh.reason, QualifyStoreReason::Pending);
         assert_eq!(fresh.failure_count, None);
         assert_eq!(fresh.requeue_seconds, 10);
+    }
+
+    /// An input change observed AFTER the Failed Job's TTL collected it (the Job is
+    /// Absent, so the decision is `Qualify { recreate: false }` for a changed and an
+    /// unchanged hash alike) still resets and qualifies at once (issue #36): the
+    /// desired hash no longer matches the hash the failures were recorded against,
+    /// so the terminal cooldown is dropped, a Job is created this pass, and the
+    /// persisted retry state is cleared. Without the recorded-hash comparison this
+    /// pass would hold out the remaining cooldown and inherit the old count.
+    #[test]
+    fn plan_absent_changed_hash_qualifies_at_once() {
+        let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
+        let changed = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            "new",
+            Some("old"),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            1_000,
+            10,
+        );
+        assert_eq!(changed.action, QualifyJobAction::Create);
+        assert_eq!(changed.reason, QualifyStoreReason::Pending);
+        assert_eq!(changed.failure_count, None);
+        assert_eq!(changed.next_retry_unix, None);
+        assert_eq!(changed.retry_hash, None);
+        assert_eq!(changed.requeue_seconds, 10);
+    }
+
+    /// The converse of the reset (issue #36): with the Job Absent, the desired hash
+    /// still equal to the recorded retry hash, and the cooldown not yet expired, the
+    /// plan holds exactly as before. The count is kept, no Job is created, and the
+    /// requeue is the exact time remaining. This is the case the recorded-hash
+    /// comparison must NOT flip.
+    #[test]
+    fn plan_absent_unchanged_hash_holds_in_cooldown() {
+        let due = 1_000 + QUALIFY_RETRY_COOLDOWN_SECONDS;
+        let held = plan_qualify_gate(
+            &QualificationDecision::Qualify { recreate: false },
+            "same",
+            Some("same"),
+            QUALIFY_RETRY_TERMINAL_THRESHOLD,
+            Some(due),
+            1_000,
+            10,
+        );
+        assert_eq!(held.action, QualifyJobAction::None);
+        assert_eq!(held.reason, QualifyStoreReason::Failed);
+        assert_eq!(held.failure_count, Some(QUALIFY_RETRY_TERMINAL_THRESHOLD));
+        assert_eq!(held.next_retry_unix, Some(due));
+        assert_eq!(held.retry_hash.as_deref(), Some("same"));
+        assert_eq!(held.requeue_seconds, due - 1_000);
+    }
+
+    /// A newly-observed failure records the desired hash as the retry key alongside
+    /// the count (issue #36), so a later pass can compare against it once the Job is
+    /// gone. The key is the desired hash, not the (absent) prior one.
+    #[test]
+    fn plan_first_failure_records_retry_hash() {
+        let first = plan_qualify_gate(
+            &QualificationDecision::Failed("boom".to_string()),
+            "desired",
+            None,
+            0,
+            None,
+            1_000,
+            10,
+        );
+        assert_eq!(first.failure_count, Some(1));
+        assert_eq!(first.retry_hash.as_deref(), Some("desired"));
     }
 
     /// The persisted retry bookkeeping (failure count, next-retry time) is NOT part
