@@ -18,13 +18,14 @@ pub enum CatalogError {
     Key(#[from] KeyError),
     #[error("commit record decode/validation error: {0}")]
     Record(#[from] RecordError),
-    /// A compaction record failed protobuf decode (docs/catalog-and-mvcc.md
-    /// step 2). Fatal: layout drift or corruption, never silently skipped.
+    /// A compaction record failed decode or its `format_version` gate
+    /// (docs/catalog-and-mvcc.md step 2, ADR-0066 decision 2). Fatal: layout
+    /// drift, corruption, or an unsupported version, never silently skipped.
     #[error("compaction record at {key:?} failed to decode: {source}")]
     CompactionRecordDecode {
         key: String,
         #[source]
-        source: prost::DecodeError,
+        source: RecordError,
     },
     /// Fatal: a commit record's own identity fields do not reconstruct to
     /// its stored `object_key` (ADR-0010 §7). Never silently prefer either

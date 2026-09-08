@@ -722,7 +722,7 @@ async fn verify_custody_catches_a_compaction_input_with_a_mismatched_hash() {
 fn decode_compaction_record_prints_fields() {
     let record = CompactionRecord {
         format_version: 1,
-        tenant_hash: vec![0u8; 32],
+        tenant_hash: vec![0u8; 16],
         signal: 1,
         shard: 3,
         ingest_hour_bucket: 42,
@@ -862,7 +862,7 @@ async fn migrate_exits_nonzero_and_holds_the_floor_when_a_straggler_survives() {
 fn decode_retention_tombstone_prints_fields() {
     let tombstone = RetentionTombstone {
         format_version: 1,
-        tenant_hash: vec![0u8; 32],
+        tenant_hash: vec![0u8; 16],
         signal: 2,
         shard: 1,
         ingest_hour_bucket: 7,

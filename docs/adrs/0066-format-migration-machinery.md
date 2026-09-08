@@ -377,3 +377,39 @@ that could go wrong here are single-record decode properties — which versions 
 gate admits, and whether a refused rewrite leaves the object untouched — and
 those are pinned by tests over the real code, including a `MemoryStore`
 byte-identity assertion after each refusal.
+
+## Amendment (2026-09-08, #1301): the Context claim made true for all three commit-family records
+
+The Context above (under "What is already versioned, per format") stated that
+`CommitRecord`, `CompactionRecord`, and `RetentionTombstone` "each carry their
+own `format_version` (= 1) with a typed check". That was true only for
+`CommitRecord`: its `validate`/`decode` pair in `crates/ravel-commit/src/record.rs`
+refused an unsupported version, but `CompactionRecord` and `RetentionTombstone`
+had no decode-and-validate pair. Every production reader decoded them with the
+raw `prost` `Message::decode` and checked identity and key consistency only, so a
+record a future writer stamped `format_version` 2 would have been read as version
+1 with no error — the exact fail-open this ADR's decision 2 forbids. The claim
+was latent, not enforced: nothing writes a version 2 today (both writers,
+`ravel-maintain::publish` and `ravel-maintain::retention`, stamp 1 explicitly),
+so the gap was invisible until a compaction-record change shipped.
+
+This change makes the claim true. `ravel-commit::record` now exports
+`decode_compaction`/`validate_compaction` and `decode_tombstone`/`validate_tombstone`,
+mirroring the `CommitRecord` pair, each routing through a shared supported-set
+check with a floor and a ceiling ({1} for both) and a typed
+`RecordError::UnsupportedRecordFormatVersion` naming the record kind and the
+version seen. Every production decode site in `ravel-catalog`, `ravel-maintain`,
+`ravel-cli`, and `ravel-bench` is routed through the new pair; the raw `prost`
+decode survives only in test helpers. An enumeration guard test asserts every
+record kind that carries a `format_version` has a versioned validate pair, so a
+fourth kind cannot ship ungated.
+
+**Formal method: RUST_ONLY.** A reader gate on a frozen record. The RSEG layout,
+the protobuf schemas, series identity, commit tokens, and the object key layout
+are all unchanged: no persistent format moves, only the reader stops admitting a
+version it does not support. There is no new interleaving to model — the property
+is the single-record decode property this ADR already pins for `CommitRecord`,
+and it is checked by tests over the real code (a version-2 and a version-0 record
+of each kind refused with the typed error, version 1 accepted, and, at each
+enforcement layer, a version-2 compaction record neither swept nor resolved as
+version 1).

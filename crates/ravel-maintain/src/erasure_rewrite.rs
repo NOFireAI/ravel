@@ -399,7 +399,7 @@ async fn get_compaction_record(
     key: &str,
 ) -> Result<CompactionRecord> {
     let got = store.get(key, GetRange::Full).await?;
-    let record = CompactionRecord::decode(got.data.as_ref())
+    let record = ravel_commit::record::decode_compaction(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("compaction record decode failed: {e}")))?;
     keys::verify_compaction_record_key(&record, key)?;
     Ok(record)

@@ -519,7 +519,7 @@ async fn get_compaction_record(
     key: &str,
 ) -> Result<CompactionRecord> {
     let got = store.get(key, GetRange::Full).await?;
-    let record = CompactionRecord::decode(got.data.as_ref())
+    let record = record::decode_compaction(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("compaction record decode failed: {e}")))?;
     keys::verify_compaction_record_key(&record, key)?;
     Ok(record)
@@ -528,8 +528,103 @@ async fn get_compaction_record(
 /// GET, decode, and key-verify one retention tombstone (ADR-0010 §7 discipline).
 async fn get_tombstone(store: &dyn ObjectStoreBackend, key: &str) -> Result<RetentionTombstone> {
     let got = store.get(key, GetRange::Full).await?;
-    let tombstone = RetentionTombstone::decode(got.data.as_ref())
+    let tombstone = record::decode_tombstone(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("tombstone decode failed: {e}")))?;
     keys::verify_retention_tombstone_key(&tombstone, key)?;
     Ok(tombstone)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::Signal;
+
+    use super::*;
+
+    fn tenant() -> TenantHash {
+        TenantHash([0u8; 16])
+    }
+
+    /// The retention read of a compaction record refuses a future
+    /// `format_version` (ADR-0066 decision 2), not reads it as version 1. The
+    /// record is otherwise self-consistent (its identity fields reconstruct its
+    /// own key), so the version gate is the only thing that can reject it.
+    /// Removing that gate makes this test fail: the record then decodes and
+    /// key-verifies as version 1 and the call returns `Ok`.
+    #[tokio::test]
+    async fn retention_refuses_a_future_version_compaction_record() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let record = CompactionRecord {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x33; 32],
+            ..Default::default()
+        };
+        let key = keys::compaction_record_key_for(&record).expect("key");
+        store
+            .put(
+                &key,
+                record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let err = get_compaction_record(&store, &key)
+            .await
+            .expect_err("a version-2 compaction record must be refused, not read as v1");
+        match &err {
+            MaintainError::Invariant(msg) => assert!(
+                msg.contains("format_version") && msg.contains("2"),
+                "the failure names the version gate and the version seen: {msg}"
+            ),
+            other => panic!("expected Invariant from the version gate, got {other:?}"),
+        }
+    }
+
+    /// The retention read of a tombstone refuses a future `format_version`
+    /// (ADR-0066 decision 2), not reads it as version 1. Same self-consistent
+    /// record and same gate-flip failure argument as the compaction case.
+    #[tokio::test]
+    async fn retention_refuses_a_future_version_tombstone() {
+        let store = MemoryStore::new();
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let tombstone = RetentionTombstone {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            retired_at_ns: 1,
+            retention_window_ns: 1,
+            record_count_observed: 0,
+        };
+        let key = keys::retention_tombstone_key_for(&tombstone).expect("key");
+        store
+            .put(
+                &key,
+                record::encode_tombstone(&tombstone),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let err = get_tombstone(&store, &key)
+            .await
+            .expect_err("a version-2 tombstone must be refused, not read as v1");
+        match &err {
+            MaintainError::Invariant(msg) => assert!(
+                msg.contains("format_version") && msg.contains("2"),
+                "the failure names the version gate and the version seen: {msg}"
+            ),
+            other => panic!("expected Invariant from the version gate, got {other:?}"),
+        }
+    }
 }

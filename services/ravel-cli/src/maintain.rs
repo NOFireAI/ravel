@@ -9,7 +9,6 @@ use std::io::Write;
 use std::sync::Arc;
 
 use clap::ValueEnum;
-use prost::Message;
 use ravel_commit::keys;
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, LegalHoldCheck,
@@ -18,7 +17,6 @@ use ravel_maintain::{
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
-use ravel_proto::commit::v1::{CompactionRecord, RetentionTombstone};
 use ravel_types::{Signal, TenantHash, TenantId};
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -964,7 +962,7 @@ pub async fn status(
             .get(key, GetRange::Full)
             .await
             .map_err(|err| anyhow::anyhow!("failed to fetch compaction record {key}: {err}"))?;
-        let record = CompactionRecord::decode(got.data.as_ref())
+        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
             .map_err(|err| anyhow::anyhow!("compaction record {key} is corrupt: {err}"))?;
         superseded_inputs += record.inputs.len();
         for part in &record.parts {
@@ -1113,8 +1111,8 @@ pub async fn audit_versions(
                         let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
                             anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
                         })?;
-                        let record =
-                            CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
+                        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
+                            .map_err(|err| {
                                 anyhow::anyhow!("compaction record {} is corrupt: {err}", meta.key)
                             })?;
                         for part in &record.parts {
@@ -1677,8 +1675,8 @@ pub async fn verify_custody(
                         let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
                             anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
                         })?;
-                        let record =
-                            CompactionRecord::decode(got.data.as_ref()).map_err(|err| {
+                        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
+                            .map_err(|err| {
                                 anyhow::anyhow!("compaction record {} is corrupt: {err}", meta.key)
                             })?;
 
@@ -1939,7 +1937,7 @@ pub async fn check_noncurrent_versions<S: NoncurrentVersionSource + ?Sized>(
 /// field-by-field style. Reports the compaction identity plus every input
 /// identity and every part's summary and level/part_index/version.
 pub fn decode_compaction_record(bytes: &[u8]) -> anyhow::Result<()> {
-    let record = CompactionRecord::decode(bytes)
+    let record = ravel_commit::record::decode_compaction(bytes)
         .map_err(|err| anyhow::anyhow!("failed to decode compaction record: {err}"))?;
     println!("format_version: {}", record.format_version);
     println!("tenant_hash: {}", hex::encode(&record.tenant_hash));
@@ -1980,7 +1978,7 @@ pub fn decode_compaction_record(bytes: &[u8]) -> anyhow::Result<()> {
 
 /// Decode and print a `RetentionTombstone` (proto).
 pub fn decode_retention_tombstone(bytes: &[u8]) -> anyhow::Result<()> {
-    let tombstone = RetentionTombstone::decode(bytes)
+    let tombstone = ravel_commit::record::decode_tombstone(bytes)
         .map_err(|err| anyhow::anyhow!("failed to decode retention tombstone: {err}"))?;
     println!("format_version: {}", tombstone.format_version);
     println!("tenant_hash: {}", hex::encode(&tombstone.tenant_hash));
@@ -2277,5 +2275,60 @@ mod tests {
             "the trait-contract default cannot enumerate versions"
         );
         assert_eq!(report.recoverable_versions, 0);
+    }
+
+    /// The `maintain inspect` decode path refuses a compaction record stamped a
+    /// future `format_version` (ADR-0066 decision 2), rather than printing it as
+    /// a version-1 record. Routing the bytes back through the raw prost
+    /// `Message::decode` (the pre-fix path) makes this test fail: the record
+    /// decodes silently and the call returns `Ok`.
+    #[test]
+    fn inspect_refuses_a_future_version_compaction_record() {
+        let record = ravel_proto::commit::v1::CompactionRecord {
+            format_version: 2,
+            tenant_hash: vec![0u8; 16],
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x44; 32],
+            ..Default::default()
+        };
+        let bytes = record::encode_compaction(&record);
+        let err = decode_compaction_record(bytes.as_ref())
+            .expect_err("a version-2 compaction record must be refused, not printed as v1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compaction record")
+                && msg.contains("format_version")
+                && msg.contains('2'),
+            "the error names the record kind, the gate, and the version seen: {msg}"
+        );
+    }
+
+    /// The `maintain inspect` decode path refuses a retention tombstone stamped
+    /// a future `format_version`. Same raw-prost-decode failure argument as the
+    /// compaction case.
+    #[test]
+    fn inspect_refuses_a_future_version_tombstone() {
+        let tombstone = ravel_proto::commit::v1::RetentionTombstone {
+            format_version: 2,
+            tenant_hash: vec![0u8; 16],
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            retired_at_ns: 1,
+            retention_window_ns: 1,
+            record_count_observed: 0,
+        };
+        let bytes = record::encode_tombstone(&tombstone);
+        let err = decode_retention_tombstone(bytes.as_ref())
+            .expect_err("a version-2 tombstone must be refused, not printed as v1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retention tombstone")
+                && msg.contains("format_version")
+                && msg.contains('2'),
+            "the error names the record kind, the gate, and the version seen: {msg}"
+        );
     }
 }
