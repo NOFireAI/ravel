@@ -587,7 +587,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "ravel-codec"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-proto"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "prost",
  "prost-build",
@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-segment"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "blake3",
  "bytes",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "ravel-types"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "blake3",
