@@ -1769,8 +1769,9 @@ fn render_bucket_protection_family(out: &mut String, mode: Mode, unknown: u64) {
 /// Under `--audit-mode required` a failed write is returned to the query as a
 /// 503 and is not counted here, so any nonzero value is the best-effort
 /// posture reporting queries that were served with no durable audit record.
-/// It carries no tenant label: the failing unit is a flush, which groups
-/// several tenants' records, and the closed [`Label`] set stays closed.
+/// It increments once per tenant group whose write fails within a flush, not
+/// once per flush. It carries no tenant label: that would disclose which
+/// tenant's writes failed on this unauthenticated route.
 fn render_audit_family(out: &mut String, mode: Mode, write_failures: u64) {
     write_header(
         out,
