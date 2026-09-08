@@ -774,6 +774,24 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub qualify_next_retry_time: Option<String>,
 
+    /// The qualify-Job input hash the persisted `qualifyFailureCount` and
+    /// `qualifyNextRetryTime` were recorded against (issue #36, finding 3). The
+    /// retry state is meaningful only for the inputs that produced the failures:
+    /// when the desired inputs no longer hash to this value the operator resets
+    /// the count and next-retry and qualifies the new inputs at once, whether or
+    /// not the failing Job still exists. Without this key the operator cannot tell
+    /// a changed-input pass from an unchanged one once the Failed Job is
+    /// TTL-garbage-collected (both observe the Job absent), so a config edit made
+    /// after the Job's TTL collected it would wait out the old inputs' cooldown and
+    /// inherit their failure count. This is never part of the qualified-input hash
+    /// itself, so recording it never re-runs a qualification that would pass.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge patch
+    /// clears it on reset or success; a skipped field would leave a stale key
+    /// behind.
+    #[serde(default)]
+    pub qualify_retry_hash: Option<String>,
+
     /// Standard Kubernetes conditions: `Available`, `Progressing`, `Degraded`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
