@@ -93,6 +93,8 @@ async fn start_keyed_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server:
         idle_tenant_state_ttl: Duration::from_secs(3600),
         distrib: None,
         remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
         ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
             1024,
         ),

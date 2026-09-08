@@ -499,6 +499,10 @@ async fn main() -> anyhow::Result<()> {
             .parse_distrib_settings()
             .context("failed to resolve --distributed-query settings")?,
         remote_clusters,
+        shutdown_timeout: cli
+            .parse_shutdown_timeout()
+            .context("failed to parse --shutdown-timeout")?,
+        drain_settle_interval: ravel_server::DEFAULT_DRAIN_SETTLE_INTERVAL,
     };
 
     let running =
@@ -507,7 +511,14 @@ async fn main() -> anyhow::Result<()> {
 
     wait_for_shutdown_signal().await;
     tracing::info!("shutdown signal received, draining");
-    running.shutdown().await?;
+    // A drain that overran `--shutdown-timeout` (or a listener error) returns
+    // `Err`: log it at error level and propagate so the process exits non-zero,
+    // rather than falling through to the "shutdown complete" line and a clean
+    // exit it did not earn.
+    if let Err(err) = running.shutdown().await {
+        tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
+        return Err(err);
+    }
     tracing::info!("shutdown complete");
     // Flush the OTLP trace exporter AFTER draining (ADR-0060 decision 7): a
     // span for the last request the server handled closes as that request
