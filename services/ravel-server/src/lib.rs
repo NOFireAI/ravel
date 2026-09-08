@@ -99,6 +99,19 @@ pub use ravel_ingest::IngestByteBudgetLimit;
 
 const DEFAULT_ACK_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Grace added to `--audit-max-age` to bound the query-audit drain in
+/// [`Running::shutdown`] (ADR-0062 decision 2b).
+///
+/// The drain is one final flush per tenant in the buffered batch: a data-object
+/// PUT plus a commit publish, each under the commit retry ladder (five
+/// attempts, about 0.3 s of total backoff). Five seconds is over ten times that
+/// ladder, so a store that is merely slow finishes inside the bound. It is a
+/// ceiling on the work, not a deadline for it: an object store that never
+/// answers must not be able to keep the process alive, and shutdown has already
+/// stopped every listener that could submit, so the only records at risk are
+/// the ones already in the batch.
+const AUDIT_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
 /// Emits a prominent startup warning when the dev-only insecure tenant header
 /// is enabled. The `--dev-insecure-tenant-header` flag lets a client name its
 /// own tenant via `x-ravel-tenant`, bypassing authenticated tenant resolution.
@@ -534,6 +547,8 @@ pub struct Running {
     /// query-serving modes that spawned one. `shutdown` drains it last, after
     /// every query surface that could still submit to it has stopped serving.
     audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>>,
+    /// The bound on that drain: `--audit-max-age` plus [`AUDIT_DRAIN_GRACE`].
+    audit_drain_timeout: Duration,
 }
 
 impl Running {
@@ -624,8 +639,23 @@ impl Running {
         // Every query surface that could submit to it has stopped serving
         // by now (the HTTP/gRPC/mTLS listener tasks above have been joined),
         // so draining here cannot race a submission arriving after drain.
+        //
+        // Bounded: the drain awaits a flush that ends in object-store calls,
+        // and an unreachable store would otherwise hold the process open with
+        // every listener already stopped. On the bound, the records still in
+        // the batch are lost and the warning says so; the pipeline's `Drop`
+        // has already signalled the flush task, so a store that recovers
+        // within the process's remaining lifetime can still complete the
+        // write.
         if let Some(pipeline) = self.audit_pipeline {
-            pipeline.shutdown().await?;
+            match tokio::time::timeout(self.audit_drain_timeout, pipeline.shutdown()).await {
+                Ok(result) => result?,
+                Err(_) => tracing::warn!(
+                    timeout_ms = self.audit_drain_timeout.as_millis(),
+                    "query-audit drain did not finish within its bound; shutting down without \
+                     it, so records still buffered may not be durable"
+                ),
+            }
         }
 
         Ok(())
@@ -2331,5 +2361,6 @@ pub async fn start(
         idle_tenant_state_task,
         metadata_sink_task,
         audit_pipeline: running_audit_pipeline,
+        audit_drain_timeout: config.audit_pipeline.max_age + AUDIT_DRAIN_GRACE,
     })
 }
