@@ -89,6 +89,7 @@ percent-encode.
 | GET, POST | `/api/v1/query_exemplars` | `query`, `start`, `end` | Prometheus exemplars JSON envelope | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/analytics` | JSON: `query`, `start`, `end`, `step`, `op`, optional `timeout`, `min_commit_token`, `allow_partial` | JSON analytics envelope, one entry per series | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/sql` | JSON: `query`, `start`, `end`, optional `timeout`, `min_commit_token` | Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
+| POST | `/mcp` | One MCP JSON-RPC message (revision `2026-07-28` or `2025-11-25`) | JSON or `text/event-stream`, per revision; a tool result carries the result envelope | 200, 400, 401, 403, 405, 413, 500 | Yes | `all`, `query` | `mcp` |
 
 `/api/v1/status/buildinfo` and `/api/v1/metadata` exist for Prometheus-shaped
 clients (Grafana's datasource test probes both). `/api/v1/metadata` never
@@ -120,6 +121,15 @@ bit-exact for every float. The SQL surface registers exactly five tables, one
 per signal: `samples` (metrics), `logs`, `spans` (traces), `alerts` (alert
 state transitions), and `audit` (audit records, including the query-audit
 trail).
+
+`/mcp` is behind the `mcp` cargo feature and `--mcp`: a build carrying the
+feature serves no MCP route until an operator passes the flag. It is the only
+MCP path, and it serves POST only. Every request is authenticated with the
+listener's own tenant resolver before the JSON-RPC message is parsed, so a
+request with no resolvable credential is 401 whatever it asked for, including
+a legacy `initialize`. An `Origin` outside `--mcp-allowed-origins` is 403, a
+body past `--mcp-max-body-bytes` is 413, and on revision `2026-07-28` a
+`Mcp-Method` or `Mcp-Name` header that disagrees with the body is 400.
 
 For the query routes, the status codes come from one shared error mapping:
 
