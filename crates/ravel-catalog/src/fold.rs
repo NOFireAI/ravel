@@ -593,6 +593,30 @@ fn varint_len(v: u64) -> u64 {
     len
 }
 
+// Test-only instrumentation for #1482: counts calls to
+// `column_stats_segments_concat` made by the per-part column-stats degrade
+// loop, so a regression test can pin the loop at measuring the body a
+// bounded number of times rather than once per dictionary dropped.
+#[cfg(test)]
+thread_local! {
+    static COLUMN_STATS_CONCAT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_column_stats_concat_call_for_test() {
+    COLUMN_STATS_CONCAT_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+fn column_stats_concat_calls_for_test() -> u64 {
+    COLUMN_STATS_CONCAT_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_column_stats_concat_calls_for_test() {
+    COLUMN_STATS_CONCAT_CALLS.with(|c| c.set(0));
+}
+
 /// One part's span in the fully-sorted entry set: the `[start, end)` index
 /// range into `entries` and the `[min_hour, watermark_hour]` ingest-hour range
 /// those entries occupy (ADR-0063 section 1). Ranges are disjoint and
@@ -1559,8 +1583,10 @@ impl Catalog {
                         .iter()
                         .map(|seg| prost::Message::encoded_len(seg) as u64)
                         .collect();
+                    #[cfg(test)]
+                    record_column_stats_concat_call_for_test();
                     let mut running_total: u64 =
-                        segment_len.iter().map(|&len| varint_len(len) + len).sum();
+                        column_stats_segments_concat(&v3_segments).len() as u64;
                     let mut heap: BinaryHeap<(u64, usize, usize, u64)> = BinaryHeap::new();
                     for (seg_idx, seg) in v3_segments.iter().enumerate() {
                         for (col_idx, col) in seg.columns.iter().enumerate() {
@@ -1577,15 +1603,14 @@ impl Catalog {
                             // false bool, so tag + varint(true) = 2 bytes
                             // recovered) plus each `DictEntry`'s own
                             // tag + length-varint + content.
-                            let dict_content_shrink: u64 = 2
-                                + col
-                                    .dictionary
-                                    .iter()
-                                    .map(|e| {
-                                        let entry_len = prost::Message::encoded_len(e) as u64;
-                                        1 + varint_len(entry_len) + entry_len
-                                    })
-                                    .sum::<u64>();
+                            let dict_content_shrink: u64 = 2 + col
+                                .dictionary
+                                .iter()
+                                .map(|e| {
+                                    let entry_len = prost::Message::encoded_len(e) as u64;
+                                    1 + varint_len(entry_len) + entry_len
+                                })
+                                .sum::<u64>();
                             let col_len_before = prost::Message::encoded_len(col) as u64;
                             let col_len_after = col_len_before - dict_content_shrink;
                             // The column's own embedding in `segment.columns`
@@ -1633,6 +1658,8 @@ impl Catalog {
                     // an explicit refusal carrying both figures, rather than
                     // either stopping early on a still-over-ceiling body or
                     // silently publishing one.
+                    #[cfg(test)]
+                    record_column_stats_concat_call_for_test();
                     let measured_total = column_stats_segments_concat(&v3_segments).len() as u64;
                     if measured_total != running_total {
                         return Err(CatalogError::FieldMismatch {
@@ -3803,6 +3830,119 @@ mod tests {
         record
     }
 
+    /// Declare `n_columns` I64 typed columns (`c00`, `c01`, ...), all names
+    /// the same byte length so every column's `ColumnStat.name` field costs
+    /// the same number of bytes regardless of index.
+    async fn set_many_column_config(store: &dyn ObjectStoreBackend, n_columns: usize) {
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(
+                (0..n_columns)
+                    .map(|i| crate::tenant_config::DeclaredTypedColumn {
+                        key: format!("c{i:02}"),
+                        ty: crate::tenant_config::DeclaredColumnType::I64,
+                    })
+                    .collect(),
+            ),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    /// Publish one L0 segment carrying all `n_columns` declared columns
+    /// (`c00`..`c{n_columns-1}`), every column given the same two distinct
+    /// values across `rows` entries, so every (segment, column) dictionary
+    /// encodes to the exact same size -- the fixture
+    /// `degrade_completes_a_part_needing_many_drops_with_one_concatenation`
+    /// needs a large, size-tied pair set so the drop order is decided purely
+    /// by the heap's `(seg_idx, col_idx)` tie-break, not by planted size
+    /// differences.
+    async fn publish_logs_segment_many_columns(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        n_columns: usize,
+        rows: usize,
+    ) -> CommitRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        );
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for i in 0..rows {
+            let ts = base_ts + i as i64;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            let attrs = (0..n_columns)
+                .map(|c| (format!("c{c:02}"), AttrValue::I64((i % 2) as i64)))
+                .collect();
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs,
+            })
+            .expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: rows as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: max_ts,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
     /// Declare `status` as an I64 typed logs column so the fold builds column
     /// statistics for a (tenant, Logs) pair.
     async fn set_status_column_config(store: &dyn ObjectStoreBackend) {
@@ -4410,6 +4550,147 @@ mod tests {
                 .is_err(),
             "HEAD must not exist after a fold that failed before publishing"
         );
+    }
+
+    /// #1482: the pre-fix loop re-measured the WHOLE part's uncompressed
+    /// body (`column_stats_segments_concat`, a fresh multi-gigabyte `Vec`)
+    /// and re-summed every dictionary's `encoded_len` on every single drop,
+    /// so a part needing many drops never finished. This fixture forces
+    /// 1,500 drops across 2,000 (segment, column) pairs (100 segments x 20
+    /// columns each, every dictionary the same size so the drop order is
+    /// decided purely by the heap's `(seg_idx, col_idx)` tie-break) and
+    /// pins the fix at measuring the body exactly twice regardless of how
+    /// many drops it takes: once before the drop loop, once after.
+    ///
+    /// Reverting the fix's initial `running_total` computation in
+    /// `fold.rs` back to a per-iteration `column_stats_segments_concat`
+    /// call inside the `while running_total > ceiling` loop (the shape
+    /// `#1482` reports) flips this test's concatenation-count assertion
+    /// back to failing, since the counter would then read 1,501 instead of
+    /// 2 (1 before the loop that is no longer needed, plus 1500 in-loop,
+    /// plus the 1 after).
+    #[tokio::test]
+    async fn degrade_completes_a_part_needing_many_drops_with_one_concatenation() {
+        let n_columns = 20;
+        let n_segments = 100;
+        let rows = 4;
+
+        // Reference fold at the real (unbounded-for-this-fixture) ceiling:
+        // every dictionary intact. Used only to measure, via the same
+        // `column_stats_segments_concat` the fold itself measures with,
+        // the exact post-drop body size for an injected ceiling that
+        // forces exactly 1500 drops.
+        let reference_store = Arc::new(MemoryStore::new());
+        set_many_column_config(reference_store.as_ref(), n_columns).await;
+        for seq in 0..n_segments {
+            publish_logs_segment_many_columns(
+                reference_store.as_ref(),
+                seq as u64,
+                10,
+                n_columns,
+                rows,
+            )
+            .await;
+        }
+        let reference_catalog = Catalog::new(reference_store.clone(), config(1)).expect("catalog");
+        let reference_report = reference_catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("reference fold at the real ceiling never degrades");
+        assert_eq!(
+            reference_report.column_stats_dictionaries_dropped, 0,
+            "the real ceiling admits this fixture with every dictionary intact"
+        );
+        let reference_head = read_logs_head(reference_store.as_ref()).await;
+        let reference_ref = reference_head.parts[0]
+            .column_stats
+            .clone()
+            .expect("v3 ref");
+        let reference_got = reference_store
+            .get(&reference_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let reference_decoded = snapshot_format::decode_column_stats(
+            &reference_got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v3 decodes");
+        assert_eq!(reference_decoded.segments.len(), n_segments);
+        for seg in &reference_decoded.segments {
+            assert_eq!(seg.columns.len(), n_columns);
+        }
+
+        // Drop every dictionary in the LAST 75 segments (all 20 columns
+        // each = 1500 pairs). Every pair's dictionary is the same size, so
+        // this is exactly what the degrade loop's heap picks: with the
+        // primary (size) key tied across all 2000 pairs, the heap's
+        // `(size, seg_idx, col_idx, ...)` tuple order pops the highest
+        // seg_idx first, then within it the highest col_idx, reproducing
+        // the same "last maximum wins" tie-break the pre-fix
+        // `max_by_key`-based loop used.
+        let mut post_drop_segments = reference_decoded.segments.clone();
+        let dropped_seg_start = n_segments - 75;
+        for seg in &mut post_drop_segments[dropped_seg_start..] {
+            for col in &mut seg.columns {
+                col.dictionary_present = false;
+                col.dictionary.clear();
+            }
+        }
+        let ceiling =
+            snapshot_format::column_stats_segments_concat(&post_drop_segments).len() as u64;
+
+        // Fresh store, byte-identical fixture, ceiling injected.
+        let store = Arc::new(MemoryStore::new());
+        set_many_column_config(store.as_ref(), n_columns).await;
+        for seq in 0..n_segments {
+            publish_logs_segment_many_columns(store.as_ref(), seq as u64, 10, n_columns, rows)
+                .await;
+        }
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(ceiling);
+
+        reset_column_stats_concat_calls_for_test();
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("an over-ceiling part degrades rather than refusing");
+        assert_eq!(
+            report.column_stats_dictionaries_dropped, 1500,
+            "exactly the 1500 pairs in the last 75 segments are dropped"
+        );
+        assert_eq!(
+            column_stats_concat_calls_for_test(),
+            2,
+            "the degrade loop measures the whole part's body exactly twice \
+             (once before the drop loop, once after) no matter how many \
+             drops it takes -- not once per drop"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        let stats_ref = head.parts[0].column_stats.clone().expect("v3 ref");
+        let got = store
+            .get(&stats_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let limits = crate::snapshot_format::ColumnStatsLimits {
+            max_column_stats_bytes: ceiling,
+        };
+        snapshot_format::decode_column_stats(&got.data, &limits)
+            .expect("the degraded object decodes under the injected ceiling");
     }
 
     /// Issue #1482 finding 2: a v3 object keyed by the PART's own hash
