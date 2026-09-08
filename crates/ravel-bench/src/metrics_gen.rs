@@ -418,8 +418,7 @@ impl<'a> Generator<'a> {
     /// therefore the union of every (family, epoch) value range, not a sum
     /// (would double-count overlaps) and not a per-family max (would miss
     /// values a later epoch adds beyond another family's range).
-    pub fn scaling_label_cardinality(&self, steps: usize) -> u64 {
-        let steps = steps as u64;
+    pub fn scaling_label_cardinality(&self, steps: u64) -> u64 {
         let epochs = self.epochs_spanned(steps);
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for plan in &self.plans {
@@ -1834,7 +1833,7 @@ mod tests {
              (see derivation above): {distinct_instances:?}"
         );
         assert_eq!(
-            generator.scaling_label_cardinality(STEPS as usize),
+            generator.scaling_label_cardinality(STEPS),
             distinct_instances.len() as u64,
             "scaling_label_cardinality must equal the generator's own distinct emitted values"
         );
