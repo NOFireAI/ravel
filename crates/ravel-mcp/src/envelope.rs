@@ -80,14 +80,69 @@ const MIN_CELL_BUDGET: usize = 256;
 /// termination is a property of the loop, not of the shrink step.
 const MAX_SHORTEN_PASSES: usize = 16;
 
+/// Largest a hex id may be, in characters: a 32-byte trace id is 64
+/// characters of hex, the widest id any signal carries. D4 states a hex id
+/// never exceeds 64 B, and [`HexId`] is what makes that true of every value
+/// that reaches an envelope.
+pub const MAX_HEX_ID_LEN: usize = 64;
+
+/// Why a string is not a hex id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum HexIdError {
+    /// Longer than [`MAX_HEX_ID_LEN`] characters.
+    #[error("hex id length {len} exceeds the {max}-character cap")]
+    TooLong { len: usize, max: usize },
+    /// Not lowercase hex. Reports the first offending character, which is one
+    /// the caller supplied.
+    #[error("hex id contains {found:?}, which is not lowercase hex")]
+    NotLowercaseHex { found: char },
+}
+
+/// The payload of a [`Cell::HexId`]: at most [`MAX_HEX_ID_LEN`] characters of
+/// lowercase hex, checked once at construction.
+///
+/// The bound is a construction-time invariant and not a `fit`-time cut
+/// because [`Envelope::fit`] skips hex id cells: D4 lists them with the
+/// booleans and the numbers as cells small enough that shortening one is
+/// never what makes an envelope fit. That skip is only sound if no oversized
+/// hex id can exist, so the inner string is private and [`HexId::new`] is the
+/// one way to make one. A `Cell::HexId(String)` variant, or a
+/// `From<String>`, would leave `fit` skipping a cell of unbounded size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HexId(String);
+
+impl HexId {
+    /// Checks the length and the alphabet, and returns a typed error rather
+    /// than a silently cut or lossy value.
+    pub fn new(id: impl Into<String>) -> Result<HexId, HexIdError> {
+        let id = id.into();
+        // Every accepted character is one ASCII byte, so `chars().count()`
+        // and the byte length agree and either bound is the other.
+        if id.len() > MAX_HEX_ID_LEN {
+            return Err(HexIdError::TooLong {
+                len: id.len(),
+                max: MAX_HEX_ID_LEN,
+            });
+        }
+        if let Some(found) = id.chars().find(|c| !matches!(c, '0'..='9' | 'a'..='f')) {
+            return Err(HexIdError::NotLowercaseHex { found });
+        }
+        Ok(HexId(id))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Byte-serialized cell payload of one table row. Every variant follows the
 /// D4 precision rules: [`Cell::Int`] and [`Cell::Timestamp`] serialize as
 /// JSON strings (nanosecond epochs exceed 2^53); [`Cell::Float`] follows
-/// `float_to_json`; [`Cell::HexId`] is a hex string and, like `Bool`, `Int`,
-/// and `Timestamp`, never exceeds 64 B and is never shortened by
-/// [`Envelope::fit`]; [`Cell::Map`] serializes as a JSON object when it fits
-/// under the per-cell budget, and is re-serialized to truncated JSON text
-/// (as a string) only when it does not.
+/// `float_to_json`; [`Cell::HexId`] is a hex string bounded at construction
+/// (see [`HexId`]) and, like `Bool`, `Int`, and `Timestamp`, never exceeds
+/// 64 B and is never shortened by [`Envelope::fit`]; [`Cell::Map`] serializes
+/// as a JSON object when it fits under the per-cell budget, and is
+/// re-serialized to truncated JSON text (as a string) only when it does not.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
     Null,
@@ -95,12 +150,18 @@ pub enum Cell {
     Int(i64),
     Timestamp(i64),
     Float(f64),
-    HexId(String),
+    HexId(HexId),
     Str(String),
     Map(Map<String, Value>),
 }
 
 impl Cell {
+    /// Builds a [`Cell::HexId`], refusing anything [`HexId::new`] refuses.
+    /// This is the only way to construct the variant.
+    pub fn hex_id(id: impl Into<String>) -> Result<Cell, HexIdError> {
+        Ok(Cell::HexId(HexId::new(id)?))
+    }
+
     fn to_value(&self) -> Value {
         match self {
             Cell::Null => Value::Null,
@@ -108,7 +169,7 @@ impl Cell {
             Cell::Int(n) => Value::String(n.to_string()),
             Cell::Timestamp(n) => Value::String(n.to_string()),
             Cell::Float(f) => float_to_json(*f),
-            Cell::HexId(s) => Value::String(s.clone()),
+            Cell::HexId(id) => Value::String(id.0.clone()),
             Cell::Str(s) => Value::String(s.clone()),
             Cell::Map(m) => Value::Object(m.clone()),
         }
@@ -538,9 +599,10 @@ fn truncate_to_budget(s: &str, budget: usize) -> String {
 /// budget including the trailing marker; a map cell over budget is serialized
 /// to JSON text first, then cut the same way and returned as a string.
 /// Numbers, timestamps, booleans, and hex ids never exceed 64 B and are left
-/// untouched. Every comparison is against the cell's serialized size, so an
-/// escape-heavy cell is sized by what goes on the wire. Returns the count of
-/// cells actually shortened.
+/// untouched -- for hex ids that holds because [`HexId::new`] is the only way
+/// to build one and refuses anything longer. Every comparison is against the
+/// cell's serialized size, so an escape-heavy cell is sized by what goes on
+/// the wire. Returns the count of cells actually shortened.
 fn shorten_row(row: &mut Row, budget_per_cell: usize) -> u64 {
     let mut truncated = 0u64;
     for cell in row.iter_mut() {
@@ -558,7 +620,15 @@ fn shorten_row(row: &mut Row, budget_per_cell: usize) -> u64 {
                 }
                 text
             }
-            _ => continue,
+            // Null, Bool, Int, Timestamp, Float, and HexId are all bounded
+            // by their own types at 64 B or less, so there is nothing here a
+            // cut could reclaim.
+            Cell::Null
+            | Cell::Bool(_)
+            | Cell::Int(_)
+            | Cell::Timestamp(_)
+            | Cell::Float(_)
+            | Cell::HexId(_) => continue,
         };
         *cell = Cell::Str(truncate_to_budget(&text, budget_per_cell));
         truncated += 1;
@@ -869,6 +939,14 @@ mod tests {
     /// The whole envelope's exact serialized size for those same three cases.
     const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 262_138;
 
+    /// Serialized size of a 200-row page of one hex id column, every id at
+    /// the 64-character bound: 13,801 B of rows (200 cells of 68 B, their
+    /// commas, and the array brackets) plus 867 B of envelope fields, far
+    /// under the 256 KiB floor. Pinned so a hex id that grew past its bound
+    /// shows up here as a size change rather than as a cell `fit` silently
+    /// skipped.
+    const HEX_ID_PAGE_SERIALIZED_LEN: usize = 14_668;
+
     /// Serialized size of a zero-row envelope with every metadata field at
     /// both its D4 bounds: the largest fixed part the bounds permit. The ADR
     /// requires this to be under 106,496 B, which is what leaves a retained
@@ -1012,6 +1090,68 @@ mod tests {
             size <= MAX_RESPONSE_BYTES_FLOOR as usize,
             "serialized size {size} exceeds cap {MAX_RESPONSE_BYTES_FLOOR}"
         );
+    }
+
+    /// A hex id is bounded at construction rather than cut at `fit` time, so
+    /// anything over 64 characters is refused with a typed error and never
+    /// becomes a cell. The alphabet is checked too: an uppercase or non-hex
+    /// character is not a hex id, and admitting one would leave the 64 B
+    /// claim resting on what the caller happened to pass.
+    #[test]
+    fn hex_id_longer_than_64_bytes_is_refused() {
+        assert_eq!(MAX_HEX_ID_LEN, 64);
+        let at_bound = "a".repeat(MAX_HEX_ID_LEN);
+        let id = HexId::new(at_bound.clone()).expect("64 characters of hex is a hex id");
+        assert_eq!(id.as_str(), at_bound);
+        assert_eq!(serialized_str_len(id.as_str()), 66);
+
+        assert_eq!(
+            HexId::new("a".repeat(MAX_HEX_ID_LEN + 1)),
+            Err(HexIdError::TooLong { len: 65, max: 64 })
+        );
+        assert_eq!(
+            Cell::hex_id("f".repeat(1024 * 1024)),
+            Err(HexIdError::TooLong {
+                len: 1_048_576,
+                max: 64,
+            })
+        );
+        assert_eq!(
+            HexId::new("00ab7F"),
+            Err(HexIdError::NotLowercaseHex { found: 'F' })
+        );
+        assert_eq!(
+            HexId::new("00ab 7f"),
+            Err(HexIdError::NotLowercaseHex { found: ' ' })
+        );
+        assert_eq!(
+            HexId::new("00ab\n7f"),
+            Err(HexIdError::NotLowercaseHex { found: '\n' })
+        );
+    }
+
+    /// `fit` skipping hex id cells is sound only because no oversized hex id
+    /// can exist: through the public API there is no path from a hostile
+    /// 1 MiB "id" to a cell, and a full 200-row page of hex ids at the bound
+    /// stays under the floor cap with nothing dropped and nothing cut.
+    #[test]
+    fn oversized_hex_id_cannot_reach_the_envelope() {
+        let hostile = "b".repeat(1024 * 1024);
+        assert!(
+            Cell::hex_id(hostile).is_err(),
+            "no cell may carry an oversized hex id"
+        );
+
+        let maximal = Cell::hex_id("c".repeat(MAX_HEX_ID_LEN)).expect("at the bound");
+        let envelope = envelope_with_rows(200, |_| vec![maximal.clone()]);
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.data.rows.len(), 200);
+        assert_eq!(fitted.presentation.rows_omitted, 0);
+        assert_eq!(fitted.presentation.cells_truncated, 0);
+        assert!(!fitted.presentation.bytes_cap_hit);
+        assert_eq!(serialized_len(&fitted), HEX_ID_PAGE_SERIALIZED_LEN);
     }
 
     /// A warning over its 512 B per-entry bound is cut to exactly the bound
