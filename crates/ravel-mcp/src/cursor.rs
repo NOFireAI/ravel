@@ -30,6 +30,41 @@
 //! code MUST call [`Cursor::redeem`] (or [`EvidenceRef::redeem`]), never
 //! [`Cursor::decode`] directly, so the tenant check happens on every call.
 //!
+//! # A token is bound to the call that minted it
+//!
+//! The tenant is not the only thing a token is scoped to. [`Cursor::redeem`]
+//! also takes the redeeming call's tool name and argument hash, and refuses a
+//! mismatch as [`CursorError::Invalid`] -- the same variant, and therefore the
+//! same message, a forged token produces. Without that check the two fields
+//! are decoration: a `ravel_search_logs` cursor could be handed to
+//! `ravel_query_promql`, or the same cursor replayed against a different
+//! predicate set, and page 2 would answer against page 1's pinned snapshot
+//! under arguments that snapshot was never planned for.
+//!
+//! # A foreign token is `Expired`, a tampered one is `Invalid`
+//!
+//! Every token carries a process nonce in the clear, ahead of the MAC'd body:
+//! [`process_nonce`] is a keyed BLAKE3 tag over a fixed context string, so it
+//! commits to the process-local [`CursorKey`] without revealing it. Decode
+//! compares it before it verifies the MAC, which is what separates the two
+//! outcomes a client can actually act on: a token minted by a process that
+//! has since restarted (a different key, hence a different nonce) is
+//! [`CursorError::Expired`], the honest answer for a token whose pinned
+//! snapshot no longer exists anywhere, while a token tampered with under this
+//! process's own key stays [`CursorError::Invalid`]. Without the nonce both
+//! collapse into `Invalid`, and a client cannot tell "restart, mint a fresh
+//! page" from "this token is corrupt". The nonce is also inside the MAC'd
+//! region, so swapping it cannot forge anything: the worst a caller can do by
+//! editing it is force its own token to read as expired.
+//!
+//! # The wire length cap
+//!
+//! Both codecs refuse a token longer than [`MAX_TOKEN_BYTES`] before they
+//! base64-decode it, with the typed [`CursorError::TokenTooLong`]. The cap is
+//! not a third D5 decode outcome: it is a resource guard on the one input a
+//! caller controls the size of, and it reports back only the length the caller
+//! itself sent.
+//!
 //! # Deviation from the wire field name `sha256`
 //!
 //! ADR-1374's evidence-reference shape names a `sha256` field. This crate has
@@ -66,15 +101,36 @@ pub const CURSOR_KEY_LEN: usize = 32;
 pub type CursorKey = [u8; CURSOR_KEY_LEN];
 
 const CURSOR_MAGIC: [u8; 4] = *b"RMC1";
-/// Version 2 pins each segment as a whole `ravel_sql::SegmentPin` (all 15
+/// Version 2 pinned each segment as a whole `ravel_sql::SegmentPin` (all 15
 /// fields, through that crate's own codec) instead of the five-field local
-/// projection version 1 carried. A version 1 token decodes as
+/// projection version 1 carried; version 3 adds the plaintext process nonce
+/// after the version byte. A token of any earlier version decodes as
 /// [`CursorError::Invalid`] like any other unsupported version, which is
 /// correct and costs nothing: these tokens are process-local and
 /// deadline-bounded, so none survives the deploy that changes the number.
-const CURSOR_VERSION: u8 = 2;
+const CURSOR_VERSION: u8 = 3;
 const EVIDENCE_MAGIC: [u8; 4] = *b"RME1";
-const EVIDENCE_VERSION: u8 = 1;
+/// Version 2 adds the same plaintext process nonce [`CURSOR_VERSION`] 3 does.
+const EVIDENCE_VERSION: u8 = 2;
+
+/// Length in bytes of the plaintext process nonce both tokens carry directly
+/// after their version byte.
+const NONCE_LEN: usize = 8;
+
+/// Bytes both codecs read in the clear before they verify anything: the
+/// 4-byte magic, the version byte, and the process nonce.
+const HEADER_LEN: usize = 4 + 1 + NONCE_LEN;
+
+/// Domain-separation context for [`process_nonce`], so the nonce a token
+/// carries in the clear can never collide with a MAC tag over token bytes.
+const NONCE_CONTEXT: &[u8] = b"ravel-mcp cursor process nonce v1";
+
+/// Largest wire token, in base64url characters, either codec will look at.
+/// 1 MiB of base64url decodes to at most 786,432 payload bytes, which at the
+/// ~250 B one segment pin costs is roughly 3,000 pinned segments: far above
+/// any real snapshot, and a bound on what a caller can make this process
+/// allocate from one token.
+pub const MAX_TOKEN_BYTES: usize = 1024 * 1024;
 
 /// Typed failure for both [`Cursor`] and [`EvidenceRef`]. The two decode
 /// outcomes are the ones ADR-1374 D5 names, and they stay
@@ -82,20 +138,28 @@ const EVIDENCE_VERSION: u8 = 1;
 /// wrong-tenant token is [`CursorError::Invalid`], so a caller cannot
 /// distinguish "not yours" from "corrupt", and only a structurally valid,
 /// correctly-tenanted token past its deadline is [`CursorError::Expired`].
-/// [`CursorError::FieldTooLong`] is not a third decode outcome: it is a
-/// length that does not fit the wire layout at all, and a caller that hits it
-/// is never a client holding a token.
+/// Neither [`CursorError::FieldTooLong`] nor [`CursorError::TokenTooLong`] is
+/// a third decode outcome: the first is a length that does not fit the wire
+/// layout at all (a mint-time refusal), and the second is a resource guard
+/// that reports back only the length the caller itself sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CursorError {
     /// The token is malformed, truncated, tampered with (MAC mismatch), an
-    /// unsupported version, or minted for a different tenant than the caller
-    /// resolves to.
+    /// unsupported version, or minted for a different tenant, tool, or
+    /// argument set than the redeeming call.
     #[error("cursor is invalid")]
     Invalid,
     /// The token is structurally valid and tenant-correct but its
-    /// `deadline_ns` has passed.
+    /// `deadline_ns` has passed, or it was minted by a process whose key no
+    /// longer exists (a nonce mismatch), which puts its pinned snapshot just
+    /// as far out of reach.
     #[error("cursor has expired")]
     Expired,
+    /// The wire token is longer than [`MAX_TOKEN_BYTES`], refused before it is
+    /// base64-decoded or allocated. Reports the length the caller sent, which
+    /// the caller already knows.
+    #[error("cursor token length {len} exceeds the {max}-byte cap")]
+    TokenTooLong { len: usize, max: usize },
     /// A length the wire layout cannot carry: at mint time a field longer
     /// than the `u32` its length prefix is written as. Never returned for a
     /// token a client could hold, which is why it is not one of the two D5
@@ -163,6 +227,7 @@ impl Cursor {
         let mut buf = Vec::new();
         buf.extend_from_slice(&CURSOR_MAGIC);
         buf.push(CURSOR_VERSION);
+        buf.extend_from_slice(&process_nonce(key));
         buf.extend_from_slice(&self.tenant.0);
         write_len_prefixed(&mut buf, self.tool.as_bytes())?;
         buf.extend_from_slice(&self.argument_hash);
@@ -209,30 +274,16 @@ impl Cursor {
         Ok(URL_SAFE_NO_PAD.encode(buf))
     }
 
-    /// Decode and MAC-verify a wire token. Does NOT check the tenant field
-    /// against a caller's resolved tenant -- that is [`Cursor::redeem`]'s job.
-    /// Every malformed, truncated, or tampered input is
-    /// [`CursorError::Invalid`], never a panic.
+    /// Decode and MAC-verify a wire token. Does NOT check the tenant, tool, or
+    /// argument hash against the redeeming call -- that is [`Cursor::redeem`]'s
+    /// job. Every malformed, truncated, or tampered input is
+    /// [`CursorError::Invalid`], never a panic; a token from another process is
+    /// [`CursorError::Expired`], and one over [`MAX_TOKEN_BYTES`] is
+    /// [`CursorError::TokenTooLong`].
     pub fn decode(token: &str, key: &CursorKey) -> Result<Cursor, CursorError> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(token)
-            .map_err(|_| CursorError::Invalid)?;
-        if bytes.len() < MAC_LEN {
-            return Err(CursorError::Invalid);
-        }
-        let split = bytes.len() - MAC_LEN;
-        let (payload, stored) = bytes.split_at(split);
-        if !ct_eq(&mac(key, payload), stored) {
-            return Err(CursorError::Invalid);
-        }
+        let body = open_token(token, key, CURSOR_MAGIC, CURSOR_VERSION)?;
 
-        let mut cur = ByteReader::new(payload);
-        if cur.read_array::<4>()? != CURSOR_MAGIC {
-            return Err(CursorError::Invalid);
-        }
-        if cur.read_u8()? != CURSOR_VERSION {
-            return Err(CursorError::Invalid);
-        }
+        let mut cur = ByteReader::new(&body);
         let tenant = TenantHash(cur.read_array::<16>()?);
         let tool = read_string(&mut cur)?;
         let argument_hash = cur.read_array::<32>()?;
@@ -301,20 +352,32 @@ impl Cursor {
         })
     }
 
-    /// Decode, verify the MAC, check the tenant against `caller_tenant`, and
-    /// check the deadline against `now_ns` -- the full redemption sequence
-    /// every call site MUST use instead of [`Cursor::decode`]. A tenant
-    /// mismatch decodes as [`CursorError::Invalid`], identically to
-    /// corruption (the D5 wrong-tenant rule): no separate signal is ever
-    /// returned for "this cursor belongs to someone else."
+    /// Decode, verify the MAC, bind the token to the redeeming call, and check
+    /// the deadline against `now_ns` -- the full redemption sequence every
+    /// call site MUST use instead of [`Cursor::decode`].
+    ///
+    /// The token must have been minted for `caller_tenant`, for `tool`, and
+    /// for `argument_hash`. Any of those three mismatching is
+    /// [`CursorError::Invalid`], identically to corruption (the D5
+    /// wrong-tenant rule extended to the other two bindings): no separate
+    /// signal is ever returned for "this cursor belongs to someone else", to
+    /// another tool, or to another argument set.
     pub fn redeem(
         token: &str,
         key: &CursorKey,
         caller_tenant: TenantHash,
+        tool: &str,
+        argument_hash: &[u8; 32],
         now_ns: i64,
     ) -> Result<Cursor, CursorError> {
         let cursor = Self::decode(token, key)?;
         if cursor.tenant != caller_tenant {
+            return Err(CursorError::Invalid);
+        }
+        if cursor.tool != tool {
+            return Err(CursorError::Invalid);
+        }
+        if !ct_eq(&cursor.argument_hash, argument_hash) {
             return Err(CursorError::Invalid);
         }
         if now_ns >= cursor.deadline_ns {
@@ -331,6 +394,7 @@ impl EvidenceRef {
         let mut buf = Vec::new();
         buf.extend_from_slice(&EVIDENCE_MAGIC);
         buf.push(EVIDENCE_VERSION);
+        buf.extend_from_slice(&process_nonce(key));
         buf.extend_from_slice(&self.tenant.0);
         write_len_prefixed(&mut buf, self.tool.as_bytes())?;
         buf.extend_from_slice(&self.sha256);
@@ -342,26 +406,11 @@ impl EvidenceRef {
         Ok(URL_SAFE_NO_PAD.encode(buf))
     }
 
+    /// See [`Cursor::decode`], including the nonce and length-cap outcomes.
     pub fn decode(token: &str, key: &CursorKey) -> Result<EvidenceRef, CursorError> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(token)
-            .map_err(|_| CursorError::Invalid)?;
-        if bytes.len() < MAC_LEN {
-            return Err(CursorError::Invalid);
-        }
-        let split = bytes.len() - MAC_LEN;
-        let (payload, stored) = bytes.split_at(split);
-        if !ct_eq(&mac(key, payload), stored) {
-            return Err(CursorError::Invalid);
-        }
+        let body = open_token(token, key, EVIDENCE_MAGIC, EVIDENCE_VERSION)?;
 
-        let mut cur = ByteReader::new(payload);
-        if cur.read_array::<4>()? != EVIDENCE_MAGIC {
-            return Err(CursorError::Invalid);
-        }
-        if cur.read_u8()? != EVIDENCE_VERSION {
-            return Err(CursorError::Invalid);
-        }
+        let mut cur = ByteReader::new(&body);
         let tenant = TenantHash(cur.read_array::<16>()?);
         let tool = read_string(&mut cur)?;
         let sha256 = cur.read_array::<32>()?;
@@ -381,15 +430,22 @@ impl EvidenceRef {
         })
     }
 
-    /// See [`Cursor::redeem`]: same wrong-tenant-decodes-as-Invalid rule.
+    /// See [`Cursor::redeem`]: same wrong-tenant-decodes-as-Invalid rule, and
+    /// the same binding to the redeeming `tool`. An evidence reference carries
+    /// no argument hash (it pins one row, not a query), so the tool name is
+    /// the whole call binding here.
     pub fn redeem(
         token: &str,
         key: &CursorKey,
         caller_tenant: TenantHash,
+        tool: &str,
         now_ns: i64,
     ) -> Result<EvidenceRef, CursorError> {
         let evidence = Self::decode(token, key)?;
         if evidence.tenant != caller_tenant {
+            return Err(CursorError::Invalid);
+        }
+        if evidence.tool != tool {
             return Err(CursorError::Invalid);
         }
         if now_ns >= evidence.deadline_ns {
@@ -397,6 +453,72 @@ impl EvidenceRef {
         }
         Ok(evidence)
     }
+}
+
+/// Checks the length cap, base64-decodes, checks magic and version, compares
+/// the plaintext process nonce, verifies the MAC, and returns the body after
+/// the header.
+///
+/// The nonce comparison sits before the MAC check on purpose: a token minted
+/// under another process's key fails both, and the nonce is what lets this
+/// report [`CursorError::Expired`] (the snapshot is gone with the process that
+/// pinned it) rather than the [`CursorError::Invalid`] a tampered token gets.
+/// The MAC still covers the nonce, so editing it forges nothing.
+fn open_token(
+    token: &str,
+    key: &CursorKey,
+    magic: [u8; 4],
+    version: u8,
+) -> Result<Vec<u8>, CursorError> {
+    if token.len() > MAX_TOKEN_BYTES {
+        return Err(CursorError::TokenTooLong {
+            len: token.len(),
+            max: MAX_TOKEN_BYTES,
+        });
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| CursorError::Invalid)?;
+    if bytes.len() < HEADER_LEN + MAC_LEN {
+        return Err(CursorError::Invalid);
+    }
+
+    let mut head = ByteReader::new(&bytes);
+    if head.read_array::<4>()? != magic {
+        return Err(CursorError::Invalid);
+    }
+    if head.read_u8()? != version {
+        return Err(CursorError::Invalid);
+    }
+    if head.read_array::<NONCE_LEN>()? != process_nonce(key) {
+        return Err(CursorError::Expired);
+    }
+
+    let split = bytes.len().saturating_sub(MAC_LEN);
+    let (payload, stored) = bytes.split_at(split);
+    if !ct_eq(&mac(key, payload), stored) {
+        return Err(CursorError::Invalid);
+    }
+    Ok(payload
+        .get(HEADER_LEN..)
+        .ok_or(CursorError::Invalid)?
+        .to_vec())
+}
+
+/// The plaintext nonce every token carries: a keyed BLAKE3 tag over a fixed
+/// context string.
+///
+/// It is a commitment to the process-local [`CursorKey`], not a secret and not
+/// a second MAC. Deriving it from the key rather than from an entropy source
+/// is what makes it a process nonce with no clock and no randomness in library
+/// code: the key is minted once per process, so a restart changes the nonce,
+/// and BLAKE3's keyed hash is a PRF, so publishing this tag reveals nothing
+/// about the key.
+fn process_nonce(key: &CursorKey) -> [u8; NONCE_LEN] {
+    let tag = blake3::keyed_hash(key, NONCE_CONTEXT);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&tag.as_bytes()[..NONCE_LEN]);
+    nonce
 }
 
 fn declared_type_tag(ty: DeclaredType) -> u8 {
@@ -544,8 +666,31 @@ mod tests {
 
     use super::*;
 
+    /// The tool and argument hash every sample token below is minted for, and
+    /// a time inside its deadline. Redemption binds all three, so the tests
+    /// name them once instead of repeating literals that must agree.
+    const SAMPLE_TOOL: &str = "ravel_search_logs";
+    const SAMPLE_ARGS: [u8; 32] = [9u8; 32];
+    const NOW_NS: i64 = 1_700_000_000_500_000_000;
+
     fn test_key() -> CursorKey {
         [0x11u8; CURSOR_KEY_LEN]
+    }
+
+    /// Re-signs mutated token bytes with `key`, so the decode failure a test
+    /// asserts on is attributable to the field it edited rather than to the
+    /// MAC check that would otherwise fire first. The nonce is unchanged, so
+    /// the re-minted token is one this process would accept but for the edit.
+    fn remint(mut bytes: Vec<u8>, key: &CursorKey) -> String {
+        let split = bytes.len().saturating_sub(MAC_LEN);
+        bytes.truncate(split);
+        let tag = mac(key, &bytes);
+        bytes.extend_from_slice(&tag);
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn token_bytes(token: &str) -> Vec<u8> {
+        URL_SAFE_NO_PAD.decode(token).expect("decode base64")
     }
 
     /// A pin with every one of its 15 fields set to a distinct non-default
@@ -574,11 +719,21 @@ mod tests {
         }
     }
 
+    fn sample_evidence(tenant: TenantHash) -> EvidenceRef {
+        EvidenceRef {
+            tenant,
+            tool: SAMPLE_TOOL.to_owned(),
+            sha256: [0x8Au8; 32],
+            mint_ns: 1_700_000_000_000_000_000,
+            deadline_ns: 1_700_000_030_000_000_000,
+        }
+    }
+
     fn sample_cursor(tenant: TenantHash) -> Cursor {
         Cursor {
             tenant,
-            tool: "ravel_search_logs".to_owned(),
-            argument_hash: [9u8; 32],
+            tool: SAMPLE_TOOL.to_owned(),
+            argument_hash: SAMPLE_ARGS,
             segments: vec![SegmentPin {
                 data_object_key: "t/aa/logs/l0/0000/w.1.2.abc.rseg".to_owned(),
                 object_size: 65_536,
@@ -620,7 +775,7 @@ mod tests {
         let key = test_key();
         let token = sample_cursor(tenant_a).encode(&key).expect("encodes");
 
-        let err = Cursor::redeem(&token, &key, tenant_b, 1_700_000_000_500_000_000)
+        let err = Cursor::redeem(&token, &key, tenant_b, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
             .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
@@ -633,12 +788,45 @@ mod tests {
         let key = test_key();
         let token = sample_cursor(tenant).encode(&key).expect("encodes");
 
-        let mut bytes = URL_SAFE_NO_PAD.decode(&token).expect("decode base64");
+        let mut bytes = token_bytes(&token);
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         let tampered = URL_SAFE_NO_PAD.encode(bytes);
 
-        let err = Cursor::redeem(&tampered, &key, tenant, 1_700_000_000_500_000_000)
+        let err = Cursor::redeem(&tampered, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// The MAC covers the payload, not just the tag: a byte flipped INSIDE the
+    /// MAC'd region is `Invalid` too. Flipping only the tag would pass on a
+    /// codec that MAC'd nothing but itself.
+    ///
+    /// The byte edited belongs to a pinned segment's object key, which is the
+    /// one thing a forger would actually want to change and which nothing
+    /// downstream re-checks: editing the tenant, tool, or argument hash would
+    /// be refused a second time by the bindings in `redeem`, and the assertion
+    /// would hold even with no MAC at all.
+    #[test]
+    fn tampered_payload_byte_is_cursor_invalid() {
+        let tenant = TenantHash([0x42u8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+
+        let mut bytes = token_bytes(&token);
+        let needle = b"t/aa/logs/l0/0000/w.1.2.abc.rseg";
+        let at = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("the pinned object key is in the payload");
+        assert!(
+            at > HEADER_LEN && at < bytes.len() - MAC_LEN,
+            "must edit inside the MAC'd payload"
+        );
+        bytes[at] ^= 0x20;
+        let tampered = URL_SAFE_NO_PAD.encode(bytes);
+
+        let err = Cursor::redeem(&tampered, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
             .expect_err("must be refused");
         assert_eq!(err, CursorError::Invalid);
     }
@@ -653,7 +841,7 @@ mod tests {
         let deadline = cursor.deadline_ns;
         let token = cursor.encode(&key).expect("encodes");
 
-        let err = Cursor::redeem(&token, &key, tenant, deadline)
+        let err = Cursor::redeem(&token, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, deadline)
             .expect_err("must be expired at exactly the deadline");
         assert_eq!(err, CursorError::Expired);
     }
@@ -671,12 +859,244 @@ mod tests {
         cursor.segments = vec![pin.clone(), every_field_pin()];
 
         let token = cursor.encode(&key).expect("encodes");
-        let decoded = Cursor::redeem(&token, &key, tenant, 1_700_000_000_500_000_000)
+        let decoded = Cursor::redeem(&token, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
             .expect("round-trips through its own codec");
 
         assert_eq!(decoded.segments.len(), 2);
         assert_eq!(decoded.segments[0], pin);
         assert_eq!(decoded.segments[1], pin);
         assert_eq!(decoded, cursor);
+    }
+
+    /// A cursor is bound to the tool that minted it: handing a
+    /// `ravel_search_logs` cursor to `ravel_query_promql` is `Invalid`, the
+    /// same variant (and therefore the same message) a forged token gets.
+    #[test]
+    fn cursor_redeemed_by_another_tool_is_refused() {
+        let tenant = TenantHash([0x3Au8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+
+        let err = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            "ravel_query_promql",
+            &SAMPLE_ARGS,
+            NOW_NS,
+        )
+        .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+        assert_eq!(err.to_string(), CursorError::Invalid.to_string());
+    }
+
+    /// And to the arguments that minted it: replaying page 1's cursor under a
+    /// different predicate set would answer the new question against the old
+    /// question's pinned snapshot. One flipped bit in the hash is enough.
+    #[test]
+    fn cursor_redeemed_with_other_arguments_is_refused() {
+        let tenant = TenantHash([0x3Bu8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+
+        let mut other = SAMPLE_ARGS;
+        other[31] ^= 0x01;
+        let err = Cursor::redeem(&token, &key, tenant, SAMPLE_TOOL, &other, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// A token minted under another process's key carries that process's
+    /// nonce, which decode compares before the MAC: the snapshot it pins died
+    /// with the process, so this is `Expired` and not `Invalid`. A client can
+    /// act on that (mint a fresh page) where `Invalid` tells it nothing.
+    #[test]
+    fn token_minted_by_another_process_is_cursor_expired() {
+        let tenant = TenantHash([0x6Du8; 16]);
+        let minting_key = test_key();
+        let redeeming_key: CursorKey = [0x22u8; CURSOR_KEY_LEN];
+        assert_ne!(
+            process_nonce(&minting_key),
+            process_nonce(&redeeming_key),
+            "two keys must produce two nonces"
+        );
+
+        let token = sample_cursor(tenant).encode(&minting_key).expect("encodes");
+        let err = Cursor::redeem(
+            &token,
+            &redeeming_key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+        )
+        .expect_err("must be refused");
+        assert_eq!(err, CursorError::Expired);
+
+        let evidence = sample_evidence(tenant)
+            .encode(&minting_key)
+            .expect("encodes");
+        let err = EvidenceRef::redeem(&evidence, &redeeming_key, tenant, SAMPLE_TOOL, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Expired);
+    }
+
+    /// The length cap is checked before the base64 decode, so an oversized
+    /// token is refused without allocating its payload. Exactly at the cap is
+    /// not refused by the cap (it fails later, as a malformed token), which is
+    /// what pins the comparison as `>` and not `>=`.
+    #[test]
+    fn oversized_token_is_refused_before_it_is_decoded() {
+        let tenant = TenantHash([0x1Fu8; 16]);
+        let key = test_key();
+
+        let over = "A".repeat(MAX_TOKEN_BYTES + 1);
+        let err = Cursor::redeem(&over, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(
+            err,
+            CursorError::TokenTooLong {
+                len: MAX_TOKEN_BYTES + 1,
+                max: MAX_TOKEN_BYTES,
+            }
+        );
+        assert_eq!(MAX_TOKEN_BYTES, 1024 * 1024);
+
+        let at_cap = "A".repeat(MAX_TOKEN_BYTES);
+        let err = Cursor::redeem(&at_cap, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// Truncation at any point is `Invalid`, never a panic and never a partial
+    /// decode: below the fixed header plus tag, and at half a real token. So
+    /// is the other direction, a token carrying bytes past the last field it
+    /// declares, which is re-MAC'd here so the trailing-bytes check is what
+    /// refuses it rather than the MAC.
+    #[test]
+    fn truncated_or_extended_token_is_cursor_invalid() {
+        let tenant = TenantHash([0x2Eu8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+        let bytes = token_bytes(&token);
+
+        for cut in [
+            0usize,
+            HEADER_LEN,
+            HEADER_LEN + MAC_LEN - 1,
+            bytes.len() / 2,
+            bytes.len() - 1,
+        ] {
+            let mut truncated = bytes.clone();
+            truncated.truncate(cut);
+            let token = URL_SAFE_NO_PAD.encode(truncated);
+            let err = Cursor::redeem(&token, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
+                .expect_err("a truncated token must be refused");
+            assert_eq!(err, CursorError::Invalid, "cut at {cut}");
+        }
+
+        let mut extended = bytes.clone();
+        let tag_at = extended.len() - MAC_LEN;
+        extended.insert(tag_at, 0x00);
+        let reminted = remint(extended, &key);
+        let err = Cursor::redeem(&reminted, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
+            .expect_err("a token with trailing bytes must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// The version byte is checked, so a token in the version 2 layout (a
+    /// whole-`SegmentPin` cursor without the process nonce) is `Invalid`
+    /// rather than parsed as if the nonce were tenant bytes. Re-MAC'd, so the
+    /// failure is the version check and not the MAC.
+    #[test]
+    fn wrong_version_token_is_cursor_invalid() {
+        let tenant = TenantHash([0x4Du8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+
+        let mut bytes = token_bytes(&token);
+        bytes[4] = CURSOR_VERSION - 1;
+        let reminted = remint(bytes, &key);
+
+        let err = Cursor::redeem(&reminted, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// The magic is checked, so an evidence reference cannot be redeemed as a
+    /// cursor even under this process's own key.
+    #[test]
+    fn wrong_magic_token_is_cursor_invalid() {
+        let tenant = TenantHash([0x5Du8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+
+        let mut bytes = token_bytes(&token);
+        bytes[..4].copy_from_slice(&EVIDENCE_MAGIC);
+        let reminted = remint(bytes, &key);
+
+        let err = Cursor::redeem(&reminted, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// A string field whose bytes are not UTF-8 is `Invalid`, not a lossy
+    /// decode and not a panic. 0xFF is never a valid UTF-8 leading byte.
+    ///
+    /// The field edited is a declared column key, not the tool name: a lossy
+    /// decode of the tool name would be caught a second time by the tool
+    /// binding in `redeem`, and the assertion would hold for the wrong reason.
+    /// Nothing downstream re-checks a column key.
+    #[test]
+    fn non_utf8_string_field_is_cursor_invalid() {
+        let tenant = TenantHash([0x7Eu8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+
+        let mut bytes = token_bytes(&token);
+        let needle = b"http.status_code";
+        let at = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("the declared column key is in the payload");
+        bytes[at] = 0xFF;
+        let reminted = remint(bytes, &key);
+
+        let err = Cursor::redeem(&reminted, &key, tenant, SAMPLE_TOOL, &SAMPLE_ARGS, NOW_NS)
+            .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// The evidence reference round-trips every field, and carries the same
+    /// bindings a cursor does: wrong tenant and wrong tool are `Invalid`, and
+    /// its own deadline is `Expired`.
+    #[test]
+    fn evidence_ref_round_trips_and_binds_its_call() {
+        let tenant = TenantHash([0x9Cu8; 16]);
+        let other = TenantHash([0x9Du8; 16]);
+        let key = test_key();
+        let evidence = sample_evidence(tenant);
+        let deadline = evidence.deadline_ns;
+        let token = evidence.encode(&key).expect("encodes");
+
+        let decoded = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, NOW_NS)
+            .expect("round-trips through its own codec");
+        assert_eq!(decoded, evidence);
+        assert_eq!(decoded.sha256, [0x8Au8; 32]);
+        assert_eq!(decoded.tool, SAMPLE_TOOL);
+        assert_eq!(decoded.mint_ns, 1_700_000_000_000_000_000);
+        assert_eq!(decoded.deadline_ns, deadline);
+
+        let err = EvidenceRef::redeem(&token, &key, other, SAMPLE_TOOL, NOW_NS)
+            .expect_err("wrong tenant must be refused");
+        assert_eq!(err, CursorError::Invalid);
+
+        let err = EvidenceRef::redeem(&token, &key, tenant, "ravel_get_trace", NOW_NS)
+            .expect_err("wrong tool must be refused");
+        assert_eq!(err, CursorError::Invalid);
+
+        let err = EvidenceRef::redeem(&token, &key, tenant, SAMPLE_TOOL, deadline)
+            .expect_err("must be expired at exactly the deadline");
+        assert_eq!(err, CursorError::Expired);
     }
 }
