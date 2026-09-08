@@ -37,6 +37,12 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Exhaustive model check
+        # State CI's resource choice rather than inheriting the script's
+        # laptop-safe default of 2 workers: `auto` is the previous behaviour
+        # on these dedicated runners, where claiming every core is fine and
+        # the default of 2 is too slow for the exhaustive budget.
+        env:
+          RAVEL_TLA_WORKERS: auto
         run: scripts/check-tla.sh exhaustive
       - name: Upload TLC logs on failure
         if: failure()

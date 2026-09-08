@@ -971,8 +971,8 @@ controls.
 ### Figures
 
 Every figure below is from a run recorded in this session. All lanes ran with
-`scripts/check-tla.sh`, which invokes TLC with `-workers auto` on this
-16-core host; the scratch probes ran with `-workers 2 -Xmx2g`.
+`scripts/check-tla.sh`, which ran with `-workers auto`, the harness default at
+the time, on this 16-core host; the scratch probes ran with `-workers 2 -Xmx2g`.
 
 | config | spec | result | states generated | distinct | depth | wall |
 |---|---|---|---|---|---|---|

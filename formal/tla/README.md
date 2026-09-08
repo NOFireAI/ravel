@@ -70,15 +70,19 @@ later if TERM was ignored. Either way the run is reported as a timeout, not
 left running and not read as a pass. CI runs on Ubuntu, which ships GNU
 `timeout`, so it needs no extra setup.
 
-TLC's worker count and JVM heap cap are fixed, not left to `-workers auto`
-(which claims every core on the host) or an uncapped `-Xmx`:
-`RAVEL_TLA_WORKERS` (default `2`) and `RAVEL_TLA_XMX` (default `2g`) control
-them. Both are validated before any model runs -- `RAVEL_TLA_WORKERS` must
-be a positive integer and `RAVEL_TLA_XMX` must match the JVM's `-Xmx`
-grammar (digits then `k`, `m`, or `g`) -- and a bad value exits 2 with a
-one-line refusal rather than reaching TLC as a silently wrong flag. The
-resolved values are printed once per run (`check-tla: resources:
-workers=<n> xmx=<size>`), next to the figures they produced.
+TLC's worker count and JVM heap cap default to small, laptop-safe values
+rather than `-workers auto` (which claims every core on the host) or an
+uncapped `-Xmx`: `RAVEL_TLA_WORKERS` (default `2`) and `RAVEL_TLA_XMX`
+(default `2g`) control them. CI overrides `RAVEL_TLA_WORKERS` to `auto` on
+its dedicated runners, where claiming every core is fine and the default of
+`2` is too slow for the budget. Both are validated before any model runs --
+`RAVEL_TLA_WORKERS` must be `auto` or a positive integer, and
+`RAVEL_TLA_XMX` must be digits then `k`, `m`, or `g` for a nonzero size (not
+the full JVM `-Xmx` grammar, so `2048` and `1t` are rejected even though the
+JVM accepts them) -- and a bad value exits 2 with a one-line refusal rather
+than reaching TLC as a silently wrong flag. An empty or unset value takes
+the default. The resolved values are printed once per run (`check-tla:
+resources: workers=<n> xmx=<size>`), next to the figures they produced.
 
 ```sh
 scripts/check-tla.sh smoke            # fast safety, every area (budget 300s/cfg)
@@ -123,10 +127,12 @@ model-check run truncates and rewrites `.cache/tla/last-run.tsv`, one row per
 config:
 
 ```
-run-id  area  cfg  states  distinct  depth  seconds  result
+run-id  area  cfg  states  distinct  depth  seconds  workers  xmx  result
 ```
 
-`run-id` is a UTC timestamp joined to the working tree hash
+`workers` and `xmx` are the resolved `RAVEL_TLA_WORKERS` / `RAVEL_TLA_XMX`
+that produced the row, so the artifact carries the configuration alongside
+the figures. `run-id` is a UTC timestamp joined to the working tree hash
 (`git rev-parse HEAD^{tree}`), so a row names the exact source it measured.
 `result` is `PASS`, `FAIL`, `TIMEOUT`, `BAND` (a PASS run whose figures fell
 outside its band), or `VIOLATED` (a negative control that failed as intended).

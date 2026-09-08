@@ -242,11 +242,24 @@ jobs:
           # The job executes scripts/check-tla.sh from the PR itself; do not
           # leave the checkout token in .git/config for it to read.
           persist-credentials: false
+      # Self-test the harness's own resource-resolution and timeout logic
+      # before running any model. It drives shell functions only, needs no
+      # JVM and no TLC jar, so it runs here rather than in a compiling lane.
+      - name: check-tla.sh self-test
+        run: bash scripts/check-tla.test.sh
       - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
         with:
           distribution: temurin
           java-version: "21"
       - name: Fast lane (smoke, negatives, traceability)
+        # State CI's resource choice rather than inheriting the script's
+        # laptop-safe default of 2 workers: at workers=2 the
+        # maintenance/MCCompactionClaims smoke config timed out at the 300s
+        # budget on this runner class, where -workers auto finished in ~246s.
+        # `auto` is the previous behaviour on GitHub runners, where claiming
+        # every core is fine.
+        env:
+          RAVEL_TLA_WORKERS: auto
         run: scripts/check-tla.sh ci
       - name: Upload TLC logs on failure
         if: failure()
