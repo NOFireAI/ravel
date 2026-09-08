@@ -1469,15 +1469,9 @@ impl QueryEngine {
         // hand after each plan below -- otherwise two log selectors would
         // each see, and could each spend, the full remaining budget.
         let mut log_series_out: Vec<SeriesData> = Vec::new();
-        // Every plan below re-walks the SAME `log_snapshot.segments` slice
-        // (issue #1228): a segment one plan prunes at its own STREAM_DIR or
-        // time-range check can be exactly the segment another plan fetches,
-        // so a plan-summed or plan-maxed count over- or under-reports the
-        // lane's true fetched/pruned split. Unioning each plan's
-        // `fetched_segments` indexes (all indexes into this same slice, see
-        // the field doc on `LogSeriesOutput`) gives the lane's real fetched
-        // set regardless of plan count, and `segments_pruned` is the rest of
-        // the resolved set by construction.
+        // Indexes into `log_snapshot.segments`, unioned across the lane's
+        // plans: every plan walks that same slice, and a segment one plan
+        // prunes can be the one another plan fetches (issue #1228).
         let mut log_fetched_segments: HashSet<usize> = HashSet::new();
         let mut fed_metric_names: Vec<&'static str> = Vec::new();
         for plan in &log_plans {
@@ -1511,7 +1505,7 @@ impl QueryEngine {
             let out_samples: usize = out.series.iter().map(|s| s.samples.len()).sum();
             samples_remaining = samples_remaining.saturating_sub(out_samples);
             series_remaining = series_remaining.saturating_sub(out.series.len());
-            log_fetched_segments.extend(out.fetched_segments.iter().copied());
+            log_fetched_segments.extend(out.fetched_segments);
             log_series_out.extend(out.series);
             if !fed_metric_names.contains(&metric.name()) {
                 fed_metric_names.push(metric.name());
@@ -1520,16 +1514,15 @@ impl QueryEngine {
 
         source.log_series = log_series_out;
         let log_segments_fetched = log_fetched_segments.len() as u64;
-        // `log_snapshot.segments.len() - log_segments_fetched` rather than a
-        // per-plan sum/max (issue #1228): the union above already counts
-        // each segment at most once regardless of how many plans fetched
-        // it, so the rest of the resolved set is pruned by construction --
-        // `log_segments_fetched + this == log_snapshot.segments.len()`
-        // holds for any plan count. `log_snapshot.segments_pruned` is
-        // structurally 0 for this lane (comment below, at
-        // `log_plan_class`): the catalog resolve passes no name filter to
-        // prune against. Adding it anyway keeps a future resolve-side prune
-        // from being silently dropped.
+        // The union counts each segment once however many plans fetched it,
+        // so the rest of the resolved set is pruned and
+        // `fetched + pruned == log_snapshot.segments.len()` for any plan
+        // count. Every caller today passes the whole slice, so the union
+        // cannot exceed its length; the subtraction saturates only so a
+        // future caller unioning indexes from a subslice cannot wrap.
+        // `log_snapshot.segments_pruned` is 0 for this lane (the resolve
+        // passes no name filter, see `log_plan_class` below); adding it keeps
+        // a future resolve-side prune from being dropped.
         let log_segments_pruned =
             (log_snapshot.segments.len() as u64).saturating_sub(log_segments_fetched);
         stats.segments_fetched += log_segments_fetched;

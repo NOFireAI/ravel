@@ -1335,29 +1335,24 @@ async fn logs_query_stats_segments_pruned_zero_when_window_covers_every_segment(
 }
 
 // ---------------------------------------------------------------------------
-// Issue #1228 fix-round: the log lane's fetched/pruned figures must be
-// set-based over the union of segments any plan in the lane fetched, not a
-// per-plan sum or max. Every plan in a log lane re-walks the SAME
-// `log_snapshot.segments` slice, so a plan-summed `segments_pruned` (the
-// pre-fix-round code) double-counts a segment pruned by more than one plan,
-// and a plan-maxed `segments_fetched` under-counts a segment fetched by only
-// one of several plans -- either way `segments_pruned + segments_fetched`
-// can land above or below `log_snapshot.segments.len()`.
+// The log lane's fetched/pruned figures are set-based over the union of
+// segments any plan in the lane fetched (issue #1228). Every plan walks the
+// same `log_snapshot.segments` slice, so a per-plan sum of `segments_pruned`
+// double-counts a segment pruned by more than one plan and a per-plan max of
+// `segments_fetched` under-counts a segment fetched by only one, and either
+// puts `segments_pruned + segments_fetched` off `log_snapshot.segments.len()`.
 // ---------------------------------------------------------------------------
 
-/// The reviewer's worked example that blocked the previous fix-round commit
-/// (beb90166): two log plans over the two-object `fixture()`, each pruning
-/// the OTHER plan's segment at STREAM_DIR (`job="api"` prunes `fixture-b`,
+/// Two log plans over the two-object `fixture()`, each pruning the OTHER
+/// plan's segment at STREAM_DIR (`job="api"` prunes `fixture-b`,
 /// `job="worker"` prunes `fixture-a`) and fetching its own, so each plan
 /// alone is fetched=1/pruned=1. A per-plan sum of `segments_pruned` reports
-/// pruned=2 over a 2-segment snapshot on a query that pruned nothing at all,
-/// and a per-plan max of `segments_fetched` reports fetched=1 for a query
-/// that fetched both segments; pruned+fetched=3 over 2 segments. Against
-/// beb90166 the `segments_fetched == 2` assertion fails first (the flipped
-/// line is `log_segments_fetched = log_segments_fetched.max(...)` in
-/// `QueryEngine::prefetch`'s log lane, `engine.rs`), then
-/// `segments_pruned == 0` fails on the `+=` beside it. The union-based fix
-/// reports the true set: both segments are fetched by SOME plan, so
+/// pruned=2 over a 2-segment snapshot on a query that pruned nothing, and a
+/// per-plan max of `segments_fetched` reports fetched=1 for a query that
+/// fetched both segments. Under those semantics `segments_fetched == 2`
+/// fails first (a `.max()` across plans in `QueryEngine::prefetch`'s log
+/// lane), then `segments_pruned == 0` fails on a `+=` beside it. The union
+/// reports the true set: both segments are fetched by some plan, so
 /// fetched=2 and pruned=0 exactly.
 #[tokio::test]
 async fn two_log_plans_that_prune_different_segments_report_the_union() {
