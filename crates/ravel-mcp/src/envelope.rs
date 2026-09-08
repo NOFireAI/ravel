@@ -31,7 +31,7 @@
 use std::borrow::Cow;
 
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 /// The smallest `max_response_bytes` the server honors; a smaller request is
@@ -128,8 +128,11 @@ impl JsonSchema for Cell {
 
 /// A JSON value of unspecified shape, for envelope fields (the `budget`
 /// block's `effective`/`actual`/`estimate` sub-objects) whose concrete shape
-/// is defined elsewhere (ADR-1374 D6) and not reconstructed here.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// is defined elsewhere (ADR-1374 D6) and not reconstructed here. Also reused
+/// by [`crate::catalog`] for tool-input fields whose shape is caller-defined
+/// (`ravel_search_logs`'s `predicates`), hence the `Deserialize` derive
+/// alongside the manual `Serialize` impl.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct AnyJson(pub Value);
 
 impl Serialize for AnyJson {
@@ -167,7 +170,9 @@ pub struct Data {
     pub row_count: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
+/// Also reused by [`crate::catalog`] as a tool-input field type, hence the
+/// `Deserialize` derive here alongside `Serialize`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TimeRange {
     pub start_ns: String,
     pub end_ns: String,
