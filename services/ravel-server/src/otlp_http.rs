@@ -133,12 +133,13 @@ fn parse_content_encoding(headers: &HeaderMap) -> ContentCoding {
 /// allocated once at its final size, and no chunk is ever copied into a larger
 /// one. What stays uncharged is a fixed per-inflate overhead: the fixed
 /// [`INFLATE_CHUNK_BYTES`] staging buffer, this struct's per-chunk bookkeeping
-/// (one `Bytes` handle and one charge guard per chunk, together under 0.1% of
-/// the bytes the chunk holds), and flate2's own decoder state (tens of KiB).
+/// (one `Bytes` handle and one charge guard per chunk, together about 48
+/// bytes per 64 KiB chunk), and flate2's own decoder state (tens of KiB).
 /// The compressed request body itself also stays resident for the whole
 /// inflate, but it is bounded by [`MAX_REQUEST_BODY_BYTES`] and already
 /// counted against `--max-inflight-ingest-requests`, not left uncharged here.
-/// None of these scale with the decompressed size.
+/// No uncharged allocation holds a copy of the decompressed bytes; the two
+/// vectors that hold those per-chunk handles grow by doubling.
 ///
 /// The identity path wraps its single body chunk here unchanged, so it still
 /// makes no copy and takes no charge.
