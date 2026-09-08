@@ -249,10 +249,10 @@ fn redact_event_text(event: &mut AuditEvent, redactor: &dyn QueryTextRedactor) {
         })
         .unwrap_or_default();
     for (key, value) in event.attrs.iter_mut() {
-        if key == ATTR_TEXT {
-            if let AttrValue::Str(text) = value {
-                *text = redactor.redact(&language, text);
-            }
+        if key == ATTR_TEXT
+            && let AttrValue::Str(text) = value
+        {
+            *text = redactor.redact(&language, text);
         }
     }
 }
