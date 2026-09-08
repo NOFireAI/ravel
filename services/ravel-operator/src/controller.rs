@@ -958,6 +958,110 @@ async fn delete_stale_qualify_job(api: &Api<Job>, name: &str) -> Result<(), Erro
     Ok(())
 }
 
+/// What a non-Proceed qualification pass must do to the qualify Job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QualifyJobAction {
+    /// Create the qualify Job for the current inputs: none exists yet.
+    Create,
+    /// Delete the existing Job with foreground propagation, so a later pass
+    /// observes it absent and creates a fresh one. Used both when a config edit
+    /// made the Job's inputs stale and when the current-hash Job Failed (finding
+    /// 4): the controller does not watch Jobs, so a Failed Job left in place
+    /// would block Deployments until its TTL collected it about an hour later.
+    DeleteStale,
+    /// Leave the Job untouched: it is running the current inputs.
+    None,
+}
+
+/// The plan for a reconcile pass that did NOT reach
+/// [`QualificationDecision::Proceed`]: the Job mutation to perform, the
+/// `StoreQualified` condition to record, the reason/message to carry onto
+/// `Available`, and how soon to requeue. Pure, so every arm's action and timing
+/// is pinned by a unit test; the caller performs the Job create/delete named by
+/// `job_action` and requeues after `requeue`.
+struct QualifyGatePlan {
+    job_action: QualifyJobAction,
+    store_qualified_condition: Condition,
+    unavailable_reason: (&'static str, String),
+    requeue: Duration,
+}
+
+/// Map a non-Proceed [`QualificationDecision`] to its [`QualifyGatePlan`].
+///
+/// A Failed Job is deleted and requeued at [`BOOTSTRAP_POLL`], not left to sit
+/// until its TTL (finding 4): the controller does not watch Jobs, so nothing
+/// else recreates it, and a fresh cluster would otherwise have no Deployments
+/// for about an hour after two failed attempts. The `StoreQualified=False`
+/// condition still carries the Job's failure reason and message across that
+/// gap, so the operator's user still sees why qualification did not finish.
+fn qualify_gate_plan(decision: &QualificationDecision, generation: Option<i64>) -> QualifyGatePlan {
+    match decision {
+        QualificationDecision::Qualify { recreate } => QualifyGatePlan {
+            job_action: if *recreate {
+                QualifyJobAction::DeleteStale
+            } else {
+                QualifyJobAction::Create
+            },
+            store_qualified_condition: condition(
+                "StoreQualified",
+                false,
+                generation,
+                STORE_QUALIFIED_PENDING_REASON,
+                STORE_QUALIFYING_MESSAGE,
+            ),
+            unavailable_reason: (
+                STORE_QUALIFIED_PENDING_REASON,
+                STORE_QUALIFYING_MESSAGE.to_string(),
+            ),
+            requeue: BOOTSTRAP_POLL,
+        },
+        QualificationDecision::Waiting => QualifyGatePlan {
+            job_action: QualifyJobAction::None,
+            store_qualified_condition: condition(
+                "StoreQualified",
+                false,
+                generation,
+                STORE_QUALIFIED_PENDING_REASON,
+                STORE_QUALIFYING_MESSAGE,
+            ),
+            unavailable_reason: (
+                STORE_QUALIFIED_PENDING_REASON,
+                STORE_QUALIFYING_MESSAGE.to_string(),
+            ),
+            requeue: BOOTSTRAP_POLL,
+        },
+        QualificationDecision::Failed(message) => QualifyGatePlan {
+            job_action: QualifyJobAction::DeleteStale,
+            store_qualified_condition: condition(
+                "StoreQualified",
+                false,
+                generation,
+                STORE_QUALIFIED_FAILED_REASON,
+                message,
+            ),
+            unavailable_reason: (STORE_QUALIFIED_FAILED_REASON, message.clone()),
+            requeue: BOOTSTRAP_POLL,
+        },
+        QualificationDecision::Proceed => {
+            unreachable!("Proceed is handled on the success path, never planned as a hold")
+        }
+    }
+}
+
+/// The `store_qualified_hash` to persist on the degraded error path (finding
+/// 2). `proceed_hash` is `Some` when the pass reached
+/// [`QualificationDecision::Proceed`] (qualification passed before a later step
+/// failed); in that case its fresh value wins, so a successful qualification is
+/// not discarded and re-run once the Job's TTL collects it. When the pass
+/// failed before the gate, `proceed_hash` is `None` and the last-persisted
+/// value is carried through unchanged.
+fn degraded_store_qualified_hash(
+    proceed_hash: Option<String>,
+    persisted: Option<String>,
+) -> Option<String> {
+    proceed_hash.or(persisted)
+}
+
 /// Reconcile one `RavelCluster` to its desired Deployments and Services.
 ///
 /// Wraps [`reconcile_inner`] so that any failure before the success-path status
@@ -978,12 +1082,17 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
     // writer silently drops them.
     let extra_conditions = spec_conditions(&obj.spec, obj.metadata.generation);
 
+    // Set by `reconcile_inner` to the fresh qualified-input hash once a pass
+    // reaches `QualificationDecision::Proceed`, so the degraded error path below
+    // persists it rather than the stale `obj.status` value (finding 2).
+    let mut proceed_hash: Option<String> = None;
     match reconcile_inner(
         &obj,
         client,
         &namespace,
         &instance,
         extra_conditions.clone(),
+        &mut proceed_hash,
     )
     .await
     {
@@ -998,14 +1107,18 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                 .status
                 .as_ref()
                 .and_then(|status| status.gc_bootstrap_waiting_since.clone());
-            // The qualified-inputs hash is owned by the qualification gate, not
-            // this error path: carry the persisted value through unchanged so a
-            // transient error after a cluster is already qualified does not drop
-            // the record and re-trigger qualification on the next pass.
-            let store_qualified_hash = obj
-                .status
-                .as_ref()
-                .and_then(|status| status.store_qualified_hash.clone());
+            // The qualified-inputs hash to persist on the degraded write
+            // (finding 2): the fresh hash if this pass already qualified before
+            // the failing step, otherwise the persisted value unchanged. Using
+            // the old hash after a successful qualification would discard the
+            // pass's proof and re-run qualification once the Job's TTL collected
+            // it; using it when the pass never qualified is correct.
+            let store_qualified_hash = degraded_store_qualified_hash(
+                proceed_hash,
+                obj.status
+                    .as_ref()
+                    .and_then(|status| status.store_qualified_hash.clone()),
+            );
             if let Err(status_err) = write_degraded_status(
                 client,
                 &namespace,
@@ -1037,6 +1150,7 @@ async fn reconcile_inner(
     namespace: &str,
     instance: &str,
     mut extra_conditions: Vec<Condition>,
+    proceed_hash: &mut Option<String>,
 ) -> Result<Action, Error> {
     // Read the resourceVersion of every credential Secret the spec references
     // BEFORE the qualification gate (finding 3): the shared storage.s3 credential
@@ -1093,89 +1207,52 @@ async fn reconcile_inner(
                 STORE_QUALIFIED_SUCCEEDED_REASON,
                 STORE_QUALIFIED_MESSAGE,
             ));
+            // Qualification passed this pass. Carry the fresh hash into the
+            // outer error path (finding 2): a later fallible step
+            // (resolve_deployment_key, an apply) can still return Err, and
+            // without this the degraded status writer would rebuild the hash
+            // from the OLD obj.status and discard a successful qualification,
+            // re-running it once the Job's TTL collected the passing Job.
+            *proceed_hash = Some(desired_hash.clone());
             Some(desired_hash.clone())
         }
         _ => {
-            // Not qualified for the current inputs: create or recreate the Job,
-            // record a `StoreQualified` condition, and return WITHOUT touching
-            // any Deployment. A fresh cluster gets none; a running cluster
-            // re-qualifying after a config edit keeps the ones it has (this pass
-            // never reaches the Deployment apply/sweep below), so a pending
-            // config change does not tear a serving cluster down.
+            // Not qualified for the current inputs: create, recreate, or delete
+            // the Job per the plan, record a `StoreQualified` condition, and
+            // return WITHOUT touching any Deployment. A fresh cluster gets none;
+            // a running cluster re-qualifying after a config edit keeps the ones
+            // it has (this pass never reaches the Deployment apply/sweep below),
+            // so a pending config change does not tear a serving cluster down.
             //
-            // `unavailable_reason` carries the qualification state onto the
+            // `plan.unavailable_reason` carries the qualification state onto the
             // `Available=False` condition (finding 4), so a fresh cluster held for
             // qualification says why -- Pending with the qualifying message, or
             // Failed with the Job's failure message -- instead of the generic
             // MinimumReplicasUnavailable. `build_status` ignores it when prior
             // ready replicas keep the cluster Available, so a serving cluster under
             // re-qualification stays Available=True.
-            let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
-            let (store_qualified_condition, unavailable_reason, action): (
-                Condition,
-                (&str, String),
-                Action,
-            ) = match &decision {
-                QualificationDecision::Qualify { recreate } => {
-                    if *recreate {
-                        // The Job's inputs changed; its pod template is immutable,
-                        // so delete the stale Job with FOREGROUND propagation
-                        // (finding 2) -- its owned Pod is torn down before the Job
-                        // object disappears -- and let a later pass observe it fully
-                        // absent and create a fresh one. Without foreground
-                        // propagation Kubernetes can remove the Job while its Pod
-                        // still runs the old inputs, and the next reconcile would
-                        // create the replacement alongside that live stale Pod.
-                        delete_stale_qualify_job(&jobs, &qualify_name).await?;
-                    } else {
-                        let mut job = desired_qualify_job(&obj.spec, instance, shared_rv);
-                        job.metadata.namespace = Some(namespace.to_string());
-                        job.metadata.owner_references = owner;
-                        apply(&jobs, &qualify_name, &job).await?;
-                    }
-                    (
-                        condition(
-                            "StoreQualified",
-                            false,
-                            obj.metadata.generation,
-                            STORE_QUALIFIED_PENDING_REASON,
-                            STORE_QUALIFYING_MESSAGE,
-                        ),
-                        (
-                            STORE_QUALIFIED_PENDING_REASON,
-                            STORE_QUALIFYING_MESSAGE.to_string(),
-                        ),
-                        Action::requeue(BOOTSTRAP_POLL),
-                    )
+            let plan = qualify_gate_plan(&decision, obj.metadata.generation);
+            match plan.job_action {
+                QualifyJobAction::Create => {
+                    let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
+                    let mut job = desired_qualify_job(&obj.spec, instance, shared_rv);
+                    job.metadata.namespace = Some(namespace.to_string());
+                    job.metadata.owner_references = owner;
+                    apply(&jobs, &qualify_name, &job).await?;
                 }
-                QualificationDecision::Waiting => (
-                    condition(
-                        "StoreQualified",
-                        false,
-                        obj.metadata.generation,
-                        STORE_QUALIFIED_PENDING_REASON,
-                        STORE_QUALIFYING_MESSAGE,
-                    ),
-                    (
-                        STORE_QUALIFIED_PENDING_REASON,
-                        STORE_QUALIFYING_MESSAGE.to_string(),
-                    ),
-                    Action::requeue(BOOTSTRAP_POLL),
-                ),
-                QualificationDecision::Failed(message) => (
-                    condition(
-                        "StoreQualified",
-                        false,
-                        obj.metadata.generation,
-                        STORE_QUALIFIED_FAILED_REASON,
-                        message,
-                    ),
-                    (STORE_QUALIFIED_FAILED_REASON, message.clone()),
-                    Action::requeue(RETRY),
-                ),
-                QualificationDecision::Proceed => unreachable!("Proceed handled above"),
-            };
-            extra_conditions.push(store_qualified_condition);
+                QualifyJobAction::DeleteStale => {
+                    // Delete the stale or Failed Job with FOREGROUND propagation:
+                    // its owned Pod is torn down before the Job object disappears,
+                    // and a later pass observes it fully absent and creates a
+                    // fresh one. Without foreground propagation Kubernetes can
+                    // remove the Job while its Pod still runs the old inputs, and
+                    // the next reconcile would create the replacement alongside
+                    // that live stale Pod.
+                    delete_stale_qualify_job(&jobs, &qualify_name).await?;
+                }
+                QualifyJobAction::None => {}
+            }
+            extra_conditions.push(plan.store_qualified_condition);
 
             // Report the readiness a prior pass recorded, so a cluster already
             // serving through a re-qualification keeps `Available=True` instead of
@@ -1191,7 +1268,10 @@ async fn reconcile_inner(
                 prior.and_then(|s| s.gateway_ready_replicas),
                 prior.and_then(|s| s.query_ready_replicas),
                 prior.and_then(|s| s.maintain_ready_replicas),
-                Some((unavailable_reason.0, unavailable_reason.1.as_str())),
+                Some((
+                    plan.unavailable_reason.0,
+                    plan.unavailable_reason.1.as_str(),
+                )),
                 PersistedStatus {
                     gc_bootstrap_waiting_since: prior
                         .and_then(|s| s.gc_bootstrap_waiting_since.clone()),
@@ -1200,7 +1280,7 @@ async fn reconcile_inner(
                 extra_conditions,
             )
             .await?;
-            return Ok(action);
+            return Ok(Action::requeue(plan.requeue));
         }
     };
 
@@ -2777,6 +2857,84 @@ mod tests {
         let available = find(&serving.conditions, "Available");
         assert_eq!(available.status, "True");
         assert_eq!(available.reason, "MinimumReplicasAvailable");
+    }
+
+    /// A Failed qualify Job is not left to sit until its TTL (finding 4): the
+    /// gate plan deletes it (foreground, via [`QualifyJobAction::DeleteStale`])
+    /// and requeues at [`BOOTSTRAP_POLL`], so the next pass observes it Absent
+    /// and creates a fresh Job, rather than the earlier RETRY-only requeue that
+    /// left a fresh cluster without Deployments until the TTL fired. The
+    /// `StoreQualified=False` condition still carries the Job's failure reason
+    /// and message across that gap.
+    #[test]
+    fn failed_qualification_deletes_the_job_and_requeues_soon() {
+        let message = "backend rejected CAS".to_string();
+        let plan = qualify_gate_plan(&QualificationDecision::Failed(message.clone()), Some(7));
+        assert_eq!(plan.job_action, QualifyJobAction::DeleteStale);
+        assert_eq!(plan.requeue, BOOTSTRAP_POLL);
+        assert_ne!(plan.requeue, RETRY);
+        assert_eq!(plan.store_qualified_condition.status, "False");
+        assert_eq!(
+            plan.store_qualified_condition.reason,
+            STORE_QUALIFIED_FAILED_REASON
+        );
+        assert_eq!(plan.store_qualified_condition.message, message);
+        assert_eq!(
+            plan.unavailable_reason,
+            (STORE_QUALIFIED_FAILED_REASON, message)
+        );
+    }
+
+    /// The gate plan maps each non-Proceed decision to its Job action, and every
+    /// hold requeues at [`BOOTSTRAP_POLL`] (finding 4): an absent Job is created,
+    /// a stale or Failed Job is deleted, a running Job is left untouched.
+    #[test]
+    fn gate_plan_maps_each_hold_to_its_job_action() {
+        assert_eq!(
+            qualify_gate_plan(&QualificationDecision::Qualify { recreate: false }, None).job_action,
+            QualifyJobAction::Create
+        );
+        assert_eq!(
+            qualify_gate_plan(&QualificationDecision::Qualify { recreate: true }, None).job_action,
+            QualifyJobAction::DeleteStale
+        );
+        assert_eq!(
+            qualify_gate_plan(&QualificationDecision::Waiting, None).job_action,
+            QualifyJobAction::None
+        );
+        for decision in [
+            QualificationDecision::Qualify { recreate: false },
+            QualificationDecision::Qualify { recreate: true },
+            QualificationDecision::Waiting,
+            QualificationDecision::Failed("m".to_string()),
+        ] {
+            assert_eq!(
+                qualify_gate_plan(&decision, None).requeue,
+                BOOTSTRAP_POLL,
+                "{decision:?} requeues at BOOTSTRAP_POLL"
+            );
+        }
+    }
+
+    /// The degraded error path persists the FRESH qualified-input hash when the
+    /// pass reached Proceed before a later step failed (finding 2), exact value,
+    /// so a successful qualification is not discarded and re-run once the Job's
+    /// TTL collects it. When the pass failed before the gate (`proceed_hash`
+    /// None), the last-persisted value is carried through unchanged.
+    #[test]
+    fn degraded_status_keeps_the_fresh_hash_after_a_post_proceed_failure() {
+        // Reached Proceed, then a later apply failed: the fresh hash wins.
+        assert_eq!(
+            degraded_store_qualified_hash(Some("fresh".to_string()), Some("old".to_string())),
+            Some("fresh".to_string())
+        );
+        // Failed before the gate: the old persisted hash is kept unchanged.
+        assert_eq!(
+            degraded_store_qualified_hash(None, Some("old".to_string())),
+            Some("old".to_string())
+        );
+        // Never qualified and nothing persisted: None.
+        assert_eq!(degraded_store_qualified_hash(None, None), None);
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and
