@@ -23,7 +23,7 @@ use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::core::DynamicObject;
 use kube::{Api, Client, Resource, ResourceExt};
 use kube_runtime::controller::{Action, Controller};
-use kube_runtime::watcher;
+use kube_runtime::{WatchStreamExt, predicates, reflector, watcher};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_types::{Signal, TenantHash, TenantHashScheme, TenantId};
@@ -988,12 +988,16 @@ struct QualifyGatePlan {
 
 /// Map a non-Proceed [`QualificationDecision`] to its [`QualifyGatePlan`].
 ///
-/// A Failed Job is deleted and requeued at [`BOOTSTRAP_POLL`], not left to sit
-/// until its TTL (finding 4): the controller does not watch Jobs, so nothing
-/// else recreates it, and a fresh cluster would otherwise have no Deployments
-/// for about an hour after two failed attempts. The `StoreQualified=False`
-/// condition still carries the Job's failure reason and message across that
-/// gap, so the operator's user still sees why qualification did not finish.
+/// A Failed Job is deleted, not left to sit until its TTL: the controller does
+/// not watch Jobs, so nothing else recreates it, and a fresh cluster would
+/// otherwise have no Deployments for about an hour after two failed attempts.
+/// The Failed hold requeues at [`RETRY`], the failure backoff, not
+/// [`BOOTSTRAP_POLL`]. Deleting the Job rewrites `.status`, and the primary
+/// watch drops that status-only write ([`predicates::generation`]), so nothing
+/// re-enqueues the object before the requeue delay; a shorter poll here would
+/// only rebuild-and-refail the Job faster. The `StoreQualified=False` condition
+/// still carries the Job's failure reason and message across the gap, so the
+/// operator's user still sees why qualification did not finish.
 fn qualify_gate_plan(decision: &QualificationDecision, generation: Option<i64>) -> QualifyGatePlan {
     match decision {
         QualificationDecision::Qualify { recreate } => QualifyGatePlan {
@@ -1040,7 +1044,7 @@ fn qualify_gate_plan(decision: &QualificationDecision, generation: Option<i64>) 
                 message,
             ),
             unavailable_reason: (STORE_QUALIFIED_FAILED_REASON, message.clone()),
-            requeue: BOOTSTRAP_POLL,
+            requeue: RETRY,
         },
         QualificationDecision::Proceed => {
             unreachable!("Proceed is handled on the success path, never planned as a hold")
@@ -1131,6 +1135,10 @@ async fn reconcile(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Action, 
                     store_qualified_hash,
                 },
                 extra_conditions,
+                obj.status
+                    .as_ref()
+                    .map(|s| s.conditions.as_slice())
+                    .unwrap_or_default(),
             )
             .await
             {
@@ -1278,6 +1286,7 @@ async fn reconcile_inner(
                     store_qualified_hash: qualified_hash,
                 },
                 extra_conditions,
+                prior.map(|s| s.conditions.as_slice()).unwrap_or_default(),
             )
             .await?;
             return Ok(Action::requeue(plan.requeue));
@@ -1687,6 +1696,10 @@ async fn reconcile_inner(
             store_qualified_hash,
         },
         extra_conditions,
+        obj.status
+            .as_ref()
+            .map(|s| s.conditions.as_slice())
+            .unwrap_or_default(),
     )
     .await?;
 
@@ -1855,6 +1868,30 @@ fn condition(
     }
 }
 
+/// Carry each condition's `lastTransitionTime` forward from the previous status
+/// whenever its `status` value is unchanged, per the Kubernetes convention that
+/// the field records the last time the condition transitioned, not the last
+/// time it was written. [`condition`] stamps a fresh timestamp on every pass, so
+/// without this an otherwise-unchanged condition would get a new
+/// `lastTransitionTime` each reconcile; the primary `RavelCluster` watch would
+/// then see every status write as a change and re-enqueue the object before its
+/// requeue delay elapsed, which is what let a terminally Failed qualify Job be
+/// deleted and recreated in a tight loop. A condition whose type is absent from
+/// `previous`, or whose status differs, keeps its freshly stamped time.
+fn preserve_transition_times(
+    mut conditions: Vec<Condition>,
+    previous: &[Condition],
+) -> Vec<Condition> {
+    for c in &mut conditions {
+        if let Some(prev) = previous.iter().find(|p| p.r#type == c.r#type)
+            && prev.status == c.status
+        {
+            c.last_transition_time = prev.last_transition_time.clone();
+        }
+    }
+    conditions
+}
+
 /// Conditions derived from the spec alone, independent of whether this pass
 /// succeeds or fails (ADR-0080 decision 1).
 ///
@@ -2000,8 +2037,9 @@ async fn write_status(
     unavailable_reason: Option<(&str, &str)>,
     persisted: PersistedStatus,
     extra_conditions: Vec<Condition>,
+    previous_conditions: &[Condition],
 ) -> Result<(), Error> {
-    let status = build_status(
+    let mut status = build_status(
         observed_generation,
         gateway_ready,
         query_ready,
@@ -2010,6 +2048,7 @@ async fn write_status(
         persisted,
         extra_conditions,
     );
+    status.conditions = preserve_transition_times(status.conditions, previous_conditions);
     patch_status(client, namespace, instance, &status).await
 }
 
@@ -2030,14 +2069,16 @@ async fn write_degraded_status(
     message: &str,
     persisted: PersistedStatus,
     extra_conditions: Vec<Condition>,
+    previous_conditions: &[Condition],
 ) -> Result<(), Error> {
-    let status = build_degraded_status(
+    let mut status = build_degraded_status(
         observed_generation,
         reason,
         message,
         persisted,
         extra_conditions,
     );
+    status.conditions = preserve_transition_times(status.conditions, previous_conditions);
     patch_status(client, namespace, instance, &status).await
 }
 
@@ -2308,8 +2349,25 @@ pub async fn run() -> Result<(), Error> {
     // this operator manages.
     let managed = watcher::Config::default().labels("app.kubernetes.io/managed-by=ravel-operator");
 
+    // Drop status-only updates on the primary `RavelCluster` watch. Every
+    // reconcile pass rewrites `.status`; without this filter each write
+    // re-enqueues the object immediately, before the pass's requeue delay, so a
+    // terminally Failed qualify Job (which the controller does not watch) would
+    // be deleted and recreated in a tight loop. `predicates::generation` passes
+    // an event only when `metadata.generation` changed: a spec edit bumps it, a
+    // status-only write does not. Deletions arrive as separate watch events, not
+    // status-only applies, so they flow through unaffected (as they do with
+    // `Controller::new`, which also drives the primary off `applied_objects`).
+    // The reflector store feeds the same owner lookups `.owns()` needs.
+    let (reader, writer) = reflector::store();
+    let cluster_events = watcher(clusters, watcher::Config::default())
+        .default_backoff()
+        .reflect(writer)
+        .applied_objects()
+        .predicate_filter(predicates::generation, Default::default());
+
     info!("starting ravel-operator controller");
-    Controller::new(clusters, watcher::Config::default())
+    Controller::for_stream(cluster_events, reader)
         .owns(deployments, managed.clone())
         .owns(services, managed.clone())
         .owns(ingresses, managed)
@@ -2859,20 +2917,21 @@ mod tests {
         assert_eq!(available.reason, "MinimumReplicasAvailable");
     }
 
-    /// A Failed qualify Job is not left to sit until its TTL (finding 4): the
-    /// gate plan deletes it (foreground, via [`QualifyJobAction::DeleteStale`])
-    /// and requeues at [`BOOTSTRAP_POLL`], so the next pass observes it Absent
-    /// and creates a fresh Job, rather than the earlier RETRY-only requeue that
-    /// left a fresh cluster without Deployments until the TTL fired. The
-    /// `StoreQualified=False` condition still carries the Job's failure reason
-    /// and message across that gap.
+    /// A Failed qualify Job is deleted (foreground, via
+    /// [`QualifyJobAction::DeleteStale`]) so the next pass observes it Absent and
+    /// creates a fresh Job, and the hold requeues at [`RETRY`], the failure
+    /// backoff, not [`BOOTSTRAP_POLL`]: the primary watch drops the status-only
+    /// write that the delete produces, so nothing re-enqueues the object before
+    /// the delay, and a shorter poll would only rebuild-and-refail the Job
+    /// faster. The `StoreQualified=False` condition still carries the Job's
+    /// failure reason and message across that gap.
     #[test]
-    fn failed_qualification_deletes_the_job_and_requeues_soon() {
+    fn failed_qualification_deletes_the_job_and_requeues_on_retry() {
         let message = "backend rejected CAS".to_string();
         let plan = qualify_gate_plan(&QualificationDecision::Failed(message.clone()), Some(7));
         assert_eq!(plan.job_action, QualifyJobAction::DeleteStale);
-        assert_eq!(plan.requeue, BOOTSTRAP_POLL);
-        assert_ne!(plan.requeue, RETRY);
+        assert_eq!(plan.requeue, RETRY);
+        assert_ne!(plan.requeue, BOOTSTRAP_POLL);
         assert_eq!(plan.store_qualified_condition.status, "False");
         assert_eq!(
             plan.store_qualified_condition.reason,
@@ -2885,9 +2944,11 @@ mod tests {
         );
     }
 
-    /// The gate plan maps each non-Proceed decision to its Job action, and every
-    /// hold requeues at [`BOOTSTRAP_POLL`] (finding 4): an absent Job is created,
-    /// a stale or Failed Job is deleted, a running Job is left untouched.
+    /// The gate plan maps each non-Proceed decision to its Job action: an absent
+    /// Job is created, a stale or Failed Job is deleted, a running Job is left
+    /// untouched. A precondition hold (Create/Recreate/Waiting) requeues at
+    /// [`BOOTSTRAP_POLL`]; a Failed hold requeues at [`RETRY`], the failure
+    /// backoff.
     #[test]
     fn gate_plan_maps_each_hold_to_its_job_action() {
         assert_eq!(
@@ -2906,7 +2967,6 @@ mod tests {
             QualificationDecision::Qualify { recreate: false },
             QualificationDecision::Qualify { recreate: true },
             QualificationDecision::Waiting,
-            QualificationDecision::Failed("m".to_string()),
         ] {
             assert_eq!(
                 qualify_gate_plan(&decision, None).requeue,
@@ -2914,6 +2974,11 @@ mod tests {
                 "{decision:?} requeues at BOOTSTRAP_POLL"
             );
         }
+        assert_eq!(
+            qualify_gate_plan(&QualificationDecision::Failed("m".to_string()), None).requeue,
+            RETRY,
+            "Failed requeues at RETRY"
+        );
     }
 
     /// The degraded error path persists the FRESH qualified-input hash when the
@@ -3603,6 +3668,151 @@ mod tests {
 
         assert_eq!(secret_value(&secret, "key"), Some(b"from-data".to_vec()));
         assert_eq!(secret_value(&secret, "missing"), None);
+    }
+
+    /// A `RavelCluster` with a fixed identity (name/namespace/uid) and a chosen
+    /// generation, for the primary-watch predicate test. The status carries a
+    /// distinctive `lastTransitionTime` so two events at the same generation but
+    /// different status can be built.
+    fn cluster_event(generation: i64, transition_time: &str) -> RavelCluster {
+        let mut rc = RavelCluster::new("primary", spec_with_affinity(None));
+        rc.metadata.namespace = Some("ns".to_string());
+        rc.metadata.uid = Some("uid-1".to_string());
+        rc.metadata.generation = Some(generation);
+        rc.status = Some(RavelClusterStatus {
+            observed_generation: Some(generation),
+            conditions: vec![Condition {
+                r#type: "Available".to_string(),
+                status: "False".to_string(),
+                observed_generation: Some(generation),
+                last_transition_time: Some(transition_time.to_string()),
+                reason: "Pending".to_string(),
+                message: "waiting".to_string(),
+            }],
+            ..RavelClusterStatus::default()
+        });
+        rc
+    }
+
+    /// The primary-watch predicate ([`predicates::generation`], as wired in
+    /// [`run`]) drops a status-only event -- same `metadata.generation`, same
+    /// spec, only `.status` changed -- and keeps an event whose generation moved
+    /// (which a spec edit bumps). Without this filter each status write the
+    /// operator makes re-enqueues the object immediately, before the requeue
+    /// delay, so a Failed qualify Job cycles delete/recreate in a tight loop.
+    #[tokio::test]
+    async fn generation_predicate_drops_status_only_events() {
+        use futures::stream;
+
+        let events: Vec<Result<RavelCluster, watcher::Error>> = vec![
+            // First apply at generation 1: passes (never seen before).
+            Ok(cluster_event(1, "2000-01-01T00:00:00Z")),
+            // Status-only rewrite at the same generation: dropped.
+            Ok(cluster_event(1, "2001-01-01T00:00:00Z")),
+            // Spec edit bumps the generation to 2: passes.
+            Ok(cluster_event(2, "2002-01-01T00:00:00Z")),
+        ];
+
+        let passed: Vec<i64> = stream::iter(events)
+            .predicate_filter(predicates::generation, Default::default())
+            .filter_map(|r| async move { r.ok() })
+            .map(|rc| rc.metadata.generation.expect("generation set"))
+            .collect()
+            .await;
+
+        assert_eq!(
+            passed,
+            vec![1, 2],
+            "the status-only event at generation 1 must be dropped and the \
+             generation-2 event kept"
+        );
+    }
+
+    /// A repeated pass with identical inputs leaves each condition's
+    /// `lastTransitionTime` untouched: [`preserve_transition_times`] carries it
+    /// forward from the previous status whenever the `status` value is unchanged,
+    /// so a Failed hold rewritten pass after pass does not stamp a new timestamp
+    /// (which is what the primary watch would otherwise see as a change).
+    #[test]
+    fn repeated_failed_pass_keeps_last_transition_time() {
+        let message = "backend rejected CAS".to_string();
+        let plan = qualify_gate_plan(&QualificationDecision::Failed(message.clone()), Some(7));
+        // The Failed hold's status: Available=False plus StoreQualified=False,
+        // exactly as `reconcile_inner` assembles it.
+        let built = build_status(
+            None,
+            None,
+            None,
+            None,
+            Some((
+                plan.unavailable_reason.0,
+                plan.unavailable_reason.1.as_str(),
+            )),
+            PersistedStatus::default(),
+            vec![plan.store_qualified_condition.clone()],
+        );
+
+        // The previous status: the same conditions with a fixed, distinctive
+        // transition time. A fresh build stamps "now"; preservation must replace
+        // it with this value because the status did not transition.
+        let sentinel = "2000-01-01T00:00:00Z";
+        let previous: Vec<Condition> = built
+            .conditions
+            .iter()
+            .map(|c| Condition {
+                last_transition_time: Some(sentinel.to_string()),
+                ..c.clone()
+            })
+            .collect();
+
+        let preserved = preserve_transition_times(built.conditions.clone(), &previous);
+        assert!(
+            !preserved.is_empty(),
+            "the Failed hold records at least Available and StoreQualified"
+        );
+        for c in &preserved {
+            assert_eq!(
+                c.last_transition_time.as_deref(),
+                Some(sentinel),
+                "{} did not transition, so its lastTransitionTime must be carried \
+                 forward unchanged",
+                c.r#type
+            );
+        }
+    }
+
+    /// When a condition actually transitions (its `status` value flips),
+    /// [`preserve_transition_times`] keeps the freshly stamped time rather than
+    /// the previous one: the timestamp records the last real transition.
+    #[test]
+    fn transition_restamps_last_transition_time() {
+        let fresh = vec![condition(
+            "Available",
+            true,
+            Some(3),
+            "MinimumReplicasAvailable",
+            "ready",
+        )];
+        let fresh_time = fresh[0].last_transition_time.clone();
+        let previous = vec![Condition {
+            r#type: "Available".to_string(),
+            status: "False".to_string(),
+            observed_generation: Some(2),
+            last_transition_time: Some("2000-01-01T00:00:00Z".to_string()),
+            reason: "MinimumReplicasUnavailable".to_string(),
+            message: "waiting".to_string(),
+        }];
+
+        let preserved = preserve_transition_times(fresh, &previous);
+        assert_eq!(
+            preserved[0].last_transition_time, fresh_time,
+            "a False -> True transition must keep the new timestamp, not the \
+             previous one"
+        );
+        assert_ne!(
+            preserved[0].last_transition_time.as_deref(),
+            Some("2000-01-01T00:00:00Z"),
+        );
     }
 
     /// #147 (ADR-0076 decision 2 / ADR-0052): `reconcile_shard_overrides` is
