@@ -18,10 +18,39 @@
 //! line carrying the key/value pairs identical across every row, with each
 //! row's own cell then printing only the keys that differ from that
 //! shared set.
+//!
+//! # Two bounds make "not a second copy" mechanical
+//!
+//! Hoisting alone does not stop the text from costing what the rows cost:
+//! a result of 5,000 rows with nothing in common renders 5,000 lines, and
+//! one row that `fit` shortened to just under a 4 MiB response cap renders
+//! one line of nearly that size. Both would double the response the D4 byte
+//! cap just sized. So the text carries at most [`MAX_TEXT_ROWS`] rows and at
+//! most [`MAX_TEXT_BYTES`] bytes, and says so in the text when either bound
+//! bites: `# rows_not_shown: N` for the row bound, a `...[truncated]`
+//! marker for the byte bound. `structuredContent` remains the complete
+//! representation, which is what a caller reads programmatically anyway;
+//! `data.row_count` keeps the true count either way.
+//!
+//! The byte bound applies to the table alone. The summary lines (status,
+//! failure, warnings, next steps) are what a caller acts on when a result
+//! is too big to read, so they are rendered outside the bounded region and
+//! survive it.
 
 use serde_json::{Map, Value};
 
 use crate::envelope::{Cell, Column, Data, Envelope, FailureClass, Row, Status};
+
+/// The most rows the text block renders, however many `data.rows` holds.
+pub const MAX_TEXT_ROWS: usize = 20;
+
+/// The most bytes the whole text block occupies. 64 KiB, an eighth of the
+/// 512 KiB default response cap.
+pub const MAX_TEXT_BYTES: usize = 64 * 1024;
+
+/// Written where the byte bound cut the table. Leads with a newline so it
+/// terminates whatever partial line it follows.
+const TRUNCATION_MARKER: &str = "\n...[truncated]\n";
 
 fn status_label(status: Status) -> &'static str {
     match status {
@@ -90,6 +119,19 @@ fn shared_map_keys(rows: &[Row], col_idx: usize) -> Option<Map<String, Value>> {
     Some(shared)
 }
 
+/// The longest prefix of `text` that is at most `max` bytes and ends on a
+/// character boundary.
+fn floor_char_boundary(text: &str, max: usize) -> &str {
+    if max >= text.len() {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.get(..end).unwrap_or("")
+}
+
 fn render_data_table(data: &Data, out: &mut String) {
     if data.columns.is_empty() {
         return;
@@ -102,8 +144,13 @@ fn render_data_table(data: &Data, out: &mut String) {
     out.push_str(&header.join("\t"));
     out.push('\n');
 
+    // Hoisting is computed over the rows actually rendered, so a key shared
+    // by every rendered row is hoisted even when a row beyond the bound
+    // differs there, and every printed cell's diff is against the `# shared`
+    // line the reader can see.
+    let rows = data.rows.get(..MAX_TEXT_ROWS).unwrap_or(&data.rows);
     let shared: Vec<Option<Map<String, Value>>> = (0..data.columns.len())
-        .map(|i| shared_map_keys(&data.rows, i))
+        .map(|i| shared_map_keys(rows, i))
         .collect();
     for (i, keys) in shared.iter().enumerate() {
         if let Some(map) = keys {
@@ -115,7 +162,7 @@ fn render_data_table(data: &Data, out: &mut String) {
         }
     }
 
-    for row in &data.rows {
+    for row in rows {
         let cells: Vec<String> = row
             .iter()
             .enumerate()
@@ -137,6 +184,11 @@ fn render_data_table(data: &Data, out: &mut String) {
         out.push('\n');
     }
 
+    let not_shown = data.rows.len().saturating_sub(rows.len());
+    if not_shown > 0 {
+        out.push_str(&format!("# rows_not_shown: {not_shown}\n"));
+    }
+
     let truncated = data.rows.len() as u64 != data.row_count;
     out.push_str(&format!(
         "row_count: {}{}\n",
@@ -145,26 +197,47 @@ fn render_data_table(data: &Data, out: &mut String) {
     ));
 }
 
-/// Render `envelope`'s compact text block. `envelope` must already have
-/// gone through [`crate::envelope::Envelope::fit`] -- this function renders
+/// Render `envelope`'s compact text block, at most [`MAX_TEXT_ROWS`] rows
+/// and at most [`MAX_TEXT_BYTES`] bytes. `envelope` must already have gone
+/// through [`crate::envelope::Envelope::fit`] -- this function renders
 /// exactly the `data` it is given, truncated or not, per D4's "the two
 /// representations never differ".
 pub fn render(envelope: &Envelope) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("status: {}\n", status_label(envelope.status)));
+    let mut head = String::new();
+    head.push_str(&format!("status: {}\n", status_label(envelope.status)));
     if let Some(failure) = &envelope.failure {
-        out.push_str(&format!(
+        head.push_str(&format!(
             "failure: {} {}\n",
             failure_class_label(failure.class),
             failure.message
         ));
     }
-    render_data_table(&envelope.data, &mut out);
+
+    let mut table = String::new();
+    render_data_table(&envelope.data, &mut table);
+
+    let mut tail = String::new();
     if !envelope.warnings.is_empty() {
-        out.push_str(&format!("warnings: {}\n", envelope.warnings.join("; ")));
+        tail.push_str(&format!("warnings: {}\n", envelope.warnings.join("; ")));
     }
     for step in &envelope.next_steps {
-        out.push_str(&format!("next_step: {} - {}\n", step.action, step.detail));
+        tail.push_str(&format!("next_step: {} - {}\n", step.action, step.detail));
+    }
+
+    let summary_len = head.len() + tail.len();
+    if summary_len + table.len() <= MAX_TEXT_BYTES {
+        return head + &table + &tail;
+    }
+
+    let available = MAX_TEXT_BYTES.saturating_sub(summary_len + TRUNCATION_MARKER.len());
+    let mut out = head;
+    out.push_str(floor_char_boundary(&table, available));
+    out.push_str(TRUNCATION_MARKER);
+    out.push_str(&tail);
+    // Reached only when the summary lines alone are over the bound, which
+    // the D4 metadata bounds make unlikely rather than impossible.
+    if out.len() > MAX_TEXT_BYTES {
+        out = floor_char_boundary(&out, MAX_TEXT_BYTES).to_string();
     }
     out
 }
@@ -175,21 +248,81 @@ mod tests {
     use super::*;
     use crate::envelope::Column;
 
-    #[test]
-    fn renders_header_and_rows_without_panicking() {
+    fn int_envelope(row_count: usize) -> Envelope {
         let mut envelope = Envelope::default();
         envelope.data.columns = vec![Column {
             name: "n".to_string(),
             r#type: "int64".to_string(),
         }];
-        envelope.data.rows = vec![vec![Cell::Int(1)], vec![Cell::Int(2)]];
-        envelope.data.row_count = 2;
+        envelope.data.rows = (0..row_count)
+            .map(|i| vec![Cell::Int(i as i64 + 1)])
+            .collect();
+        envelope.data.row_count = row_count as u64;
+        envelope
+    }
+
+    /// The whole rendering, asserted exactly. `contains` assertions cannot
+    /// see a dropped row: `contains("2\n")` still holds when the row `2` is
+    /// gone, because `row_count: 2\n` ends in the same two characters.
+    #[test]
+    fn renders_every_row_as_its_own_exact_line() {
+        let text = render(&int_envelope(2));
+        assert_eq!(text, "status: ok\nn\n1\n2\nrow_count: 2\n");
+    }
+
+    /// 25 rows render as exactly 20 row lines plus the count of the 5 that
+    /// did not, so the text never costs what the rows cost while
+    /// `row_count` still reports the true total.
+    #[test]
+    fn renders_at_most_twenty_rows_and_reports_the_rest() {
+        let text = render(&int_envelope(25));
+
+        let mut expected = String::from("status: ok\nn\n");
+        for n in 1..=20 {
+            expected.push_str(&format!("{n}\n"));
+        }
+        expected.push_str("# rows_not_shown: 5\nrow_count: 25\n");
+        assert_eq!(text, expected);
+
+        let row_lines = text
+            .lines()
+            .filter(|line| line.parse::<u32>().is_ok())
+            .count();
+        assert_eq!(row_lines, MAX_TEXT_ROWS);
+        assert_eq!(row_lines, 20);
+    }
+
+    /// One row is enough to blow the byte bound: `fit` may keep a cell just
+    /// under a 4 MiB response cap, and rendering it whole would double the
+    /// response. The text is cut to exactly 64 KiB, marker included, and
+    /// the summary lines outside the bounded table survive the cut.
+    #[test]
+    fn renders_at_most_sixty_four_kibibytes() {
+        let mut envelope = int_envelope(1);
+        envelope.data.rows = vec![vec![Cell::Str("x".repeat(200 * 1024))]];
+        envelope.warnings = vec!["one row was shortened".to_string()];
+
         let text = render(&envelope);
-        assert!(text.starts_with("status: ok\n"));
-        assert!(text.contains("n\n"));
-        assert!(text.contains("1\n"));
-        assert!(text.contains("2\n"));
-        assert!(text.contains("row_count: 2\n"));
+
+        assert_eq!(text.len(), MAX_TEXT_BYTES);
+        assert_eq!(text.len(), 65_536);
+        assert!(text.starts_with("status: ok\nn\nxxx"));
+        assert!(text.ends_with("\n...[truncated]\nwarnings: one row was shortened\n"));
+    }
+
+    /// The cut lands on a character boundary, never mid-`char`: a table of
+    /// three-byte characters cuts to 65,534 bytes, the largest total at or
+    /// under the bound that leaves no split character.
+    #[test]
+    fn byte_bound_cuts_on_a_character_boundary() {
+        let mut envelope = int_envelope(1);
+        envelope.data.rows = vec![vec![Cell::Str("\u{20ac}".repeat(30 * 1024))]];
+
+        let text = render(&envelope);
+
+        assert_eq!(text.len(), 65_534);
+        assert!(text.len() <= MAX_TEXT_BYTES);
+        assert!(text.ends_with("\u{20ac}\n...[truncated]\n"));
     }
 
     #[test]
