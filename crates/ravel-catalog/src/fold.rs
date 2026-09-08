@@ -1386,34 +1386,17 @@ impl Catalog {
                 let part_crc = crc32c::crc32c(&part_bytes);
                 let hash16 = &part_hash.to_hex()[..16];
                 let part_key = part_object_key(tenant, signal, part_watermark, hash16);
-                match self
-                    .store()
-                    .put(
-                        &part_key,
-                        Bytes::from(part_bytes),
-                        PutOptions::create_if_absent()
-                            .with_checksum(UploadChecksum::Crc32c(part_crc)),
-                    )
-                    .await
-                {
-                    Ok(_) => {}
-                    // Content-addressed key: bytes are identical by
-                    // construction, so a losing folder's part is as good as
-                    // its own (mirrors `publish::put_data_object`).
-                    Err(StoreError::AlreadyExists) => {}
-                    Err(e) => return Err(CatalogError::Store(e)),
-                }
-                counters.put_requests += 1;
-                total_part_bytes += part_bytes_len;
-                part_hashes.push(*part_hash.as_bytes());
 
-                // ADR-1413: a per-part (v3) column-statistics object, built
-                // only for a part this fold actually wrote (a carried-forward
-                // part above forwards its existing ref, if any, unchanged).
-                // Unlike the v1/v2 builds below, a failure here is never
-                // graceful: an over-bound part must fail the whole fold
-                // rather than publish a truncated object or silently carry
-                // on without one (decision 4).
+                // ADR-1413: build (and bound-check) the per-part (v3)
+                // column-statistics object BEFORE writing the part's own
+                // `.csnap` object below. Unlike the v1/v2 builds below, a
+                // failure here is never graceful: an over-bound part must
+                // fail the whole fold rather than publish a truncated object
+                // or silently carry on without one (decision 4). Deriving it
+                // first means that refusal happens before the part object is
+                // ever written, so a refused fold leaves no orphaned
+                // `.csnap` behind for a part that will never gain a HEAD
+                // entry.
                 let column_stats = if typed_attr_columns.is_empty() {
                     None
                 } else {
@@ -1521,6 +1504,27 @@ impl Catalog {
                         part_blake3: vec![part_hash.as_bytes().to_vec()],
                     })
                 };
+
+                match self
+                    .store()
+                    .put(
+                        &part_key,
+                        Bytes::from(part_bytes),
+                        PutOptions::create_if_absent()
+                            .with_checksum(UploadChecksum::Crc32c(part_crc)),
+                    )
+                    .await
+                {
+                    Ok(_) => {}
+                    // Content-addressed key: bytes are identical by
+                    // construction, so a losing folder's part is as good as
+                    // its own (mirrors `publish::put_data_object`).
+                    Err(StoreError::AlreadyExists) => {}
+                    Err(e) => return Err(CatalogError::Store(e)),
+                }
+                counters.put_requests += 1;
+                total_part_bytes += part_bytes_len;
+                part_hashes.push(*part_hash.as_bytes());
 
                 part_refs.push(SnapshotPartRef {
                     key: part_key,
@@ -3768,6 +3772,12 @@ mod tests {
         assert!(
             keys.iter().all(|k| !k.ends_with(".cstat")),
             "no column-stats object of any version was written, got {keys:?}"
+        );
+        // The v3 bound check runs before the part's own `.csnap` PUT, so a
+        // refused part never leaves an orphan part object behind either.
+        assert!(
+            keys.iter().all(|k| !k.ends_with(".csnap")),
+            "no part object was written for the refused part, got {keys:?}"
         );
         // HEAD was never written either: a failed fold must not publish any
         // catalog state.
