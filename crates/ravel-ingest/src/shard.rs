@@ -42,7 +42,9 @@ use uuid::Uuid;
 
 use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
-use crate::config::{IngestConfig, SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket};
+use crate::config::{
+    IngestConfig, MAX_FLUSH_CLOCK_HOLD_NS, SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket,
+};
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -865,9 +867,10 @@ pub(crate) struct ShardActor {
     /// largest `created_unix_ns` this actor has stamped. `flush_tenant` raises
     /// each raw clock reading to this floor before stamping, so a backwards
     /// wall-clock step never mints a `created_unix_ns` below one already
-    /// committed. In-process state only, never persisted: a restart mints a
-    /// fresh `writer_id`, so it resets to 0 by construction (see
-    /// [`ShardActor::monotonic_flush_open_ns`]).
+    /// committed. In-process state only, never persisted: it resets to 0 on
+    /// restart by construction (a fresh actor starts the floor at 0). The
+    /// guarantee is therefore per-process; ADR-1307 records the cross-restart
+    /// limitation (see [`ShardActor::monotonic_flush_open_ns`]).
     last_flush_open_ns: i64,
     clock: Arc<dyn Clock>,
     config: IngestConfig,
@@ -1207,35 +1210,67 @@ impl ShardActor {
         }
     }
 
-    /// The flush-open stamp for this flush, raised to this writer's monotonic
-    /// floor (ADR-1307). The raw clock reading is a plausibility-checked value
-    /// (`checked_ingest_hour_bucket`) but carries no ordering guarantee: a
-    /// backwards wall-clock step (an NTP correction, a manual set) can read
-    /// below a stamp this writer already committed. Stamping that raw reading
-    /// as `created_unix_ns` would let a stale duplicate sample outrank its own
+    /// The flush-open stamp for this flush: `raw_ns` (the single flush-open
+    /// clock reading) raised to this writer's monotonic floor (ADR-1307).
+    ///
+    /// `raw_ns` is plausibility-checked here first
+    /// (`checked_ingest_hour_bucket`), so a sub-floor or otherwise garbage
+    /// reading fails loud before the floor can hide it: raising a garbage
+    /// reading to an armed floor would defeat that check and stamp a valid-
+    /// looking `created_unix_ns` onto a flush whose clock is broken.
+    ///
+    /// The reading carries no ordering guarantee on its own: a backwards
+    /// wall-clock step (an NTP correction, a manual set) can read below a stamp
+    /// this writer already committed. Stamping that raw reading as
+    /// `created_unix_ns` would let a stale duplicate sample outrank its own
     /// correction under the query-time dedup order (docs/catalog-and-mvcc.md
-    /// "Cross-segment duplicate samples"), because that order takes
-    /// `created_unix_ns` first. Raising each reading to `last_flush_open_ns`
-    /// keeps stamps non-decreasing within this writer's process lifetime and
-    /// counts every step it absorbs. The floor is in-process state, never read
-    /// back after a restart: a restart mints a fresh `writer_id`, so it resets
-    /// to 0 by construction, and cross-process order rests on that identity
-    /// rule (commit/README.md "a crash retires its identity"), not on the
-    /// floor.
-    fn monotonic_flush_open_ns(&mut self) -> i64 {
-        let raw_ns = self.clock.now_ns();
-        let stamped_ns = raw_ns.max(self.last_flush_open_ns);
-        if stamped_ns != raw_ns {
-            let regression_ns = stamped_ns - raw_ns;
-            self.metrics.record_clock_regression();
+    /// "Cross-segment duplicate samples"), whose primary key is
+    /// `created_unix_ns`. Raising each reading to `last_flush_open_ns` keeps
+    /// stamps non-decreasing within this writer's process lifetime and counts
+    /// every step it absorbs (`clock_regressions`).
+    ///
+    /// A backwards step is absorbed only up to [`MAX_FLUSH_CLOCK_HOLD_NS`].
+    /// Beyond that the flush is refused with a typed error rather than stamped
+    /// (`clock_regressions_refused`) and the floor re-anchors to `raw_ns`, so a
+    /// single spurious forward glitch that ratcheted the floor into a future
+    /// ingest hour cannot pin every later flush there: exactly the one flush
+    /// that crosses the bound fails, and the next normal reading proceeds. See
+    /// [`MAX_FLUSH_CLOCK_HOLD_NS`] for why an unbounded hold must fail loud.
+    ///
+    /// The floor is in-process state, never persisted and never read back after
+    /// a restart, so it resets to 0 by construction. That default preserves the
+    /// fail-loud path for a non-positive clock: the raw check above rejects the
+    /// reading before the floor is consulted. The guarantee is per-process;
+    /// ADR-1307 records the cross-restart limitation.
+    fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, String> {
+        checked_ingest_hour_bucket(raw_ns)?;
+        if raw_ns >= self.last_flush_open_ns {
+            self.last_flush_open_ns = raw_ns;
+            return Ok(raw_ns);
+        }
+        let held_ns = self.last_flush_open_ns - raw_ns;
+        if held_ns > MAX_FLUSH_CLOCK_HOLD_NS {
+            self.last_flush_open_ns = raw_ns;
+            self.metrics.record_clock_regression_refused();
             tracing::warn!(
                 shard = self.shard,
-                regression_ns,
-                "ravel-ingest: flush clock stepped backwards; held flush-open stamp to per-writer monotonic floor"
+                held_ns,
+                bound_ns = MAX_FLUSH_CLOCK_HOLD_NS,
+                "ravel-ingest: flush clock regressed beyond the monotonic hold bound; refusing the flush and re-anchoring the floor"
             );
+            return Err(format!(
+                "flush clock regressed {held_ns} ns below the previous flush-open stamp, \
+                 beyond the monotonic hold bound of {MAX_FLUSH_CLOCK_HOLD_NS} ns; \
+                 refusing the flush (ADR-1307)"
+            ));
         }
-        self.last_flush_open_ns = stamped_ns;
-        stamped_ns
+        self.metrics.record_clock_regression();
+        tracing::warn!(
+            shard = self.shard,
+            regression_ns = held_ns,
+            "ravel-ingest: flush clock stepped backwards; held flush-open stamp to per-writer monotonic floor"
+        );
+        Ok(self.last_flush_open_ns)
     }
 
     /// Pins `buf`'s flush identity, then moves `buf`'s payload and waiters
@@ -1295,7 +1330,16 @@ impl ShardActor {
         let tenant_hash = tenant.hash();
         let seq = self.next_seq;
         self.next_seq += 1;
-        let flush_open_ns = self.monotonic_flush_open_ns();
+        let raw_ns = self.clock.now_ns();
+        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
+            Ok(ns) => ns,
+            Err(msg) => {
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(waiters, Err(WriteError::SegmentBuild(msg)));
+                return 0;
+            }
+        };
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
             Err(msg) => {
@@ -1305,8 +1349,11 @@ impl ShardActor {
                 return 0;
             }
         };
-        let deadline_ns =
-            flush_open_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
+        // ADR-1307 finding 4: the abandonment deadline measures real-time
+        // budget, so it derives from the raw clock reading, not the (possibly
+        // floor-raised) stamp. Absorbing a backwards step must not extend how
+        // long this flush may run before `bound_to_deadline` abandons it.
+        let deadline_ns = raw_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
 
         let identity = SegmentIdentity {
             tenant_hash: tenant_hash.0,
