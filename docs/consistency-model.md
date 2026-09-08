@@ -241,10 +241,17 @@ and no stronger; it does not promise a single stored copy per record.
   Each shard actor therefore holds the flush-open stamp to a per-writer
   monotonic floor: every reading is raised to the highest stamp this writer has
   already issued, so stamps are non-decreasing within a process lifetime and
-  each absorbed step is counted (`ravel_ingest_clock_regressions_total`). The floor
-  is in-process state, never read back after a restart; a restart mints a fresh
-  `writer_id`, so cross-process order rests on that identity component of the
-  dedup key, not on the floor (ADR-1307).
+  each absorbed step is counted (intended for export as
+  `ravel_ingest_clock_regressions_total` once the Prometheus wiring lands). A
+  backwards step larger than
+  a bounded hold (20 minutes) is refused with a typed error rather than
+  absorbed, so a spurious forward glitch cannot ratchet the floor into a future
+  ingest hour and strand every later flush. The floor is in-process state,
+  reset to 0 on restart by construction; the guarantee is per-process, and a
+  backwards step spanning a restart can still invert resolution. `writer_id`
+  does not close this: it is not part of the duplicate-resolution comparator,
+  only a final tiebreak in the catalog segment sort. ADR-1307 records the
+  limitation.
 - Config discipline: `max_ingest_lag` is one shared bound, not a per-signal
   one, in the sense that matters operationally, though it is not shared by
   reference: the admission checks (one `max_ingest_lag_ns` constant per
