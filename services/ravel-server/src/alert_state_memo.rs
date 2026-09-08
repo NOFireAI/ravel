@@ -68,6 +68,12 @@ pub enum MemoError {
          {{{ALERT_STATE_MEMO_FORMAT_VERSION}}}"
     )]
     UnsupportedVersion { found: u32 },
+    /// Serializing a memo to its on-object bytes failed. A `WireMemo` of owned
+    /// scalars and strings does not fail to serialize in practice; this variant
+    /// lets [`write_alert_state_memo`] propagate rather than overwrite a good
+    /// memo with a zero-byte object.
+    #[error("alert state memo encode: {0}")]
+    Encode(String),
 }
 
 /// The folded latest-state-per-`alert_id` snapshot, plus the watermark hour the
@@ -157,15 +163,59 @@ impl WireRecord {
 
 /// Serialize a memo to its on-object bytes, stamping the current
 /// [`ALERT_STATE_MEMO_FORMAT_VERSION`].
-pub fn encode(memo: &AlertStateMemo) -> Vec<u8> {
+///
+/// Returns [`MemoError::Encode`] rather than an empty `Vec` on a serialize
+/// failure, so [`write_alert_state_memo`] leaves the prior memo intact instead
+/// of overwriting it with a zero-byte object that the next tick would decode as
+/// corrupt and pay a full fold to replace.
+pub fn encode(memo: &AlertStateMemo) -> Result<Vec<u8>, MemoError> {
     let wire = WireMemo {
         format_version: ALERT_STATE_MEMO_FORMAT_VERSION,
         watermark_hour: memo.watermark_hour,
         records: memo.records.values().map(WireRecord::from_record).collect(),
     };
-    // A `WireMemo` of owned Rust scalars and strings cannot fail to serialize;
-    // treat any error as a decode-class failure rather than panicking.
-    serde_json::to_vec(&wire).unwrap_or_default()
+    encode_wire(&wire)
+}
+
+/// Serialize any wire value to JSON bytes, mapping a serialize failure to
+/// [`MemoError::Encode`]. Split out so a test can drive the failure path with a
+/// type whose `Serialize` impl errors, which a `WireMemo` of plain scalars and
+/// strings never does.
+fn encode_wire<T: Serialize>(wire: &T) -> Result<Vec<u8>, MemoError> {
+    serde_json::to_vec(wire).map_err(|err| MemoError::Encode(err.to_string()))
+}
+
+/// A wire value whose `Serialize` impl always fails, so a test can drive the
+/// [`MemoError::Encode`] path (and, via [`write_memo_encoded`], prove a failed
+/// encode never overwrites the prior memo). The real [`WireMemo`] cannot fail
+/// to serialize, so this is the only way to reach that path.
+#[cfg(test)]
+pub(crate) struct UnserializableWire;
+
+#[cfg(test)]
+impl Serialize for UnserializableWire {
+    fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("forced serialize failure"))
+    }
+}
+
+/// Encode `UnserializableWire`, exposing the module-private [`encode_wire`] to
+/// the sibling `alerting` test module so its store-backed test can prove the
+/// write path short-circuits on an encode failure.
+#[cfg(test)]
+pub(crate) fn encode_unserializable_for_test() -> Result<Vec<u8>, MemoError> {
+    encode_wire(&UnserializableWire)
+}
+
+/// Overwrite a tenant's memo with whatever `encode_unserializable_for_test`
+/// produces, so the sibling `alerting` test can drive [`write_memo_encoded`]
+/// through a failing encoder without access to the module-private seam.
+#[cfg(test)]
+pub(crate) async fn write_with_failing_encode_for_test(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> anyhow::Result<()> {
+    write_memo_encoded(store, tenant, encode_unserializable_for_test).await
 }
 
 /// Parse memo bytes, gating on the supported version set before the body.
@@ -234,8 +284,25 @@ pub async fn write_alert_state_memo(
     tenant: &TenantHash,
     memo: &AlertStateMemo,
 ) -> anyhow::Result<()> {
+    write_memo_encoded(store, tenant, || encode(memo)).await
+}
+
+/// Encode via `encode`, then overwrite the memo object with the result.
+///
+/// The encode step runs first and its error is propagated before any `put`, so
+/// a failed serialize leaves the prior object untouched. Factored out from
+/// [`write_alert_state_memo`] so a test can inject a failing encoder and prove
+/// no `put` reaches the store, without a way to make the real `encode` fail.
+async fn write_memo_encoded<F>(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    encode: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> Result<Vec<u8>, MemoError>,
+{
+    let body = Bytes::from(encode()?);
     let key = alert_state_memo_key(tenant);
-    let body = Bytes::from(encode(memo));
     store
         .put(
             &key,
@@ -279,7 +346,7 @@ mod tests {
             records,
         };
 
-        let decoded = decode(&encode(&memo)).expect("round trips");
+        let decoded = decode(&encode(&memo).expect("encodes")).expect("round trips");
         assert_eq!(decoded.watermark_hour, 42);
         assert_eq!(decoded.records.len(), 2);
         assert_eq!(decoded.records.get(&a.alert_id), Some(&a));
@@ -292,7 +359,7 @@ mod tests {
             watermark_hour: 1,
             records: HashMap::new(),
         };
-        let bytes = encode(&memo);
+        let bytes = encode(&memo).expect("encodes");
         let err = decode(&bytes[..bytes.len() / 2]).expect_err("truncation rejected");
         assert!(matches!(err, MemoError::Decode(_)), "got {err:?}");
     }
@@ -330,6 +397,16 @@ mod tests {
              "generation":1,"ts_ns":2,"labels":[],"annotations":[],"body":"b"}]}"#;
         let err = decode(bytes).expect_err("duplicate alert_id rejected");
         assert!(matches!(err, MemoError::Decode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_serialize_failure_is_an_encode_error_not_an_empty_vec() {
+        // The real `encode` cannot fail; drive the failure through the same
+        // `encode_wire` with a type whose `Serialize` impl errors. The old code
+        // returned an empty `Vec` here (`unwrap_or_default`), which the writer
+        // would then have put as a zero-byte object.
+        let err = encode_wire(&UnserializableWire).expect_err("serialize failure is an error");
+        assert!(matches!(err, MemoError::Encode(_)), "got {err:?}");
     }
 
     #[test]
