@@ -170,7 +170,15 @@ trait honors cancellation by drop, so the query deadline (usually well under
 - Listing is paginated (S3 pages at 1000 keys). Cross-page guarantee: any
   key created before the first page request is returned; keys created
   during the scan may or may not appear; a key MAY appear more than once
-  and callers MUST dedup by key.
+  and callers MUST dedup by key. Because keys arrive in lexicographic
+  order, a permitted repeat is always equal to the last key already
+  delivered, so a caller draining every page dedups at constant memory by
+  holding only that last key. A key strictly below the last delivered one
+  is an order violation, not a repeat, and the client rejects it. The
+  client also bounds the drain: a continuation token equal to the previous
+  one is a spinning backend and the client fails rather than looping
+  forever, and a token that keeps changing without ending is bounded by a
+  page ceiling (100 000 pages, 100 million keys at the 1000-key page size).
 - `list_after(prefix, start_after, page)` returns exactly the keys `list`
   would, minus every key `<= start_after`: each returned key compares
   strictly greater than `start_after`, in the same lexicographic order and

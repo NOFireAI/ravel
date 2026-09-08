@@ -193,6 +193,15 @@ impl StoreErrorClass {
             StoreError::InvalidRange(_) => StoreErrorClass::InvalidRange,
             StoreError::Transient(_) => StoreErrorClass::Transient,
             StoreError::Permanent(_) => StoreErrorClass::Permanent,
+            // The drain helpers ([`crate::list_all`]) synthesize these when a
+            // backend violates the listing contract; they never flow through
+            // this decorator, which records raw `list` results, not drain
+            // outcomes. They are permanent, non-retryable client-side failures,
+            // so they classify as `Permanent`. Named explicitly, not via a
+            // wildcard, so a future variant still fails to compile here.
+            StoreError::ListRepeatedToken { .. }
+            | StoreError::ListPageCeiling { .. }
+            | StoreError::ListOrderViolation { .. } => StoreErrorClass::Permanent,
         }
     }
 
