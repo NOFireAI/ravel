@@ -776,7 +776,9 @@ for adir in "$REPO_ROOT"/formal/tla/*/; do
     aname="$(basename "$adir")"
     bands="$adir/bands.tsv"
     [ -f "$bands" ] || continue
-    asum="$(awk -F'\t' 'NR>1 && $1 ~ /\.exhaustive\.cfg$/ { b=$6; if (b !~ /^[0-9]{1,9}$/ || (b+0)==0) b=3600; sum+=b } END{print sum+0}' "$bands")"
+    # Both spellings: a single-spec area names its config `exhaustive.cfg`,
+    # a multi-module area `MC<Spec>.exhaustive.cfg`.
+    asum="$(awk -F'\t' 'NR>1 && $1 ~ /(^|\.)exhaustive\.cfg$/ { b=$6; if (b !~ /^[0-9]{1,9}$/ || (b+0)==0) b=3600; sum+=b } END{print sum+0}' "$bands")"
     if [ "$asum" -gt "$max_sum" ]; then max_sum="$asum"; max_area="$aname"; fi
 done
 echo "    largest area exhaustive-budget sum: $max_area = ${max_sum}s"
