@@ -586,3 +586,37 @@ their 4 KiB allowance. D4 and D5 name the evidence digest field
 cannot be verified by a reader who trusts the name. D5 states that an
 evidence reference presented after its pin has passed redeems as unpinned,
 re-executing fresh, rather than failing as expired.
+
+**Amendment (2026-09-09, #1501).** D4 bounds the scalar fields, including
+`presentation.cursor`, to 4 KiB together. D5 requires the cursor to carry
+the pinned segment set, and one `SegmentPin` costs about 250 B plus
+base64: the 2,000-segment admission figure in D6 yields a token of several
+hundred KiB, over the whole 256 KiB response floor. This amendment
+replaces the segment-enumeration cursor with a resolve-input cursor and
+gives it its own bound.
+
+1. A cursor pins its snapshot by resolve inputs, not by segment
+   enumeration: the tenant hash, the signal, the half-open time range, the
+   minimum commit-token watermark the page was resolved against, the
+   pending erasure predicates in force, the declared column set, and the
+   keyset position (the last tuple of the page and the `ORDER BY` it was
+   taken under). Redemption re-resolves the snapshot against that
+   watermark deterministically. When the re-resolve cannot reproduce the
+   pinned watermark (a compaction past the protection horizon, a newer
+   erasure), redemption fails with `cursor_expired` and the caller re-runs
+   the query. A tampered or wrong-tenant token stays `cursor_invalid`. The
+   dead-process rule, the tenant binding, the tool and argument-hash
+   binding, and the deadline clamp are unchanged.
+2. The cursor leaves the 4 KiB scalar allowance of D4 and gets its own
+   4 KiB bound, accounted for in the fixed part of the envelope. The
+   maximal fixed part is now the D4 list bounds plus the 4 KiB scalar
+   allowance (102 KiB, unchanged) plus the new 4 KiB cursor bound, 106 KiB,
+   which stays under the 256 KiB floor. A cursor over its bound is a
+   server defect, not a client-visible degradation: the envelope reports
+   it as an `internal` failure rather than silently paging without a
+   cursor.
+3. Evidence references are unchanged: each pins one row's segment with a
+   `SegmentPin`, and the pin-codec reuse of D9 stays for them.
+4. The shipped cursor codec (segment enumeration) is replaced by the
+   resolve-input form before the first paging tool ships (#1380); until
+   then no tool mints a cursor.

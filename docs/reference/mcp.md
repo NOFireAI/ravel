@@ -69,12 +69,12 @@ Three counters say what the fit removed outside `data.rows`.
 `metadata_elided` counts list entries dropped because their list was over
 its count bound. `entries_truncated` counts entries kept but cut because
 the entry was over its own size bound; a cut entry carries a truncation
-marker. `scalars_truncated` counts scalar cuts and the cursor drop.
-Sub-bounded scalars are cut to their own bounds first. The allowance pass
-then cuts `plan`, the failure message, and the budget values. If the
-scalars are still over, the cursor is dropped and announced with a
-warning and a next step. Cutting a token breaks its authentication code,
-so it is dropped rather than cut.
+marker. `scalars_truncated` counts scalar cuts. Sub-bounded scalars are
+cut to their own bounds first. The allowance pass then cuts `plan`, the
+failure message, and the budget values. The cursor carries its own 4 KiB
+bound, separate from the scalar allowance. A cursor over its bound is
+never cut, because cutting a token breaks its authentication code; it is
+a server defect reported as an `internal` failure.
 
 The first-row guarantee applies to the byte cap. It does not apply to
 the row cap. When the equal-group rule leaves no complete group inside
@@ -113,16 +113,22 @@ the protocol level instead.
 
 A cursor is a token with a keyed message authentication code, minted fresh
 for each call rather than stored server-side. It carries the tenant hash,
-the tool name, a hash of the arguments, the position to resume from, and
-the pinned snapshot, including which erasure predicates were pending and
-which typed attribute columns were declared at mint time.
+the tool name, a hash of the arguments, the signal, the half-open time
+range, the minimum commit-token watermark the page was resolved against,
+which erasure predicates were pending, which typed attribute columns were
+declared, and the position to resume from. It pins a snapshot by these
+resolve inputs, not by enumerating segments.
 
 A cursor stays valid until the earlier of the call's remaining deadline
 and the protection horizon minus the grace period. Redeeming a cursor
-re-executes the original statement against the pinned snapshot with a
-keyset predicate; the server holds nothing in between calls. Only the
-process that minted a cursor can redeem it, so a load balancer needs
-sticky routing to a paging client.
+re-resolves the snapshot deterministically from the pinned watermark and
+re-executes the original statement against it with a keyset predicate; the
+server holds nothing in between calls. Only the process that minted a
+cursor can redeem it, so a load balancer needs sticky routing to a paging
+client. When the re-resolve cannot reproduce the pinned watermark, because
+a compaction or a newer erasure moved past it, redemption fails with
+`cursor_expired` and the caller re-runs the query. A tampered or
+wrong-tenant token fails with `cursor_invalid`.
 
 `ravel_query_sql` mints a cursor only when the statement's `ORDER BY`,
 plus a tiebreak the tool appends, is a total order over the projection.
@@ -173,6 +179,7 @@ failure.
 | `max_response_bytes` | 512 KiB | floor 256 KiB | yes, raised to the floor if lower |
 | `max_response_bytes` ceiling | 4 MiB | an operator may configure a lower one | no; a larger request clamps to it |
 | cursor or evidence token length | 1 MiB | fixed | no; a longer token is refused unread |
+| `presentation.cursor` in the envelope | 4 KiB | fixed | no; a cursor over its bound is an `internal` failure |
 | metric families per `ravel_describe_data` page | 100 | fixed | no |
 | segments admitted for `ravel_find_labels` resolution | 2,000 | fixed | no |
 
