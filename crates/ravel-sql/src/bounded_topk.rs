@@ -222,11 +222,18 @@ impl BoundedTopKAggregate {
                         None => refused = true,
                     }
                 } else if let Some(projection) = inner.downcast_ref::<ProjectionExec>() {
+                    // One remap per projection: the alias lives in the
+                    // projection's output namespace and the source in its
+                    // input's, so once the name has crossed to the input side
+                    // it must not be matched against this projection's other
+                    // aliases, or `b AS a` and `a AS m` would chain and name a
+                    // different aggregate than the sort orders by.
                     for expr in projection.expr() {
                         if expr.alias == order_name
                             && let Some(source) = expr.expr.downcast_ref::<Column>()
                         {
                             order_name = source.name().to_string();
+                            break;
                         }
                     }
                 } else if !is_pass_through(&inner) {

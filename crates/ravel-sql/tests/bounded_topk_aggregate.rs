@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::arrow::array::{Array, Int64Array, TimestampNanosecondArray};
-use datafusion::physical_plan::displayable;
+use datafusion::physical_plan::aggregates::AggregateExec;
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -238,6 +239,13 @@ fn request(sql: &str) -> SqlRequest {
 /// `EXPLAIN` renders it. Plan equality in the gate's negative tests is equality
 /// of this string.
 async fn physical_plan(executor: &SqlExecutor, sql: &str) -> String {
+    let plan = physical_plan_tree(executor, sql).await;
+    format!("{}", displayable(plan.as_ref()).indent(false))
+}
+
+/// The physical plan itself, for assertions that inspect operators rather
+/// than the rendered text.
+async fn physical_plan_tree(executor: &SqlExecutor, sql: &str) -> Arc<dyn ExecutionPlan> {
     let accounting = QueryAccounting::new();
     let declared = executor
         .resolve_declared_columns(tenant().hash(), request(sql).now_ns)
@@ -250,11 +258,25 @@ async fn physical_plan(executor: &SqlExecutor, sql: &str) -> String {
         .plan_pinned(tenant().hash(), snapshot, sql, &accounting, &declared)
         .await
         .expect("query plans");
-    let plan = planned
+    planned
         .create_physical_plan()
         .await
-        .expect("physical plan builds");
-    format!("{}", displayable(plan.as_ref()).indent(false))
+        .expect("physical plan builds")
+}
+
+/// Every `AggregateExec` limit in `plan`, in pre-order: the structural form
+/// of the `lim=[k]` marker, independent of how DataFusion renders it.
+fn aggregate_limits(plan: &Arc<dyn ExecutionPlan>) -> Vec<usize> {
+    let mut out = Vec::new();
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+        && let Some(options) = aggregate.limit_options()
+    {
+        out.push(options.limit);
+    }
+    for child in plan.children() {
+        out.extend(aggregate_limits(child));
+    }
+    out
 }
 
 /// `column`'s value at `row` as `i64`, whichever of the two integer-shaped
@@ -633,16 +655,24 @@ async fn a_nullable_ordering_input_does_not_fire() {
 /// tests (an unbounded plan answers the same query correctly too). Only this
 /// test and the bytes test below would catch that stub, and this one names
 /// the mechanism directly: the rule-on plan differs from the rule-off plan,
-/// and it carries the aggregate's limit marker.
+/// and an `AggregateExec` in it carries exactly `TOP_K` as its limit,
+/// inspected on the operator rather than in the rendered text so a display
+/// change cannot fail it while the limit is still there.
 #[tokio::test]
 async fn the_rule_rewrites_the_gated_shape() {
     let sql = topk_sql(TOP_K);
-    let on = physical_plan(&executor(SMALL_KEYS, Some(TOP_K)).await, &sql).await;
-    let off = physical_plan(&executor(SMALL_KEYS, None).await, &sql).await;
+    let on_tree = physical_plan_tree(&executor(SMALL_KEYS, Some(TOP_K)).await, &sql).await;
+    let off_tree = physical_plan_tree(&executor(SMALL_KEYS, None).await, &sql).await;
+    let on = format!("{}", displayable(on_tree.as_ref()).indent(false));
+    let off = format!("{}", displayable(off_tree.as_ref()).indent(false));
     assert_ne!(on, off, "the rule did not change the plan:\n{on}");
     assert!(
-        on.contains(&format!("lim=[{TOP_K}]")),
-        "the rule-on plan carries no limit marker:\n{on}"
+        aggregate_limits(&on_tree).contains(&TOP_K),
+        "no AggregateExec in the rule-on plan carries limit {TOP_K}:\n{on}"
+    );
+    assert!(
+        aggregate_limits(&off_tree).is_empty(),
+        "the rule-off plan carries an aggregate limit:\n{off}"
     );
 }
 
