@@ -57,9 +57,11 @@
 //! independent of the rule count actually needed. [`AlertEvaluator::fold_latest`]
 //! avoids that with a tenant-wide derived cache, the alert state memo
 //! ([`crate::alert_state_memo`], issue #1294): each tick seeds from the memo and
-//! folds only the ingest hours at or after its watermark. The memo is never
-//! source of truth (the transition records remain the only durable state,
-//! ADR-0040 decision 3); a lost, stale, or corrupt memo costs a full fold, never
+//! folds only the ingest hours at or after its watermark, clamped to the
+//! reader's own seal bound so a watermark from a fast clock cannot move the tail
+//! cursor past hours that still hold commit keys. The memo is never source of
+//! truth (the transition records remain the only durable state, ADR-0040
+//! decision 3); a lost, stale, or corrupt memo costs a full fold, never
 //! correctness, because the tail listing re-folds every hour that could hold a
 //! record written since the memo. Only the lease holder writes it.
 
@@ -499,7 +501,7 @@ impl AlertEvaluator {
             }
         };
 
-        let mut latest = match self.fold_latest(memo.as_ref()).await {
+        let mut latest = match self.fold_latest(memo.as_ref(), now_ns).await {
             Ok(latest) => latest,
             Err(err) => {
                 tracing::warn!(
@@ -1066,20 +1068,36 @@ impl AlertEvaluator {
     /// a derived cache when one is present (issue #1294).
     ///
     /// With a memo, this seeds from its folded snapshot and then folds only the
-    /// commit records at or after `memo.watermark_hour`, so the per-tick cost is
-    /// bounded by the transitions written since the memo rather than by the
-    /// whole history. The tail listing is non-optional: it is what makes a stale
-    /// memo detectable rather than silently wrong, since any record written
-    /// since the memo is stamped at an ingest hour at or above its watermark and
-    /// is therefore re-listed here. Records below the watermark come only from
-    /// the memo, which is why an arbitrarily old still-`Firing` record survives a
-    /// tail that a bounded lookback would step past.
+    /// commit records at or after the memo's effective watermark, so the
+    /// per-tick cost is bounded by the transitions written since the memo rather
+    /// than by the whole history. The tail listing is non-optional: it is what
+    /// makes a stale memo detectable rather than silently wrong, since any
+    /// record written since the memo is stamped at an ingest hour at or above
+    /// its watermark and is therefore re-listed here. Records below the
+    /// watermark come only from the memo, which is why an arbitrarily old
+    /// still-`Firing` record survives a tail that a bounded lookback would step
+    /// past.
+    ///
+    /// The effective watermark is the minimum of the persisted
+    /// `memo.watermark_hour` and this reader's own `seal_bound_hour(now_ns)`
+    /// (ADR-1294 decision 3). `decode` accepts any `u32`, so a memo written by a
+    /// replica whose clock runs ahead, or one whose watermark field was
+    /// corrupted into a decodable but too-large value, would otherwise start the
+    /// tail cursor past the hours the current commit keys live in: the tail
+    /// would skip them, the seed would serve state from before them, and
+    /// `evaluate_rule` would take a skipped firing transition for a resolved
+    /// alert and write the transition again. Clamping restores the staleness
+    /// invariant's precondition (the watermark is at or below every hour the
+    /// tail must cover) and only ever widens the tail, which the fold tolerates
+    /// by construction: a re-read record wins the tie against its byte-identical
+    /// memoized copy.
     ///
     /// With no memo (cold, absent, corrupt, or unsupported version) this is a
     /// full fold, identical to [`Self::load_latest_records`].
     async fn fold_latest(
         &self,
         memo: Option<&AlertStateMemo>,
+        now_ns: i64,
     ) -> anyhow::Result<HashMap<AlertId, AlertRecord>> {
         let best = match memo {
             Some(memo) => {
@@ -1093,7 +1111,11 @@ impl AlertEvaluator {
                     .iter()
                     .map(|(id, record)| (*id, ((record.ts_ns, 0, 0), record.clone())))
                     .collect();
-                self.fold_tail(&mut best, memo.watermark_hour).await?;
+                // A watermark above this reader's seal bound is not trusted: the
+                // seal bound is the newest hour no writer can still be stamping
+                // into, so it is the highest cursor this fold may start from.
+                let watermark = memo.watermark_hour.min(self.seal_bound_hour(now_ns));
+                self.fold_tail(&mut best, watermark).await?;
                 best
             }
             // No memo: the cold path is a full fold, the same read
@@ -2531,8 +2553,20 @@ mod tick_tests {
             records: full.clone(),
         };
 
+        // Fold two hours on, so the reader's own seal bound is at or above the
+        // memo's watermark and the effective-watermark clamp is a no-op here:
+        // this test is about the tail cursor, not about the clamp.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= memo.watermark_hour,
+            "the clamp must not lower the watermark under test"
+        );
+
         let before = metrics.snapshot();
-        let via_memo = ev.fold_latest(Some(&memo)).await.expect("memo fold");
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
         let after = metrics.snapshot();
 
         assert_eq!(
@@ -2581,7 +2615,17 @@ mod tick_tests {
         let resolved = build_transition_record(&rule, AlertState::Resolved, 0, hour1_ts);
         seed_alert_history(&ev, &[resolved]).await;
 
-        let via_memo = ev.fold_latest(Some(&memo)).await.expect("memo fold");
+        // Fold two hours on, so the effective-watermark clamp is a no-op and the
+        // tail cursor really is the memo's own hour 1.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= memo.watermark_hour,
+            "the clamp must not lower the watermark under test"
+        );
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
         let full = ev.load_latest_records().await.expect("full fold");
 
         assert_eq!(
@@ -2745,7 +2789,10 @@ mod tick_tests {
 
         // So the tick folds `None`: a full fold, exactly 2 GETs per transition.
         let before = metrics.snapshot();
-        let latest = ev.fold_latest(None).await.expect("full fold fallback");
+        let latest = ev
+            .fold_latest(None, NOW_NS)
+            .await
+            .expect("full fold fallback");
         let after = metrics.snapshot();
         assert_eq!(latest.len(), 1, "all transitions share one alert_id");
         assert_eq!(
@@ -2841,15 +2888,26 @@ mod tick_tests {
             "the surviving memo is the prior one, untouched by the failed overwrite"
         );
 
-        // The next tick's read path (memo GET then tail fold) takes the fold_tail
+        // A later tick's read path (memo GET then tail fold) takes the fold_tail
         // path over the surviving memo, not a full fold: one memo GET, no
         // commit/data GETs for the below-watermark record, and one tail LIST.
+        // "Later" is two hours on so this reader's seal bound is at or above the
+        // surviving watermark and the effective-watermark clamp is a no-op; the
+        // claim under test is that a failed write left a usable memo behind.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= 1,
+            "the clamp must not lower the surviving watermark under test"
+        );
         let before = metrics.snapshot();
         let memo = read_alert_state_memo(store.as_ref(), &tenant)
             .await
             .expect("memo readable")
             .expect("memo present");
-        let via_memo = ev.fold_latest(Some(&memo)).await.expect("memo fold");
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
         let after = metrics.snapshot();
 
         assert_eq!(
@@ -2978,7 +3036,7 @@ mod tick_tests {
             .await
             .expect("memo readable")
             .expect("A wrote a memo");
-        let via_memo = a.fold_latest(Some(&memo)).await.expect("memo fold");
+        let via_memo = a.fold_latest(Some(&memo), now).await.expect("memo fold");
         let full = a.load_latest_records().await.expect("full fold");
 
         assert_eq!(
@@ -2990,6 +3048,91 @@ mod tick_tests {
             via_memo.get(&alert_id).map(|r| r.state),
             Some(AlertState::Resolved),
             "the late Resolved from the overlapping prior holder is not lost"
+        );
+    }
+
+    /// A memo watermark above this reader's seal bound is clamped to the seal
+    /// bound, so the tail cursor never starts past the hours the current commit
+    /// keys live in. `decode` accepts any `u32`, so such a memo is reachable from
+    /// a replica whose clock runs ahead or from a corrupted-but-decodable field.
+    /// Without the clamp the tail skips the current hour, the fold serves the
+    /// memo's pre-transition state, and the tick re-writes a firing transition
+    /// that is already durable.
+    #[tokio::test]
+    async fn a_watermark_above_the_seal_bound_is_clamped_to_it() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // One firing transition, committed in the current hour: the hour the
+        // tail must cover, and the hour an over-high watermark skips.
+        let seal = ev.seal_bound_hour(NOW_NS);
+        let firing_ts = NOW_NS - 10 * NS_PER_SEC;
+        assert_eq!(
+            hour_bucket(firing_ts),
+            seal,
+            "the firing transition sits in the seal-bound hour, so only a watermark \
+             above the seal bound can skip it"
+        );
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, firing_ts);
+        seed_alert_history(&ev, &[firing]).await;
+
+        let full = ev.load_latest_records().await.expect("full fold");
+        assert_eq!(
+            full.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the durable history folds to Firing"
+        );
+
+        // A memo one hour above the seal bound, holding no record for the alert:
+        // the state as of before the firing transition was written.
+        let memo = AlertStateMemo {
+            watermark_hour: seal + 1,
+            records: HashMap::new(),
+        };
+        write_alert_state_memo(store.as_ref(), &tenant, &memo)
+            .await
+            .expect("seed the over-high memo");
+
+        // The served state is the full fold, record for record, not the memo's
+        // empty snapshot.
+        let via_memo = ev
+            .fold_latest(Some(&memo), NOW_NS)
+            .await
+            .expect("memo fold");
+        assert_eq!(
+            via_memo, full,
+            "the clamped watermark keeps the current hour in the tail, so the memo \
+             fold equals the full fold exactly"
+        );
+
+        // And the next evaluation writes no duplicate transition: the tick reads
+        // the same over-high memo from the store, folds to Firing, and finds no
+        // transition to make. The history stays at the one record seeded above.
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "already firing: the tick writes no duplicate firing transition"
+        );
+        let history = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(
+            history.len(),
+            1,
+            "the durable history still holds exactly the one seeded transition"
+        );
+        assert_eq!(
+            history[0].state,
+            AlertState::Firing,
+            "and it is the firing record the memo's watermark would have skipped"
         );
     }
 

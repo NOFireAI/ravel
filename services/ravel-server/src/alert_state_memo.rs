@@ -16,7 +16,8 @@
 //! format changes). Following the `sys/maintain/memo` precedent (ADR-0065),
 //! everything here is advisory and reconstructible; a lost, stale, or corrupt
 //! memo costs a rescan, never correctness, because the reader always re-lists
-//! the hours at or after the memo's watermark and re-folds them over the memo.
+//! the hours at or after the memo's watermark, clamped to its own seal bound,
+//! and re-folds them over the memo.
 //!
 //! # Wire format and versioning
 //!
@@ -90,6 +91,13 @@ pub struct AlertStateMemo {
     /// `now_ns - (lease_ttl + query_deadline)`), so a late transition an
     /// expired-but-still-finishing holder publishes after this holder's tail
     /// LIST still lands at or above the watermark and stays inside the tail.
+    ///
+    /// This field is untrusted on read: [`decode`] accepts any `u32`, so the
+    /// value can exceed the reading replica's own seal bound (a writer whose
+    /// clock ran ahead, or a corrupted-but-decodable field). The reader clamps
+    /// it, folding from `min(watermark_hour, seal_bound_hour(now_ns))` instead
+    /// (ADR-1294 decision 3); an unclamped cursor would start past the hours the
+    /// current commit keys live in and serve pre-transition state.
     pub watermark_hour: u32,
     /// Latest record per `alert_id` as of `watermark_hour`.
     pub records: HashMap<AlertId, AlertRecord>,
@@ -223,6 +231,12 @@ pub(crate) async fn write_with_failing_encode_for_test(
 /// Never panics: a truncated or malformed object, an `alert_id`/`state` that
 /// does not decode, or a version outside the supported set is a typed error the
 /// caller turns into a full fold, not a crash.
+///
+/// `watermark_hour` is deliberately not validated here: every `u32` is a
+/// syntactically valid ingest hour, and whether one is too far in the future is
+/// a question about the reading replica's clock, not about the bytes. The fold
+/// answers it instead, by clamping to its own seal bound (see
+/// [`AlertStateMemo::watermark_hour`]).
 pub fn decode(bytes: &[u8]) -> Result<AlertStateMemo, MemoError> {
     let header: WireHeader =
         serde_json::from_slice(bytes).map_err(|err| MemoError::Decode(err.to_string()))?;
