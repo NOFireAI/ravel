@@ -1452,3 +1452,118 @@ distinct=3587643 depth=30`, 1103s, liveness under `FairSpec` included). The
 before/after probe figures above were measured on the same runtime with
 `-workers 2 -Xmx2g`. `python3 scripts/check_docs.py` exit 0, `docs gate:
 clean.`.
+
+## Round twelve
+
+Closes two TLA+ review findings on the maintenance model (issues #1289,
+#1221). Both are model-hygiene changes, not protocol changes: one removes a
+duplicated UNCHANGED spelling, the other adds a checked invariant that the
+shipped model already satisfies. The reachable state graph is unchanged, so the
+figures and both bands are identical to round eleven; the two runs below
+confirm that rather than move it.
+
+### Finding 1: actions spell out `maintVars` instead of naming the tuple
+
+`maintVars == <<leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>` was
+defined but every action still listed the five names. The sixteen actions that
+leave all five alone (Tick, the store/retention/query/sweep actions) now name
+`maintVars` in their UNCHANGED list; the six that assign a subset (StartRewrite,
+PublishRewrite, ExpireLease, and the three compaction actions) keep an explicit
+list, because naming the tuple there would double-constrain a variable the
+action also sets. The `maintVars` comment records both forms and why an
+omission is not caught by the parser.
+
+The weakening is real, and a probe shows what enforces it. On a scratch copy
+`rwInputs` was dropped from `Tick`'s UNCHANGED list (the pre-refactor explicit
+form with one entry missing). TLC halts:
+
+```
+Error: Successor state is not completely specified by action Tick of the
+next-state relation. The following variable is not assigned: rwInputs.
+State 1: <Initial predicate>
+State 2: <Tick ...>
+```
+
+Exit 75, depth 1. An omitted maintenance variable is not silently free: TLC
+rejects the incompletely specified successor at the first `Tick`. Naming
+`maintVars` and spelling out the five names are therefore the same constraint;
+the refactor cannot change the state graph, and the runs below show it did not.
+The scratch model lives under `/tmp` and is not committed.
+
+### Finding 2: `RewriteTargetMatchesResolvedInputs`
+
+`TargetOf` maps every resolved input set other than `CompactOut` to `"rwA"`,
+and `PublishRewrite` fills the target from `RecordSetContent`, which reads the
+static `Predecessors(target)`. They agree only because the shipped `RawInputs`
+and `CompactOut` are singletons, so the resolved set is always the whole
+predecessor set. The new invariant makes the agreement a checked precondition:
+
+```tla
+RewriteTargetMatchesResolvedInputs ==
+    \A id \in RewriteIds :
+        rwPhase[id] = "done" =>
+            Predecessors(TargetOf(rwInputs[id])) = rwInputs[id]
+```
+
+It holds vacuously on the shipped singleton model, so its non-vacuity is shown
+by a two-raw-input probe where a pass resolves a proper subset. A scratch copy
+widens `RawInputs` to `{"raw1", "raw2"}` with `raw2` absent at `Init`, so
+`LiveInputs` resolves `{"raw1"}` while `Predecessors("rwA")` still names both.
+Before the fix TLC breaks the invariant:
+
+```
+Error: Invariant RewriteTargetMatchesResolvedInputs is violated.
+State 1: <Initial predicate>
+State 2: <RequestErasure ...>
+State 3: <StartRewrite ...>
+State 4: <PublishRewrite ...>
+401 states generated, 206 distinct states found
+```
+
+Exit 12, counterexample four states (three transitions): at State 4
+`rwInputs[A] = {"raw1"}` but `Predecessors(TargetOf({"raw1"})) =
+Predecessors("rwA") = {"raw1", "raw2"}`. Widening `TargetOf` so the subset maps
+to its own target (`"rwA2"`, `Predecessors("rwA2") = {"raw1"}`) makes it hold
+over the complete graph: exit 0, `2002442 states generated, 322428 distinct
+states found`, depth 27. The shipped model keeps the singleton inputs, where
+the invariant holds; the probe shows it would catch a future change that let a
+pass resolve a proper subset without widening the target map. Full reasoning in
+`counterexamples/rewrite-target-matches-resolved-inputs-probe.md`.
+
+The invariant is added to `smoke.cfg`, `exhaustive.cfg`, and every
+`negative/*.cfg` (the negatives run the full smoke invariant list, finding 5),
+and a traceability row cites the content-addressed key derivation the property
+mirrors.
+
+### Figures and the bands
+
+Both changes leave the reachable state graph identical. `smoke.cfg` and
+`exhaustive.cfg` still reach `3587643` distinct states at depth 30, the same as
+round eleven, so `bands.tsv` is unchanged at `3583300`-`3592000`, depth 30, for
+both configs. Adding an invariant checks states without constraining them, and
+naming `maintVars` is the same constraint as the five explicit names, so no
+movement was expected and none occurred.
+
+### Documentation reconciled
+
+`README.md` now reads seventeen safety invariants (TypeOK plus sixteen named),
+lists `RewriteTargetMatchesResolvedInputs`, describes it, and records its
+probe-based non-vacuity in the Non-vacuity section; the negative-controls
+section reads all seventeen INVARIANT lines. `traceability.md` gains the
+matching row (21 rows now resolve, from 20). README, `results.md`, and
+`bands.tsv` agree on the current figures: `3587643` distinct, depth `30`, band
+`3583300`-`3592000`.
+
+### Execution note
+
+TLC ran this round. The fleet executor carried no Java runtime, so a Temurin
+JRE 21 was fetched from Adoptium into `/tmp` and passed through
+`RAVEL_TLA_JAVA`; nothing from `/tmp` or `.cache` is committed. `scripts/check-tla.sh
+ci` PASS (lifecycle smoke `states=24004521 distinct=3587643 depth=30`, 89s; all
+eight negative controls VIOLATED as expected with their named target;
+traceability 21 rows resolve; every other area's smoke, negatives, and
+traceability also pass) and `scripts/check-tla.sh exhaustive -a lifecycle` PASS
+(`states=24004521 distinct=3587643 depth=30`, 1075s, liveness under `FairSpec`
+included). The three probe runs above were measured on the same runtime with
+`-workers 2 -Xmx2g`. `python3 scripts/check_docs.py` exit 0, `docs gate:
+clean.`.

@@ -272,8 +272,14 @@ vars == <<store, lastModified, versionCounter, uploads, listState,
 
 \* The maintenance-pass bookkeeping (who holds the lease, how far each pass got,
 \* and the input sets each pass resolved). Every action that is not a maintenance
-\* pass leaves all five alone, so it is worth a name rather than five entries on a
-\* dozen UNCHANGED lists.
+\* pass leaves all five alone and names this tuple in its UNCHANGED list, rather
+\* than spelling out five entries on each of a dozen lists. The passes that assign
+\* a subset of the five (StartRewrite, PublishRewrite, ExpireLease, and the three
+\* compaction actions) keep an explicit list of the ones they leave alone: naming
+\* maintVars there would double-constrain a variable the action also sets. An
+\* omission from an UNCHANGED list does not fail to parse; it lets the variable
+\* take any value in the step, so the tuple has to be spelled out somewhere for
+\* every action, and using the name is what keeps the two forms from drifting.
 maintVars == <<leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
 
 S == INSTANCE RavelObjectStore
@@ -499,7 +505,7 @@ Tick ==
     /\ UNCHANGED <<head, headState, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 \* Pin an in-flight query at the current HEAD; its deadline is pin + mqd. It is
@@ -514,7 +520,7 @@ PinQuery ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 ExpireQuery ==
@@ -525,7 +531,7 @@ ExpireQuery ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 \* Place / release a legal hold on bucket b (its data prefixes).
@@ -536,7 +542,7 @@ PlaceHold(b) ==
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 ReleaseHold(b) ==
@@ -546,7 +552,7 @@ ReleaseHold(b) ==
     /\ UNCHANGED <<head, headState, clock, superseded,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 \* The HEAD object read can fail (unreadable) or find the HEAD gone (absent).
@@ -567,7 +573,7 @@ SetHeadState(s) ==
     /\ UNCHANGED <<head, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 \* Toggle this tick's legal-hold refresh outcome.
@@ -579,7 +585,7 @@ SetRefresh(f) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 --------------------------------------------------------------------------------
@@ -596,7 +602,7 @@ RequestErasure ==
     /\ dreqHorizon' = clock + DreqHorizonDelta
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, tombRetiredAt, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 \* --- Live input resolution (resolve_live_inputs) ------------------------------
@@ -843,7 +849,7 @@ HeadAdvanceRewrite ==
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 \* Complete the erasure: write .done only when the served set no longer serves the
@@ -864,7 +870,7 @@ CompleteErasure ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ CompletionWitness
 
 --------------------------------------------------------------------------------
@@ -879,7 +885,7 @@ RetireBucket ==
     /\ tombRetiredAt' = [tombRetiredAt EXCEPT !["b1"] = clock]
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 \* Fold reconciles a retired bucket out of the HEAD; it may lag (a late fold) and
@@ -895,7 +901,7 @@ DropRetiredBucketFromHead ==
     /\ UNCHANGED <<headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
     /\ NoGc
 
 \* Retention physical sweep of one b1 data object. Gates on now >= retired_at +
@@ -930,7 +936,7 @@ RetentionSweep(o) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
 
 \* Final tombstone delete (finding 3, round four): physical_sweep deletes the
 \* bucket's data, verifies via bucket_is_empty_but_tombstone that only the
@@ -952,7 +958,7 @@ SweepTombstone ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
 
 --------------------------------------------------------------------------------
 \* Physical GC actor (maintainer): superseded-input sweep and .dreq sweep
@@ -983,7 +989,7 @@ SupersededSweep(o) ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
 
 \* .dreq sweep: delete the .dreq when a matching .done exists, its completed
 \* timestamp is non-zero, the horizon has passed, no reader (the current HEAD or
@@ -1009,7 +1015,7 @@ DreqSweep ==
     /\ UNCHANGED <<head, headState, clock, superseded, heldBuckets,
                    refreshFailed, query, erasureRequested, tombRetiredAt,
                    dreqHorizon, doneAt, sysgc, supersededAt, objContent, variantKey,
-                   leaseOwner, rwPhase, rwInputs, cmpPhase, cmpInputs>>
+                   maintVars>>
 
 --------------------------------------------------------------------------------
 Next ==
@@ -1133,6 +1139,29 @@ RewriteOutputsAreInputsMinusErased ==
                 ServesSubject(w, s) <=>
                     ( (\E i \in Predecessors(w) : ServesSubject(i, s))
                       /\ s \notin ErasedBy(AppliedReqs(w)) )
+
+\* The target a resolved input set selects is the record set whose static
+\* predecessors ARE that resolved set. TargetOf maps every resolved set other than
+\* CompactOut to rwA, and PublishRewrite writes objContent'[tgt] from
+\* RecordSetContent(tgt), which reads the static Predecessors(tgt); the published
+\* content and the variant naming are only sound when the target's predecessors
+\* equal the set the pass actually resolved. In this instance RawInputs and
+\* CompactOut are the only resolvable input sets and each maps to a target whose
+\* predecessors match it, so the link holds -- but it holds because those two sets
+\* are singletons, not because the mapping checks anything. In a larger instance a
+\* pass that resolved a proper subset of RawInputs would still target rwA (the
+\* catch-all branch of TargetOf) and publish content derived from the full
+\* RawInputs, and RewriteOutputsAreInputsMinusErased, which reads the same static
+\* predecessors, would then pass for a rewrite that never happened. This invariant
+\* makes that agreement a checked precondition rather than a coincidence: for every
+\* identity whose publish has run, the target's predecessors equal the resolved
+\* input set the pass recorded. counterexamples/rewrite-target-matches-resolved-inputs-probe.md
+\* resolves a proper subset in a two-raw-input scratch, shows this VIOLATED on the
+\* current mapping, then holding once the target names the resolved set.
+RewriteTargetMatchesResolvedInputs ==
+    \A id \in RewriteIds :
+        rwPhase[id] = "done" =>
+            Predecessors(TargetOf(rwInputs[id])) = rwInputs[id]
 
 \* At most one record set a reader can be served from references objects that a
 \* completed rewrite has already superseded (issue #1289).
