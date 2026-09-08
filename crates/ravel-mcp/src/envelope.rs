@@ -1250,6 +1250,48 @@ mod tests {
         assert_eq!(ts_cell.parse::<i64>().expect("round-trips"), ts_ns);
     }
 
+    /// JSON has no NaN or infinity, so the three non-finite floats travel
+    /// as the strings PromQL already uses for them, and a NaN payload
+    /// collapses to the same `"NaN"` rather than to null. `-0.0` is the
+    /// opposite case: it is a finite number and must stay one, with its
+    /// sign, because `-0.0` and `0.0` are distinct values in storage and
+    /// dedup paths and the wire form is where the sign is lost.
+    #[test]
+    fn float_to_json_keeps_nan_inf_and_negative_zero() {
+        assert_eq!(float_to_json(f64::NAN), Value::String("NaN".to_string()));
+        assert_eq!(
+            float_to_json(f64::from_bits(0x7ff8_0000_0000_0001)),
+            Value::String("NaN".to_string())
+        );
+        assert_eq!(
+            float_to_json(f64::INFINITY),
+            Value::String("+Inf".to_string())
+        );
+        assert_eq!(
+            float_to_json(f64::NEG_INFINITY),
+            Value::String("-Inf".to_string())
+        );
+
+        let negative_zero = float_to_json(-0.0);
+        let number = negative_zero
+            .as_f64()
+            .expect("-0.0 must stay a JSON number");
+        assert_eq!(number.to_bits(), (-0.0f64).to_bits());
+        assert_ne!(number.to_bits(), 0.0f64.to_bits());
+
+        let row = vec![
+            Cell::Float(f64::NAN),
+            Cell::Float(f64::INFINITY),
+            Cell::Float(f64::NEG_INFINITY),
+            Cell::Float(-0.0),
+            Cell::Float(0.0),
+        ];
+        assert_eq!(
+            serde_json::to_string(&row).expect("row serializes"),
+            r#"["NaN","+Inf","-Inf",-0.0,0.0]"#
+        );
+    }
+
     /// An envelope no cap stopped is `ok`, and it stays `ok` with zero rows:
     /// D4 counts a zero-row match and an unfilled `LIMIT` as complete
     /// results, not as bounded ones.
