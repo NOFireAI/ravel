@@ -113,11 +113,8 @@ pub fn store_and_metrics_from_env(
 /// this -- MinIO is valid for correctness, conformance and CI, never for a
 /// performance or cost claim, because removing per-request fees is what
 /// makes a request-count defect invisible), true only for real S3 with no
-/// endpoint override. The one place every `--store`-driven bin derives this
-/// instead of re-deriving it from `StoreKind` alone (issue #1352: two sites,
-/// `metricsbench_ingest` and `bench_report`, derived it as `matches!(store,
-/// StoreKind::S3)`, which is also true against a billed-nothing MinIO
-/// endpoint).
+/// endpoint override. The one place every `--store`-driven bin derives this,
+/// rather than re-deriving it from `StoreKind` alone.
 pub fn backend_bills_requests(kind: StoreKind) -> bool {
     backend_bills_requests_from_lookup(kind, |key| std::env::var(key).ok())
 }
@@ -239,9 +236,6 @@ mod tests {
         assert_eq!(cfg.auth, S3AuthMode::Static);
     }
 
-    /// Issue #1352: `matches!(args.store, StoreKind::S3)` alone reported the
-    /// nightly MinIO lane (S3 protocol, `RAVEL_S3_ENDPOINT=http://
-    /// localhost:9000`) as billing requests, when MinIO bills nothing.
     /// `backend_bills_requests` is true only for real S3 with no endpoint
     /// override; a configured endpoint or a `MemoryStore` are both false.
     #[test]
