@@ -7,11 +7,13 @@ the data PUT's response.
 
 Violated invariant: `PutDataLostResponseUnreachable` (safety, TLC exit 12).
 
-Trace, in prose: writer `w1` issues the data PUT for its flush on shard
-`s1`; the object store durably writes the object but the response back to
-the writer is lost. The writer, having no acknowledgement, retries. That is
-the `PutDataLostResponse` state the invariant says must not exist, and TLC
-finds it in two steps (2 states generated, 2 distinct, depth 2).
+Trace, in prose: writer `w1` pins a flush, issues the data PUT for it on
+shard `s1`; the object store durably writes the object but the response
+back to the writer is lost. The writer, having no acknowledgement, retries.
+The invariant is a post-state check on `faultFired`, the execution witness
+`PutDataLostResponse` alone sets, so TLC reports it violated only once that
+transition actually fires, at depth 3 (PinFlush, PutDataLostResponse; 11
+states generated, 11 distinct).
 
 The obligation is correct exactly because TLC reports it violated: a model
 where a lost data-PUT response could never happen would leave this green,
