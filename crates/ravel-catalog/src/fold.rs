@@ -12,7 +12,7 @@
 //! error; it never corrupts HEAD or leaves a torn snapshot visible.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -577,6 +577,20 @@ fn incremental_buckets(
 /// hard-fail every query permanently).
 fn fold_shard_ceiling(generations: &[ShardGeneration], watermark_hour: u32) -> u32 {
     crate::provisioning::shard_ceiling(generations, watermark_hour)
+}
+
+/// The number of bytes a protobuf varint encodes `v` in: 7 payload bits per
+/// byte, continuation bit set on every byte but the last. Used by the
+/// per-part column-stats degrade loop to track, without re-encoding, how a
+/// message's own length-delimiter width changes when its content shrinks.
+fn varint_len(v: u64) -> u64 {
+    let mut len = 1u64;
+    let mut rest = v >> 7;
+    while rest > 0 {
+        len += 1;
+        rest >>= 7;
+    }
+    len
 }
 
 /// One part's span in the fully-sorted entry set: the `[start, end)` index
@@ -1515,36 +1529,89 @@ impl Catalog {
                     // While the segments' uncompressed body -- measured
                     // exactly as the encoder will measure it -- exceeds the
                     // ceiling, drop the largest remaining dictionary (by its
-                    // own encoded size) and re-measure. min/max/count/sum are
-                    // never touched: only `dictionary_present`/`dictionary`
-                    // are cleared, the same omitted-dictionary shape ADR-0850
-                    // decision 3 already uses for the cardinality ceiling.
-                    // Only once no dictionary is left does
-                    // `encode_column_stats_v3` below refuse.
+                    // own encoded size). min/max/count/sum are never touched:
+                    // only `dictionary_present`/`dictionary` are cleared, the
+                    // same omitted-dictionary shape ADR-0850 decision 3
+                    // already uses for the cardinality ceiling. Only once no
+                    // dictionary is left does `encode_column_stats_v3` below
+                    // refuse.
+                    //
+                    // #1482: the naive form of this loop re-measured the
+                    // WHOLE part's uncompressed body
+                    // (`column_stats_segments_concat`, a fresh multi-gigabyte
+                    // `Vec`) and re-summed every dictionary's `encoded_len`
+                    // on every single drop; a part needing tens of thousands
+                    // of drops never finished. Instead, every (segment,
+                    // column) pair's exact contribution to the body is
+                    // measured once, kept in a max-heap, and a running total
+                    // is adjusted by exactly the bytes each drop removes: the
+                    // `DictEntry` bytes and the `dictionary_present` flag,
+                    // plus any varint length-delimiter shrink on the
+                    // enclosing `ColumnStat` and on the segment's own
+                    // length-delimited framing (`encode_length_delimited_to_vec`,
+                    // per `column_stats_segments_concat`). Popping by
+                    // `(dict_size, seg_idx, col_idx)`'s natural tuple max
+                    // reproduces the old `max_by_key`'s tie-break exactly:
+                    // largest size first, then the last maximum in ascending
+                    // (seg_idx, col_idx) order.
                     let ceiling = self.column_stats_part_ceiling();
-                    let mut dropped_this_part: u64 = 0;
-                    while column_stats_segments_concat(&v3_segments).len() as u64 > ceiling {
-                        let largest = v3_segments
-                            .iter()
-                            .enumerate()
-                            .flat_map(|(seg_idx, seg)| {
-                                seg.columns
+                    let mut segment_len: Vec<u64> = v3_segments
+                        .iter()
+                        .map(|seg| prost::Message::encoded_len(seg) as u64)
+                        .collect();
+                    let mut running_total: u64 =
+                        segment_len.iter().map(|&len| varint_len(len) + len).sum();
+                    let mut heap: BinaryHeap<(u64, usize, usize, u64)> = BinaryHeap::new();
+                    for (seg_idx, seg) in v3_segments.iter().enumerate() {
+                        for (col_idx, col) in seg.columns.iter().enumerate() {
+                            if !col.dictionary_present {
+                                continue;
+                            }
+                            let dict_size: u64 = col
+                                .dictionary
+                                .iter()
+                                .map(|e| prost::Message::encoded_len(e) as u64)
+                                .sum();
+                            // Bytes the `ColumnStat`'s own body shrinks by:
+                            // the `dictionary_present` flag (proto3 omits a
+                            // false bool, so tag + varint(true) = 2 bytes
+                            // recovered) plus each `DictEntry`'s own
+                            // tag + length-varint + content.
+                            let dict_content_shrink: u64 = 2
+                                + col
+                                    .dictionary
                                     .iter()
-                                    .enumerate()
-                                    .filter(|(_, col)| col.dictionary_present)
-                                    .map(move |(col_idx, col)| {
-                                        let size: usize = col
-                                            .dictionary
-                                            .iter()
-                                            .map(prost::Message::encoded_len)
-                                            .sum();
-                                        (size, seg_idx, col_idx)
+                                    .map(|e| {
+                                        let entry_len = prost::Message::encoded_len(e) as u64;
+                                        1 + varint_len(entry_len) + entry_len
                                     })
-                            })
-                            .max_by_key(|(size, _, _)| *size);
-                        let Some((_, seg_idx, col_idx)) = largest else {
+                                    .sum::<u64>();
+                            let col_len_before = prost::Message::encoded_len(col) as u64;
+                            let col_len_after = col_len_before - dict_content_shrink;
+                            // The column's own embedding in `segment.columns`
+                            // (tag + length-varint + content): the content
+                            // shrink plus any varint-width drop in its own
+                            // length prefix.
+                            let seg_reduction = dict_content_shrink
+                                + (varint_len(col_len_before) - varint_len(col_len_after));
+                            heap.push((dict_size, seg_idx, col_idx, seg_reduction));
+                        }
+                    }
+
+                    let mut dropped_this_part: u64 = 0;
+                    while running_total > ceiling {
+                        let Some((_, seg_idx, col_idx, seg_reduction)) = heap.pop() else {
                             break;
                         };
+                        let seg_len_before = segment_len[seg_idx];
+                        let seg_len_after = seg_len_before - seg_reduction;
+                        // Any varint-width drop in the segment's own
+                        // length-delimited framing shrinks the body by that
+                        // much more than the column's own contribution.
+                        let body_reduction = seg_reduction
+                            + (varint_len(seg_len_before) - varint_len(seg_len_after));
+                        running_total -= body_reduction;
+                        segment_len[seg_idx] = seg_len_after;
                         let col = &mut v3_segments[seg_idx].columns[col_idx];
                         col.dictionary_present = false;
                         col.dictionary.clear();
@@ -1559,6 +1626,21 @@ impl Catalog {
                             "per-part column-stats degrade dropped dictionaries to fit the ceiling"
                         );
                         column_stats_dictionaries_dropped += dropped_this_part;
+                    }
+                    // The incremental accounting above must agree exactly
+                    // with what the encoder measures. Re-measuring once here
+                    // (not on every drop) turns a drift between the two into
+                    // an explicit refusal carrying both figures, rather than
+                    // either stopping early on a still-over-ceiling body or
+                    // silently publishing one.
+                    let measured_total = column_stats_segments_concat(&v3_segments).len() as u64;
+                    if measured_total != running_total {
+                        return Err(CatalogError::FieldMismatch {
+                            key: part_key.clone(),
+                            field: "column_stats_degrade_running_total",
+                            expected: running_total.to_string(),
+                            actual: measured_total.to_string(),
+                        });
                     }
                     let stats_bytes = snapshot_format::encode_column_stats_v3(
                         tenant.0,
