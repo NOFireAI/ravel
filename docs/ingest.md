@@ -565,9 +565,12 @@ decompression whose running total would cross the ceiling is shed mid-inflate
 full expansion first. Charging the produced bytes, not the 64 MiB cap and not a
 compressed-size estimate, keeps the charge equal to the actual inflated length
 (no over-charge of a well-compressing request). The gateway holds that charge
-through protobuf decode and normalize and drops it once the router has taken its
-own buffered charge, so the peak decode-time bytes are accounted for their whole
-lifetime. The identity (uncompressed) path allocates no transient inflate buffer
+through protobuf decode and releases it at the instant it drops the raw inflate
+buffer -- once prost has copied it into owned structs, before the router takes
+its own buffered charge -- so a single request's inflate charge and buffered
+charge never coexist (the gauge counts concurrent inflate buffers, not one
+request's bytes twice). The identity (uncompressed) path allocates
+no transient inflate buffer
 and takes no gateway charge; its decoded body is bounded by the 16 MiB body
 limit and `--max-inflight-ingest-requests` (term 2 below). The OTLP gRPC and
 Remote Write decode paths are unchanged by this amendment and remain term 2.

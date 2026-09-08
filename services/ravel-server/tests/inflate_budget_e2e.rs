@@ -7,10 +7,19 @@
 //! `--max-inflight-ingest-requests` copies of it could exist at once, 64 GiB at
 //! the default, and the flag that claims to bound ingest memory did not.
 //!
-//! Both tests drive real HTTP against a full server. The concurrency test holds
-//! the first request mid-flush with a `FaultStore` hold gate (the same
-//! discipline as `ingest_concurrency_e2e.rs`) so its budget charge stays held
-//! while the second request is admitted or shed.
+//! Every test drives real HTTP against a full server. The accept and
+//! concurrency tests hold a request mid-flush with a `FaultStore` hold gate (the
+//! same discipline as `ingest_concurrency_e2e.rs`) so its router buffered charge
+//! stays held while the in-flight gauge is read or a second request is shed.
+//!
+//! Issue #1297 finding 3: the gateway releases the transient inflate charge when
+//! it drops the raw inflate buffer after decode, before the router takes its own
+//! buffered charge, so a single request's inflate and batch terms never coexist.
+//! The accept test proves a request whose two terms each fit but whose sum
+//! exceeds the ceiling is admitted; the concurrency test proves genuine
+//! simultaneous pressure (one request's held batch plus another's inflate) is
+//! still shed. Both size the ceiling strictly between max(inflate, batch) and
+//! their sum, from a router charge measured on a throwaway server.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -226,6 +235,56 @@ fn post_gzip(client: &reqwest::Client, base: &str, body: Vec<u8>) -> reqwest::Re
         .body(body)
 }
 
+/// The router buffered charge (`ravel_ingest_buffer_bytes`) that a normalized
+/// batch of `points` metric points holds, measured on a throwaway server with a
+/// generous budget by parking one request on a held flush. This is the
+/// "normalized batch" term the budget attributes to the request; a later
+/// tight-budget ceiling is sized strictly between it and the inflated body
+/// length so the two terms' sum crosses while each alone fits.
+///
+/// Measured with an identity (uncompressed) body, which takes no inflate charge,
+/// so the reading is the router charge alone. The estimate is a function of the
+/// batch shape, so a same-shape gzip request on another server holds the exact
+/// same router charge.
+async fn measured_router_charge(points: usize) -> u64 {
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    let running = start_test_server(store, IngestByteBudgetLimit::Bounded(256 * 1024 * 1024)).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
+    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let body = compressible_request(points).encode_to_vec();
+    let task = {
+        let client = client.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("{base}/v1/metrics"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/x-protobuf")
+                .body(body)
+                .send()
+                .await
+                .expect("measurement export completes once released")
+        })
+    };
+    assert!(
+        wait_for_buffered_items(&client, &base, points as u64).await >= points as u64,
+        "the measurement request must buffer its points and hold its charge"
+    );
+    let charge = metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await;
+    assert!(
+        charge > 0,
+        "the buffered batch holds a nonzero router charge"
+    );
+    drain_until_done(&gate, std::slice::from_ref(&task)).await;
+    assert_eq!(task.await.expect("task joins").status(), 200);
+    running.shutdown().await.expect("graceful shutdown");
+    charge
+}
+
 /// A gzip body whose inflate crosses the ceiling is shed with 429 + Retry-After
 /// *before* it finishes inflating, and the buffer-budget shed counter reads
 /// exactly 1. The body is a zeros bomb: it inflates well past the 1 MiB ceiling
@@ -288,31 +347,25 @@ async fn gzip_body_is_charged_against_the_budget_before_it_inflates() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// With the first request held mid-flush, a second concurrent gzip request is
-/// shed with 429 because the two requests' summed charges cross the ceiling,
-/// while the first still completes 200 once released and the same second body
-/// succeeds on its own afterwards (proving it only shed because of the sum).
+/// Issue #1297 finding 3: a single gzip request whose inflate and normalized
+/// batch each fit the budget but whose sum exceeds it is NOT shed, because at no
+/// instant are both live. The gateway releases the inflate charge when it drops
+/// the raw inflate buffer after decode, before the router charges the normalized
+/// batch, so the request's peak contribution to the gauge is the larger of the
+/// two terms, not their sum. Held mid-flush through the FaultStore gate, the
+/// in-flight gauge reads exactly the router charge (the single live charge),
+/// with the inflate charge already released.
 ///
-/// The in-flight byte gauge is read while the first request is held and its
-/// gzip decode charge is isolated exactly: the same body sent uncompressed
-/// (identity) holds only the router's buffered charge, so the gzip request's
-/// held bytes minus the identity request's held bytes equal the decompressed
-/// body length to the byte.
-///
-/// Non-vacuity: revert the per-chunk `budget.try_charge` and the gzip request
-/// holds no decode charge, so `gzip_held - identity_held` is 0 rather than the
-/// inflated length, and the isolation assertion fails.
+/// Non-vacuity (the flip is holding the inflate charge through normalize again):
+/// keep `decode_charge` alive across `handle_export` in `export_metrics` and the
+/// request's inflate plus batch cross the ceiling, so it sheds at the router
+/// charge (429) and never buffers -- the `wait_for_buffered_items` assertion,
+/// the 200, and the exact-charge assertion all fail.
 #[tokio::test]
-async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() {
-    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
-    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
-    // 3 MiB ceiling: one request's charge (~2.1 MiB below) fits, two do not.
-    let running = start_test_server(store, IngestByteBudgetLimit::Bounded(3 * 1024 * 1024)).await;
-    let base = format!("http://{}", running.http_addr);
-    let client = reqwest::Client::new();
-
-    let request = compressible_request(20_000);
-    let encoded = request.encode_to_vec();
+async fn a_request_whose_inflate_and_batch_each_fit_is_not_shed_for_their_sum() {
+    let points = 20_000;
+    let router_charge = measured_router_charge(points).await;
+    let encoded = compressible_request(points).encode_to_vec();
     let inflated_len = encoded.len() as u64;
     let compressed = gzip(&encoded);
     assert!(
@@ -321,55 +374,137 @@ async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() 
         compressed.len()
     );
 
-    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
+    // A ceiling strictly between max(inflate, batch) and their sum: each term
+    // alone fits, the sum does not.
+    let hi = router_charge.max(inflated_len);
+    let lo = router_charge.min(inflated_len);
+    assert!(lo >= 2, "both terms must be nonzero to size the ceiling");
+    let ceiling = hi + lo / 2;
+    assert!(
+        ceiling > hi && ceiling < router_charge + inflated_len,
+        "ceiling {ceiling} must sit strictly between max({router_charge}, {inflated_len}) and their sum"
+    );
 
-    // --- Control: the same body, uncompressed. The identity path takes no
-    // decode charge, so the held in-flight bytes are the router's buffered
-    // charge alone. ---
-    let gate = fault.hold(Op::Put, Some(data_key_prefix.clone()), Occurrence::Always);
-    let identity_body = encoded.clone();
-    let identity_task = {
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    let running = start_test_server(store, IngestByteBudgetLimit::Bounded(ceiling)).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
+    let shed_before = metric_value(
+        &client,
+        &base,
+        "ravel_ingest_buffer_shed_total{mode=\"all\"}",
+    )
+    .await;
+
+    let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
+    let gzip_body = compressed.clone();
+    let task = {
         let client = client.clone();
         let base = base.clone();
         tokio::spawn(async move {
-            client
-                .post(format!("{base}/v1/metrics"))
-                .header("authorization", format!("Bearer {TOKEN}"))
-                .header("content-type", "application/x-protobuf")
-                .body(identity_body)
+            post_gzip(&client, &base, gzip_body)
                 .send()
                 .await
-                .expect("identity export completes once released")
+                .expect("gzip export completes once released")
         })
     };
-    // `buffered_items_total` is a cumulative point count; one request buffers
-    // all 20_000 of its points, and the counter never decreases.
+    // The request buffers, so it passed BOTH the inflate charge and the router
+    // charge without being shed, even though their sum exceeds the ceiling.
     assert!(
-        wait_for_buffered_items(&client, &base, 20_000).await >= 20_000,
-        "the identity request must buffer its points and hold its charge"
+        wait_for_buffered_items(&client, &base, points as u64).await >= points as u64,
+        "the single gzip request buffers: it is not shed for the sum of its two terms"
     );
-    let identity_held =
-        metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await;
     assert!(
-        identity_held > 0,
-        "the identity request holds a router buffered charge"
+        !task.is_finished(),
+        "the request is parked on the held flush, not shed"
     );
-    drain_until_done(&gate, std::slice::from_ref(&identity_task)).await;
-    assert_eq!(
-        identity_task.await.expect("task joins").status(),
-        200,
-        "the control request succeeds once released"
-    );
-    // Wait for the flush to drain so the budget returns to baseline.
-    for _ in 0..1_000 {
-        if metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 
-    // --- Test: the gzip body, held. Its held bytes are the decode charge
-    // (inflated length) plus the same router buffered charge as the control. ---
+    // Mid-flight the only live charge is the router buffered charge: the inflate
+    // charge was released when the raw buffer was dropped after decode.
+    let in_flight = metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await;
+    assert_eq!(
+        in_flight, router_charge,
+        "the in-flight gauge equals the single live (router) charge exactly; the inflate charge is gone"
+    );
+    let shed_mid = metric_value(
+        &client,
+        &base,
+        "ravel_ingest_buffer_shed_total{mode=\"all\"}",
+    )
+    .await;
+    assert_eq!(
+        shed_mid, shed_before,
+        "no shed while the single request is admitted"
+    );
+
+    drain_until_done(&gate, std::slice::from_ref(&task)).await;
+    assert_eq!(
+        task.await.expect("task joins").status(),
+        200,
+        "the request completes 200 once released"
+    );
+
+    let shed_after = metric_value(
+        &client,
+        &base,
+        "ravel_ingest_buffer_shed_total{mode=\"all\"}",
+    )
+    .await;
+    assert_eq!(
+        shed_after, shed_before,
+        "the shed counter is unchanged: a request whose inflate and batch each fit is not shed for their sum"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// Issue #1297 finding 3, the concurrency complement of the accept case above:
+/// genuine simultaneous pressure is still caught. With one gzip request held
+/// mid-flush -- holding its router buffered charge, its inflate charge already
+/// released -- a second concurrent gzip request whose inflate summed with the
+/// held charge crosses the ceiling is shed with 429. The held request's
+/// in-flight bytes read exactly the router charge, proving its inflate charge is
+/// no longer live; the shed is driven by two charges that ARE simultaneously
+/// live (the first's buffered batch and the second's inflate). Released, the
+/// first completes 200 and the same body succeeds on its own, proving it only
+/// shed because of the concurrent sum.
+///
+/// Non-vacuity: hold `decode_charge` through normalize in `export_metrics` and
+/// the first request's own inflate plus batch already cross the ceiling, so it
+/// sheds at its router charge and never reaches the held flush -- the
+/// `wait_for_buffered_items` and exact-charge assertions fail.
+#[tokio::test]
+async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() {
+    let points = 20_000;
+    let router_charge = measured_router_charge(points).await;
+    let encoded = compressible_request(points).encode_to_vec();
+    let inflated_len = encoded.len() as u64;
+    let compressed = gzip(&encoded);
+    assert!(
+        compressed.len() < encoded.len(),
+        "fixture must compress: compressed={} decompressed={inflated_len}",
+        compressed.len()
+    );
+
+    let hi = router_charge.max(inflated_len);
+    let lo = router_charge.min(inflated_len);
+    assert!(lo >= 2, "both terms must be nonzero to size the ceiling");
+    let ceiling = hi + lo / 2;
+    assert!(
+        ceiling > hi && ceiling < router_charge + inflated_len,
+        "ceiling {ceiling} must sit strictly between max({router_charge}, {inflated_len}) and their sum"
+    );
+
+    let fault = Arc::new(FaultStore::new(MemoryStore::new(), Default::default()));
+    let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+    let running = start_test_server(store, IngestByteBudgetLimit::Bounded(ceiling)).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let data_key_prefix = format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex());
     let gate = fault.hold(Op::Put, Some(data_key_prefix), Occurrence::Always);
     let gzip_body = compressed.clone();
     let held_task = {
@@ -382,21 +517,22 @@ async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() 
                 .expect("held gzip export completes once released")
         })
     };
-    // The gzip request adds its own 20_000 points on top of the control's.
     assert!(
-        wait_for_buffered_items(&client, &base, 40_000).await >= 40_000,
-        "the gzip request must buffer its points and hold its charge"
+        wait_for_buffered_items(&client, &base, points as u64).await >= points as u64,
+        "the first gzip request buffers and holds its router charge"
     );
     assert!(
         !held_task.is_finished(),
-        "the first gzip request must still be in flight, blocked on the held flush"
+        "the first request is parked on the held flush"
     );
-    let gzip_held = metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await;
+
+    // The held request holds only its router charge -- its inflate charge was
+    // released after decode -- so the gauge reads the router charge exactly, not
+    // the router charge plus the inflated length.
+    let held = metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await;
     assert_eq!(
-        gzip_held - identity_held,
-        inflated_len,
-        "the gzip request's held bytes exceed the identity request's by exactly the \
-         decompressed body length (the transient decode charge)"
+        held, router_charge,
+        "the held request's live bytes are the router charge alone; the inflate charge is released"
     );
 
     let shed_before = metric_value(
@@ -406,8 +542,8 @@ async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() 
     )
     .await;
 
-    // The second concurrent gzip request: its charge summed with the held
-    // first request's crosses the 3 MiB ceiling, so it is shed.
+    // The second concurrent request: its inflate summed with the first's held
+    // router charge crosses the ceiling, so it is shed mid-inflate.
     let second = post_gzip(&client, &base, compressed.clone())
         .send()
         .await
@@ -415,7 +551,7 @@ async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() 
     assert_eq!(
         second.status(),
         429,
-        "the second concurrent request is shed once the sum crosses the ceiling"
+        "the second concurrent request is shed once the genuine simultaneous peak crosses the ceiling"
     );
 
     let shed_after = metric_value(
@@ -437,7 +573,7 @@ async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() 
         200,
         "the first request succeeds once released"
     );
-    // Drain to baseline again.
+    // Drain to baseline.
     for _ in 0..1_000 {
         if metric_value(&client, &base, "ravel_ingest_buffer_bytes{mode=\"all\"}").await == 0 {
             break;
@@ -445,9 +581,9 @@ async fn second_concurrent_inflate_sheds_when_the_sum_would_cross_the_ceiling() 
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    // The same body succeeds on its own: it only shed because of the sum. The
-    // hold gate is still armed (Occurrence::Always), so drive it through the
-    // drain the same way, then assert it was admitted (200), not shed (429).
+    // The same body succeeds on its own: it only shed because of the concurrent
+    // sum. The hold gate is still armed (Occurrence::Always), so drive it
+    // through the drain the same way, then assert 200, not 429.
     let alone_body = compressed.clone();
     let alone_task = {
         let client = client.clone();
