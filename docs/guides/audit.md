@@ -28,7 +28,9 @@ deployment that has taken those actions.
 
 Attributes:
 
-- `query.language`: the query language, `sql` today.
+- `query.language`: the query language or surface that produced the record:
+  `sql`, `promql`, `labels`, `label_values`, `series`, `analytics`, or
+  `exemplars`.
 - `query.tenant`: the hex hash of the resolved tenant, so the record is
   attributed to the tenant Ravel authenticated rather than to any identity the
   client claimed.
