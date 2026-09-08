@@ -3606,6 +3606,14 @@ impl Cli {
         // pre-flight failure, like --limits-file and the credential files.
         self.resolve_store_cost_profile()?;
 
+        // Resolve here for the same reason: the `ServerConfig` build site
+        // (main.rs) runs after startup has already pinned the tenancy marker
+        // and written key-epoch state, so a bad --audit-max-batch/
+        // --audit-max-age must fail before any of that, not after. This does
+        // not resolve --audit-text: that needs the deployment key, which
+        // isn't available yet at this point in startup.
+        self.resolve_audit_pipeline_config()?;
+
         if self.max_inflight_flushes == 0 {
             anyhow::bail!(
                 "--max-inflight-flushes '0' would deadlock every flush: a shard could never \
@@ -7425,6 +7433,26 @@ mod tests {
         assert!(
             err.to_string().contains("--catalog-resolve-concurrency"),
             "expected the catalog-resolve-concurrency error, got: {err}"
+        );
+    }
+
+    /// `--audit-max-batch 0` must be rejected here, at `Cli::validate`, not
+    /// only later when `main` builds `ServerConfig` -- by then startup has
+    /// already pinned the tenancy marker and written key-epoch state.
+    /// Deleting the `resolve_audit_pipeline_config()?` line added to
+    /// `Cli::validate` leaves this test green (startup still fails, just
+    /// later, through the `main.rs` call site's own check) -- this test pins
+    /// the flag-level rejection specifically.
+    #[test]
+    fn audit_max_batch_zero_is_rejected_at_startup() {
+        let cli = Cli::try_parse_from(["ravel-server", "--audit-max-batch", "0"])
+            .expect("flag parses at the CLI layer");
+        let err = cli
+            .validate()
+            .expect_err("startup must reject --audit-max-batch 0");
+        assert!(
+            err.to_string().contains("--audit-max-batch"),
+            "expected an --audit-max-batch error, got: {err}"
         );
     }
 
