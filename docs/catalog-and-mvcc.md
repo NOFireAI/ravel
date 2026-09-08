@@ -1447,14 +1447,18 @@ carries the decrease-specific straggler slack window.
 Queries dedup by (series_id, ts) under the provenance order
 (commit created_unix_ns, writer_epoch, writer_seq, in-page index); the
 greatest wins. Values compare by f64 bit pattern (ADR-0010 §5). The primary
-key `created_unix_ns` is the flush-open clock reading; each writer raises every
-reading to a per-writer monotonic floor within its process lifetime, so a
-backwards wall-clock step cannot stamp a correction below the stale sample it
-supersedes (ADR-1307). A step larger than a bounded hold (20 minutes) is
-refused rather than absorbed. The floor is per-process and resets on restart;
-a backwards step spanning a restart can still invert resolution, and
-`writer_id` does not prevent it, being only the segment-order tiebreak below
-and not part of this comparator (ADR-1307 Known limitation).
+key `created_unix_ns` is the flush-open clock reading; each ingest shard actor
+(metrics, logs, spans) raises every reading to a per-writer monotonic floor
+within its process lifetime, so a backwards wall-clock step cannot stamp a
+correction below the stale sample it supersedes (ADR-1307). A step larger than a
+bounded hold (the catalog clock-skew allowance, 5 min) is refused rather than
+absorbed. Only the ingest shard actors apply this floor: the maintenance writers
+(compaction, migration, erasure rewrite in `ravel-maintain`) mint their commit
+records' `created_unix_ns` from their own clock with no floor, and are not
+covered by this guarantee. The floor is per-process and resets on restart; a
+backwards step spanning a restart can still invert resolution, and `writer_id`
+does not prevent it, being only the segment-order tiebreak below and not part of
+this comparator (ADR-1307 Known limitation).
 
 That provenance order is not total across segments: two same-shard segments
 from different writers can tie on (created_unix_ns, writer_epoch, writer_seq)
