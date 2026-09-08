@@ -721,6 +721,54 @@ impl Envelope {
         }
         truncated
     }
+
+    /// Resolves `status` from what the caps and the cursor actually did, the
+    /// last step before a result is returned.
+    ///
+    /// D4 defines three success values and they are not interchangeable
+    /// (ADR-1374 D4, docs/reference/mcp.md#the-envelope):
+    ///
+    /// - `ok_page`: a cap stopped the result and a cursor exists, so the
+    ///   caller can ask for the next page.
+    /// - `ok_bounded`: a cap stopped the result and no cursor exists, so
+    ///   more rows match than were returned and there is no way to reach
+    ///   them but a narrower request.
+    /// - `ok`: no cap stopped the result. A zero-row match and an unfilled
+    ///   `LIMIT` are both complete results and both `ok`.
+    ///
+    /// `has_total_order` is the statement-level fact that decides whether a
+    /// cursor may be handed out at all: D5 mints one only when the ordering
+    /// plus its tiebreak is a total order, because a cursor over a partial
+    /// order can skip or repeat rows at the page boundary. A caller of this
+    /// method that has set `presentation.cursor` on a statement without a
+    /// total order gets the cursor dropped and `ok_bounded`, not `ok_page`:
+    /// the status and the cursor cannot disagree, and dropping is the safe
+    /// direction. A cursor set when no cap stopped the result is dropped for
+    /// the same reason -- there is no next page to point at.
+    ///
+    /// An `Error` envelope keeps its status and loses its cursor: a failure
+    /// is never a page.
+    pub fn finish(mut self, has_total_order: bool) -> Envelope {
+        if self.status == Status::Error || self.failure.is_some() {
+            self.status = Status::Error;
+            self.presentation.cursor = None;
+            return self;
+        }
+
+        let capped = self.presentation.row_cap_hit || self.presentation.bytes_cap_hit;
+        if !has_total_order || !capped {
+            self.presentation.cursor = None;
+        }
+
+        self.status = if self.presentation.cursor.is_some() {
+            Status::OkPage
+        } else if capped {
+            Status::OkBounded
+        } else {
+            Status::Ok
+        };
+        self
+    }
 }
 
 #[cfg(test)]
@@ -1200,5 +1248,109 @@ mod tests {
             .as_str()
             .expect("timestamp cell must be a JSON string");
         assert_eq!(ts_cell.parse::<i64>().expect("round-trips"), ts_ns);
+    }
+
+    /// An envelope no cap stopped is `ok`, and it stays `ok` with zero rows:
+    /// D4 counts a zero-row match and an unfilled `LIMIT` as complete
+    /// results, not as bounded ones.
+    #[test]
+    fn finish_is_ok_when_no_cap_stopped_the_result() {
+        let finished = Envelope::default().finish(true);
+        assert_eq!(finished.status, Status::Ok);
+        assert_eq!(finished.presentation.cursor, None);
+
+        let mut envelope = envelope_with_rows(3, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.max_rows = 200;
+        let finished = envelope.finish(true);
+        assert_eq!(finished.status, Status::Ok);
+        assert_eq!(finished.data.rows.len(), 3);
+    }
+
+    /// The row cap and the byte cap each stop a result on their own, and
+    /// either one without a cursor is `ok_bounded`: more rows match than
+    /// came back and nothing points at them.
+    #[test]
+    fn finish_is_ok_bounded_when_a_cap_stopped_the_result_without_a_cursor() {
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.row_cap_hit = true;
+        let finished = envelope.finish(false);
+        assert_eq!(finished.status, Status::OkBounded);
+        assert_eq!(finished.presentation.cursor, None);
+
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.bytes_cap_hit = true;
+        envelope.presentation.rows_omitted = 7;
+        let finished = envelope.finish(false);
+        assert_eq!(finished.status, Status::OkBounded);
+        assert_eq!(finished.presentation.rows_omitted, 7);
+    }
+
+    /// A cap stopped the result, the statement has a total order, and a
+    /// cursor was minted: that is the one combination that is `ok_page`, and
+    /// the cursor survives for the caller to redeem.
+    #[test]
+    fn finish_is_ok_page_when_a_cap_stopped_the_result_and_a_cursor_exists() {
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.row_cap_hit = true;
+        envelope.presentation.cursor = Some("cursor-token".to_string());
+
+        let finished = envelope.finish(true);
+
+        assert_eq!(finished.status, Status::OkPage);
+        assert_eq!(
+            finished.presentation.cursor.as_deref(),
+            Some("cursor-token")
+        );
+    }
+
+    /// D5 mints a cursor only over a total order, because a cursor over a
+    /// partial order can skip or repeat rows at the page boundary. A cursor
+    /// handed to `finish` for a statement without one is dropped and the
+    /// status degrades to `ok_bounded`; the status and the cursor never
+    /// disagree.
+    #[test]
+    fn finish_drops_a_cursor_when_the_ordering_is_not_total() {
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.row_cap_hit = true;
+        envelope.presentation.cursor = Some("cursor-token".to_string());
+
+        let finished = envelope.finish(false);
+
+        assert_eq!(finished.status, Status::OkBounded);
+        assert_eq!(finished.presentation.cursor, None);
+    }
+
+    /// A cursor with no cap behind it points at no next page, so it is
+    /// dropped and the result is the plain `ok` it is.
+    #[test]
+    fn finish_drops_a_cursor_when_no_cap_stopped_the_result() {
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        envelope.presentation.cursor = Some("cursor-token".to_string());
+
+        let finished = envelope.finish(true);
+
+        assert_eq!(finished.status, Status::Ok);
+        assert_eq!(finished.presentation.cursor, None);
+    }
+
+    /// A failure is never a page: an `Error` envelope keeps its status even
+    /// with both caps set, and loses any cursor on it.
+    #[test]
+    fn finish_preserves_an_error_status_and_drops_its_cursor() {
+        let mut envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i64)]);
+        envelope.status = Status::Error;
+        envelope.failure = Some(Failure {
+            class: FailureClass::BudgetExceeded,
+            message: "over budget".to_string(),
+            counter: None,
+        });
+        envelope.presentation.row_cap_hit = true;
+        envelope.presentation.bytes_cap_hit = true;
+        envelope.presentation.cursor = Some("cursor-token".to_string());
+
+        let finished = envelope.finish(true);
+
+        assert_eq!(finished.status, Status::Error);
+        assert_eq!(finished.presentation.cursor, None);
     }
 }

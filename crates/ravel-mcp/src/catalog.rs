@@ -46,14 +46,26 @@ pub struct ExplainQueryInput {
     pub time_range: TimeRange,
 }
 
+/// Every data-returning tool declares the same six lowerable budget knobs
+/// (docs/reference/mcp.md#budget-defaults-and-floors): `max_rows`,
+/// `max_bytes_scanned`, `max_store_requests`, `max_segments`,
+/// `max_response_bytes`, `deadline_ms`. An absent field resolves to its
+/// default or to the server ceiling, and a value above its ceiling clamps
+/// down; both happen in [`crate::budget::McpRequestBudgets::clamp`], never
+/// here. The fields are repeated per input struct rather than shared,
+/// because `tools/list` advertises each tool's input schema on its own and a
+/// caller reads that one schema, not a definition it would have to resolve.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct QuerySqlInput {
     pub query: String,
     pub time_range: TimeRange,
+    /// Rows returned; default 200, ceiling 5,000.
     pub max_rows: Option<u32>,
     pub max_bytes_scanned: Option<u64>,
     pub max_store_requests: Option<u32>,
     pub max_segments: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
     pub max_response_bytes: Option<u64>,
     pub deadline_ms: Option<u64>,
     pub cursor: Option<String>,
@@ -71,6 +83,15 @@ pub struct QueryPromqlInput {
     /// `time_range`/`step` pair must be present.
     pub evaluation_time: Option<String>,
     pub allow_partial_coverage: bool,
+    /// Series rows returned; default 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
+    pub max_bytes_scanned: Option<u64>,
+    pub max_store_requests: Option<u32>,
+    pub max_segments: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
     pub evidence_ref: Option<String>,
 }
 
@@ -85,6 +106,15 @@ pub struct SearchLogsInput {
     pub severity: Option<String>,
     pub trace_id: Option<String>,
     pub time_range: TimeRange,
+    /// Rows returned; default 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
+    pub max_bytes_scanned: Option<u64>,
+    pub max_store_requests: Option<u32>,
+    pub max_segments: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
     pub cursor: Option<String>,
     pub evidence_ref: Option<String>,
 }
@@ -94,6 +124,16 @@ pub struct GetTraceInput {
     pub trace_id: String,
     pub time_range: TimeRange,
     pub include_logs: Option<bool>,
+    /// Spans (plus log rows when `include_logs` is set) returned; default
+    /// 200, ceiling 5,000.
+    pub max_rows: Option<u32>,
+    pub max_bytes_scanned: Option<u64>,
+    pub max_store_requests: Option<u32>,
+    pub max_segments: Option<u32>,
+    /// Bounds the whole serialized envelope; default 512 KiB, floored at
+    /// 256 KiB.
+    pub max_response_bytes: Option<u64>,
+    pub deadline_ms: Option<u64>,
     pub evidence_ref: Option<String>,
 }
 
@@ -237,19 +277,138 @@ mod tests {
 
     use super::*;
 
+    use crate::envelope::{Envelope, Status};
+
+    /// The exact serialized size of the nine-tool `tools/list` response.
+    ///
+    /// Pinned rather than bounded: the D2 budget is what the figure must
+    /// stay under, but a schema change that moves it is a change to what
+    /// every client parses on every reconnect, and it should be read in a
+    /// diff rather than absorbed silently anywhere under the bound. Update
+    /// it in the same commit as the schema change that moves it.
+    const TOOLS_LIST_SERIALIZED_LEN: usize = 14_206;
+
+    /// D2 bounds `tools/list` so the catalog itself never competes with a
+    /// data response for the response-size budget.
+    const _: () = assert!(
+        TOOLS_LIST_SERIALIZED_LEN < 24_576,
+        "tools/list must serialize to under 24576 bytes"
+    );
+
     /// `tools/list` is served once per session and re-parsed by every
-    /// client on every reconnect; D2 bounds it so the catalog itself never
-    /// competes with a data response for the response-size budget.
+    /// client on every reconnect.
     #[test]
     fn tools_list_serializes_inside_band() {
         let tools = tool_catalog();
         assert_eq!(tools.len(), 9, "D2 names exactly nine tools");
         let result = ListToolsResult::with_all_items(tools);
         let bytes = serde_json::to_vec(&result).expect("tools/list serializes");
-        assert!(
-            bytes.len() < 24_576,
-            "tools/list serialized to {} bytes, must be < 24576",
-            bytes.len()
+        assert_eq!(bytes.len(), TOOLS_LIST_SERIALIZED_LEN);
+    }
+
+    /// The advertised output schema is hand-written, so nothing but a test
+    /// keeps it in step with the struct it describes. A block added to
+    /// [`Envelope`] and not to the schema would make every tool advertise a
+    /// shape its own results violate.
+    #[test]
+    fn schema_required_list_matches_envelope_keys() {
+        let schema = envelope_output_schema();
+
+        let mut required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .expect("the schema has a required list")
+            .iter()
+            .map(|entry| entry.as_str().expect("every required entry is a string"))
+            .collect();
+        required.sort_unstable();
+
+        let mut advertised: Vec<&str> = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("the schema has a properties object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        advertised.sort_unstable();
+
+        let envelope = serde_json::to_value(Envelope::default()).expect("envelope serializes");
+        let mut actual: Vec<&str> = envelope
+            .as_object()
+            .expect("an envelope is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        actual.sort_unstable();
+
+        assert_eq!(actual.len(), 14, "D4 defines exactly 14 envelope blocks");
+        assert_eq!(required, actual);
+        assert_eq!(advertised, actual);
+    }
+
+    /// The `status` property enumerates the four D4 values, in the wire
+    /// spelling [`Status`] serializes to.
+    #[test]
+    fn schema_status_enum_matches_the_status_wire_values() {
+        let schema = envelope_output_schema();
+        let advertised = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .and_then(|properties| properties.get("status"))
+            .cloned()
+            .expect("the schema advertises status");
+
+        let wire: Vec<Value> = [Status::Ok, Status::OkBounded, Status::OkPage, Status::Error]
+            .iter()
+            .map(|status| serde_json::to_value(status).expect("a status serializes"))
+            .collect();
+
+        assert_eq!(wire.len(), 4);
+        assert_eq!(
+            advertised,
+            json!({"type": "string", "enum": Value::Array(wire)})
         );
+    }
+
+    /// Every data-returning tool takes the same six lowerable budget knobs
+    /// (docs/reference/mcp.md#budget-defaults-and-floors). A tool missing
+    /// one advertises no way to lower it, so a caller that cannot afford
+    /// the default has only the server ceiling to fall back on.
+    #[test]
+    fn every_data_tool_advertises_the_lowerable_budgets() {
+        const BUDGET_KEYS: [&str; 6] = [
+            "deadline_ms",
+            "max_bytes_scanned",
+            "max_response_bytes",
+            "max_rows",
+            "max_segments",
+            "max_store_requests",
+        ];
+        const DATA_TOOLS: [&str; 4] = [
+            "ravel_query_sql",
+            "ravel_query_promql",
+            "ravel_search_logs",
+            "ravel_get_trace",
+        ];
+
+        let catalog = tool_catalog();
+        for name in DATA_TOOLS {
+            let tool = catalog
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} is in the catalog"));
+            let properties = tool
+                .input_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .unwrap_or_else(|| panic!("{name} advertises input properties"));
+
+            let mut present: Vec<&str> = BUDGET_KEYS
+                .into_iter()
+                .filter(|key| properties.contains_key(*key))
+                .collect();
+            present.sort_unstable();
+            assert_eq!(present, BUDGET_KEYS, "{name} is missing a budget knob");
+        }
     }
 }
