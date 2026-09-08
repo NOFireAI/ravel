@@ -79,18 +79,20 @@ hosted runner is slower per distinct state. Run 34230857065
 3600 s per-configuration budget on `MCMaintenanceOwnership.exhaustive.cfg`
 before it could finish: 116,707,410 states generated, 12,448,134 distinct,
 1,450,354 states left on the queue, search depth 17, at roughly 2.4M states
-per minute and 120k to 180k distinct states per minute in the last ten
-minutes before the kill (TLC also ran its temporal-property check every six
-minutes, for about a minute each time). The recorded complete run above
-(136,617,032 generated, 13,183,990 distinct, depth 20, 1769 s, fleet
-executor) reached 94% of its final distinct-state count by the time this run
-was killed; at this run's own distinct-state rate the remainder needs
-roughly 400 to 600 s more, a projected total of 4,000 to 4,200 s. That makes
-the hosted runner about 2.3x slower per distinct state than the fleet
-executor the 1769 s figure was recorded on. The other five areas all
-finished well inside 3600 s on the same run (catalog 1034 s, commit 96 s,
-common 287 s, lifecycle 1371 s, `MCCompactionClaims.exhaustive.cfg` 1 s), so
-only this one configuration needed headroom.
+per minute and a falling 116k to 181k distinct states per minute in the last
+ten minutes before the kill (181,101 / 157,388 / 151,690 / 157,848 / 124,073
+/ 116,020) (TLC also ran its temporal-property check every six minutes, for
+about a minute each time). The recorded complete run above (136,617,032
+generated, 13,183,990 distinct, depth 20, 1769 s, fleet executor) reached
+94% of its final distinct-state count by the time this run was killed; at
+this run's own distinct-state rate the remainder needs roughly 400 to 600 s
+more, a projected total of 4,000 to 4,200 s. That makes the hosted runner
+about 2.3x slower per distinct state than the fleet executor the 1769 s
+figure was recorded on. The other five areas all finished well inside
+3600 s on the same run (catalog 1034 s, commit 96 s, common 287 s,
+lifecycle 1371 s, resharding 59 s), as did the maintenance area's other
+config (`MCCompactionClaims.exhaustive.cfg` 1 s), so only this one
+configuration needed headroom.
 
 `scripts/check-tla.sh` now reads an optional per-configuration budget from
 `bands.tsv`'s `budget_s` column (`check_one_model` via `cfg_budget`) instead

@@ -47,7 +47,7 @@ distinct-state count and wall time.
 | common | `RavelObjectStore.tla` | fleet executor | 3845952 | 252 seconds |
 | commit | `CommitProtocol.tla` | fleet executor | 5466239 | 131 seconds |
 | catalog | `CatalogMVCC.tla` | fleet executor | 3422524 | 510 seconds |
-| lifecycle | `LifecycleGC.tla` | fleet executor | 230815 | 30 seconds |
+| lifecycle | `LifecycleGC.tla` | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | 3587643 | 1371 seconds |
 | resharding | `OnlineResharding.tla` | fleet executor | 1179718 | under 300 seconds |
 | maintenance | `MaintenanceOwnership.tla` | fleet executor | 13183990 | 1769 seconds |
 | maintenance | `MaintenanceOwnership.tla` | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | 12448134 (TIMEOUT at 3600 s, 1,450,354 states still queued; projected 4,000 to 4,200 s to finish) | 3600 seconds (killed) |

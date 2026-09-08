@@ -585,17 +585,71 @@ if [ "$qout" = "5400" ]; then ok; else bad "q: expected 5400, got '$qout'"; fi
 FORMAL_DIR="$orig_formal_dir4"
 rm -rf "$qdir"
 
-echo "--- (r) cfg_budget: row without a budget_s column falls back to the default"
-rdir="$(mktemp -d)"
-rarea_dir="$rdir/farea"
-mkdir -p "$rarea_dir"
-printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nBar.exhaustive.cfg\t1\t2\t3\t4\n' \
-    > "$rarea_dir/bands.tsv"
-FORMAL_DIR="$rdir"
-rout="$(cfg_budget farea Bar.exhaustive.cfg 3600)"
-if [ "$rout" = "3600" ]; then ok; else bad "r: expected 3600 (default), got '$rout'"; fi
-FORMAL_DIR="$orig_formal_dir4"
-rm -rf "$rdir"
+echo "--- (r) cfg_budget: every fallback branch uses the default and logs a note"
+# run_cfg_budget_case <bands-content-or-""> <cfg-name> <errfile> -> echoes
+# cfg_budget's stdout; "" for the bands-content means no bands.tsv at all
+# (the fourth branch), as opposed to a bands.tsv that exists but carries no
+# matching row or no budget_s column.
+run_cfg_budget_case() {
+    local bands_content="$1" cfg_name="$2" errfile="$3"
+    local tmp
+    tmp="$(mktemp -d)"
+    mkdir -p "$tmp/farea"
+    if [ -n "$bands_content" ]; then
+        printf '%s' "$bands_content" > "$tmp/farea/bands.tsv"
+    fi
+    FORMAL_DIR="$tmp"
+    cfg_budget farea "$cfg_name" 3600 2>"$errfile"
+    FORMAL_DIR="$orig_formal_dir4"
+    rm -rf "$tmp"
+}
+
+r1err="$(mktemp)"
+r1out="$(run_cfg_budget_case \
+    "$(printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\nBar.exhaustive.cfg\t1\t2\t3\t4\n')" \
+    Bar.exhaustive.cfg "$r1err")"
+if [ "$r1out" = "3600" ]; then ok; else bad "r1 (column absent): expected 3600, got '$r1out'"; fi
+if grep -qF "has no budget_s column" "$r1err"; then ok; else bad "r1 (column absent): missing note; got: $(cat "$r1err")"; fi
+rm -f "$r1err"
+
+r2err="$(mktemp)"
+r2out="$(run_cfg_budget_case \
+    "$(printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\tbudget_s\nBar.exhaustive.cfg\t1\t2\t3\t4\tabc\n')" \
+    Bar.exhaustive.cfg "$r2err")"
+if [ "$r2out" = "3600" ]; then ok; else bad "r2 (non-numeric): expected 3600, got '$r2out'"; fi
+if grep -qF "budget_s 'abc' invalid" "$r2err"; then ok; else bad "r2 (non-numeric): missing note; got: $(cat "$r2err")"; fi
+rm -f "$r2err"
+
+r3err="$(mktemp)"
+r3out="$(run_cfg_budget_case \
+    "$(printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\tbudget_s\nOther.exhaustive.cfg\t1\t2\t3\t4\t5400\n')" \
+    Bar.exhaustive.cfg "$r3err")"
+if [ "$r3out" = "3600" ]; then ok; else bad "r3 (no matching row): expected 3600, got '$r3out'"; fi
+if grep -qF "no row for Bar.exhaustive.cfg" "$r3err"; then ok; else bad "r3 (no matching row): missing note; got: $(cat "$r3err")"; fi
+rm -f "$r3err"
+
+r4err="$(mktemp)"
+r4out="$(run_cfg_budget_case "" Bar.exhaustive.cfg "$r4err")"
+if [ "$r4out" = "3600" ]; then ok; else bad "r4 (no bands.tsv): expected 3600, got '$r4out'"; fi
+if grep -qF "no bands.tsv for Bar.exhaustive.cfg" "$r4err"; then ok; else bad "r4 (no bands.tsv): missing note; got: $(cat "$r4err")"; fi
+rm -f "$r4err"
+
+r5err="$(mktemp)"
+r5out="$(run_cfg_budget_case \
+    "$(printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\tbudget_s\nBar.exhaustive.cfg\t1\t2\t3\t4\t0\n')" \
+    Bar.exhaustive.cfg "$r5err")"
+if [ "$r5out" = "3600" ]; then ok; else bad "r5 (zero): expected 3600, got '$r5out'"; fi
+if grep -qF "budget_s '0' invalid" "$r5err"; then ok; else bad "r5 (zero): missing note; got: $(cat "$r5err")"; fi
+rm -f "$r5err"
+
+r6err="$(mktemp)"
+r6val="12345678901234567890"
+r6out="$(run_cfg_budget_case \
+    "$(printf 'cfg\tmin_distinct\tmax_distinct\tmin_depth\tmax_depth\tbudget_s\nBar.exhaustive.cfg\t1\t2\t3\t4\t%s\n' "$r6val")" \
+    Bar.exhaustive.cfg "$r6err")"
+if [ "$r6out" = "3600" ]; then ok; else bad "r6 (20-digit): expected 3600, got '$r6out'"; fi
+if grep -qF "budget_s '$r6val' invalid" "$r6err"; then ok; else bad "r6 (20-digit): missing note; got: $(cat "$r6err")"; fi
+rm -f "$r6err"
 
 echo "--- (s) check_one_model: an exhaustive run honors bands.tsv's budget_s override (measured timeout)"
 sdir="$(mktemp -d)"
@@ -635,6 +689,7 @@ JAR="/dev/null"
 resolve_timeout
 resolve_tla_resources
 truncate_tsv
+# shellcheck disable=SC2034  # consumed by check-tla.sh's sourced record_row, not read in this file
 RUN_ID="test-run"
 
 sstart=$(date +%s)
@@ -700,6 +755,45 @@ if [ -f "$workflow" ]; then
     fi
 else
     bad "t: $workflow not found"
+fi
+
+# --- (u) issue #1358 hardening: tla-nightly.yml's timeout-minutes bounds the
+# sum of an area's exhaustive budgets, not any single config's -------------
+# check_model runs every MC*.tla module's exhaustive cfg in an area
+# sequentially, so an area with more than one exhaustive config (maintenance
+# runs MCMaintenanceOwnership.exhaustive.cfg and MCCompactionClaims.exhaustive.cfg)
+# needs its job's timeout-minutes to cover their sum, not just the largest
+# single budget_s. This sums each area's exhaustive-config budgets straight
+# from bands.tsv (default 3600s where budget_s is absent or invalid, the same
+# fallback cfg_budget applies) and asserts the workflow's timeout-minutes
+# exceeds the largest sum by at least 10 minutes, so a future budget_s bump
+# that outgrows the ceiling fails here instead of timing out on the next
+# scheduled run.
+echo "--- (u) tla-nightly.yml timeout-minutes exceeds the largest per-area exhaustive-budget sum by >=10 minutes"
+max_sum=0
+max_area=""
+for adir in "$REPO_ROOT"/formal/tla/*/; do
+    aname="$(basename "$adir")"
+    bands="$adir/bands.tsv"
+    [ -f "$bands" ] || continue
+    asum="$(awk -F'\t' 'NR>1 && $1 ~ /\.exhaustive\.cfg$/ { b=$6; if (b !~ /^[0-9]{1,9}$/ || (b+0)==0) b=3600; sum+=b } END{print sum+0}' "$bands")"
+    if [ "$asum" -gt "$max_sum" ]; then max_sum="$asum"; max_area="$aname"; fi
+done
+echo "    largest area exhaustive-budget sum: $max_area = ${max_sum}s"
+if [ -f "$workflow" ]; then
+    timeout_line="$(grep -E '^[[:space:]]*timeout-minutes:[[:space:]]*[0-9]+[[:space:]]*$' "$workflow" | head -1)"
+    timeout_minutes="$(printf '%s' "$timeout_line" | grep -oE '[0-9]+')"
+    if [ -n "$timeout_minutes" ]; then ok; else bad "u: no timeout-minutes line found in $workflow"; fi
+    timeout_secs=$((timeout_minutes * 60))
+    headroom=$((timeout_secs - max_sum))
+    echo "    workflow timeout-minutes=$timeout_minutes (${timeout_secs}s), headroom: ${headroom}s"
+    if [ "$headroom" -ge 600 ]; then
+        ok
+    else
+        bad "u: timeout-minutes=$timeout_minutes leaves only ${headroom}s headroom over $max_area's ${max_sum}s exhaustive-budget sum, want >= 600s (10 min)"
+    fi
+else
+    bad "u: $workflow not found"
 fi
 
 rm -f "$LIB_SRC"
