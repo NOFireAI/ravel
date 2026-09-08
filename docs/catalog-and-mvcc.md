@@ -535,22 +535,29 @@ bytes, like the part object's own PUT, makes `AlreadyExists` really mean
 "two folders raced the same input and wrote the same content-addressed
 bytes."
 
-**Per-part bound and refusal (ADR-1413 decisions 3-4).** Before compressing,
-`encode_column_stats_v3` checks the concatenated uncompressed body against
-`per_part_column_stats_bound(entry_count, declared_column_count) =
-entry_count * declared_column_count * PER_SEGMENT_COLUMN_STATS_BOUND_BYTES`,
-where `PER_SEGMENT_COLUMN_STATS_BOUND_BYTES = 54,712` is the measured
-bytes-per-(segment, column) figure from the ADR's ClickBench `hits`
-reference tenant (a few hundred `DictEntry` messages per wide-table
-segment/column pair, comfortably inside ADR-0850 decision 3's 10,000-entry
-dictionary ceiling). The bound is a function of what the part itself holds,
-not of the tenant's history, so unlike the old whole-object 256 MiB ceiling
-(ADR-1413 decision 3) it does not grow as the tenant does. A part whose
-statistics would exceed the bound fails the whole fold for that (tenant,
-signal, part) with the declared size and the bound in the error
-(`SnapshotFormatError::ColumnStatsPartOverBound`/
-`CatalogError::ColumnStatsPartOverBound`) and writes no object -- there is no
-silent skip and no truncated object for a reader to silently drop.
+**Per-part ceiling and degrade (ADR-1413 decisions 3-4, amended
+2026-09-08).** The per-part ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES` (256
+MiB), the same constant `ColumnStatsLimits` already enforces on the
+whole-object v1/v2 guard, not a separate per-part formula: the original
+`entry_count * declared_column_count * PER_SEGMENT_COLUMN_STATS_BOUND_BYTES`
+bound could refuse a legal part outright (a tenant with one or two
+high-cardinality typed attribute columns near the ADR-0850 decision 3 10,000-entry
+dictionary ceiling), and a refused fold stalls that tenant's catalog
+permanently. Before compressing, the fold measures the concatenated
+uncompressed body (`column_stats_segments_concat`, the same function the
+encoder's own ceiling check and the compressor's input use) and, while it
+exceeds the ceiling, drops the single largest remaining dictionary by its
+own encoded size (scanning every (segment, column) pair each pass and
+re-measuring from scratch), marking that (segment, column)
+`dictionary_present = false` per ADR-0850 decision 3's omit-never-truncate
+rule -- min, max, count, and sum stay exact regardless of how many
+dictionaries are dropped. `FoldReport::column_stats_dictionaries_dropped`
+counts drops for the fold call. Only once no dictionary is left to drop and
+the dictionary-free statistics are still over the ceiling does the fold fail
+the whole (tenant, signal, part) with the declared size and the ceiling in
+the error (`SnapshotFormatError::ColumnStatsPartOverBound`/
+`CatalogError::ColumnStatsPartOverBound`) and write no object -- there is no
+truncated object for a reader to silently trust.
 
 **Dual-publish window.** The fold keeps writing the v1 (field 11) and v2
 (field 13) whole-object statistics unchanged alongside the new v3 per-part

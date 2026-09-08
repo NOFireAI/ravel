@@ -3,6 +3,15 @@
 Status: Accepted (2026-09-08). Epic: #1413. Supersedes nothing; extends
 ADR-0850 and ADR-0942.
 
+Amended (2026-09-08): decisions 3 and 4 below are revised. The original
+per-part bound (`entry_count x declared_column_count x 54,712`) refused
+entirely legal parts, such as a tenant with one or two high-cardinality
+declared columns near the 10,000-entry dictionary ceiling, and a refused
+fold permanently stalls that tenant's catalog: no fold, no HEAD update, no
+progress until an operator intervenes. The per-part ceiling is now the same
+fixed `DEFAULT_MAX_COLUMN_STATS_BYTES` the reader already enforces, and the
+fold degrades an over-ceiling part instead of refusing it.
+
 ## Context
 
 ADR-0850 shipped exact per-segment column statistics as one `.cstat` object
@@ -116,31 +125,45 @@ rule: a decode failure of an object HEAD references is logged once per
 (landed separately as the observability half of #1400). Absence stays
 silent; a referenced object the reader cannot open does not.
 
-### 3. A per-part ceiling, proportional to the part
+### 3. A per-part ceiling: the reader's existing fixed ceiling
 
-The reader's guard is retained and re-derived: a v3 object may declare at
-most `part.entry_count x per_segment_stats_bound` uncompressed bytes, where
-`per_segment_stats_bound` is a fold-time constant sized from the measured
-27,356 bytes per (segment, column) times the tenant's declared column count,
-with the 2x headroom `DEFAULT_BYTE_CACHE_MAX_BYTES` takes over
-`DEFAULT_MAX_SNAPSHOT_PART_BYTES`. It is a function of
-what the part holds, not of the tenant's history, so it does not grow as the
-tenant does. The hostile-size purpose survives: a header declaring more than
-the part could possibly hold is refused before inflating.
+The per-part ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES` (256 MiB), the same
+constant and the same `ColumnStatsLimits` guard the v1/v2 whole-object path
+already enforces. It is not derived from the part's entry count or the
+tenant's declared column count: a proportional bound looked like the
+tighter guard, but a legal part can carry declared columns near the
+10,000-entry dictionary ceiling and cross a proportional bound while still
+being well inside what the reader can safely inflate. One fixed ceiling,
+shared by the v1/v2 whole-object path and the v3 per-part path, is simpler
+and cannot itself be the reason a legal part is refused.
 
-The whole-object v1/v2 ceiling stays at 256 MiB. Objects over it remain
-unreadable, which is the state today; the per-part path is how they become
-readable, by being re-folded.
+The whole-object v1/v2 ceiling stays at 256 MiB, the same value. Objects
+over it remain unreadable, which is the state today; the per-part path is
+how they become readable, by being re-folded.
 
-### 4. The writer refuses what the reader would
+### 4. The writer degrades before it refuses
 
-`encode_column_stats_v3` takes the per-part bound and returns a typed
-`SnapshotFormatError` when the body would exceed it, before compressing. The
-fold surfaces that as a failure for that (tenant, signal, part) with the
-size and the bound in the message, and writes no object. A part whose
-statistics genuinely cannot fit the bound is a signal to raise the bound
-deliberately, in a reviewed change citing the measurement; it is never
-silently skipped, and never written for a reader to silently drop.
+`encode_column_stats_v3` still takes a ceiling and returns a typed
+`SnapshotFormatError` when the body would exceed it, before compressing, but
+the fold no longer calls it against an as-built part. Before encoding, the
+fold measures the part's segments the same way the encoder measures its own
+uncompressed body (length-delimited concatenation), and while that exceeds
+the ceiling, drops the largest remaining dictionary by its own encoded size:
+that (segment, column) pair gets `dictionary_present = false` and an empty
+`dictionary`, the same omitted-dictionary shape ADR-0850 decision 3 already
+uses for a column over the cardinality ceiling. min, max, count, and sum are
+never touched; only the dictionary is dropped, never truncated. The fold
+re-measures after each drop and repeats until the part fits or no dictionary
+is left.
+
+Only once no dictionary is left to drop, and the dictionary-free body (the
+fixed fields: name, declared_type, non_null_count, null_count, min, max,
+sum, plus the segment and header framing) is still over the ceiling, does
+`encode_column_stats_v3` refuse. The fold surfaces that as a failure for
+that (tenant, signal, part) with the size and the ceiling in the message,
+and writes no object. That case is a signal to raise the ceiling
+deliberately, in a reviewed change; it is never silently skipped, and never
+written for a reader to silently drop.
 
 ### 5. Decoded statistics are a term in the memory budget
 
@@ -183,6 +206,14 @@ eviction; per-part entries return it to ordinary LRU granularity.
 - **Lazy per-segment decode from the cache.** Solves memory but not the
   500 MB-per-query download or the reader's guard; the object is still
   fetched whole.
+- **A per-part bound proportional to the part** (`entry_count x
+  declared_column_count x per_segment_stats_bound`, this ADR's original
+  decision 3). Rejected on amendment (2026-09-08): the formula refuses
+  entirely legal parts, such as a tenant with one or two high-cardinality
+  declared columns near the 10,000-entry dictionary ceiling, and a refused
+  fold permanently stalls that tenant's catalog rather than degrading it.
+  A fixed ceiling shared with the existing whole-object guard admits every
+  part the reader can safely inflate and needs no per-tenant tuning.
 
 ## Migration class and convergence plan
 
@@ -229,16 +260,16 @@ extended by one version:
 - One more version byte to keep readable (v1, v2, v3) for the dual-read
   window, and one more field on `SnapshotPartRef`. Additive only; no
   renumbering.
-- The per-part ceiling is a new constant with a measured basis; its doc
-  comment carries the 27,356-byte figure and the host it came from, the way
-  `CACHE_MEMORY_PERCENT` carries its sweep.
+- The per-part ceiling is the existing `DEFAULT_MAX_COLUMN_STATS_BYTES`
+  constant, not a new one; the writer now shares the exact bound the reader
+  already enforced, instead of deriving its own from the part.
 
 ## Data flow
 
 ```mermaid
 flowchart LR
   subgraph fold["fold (per part)"]
-    P[SnapshotPartRef] -->|writes| S[".cstat v3<br/>one part, bound checked"]
+    P[SnapshotPartRef] -->|writes| S[".cstat v3<br/>one part, degraded to fit the ceiling"]
     P -->|field 7| S
   end
   subgraph query["query"]
@@ -256,12 +287,15 @@ flowchart LR
 
 ## Verification obligations for the implementing tasks
 
-- A part whose statistics exceed the per-part bound is refused at fold time
-  with the size and bound in the error, and no object is written (assert the
-  store's key set).
-- A v3 fixture over the OLD 256 MiB whole-object ceiling but inside the
-  per-part bound loads; the same object under the v2 path is rejected and
-  WARNs. Shown failing against pre-ADR code.
+- A part whose statistics exceed the ceiling degrades: the fold drops the
+  largest remaining dictionary, by encoded size, until the part fits,
+  leaving min/max/count/sum exact and the dropped columns'
+  `dictionary_present` false; the fold report counts how many were dropped.
+- A part whose dictionary-free statistics alone exceed the ceiling is
+  refused at fold time with the size and ceiling in the error, and no
+  object is written (assert the store's key set).
+- A v3 object at exactly the ceiling decodes; the same object one byte over
+  a reader's ceiling is rejected.
 - A query over a window covering k of n parts issues exactly k per-part
   GETs and zero whole-object GETs; pinned to the count, not `< n`.
 - An old reader (v2-only) against a dual-published snapshot reads field 13
