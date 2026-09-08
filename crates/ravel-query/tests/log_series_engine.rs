@@ -32,7 +32,7 @@ use ravel_query::distrib::client::{DistribError, SliceFetcher, SliceResponse};
 use ravel_query::distrib::{Federation, RemoteCluster};
 use ravel_query::http::{AppState, StaticBearerTokenResolver, router};
 use ravel_query::{EngineConfig, QueryEngine, QueryError, RequestLimit};
-use ravel_types::{Signal, TenantHash, TenantId, TimeRange};
+use ravel_types::{CommitToken, Signal, TenantHash, TenantId, TimeRange};
 use serde_json::Value as JsonValue;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -115,12 +115,15 @@ fn record(
 /// field by hand from `records` exactly as an ingest sink would (mirrors
 /// `services/ravel-cli/tests/catalog_signal.rs`'s `publish_rlog`,
 /// generalized to a caller-supplied record set spanning multiple streams).
+/// Returns the published record's `CommitToken`, so a caller can force the
+/// catalog to resolve this exact segment via `min_tokens` regardless of
+/// whether it overlaps a query's time window.
 async fn publish_log_segment(
     store: &MemoryStore,
     tenant_hash: TenantHash,
     seq: u64,
     records: &[LogRecord],
-) {
+) -> CommitToken {
     let mut writer = RlogWriter::new(RlogConfig::default(), identity(tenant_hash, seq));
     for r in records {
         writer.push(r.clone()).expect("push log record");
@@ -172,7 +175,7 @@ async fn publish_log_segment(
         .expect("put rlog data object");
     publish::publish(store, &commit, &RetryPolicy::default())
         .await
-        .expect("publish logs commit record");
+        .expect("publish logs commit record")
 }
 
 /// The two-stream, two-object fixture every test in this file builds on.
@@ -631,8 +634,11 @@ async fn log_lane_never_escalates_a_selectively_indexed_metrics_lane_to_exhausti
         .expect("query succeeds");
 
     assert_eq!(
-        stats.segments_pruned, 1,
-        "the unrelated metric segment must actually be pruned for this test to be meaningful"
+        stats.segments_pruned, 2,
+        "1 from the metrics lane's own unrelated-segment postings prune, plus 1 from the log \
+         lane's own fetch_log_series pruning the job=\"worker\" fixture segment (its \
+         STREAM_DIR doesn't match this query's job=\"api\" matcher); the log lane's own \
+         catalog resolve still contributes 0 (name_filter: None never prunes there)"
     );
     assert_eq!(
         stats.io_shape.plan_class,
@@ -1199,5 +1205,117 @@ async fn phase_accounting_reports_exact_get_counts_for_a_log_query() {
         pooled.s3_requests(AccountedOp::Get),
         6,
         "every GET this query issues is charged to exactly one phase"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1228: `stats.segments_pruned` for the logs lane must be
+// `fetch_log_series`'s own per-segment pruning count, not the catalog
+// resolve's `log_snapshot.segments_pruned`, which is structurally always 0
+// for this lane (`resolve_bounded` always passes `name_filter: None`).
+// ---------------------------------------------------------------------------
+
+/// Publishes one single-record log segment on stream `job="x"` at `ts`, as
+/// its own RLOG object (`writer_seq` distinguishes the five objects this
+/// test publishes), returning its `CommitToken`.
+async fn publish_single_record_segment(
+    store: &MemoryStore,
+    tenant_hash: TenantHash,
+    writer_seq: u64,
+    ts: i64,
+) -> CommitToken {
+    let s = [("service.name", AttrValue::Str("x".to_string()))];
+    let records = vec![record(&s, ts, "ERROR", "x", &[])];
+    publish_log_segment(store, tenant_hash, writer_seq, &records).await
+}
+
+#[tokio::test]
+async fn logs_query_stats_report_the_lane_segments_pruned() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+
+    // N=5 segments, one record each, all on the same `job="x"` stream so
+    // only the per-segment time-window check (not stream-label pruning)
+    // decides which are pruned. K=3 (seg0, seg1, seg4) lie outside the query
+    // window below; seg2 (BASE+95s) and seg3 (BASE+105s) are inside it.
+    //
+    // `Catalog::resolve` itself already excludes a segment whose event range
+    // does not overlap the query window before `fetch_log_series` ever runs
+    // (`Catalog::process_bucket`'s `event_range.overlaps(&range)` filter), so
+    // a segment genuinely outside the window never reaches this lane's own
+    // pruning check via ordinary time-based listing. The three out-of-window
+    // segments are instead forced into the resolved set via their
+    // `CommitToken`s passed as `min_tokens` -- the same read-your-write path
+    // a client uses to pin a specific just-published segment -- which
+    // resolves by explicit key regardless of window overlap
+    // (`Catalog::resolve_min_token`). `fetch_log_series` then applies its own
+    // time-range check to these token-forced segments exactly as it would
+    // to any other, pruning the three that don't overlap `[BASE+90s,
+    // BASE+110s]`.
+    let t0 = publish_single_record_segment(&store, th, 0, BASE).await;
+    let t1 = publish_single_record_segment(&store, th, 1, BASE + 40 * NS).await;
+    publish_single_record_segment(&store, th, 2, BASE + 95 * NS).await;
+    publish_single_record_segment(&store, th, 3, BASE + 105 * NS).await;
+    let t4 = publish_single_record_segment(&store, th, 4, BASE + 300 * NS).await;
+
+    let (engine, _tid) = build_engine(store, EngineConfig::default());
+
+    // `[20s]` at instant `BASE+110s` fetches the window `[BASE+90s,
+    // BASE+110s]` (`selector_fetch_window`: `[instant - range, instant]`).
+    let (_value, stats) = engine
+        .instant_with_stats(
+            th,
+            r#"count_over_time(ravel_log_lines{job="x"}[20s])"#,
+            ms(BASE + 110 * NS),
+            &[t0, t1, t4],
+            NOW_NS,
+            DEADLINE,
+        )
+        .await
+        .expect("query succeeds");
+
+    assert_eq!(
+        stats.segments_pruned, 3,
+        "3 of the 5 segments lie outside the query window and must be \
+         pruned by fetch_log_series's own time-range check, not the \
+         catalog resolve's structural 0 for this lane"
+    );
+}
+
+#[tokio::test]
+async fn logs_query_stats_segments_pruned_zero_when_window_covers_every_segment() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+
+    publish_single_record_segment(&store, th, 0, BASE).await;
+    publish_single_record_segment(&store, th, 1, BASE + 40 * NS).await;
+    publish_single_record_segment(&store, th, 2, BASE + 95 * NS).await;
+    publish_single_record_segment(&store, th, 3, BASE + 105 * NS).await;
+    publish_single_record_segment(&store, th, 4, BASE + 300 * NS).await;
+
+    let (engine, _tid) = build_engine(store, EngineConfig::default());
+
+    // `[400s]` at instant `BASE+300s` fetches `[BASE-100s, BASE+300s]`,
+    // which covers every one of the five segments above, so ordinary
+    // time-based listing resolves all of them and no `min_tokens` are
+    // needed.
+    let (_value, stats) = engine
+        .instant_with_stats(
+            th,
+            r#"count_over_time(ravel_log_lines{job="x"}[400s])"#,
+            ms(BASE + 300 * NS),
+            &[],
+            NOW_NS,
+            DEADLINE,
+        )
+        .await
+        .expect("query succeeds");
+
+    assert_eq!(
+        stats.segments_pruned, 0,
+        "the window covers every segment, so the lane figure must be 0, \
+         not the segment total"
     );
 }

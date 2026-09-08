@@ -1470,6 +1470,7 @@ impl QueryEngine {
         // each see, and could each spend, the full remaining budget.
         let mut log_series_out: Vec<SeriesData> = Vec::new();
         let mut log_segments_fetched: u64 = 0;
+        let mut log_segments_pruned: u64 = 0;
         let mut fed_metric_names: Vec<&'static str> = Vec::new();
         for plan in &log_plans {
             // `log_plans` was filtered by `log_metric_of(...).is_some()`
@@ -1503,6 +1504,7 @@ impl QueryEngine {
             samples_remaining = samples_remaining.saturating_sub(out_samples);
             series_remaining = series_remaining.saturating_sub(out.series.len());
             log_segments_fetched = log_segments_fetched.max(out.segments_fetched as u64);
+            log_segments_pruned += out.segments_pruned as u64;
             log_series_out.extend(out.series);
             if !fed_metric_names.contains(&metric.name()) {
                 fed_metric_names.push(metric.name());
@@ -1511,7 +1513,14 @@ impl QueryEngine {
 
         source.log_series = log_series_out;
         stats.segments_fetched += log_segments_fetched;
-        stats.segments_pruned += log_snapshot.segments_pruned;
+        // `log_snapshot.segments_pruned` is structurally 0 for this lane
+        // (comment below, at `log_plan_class`): the catalog resolve passes
+        // no name filter to prune against. `log_segments_pruned` is the
+        // figure that actually reflects pruning for the log lane --
+        // `fetch_log_series`'s own per-segment time-range and stream-label
+        // check, summed across every plan this lane ran. Adding both keeps
+        // a future resolve-side prune from being silently dropped.
+        stats.segments_pruned += log_segments_pruned + log_snapshot.segments_pruned;
         stats.phase_accounting =
             combine_phase_accounting(&stats.phase_accounting, &log_accounting.snapshot());
         stats.accounting = stats.phase_accounting.pooled();
