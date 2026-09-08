@@ -30,10 +30,32 @@ closed. `--audit-max-batch` and `--audit-max-age` bound how many records the
 pipeline groups into one write and how long a record waits before that group
 is forced out; unset, both take the pipeline's own defaults. Installed only in
 the query-serving modes (`all` and `query`); `maintain` and `gateway` serve no
-query surface and install no pipeline. `--audit-text` names the posture a
-deployment expects on the `query.text` attribute below (`redacted`, the
-default, or `plaintext`); it records the operator's choice and does not itself
-transform the text a surface writes.
+query surface and install no pipeline.
+
+`--audit-text` selects how the `query.text` attribute below is recorded.
+`redacted`, the default, stores a structure-preserving tokenization: every
+string literal in a SQL statement and every label-matcher value in a PromQL
+expression is replaced by a `tok_<hex>` token, while table names, column names,
+metric names, label names, operators, keywords, and the `LIMIT`/`OFFSET` counts
+stay readable. The same value tokenizes to the same token everywhere, so a
+record can still be correlated across queries and surfaces without storing the
+value. Tokenization runs before the record reaches the pipeline, so no verbatim
+text is written to the audit object or its commit record.
+
+The token key comes from `RAVEL_AUDIT_TOKEN_KEY`, 64 hex characters for a
+32-byte key (hex only: a 64-character string is also valid base64, and
+accepting both would let one spelling of a key mean two different keys). With
+that variable unset, the key is derived from the deployment key configured by
+`--tenant-hash-key-file`. If neither is available, a query-serving process
+refuses to start under `redacted` rather than fall back to recording verbatim
+text. Keep the key for as long as the records tokenized under it: a different
+key produces different tokens for the same value, so records written under a
+lost key stay readable but no longer correlate with later ones.
+
+`--audit-text plaintext` stores the query text verbatim. It is an explicit
+opt-in for a regime that requires the original text, and it puts whatever the
+query carried, including any personal data in a literal or a matcher value,
+into the audit trail for that trail's whole retention window.
 
 Attributes:
 
@@ -43,10 +65,13 @@ Attributes:
   attributed to the tenant Ravel authenticated rather than to any identity the
   client claimed.
 - `query.status`: `ok` or `error`, the request's outcome.
-- `query.text`: the query text as that surface understands it: the SQL
-  statement for `sql`, the PromQL expression for `promql` and `analytics`, the
-  joined selector list for `labels`, `label_values`, and `series`, and the
-  selector for `exemplars`.
+- `query.text`: the query text as that surface understands it, in the posture
+  `--audit-text` selected: the SQL statement for `sql`, the PromQL expression
+  for `promql` and `analytics`, the joined selector list for `labels`,
+  `label_values`, and `series`, and the selector for `exemplars`. Under
+  `redacted` a text Ravel cannot parse is stored as a single token over the
+  whole text, so an unparseable query is recorded as having run without its
+  content being stored.
 - `query.window_start_ns` and `query.window_end_ns`: the resolved event-time
   range, in the terms that surface's own request uses. `sql` and `analytics`
   record the request's resolved range; `promql`'s instant query records its
