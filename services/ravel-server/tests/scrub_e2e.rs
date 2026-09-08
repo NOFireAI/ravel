@@ -38,6 +38,8 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// window) and the maintenance loop left disabled, so only the scrubber acts.
 fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
     ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         adaptive_flush_delay: false,

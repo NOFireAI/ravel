@@ -447,6 +447,20 @@ pub struct ServerConfig {
     /// configured here, never the calling client's. Independent of `distrib`
     /// above: federation is coordinator-side and needs no local fragment surface.
     pub remote_clusters: Vec<crate::config::RemoteClusterConfig>,
+    /// The resolved query-audit pipeline config (ADR-0062 decision 2b), from
+    /// `--audit-mode`/`--audit-max-batch`/`--audit-max-age`. In a query-serving
+    /// mode ([`Mode::All`]/[`Mode::Query`]) [`start`] spawns one
+    /// [`ravel_maintain::AuditPipeline`] from this and installs its sink on
+    /// every query surface; `Mode::Maintain`/`Mode::Gateway` serve no query
+    /// surface and install [`ravel_maintain::NoopQueryAuditSink`] instead,
+    /// ignoring this field.
+    pub audit_pipeline: ravel_maintain::AuditPipelineConfig,
+    /// The expected posture of a query-audit record's `query.text`
+    /// (ADR-0062 decision 2e), from `--audit-text`. Not yet wired to redact
+    /// anything (see docs/guides/audit.md); carried on `ServerConfig` so a
+    /// deployment's chosen posture is visible in its resolved config even
+    /// though [`start`] does not act on it yet.
+    pub audit_text: crate::config::AuditTextArg,
 }
 
 /// A running server instance. Dropping this without calling [`Running::shutdown`]
@@ -503,9 +517,32 @@ pub struct Running {
     lifecycle_refresh_task: lifecycle_refresh::LifecycleRefreshTask,
     idle_tenant_state_task: idle_tenant_state::IdleTenantStateTask,
     metadata_sink_task: metadata_sink_task::MetadataSinkTask,
+    /// The query-audit pipeline (ADR-0062 decision 2b), `Some` exactly in the
+    /// query-serving modes that spawned one. `shutdown` drains it last, after
+    /// every query surface that could still submit to it has stopped serving.
+    audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>>,
 }
 
 impl Running {
+    /// Whether `start` spawned a query-audit pipeline for this process
+    /// (`true` in [`Mode::All`]/[`Mode::Query`], `false` in
+    /// [`Mode::Maintain`]/[`Mode::Gateway`], which serve no query surface).
+    pub fn has_audit_pipeline(&self) -> bool {
+        self.audit_pipeline.is_some()
+    }
+
+    /// The query-audit pipeline's best-effort flush-failure count (ADR-0062
+    /// decision 2b): `0` when no pipeline was installed for this process's
+    /// mode. Not yet exported as a `/metrics` series (`metrics.rs` is outside
+    /// this change's scope; see the audit-pipeline installation report), so
+    /// this is the only way to observe it from outside the process.
+    pub fn audit_write_failures(&self) -> u64 {
+        self.audit_pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.flush_failures())
+            .unwrap_or(0)
+    }
+
     /// Stops accepting new connections, waits for both listeners to drain,
     /// then flushes and joins every ingest shard actor: metrics, logs, and
     /// spans alike.
@@ -582,6 +619,13 @@ impl Running {
         // Last: its final flush writes whatever the in-progress window
         // observed, and it must not race the ingest surfaces that feed it.
         self.metadata_sink_task.shutdown().await;
+
+        // Every query surface that could submit to it has stopped serving
+        // by now (the HTTP/gRPC/mTLS listener tasks above have been joined),
+        // so draining here cannot race a submission arriving after drain.
+        if let Some(pipeline) = self.audit_pipeline {
+            pipeline.shutdown().await?;
+        }
 
         Ok(())
     }
@@ -987,6 +1031,10 @@ pub async fn start(
     // rather than whichever instance it can reach.
     let mut query_service_handle: Option<service::QueryService> = None;
     let mut mtls_query_service_handle: Option<service::QueryService> = None;
+    // The process's one query-audit pipeline (ADR-0062 decision 2b), `Some`
+    // exactly in the query-serving modes that spawn one; carried out to
+    // `Running` so `shutdown` can drain it.
+    let mut running_audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>> = None;
     if let (Some(router), Some(log_router), Some(span_router)) =
         (&ingest_router, &log_ingest_router, &span_ingest_router)
     {
@@ -1264,6 +1312,39 @@ pub async fn start(
     let mut alert_tasks = alerting::AlertEvalTasks::none();
 
     if matches!(config.mode, Mode::All | Mode::Query) {
+        // ADR-0062 decision 2b: one AuditPipeline for the process, shared by
+        // every query surface below (SQL, Flight SQL, PromQL, labels,
+        // label_values, series, analytics, exemplars) so `kind = query`
+        // records land through a single group-committing writer rather than
+        // one pipeline per surface.
+        //
+        // KNOWN GAP (reported, not silently worked around): `AuditPipeline`
+        // is scoped to exactly one `TenantHash` at construction and has no
+        // per-event tenant routing (see `ravel_maintain::AuditPipeline`).
+        // `ravel-server` is genuinely multi-tenant, and `config.fold_tenants`
+        // is legitimately empty for an OIDC/mTLS deployment with no static
+        // tenant list. Using the first configured tenant (or an all-zero
+        // sentinel when none is configured) means every other tenant's query
+        // audit records are written under this one tenant's object-storage
+        // prefix: invisible to their own `audit` table reads, and readable
+        // by whichever tenant was picked. This is the literal reading of the
+        // task and of ADR-0062 decision 2b ("A single AuditPipeline in
+        // ravel-server..."), not a local design choice; a correct multi-tenant
+        // fix needs a per-tenant pipeline registry in `ravel-maintain`, out of
+        // this task's scope.
+        let audit_tenant = config
+            .fold_tenants
+            .first()
+            .copied()
+            .unwrap_or(TenantHash([0u8; 16]));
+        let audit_pipeline_handle = Arc::new(ravel_maintain::AuditPipeline::spawn(
+            store.clone(),
+            audit_tenant,
+            config.audit_pipeline.clone(),
+        ));
+        let audit_sink: Arc<dyn ravel_maintain::QueryAuditSink> = audit_pipeline_handle.clone();
+        running_audit_pipeline = Some(audit_pipeline_handle);
+
         // The real query engine's deadline is the value `main` validated
         // against `sys/gc` (ADR-0050 section 4, EC4), not an independent
         // `EngineConfig::default()`: the deadline validated is the deadline
@@ -1340,6 +1421,11 @@ pub async fn start(
             federation,
             metadata_cache.clone(),
         );
+        // `build_app_state` installs `NoopQueryAuditSink` internally; override
+        // with the process-wide pipeline (ADR-0062 decision 2b) so PromQL
+        // instant/range queries, labels, label_values, and series all reach
+        // it too, same as the SQL and exemplars/analytics surfaces below.
+        let app_state = app_state.with_audit_sink(audit_sink.clone());
         // Bound without an initializer and assigned exactly once inside the
         // block below, which always runs under this feature: a `None` default
         // would be an assignment no reader ever sees.
@@ -1403,6 +1489,15 @@ pub async fn start(
                 query_admission.clone(),
                 Some(declared_columns),
             )?;
+            // `build_sql_state` installs `NoopQueryAuditSink` internally;
+            // override with the process-wide pipeline (ADR-0062 decision 2b).
+            // `mtls_sql_query_state` below is built from `state.clone()` after
+            // this, so the mTLS SQL surface (and Flight SQL, which shares this
+            // same `state` via `sql_state` further down) inherit it too.
+            let state = sql::SqlState {
+                audit_sink: audit_sink.clone(),
+                ..state
+            };
             alert_sql_executor = Some(state.executor.clone());
             sql_query_state = state.clone();
             // The same executor the idle-tenant sweep evicts idle accountants
@@ -1435,10 +1530,9 @@ pub async fn start(
             tenant_resolver: config.tenant_resolver.clone(),
             clock: Arc::new(SystemClock),
             query_accounting: query_accounting.clone(),
-            // Analytics routes through the QueryAuditSink seam; the
-            // process-wide AuditPipeline install is a separate step, so this is
-            // the no-op sink today (the handler already submits and awaits through it).
-            audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+            // Analytics routes through the QueryAuditSink seam (ADR-0062
+            // decision 2b): the process-wide AuditPipeline built above.
+            audit_sink: audit_sink.clone(),
             // The one shared fleet ceiling: an analytics call is the same range
             // evaluation /api/v1/query_range runs, so it competes for the same
             // permits rather than running outside them.
@@ -1455,7 +1549,7 @@ pub async fn start(
                     tenant_resolver: mtls.resolver.clone(),
                     clock: Arc::new(SystemClock),
                     query_accounting: query_accounting.clone(),
-                    audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+                    audit_sink: audit_sink.clone(),
                     query_admission: query_admission.clone(),
                 });
         if let Some(state) = mtls_analytics_state.clone() {
@@ -1519,7 +1613,8 @@ pub async fn start(
             get_limiter.clone(),
         )
         .with_query_admission(query_admission.clone())
-        .with_query_accounting(query_accounting.clone());
+        .with_query_accounting(query_accounting.clone())
+        .with_audit_sink(audit_sink.clone());
         http_router = http_router.merge(exemplars::router(exemplars_state.clone()));
         let mtls_exemplars_state = config.mtls_listener.as_ref().map(|mtls| {
             exemplars::ExemplarsState::from_engine(
@@ -1532,6 +1627,7 @@ pub async fn start(
             )
             .with_query_admission(query_admission.clone())
             .with_query_accounting(query_accounting.clone())
+            .with_audit_sink(audit_sink.clone())
         });
         if let Some(state) = mtls_exemplars_state.clone() {
             mtls_router = mtls_router.merge(exemplars::router(state));
@@ -1551,7 +1647,7 @@ pub async fn start(
             Arc::new(SystemClock),
             query_admission.clone(),
             query_accounting.clone(),
-            Arc::new(ravel_maintain::NoopQueryAuditSink),
+            audit_sink.clone(),
         )
         .with_engine(app_state.engine.clone())
         .with_analytics(analytics_state_for_service)
@@ -1575,7 +1671,7 @@ pub async fn start(
                 Arc::new(SystemClock),
                 query_admission.clone(),
                 query_accounting.clone(),
-                Arc::new(ravel_maintain::NoopQueryAuditSink),
+                audit_sink.clone(),
             )
             .with_engine(app_state.engine.clone());
             let mtls_query_service = match mtls_analytics_state {
@@ -1612,7 +1708,8 @@ pub async fn start(
                 ravel_query::http::AppState::new(app_state.engine.clone(), mtls.resolver.clone())
                     .with_cost_recorder(query_accounting.clone())
                     .with_usage_sink(query_accounting.clone())
-                    .with_query_admission(query_admission.clone());
+                    .with_query_admission(query_admission.clone())
+                    .with_audit_sink(audit_sink.clone());
             // Same read-side metadata cache the primary listener serves from
             // (ADR-0085 decision 1): the mTLS `/api/v1/metadata` must serve the
             // same per-tenant record, not fall back to the empty object.
@@ -2226,5 +2323,6 @@ pub async fn start(
         lifecycle_refresh_task,
         idle_tenant_state_task,
         metadata_sink_task,
+        audit_pipeline: running_audit_pipeline,
     })
 }
