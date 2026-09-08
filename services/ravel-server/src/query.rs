@@ -306,6 +306,12 @@ pub fn build_sql_state(
         // is an in-process escape hatch and the regression fixture's red side,
         // not a server-level knob.
         late_materialization_extra_columns: SqlConfig::default().late_materialization_extra_columns,
+        // The bounded top-k grouped aggregate's limit ceiling: the shipped
+        // default, with no flag, for the same reason as the two lines above.
+        // The rewrite is exact for the shape it admits, so the `SqlConfig`
+        // field is an in-process escape hatch and the tests' rule-off side,
+        // not a server-level knob.
+        bounded_topk_max_limit: SqlConfig::default().bounded_topk_max_limit,
         // ADR-0954: bounded ephemeral spill is off by default (requirement 9's
         // no-spill deployment profile). `with_spill_from_env` below fills this
         // from `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` when both are

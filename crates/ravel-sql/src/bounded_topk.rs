@@ -41,6 +41,25 @@
 //! accumulation, which is what makes eviction safe. See
 //! [`BoundedTopKAggregate`]'s doc comment for the argument.
 //!
+//! A NULL ordering value breaks that argument at the input, not the
+//! aggregate: DataFusion's priority map never admits a group whose ordering
+//! value is NULL, so under the default `NULLS FIRST` that group belongs first
+//! in the unbounded answer, and under `NULLS LAST` it still belongs whenever
+//! fewer than `k` non-null groups exist. A plain column the input schema
+//! marks non-nullable is the only input the map's NULL-blind admission is
+//! provably exact for, so `bound_aggregate` refuses any other ordering input.
+//! Every declared attribute column is nullable by construction
+//! (`crate::logs_schema`, "Every declared column is nullable"), so today this
+//! only fires over a fixed non-nullable column such as `ts`, `severity_num`,
+//! or `flags`; widening it to a declared column needs a statistics-derived
+//! proof that the column holds no NULLs, which is a separate change.
+//!
+//! At a tie on the k-th value the bounded map keeps the later-arriving group,
+//! and the unbounded sort's own choice between tied groups is arrival-order
+//! dependent too; SQL leaves that order unspecified, so
+//! `tests/bounded_topk_aggregate.rs` builds its fixture to have no ties rather
+//! than assert one order over the other.
+//!
 //! # Why the gate is ravel's and not DataFusion's default
 //!
 //! `datafusion.optimizer.enable_topk_aggregation` defaults to `true`, so
@@ -48,11 +67,14 @@
 //! ungated. Two of the shapes it admits are ones ravel must not take:
 //!
 //! - **Float `min`/`max`.** ADR-0023 gives ravel its own total-order min/max
-//!   UDAF whose float comparison is `f64::total_cmp`, so `-0.0` and NaN
-//!   payloads order deterministically. The priority map does its own
-//!   comparisons and never constructs that accumulator, so a float `min`/`max`
-//!   routed through it answers under DataFusion's ordering, not ravel's.
-//!   [`crate::minmax::is_float`] inputs are refused here.
+//!   UDAF whose comparison is `f64::total_cmp`, so `-0.0` and NaN payloads
+//!   order deterministically. The priority map's heap also orders with
+//!   `total_cmp`, but its worse-than pre-check -- the fast path that decides
+//!   whether an incoming row can possibly replace the current k-th -- compares
+//!   with `PartialOrd` instead, so whether `-0.0` against `0.0` and NaN
+//!   payloads end up ordered the way ADR-0023 mandates is not something this
+//!   rule can prove. [`crate::minmax::is_float`] inputs are refused here
+//!   rather than assumed correct.
 //! - **An unbounded `LIMIT`.** The bound this rule buys is proportional to the
 //!   limit; at a large enough `k` the priority map is the group table with
 //!   extra steps. [`crate::SqlConfig::bounded_topk_max_limit`] is the ceiling.
@@ -71,7 +93,9 @@ use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::physical_plan::aggregates::{AggregateExec, LimitOptions, topk_types_supported};
+use datafusion::physical_plan::aggregates::{
+    AggregateExec, AggregateInputMode, LimitOptions, topk_types_supported,
+};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::coop::CooperativeExec;
 use datafusion::physical_plan::projection::ProjectionExec;
@@ -175,6 +199,14 @@ impl BoundedTopKAggregate {
         let mut order_name = order_column.name().to_string();
         let mut refused = false;
         let mut bounded = false;
+        // A two-stage plan calls `bound_aggregate` twice for the same logical
+        // aggregate: once on the `Final`/`FinalPartitioned` node, whose own
+        // "input" is the OTHER stage's merged accumulator state, and once on
+        // the `Partial` node below it, whose input is the real scan schema.
+        // Only the latter can verify the ordering-input nullability conjunct
+        // against a real column; the rewrite is trusted only once at least
+        // one stage has done that verification.
+        let mut nullability_verified = false;
         let input = Arc::clone(sort.input())
             .transform_down(|inner| {
                 if refused {
@@ -182,8 +214,9 @@ impl BoundedTopKAggregate {
                 }
                 if let Some(aggregate) = inner.downcast_ref::<AggregateExec>() {
                     match bound_aggregate(aggregate, &order_name, descending, limit) {
-                        Some(rewritten) => {
+                        Some((rewritten, verified_here)) => {
                             bounded = true;
+                            nullability_verified |= verified_here;
                             return Ok(Transformed::yes(Arc::new(rewritten) as _));
                         }
                         None => refused = true,
@@ -203,7 +236,7 @@ impl BoundedTopKAggregate {
             })
             .data()?;
 
-        if !bounded {
+        if !bounded || !nullability_verified {
             return Ok(Transformed::no(node));
         }
         let rewritten = SortExec::new(sort.expr().clone(), input)
@@ -236,14 +269,18 @@ fn is_pass_through(plan: &Arc<dyn ExecutionPlan>) -> bool {
         || plan.is::<RepartitionExec>()
 }
 
-/// The gate, one conjunct per `return None`. `Some` is the aggregate rebuilt to
-/// execute as a bounded priority map of `limit` groups.
+/// The gate, one conjunct per `return None`. `Some` carries the aggregate
+/// rebuilt to execute as a bounded priority map of `limit` groups, and
+/// whether THIS call independently verified the ordering-input nullability
+/// conjunct against a real (non-synthetic) schema field -- see the note at
+/// this function's call site on why that can only happen for some stages of
+/// a multi-stage aggregation.
 fn bound_aggregate(
     aggregate: &AggregateExec,
     order_name: &str,
     descending: bool,
     limit: usize,
-) -> Option<AggregateExec> {
+) -> Option<(AggregateExec, bool)> {
     // Already carrying a limit: leave whoever set it alone.
     if aggregate.limit_options().is_some() {
         return None;
@@ -273,8 +310,48 @@ fn bound_aggregate(
     if aggregate_descending != descending || field.name() != order_name {
         return None;
     }
-    // ADR-0023: ravel's float min/max is a total order the priority map does
-    // not implement. Refusing float input keeps the answer ravel's.
+    // The ordering aggregate's own input must be incapable of NULL: the
+    // priority map never admits a NULL-valued group, and a nullable input can
+    // hold one. The module docs give the NULLS FIRST/LAST argument that makes
+    // this a correctness gate.
+    //
+    // This stage's `aggregate.input()` is only the real (scan-derived) schema
+    // when the stage consumes raw rows (`AggregateInputMode::Raw`: `Partial`,
+    // `Single`, `SinglePartitioned`). A `Final`/`FinalPartitioned` stage's
+    // input is the OTHER stage's merged accumulator state, whose field for
+    // this same aggregate is a synthetic one DataFusion marks nullable by
+    // default regardless of the real column (`AggregateUDFImpl::is_nullable`
+    // defaults to `true`, and ravel's `max`/`min` do not override it) -- an
+    // artifact of the two-stage plan, not a signal about the real data. So
+    // the check below runs only at a raw-input stage, and callers trust the
+    // rewrite only once some stage in the chain has actually run it (see the
+    // `nullability_verified` note at the call site).
+    let nullability_verified = if aggregate.mode().input_mode() == AggregateInputMode::Raw {
+        // A plain column is the only input shape this rule can check
+        // nullability against; anything else (an expression, a literal) is
+        // refused with it.
+        let order_arg = aggregate.aggr_expr().first()?;
+        let order_args = order_arg.expressions();
+        let [order_input] = order_args.as_slice() else {
+            return None;
+        };
+        let order_input_column = order_input.downcast_ref::<Column>()?;
+        // Resolve by the column's position, not its name: a physical column
+        // is bound to an index, and two fields can share a name.
+        let input_schema = aggregate.input().schema();
+        let input_field = input_schema.fields().get(order_input_column.index())?;
+        if input_field.is_nullable() {
+            return None;
+        }
+        true
+    } else {
+        false
+    };
+    // The priority map orders floats with `total_cmp` like ADR-0023's total
+    // order, but its worse-than pre-check compares with `PartialOrd`, so
+    // whether it treats `-0.0`/`0.0` and NaN payloads the way ADR-0023
+    // mandates is not proven here. Refusing float input keeps the answer
+    // provably ravel's rather than assumed so.
     if is_float(field.data_type()) {
         return None;
     }
@@ -282,8 +359,9 @@ fn bound_aggregate(
     if !topk_types_supported(&key_type, field.data_type()) {
         return None;
     }
-    Some(AggregateExec::with_new_limit_options(
+    let rewritten = AggregateExec::with_new_limit_options(
         aggregate,
         Some(LimitOptions::new_with_order(limit, descending)),
-    ))
+    );
+    Some((rewritten, nullability_verified))
 }
