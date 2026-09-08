@@ -474,6 +474,24 @@ The request hit rate is `hits / (hits + misses)`. A refresh-error rate rising
 toward the refresh rate means the metadata record is unreadable while stale data
 is still being served, which the operations guide pages on.
 
+### Query audit (`ravel_audit_write_failures_total`)
+
+Labels: `mode` only. The failing unit is one group-commit flush, which carries
+several tenants' records, so there is no `tenant_hash` dimension to attribute
+it to. It renders only in a mode that installed the query-audit pipeline
+(`all` or `query`); a gateway- or maintain-only process omits the family
+rather than reporting a zero for a pipeline it never ran.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_audit_write_failures_total` | Query-audit writes that failed and were released anyway under `--audit-mode best-effort`. Each one is a query that was served with no durable audit record. |
+
+Under `--audit-mode required` (the default) a failed audit write fails the
+query with a 503 instead, and is not counted here, so this counter is always
+zero on a fail-closed deployment. On a best-effort one, any increase is the
+audit trail going incomplete while queries keep succeeding, which is why an
+operator alerts on the increase rather than on a threshold.
+
 ### Distributed read fan-out (`ravel_distrib_*`)
 
 Labels: `mode` only, plus `le` on the histogram buckets. This family carries no

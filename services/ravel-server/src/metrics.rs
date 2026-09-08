@@ -1758,6 +1758,32 @@ fn render_bucket_protection_family(out: &mut String, mode: Mode, unknown: u64) {
     );
 }
 
+/// The query-audit pipeline's write-failure counter (ADR-0062 decision 2c).
+///
+/// Rendered only by a process that installed a pipeline: `maintain` and
+/// `gateway` serve no query surface, and a zero for a subsystem they never ran
+/// would read as "no failures" rather than "not applicable".
+///
+/// Under `--audit-mode required` a failed write is returned to the query as a
+/// 503 and is not counted here, so any nonzero value is the best-effort
+/// posture reporting queries that were served with no durable audit record.
+/// It carries no tenant label: the failing unit is a flush, which groups
+/// several tenants' records, and the closed [`Label`] set stays closed.
+fn render_audit_family(out: &mut String, mode: Mode, write_failures: u64) {
+    write_header(
+        out,
+        "ravel_audit_write_failures_total",
+        "Query-audit writes that failed and were released anyway under --audit-mode best-effort. Each one is a query served with no durable audit record.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_audit_write_failures_total",
+        &[Label::Mode(mode)],
+        write_failures,
+    );
+}
+
 /// The durable auth (`sys/auth`) background-refresh loop's three counters
 /// (ADR-0066 decision 6), decoupled from
 /// [`crate::lifecycle_refresh::DurableAuthState`] so the renderer is testable
@@ -3611,6 +3637,7 @@ pub fn render(
     cache_disk_residency: Option<(usize, u64)>,
     cache_max_bytes: Option<u64>,
     catalog_cache_max_bytes: Option<u64>,
+    audit_write_failures: Option<u64>,
 ) -> String {
     let mut out = String::new();
     render_allocator_family(&mut out, mode, allocator);
@@ -3640,6 +3667,9 @@ pub fn render(
     );
     if let Some(snapshot) = durable_auth {
         render_durable_auth_family(&mut out, mode, snapshot);
+    }
+    if let Some(write_failures) = audit_write_failures {
+        render_audit_family(&mut out, mode, write_failures);
     }
     render_query_postings_family(&mut out, mode, crate::query_postings_metrics::snapshot());
     render_typed_attr_columns_family(&mut out, mode, crate::typed_attr_metrics::stale_fallbacks());
@@ -3837,6 +3867,11 @@ pub struct MetricsState {
     /// in a request-serving mode that built one (`Mode::All`/`Mode::Query`);
     /// `None` otherwise leaves the whole family off the exposition.
     pub metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
+    /// The process's one query-audit pipeline (ADR-0062 decision 2b), read at
+    /// scrape time for its write-failure counter. `Some` only in a mode that
+    /// installed one (`Mode::All`/`Mode::Query`); `None` otherwise leaves the
+    /// `ravel_audit_write_failures_total` family off the exposition.
+    pub audit_pipeline: Option<Arc<ravel_maintain::AuditPipeline>>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -4039,6 +4074,13 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ));
     }
 
+    // The query-audit pipeline's failure counter, read at scrape time (an
+    // atomic load). `None` in a mode that installed no pipeline.
+    let audit_write_failures = state
+        .audit_pipeline
+        .as_ref()
+        .map(|pipeline| pipeline.flush_failures());
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -4066,6 +4108,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         cache_disk_residency,
         cache_max_bytes,
         catalog_cache_max_bytes,
+        audit_write_failures,
     );
     (
         StatusCode::OK,
@@ -4144,6 +4187,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -4311,6 +4355,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let postings_lines: Vec<&str> = body
@@ -4391,6 +4436,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -4530,6 +4576,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -4713,6 +4760,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(body.contains(
@@ -4781,6 +4829,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -4858,6 +4907,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(
@@ -4917,6 +4967,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -5026,6 +5077,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(
@@ -5080,6 +5132,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(
@@ -5113,6 +5166,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -5186,6 +5240,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(
@@ -5241,6 +5296,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         assert!(
@@ -5284,6 +5340,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -5393,6 +5450,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         // All three counters appear, mode-labeled, carrying the driven value.
@@ -5443,6 +5501,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -5501,6 +5560,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -5598,6 +5658,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         for expected in [
@@ -5674,6 +5735,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             !off.contains("ravel_distrib_"),
@@ -5726,6 +5788,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -5818,6 +5881,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -5870,6 +5934,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -5953,6 +6018,7 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -6186,6 +6252,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -6224,6 +6291,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -6423,6 +6491,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -6501,6 +6570,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -6586,6 +6656,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
         );
         assert!(
             body.contains(&format!(
@@ -6639,6 +6710,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
@@ -6860,6 +6932,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             metadata_cache,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
             None,
             None,
             None,
