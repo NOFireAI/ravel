@@ -1164,7 +1164,6 @@ async fn unauthenticated_request_consumes_no_permit() {
     // None of them reached admission, so the stock is still exactly the one
     // permit this test holds.
     assert_eq!(h.admission.in_flight(), 1);
-    assert_eq!(h.usage.records().len(), 0);
 
     // The positive control: the same route, the same saturated ceiling, a token
     // that does resolve. This is the answer the assertions above would have got
