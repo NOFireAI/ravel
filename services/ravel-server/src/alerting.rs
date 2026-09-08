@@ -1826,6 +1826,9 @@ mod tick_tests {
     use ravel_alerting::build_transition_record;
     use ravel_catalog::{Catalog, CatalogConfig};
     use ravel_object_store::InstrumentedStore;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule as FaultRule, ScriptedFault,
+    };
     use ravel_object_store::memory::MemoryStore;
     use ravel_query::{EngineConfig, QueryEngine};
     use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
@@ -2563,6 +2566,38 @@ mod tick_tests {
             Some(AlertState::Firing),
             "the memo records the firing alert the tick just wrote"
         );
+
+        // Finding 4 (issue #1438): the fold seeds the memo with no active-rule
+        // filter, so an identity for a rule that is no longer configured stays in
+        // the memo. Seed one transition for a rule this evaluator is NOT
+        // configured with (a rule since deleted, whose history remains), fold
+        // again, and the identity is still present. The memo's growth is bounded
+        // by distinct identities ever configured, not by ticks or transitions, and
+        // pruning that growth is deferred to issue #1438. The day that prune lands,
+        // this exact-key-set assertion is the one that changes.
+        let deleted_rule = Rule {
+            rule_id: "since-deleted-rule".to_string(),
+            ..threshold_rule()
+        };
+        let deleted_id = compute_alert_id(&deleted_rule.rule_id, &deleted_rule.labels);
+        assert_ne!(
+            deleted_id, alert_id,
+            "the deleted rule has its own identity"
+        );
+        let ghost = build_transition_record(&deleted_rule, AlertState::Firing, 0, NOW_NS);
+        seed_alert_history(&ev, &[ghost]).await;
+
+        let refolded = ev.load_latest_records().await.expect("refold");
+        assert_eq!(
+            refolded
+                .keys()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            [alert_id, deleted_id]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "the deleted rule's identity is retained in the fold: no active-rule filter prunes it"
+        );
     }
 
     /// A corrupt memo is not fatal: the tick falls back to a full fold, still
@@ -2663,6 +2698,136 @@ mod tick_tests {
             2 * n,
             "the duplicate-memo fallback is a full fold: one commit GET and one \
              data GET per transition"
+        );
+    }
+
+    /// A failed memo write does not clear the prior memo, so the next tick reads
+    /// the surviving memo and folds only the tail, not the whole history (finding
+    /// 1, issue #1294). `run_tick` logs the `write_alert_state_memo` error and
+    /// leaves the object as it was; the full-fold path is reached only when no
+    /// readable memo exists, never merely because a write failed. The fault layer
+    /// fails the tick's memo `Overwrite`; the prior memo sits below that layer, so
+    /// it stays readable and its own seeding write is not the faulted one.
+    #[tokio::test]
+    async fn a_failed_memo_write_leaves_the_prior_memo_so_the_next_tick_folds_the_tail() {
+        let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = instrumented.metrics();
+        let tenant = TenantId::new(TENANT).hash();
+        let memo_key = crate::alert_state_memo::alert_state_memo_key(&tenant);
+
+        // A metric above the threshold so the alert stays Firing and the tick
+        // writes no new transition: the durable history is fixed at one record.
+        publish_metric(
+            instrumented.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        // Fail the FIRST memo PUT the fault layer sees. The prior memo below is
+        // seeded straight into the counting store, under the fault layer, so it is
+        // not that first PUT; the tick's own memo `Overwrite` is.
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert state memo write unavailable".into()),
+            )
+            .with_key_contains(memo_key.clone())
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let fault = Arc::new(FaultStore::new(Arc::clone(&instrumented), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        // One Firing transition in ingest hour 0 is the whole durable history.
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+        assert_eq!(hour_bucket(NOW_NS), 0, "the firing record is in hour 0");
+        seed_alert_history(&ev, &[firing]).await;
+
+        // The full fold of that history: the state the memo must reproduce.
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        // A prior, valid memo whose watermark (hour 1) is above the record's hour
+        // 0, so a fold over it re-reads no commit/data objects. Seeded below the
+        // fault layer, so it stays readable and does not trip the PUT fault.
+        let prior = AlertStateMemo {
+            watermark_hour: 1,
+            records: full.clone(),
+        };
+        write_alert_state_memo(instrumented.as_ref(), &tenant, &prior)
+            .await
+            .expect("seed prior memo below the fault layer");
+
+        // The tick reads the prior memo, stays Firing (writes no transition), and
+        // attempts to rewrite the memo at the seal-bound watermark (hour 0, below
+        // the prior hour 1), which the fault fails.
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "already firing: the tick writes no new transition"
+        );
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::Transient),
+            1,
+            "the memo write was attempted and the injected fault fired exactly once"
+        );
+
+        // The failed write did not clear the memo: the prior memo (watermark hour
+        // 1) is still readable, not gone.
+        let surviving = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the failed write left the prior memo in place");
+        assert_eq!(
+            surviving.watermark_hour, 1,
+            "the surviving memo is the prior one, untouched by the failed overwrite"
+        );
+
+        // The next tick's read path (memo GET then tail fold) takes the fold_tail
+        // path over the surviving memo, not a full fold: one memo GET, no
+        // commit/data GETs for the below-watermark record, and one tail LIST.
+        let before = metrics.snapshot();
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("memo present");
+        let via_memo = ev.fold_latest(Some(&memo)).await.expect("memo fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            via_memo, full,
+            "the served state still equals the full fold, record for record"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            1,
+            "the memo path reads only the memo object: no commit/data GETs below the watermark"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+
+        // Contrast: a full fold over the same history costs two GETs (one commit,
+        // one data) for the one transition, so the memo path above really did skip
+        // the full fold rather than accidentally matching its cost.
+        let before = metrics.snapshot();
+        let full_again = ev.load_latest_records().await.expect("full fold");
+        let after = metrics.snapshot();
+        assert_eq!(full_again, full, "the full fold is stable");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2,
+            "a full fold reads one commit GET and one data GET per transition"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the memo path still serves the firing alert from the surviving memo"
         );
     }
 
