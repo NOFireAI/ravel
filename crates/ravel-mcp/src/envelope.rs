@@ -579,6 +579,8 @@ fn bound_string_entries(items: &mut [String], bound: usize) -> u64 {
 /// stops making progress, so no field is cut below the marker.
 fn bound_entry_fields(fields: &mut [&mut String], overhead: usize, bound: usize) -> bool {
     let mut truncated = false;
+    // Terminates: every pass either returns or cuts the longest field strictly
+    // shorter, and the marker length is a floor no field can go below.
     loop {
         let fields_len: usize = fields.iter().map(|field| serialized_str_len(field)).sum();
         let total = overhead.saturating_add(fields_len);
@@ -681,7 +683,10 @@ const MARKER_SERIALIZED_LEN: usize = TRUNCATION_MARKER.len() + 2;
 /// Serialized size of `s` as a JSON string value, quotes and every escape
 /// sequence included. This is the number every budget in this module is
 /// measured in: a source byte count is not it, because one source byte can
-/// serialize to two (`"`, `\`, `\n`) or six (` `) bytes.
+/// serialize to two (`"`, `\`, `\n`) or six (a NUL, which serde_json writes
+/// as a backslash, a `u`, and four hex digits). That escape is spelled out
+/// here rather than written literally: a raw NUL byte in a source file makes
+/// every text tool, `grep` and `git diff` included, treat it as binary.
 fn serialized_str_len(s: &str) -> usize {
     escaped_len(s) + 2
 }

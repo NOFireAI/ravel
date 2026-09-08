@@ -845,7 +845,7 @@ impl From<FlightTicketError> for CursorError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use ravel_catalog::SegmentLevel;
+    use ravel_sql::SegmentLevel;
     use uuid::Uuid;
 
     use super::*;

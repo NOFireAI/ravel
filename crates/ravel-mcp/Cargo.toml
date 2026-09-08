@@ -27,10 +27,9 @@ blake3 = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-# Only the cursor round-trip test names these: it builds a `SegmentPin` with
-# every field non-default, which means naming `SegmentLevel::L1` and a
-# non-nil `Uuid`. Neither type appears in this crate's own API or in any
-# production path here, which is why they are dev-only.
-ravel-catalog = { workspace = true }
+# Only the cursor round-trip test names this: it builds a `SegmentPin` with
+# every field non-default, which means a non-nil `Uuid`. The pin's
+# `SegmentLevel` comes from `ravel_sql`, which re-exports it beside
+# `SegmentPin`, so no `ravel-catalog` dependency is needed here.
 uuid = { workspace = true }
 proptest = { workspace = true }
