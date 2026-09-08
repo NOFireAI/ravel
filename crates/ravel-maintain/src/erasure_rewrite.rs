@@ -56,25 +56,25 @@
 //! target `max_l1_part_bytes`, issue #872); only metrics still has the
 //! whole-object, single-part shape described above.
 //!
-//! ## Exemplars are dropped, not carried forward (open gap)
+//! ## Exemplars are carried forward
 //!
-//! ADR-0047 decision 3 says exemplars ride along verbatim through compaction
-//! and format-migration, with only `series_index` remapped. This module does
-//! not do that: [`build_rewrite`] calls
-//! `SegmentWriter::write_v5_with_exemplars` with an empty exemplar list, so
-//! every input's exemplars (including ones belonging to series this rewrite
-//! never touches) are dropped from the output. This does not violate the
-//! sample-count conservation gate (exemplars are not counted samples), but it
-//! is a real, silent loss of exemplar data on any bucket this pass rewrites.
-//! `read.rs`'s [`crate::read::load_catalog_from_object`] already loads each
-//! input's `InputCatalog::exemplars`, so wiring correct carry-forward (drop
-//! only exemplars whose named series has zero surviving samples, remap the
-//! rest through the same series-id resolution `build_parts` relies on) is
-//! straightforward for a follow-up but is not done here: this task's
-//! dispatch does not name exemplars among its deliverables, and reusing
-//! `build_parts`'s per-batch exemplar assignment machinery would have meant
-//! adopting its batching complexity too, which the scope reduction above
-//! deliberately avoids. Flagged here and in the task's final report.
+//! ADR-0047 decision 3 requires exemplars to ride along verbatim through
+//! compaction and format-migration, with only `series_index` remapped.
+//! [`build_rewrite`] does that: it hands every input exemplar
+//! [`crate::read::load_catalog_from_object`] loaded to
+//! `SegmentWriter::write_v5_with_exemplars`, except those whose named series
+//! has zero surviving samples in the output. An exemplar's parent series can
+//! lose every sample to an erasure predicate, and the writer rejects an
+//! exemplar naming a series absent from the output
+//! (`WriteError::ExemplarUnknownSeries`), so an exemplar is dropped exactly
+//! when its series does not survive, and never otherwise. The `series_index`
+//! remap is the writer's own: it resolves each `ExemplarInput::series_id`
+//! against the output's SERIES_IDS ordering, the same resolution
+//! `build_parts` relies on, so this module carries no second resolution path
+//! and adopts none of `build_parts`'s per-batch exemplar-assignment batching
+//! (this metrics path writes a single part, so a flat carry-forward suffices).
+//! An exemplar belonging to a series the rewrite never touches survives with
+//! that series.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -92,8 +92,8 @@ use ravel_proto::commit::v1::{
     ErasureRequest, RewriteDrop, RewriteRecord,
 };
 use ravel_segment::{
-    CompactionMetaV4, IngestBounds, ReaderLimits, RunEntry, RunInputV4, RunValuePageV4,
-    SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
+    CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunEntry, RunInputV4,
+    RunValuePageV4, SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
     decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
 };
 use ravel_types::{LabelSet, Sample, Signal, TenantHash};
@@ -1072,6 +1072,23 @@ pub async fn build_rewrite(
         }
     }
 
+    // Carry exemplars forward (ADR-0047 decision 3). Every input exemplar
+    // survives except one whose named series has zero surviving samples in
+    // this output: the writer rejects an exemplar naming a series absent from
+    // the output, and such a series carries no run here. The writer performs
+    // the series_index remap itself, keyed on `ExemplarInput::series_id` (the
+    // same resolution driving `series_out`), so this filter is the whole
+    // carry-forward. Records are cloned rather than moved because `catalogs`
+    // is borrowed; read.rs bounds each input's exemplar set to the
+    // catalog-metadata memory term, so one copy stays inside that bound.
+    let surviving_series: HashSet<[u8; 16]> = series_out.iter().map(|s| s.series_id.0).collect();
+    let exemplars: Vec<ExemplarInput> = catalogs
+        .iter()
+        .flat_map(|catalog| catalog.exemplars.iter())
+        .filter(|e| surviving_series.contains(&e.series_id.0))
+        .cloned()
+        .collect();
+
     let parts = if series_out.is_empty() {
         Vec::new()
     } else {
@@ -1080,6 +1097,7 @@ pub async fn build_rewrite(
             config,
             input_set_hash,
             series_out,
+            exemplars,
         )?]
     };
 
@@ -1108,13 +1126,19 @@ pub async fn build_rewrite(
 /// records), which a rewrite's live input may not have at all when it is
 /// itself an L1/rewrite part, and no query-correctness path reads a
 /// compaction/rewrite part's ingest bounds (they gate ingest-time admission,
-/// not query results) -- a further transparent scope reduction alongside the
-/// exemplar drop documented at the top of this module.
+/// not query results) -- a transparent scope reduction covering ingest bounds
+/// only.
+///
+/// `exemplars` are the input exemplars carried forward (ADR-0047 decision 3),
+/// already filtered by [`build_rewrite`] to series that survive into `batch`;
+/// `write_v5_with_exemplars` resolves each record's `series_index` against
+/// this part's own SERIES_IDS ordering.
 fn build_rewrite_part(
     bucket: &Bucket,
     config: &CompactorConfig,
     input_set_hash: &[u8; 32],
     batch: Vec<SeriesInputV4>,
+    exemplars: Vec<ExemplarInput>,
 ) -> Result<BuiltPart> {
     let run_count: u64 = batch.iter().map(|s| s.runs.len() as u64).sum();
     let first_series_id = batch.iter().map(|s| s.series_id).min();
@@ -1137,8 +1161,7 @@ fn build_rewrite_part(
         min_ingest_ts_ns: 0,
         max_ingest_ts_ns: 0,
     };
-    let written =
-        SegmentWriter::write_v5_with_exemplars(batch, identity, ingest, meta, Vec::new())?;
+    let written = SegmentWriter::write_v5_with_exemplars(batch, identity, ingest, meta, exemplars)?;
     let content_hash = written.summary.blake3;
     let hash16 = hex::encode(&content_hash[..8]);
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
@@ -2485,6 +2508,32 @@ mod tests {
     }
 
     async fn seed(store: &dyn ObjectStoreBackend, seq: u64, series: Vec<SeriesInputV3>) {
+        seed_with_exemplars(store, seq, series, Vec::new()).await;
+    }
+
+    /// One exemplar naming `metric`'s series, at `ts_ns` with `value` and one
+    /// attribute pair, non-zero trace/span ids so the record is distinguishable
+    /// on read-back.
+    fn exemplar(metric: &str, ts_ns: i64, value: f64) -> ExemplarInput {
+        ExemplarInput {
+            series_id: series_id(metric),
+            ts_ns,
+            value,
+            trace_id: [0x11; 16],
+            span_id: [0x22; 8],
+            attrs: vec![("k".to_string(), metric.to_string())],
+        }
+    }
+
+    /// [`seed`] that additionally writes an EXEMPLARS section. Every
+    /// `ExemplarInput::series_id` must name a series in `series`, or the L0
+    /// write fails (`WriteError::ExemplarUnknownSeries`).
+    async fn seed_with_exemplars(
+        store: &dyn ObjectStoreBackend,
+        seq: u64,
+        series: Vec<SeriesInputV3>,
+        exemplars: Vec<ExemplarInput>,
+    ) {
         let th = tenant_hash();
         let writer_id = Uuid::from_u128(u128::from(seq));
         let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
@@ -2500,7 +2549,7 @@ mod tests {
             max_ingest_ts_ns: created,
         };
         let written =
-            SegmentWriter::write_histograms_with_exemplars(series, identity, bounds, Vec::new())
+            SegmentWriter::write_histograms_with_exemplars(series, identity, bounds, exemplars)
                 .expect("write L0");
         let content_hash = written.summary.blake3;
         let data_key = keys::data_key(
@@ -6496,6 +6545,175 @@ mod tests {
             decode_logs_part(&store, &part_key).await,
             vec![kept],
             "only the surviving record may remain in the rewritten part"
+        );
+    }
+
+    /// Every exemplar on the rewrite output part, `series_id` resolved, sorted
+    /// by `(series_id, ts_ns)` for a deterministic exact-count/exact-content
+    /// assertion.
+    async fn read_output_exemplars(
+        store: &dyn ObjectStoreBackend,
+        config: &CompactorConfig,
+        part_key: &str,
+    ) -> Vec<(SeriesId, i64)> {
+        let catalog =
+            crate::read::load_catalog_from_object(store, config, part_key.to_string(), 0, 0, 0)
+                .await
+                .expect("load output catalog");
+        let mut out: Vec<(SeriesId, i64)> = catalog
+            .exemplars
+            .iter()
+            .map(|e| (e.series_id, e.ts_ns))
+            .collect();
+        out.sort_by_key(|a| (a.0, a.1));
+        out
+    }
+
+    /// Rewrite output part key from the single published `RewriteRecord`.
+    async fn output_part_key(store: &dyn ObjectStoreBackend) -> String {
+        let record = read_rewrite_record(store).await;
+        assert_eq!(record.parts.len(), 1, "expected one output part");
+        keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key")
+    }
+
+    /// An exemplar present on an input object is present on the rewrite output,
+    /// including one belonging to a series the rewrite never touches. Generates
+    /// four input exemplars (one on the fully-erased `alpha`, two on the
+    /// surviving `beta`, one on the never-matched `gamma`) and asserts EXACTLY
+    /// the three whose series survive appear on the output, with their series
+    /// and timestamps intact.
+    ///
+    /// Flip-line proof: this fails against the pre-fix code. Reverting
+    /// `build_rewrite_part`'s `write_v5_with_exemplars(..., exemplars)` back to
+    /// `write_v5_with_exemplars(..., Vec::new())` drops every exemplar, so
+    /// `read_output_exemplars` returns an empty vec and the `expected` (3
+    /// records) assertion fails. That is the exact line the pre-fix bug lived
+    /// on.
+    ///
+    /// Under-carry proof: narrowing the carry-forward filter so a survivor is
+    /// dropped -- e.g. `surviving_series.contains(&e.series_id.0)` changed to
+    /// exclude `gamma` -- makes this return 2 records, failing the exact-count
+    /// `assert_eq!` against the 3 expected.
+    #[tokio::test]
+    async fn rewrite_carries_surviving_input_exemplars_including_untouched_series() {
+        let store = MemoryStore::new();
+        seed_with_exemplars(
+            &store,
+            1,
+            vec![
+                series("alpha", &[(10, 1.0), (20, 2.0)]),
+                series("beta", &[(15, 9.5)]),
+                series("gamma", &[(30, 3.0)]),
+            ],
+            vec![
+                exemplar("alpha", 10, 1.0),
+                exemplar("beta", 15, 9.5),
+                exemplar("beta", 16, 9.6),
+                exemplar("gamma", 30, 3.0),
+            ],
+        )
+        .await;
+
+        // Erases `alpha` outright (windowless predicate on the metric name).
+        let request = erasure_request(1, "alpha");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(outcome, ErasureRewriteOutcome::Rewritten { parts: 1, .. }),
+            "expected a one-part rewrite, got {outcome:?}"
+        );
+
+        let part_key = output_part_key(&store).await;
+        let got = read_output_exemplars(&store, &config, &part_key).await;
+
+        let mut expected = vec![
+            (series_id("beta"), 15),
+            (series_id("beta"), 16),
+            (series_id("gamma"), 30),
+        ];
+        expected.sort_by_key(|a| (a.0, a.1));
+        assert_eq!(
+            got, expected,
+            "exactly the three exemplars whose series survive must carry forward: \
+             both beta records and gamma's, and no alpha record"
+        );
+    }
+
+    /// The direction a carry-everything implementation gets wrong: an exemplar
+    /// whose series has ZERO surviving samples in the output IS dropped, and
+    /// only it. `alpha` is erased to nothing; `beta` survives. The output must
+    /// carry exactly `beta`'s one exemplar.
+    ///
+    /// Flip-line proof: an implementation that carries everything (deleting the
+    /// `.filter(|e| surviving_series.contains(&e.series_id.0))` in
+    /// `build_rewrite`) hands `alpha`'s exemplar -- naming a series absent from
+    /// the output -- to `write_v5_with_exemplars`, which fails with
+    /// `WriteError::ExemplarUnknownSeries`; the rewrite then errors and the
+    /// `.expect("rewrite")` below panics. So a test that only proved
+    /// carry-forward would not distinguish this fix from carry-everything; this
+    /// one does.
+    #[tokio::test]
+    async fn rewrite_drops_exemplar_of_fully_erased_series() {
+        let store = MemoryStore::new();
+        seed_with_exemplars(
+            &store,
+            1,
+            vec![
+                series("alpha", &[(10, 1.0), (20, 2.0)]),
+                series("beta", &[(15, 9.5)]),
+            ],
+            vec![exemplar("alpha", 10, 1.0), exemplar("beta", 15, 9.5)],
+        )
+        .await;
+
+        let request = erasure_request(1, "alpha");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(outcome, ErasureRewriteOutcome::Rewritten { parts: 1, .. }),
+            "expected a one-part rewrite, got {outcome:?}"
+        );
+
+        let part_key = output_part_key(&store).await;
+        let got = read_output_exemplars(&store, &config, &part_key).await;
+        assert_eq!(
+            got,
+            vec![(series_id("beta"), 15)],
+            "only beta's exemplar survives; alpha's must be dropped with its samples"
         );
     }
 }
