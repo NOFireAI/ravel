@@ -179,23 +179,40 @@ fn tier_credentials_secret_name<'a>(
 /// content changes and are stable otherwise, so this value is stable across
 /// reconciles that see the same Secrets (no pod churn) and changes the moment a
 /// token is rotated, the tier's credential is rewritten, or the deployment key
-/// is rotated. The hash is `DefaultHasher` (SipHash with fixed keys),
-/// deterministic across processes, so an operator restart does not roll pods.
-/// It is not a security boundary, only a signal. Stamped onto the tier's pod
-/// template as [`SECRETS_CHECKSUM_ANNOTATION`]; when tiers resolve to
-/// different credential Secrets, a change to one rolls only the tier(s) that
-/// consume it.
+/// is rotated. The hash is `blake3`, a fixed algorithm, so the value depends
+/// only on the inputs and is stable across processes AND Rust toolchain
+/// versions: an operator restart or a compiler upgrade does not roll pods.
+/// (std's `DefaultHasher` is not stable across Rust releases, so an upgrade
+/// would have rolled every tier Deployment for unchanged inputs.) It is not a
+/// security boundary, only a signal. Stamped onto the tier's pod template as
+/// [`SECRETS_CHECKSUM_ANNOTATION`]; when tiers resolve to different credential
+/// Secrets, a change to one rolls only the tier(s) that consume it.
 pub fn secrets_checksum(
     token_rv: Option<&str>,
     credentials_rv: Option<&str>,
     deployment_key_rv: Option<&str>,
 ) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    token_rv.unwrap_or("").hash(&mut hasher);
-    credentials_rv.unwrap_or("").hash(&mut hasher);
-    deployment_key_rv.unwrap_or("").hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    blake3_hex(&[
+        token_rv.unwrap_or(""),
+        credentials_rv.unwrap_or(""),
+        deployment_key_rv.unwrap_or(""),
+    ])
+}
+
+/// A stable hex digest of an ordered list of string fields, using `blake3`
+/// (finding 3, issue #36). Each field is fed followed by a `0xff` separator
+/// byte, which cannot appear in UTF-8, so no concatenation of adjacent fields
+/// can collide with a different split (`"ab" + "c"` differs from `"a" + "bc"`).
+/// The digest is rendered as lowercase hex. Used by [`secrets_checksum`] and
+/// [`qualify_job_input_hash`]; both are change signals, not security
+/// boundaries.
+fn blake3_hex(fields: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for field in fields {
+        hasher.update(field.as_bytes());
+        hasher.update(&[0xff]);
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// The [`SECRETS_CHECKSUM_ANNOTATION`] value for a tier, resolving which
@@ -2022,31 +2039,24 @@ pub const STORE_QUALIFIED_MESSAGE: &str =
 /// `resourceVersion`, this hash changes, and the gate recreates the Job. The
 /// bound on noticing a rotation is therefore one `RESYNC` interval.
 ///
-/// `DefaultHasher` (SipHash with fixed keys) is deterministic across processes,
-/// so an operator restart does not spuriously re-qualify. It is a change signal,
-/// not a security boundary, exactly like [`secrets_checksum`].
+/// `blake3` is a fixed algorithm, so the hash depends only on the inputs and is
+/// stable across processes AND Rust toolchain versions: neither an operator
+/// restart nor a compiler upgrade spuriously re-qualifies. (std's
+/// `DefaultHasher` is not stable across Rust releases, so an upgrade would have
+/// re-run qualification for every cluster on unchanged inputs.) It is a change
+/// signal, not a security boundary, exactly like [`secrets_checksum`].
 pub fn qualify_job_input_hash(
     spec: &RavelClusterSpec,
     credentials_resource_version: Option<&str>,
 ) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    spec.storage.s3.bucket.hash(&mut hasher);
-    spec.storage.s3.region.hash(&mut hasher);
-    spec.storage
-        .s3
-        .endpoint
-        .as_deref()
-        .unwrap_or("")
-        .hash(&mut hasher);
-    spec.image.hash(&mut hasher);
-    spec.storage
-        .s3
-        .credentials_secret_ref
-        .name
-        .hash(&mut hasher);
-    credentials_resource_version.unwrap_or("").hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    blake3_hex(&[
+        spec.storage.s3.bucket.as_str(),
+        spec.storage.s3.region.as_str(),
+        spec.storage.s3.endpoint.as_deref().unwrap_or(""),
+        spec.image.as_str(),
+        spec.storage.s3.credentials_secret_ref.name.as_str(),
+        credentials_resource_version.unwrap_or(""),
+    ])
 }
 
 /// The one-shot store-qualification Job for a cluster (issue #36).
@@ -5840,35 +5850,68 @@ mod tests {
     /// equal and does not re-run a qualification that already passed.
     #[test]
     fn the_deadline_is_not_part_of_the_qualified_input_hash() {
-        use std::hash::{Hash, Hasher};
         let spec = base_spec();
 
         // Recompute the hash over exactly the six qualified inputs, deliberately
-        // excluding both knobs. If the production hasher folded either in, this
-        // reference would diverge and the assertion would fail.
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        spec.storage.s3.bucket.hash(&mut hasher);
-        spec.storage.s3.region.hash(&mut hasher);
-        spec.storage
-            .s3
-            .endpoint
-            .as_deref()
-            .unwrap_or("")
-            .hash(&mut hasher);
-        spec.image.hash(&mut hasher);
-        spec.storage
-            .s3
-            .credentials_secret_ref
-            .name
-            .hash(&mut hasher);
-        "rv-1".hash(&mut hasher);
-        let expected = format!("{:016x}", hasher.finish());
+        // excluding both knobs, through the same `blake3_hex` composition the
+        // production hasher uses. If it folded either knob in, this reference
+        // would diverge and the assertion would fail.
+        let expected = blake3_hex(&[
+            spec.storage.s3.bucket.as_str(),
+            spec.storage.s3.region.as_str(),
+            spec.storage.s3.endpoint.as_deref().unwrap_or(""),
+            spec.image.as_str(),
+            spec.storage.s3.credentials_secret_ref.name.as_str(),
+            "rv-1",
+        ]);
 
         assert_eq!(
             qualify_job_input_hash(&spec, Some("rv-1")),
             expected,
             "the qualified-input hash covers exactly the six store-identity inputs, never the \
              deadline or the backoff limit"
+        );
+    }
+
+    /// Golden value for [`blake3_hex`] (finding 3): a fixed input set hashes to
+    /// a fixed literal. This pins the algorithm (blake3), the `0xff` field
+    /// separator, and the lowercase-hex rendering by construction, so a future
+    /// change to any of them fails here instead of silently re-running
+    /// qualification and rolling every tier Deployment on a toolchain upgrade.
+    #[test]
+    fn blake3_hex_golden_is_stable_by_construction() {
+        assert_eq!(
+            blake3_hex(&["field-a", "field-b", "field-c"]),
+            "cef8162179abe2fd9467777a9e0957f18af3abff59960b15b0210ee312836274",
+        );
+        // The `0xff` separator makes the field split significant: no other
+        // grouping of the same bytes collides.
+        assert_ne!(
+            blake3_hex(&["field-a", "field-b", "field-c"]),
+            blake3_hex(&["field-afield-b", "field-c"]),
+        );
+    }
+
+    /// Golden value for [`secrets_checksum`] (finding 3): a fixed set of
+    /// resourceVersions hashes to a fixed literal, so a toolchain upgrade that
+    /// changed the algorithm would fail here rather than roll every tier's pods.
+    #[test]
+    fn secrets_checksum_golden_is_stable_by_construction() {
+        assert_eq!(
+            secrets_checksum(Some("100"), Some("200"), Some("300")),
+            "cea2e01fb489ecc4dac2f461605797406a50b29725416c6c6dd5ab97a18ea8a0",
+        );
+    }
+
+    /// Golden value for [`qualify_job_input_hash`] (finding 3): the six
+    /// store-identity inputs of [`base_spec`] plus a fixed credentials
+    /// `resourceVersion` hash to a fixed literal, stable by construction across
+    /// Rust releases.
+    #[test]
+    fn qualify_job_input_hash_golden_is_stable_by_construction() {
+        assert_eq!(
+            qualify_job_input_hash(&base_spec(), Some("rv-golden")),
+            "adfd6df5df66464b2bdfa458c3af84ae1011a0c445d2e4823dfd02adda76bbf8",
         );
     }
 
