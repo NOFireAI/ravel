@@ -529,6 +529,11 @@ impl QueryService {
     /// MCP adapter (issue #1381) builds a `SqlRequest` directly, and an
     /// operation whose only clamp lives in one of its transports has no clamp
     /// at all from the others.
+    ///
+    /// A request that named no budgets keeps naming none. `None` is the
+    /// executor's documented per-request fast path, and filling it in with the
+    /// configured ceilings takes that path away from every caller: the clamp
+    /// exists to lower what a caller asked for, not to make every caller ask.
     #[cfg(feature = "sql")]
     pub(crate) fn clamped_sql_request(
         &self,
@@ -539,10 +544,10 @@ impl QueryService {
             deadline: self
                 .controls
                 .clamp_deadline(request.deadline, state.max_deadline),
-            budgets: Some(
+            budgets: request.budgets.as_ref().map(|budgets| {
                 self.controls
-                    .clamp_budgets(request.budgets.as_ref(), &state.executor.config().engine),
-            ),
+                    .clamp_budgets(Some(budgets), &state.executor.config().engine)
+            }),
             ..request.clone()
         }
     }
