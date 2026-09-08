@@ -11,16 +11,19 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly eleven label keys: `tenant_hash`, `signal`, `mode`, `op`,
-//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`, and
-//! `kind` (ADR-0044
+//! renders exactly fourteen label keys: `tenant_hash`, `signal`, `mode`, `op`,
+//! `error_kind`, `workload_class`, `level`, `reason`, `cache`, `tier`,
+//! `kind`, `allocator`, `stat`, and `component` (ADR-0044
 //! section 4; `reason` added by ADR-0051 section 6 for the admission-rejection
 //! family and reused by ADR-0059 section 2 for the scrub seal-divergence family,
 //! `cache` to split the read-cache family into the
 //! fetcher and catalog byte caches, `tier` added by #97 to split each of those
-//! into its RAM and local-disk tiers when a disk tier is configured, and `kind`
+//! into its RAM and local-disk tiers when a disk tier is configured, `kind`
 //! added by ADR-0065 decision 4 to split the maintenance merge-memory gauge into
-//! its transient and total high-water marks). The eleven keys come from twelve
+//! its transient and total high-water marks, `allocator`/`stat` added by
+//! #1170 for the process allocator gauges, and `component` added by ADR-1170
+//! decision 4 to split the process memory budget's reserved-bytes gauge by
+//! which side reserved it). The fourteen keys come from fifteen
 //! `Label` variants: `RejectReason` and `ScrubReason` both render `reason`.
 //! Every variant's payload is a closed enum
 //! or [`TenantHash`]'s fixed-width hash, so there is no `String` or `&str`
@@ -237,6 +240,13 @@ pub enum Label {
     /// tenant input), so there is no cardinality this label could blow up.
     Allocator(&'static str),
     AllocatorStat(AllocatorStat),
+    /// Which side of the ADR-1170 process memory budget a
+    /// `ravel_memory_reserved_bytes` sample is. `Fetch` always renders `0`:
+    /// decision 2 (fetch-layer reservation against this same budget) has not
+    /// landed upstream, so nothing yet charges the budget on the fetcher's
+    /// behalf. This is an honest gap, not a bug -- the gauge exists now so a
+    /// dashboard need not change shape once decision 2 lands.
+    MemoryComponent(MemoryComponent),
 }
 
 /// Which high-water mark a `ravel_maintain_rlog_merge_peak_bytes` sample is
@@ -327,6 +337,26 @@ impl AllocatorStat {
     }
 }
 
+/// Which side of the ADR-1170 process memory budget reserved a share of it:
+/// `Sql` is the `SqlExecutor`'s per-tenant accountants
+/// (`ravel_memory::TenantMemoryAccountant`), all sharing the one process
+/// `MemoryBudget`; `Fetch` is the fetch layer's own reservation against that
+/// same budget, decision 2, not yet landed (see [`Label::MemoryComponent`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryComponent {
+    Sql,
+    Fetch,
+}
+
+impl MemoryComponent {
+    fn name(self) -> &'static str {
+        match self {
+            MemoryComponent::Sql => "sql",
+            MemoryComponent::Fetch => "fetch",
+        }
+    }
+}
+
 impl Label {
     fn key(&self) -> &'static str {
         match self {
@@ -344,6 +374,7 @@ impl Label {
             Label::MergeMemoryKind(_) => "kind",
             Label::Allocator(_) => "allocator",
             Label::AllocatorStat(_) => "stat",
+            Label::MemoryComponent(_) => "component",
         }
     }
 
@@ -363,6 +394,7 @@ impl Label {
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
             Label::Allocator(name) => name.to_string(),
             Label::AllocatorStat(stat) => stat.name().to_string(),
+            Label::MemoryComponent(component) => component.name().to_string(),
         }
     }
 }
@@ -1498,6 +1530,75 @@ fn render_ingest_buffer_budget_family(
         "ravel_ingest_buffer_shed_total",
         &[Label::Mode(mode)],
         shed_total,
+    );
+}
+
+/// The ADR-1170 decisions 3/4 process memory budget family: the derived
+/// ceiling, the reserved share per component, and the tenant handoff overlap
+/// the same one `ravel_memory::MemoryBudget` tracks. Unconditional, like
+/// `render_ingest_buffer_budget_family` above: `MetricsState::process_memory_budget`
+/// is always built (`crate::start`), regardless of the `sql` feature or mode,
+/// so this family renders in every build even where nothing yet reserves
+/// against the budget.
+///
+/// `ravel_memory_budget_bytes` is `u64::MAX` when the process was built with
+/// no derived budget (matching `ravel_memory::MemoryBudget::unlimited`'s own
+/// convention), not `0`: a `0` ceiling would misread as "everything refused."
+///
+/// `ravel_memory_reserved_bytes{component="fetch"}` is always `0`: decision 2
+/// (fetch-layer reservation against this budget) has not landed upstream, so
+/// `reserved` below is entirely the SQL side's usage. See
+/// [`Label::MemoryComponent`]'s doc comment.
+fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudgetSnapshot) {
+    write_header(
+        out,
+        "ravel_memory_budget_bytes",
+        "The ADR-1170 process-wide memory budget ceiling (ServerConfig::process_memory_budget_bytes); u64::MAX means unlimited.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_memory_budget_bytes",
+        &[Label::Mode(mode)],
+        budget.limit,
+    );
+
+    write_header(
+        out,
+        "ravel_memory_reserved_bytes",
+        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"fetch\" reads 0 until decision 2 (fetch-layer reservation) lands upstream.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_memory_reserved_bytes",
+        &[
+            Label::Mode(mode),
+            Label::MemoryComponent(MemoryComponent::Sql),
+        ],
+        budget.reserved,
+    );
+    write_sample(
+        out,
+        "ravel_memory_reserved_bytes",
+        &[
+            Label::Mode(mode),
+            Label::MemoryComponent(MemoryComponent::Fetch),
+        ],
+        0,
+    );
+
+    write_header(
+        out,
+        "ravel_memory_handoff_overlap_bytes",
+        "Bytes double-counted right now because a tenant's memory handed off between components overlaps in the ADR-1170 process budget's accounting window.",
+        "gauge",
+    );
+    write_sample(
+        out,
+        "ravel_memory_handoff_overlap_bytes",
+        &[Label::Mode(mode)],
+        budget.handoff_overlap,
     );
 }
 
@@ -3611,6 +3712,7 @@ pub fn render(
     cache_disk_residency: Option<(usize, u64)>,
     cache_max_bytes: Option<u64>,
     catalog_cache_max_bytes: Option<u64>,
+    memory_budget: MemoryBudgetSnapshot,
 ) -> String {
     let mut out = String::new();
     render_allocator_family(&mut out, mode, allocator);
@@ -3703,6 +3805,7 @@ pub fn render(
             catalog_cache_max_bytes,
         );
     }
+    render_memory_budget_family(&mut out, mode, memory_budget);
     out
 }
 
@@ -3714,6 +3817,19 @@ pub struct IngestBufferBudgetSnapshot {
     pub in_flight_bytes: u64,
     pub ceiling: u64,
     pub shed_total: u64,
+}
+
+/// The ADR-1170 process memory budget readings the `/metrics` handler
+/// snapshots from [`ravel_memory::MemoryBudget`] at scrape time (atomic
+/// loads). `Default` (all zero) is the reading of an unpopulated test
+/// snapshot, not a real process's; a real process's `limit` is never `0`
+/// (see [`render_memory_budget_family`]'s doc comment on the `u64::MAX`
+/// unlimited convention).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemoryBudgetSnapshot {
+    pub limit: u64,
+    pub reserved: u64,
+    pub handoff_overlap: u64,
 }
 
 /// Router state for `GET /metrics`. Every field is a handle already built by
@@ -3837,6 +3953,15 @@ pub struct MetricsState {
     /// in a request-serving mode that built one (`Mode::All`/`Mode::Query`);
     /// `None` otherwise leaves the whole family off the exposition.
     pub metadata_cache: Option<Arc<ravel_query::http::MetadataCache>>,
+    /// The ADR-1170 decisions 1/3/4 process-wide memory accountant, the SAME
+    /// instance installed on the `sql`-featured `SqlExecutor` via
+    /// `SqlExecutor::with_process_memory_budget` (when `sql` is compiled in
+    /// and the mode serves queries) so a tenant's SQL reservation and this
+    /// gauge read one counter, not two independently drifting ones. Always
+    /// present: `crate::start` builds it in every mode from
+    /// `ServerConfig::process_memory_budget_bytes`, unconditionally of the
+    /// `sql` feature, so the gauge family renders in every build.
+    pub process_memory_budget: Arc<ravel_memory::MemoryBudget>,
 }
 
 /// `GET /metrics`, mounted in every mode (ADR-0044 section 4). Reads only
@@ -4039,6 +4164,14 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         ));
     }
 
+    // The ADR-1170 process memory budget readings (atomic loads), like every
+    // other family, rather than baking a snapshot in at construction.
+    let memory_budget_snapshot = MemoryBudgetSnapshot {
+        limit: state.process_memory_budget.limit(),
+        reserved: state.process_memory_budget.reserved(),
+        handoff_overlap: state.process_memory_budget.handoff_overlap(),
+    };
+
     let body = render(
         state.mode,
         &store_snapshot,
@@ -4066,6 +4199,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         cache_disk_residency,
         cache_max_bytes,
         catalog_cache_max_bytes,
+        memory_budget_snapshot,
     );
     (
         StatusCode::OK,
@@ -4148,6 +4282,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -4194,7 +4329,9 @@ mod tests {
         // ADR-0065 decision 4 for the RLOG merge-memory gauge; `tier` is the
         // eleventh, added by #97 to split each read cache into its RAM and
         // local-disk tiers; `allocator` and `stat` are the twelfth and
-        // thirteenth, added by #1170 for the process allocator gauges.
+        // thirteenth, added by #1170 for the process allocator gauges;
+        // `component` is the fourteenth, added by ADR-1170 decision 4 for the
+        // process memory budget's reserved-bytes gauge.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -4210,6 +4347,7 @@ mod tests {
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
             Label::Allocator("jemalloc"),
             Label::AllocatorStat(AllocatorStat::Allocated),
+            Label::MemoryComponent(MemoryComponent::Sql),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -4228,6 +4366,7 @@ mod tests {
                 Label::MergeMemoryKind(_) => "kind",
                 Label::Allocator(_) => "allocator",
                 Label::AllocatorStat(_) => "stat",
+                Label::MemoryComponent(_) => "component",
             })
             .collect();
         assert_eq!(
@@ -4250,16 +4389,18 @@ mod tests {
                 "kind",
                 "allocator",
                 "stat",
+                "component",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), the `cache` label, #97's `tier` \
-             label, ADR-0065 decision 4's `kind`, and #1170's `allocator`/`stat`; `shard` must \
+             label, ADR-0065 decision 4's `kind`, #1170's `allocator`/`stat`, and ADR-1170 \
+             decision 4's `component`; `shard` must \
              never appear here"
         );
         assert_eq!(
             one_of_each.len(),
-            14,
-            "exactly 14 label variants, 13 distinct keys"
+            15,
+            "exactly 15 label variants, 14 distinct keys"
         );
     }
 
@@ -4311,6 +4452,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let postings_lines: Vec<&str> = body
@@ -4395,6 +4537,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let lines: Vec<&str> = body
@@ -4534,6 +4677,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let mut declared_types: HashSet<String> = HashSet::new();
@@ -4713,6 +4857,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(body.contains(
@@ -4785,6 +4930,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let written = "ravel_ingest_exemplars_written_total{mode=\"gateway\",signal=\"metrics\"} 7";
@@ -4858,6 +5004,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -4921,6 +5068,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let adaptive =
@@ -5026,6 +5174,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5080,6 +5229,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5117,6 +5267,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(!body.is_empty(), "a zero snapshot must still render text");
@@ -5186,6 +5337,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5241,6 +5393,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5288,6 +5441,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
         // Default reachability is healthy (1); the process runs no probe here.
         assert!(
@@ -5393,6 +5547,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         // All three counters appear, mode-labeled, carrying the driven value.
@@ -5447,6 +5602,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             !body.contains("ravel_durable_auth_"),
@@ -5505,6 +5661,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5598,6 +5755,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         for expected in [
@@ -5674,6 +5832,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             !off.contains("ravel_distrib_"),
@@ -5730,6 +5889,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -5818,6 +5978,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             !body.contains("ravel_scrub_"),
@@ -5874,6 +6035,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         for line in body.lines() {
@@ -5957,6 +6119,7 @@ mod tests {
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         // Fetcher cache, labeled cache="fetch".
@@ -6186,6 +6349,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             body.contains("ravel_cache_hits_total{mode=\"gateway\",cache=\"catalog\"} 7"),
@@ -6228,6 +6392,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert!(
@@ -6423,6 +6588,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         assert_eq!(
@@ -6505,6 +6671,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
 
         let rendered = admission_tenant_hashes(&body);
@@ -6586,6 +6753,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         );
         assert!(
             body.contains(&format!(
@@ -6643,6 +6811,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         )
     }
 
@@ -6864,6 +7033,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            MemoryBudgetSnapshot::default(),
         )
     }
 

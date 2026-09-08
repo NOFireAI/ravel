@@ -400,3 +400,59 @@ Report only, found while verifying: ADR-0107's 2026-09-05 amendment
 (`docs/adrs/0107-pruning-proportional-logs-fetch.md:322-324`) still says the
 RLOG whole-object funnel issues GETs without a permit; `fad582c7` closed that
 and `docs/query-engine.md:703-707` is current.
+
+## Amendment 2026-09-07 (issue #1255): decisions 3 and 4 landed
+
+Decisions 3 and 4 landed in `ravel-server`. `resolve_performance_defaults`
+derives `memory_budget_bytes` from cgroup-capped effective memory minus
+`MEMORY_OVERHEAD_RESERVE_BYTES` (`config.rs:1751`); both cache carves rebase
+onto it; startup refuses with a typed `MemoryBudgetExceeded` rather than
+clamping when an explicit `--cache-max-bytes` pushes the two hard caps above
+the budget; `emit` logs the derivation one line per figure; and `/metrics`
+exposes `ravel_memory_budget_bytes`, `ravel_memory_reserved_bytes{component=
+"sql"|"fetch"}`, and `ravel_memory_handoff_overlap_bytes` in every mode.
+
+Decision 1's accountant adapter is also already in place in `ravel-sql`
+(`TenantMemoryAccountant::with_process_budget`, `crates/ravel-sql/src/
+memory.rs`), forwarding each tenant `grow`/`try_grow`/`shrink` to the same
+process-wide counter this amendment's gauges read; `SqlExecutor` and
+`MetricsState` now share one `Arc<ravel_memory::MemoryBudget>` instance built
+from `memory_remainder_bytes` (`main.rs:487`, `lib.rs:975-976`), so
+`component="sql"` reads real reservations, not a placeholder.
+
+One process-wide counter for every tenant means a cross-tenant cascade,
+which the accountant wiring above does not state on its own: once any one
+tenant's infallible `grow` (`reserve_unchecked`'s saturating add) pushes the
+shared counter above `limit`, every OTHER tenant's next `try_reserve(n > 0)`
+-- including a 1-byte one -- also fails, until the first tenant's `shrink`
+releases enough for the counter to fall back under `limit`. This follows
+directly from `reserve_unchecked` and `try_reserve`'s `reserved + n <= limit`
+comparison (`crates/ravel-memory/src/lib.rs`), and it is faithful to decision
+1 as designed, not a new defect introduced by landing it: decision 1
+deliberately made `grow` infallible and shared the counter process-wide, and
+a cascade is the necessary consequence of both choices together. A later
+acceptance run (M5) must count cascade-caused `try_grow` refusals separately
+from the breaching tenant's own `grow` overshoot: pooling the two into one
+error-rate figure hides whether a band was blown by one tenant's breach or
+by the cascade it triggered against every other tenant sharing the counter.
+
+Decision 2 has not landed: no site in `ravel-query` reserves fetch bytes
+against this budget, so `component="fetch"` always reads `0`. That is the one
+piece decisions 3 and 4 depend on without providing: the fetch-side kill this
+ADR opened with is not yet charged or refused by anything landed here, only
+observed through the existing allocator and cache-residency gauges as before.
+
+`MEMORY_OVERHEAD_RESERVE_BYTES` is, as landed, the round provisional 2 GiB
+decision 3 names as a placeholder (`config.rs:1746-1751`), not the measured
+figure a frozen calibration run would produce. Decision 1's aggregate
+exposure bound for the infallible `grow` path, `max_concurrent_queries x
+partitions x max batch bytes`, must stay under whatever reserve is in force
+for that path's blast radius to stay bounded; that inequality has not been
+checked, because the calibration run decision 3 specifies has not been made,
+and a deployment that leaves `--max-concurrent-queries` unset carries an
+unbounded left-hand side against this constant right-hand side today. Landing
+decisions 3 and 4 narrows the regression this ADR opened with (the
+25%-of-MemTotal cache carve, `#1395`) without yet closing the kill this ADR
+analyzes: an infallible-`grow` overshoot is still bounded only by a
+provisional constant, and fetch-layer memory is still uncharged until
+decision 2 lands and a calibration run freezes the reserve against it.
