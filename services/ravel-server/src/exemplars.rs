@@ -101,19 +101,19 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ravel_catalog::{Catalog, SegmentLevel, SegmentRef};
 use ravel_ingest::Clock;
-use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
+use ravel_maintain::QueryAuditSink;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_promql::{LabelMatcher, MatchOp, matches_series, plan_selectors};
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::http::{QueryErrorResponse, TenantResolver};
+use ravel_query::http::TenantResolver;
 use ravel_query::{
-    EngineConfig, QueryEngine, QueryError, admit, request_budget_exceeded,
-    snapshot_erasure_predicates,
+    EngineConfig, QueryAdmissionController, QueryConcurrencyLimit, QueryEngine, QueryError, admit,
+    request_budget_exceeded, snapshot_erasure_predicates,
 };
 use ravel_segment::{
     ExemplarRecord, ExpectedIdentity, Footer, ReaderLimits, SeriesEntryV4, check_identity,
@@ -124,7 +124,11 @@ use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, SeriesId, Signal, TenantHash, TimeRange,
 };
 use serde::{Serialize, Serializer};
-use serde_json::json;
+
+use crate::metrics::QueryAccountingMetrics;
+use crate::service::{
+    ApiError, ExemplarsRequest, LiveCost, QueryService, ServiceError, default_query_accounting,
+};
 
 /// Cap on the request body: a query plus a few scalar parameters, never large
 /// in legitimate use. Mirrors the defensive bound the sibling `/api/v1/sql`
@@ -206,6 +210,21 @@ pub struct ExemplarsState {
     /// ([`from_engine`](Self::from_engine)); a deployment attaches the one
     /// shared pipeline with [`with_audit_sink`](Self::with_audit_sink).
     pub audit_sink: Arc<dyn QueryAuditSink>,
+    /// The fleet-global query concurrency ceiling (ADR-0061 decision 2). An
+    /// exemplar query is a snapshot resolve plus a segment walk, the same shape
+    /// and the same cost class as the sample query it illustrates, so it takes
+    /// a permit from the same controller rather than running outside the
+    /// ceiling. Defaults to an unlimited (never-rejecting) controller in
+    /// [`from_engine`](Self::from_engine); a deployment attaches the one shared
+    /// controller with
+    /// [`with_query_admission`](Self::with_query_admission).
+    pub query_admission: Arc<QueryAdmissionController>,
+    /// The `/metrics` aggregator this surface's cost and usage records fold
+    /// into (ADR-0044 section 4). Defaults to an aggregator with an empty
+    /// per-tenant allowlist in [`from_engine`](Self::from_engine); a deployment
+    /// attaches the process-wide one with
+    /// [`with_query_accounting`](Self::with_query_accounting).
+    pub query_accounting: Arc<QueryAccountingMetrics>,
 }
 
 impl ExemplarsState {
@@ -232,6 +251,8 @@ impl ExemplarsState {
             get_limiter,
             max_exemplars: DEFAULT_MAX_EXEMPLARS,
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+            query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+            query_accounting: default_query_accounting(),
         }
     }
 
@@ -240,6 +261,33 @@ impl ExemplarsState {
     pub fn with_audit_sink(mut self, audit_sink: Arc<dyn QueryAuditSink>) -> Self {
         self.audit_sink = audit_sink;
         self
+    }
+
+    /// Attach the one shared fleet-global admission controller, so this surface
+    /// competes for the same ceiling as `/api/v1/query` and `/api/v1/sql`.
+    pub fn with_query_admission(mut self, admission: Arc<QueryAdmissionController>) -> Self {
+        self.query_admission = admission;
+        self
+    }
+
+    /// Attach the process-wide `/metrics` aggregator.
+    pub fn with_query_accounting(mut self, accounting: Arc<QueryAccountingMetrics>) -> Self {
+        self.query_accounting = accounting;
+        self
+    }
+
+    /// The query service layer for this surface: the shared controls plus this
+    /// state. The handler below calls it, and so does the process-wide service
+    /// built in `lib.rs`, through one implementation of the controls.
+    pub fn service(&self) -> QueryService {
+        QueryService::with_metrics(
+            Arc::clone(&self.tenant_resolver),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.query_admission),
+            Arc::clone(&self.query_accounting),
+            Arc::clone(&self.audit_sink),
+        )
+        .with_exemplars(self.clone())
     }
 }
 
@@ -260,10 +308,15 @@ async fn handle(State(state): State<ExemplarsState>, req: Request<Body>) -> Resp
     }
 }
 
-async fn run(state: ExemplarsState, req: Request<Body>) -> Result<Response, ApiError> {
+/// Parse, authenticate, ask the query service layer, encode. Admission, the
+/// wall deadline clamp, the usage record, the audit event, and error redaction
+/// all happen inside [`QueryService::exemplars`], shared with every other query
+/// surface.
+async fn run(state: ExemplarsState, req: Request<Body>) -> Result<Response, ServiceError> {
     let headers = req.headers().clone();
     let query_string = req.uri().query().map(str::to_owned);
-    let tenant_hash = authenticate(&state, &headers)?;
+    // Before the service takes a permit, so an anonymous request consumes none.
+    let tenant_hash = crate::service::authenticate(state.tenant_resolver.as_ref(), &headers)?;
 
     let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
@@ -274,59 +327,67 @@ async fn run(state: ExemplarsState, req: Request<Body>) -> Result<Response, ApiE
     let start_ns = parse_timestamp_ns("start", params.require("start")?)?;
     let end_ns = parse_timestamp_ns("end", params.require("end")?)?;
     if start_ns > end_ns {
-        return Err(ApiError::bad_request(format!(
-            "start {start_ns} ns is after end {end_ns} ns"
-        )));
+        return Err(
+            ApiError::bad_request(format!("start {start_ns} ns is after end {end_ns} ns")).into(),
+        );
     }
-    let deadline = parse_deadline(&params, state.deadline)?;
-    let min_tokens = params
-        .all("min_commit_token")
-        .iter()
-        .map(|raw| {
-            CommitToken::decode(raw)
-                .map_err(|_| ApiError::bad_request(format!("invalid min_commit_token: {raw:?}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // The whole request runs under one wall deadline, exactly as the query
-    // engine wraps its own evaluation: an elapsed timeout is the same
-    // `DeadlineExceeded` (504) a sample query would surface.
-    //
-    // The read now runs for a resolved tenant, so it is auditable (ADR-0062
-    // §2a): capture its outcome, submit one audit event, and await durability
-    // before releasing the response. A request rejected earlier (auth, missing
-    // or invalid parameters) never reached here and is not audited. The
-    // recorded window is the request's `[start, end]`.
-    let audit_now = state.clock.now_ns();
-    let outcome = match tokio::time::timeout(
-        deadline,
-        collect_exemplars(&state, tenant_hash, &query, start_ns, end_ns, &min_tokens),
-    )
-    .await
-    {
-        Ok(inner) => inner,
-        Err(_) => Err(ApiError::from_query(QueryError::DeadlineExceeded {
-            deadline,
-        })),
-    };
-    let status = if outcome.is_ok() {
-        QueryStatus::Ok
-    } else {
-        QueryStatus::Error
-    };
-    submit_audit(
-        &state,
-        tenant_hash,
-        audit_now,
-        &query,
-        status,
+    let request = ExemplarsRequest {
+        query,
         start_ns,
         end_ns,
-    )
-    .await?;
-    let (series, stats) = outcome?;
+        min_tokens: params
+            .all("min_commit_token")
+            .iter()
+            .map(|raw| {
+                CommitToken::decode(raw).map_err(|_| {
+                    ApiError::bad_request(format!("invalid min_commit_token: {raw:?}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        deadline: parse_deadline(&params, state.deadline)?,
+    };
 
-    Ok((StatusCode::OK, axum::Json(Envelope::success(series, stats))).into_response())
+    let outcome = state.service().exemplars(tenant_hash, &request).await?;
+    Ok((
+        StatusCode::OK,
+        axum::Json(Envelope::success(outcome.series, outcome.stats)),
+    )
+        .into_response())
+}
+
+/// The exemplar read under one wall deadline, exactly as the query engine wraps
+/// its own evaluation: an elapsed timeout is the same `DeadlineExceeded` (504) a
+/// sample query would surface.
+///
+/// The service layer calls this between its admission permit and its usage
+/// record, so `live` sees whatever the read spent before a timeout or a
+/// cancellation cut it short.
+pub(crate) async fn collect_within_deadline(
+    state: &ExemplarsState,
+    tenant_hash: TenantHash,
+    request: &ExemplarsRequest,
+    deadline: Duration,
+    live: &LiveCost,
+) -> Result<(Vec<ExemplarSeriesJson>, QueryStatsJson), ServiceError> {
+    let collected = tokio::time::timeout(
+        deadline,
+        collect_exemplars(
+            state,
+            tenant_hash,
+            &request.query,
+            request.start_ns,
+            request.end_ns,
+            &request.min_tokens,
+            live,
+        ),
+    )
+    .await;
+    match collected {
+        Ok(inner) => inner,
+        Err(_) => Err(ServiceError::from_query(QueryError::DeadlineExceeded {
+            deadline,
+        })),
+    }
 }
 
 /// Resolves the snapshot over the query's `[start, end]` window (the fixed
@@ -342,7 +403,8 @@ async fn collect_exemplars(
     start_ns: i64,
     end_ns: i64,
     min_tokens: &[CommitToken],
-) -> Result<(Vec<ExemplarSeriesJson>, QueryStatsJson), ApiError> {
+    live: &LiveCost,
+) -> Result<(Vec<ExemplarSeriesJson>, QueryStatsJson), ServiceError> {
     // Parse the query into its selectors exactly as the engine's prefetch
     // does (`plan_selectors`), so the matcher sets and the equality-`__name__`
     // pruning line up with what a sample query over the same text would use. A
@@ -385,6 +447,7 @@ async fn collect_exemplars(
         end_ns,
         min_tokens,
         now_ns,
+        live,
     )
     .await
     {
@@ -400,13 +463,14 @@ async fn collect_exemplars(
             end_ns,
             min_tokens,
             now_ns,
+            live,
         )
         .await
         {
             Ok(result) => Ok(result),
             Err(CollectError::Api(e)) => Err(e),
             Err(CollectError::SnapshotStale) => {
-                Err(ApiError::from_query(QueryError::SnapshotInvalidated))
+                Err(ServiceError::from_query(QueryError::SnapshotInvalidated))
             }
         },
     }
@@ -431,8 +495,13 @@ async fn collect_once(
     end_ns: i64,
     min_tokens: &[CommitToken],
     now_ns: i64,
+    live: &LiveCost,
 ) -> Result<(Vec<ExemplarSeriesJson>, QueryStatsJson), CollectError> {
+    // Each attempt installs its own fresh accounting into the live view, so a
+    // cancelled or timed-out query records what the attempt that was running
+    // had spent, and a discarded first attempt's counters do not bleed into it.
     let accounting = QueryAccounting::new();
+    live.install(&accounting);
     let (snapshot, origins) = state
         .catalog
         .resolve_pruned_with_admission(
@@ -445,7 +514,7 @@ async fn collect_once(
             &accounting,
         )
         .await
-        .map_err(|e| CollectError::Api(ApiError::from_query(QueryError::from(e))))?;
+        .map_err(|e| CollectError::Api(ServiceError::from_query(QueryError::from(e))))?;
 
     // The same admission seam `/api/v1/query` and SQL enforce after resolve
     // (ADR-0073 decision 4): the sealed-set count against
@@ -453,7 +522,7 @@ async fn collect_once(
     // Their cost is bounded below instead, incrementally, by the S3 request
     // budget (decision 3).
     admit(&snapshot, &origins, &state.engine_config)
-        .map_err(|e| CollectError::Api(ApiError::from_query(e)))?;
+        .map_err(|e| CollectError::Api(ServiceError::from_query(e)))?;
 
     // Pending selective-erasure predicates carried on the resolved snapshot
     // (ADR-0064 decision 1). The resolver attaches every pending request to
@@ -499,7 +568,7 @@ async fn collect_once(
             accounting.snapshot().total_s3_requests(),
             state.engine_config.max_s3_requests,
         ) {
-            return Err(CollectError::Api(ApiError::from_query(err)));
+            return Err(CollectError::Api(ServiceError::from_query(err)));
         }
     }
 
@@ -542,11 +611,11 @@ enum CollectError {
     /// a concurrent publish-and-sweep. The caller re-resolves and retries once.
     SnapshotStale,
     /// Any other failure, already mapped to its client-visible form.
-    Api(ApiError),
+    Api(ServiceError),
 }
 
-impl From<ApiError> for CollectError {
-    fn from(e: ApiError) -> Self {
+impl From<ServiceError> for CollectError {
+    fn from(e: ServiceError) -> Self {
         CollectError::Api(e)
     }
 }
@@ -963,15 +1032,15 @@ fn section_slice<'a>(
 // Store/segment error mapping
 // ---------------------------------------------------------------------------
 
-fn fetch_store_error(key: &str, source: StoreError) -> ApiError {
-    ApiError::from_query(QueryError::Fetch(ravel_query::FetchError::Store {
+fn fetch_store_error(key: &str, source: StoreError) -> ServiceError {
+    ServiceError::from_query(QueryError::Fetch(ravel_query::FetchError::Store {
         key: key.to_string(),
         source,
     }))
 }
 
-fn corrupt(key: &str, source: ravel_segment::SegmentError) -> ApiError {
-    ApiError::from_query(QueryError::Fetch(ravel_query::FetchError::Corrupt {
+fn corrupt(key: &str, source: ravel_segment::SegmentError) -> ServiceError {
+    ServiceError::from_query(QueryError::Fetch(ravel_query::FetchError::Corrupt {
         key: key.to_string(),
         source,
     }))
@@ -987,8 +1056,8 @@ fn corrupt(key: &str, source: ravel_segment::SegmentError) -> ApiError {
 /// walk stops at the first exemplar over the line rather than counting the
 /// rest: the exact total is unknown, and materializing it is the thing the cap
 /// exists to prevent.
-fn too_many_exemplars(max: usize) -> ApiError {
-    let mut err = ApiError::from_query(QueryError::TooManySamples {
+fn too_many_exemplars(max: usize) -> ServiceError {
+    let mut err = ServiceError::from_query(QueryError::TooManySamples {
         count: max.saturating_add(1),
         max,
     });
@@ -1178,7 +1247,7 @@ impl Envelope {
 /// would be a permanently-zero field, which `ravel-query`'s own accounting
 /// JSON explicitly refuses to carry).
 #[derive(Debug, Default, Serialize)]
-struct QueryStatsJson {
+pub struct QueryStatsJson {
     #[serde(rename = "segmentsFetched")]
     segments_fetched: u64,
     #[serde(rename = "segmentsPruned")]
@@ -1243,7 +1312,7 @@ impl QueryAccountingJson {
 }
 
 #[derive(Debug, Serialize)]
-struct ExemplarSeriesJson {
+pub struct ExemplarSeriesJson {
     #[serde(rename = "seriesLabels")]
     series_labels: BTreeMap<String, String>,
     exemplars: Vec<ExemplarEntryJson>,
@@ -1290,107 +1359,6 @@ fn format_value(v: f64) -> String {
     } else {
         format!("{v}")
     }
-}
-
-// ---------------------------------------------------------------------------
-// Error boundary
-// ---------------------------------------------------------------------------
-
-/// A client-visible error: a status, a stable type tag, and a message that has
-/// already passed the redaction boundary (storage faults are redacted by
-/// `QueryErrorResponse`, never echoed).
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    error_type: &'static str,
-    message: String,
-}
-
-impl ApiError {
-    fn bad_request(message: String) -> Self {
-        ApiError {
-            status: StatusCode::BAD_REQUEST,
-            error_type: "bad_data",
-            message,
-        }
-    }
-
-    fn invalid_param(name: &str, value: &str) -> Self {
-        ApiError::bad_request(format!("invalid value for parameter {name:?}: {value:?}"))
-    }
-
-    /// Maps a `QueryError` through `ravel-query`'s public HTTP mapping, so this
-    /// endpoint keeps the exact status contract of `/api/v1/query`, including
-    /// the redaction of storage-layer faults, from one shared source.
-    fn from_query(err: QueryError) -> Self {
-        let QueryErrorResponse {
-            status,
-            error_type,
-            message,
-        } = QueryErrorResponse::from_query_error(err);
-        ApiError {
-            status,
-            error_type,
-            message,
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            axum::Json(json!({
-                "status": "error",
-                "errorType": self.error_type,
-                "error": self.message,
-            })),
-        )
-            .into_response()
-    }
-}
-
-/// Submit one query-audit event for an executed exemplar query and await its
-/// durability before the response is released (ADR-0062 §2a). `language` is
-/// `exemplars` so the record shape stays one schema across surfaces. On a
-/// submission failure the request fails closed with a retryable 503
-/// (`audit_mode=required`); in best-effort mode the pipeline resolves it to
-/// `Ok`.
-async fn submit_audit(
-    state: &ExemplarsState,
-    tenant_hash: TenantHash,
-    now_ns: i64,
-    query_text: &str,
-    status: QueryStatus,
-    window_start_ns: i64,
-    window_end_ns: i64,
-) -> Result<(), ApiError> {
-    let event = query_audit_event(
-        &tenant_hash,
-        now_ns,
-        query_text,
-        "exemplars",
-        status,
-        window_start_ns,
-        window_end_ns,
-    );
-    state.audit_sink.submit(event).await.map_err(|_| ApiError {
-        status: StatusCode::SERVICE_UNAVAILABLE,
-        error_type: "unavailable",
-        message: "query audit is temporarily unavailable; retry".to_string(),
-    })
-}
-
-fn authenticate(state: &ExemplarsState, headers: &HeaderMap) -> Result<TenantHash, ApiError> {
-    state
-        .tenant_resolver
-        .resolve(headers)
-        .map(|tenant| tenant.hash())
-        .map_err(|_| ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            error_type: "unauthorized",
-            message: "authentication required".to_string(),
-        })
 }
 
 #[cfg(test)]
@@ -1810,6 +1778,8 @@ mod tests {
             get_limiter: Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
             max_exemplars,
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+            query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+            query_accounting: default_query_accounting(),
         };
         router(state)
     }
@@ -1859,6 +1829,8 @@ mod tests {
             audit_sink: Arc::new(RecordingSink {
                 events: Arc::clone(&events),
             }),
+            query_admission: QueryAdmissionController::shared(QueryConcurrencyLimit::Unlimited),
+            query_accounting: default_query_accounting(),
         };
         (router(state), events)
     }

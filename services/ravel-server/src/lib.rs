@@ -49,6 +49,7 @@ pub mod query_admission_reconcile;
 pub mod query_postings_metrics;
 pub mod remote_write;
 pub mod scrub;
+pub mod service;
 #[cfg(feature = "sql")]
 pub mod sql;
 #[cfg(feature = "flight-sql")]
@@ -1327,6 +1328,10 @@ pub async fn start(
         // would be an assignment no reader ever sees.
         #[cfg(feature = "sql")]
         let alert_sql_executor: Option<Arc<ravel_sql::SqlExecutor>>;
+        // The SQL surface's state, kept for the process-wide `QueryService`
+        // assembled below.
+        #[cfg(feature = "sql")]
+        let sql_query_state: sql::SqlState;
         #[cfg(feature = "sql")]
         {
             // Mounted alongside the Prometheus-shaped routes on the same
@@ -1377,6 +1382,7 @@ pub async fn start(
                 Some(declared_columns),
             )?;
             alert_sql_executor = Some(state.executor.clone());
+            sql_query_state = state.clone();
             // The same executor the idle-tenant sweep evicts idle accountants
             // from (ADR-0069 decision 2): built once here, shared, never a
             // second instance with its own per-tenant accounting.
@@ -1411,7 +1417,12 @@ pub async fn start(
             // process-wide AuditPipeline install is a separate step, so this is
             // the no-op sink today (the handler already submits and awaits through it).
             audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+            // The one shared fleet ceiling: an analytics call is the same range
+            // evaluation /api/v1/query_range runs, so it competes for the same
+            // permits rather than running outside them.
+            query_admission: query_admission.clone(),
         };
+        let analytics_state_for_service = analytics_state.clone();
         http_router = http_router.merge(analytics::router(analytics_state));
         if let Some(mtls) = &config.mtls_listener {
             let mtls_analytics_state = analytics::AnalyticsState {
@@ -1420,6 +1431,7 @@ pub async fn start(
                 clock: Arc::new(SystemClock),
                 query_accounting: query_accounting.clone(),
                 audit_sink: Arc::new(ravel_maintain::NoopQueryAuditSink),
+                query_admission: query_admission.clone(),
             };
             mtls_router = mtls_router.merge(analytics::router(mtls_analytics_state));
         }
@@ -1479,8 +1491,10 @@ pub async fn start(
             config.tenant_resolver.clone(),
             Arc::new(SystemClock),
             get_limiter.clone(),
-        );
-        http_router = http_router.merge(exemplars::router(exemplars_state));
+        )
+        .with_query_admission(query_admission.clone())
+        .with_query_accounting(query_accounting.clone());
+        http_router = http_router.merge(exemplars::router(exemplars_state.clone()));
         if let Some(mtls) = &config.mtls_listener {
             let mtls_exemplars_state = exemplars::ExemplarsState::from_engine(
                 &app_state.engine,
@@ -1489,8 +1503,36 @@ pub async fn start(
                 mtls.resolver.clone(),
                 Arc::new(SystemClock),
                 get_limiter.clone(),
-            );
+            )
+            .with_query_admission(query_admission.clone())
+            .with_query_accounting(query_accounting.clone());
             mtls_router = mtls_router.merge(exemplars::router(mtls_exemplars_state));
+        }
+
+        // The one query service layer for this process (ADR-1374 decision 3):
+        // the same controls every route mounted above runs its query through,
+        // with every query surface this process serves attached to it. Each
+        // route's own state builds an equivalent facade per request out of the
+        // same `Arc`s, so this instance and theirs share one admission
+        // controller, one cost recorder, one usage sink, and one audit sink.
+        // Layered as an extension so an in-process transport that is not an
+        // axum route (the MCP adapter, issue #1381) has one place to take it
+        // from rather than reassembling the controls itself.
+        let query_service = service::QueryService::with_metrics(
+            config.tenant_resolver.clone(),
+            Arc::new(SystemClock),
+            query_admission.clone(),
+            query_accounting.clone(),
+            Arc::new(ravel_maintain::NoopQueryAuditSink),
+        )
+        .with_engine(app_state.engine.clone())
+        .with_analytics(analytics_state_for_service)
+        .with_exemplars(exemplars_state);
+        #[cfg(feature = "sql")]
+        let query_service = query_service.with_sql(sql_query_state);
+        http_router = http_router.layer(axum::Extension(query_service.clone()));
+        if config.mtls_listener.is_some() {
+            mtls_router = mtls_router.layer(axum::Extension(query_service));
         }
 
         // Same `QueryEngine` (and, under the `sql` feature, the same

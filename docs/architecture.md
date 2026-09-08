@@ -236,6 +236,20 @@ boundary. A slow or unreachable remote degrades to partial coverage, and that
 state is always visible in the query's stats and warnings
 ([guides/distributed-query.md](guides/distributed-query.md)).
 
+One query service layer sits between every query transport and the engine,
+and it is the single place the per-query controls live: admission against the
+fleet-global concurrency ceiling, the deadline and request-budget clamps
+(which may only lower a server ceiling), the usage record folded on every
+exit path including a client disconnect, the evidential audit event whose
+durability is awaited before an answer is released, the partial-coverage
+consent gate, and the redaction a failure passes through on the way out. A
+transport parses its request, authenticates it, calls one operation, and
+encodes the outcome; it holds none of those controls itself. Authentication
+stays on the transport side and runs before admission, so an unauthenticated
+request cannot consume a permit. Adding a transport therefore cannot add a
+surface that queries outside the ceiling, spends without recording, or
+answers without an audit trail.
+
 The failure boundaries are the two PUTs of a write and the compare-and-swap
 of a fold. A failure on either side of them has a defined outcome and never
 an ambiguous one for Ravel, only sometimes for the client. Storage

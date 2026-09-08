@@ -58,18 +58,16 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use ravel_ingest::Clock;
-use ravel_maintain::{QueryAuditSink, QueryStatus, query_audit_event};
+use ravel_maintain::QueryAuditSink;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::QueryAdmissionController;
 use ravel_query::http::TenantResolver;
-use ravel_sql::{ErrorClass, LiveAccounting, SqlError, SqlExecutor, SqlRequest};
-use ravel_types::accounting::{CostEstimate, QueryAccountingSnapshot};
+use ravel_sql::{SqlExecutor, SqlRequest};
 use ravel_types::{CommitToken, TenantHash, TimeRange};
 use serde::Deserialize;
 use serde_json::json;
-use tracing::Instrument;
 
-use crate::metrics::{QueryOutcomeStatus, WorkloadClass};
+use crate::service::{ApiError, QueryService, ServiceError};
 
 /// The Arrow IPC stream media type, as registered by the Arrow project.
 pub const ARROW_STREAM_MEDIA_TYPE: &str = "application/vnd.apache.arrow.stream";
@@ -120,6 +118,22 @@ pub struct SqlState {
     pub query_admission: Arc<QueryAdmissionController>,
 }
 
+impl SqlState {
+    /// The query service layer for this surface: the shared controls plus this
+    /// state. The handler below calls it, and so does the process-wide service
+    /// built in `lib.rs`, through one implementation of the controls.
+    pub fn service(&self) -> QueryService {
+        QueryService::with_metrics(
+            Arc::clone(&self.tenant_resolver),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.query_admission),
+            Arc::clone(&self.query_accounting),
+            Arc::clone(&self.audit_sink),
+        )
+        .with_sql(self.clone())
+    }
+}
+
 /// The `/api/v1/sql` router.
 pub fn router(state: SqlState) -> Router {
     Router::new()
@@ -144,121 +158,24 @@ struct SqlBody {
     min_commit_token: Vec<String>,
 }
 
-/// Guarantees `run`'s query cost and outcome status reach
-/// `state.query_accounting` exactly once, on every exit from `run` -- success,
-/// error, and the one exit no `return` or `?` can reach: the enclosing
-/// request future being dropped mid-`.await` on `execute` (a client
-/// disconnect while the query is still doing object-store work). This is the
-/// same guard/`Drop` shape as `handle`'s `_permit`
-/// (`QueryAdmissionController`, ADR-0061 decision 2), applied to cost
-/// recording instead of concurrency admission.
-///
-/// `finish` is called immediately once `result` is known, before
-/// `submit_audit(..).await?` or `result.map_err(..)?` get a chance to return
-/// early, so both of those early returns run after the fold has already
-/// happened and cannot skip it. If `finish` is never reached -- the only way
-/// is the guard itself being dropped without `run` reaching that line, i.e.
-/// the whole `run` future dropped mid-`execute().await` -- `Drop::drop` runs
-/// unconditionally (Rust guarantees this for every value dropped by scope
-/// exit, `return`, `?`, panic, or an abandoned `.await`) and folds a
-/// `Canceled` record whose cost is read live from the executor's accounting
-/// handle, so a query that fetched objects for two minutes and was then
-/// dropped records what it actually spent, not zeros.
-///
-/// The guard holds a [`LiveAccounting`] handed to `SqlExecutor::execute_accounted`,
-/// which re-points it at the running attempt's counters. Both `finish` and
-/// `drop` snapshot it, so a timeout, a mid-fetch drop, and every error path
-/// record the requests and bytes issued up to that instant with the right
-/// status.
-struct CostGuard<'a> {
-    metrics: &'a crate::metrics::QueryAccountingMetrics,
-    tenant_hash: TenantHash,
-    live: LiveAccounting,
-    finished: bool,
-}
-
-impl<'a> CostGuard<'a> {
-    fn new(
-        metrics: &'a crate::metrics::QueryAccountingMetrics,
-        tenant_hash: TenantHash,
-        live: LiveAccounting,
-    ) -> Self {
-        CostGuard {
-            metrics,
-            tenant_hash,
-            live,
-            finished: false,
-        }
-    }
-
-    /// Record the real outcome. Consumes the guard so a second call is a
-    /// compile error, not a double fold.
-    fn finish(
-        mut self,
-        status: QueryOutcomeStatus,
-        accounting: &QueryAccountingSnapshot,
-        estimate: &CostEstimate,
-    ) {
-        self.metrics
-            .record_outcome(self.tenant_hash, status, accounting, estimate);
-        self.finished = true;
-    }
-}
-
-impl Drop for CostGuard<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            // The run future was dropped mid-`execute` (a client disconnect
-            // while the query was still doing object-store work). Record the
-            // cost issued up to this instant, read live from the executor's
-            // accounting handle -- not zeros.
-            self.metrics.record_outcome(
-                self.tenant_hash,
-                QueryOutcomeStatus::Canceled,
-                &self.live.snapshot(),
-                &CostEstimate::new(0, 0, 0, 0, 0),
-            );
-        }
-    }
-}
-
-/// The outcome status for a failed query, from the `SqlError` class alone. A
-/// wall-deadline trip is a `Timeout`; every other error is an `Error`. The cost
-/// recorded alongside it is read from the live accounting handle, not derived
-/// from the error variant, so `DeadlineExceeded` and a dropped future carry the
-/// real requests and bytes the query issued rather than zeros.
-fn error_status(err: &SqlError) -> QueryOutcomeStatus {
-    match err.class() {
-        ErrorClass::Timeout => QueryOutcomeStatus::Timeout,
-        _ => QueryOutcomeStatus::Error,
-    }
-}
-
 async fn handle(State(state): State<SqlState>, req: Request<Body>) -> Response {
-    // Fleet-global concurrency admission (ADR-0061 decision 2): decide before
-    // `run` does any resolve or GET. The permit is held for the whole request and
-    // released on return (success or error) or on a dropped request future, by
-    // its `Drop`.
-    let _permit = match state.query_admission.try_admit() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return ApiError {
-                status: StatusCode::SERVICE_UNAVAILABLE,
-                error_type: "unavailable",
-                message: "fleet query concurrency ceiling reached; retry".to_string(),
-            }
-            .into_response();
-        }
-    };
     match run(&state, req).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
     }
 }
 
-async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError> {
+/// Parse, authenticate, ask the query service layer, encode. Fleet-global
+/// admission, the usage record on every exit path (the dropped-future exit
+/// included), the audit event and its durability wait, and error redaction all
+/// happen inside [`QueryService::sql_execute`], shared with every other query
+/// surface.
+///
+/// Authentication runs here, before the service takes a permit, so an anonymous
+/// caller no longer consumes one from the fleet-global concurrency ceiling.
+async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceError> {
     let headers = req.headers().clone();
-    let tenant_hash = authenticate(state, &headers)?;
+    let tenant_hash = crate::service::authenticate(state.tenant_resolver.as_ref(), &headers)?;
 
     let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
@@ -269,106 +186,14 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
     let now_ns = state.clock.now_ns();
     let request = build_request(&body, now_ns, state.max_deadline)?;
 
-    // A request-level span carrying only bounded values (ADR-0044 section 5):
-    // the tenant hash, the workload class, and -- recorded once the query
-    // finishes -- the final store request and byte counts. No query text, label
-    // values, or object keys ever become span fields. Every SQL statement over
-    // this transport is an interactive, client-driven query.
-    let span = tracing::info_span!(
-        "sql_query",
-        tenant_hash = %tenant_hash.to_hex(),
-        workload_class = WorkloadClass::Interactive.name(),
-        s3_requests = tracing::field::Empty,
-        s3_bytes = tracing::field::Empty,
-    );
-
-    // The live accounting handle: the executor re-points it at the running
-    // query's counters, and the guard snapshots it on every exit -- including
-    // the dropped-future and timeout exits that carry no `SqlOutcome`.
-    let live = LiveAccounting::new();
-
-    // Constructed before `execute` is awaited so a dropped `run` future
-    // (client disconnect mid-query) still folds a Canceled record through its
-    // `Drop` -- see `CostGuard`'s doc comment for the full mechanism.
-    let cost_guard = CostGuard::new(&state.query_accounting, tenant_hash, live.clone());
-
-    // The query has now reached execution for a resolved tenant, so it is
-    // auditable (ADR-0042 decision 4, ADR-0062 §2a). Run it, then submit
-    // exactly one query-audit event for the outcome - success or the specific
-    // SqlError - through the shared sink and await its durability before
-    // mapping the result to a response. Requests rejected earlier (no tenant,
-    // an unreadable body, or invalid request parameters) never reach here and
-    // are not audited: there is no executed query to attribute.
-    let result = state
-        .executor
-        .execute_accounted(tenant_hash, &request, &live)
-        .instrument(span.clone())
-        .await;
-    let status = match &result {
-        Ok(_) => QueryStatus::Ok,
-        Err(_) => QueryStatus::Error,
-    };
-
-    // Fold the real outcome on EVERY exit past this point (issue #809): this
-    // runs before `submit_audit`'s `?` and `result.map_err(..)?` below, so an
-    // audit-write failure or a redacted `SqlError` can no longer skip cost
-    // recording the way only the success path used to reach it.
-    match &result {
-        Ok(outcome) => {
-            cost_guard.finish(
-                QueryOutcomeStatus::Success,
-                &outcome.accounting,
-                &outcome.estimate,
-            );
-        }
-        Err(err) => {
-            // The live handle carries the requests and bytes the query issued
-            // before it failed, including a fetch still outstanding when a
-            // deadline tripped. The estimate is only known on the success path.
-            cost_guard.finish(
-                error_status(err),
-                &live.snapshot(),
-                &CostEstimate::new(0, 0, 0, 0, 0),
-            );
-        }
-    }
-
-    submit_audit(
-        state,
-        tenant_hash,
-        now_ns,
-        &request.sql,
-        status,
-        request.window.start_ns,
-        request.window.end_ns,
-    )
-    .await?;
-
-    let outcome = result.map_err(|err| ApiError::from_sql(err, tenant_hash))?;
-
-    // Fold this query's actual cost and its pre-execution estimate into the
-    // process-global aggregator for `/metrics` (ADR-0044 section 4), and record
-    // the final counts on the span. The executor already built and dropped a
-    // fresh `QueryAccounting` per attempt; `outcome.accounting` is the
-    // successful attempt's snapshot, so a retried attempt's counters never
-    // bleed in. Unchanged by the outcome-status fold above: this is the
-    // pre-existing `ravel_query_*` family, fed only on success as before, and
-    // `CostGuard` folds into its own independent map.
-    span.record("s3_requests", outcome.accounting.total_s3_requests());
-    span.record("s3_bytes", outcome.accounting.total_s3_bytes());
-    state.query_accounting.record(
-        tenant_hash,
-        WorkloadClass::Interactive,
-        &outcome.accounting,
-        &outcome.estimate,
-    );
+    let outcome = state.service().sql_execute(tenant_hash, &request).await?;
 
     // Fold this query's LogsScanExec block counters into the process-global
     // prune-selectivity totals. These are the scan's own
     // DataFusion counters, read off the plan in ravel-sql and surfaced on
     // `stats`; a metrics query passes zeros and moves nothing. Separate from
-    // the cost aggregator above: that one answers "what did this query
-    // spend", this one answers "how much did POSTINGS let it skip".
+    // the cost aggregator in the service layer: that one answers "what did this
+    // query spend", this one answers "how much did POSTINGS let it skip".
     crate::query_postings_metrics::record(
         outcome.stats.blocks_total,
         outcome.stats.blocks_scanned,
@@ -377,62 +202,6 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ApiError>
 
     let stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
     encode(&headers, &outcome, tenant_hash, stats)
-}
-
-/// Submit the query-audit event for one request through the shared sink and
-/// await its durability (ADR-0062 §2a). Unlike a direct-write path
-/// that logs and swallows a write failure so a successful
-/// query stays a success, the audit trail is a release gate: in
-/// `audit_mode=required` a flush failure (or a stopped pipeline) returns an
-/// error here and the request fails closed with a retryable 503, the
-/// deliberate inversion of "queries outlive the trail". In
-/// `audit_mode=best-effort` the pipeline resolves the submission to `Ok`, so
-/// this returns `Ok` and the response is released. The record is written by the
-/// server from the resolved tenant, never derived from a client body, so a
-/// tenant cannot forge or suppress it.
-#[allow(clippy::too_many_arguments)]
-async fn submit_audit(
-    state: &SqlState,
-    tenant_hash: TenantHash,
-    now_ns: i64,
-    query_text: &str,
-    status: QueryStatus,
-    window_start_ns: i64,
-    window_end_ns: i64,
-) -> Result<(), ApiError> {
-    let event = query_audit_event(
-        &tenant_hash,
-        now_ns,
-        query_text,
-        "sql",
-        status,
-        window_start_ns,
-        window_end_ns,
-    );
-    state.audit_sink.submit(event).await.map_err(|err| {
-        tracing::warn!(
-            tenant = %tenant_hash.to_hex(),
-            error = %err,
-            "query-audit submission failed; failing the request closed (audit_mode=required)",
-        );
-        ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            error_type: "unavailable",
-            message: "query audit is temporarily unavailable; retry".to_string(),
-        }
-    })
-}
-
-fn authenticate(state: &SqlState, headers: &HeaderMap) -> Result<TenantHash, ApiError> {
-    state
-        .tenant_resolver
-        .resolve(headers)
-        .map(|tenant| tenant.hash())
-        .map_err(|_| ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            error_type: "unauthorized",
-            message: "authentication required".to_string(),
-        })
 }
 
 /// Turn the request body into a [`SqlRequest`], resolving the window and
@@ -526,12 +295,12 @@ fn encode(
     outcome: &ravel_sql::SqlOutcome,
     tenant_hash: TenantHash,
     stats: serde_json::Value,
-) -> Result<Response, ApiError> {
+) -> Result<Response, ServiceError> {
     if wants_arrow(headers) {
         let bytes = outcome
             .output
             .to_arrow_ipc()
-            .map_err(|err| ApiError::from_sql(err, tenant_hash))?;
+            .map_err(|err| ServiceError::from_sql(err, tenant_hash))?;
         return Ok((
             StatusCode::OK,
             [(header::CONTENT_TYPE, ARROW_STREAM_MEDIA_TYPE)],
@@ -543,7 +312,7 @@ fn encode(
     let data = outcome
         .output
         .to_json()
-        .map_err(|err| ApiError::from_sql(err, tenant_hash))?;
+        .map_err(|err| ServiceError::from_sql(err, tenant_hash))?;
     Ok((
         StatusCode::OK,
         axum::Json(json!({ "status": "success", "data": data, "stats": stats })),
@@ -558,88 +327,11 @@ fn wants_arrow(headers: &HeaderMap) -> bool {
         .is_some_and(|accept| accept.contains(ARROW_STREAM_MEDIA_TYPE))
 }
 
-/// A client-visible error: a status, a stable type tag, and a message that
-/// has already passed the redaction boundary.
-///
-/// `Debug` is safe to derive precisely because every field is already
-/// redacted: there is no unredacted source error held here to leak through a
-/// stray `{:?}`.
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    error_type: &'static str,
-    message: String,
-}
-
-impl ApiError {
-    /// Errors raised by this module before the query runs. The messages
-    /// describe the caller's own request and carry no server state.
-    fn bad_request(message: String) -> Self {
-        ApiError {
-            status: StatusCode::BAD_REQUEST,
-            error_type: "bad_data",
-            message,
-        }
-    }
-
-    /// The redaction boundary. The full error is logged here, once, with the
-    /// tenant hash as a structured field (server-side logs may carry it; a
-    /// client body may not). The body gets `client_message()` and nothing
-    /// else -- in particular never `{err}`.
-    fn from_sql(err: SqlError, tenant_hash: TenantHash) -> Self {
-        let message = err.client_message();
-        let (status, error_type) = match err.class() {
-            ErrorClass::BadRequest => (StatusCode::BAD_REQUEST, "bad_data"),
-            ErrorClass::Unsupported => (StatusCode::UNPROCESSABLE_ENTITY, "execution"),
-            ErrorClass::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-            ErrorClass::Timeout => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
-        };
-
-        // Client-caused rejections are not operational events; log them at
-        // debug so a scripted client cannot flood warn-level logs. Everything
-        // else keeps warn, because it is either a storage fault or a bug.
-        if status == StatusCode::BAD_REQUEST {
-            tracing::debug!(
-                tenant = %tenant_hash.to_hex(),
-                error = %err,
-                client_message = %message,
-                "sql request rejected",
-            );
-        } else {
-            tracing::warn!(
-                tenant = %tenant_hash.to_hex(),
-                error = %err,
-                client_message = %message,
-                "sql query error redacted from client response",
-            );
-        }
-
-        ApiError {
-            status,
-            error_type,
-            message,
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            axum::Json(json!({
-                "status": "error",
-                "errorType": self.error_type,
-                "error": self.message,
-            })),
-        )
-            .into_response()
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ravel_sql::SqlError;
 
     fn body(json: &str) -> SqlBody {
         serde_json::from_str(json).expect("valid body")
@@ -749,7 +441,7 @@ mod tests {
             ),
         ];
         for (err, status, error_type) in cases {
-            let api = ApiError::from_sql(err, tenant);
+            let api = ServiceError::from_sql(err, tenant);
             assert_eq!(api.status, status);
             assert_eq!(api.error_type, error_type);
         }
