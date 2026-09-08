@@ -89,17 +89,19 @@
 //! caller controls the size of, and it reports back only the length the caller
 //! itself sent.
 //!
-//! # Deviation from the wire field name `sha256`
+//! # The digest is BLAKE3-256, and the field says so
 //!
 //! ADR-1374's evidence-reference shape names a `sha256` field. This crate has
 //! no `sha2` dependency (only `rmcp` is an authorized new dependency for this
 //! task; the workspace-root edit scope is the `ravel-mcp` member plus the
 //! `rmcp` workspace dependency only), and `blake3` is already the codebase's
-//! universal hashing and MAC primitive (see `ravel_sql::flight_ticket`).
-//! [`EvidenceRef`] hashes the referenced row with BLAKE3-256 while keeping the
-//! wire field named `sha256` for D5 compatibility. This is flagged here, in
-//! the crate rustdoc, and in the task's final report as an ADR ambiguity
-//! rather than silently resolved.
+//! universal hashing and MAC primitive (see `ravel_sql::flight_ticket`). So
+//! [`EvidenceRef`] hashes the referenced row with BLAKE3-256, and both the
+//! field here and the `evidence[].blake3_256` field of the D4 envelope carry
+//! that name: a field called `sha256` holding a BLAKE3 digest cannot be
+//! verified by a client that believes the name, which is worse than a name
+//! the ADR did not anticipate. The 2026-09-09 amendment to
+//! docs/adrs/1374-agent-mcp-server.md records the rename.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -282,9 +284,10 @@ pub struct EvidenceRef {
     /// was minted by, so the hash is what a redeemer needs back, not
     /// something it supplies.
     pub argument_hash: [u8; 32],
-    /// BLAKE3-256 hash of the referenced row. Wire field name `sha256`; see
-    /// this module's "Deviation from the wire field name `sha256`" docs.
-    pub sha256: [u8; 32],
+    /// BLAKE3-256 hash of the referenced row, the same digest the envelope's
+    /// `evidence[].blake3_256` field carries in hex. See this module's "The
+    /// digest is BLAKE3-256, and the field says so" docs.
+    pub blake3_256: [u8; 32],
     pub mint_ns: i64,
     pub deadline_ns: i64,
 }
@@ -512,7 +515,7 @@ impl EvidenceRef {
         buf.extend_from_slice(&self.tenant.0);
         write_len_prefixed(&mut buf, self.tool.as_bytes())?;
         buf.extend_from_slice(&self.argument_hash);
-        buf.extend_from_slice(&self.sha256);
+        buf.extend_from_slice(&self.blake3_256);
         buf.extend_from_slice(&self.mint_ns.to_le_bytes());
         buf.extend_from_slice(&self.deadline_ns.to_le_bytes());
 
@@ -540,7 +543,7 @@ impl EvidenceRef {
         let tenant = TenantHash(cur.read_array::<16>()?);
         let tool = read_string(&mut cur)?;
         let argument_hash = cur.read_array::<32>()?;
-        let sha256 = cur.read_array::<32>()?;
+        let blake3_256 = cur.read_array::<32>()?;
         let mint_ns = i64::from_le_bytes(cur.read_array::<8>()?);
         let deadline_ns = i64::from_le_bytes(cur.read_array::<8>()?);
 
@@ -552,7 +555,7 @@ impl EvidenceRef {
             tenant,
             tool,
             argument_hash,
-            sha256,
+            blake3_256,
             mint_ns,
             deadline_ns,
         })
@@ -598,7 +601,7 @@ impl EvidenceRef {
             return Ok(Redeemed::Pinned(evidence));
         }
         Ok(Redeemed::Unpinned {
-            digest: evidence.sha256,
+            digest: evidence.blake3_256,
             tool: evidence.tool,
             argument_hash: evidence.argument_hash,
             tenant: evidence.tenant,
@@ -910,7 +913,7 @@ mod tests {
             tenant,
             tool: SAMPLE_TOOL.to_owned(),
             argument_hash: SAMPLE_ARGS,
-            sha256: [0x8Au8; 32],
+            blake3_256: [0x8Au8; 32],
             mint_ns: 1_700_000_000_000_000_000,
             deadline_ns: 1_700_000_030_000_000_000,
         }
@@ -1402,7 +1405,7 @@ mod tests {
         assert_eq!(redeemed, Redeemed::Pinned(evidence.clone()));
         let decoded = EvidenceRef::decode(&token, &key).expect("decodes");
         assert_eq!(decoded, evidence);
-        assert_eq!(decoded.sha256, [0x8Au8; 32]);
+        assert_eq!(decoded.blake3_256, [0x8Au8; 32]);
         assert_eq!(decoded.argument_hash, SAMPLE_ARGS);
         assert_eq!(decoded.tool, SAMPLE_TOOL);
         assert_eq!(decoded.mint_ns, 1_700_000_000_000_000_000);
@@ -1594,7 +1597,7 @@ mod tests {
                 tenant,
                 tool: SAMPLE_TOOL.to_owned(),
                 argument_hash: SAMPLE_ARGS,
-                sha256: [0x8Au8; 32],
+                blake3_256: [0x8Au8; 32],
                 mint_ns: 1_700_000_000_000_000_000,
                 deadline_ns: clamped,
             })
@@ -1621,7 +1624,7 @@ mod tests {
                 tenant,
                 tool: SAMPLE_TOOL.to_owned(),
                 argument_hash: SAMPLE_ARGS,
-                sha256: [0x8Au8; 32],
+                blake3_256: [0x8Au8; 32],
                 mint_ns: 1_700_000_000_000_000_000,
                 deadline_ns: embedded,
             }),

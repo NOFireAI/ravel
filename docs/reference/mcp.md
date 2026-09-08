@@ -18,13 +18,13 @@ the envelope, and the empty-result checklist.
 | --- | --- | --- | --- | --- | --- |
 | `ravel_capabilities` | Protocol and server version, enabled tools, effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `unauthorized`, `internal` |
 | `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal`, an optional `cursor` | `data`, `scope`, `visibility`, `coverage`, `presentation` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter, `time_range` (required), an optional `evidence_ref`. An unfiltered tenant-wide list is refused | `data`, `scope`, `coverage`, `evidence` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
+| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter, `time_range` (required), an optional `evidence_ref`, `deadline_ms`, `max_response_bytes`. An unfiltered tenant-wide list is refused | `data`, `scope`, `coverage`, `evidence` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range`, `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
 | `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent, an optional `evidence_ref` | `data`, `scope`, `coverage`, `accuracy`, `budget`, `evidence` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
-| `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required), an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_get_trace` | Spans of one trace id, the span tree, missing parents, orphans | `trace_id`, `time_range` (required), an optional logs pass, an optional `evidence_ref` | `data`, `scope`, `coverage`, `presentation`, `budget`, `evidence` | the shared budgets in the section below | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
-| `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result | `query`, `time_range`, `step`, `op`, an optional `evidence_ref` | `data`, `accuracy`, `budget`, `evidence` | reports the minimum point count the method needs | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `deadline`, `unavailable`, `internal` |
+| `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `coverage`, `accuracy`, `budget`, `evidence` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
+| `ravel_search_logs` | Typed log search compiled to SQL | indexed and typed-attribute predicates, `has_word`, severity, trace id, `time_range` (required), an optional `cursor`, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
+| `ravel_get_trace` | Spans of one trace id, the span tree, missing parents, orphans | `trace_id`, `time_range` (required), an optional logs pass, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `coverage`, `presentation`, `budget`, `evidence` | the shared budgets in the section below | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_analyze_timeseries` | `change_point` or `summary` over a PromQL range result | `query`, `time_range`, `step`, `op`, an optional `evidence_ref`, `deadline_ms`, `max_response_bytes` | `data`, `accuracy`, `budget`, `evidence` | reports the minimum point count the method needs | `unauthorized`, `missing_argument`, `invalid_argument`, `unsupported`, `deadline`, `unavailable`, `internal` |
 <!-- mcp-tools:end -->
 
 `ravel_capabilities` and `ravel_describe_data` return metadata only.
@@ -41,14 +41,15 @@ field means and how to read it.
   "status": "ok | ok_bounded | ok_page | error",
   "failure": null,
   "data": {"columns": [], "rows": [], "row_count": 0},
+  "plan": null,
   "scope": {"signal": "", "table": "", "time_range": {}, "predicates_applied": [], "order_by": []},
   "ids": {"query_id": "", "audit_ref": ""},
   "visibility": {"snapshot_id": "", "watermark_hour": "", "pinned": false, "min_commit_tokens_applied": []},
   "coverage": {"complete": true, "partial": false, "fragments": [], "unindexed_predicates": []},
   "accuracy": {"exact": true, "approximation": null, "lower_bound_count": false},
-  "presentation": {"max_rows": 200, "row_cap_hit": false, "bytes_cap_hit": false, "rows_omitted": 0, "cells_truncated": 0, "metadata_elided": 0, "effective_max_response_bytes": 524288, "floor_applied": false, "cursor": null},
+  "presentation": {"max_rows": 200, "row_cap_hit": false, "bytes_cap_hit": false, "rows_omitted": 0, "cells_truncated": 0, "metadata_elided": 0, "entries_truncated": 0, "scalars_truncated": 0, "effective_max_response_bytes": 524288, "floor_applied": false, "cursor": null},
   "budget": {"effective": {}, "actual": {}, "estimate": {}, "estimate_is_upper_envelope": true},
-  "evidence": [{"ref": "", "covers": "data.rows", "sha256": ""}],
+  "evidence": [{"ref": "", "covers": "data.rows", "blake3_256": ""}],
   "warnings": [],
   "next_steps": [{"action": "", "detail": ""}]
 }
@@ -63,6 +64,14 @@ the query produced one, shortening its cells under a per-cell budget rather
 than dropping it. A number, a timestamp, a boolean, and a hex-encoded
 binary id never shorten; a string or a structured value that exceeds the
 per-cell budget is cut to that budget.
+
+Three counters say what the fit removed outside `data.rows`.
+`metadata_elided` counts list entries dropped because their list was over
+its count bound. `entries_truncated` counts entries kept but cut because
+the entry was over its own size bound; a cut entry carries a truncation
+marker. `scalars_truncated` counts scalar fields cut or dropped because
+the scalars together were over their 4 KiB allowance. A cursor is dropped
+rather than cut, because cutting a token breaks its authentication code.
 
 The first-row guarantee applies to the byte cap. It does not apply to
 the row cap. When the equal-group rule leaves no complete group inside
@@ -141,7 +150,9 @@ tenant binding, and lifetime as every other cursor.
 Every data tool accepts an optional `evidence_ref` input. Redeeming a
 reference re-executes the tool with the reference's own arguments. The
 re-execution runs against the reference's pinned snapshot while the pin is
-valid. The server then compares the sha256 of the canonical row bytes.
+valid. The server then compares the BLAKE3-256 digest of the canonical row
+bytes. The digest travels in the evidence entry's `blake3_256` field, named
+for the function that produced it.
 After the pin expires, redemption re-executes fresh instead of using the
 pin. It reports `pinned: false` and states whether the hash matched.
 `cursor_invalid` and `cursor_expired` do not apply to an evidence reference
@@ -157,6 +168,8 @@ failure.
 | `max_bytes_scanned` | server ceiling | server ceiling | yes |
 | `max_store_requests` | server ceiling | server ceiling | yes |
 | `max_response_bytes` | 512 KiB | floor 256 KiB | yes, raised to the floor if lower |
+| `max_response_bytes` ceiling | 4 MiB | an operator may configure a lower one | no; a larger request clamps to it |
+| cursor or evidence token length | 1 MiB | fixed | no; a longer token is refused unread |
 | metric families per `ravel_describe_data` page | 100 | fixed | no |
 | segments admitted for `ravel_find_labels` resolution | 2,000 | fixed | no |
 

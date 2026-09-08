@@ -576,3 +576,13 @@ the catalog by a drift test, a README section, the `/mcp` row in
   - the `audit` table described as "including the query-audit trail"
   - the global "one snapshot per query" statement in
     `docs/consistency-model.md`
+
+**Amendment (2026-09-09, #1379).** Three changes, each matching what
+shipped. D4's `presentation` block carries three elision counters, not one:
+`metadata_elided` for dropped list entries, `entries_truncated` for entries
+kept but cut, and `scalars_truncated` for scalar fields cut or dropped under
+their 4 KiB allowance. D4 and D5 name the evidence digest field
+`blake3_256`, because the digest is BLAKE3-256 and a field called `sha256`
+cannot be verified by a reader who trusts the name. D5 states that an
+evidence reference presented after its pin has passed redeems as unpinned,
+re-executing fresh, rather than failing as expired.
