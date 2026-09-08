@@ -1236,7 +1236,7 @@ async fn sql_explain_clamps_the_deadline_and_budgets() {
     assert_eq!(clamped.deadline, Duration::from_secs(5));
     let budgets = clamped
         .budgets
-        .expect("the layer resolves budgets rather than leaving them absent");
+        .expect("the caller named budgets, so the clamped request names them too");
     assert_eq!(
         budgets.max_bytes_scanned,
         Some(ravel_query::ByteLimit::Bounded(64 << 20)),
@@ -1270,20 +1270,15 @@ async fn sql_explain_clamps_the_deadline_and_budgets() {
     );
     assert_eq!(budgets.max_segments, Some(3));
 
-    // A caller that named no budgets at all still runs under concrete ones.
+    // A caller that named no budgets keeps naming none: the clamp lowers what
+    // was asked for and does not ask on the caller's behalf. Filling this in
+    // would take the executor's documented no-budgets path away from every
+    // caller of the operation.
     let clamped = h
         .service
         .clamped_sql_request(state, &sql_request("SELECT 1"));
-    let budgets = clamped.budgets.expect("budgets");
-    assert_eq!(
-        budgets.max_bytes_scanned,
-        Some(ravel_query::ByteLimit::Bounded(64 << 20)),
-    );
-    assert_eq!(
-        budgets.max_store_requests,
-        Some(ravel_query::RequestLimit::Bounded(4_096)),
-    );
-    assert_eq!(budgets.max_segments, Some(512));
+    assert!(clamped.budgets.is_none());
+    assert_eq!(clamped.deadline, Duration::from_secs(5));
 
     // And both operations run the clamped request rather than the caller's:
     // the greedy deadline above is beyond the ceiling, and neither call
