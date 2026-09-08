@@ -1446,7 +1446,11 @@ carries the decrease-specific straggler slack window.
 
 Queries dedup by (series_id, ts) under the provenance order
 (commit created_unix_ns, writer_epoch, writer_seq, in-page index); the
-greatest wins. Values compare by f64 bit pattern (ADR-0010 §5).
+greatest wins. Values compare by f64 bit pattern (ADR-0010 §5). The primary
+key `created_unix_ns` is the flush-open clock reading; each writer raises every
+reading to a per-writer monotonic floor within its process lifetime, so a
+backwards wall-clock step cannot stamp a correction below the stale sample it
+supersedes (ADR-1307).
 
 That provenance order is not total across segments: two same-shard segments
 from different writers can tie on (created_unix_ns, writer_epoch, writer_seq)

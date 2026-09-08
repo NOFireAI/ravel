@@ -69,6 +69,11 @@ pub struct SpanIngestMetrics {
     /// Distinct span shard actors observed dead by the router. Counted once
     /// per shard on the first observation, so it never exceeds `shard_count`.
     shard_deaths: AtomicU64,
+    /// Flush-open stamps raised to this writer's monotonic floor because the
+    /// injected clock read below the previous stamp (ADR-1307), the
+    /// span-pipeline counterpart of [`crate::IngestMetrics`]'s own counter.
+    /// Exported as `ravel_ingest_clock_regressions_total`.
+    clock_regressions: AtomicU64,
     /// Multi-shard Strict writes that returned
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
@@ -120,6 +125,10 @@ pub struct SpanIngestMetricsSnapshot {
     pub acks_ok: u64,
     pub acks_err: u64,
     pub shard_deaths: u64,
+    /// Flush-open stamps raised to this writer's monotonic floor after a
+    /// backwards clock step (ADR-1307). Exported as
+    /// `ravel_ingest_clock_regressions_total`.
+    pub clock_regressions: u64,
     /// Multi-shard Strict writes returned as
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): a partial
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
@@ -191,6 +200,12 @@ impl SpanIngestMetrics {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush whose flush-open stamp was raised to this writer's monotonic
+    /// floor because the clock read below the previous stamp (ADR-1307).
+    pub(crate) fn record_clock_regression(&self) {
+        self.clock_regressions.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably before a sibling failed. Recorded once per such write,
@@ -254,6 +269,7 @@ impl SpanIngestMetrics {
             acks_ok: self.acks_ok.load(Ordering::Relaxed),
             acks_err: self.acks_err.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
@@ -331,6 +347,13 @@ mod tests {
             SpanIngestMetrics::record_shard_death,
             SpanIngestMetricsSnapshot {
                 shard_deaths: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            SpanIngestMetrics::record_clock_regression,
+            SpanIngestMetricsSnapshot {
+                clock_regressions: 1,
                 ..Default::default()
             },
         );
