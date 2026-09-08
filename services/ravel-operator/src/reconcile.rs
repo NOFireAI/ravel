@@ -152,6 +152,14 @@ pub struct RenderCtx {
     /// credential or tenant-token rotation does; folded into
     /// [`secrets_checksum`] alongside the other two.
     pub deployment_key_resource_version: Option<String>,
+
+    /// `resourceVersion` of the audit-token-key Secret the query tier
+    /// consumes (explicit `auditTokenKeySecretRef`, or the operator-generated
+    /// `<cluster>-audit-token-key`), or `None` when `deploymentKeySecretRef`
+    /// covers it and no such Secret is read (#1487). Folded only into the
+    /// query tier's checksum: gateway and maintain never read this Secret, so
+    /// their checksums must not move when it rotates.
+    pub audit_token_key_resource_version: Option<String>,
 }
 
 /// Resolve the credential Secret name a tier consumes: its own
@@ -191,11 +199,13 @@ pub fn secrets_checksum(
     token_rv: Option<&str>,
     credentials_rv: Option<&str>,
     deployment_key_rv: Option<&str>,
+    audit_token_key_rv: Option<&str>,
 ) -> String {
     blake3_hex(&[
         token_rv.unwrap_or(""),
         credentials_rv.unwrap_or(""),
         deployment_key_rv.unwrap_or(""),
+        audit_token_key_rv.unwrap_or(""),
     ])
 }
 
@@ -218,10 +228,16 @@ fn blake3_hex(fields: &[&str]) -> String {
 /// The [`SECRETS_CHECKSUM_ANNOTATION`] value for a tier, resolving which
 /// credential Secret the tier consumes and hashing its `resourceVersion`
 /// together with the token Secret's and the deployment-key Secret's.
+///
+/// `audit_key_rv` is folded in only by the query tier's call site (#1487):
+/// gateway and maintain always pass `None` here regardless of
+/// `ctx.audit_token_key_resource_version`, so a rotation of that Secret never
+/// moves their checksum.
 fn tier_secrets_checksum(
     spec: &RavelClusterSpec,
     ctx: &RenderCtx,
     tier_override: Option<&LocalSecretRef>,
+    audit_key_rv: Option<&str>,
 ) -> String {
     let secret_name = tier_credentials_secret_name(spec, tier_override);
     let credentials_rv = ctx
@@ -232,6 +248,7 @@ fn tier_secrets_checksum(
         ctx.token_resource_version.as_deref(),
         credentials_rv,
         ctx.deployment_key_resource_version.as_deref(),
+        audit_key_rv,
     )
 }
 
@@ -363,6 +380,101 @@ pub(crate) const DEPLOYMENT_KEY_MOUNT_DIR: &str = "/etc/ravel/deployment-key";
 /// reconciliation, so the mounted path and the value the operator hashes
 /// with can never name two different Secret keys.
 pub(crate) const DEPLOYMENT_KEY_SECRET_KEY: &str = "key";
+
+/// Env var the query tier reads the query-audit token key from (#1487).
+/// Gateway and maintain never render this: only the query tier records
+/// query text for audit.
+pub(crate) const AUDIT_TOKEN_KEY_ENV: &str = "RAVEL_AUDIT_TOKEN_KEY";
+
+/// Key within an `auditTokenKeySecretRef` (explicit or operator-generated)
+/// Secret holding the 64 lowercase hex characters, mirroring
+/// [`DEPLOYMENT_KEY_SECRET_KEY`]'s naming for the deployment-key Secret.
+pub(crate) const AUDIT_TOKEN_KEY_SECRET_KEY: &str = "key";
+
+/// Name of the operator-generated audit-token-key Secret when
+/// `spec.audit_token_key_secret_ref` and `spec.deployment_key_secret_ref` are
+/// both unset: `<cluster>-audit-token-key`.
+pub(crate) fn audit_token_key_secret_name(instance: &str) -> String {
+    child_name(instance, "audit-token-key")
+}
+
+/// The query tier's `RAVEL_AUDIT_TOKEN_KEY` env var, or `None` when no
+/// Secret should be read (#1487).
+///
+/// An explicit `spec.audit_token_key_secret_ref` always wins, even when
+/// `deploymentKeySecretRef` is also set. Otherwise, when
+/// `deploymentKeySecretRef` is set, the server derives the key from the
+/// deployment key and needs no env var at all. Otherwise, the operator
+/// generates and owns a Secret named by [`audit_token_key_secret_name`].
+fn audit_token_key_env(spec: &RavelClusterSpec, instance: &str) -> Option<EnvVar> {
+    let secret_name = if let Some(explicit) = &spec.audit_token_key_secret_ref {
+        explicit.name.clone()
+    } else if spec.deployment_key_secret_ref.is_some() {
+        return None;
+    } else {
+        audit_token_key_secret_name(instance)
+    };
+    Some(EnvVar {
+        name: AUDIT_TOKEN_KEY_ENV.to_string(),
+        value_from: Some(secret_key_env(&secret_name, AUDIT_TOKEN_KEY_SECRET_KEY)),
+        ..Default::default()
+    })
+}
+
+/// Whether the operator itself owns and generates the audit-token-key Secret
+/// for a cluster: true only when neither `auditTokenKeySecretRef` nor
+/// `deploymentKeySecretRef` is set (#1487).
+fn generates_audit_token_key_secret(spec: &RavelClusterSpec) -> bool {
+    spec.audit_token_key_secret_ref.is_none() && spec.deployment_key_secret_ref.is_none()
+}
+
+/// Whether the operator-generated audit-token-key Secret named by
+/// [`audit_token_key_secret_name`] already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditTokenKeySecretObservation {
+    /// No Secret with that name was found.
+    Absent,
+    /// A Secret with that name already exists; its value must not change.
+    Present,
+}
+
+/// What the controller should do about the generated audit-token-key Secret
+/// this reconcile pass, decided purely from the spec and the observation
+/// (mirrors [`QualifyJobAction`]'s observation-then-plan split).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditTokenKeySecretAction {
+    /// The cluster has an explicit `auditTokenKeySecretRef` or
+    /// `deploymentKeySecretRef`; the operator generates nothing.
+    NotGenerated,
+    /// The Secret already exists: reuse it unchanged. Regenerating here would
+    /// break token correlation across the audit trail for every query
+    /// recorded under the old key.
+    Reuse,
+    /// The Secret is absent: create it with `key`, freshly generated.
+    Create { key: String },
+}
+
+/// Pure decision for the generated audit-token-key Secret (#1487): whether
+/// the operator generates one at all, and if so, whether to create it now or
+/// reuse what is already there. `fresh_key` is only consumed on the `Absent`
+/// branch, so a caller may compute it lazily and pass a placeholder when the
+/// Secret is already `Present` without that value ever reaching the object
+/// the controller applies.
+pub fn plan_audit_token_key_secret(
+    spec: &RavelClusterSpec,
+    observation: AuditTokenKeySecretObservation,
+    fresh_key: &str,
+) -> AuditTokenKeySecretAction {
+    if !generates_audit_token_key_secret(spec) {
+        return AuditTokenKeySecretAction::NotGenerated;
+    }
+    match observation {
+        AuditTokenKeySecretObservation::Present => AuditTokenKeySecretAction::Reuse,
+        AuditTokenKeySecretObservation::Absent => AuditTokenKeySecretAction::Create {
+            key: fresh_key.to_string(),
+        },
+    }
+}
 
 /// Args shared by every mode: store selection, shard count, and the S3
 /// bucket/region/endpoint flags. Access/secret keys are NOT here (they are env
@@ -696,7 +808,7 @@ pub fn desired_gateway_deployment(
         spec.gateway.replicas,
         spec.gateway.resources.as_ref(),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override),
+        &tier_secrets_checksum(spec, ctx, tier_override, None),
     )
 }
 
@@ -719,6 +831,9 @@ pub fn desired_query_deployment(
     let tier_override = spec.query.credentials_secret_ref.as_ref();
     let mut env = s3_credential_env(spec, tier_override);
     env.extend(tenant_token_env(spec, ctx));
+    if let Some(audit_env) = audit_token_key_env(spec, instance) {
+        env.push(audit_env);
+    }
 
     let ports = vec![ContainerPort {
         name: Some("http".to_string()),
@@ -736,7 +851,12 @@ pub fn desired_query_deployment(
         spec.query.replicas,
         spec.query.resources.as_ref(),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override),
+        &tier_secrets_checksum(
+            spec,
+            ctx,
+            tier_override,
+            ctx.audit_token_key_resource_version.as_deref(),
+        ),
     )
 }
 
@@ -839,7 +959,7 @@ pub fn desired_maintain_deployment(
         spec.maintain.replicas,
         spec.maintain.resources.as_ref(),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override),
+        &tier_secrets_checksum(spec, ctx, tier_override, None),
     )))
 }
 
@@ -2789,6 +2909,7 @@ mod tests {
                 name: "ravel-tokens".to_string(),
             }),
             deployment_key_secret_ref: None,
+            audit_token_key_secret_ref: None,
             gateway: GatewaySpec {
                 replicas: 3,
                 resources: None,
@@ -2833,6 +2954,7 @@ mod tests {
                 "cred-1".to_string(),
             )]),
             deployment_key_resource_version: None,
+            audit_token_key_resource_version: None,
         }
     }
 
@@ -3512,7 +3634,7 @@ mod tests {
         // so all three carry the same checksum (they roll together).
         let spec = base_spec();
         let ctx = ctx();
-        let expected = secrets_checksum(Some("tok-1"), Some("cred-1"), None);
+        let expected = secrets_checksum(Some("tok-1"), Some("cred-1"), None, None);
         for dep in [
             desired_gateway_deployment(&spec, "prod", &ctx),
             desired_query_deployment(&spec, "prod", &ctx),
@@ -3616,19 +3738,34 @@ mod tests {
         // The pure hash behind every tier's pod-template annotation (ADR-0055
         // section 5): stable for the same inputs (no pod churn), and changing
         // when either the token or the credential resourceVersion moves.
-        let a = secrets_checksum(Some("100"), Some("200"), Some("300"));
-        assert_eq!(a, secrets_checksum(Some("100"), Some("200"), Some("300")));
-        assert_ne!(a, secrets_checksum(Some("101"), Some("200"), Some("300")));
-        assert_ne!(a, secrets_checksum(Some("100"), Some("201"), Some("300")));
+        let a = secrets_checksum(Some("100"), Some("200"), Some("300"), Some("400"));
+        assert_eq!(
+            a,
+            secrets_checksum(Some("100"), Some("200"), Some("300"), Some("400"))
+        );
         assert_ne!(
             a,
-            secrets_checksum(Some("100"), Some("200"), Some("301")),
+            secrets_checksum(Some("101"), Some("200"), Some("300"), Some("400"))
+        );
+        assert_ne!(
+            a,
+            secrets_checksum(Some("100"), Some("201"), Some("300"), Some("400"))
+        );
+        assert_ne!(
+            a,
+            secrets_checksum(Some("100"), Some("200"), Some("301"), Some("400")),
             "the deployment-key resourceVersion must also feed the checksum, \
              so its rotation rolls pods that mount it"
         );
+        assert_ne!(
+            a,
+            secrets_checksum(Some("100"), Some("200"), Some("300"), Some("401")),
+            "the audit-token-key resourceVersion must also feed the checksum, \
+             so its rotation rolls pods that mount it"
+        );
         // Absent versions collapse to a distinct, stable value.
-        let none = secrets_checksum(None, Some("200"), None);
-        assert_eq!(none, secrets_checksum(None, Some("200"), None));
+        let none = secrets_checksum(None, Some("200"), None, None);
+        assert_eq!(none, secrets_checksum(None, Some("200"), None, None));
         assert_ne!(none, a);
     }
 
@@ -3660,6 +3797,7 @@ mod tests {
                 ("mt-creds".to_string(), "cred-mt".to_string()),
             ]),
             deployment_key_resource_version: None,
+            audit_token_key_resource_version: None,
         };
 
         let g = desired_gateway_deployment(&spec, "prod", &ctx);
@@ -3746,7 +3884,7 @@ mod tests {
         let m = desired_maintain_deployment(&none_spec, "prod", &ctx)
             .expect("no gc render error")
             .expect("enabled");
-        let shared_checksum = secrets_checksum(Some("tok-1"), Some("cred-1"), None);
+        let shared_checksum = secrets_checksum(Some("tok-1"), Some("cred-1"), None, None);
         assert_eq!(checksum_of(&g).as_deref(), Some(shared_checksum.as_str()));
         assert_eq!(checksum_of(&q).as_deref(), Some(shared_checksum.as_str()));
         assert_eq!(checksum_of(&m).as_deref(), Some(shared_checksum.as_str()));
@@ -3780,6 +3918,7 @@ mod tests {
             token_resource_version: Some("tok-1".to_string()),
             credential_resource_versions: base_versions.clone(),
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
         // Rotate ONLY the gateway credential Secret.
         let mut after_versions = base_versions.clone();
@@ -3789,6 +3928,7 @@ mod tests {
             token_resource_version: Some("tok-1".to_string()),
             credential_resource_versions: after_versions,
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
 
         let g_before = desired_gateway_deployment(&over_spec, "prod", &before);
@@ -3828,6 +3968,7 @@ mod tests {
                 "shared-1".to_string(),
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
         let shared_after = RenderCtx {
             tenant_names: vec!["acme".to_string()],
@@ -3837,6 +3978,7 @@ mod tests {
                 "shared-2".to_string(),
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
         let gb = desired_gateway_deployment(&shared_spec, "prod", &shared_before);
         let ga = desired_gateway_deployment(&shared_spec, "prod", &shared_after);
@@ -3851,6 +3993,178 @@ mod tests {
         assert_ne!(checksum_of(&gb), checksum_of(&ga), "gateway must roll");
         assert_ne!(checksum_of(&qb), checksum_of(&qa), "query must roll");
         assert_ne!(checksum_of(&mb), checksum_of(&ma), "maintain must roll");
+    }
+
+    /// #1487: a cluster with neither `auditTokenKeySecretRef` nor
+    /// `deploymentKeySecretRef` set gets the query tier's
+    /// `RAVEL_AUDIT_TOKEN_KEY` sourced from the operator-generated Secret
+    /// `<instance>-audit-token-key`. Flip [`audit_token_key_secret_name`]'s
+    /// `child_name(instance, "audit-token-key")` to
+    /// `child_name(instance, "audit-key")` and this fails: the env var still
+    /// exists, but its Secret name no longer matches.
+    #[test]
+    fn unkeyed_cluster_query_tier_gets_generated_audit_token_key_env() {
+        let spec = base_spec(); // both refs unset
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        assert_eq!(
+            env_secret_name(&q, AUDIT_TOKEN_KEY_ENV).as_deref(),
+            Some("prod-audit-token-key"),
+            "query tier must source RAVEL_AUDIT_TOKEN_KEY from the generated Secret"
+        );
+    }
+
+    /// #1487: a cluster with `deploymentKeySecretRef` set and no
+    /// `auditTokenKeySecretRef` renders no `RAVEL_AUDIT_TOKEN_KEY` at all --
+    /// the server derives the key from the deployment key. Flip
+    /// [`audit_token_key_env`]'s `deployment_key_secret_ref.is_some()` branch
+    /// to fall through to generation instead of returning `None` and this
+    /// fails: the env var appears, sourced from a Secret the operator never
+    /// creates.
+    #[test]
+    fn keyed_cluster_injects_no_audit_token_key_env() {
+        let mut spec = base_spec();
+        spec.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "dk".to_string(),
+        });
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        assert!(
+            env_secret_name(&q, AUDIT_TOKEN_KEY_ENV).is_none(),
+            "a keyed cluster must render no RAVEL_AUDIT_TOKEN_KEY env var"
+        );
+    }
+
+    /// #1487: an explicit `auditTokenKeySecretRef` wins even when
+    /// `deploymentKeySecretRef` is ALSO set. Flip [`audit_token_key_env`]'s
+    /// field order so the `deployment_key_secret_ref.is_some()` check runs
+    /// before the explicit-ref check and this fails: the env var disappears
+    /// even though an explicit ref was given.
+    #[test]
+    fn explicit_audit_token_key_ref_wins_over_generation() {
+        let mut spec = base_spec();
+        spec.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "dk".to_string(),
+        });
+        spec.audit_token_key_secret_ref = Some(LocalSecretRef {
+            name: "explicit-audit".to_string(),
+        });
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        assert_eq!(
+            env_secret_name(&q, AUDIT_TOKEN_KEY_ENV).as_deref(),
+            Some("explicit-audit"),
+            "an explicit auditTokenKeySecretRef must win over both generation and \
+             the deployment-key derivation"
+        );
+    }
+
+    /// #1487: the generated audit-token-key Secret is created only when
+    /// absent, and reused unchanged once present -- a second reconcile must
+    /// never adopt a newly-offered random value, since a new key would break
+    /// token correlation across the audit trail. Flip
+    /// [`plan_audit_token_key_secret`]'s `Present => Reuse` arm to
+    /// `Present => Create { key: fresh_key.to_string() }` and this fails:
+    /// the second call would return a fresh key instead of reusing.
+    #[test]
+    fn generated_audit_token_key_secret_is_created_once_and_reused() {
+        let spec = base_spec(); // both refs unset: operator generates
+        let first = plan_audit_token_key_secret(
+            &spec,
+            AuditTokenKeySecretObservation::Absent,
+            "aaaa000000000000000000000000000000000000000000000000000000000000",
+        );
+        assert_eq!(
+            first,
+            AuditTokenKeySecretAction::Create {
+                key: "aaaa000000000000000000000000000000000000000000000000000000000000".to_string(),
+            },
+            "absent Secret must be created with the fresh key"
+        );
+        // A later reconcile observes the Secret present and offers a
+        // DIFFERENT fresh key (as a real random draw would); the plan must
+        // ignore it and reuse, never regenerate.
+        let second = plan_audit_token_key_secret(
+            &spec,
+            AuditTokenKeySecretObservation::Present,
+            "bbbb111111111111111111111111111111111111111111111111111111111111",
+        );
+        assert_eq!(
+            second,
+            AuditTokenKeySecretAction::Reuse,
+            "present Secret must be reused, never regenerated with the new fresh key"
+        );
+    }
+
+    /// #1487: gateway and maintain never read a query-audit token, in either
+    /// the generated or the explicit-ref case. Flip [`desired_gateway_deployment`]
+    /// (or [`desired_maintain_deployment`]) to also push
+    /// `audit_token_key_env(spec, instance)` into its env list, the same as
+    /// query, and this fails: one of the two non-query tiers would carry the
+    /// env var.
+    #[test]
+    fn gateway_and_maintain_carry_no_audit_token_key_env() {
+        let spec = base_spec(); // generated case: the one most likely to leak
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("no gc render error")
+            .expect("enabled");
+        assert!(
+            env_secret_name(&g, AUDIT_TOKEN_KEY_ENV).is_none(),
+            "gateway must never carry RAVEL_AUDIT_TOKEN_KEY"
+        );
+        assert!(
+            env_secret_name(&m, AUDIT_TOKEN_KEY_ENV).is_none(),
+            "maintain must never carry RAVEL_AUDIT_TOKEN_KEY"
+        );
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        assert!(
+            env_secret_name(&q, AUDIT_TOKEN_KEY_ENV).is_some(),
+            "sanity: query itself does carry it in the generated case"
+        );
+    }
+
+    /// #1487: the query tier's checksum must move when the audit-token-key
+    /// Secret's resourceVersion changes, and gateway/maintain's checksums must
+    /// NOT move -- proving the new field is isolated to the one tier that
+    /// reads that Secret. Flip [`tier_secrets_checksum`]'s query call site to
+    /// pass `None` instead of `ctx.audit_token_key_resource_version.as_deref()`
+    /// and the first assertion fails: the query checksum stops moving.
+    #[test]
+    fn query_tier_checksum_changes_with_the_audit_key_secret() {
+        let spec = base_spec();
+        let before = RenderCtx {
+            audit_token_key_resource_version: Some("a1".to_string()),
+            ..ctx()
+        };
+        let after = RenderCtx {
+            audit_token_key_resource_version: Some("a2".to_string()),
+            ..ctx()
+        };
+
+        let q_before = desired_query_deployment(&spec, "prod", &before);
+        let q_after = desired_query_deployment(&spec, "prod", &after);
+        assert_ne!(
+            checksum_of(&q_before),
+            checksum_of(&q_after),
+            "query checksum must move with the audit-token-key Secret's resourceVersion"
+        );
+
+        let g_before = desired_gateway_deployment(&spec, "prod", &before);
+        let g_after = desired_gateway_deployment(&spec, "prod", &after);
+        assert_eq!(
+            checksum_of(&g_before),
+            checksum_of(&g_after),
+            "gateway checksum must NOT move with the audit-token-key Secret"
+        );
+        let m_before = desired_maintain_deployment(&spec, "prod", &before)
+            .expect("no gc render error")
+            .expect("enabled");
+        let m_after = desired_maintain_deployment(&spec, "prod", &after)
+            .expect("no gc render error")
+            .expect("enabled");
+        assert_eq!(
+            checksum_of(&m_before),
+            checksum_of(&m_after),
+            "maintain checksum must NOT move with the audit-token-key Secret"
+        );
     }
 
     /// `base_spec` with a per-mode credential Secret on every tier: the
@@ -4664,6 +4978,7 @@ mod tests {
                 "shared-1".to_string(),
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
+            audit_token_key_resource_version: None,
         };
         let after = RenderCtx {
             deployment_key_resource_version: Some("dk-2".to_string()),
@@ -6242,9 +6557,13 @@ mod tests {
     /// changed the algorithm would fail here rather than roll every tier's pods.
     #[test]
     fn secrets_checksum_golden_is_stable_by_construction() {
+        // Literal recomputed for #1487: a 4th field (the audit-token-key
+        // resourceVersion) joined the hash, so the 3-field literal this test
+        // pinned before no longer applies -- a new input shape, not an
+        // accidental algorithm change.
         assert_eq!(
-            secrets_checksum(Some("100"), Some("200"), Some("300")),
-            "cea2e01fb489ecc4dac2f461605797406a50b29725416c6c6dd5ab97a18ea8a0",
+            secrets_checksum(Some("100"), Some("200"), Some("300"), Some("400")),
+            "35396940142d0f2998ba074acda24baf7f660d6e4b300d74f4e828d4707f3168",
         );
     }
 

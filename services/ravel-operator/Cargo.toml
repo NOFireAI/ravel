@@ -65,6 +65,10 @@ blake3 = { workspace = true }
 # between them. Pinned to `ring` here, matching kube's existing selection, so
 # this is the only crate whose Cargo.toml needs to change.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Generates the operator-owned audit-token-key Secret's 32 random bytes
+# (#1487) when neither auditTokenKeySecretRef nor deploymentKeySecretRef is
+# set. Already a workspace pin; adds no new external crate.
+rand = { workspace = true }
 
 [lints]
 workspace = true
