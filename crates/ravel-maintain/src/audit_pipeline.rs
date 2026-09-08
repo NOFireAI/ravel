@@ -819,7 +819,7 @@ mod tests {
         // writes normally.
         let plan = FaultPlan::empty().with_rule(
             Rule::new(Op::Put, ScriptedFault::Timeout)
-                .with_key_contains(&format!("t/{}/u/l0/", one.to_hex())),
+                .with_key_contains(format!("t/{}/u/l0/", one.to_hex())),
         );
         let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
         let config = pipeline_config(2, Duration::from_secs(3600));
