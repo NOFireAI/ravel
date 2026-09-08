@@ -219,7 +219,7 @@ pub enum SnapshotFormatError {
     ColumnStatsV3PartBlake3CountMismatch(usize),
     /// ADR-1413 (amended): the fold degrades a per-part column-stats object
     /// that would exceed the ceiling by dropping its largest dictionaries
-    /// first, re-measuring after each drop. This error fires only once no
+    /// first against a running total. This error fires only once no
     /// dictionary is left to drop and the dictionary-free body (fixed fields:
     /// min/max/count/sum, never truncated) is still over the fixed ceiling
     /// (`DEFAULT_MAX_COLUMN_STATS_BYTES`), checked before compression. Never

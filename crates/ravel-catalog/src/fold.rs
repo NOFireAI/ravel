@@ -631,9 +631,9 @@ struct PartSpan {
 }
 
 /// One span's part encoding, computed once and reused by both the
-/// `reused_old_part_hashes` baseline pass and the main per-span build loop
-/// (issue #1482 finding: encoding and hashing every span twice was wasted
-/// CPU on every fold). `min_hour`/`watermark` are this span's already-resolved
+/// `reused_old_part_hashes` baseline pass and the main per-span build loop,
+/// so a span is encoded and hashed once per fold. `min_hour`/`watermark` are
+/// this span's already-resolved
 /// part bounds (single-part/tail overrides applied), not the raw `PartSpan`
 /// values.
 struct SpanEncoding {
@@ -1335,17 +1335,12 @@ impl Catalog {
                 _ => HashMap::new(),
             };
 
-            // Issue #1482 finding 4: an old part carried forward by reference
-            // below (`existing_by_blake3`) never touches `v3_content_baseline`
-            // at all -- the per-span loop `continue`s straight past the v3
-            // block for it -- so fetching that part's previous stats object
-            // here was a wasted GET on every incremental fold, one per
-            // untouched sealed part, forever, independent of how many parts
-            // this fold actually re-derives. Precompute here exactly which old
-            // part hashes this fold's spans reproduce byte-for-byte and will
-            // therefore carry forward unchanged: only an old part NOT in that
-            // set is actually about to be re-derived and can use its prior
-            // per-segment statistics as a baseline.
+            // An old part carried forward by reference below
+            // (`existing_by_blake3`) never touches `v3_content_baseline`: the
+            // per-span loop skips the v3 block for it. Only an old part this
+            // fold re-derives can use its prior per-segment statistics as a
+            // baseline, so precompute which old part hashes the spans
+            // reproduce byte-for-byte and fetch baselines for the rest only.
             //
             // Encoded once per span (kept in `span_encodings`, not discarded):
             // the per-span build loop below consumes the same bytes and hash
@@ -1560,24 +1555,20 @@ impl Catalog {
                     // dictionary is left does `encode_column_stats_v3` below
                     // refuse.
                     //
-                    // #1482: the naive form of this loop re-measured the
-                    // WHOLE part's uncompressed body
-                    // (`column_stats_segments_concat`, a fresh multi-gigabyte
-                    // `Vec`) and re-summed every dictionary's `encoded_len`
-                    // on every single drop; a part needing tens of thousands
-                    // of drops never finished. Instead, every (segment,
-                    // column) pair's exact contribution to the body is
-                    // measured once, kept in a max-heap, and a running total
-                    // is adjusted by exactly the bytes each drop removes: the
+                    // The body is never re-concatenated per drop: a part can
+                    // need tens of thousands of drops against a
+                    // multi-gigabyte body. Every (segment, column) pair's
+                    // exact contribution to the body is measured once, kept
+                    // in a max-heap, and a running total is adjusted by
+                    // exactly the bytes each drop removes: the
                     // `DictEntry` bytes and the `dictionary_present` flag,
                     // plus any varint length-delimiter shrink on the
                     // enclosing `ColumnStat` and on the segment's own
                     // length-delimited framing (`encode_length_delimited_to_vec`,
                     // per `column_stats_segments_concat`). Popping by
                     // `(dict_size, seg_idx, col_idx)`'s natural tuple max
-                    // reproduces the old `max_by_key`'s tie-break exactly:
-                    // largest size first, then the last maximum in ascending
-                    // (seg_idx, col_idx) order.
+                    // orders the drops: largest size first, then the highest
+                    // (seg_idx, col_idx).
                     let ceiling = self.column_stats_part_ceiling();
                     let mut segment_len: Vec<u64> = v3_segments
                         .iter()
