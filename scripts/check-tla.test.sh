@@ -763,22 +763,26 @@ fi
 # sequentially, so an area with more than one exhaustive config (maintenance
 # runs MCMaintenanceOwnership.exhaustive.cfg and MCCompactionClaims.exhaustive.cfg)
 # needs its job's timeout-minutes to cover their sum, not just the largest
-# single budget_s. This sums each area's exhaustive-config budgets straight
-# from bands.tsv (default 3600s where budget_s is absent or invalid, the same
-# fallback cfg_budget applies) and asserts the workflow's timeout-minutes
-# exceeds the largest sum by at least 10 minutes, so a future budget_s bump
+# single budget_s. This walks every exhaustive config in the tree (both
+# spellings: a single-spec area's `exhaustive.cfg`, a multi-module area's
+# `MC<Spec>.exhaustive.cfg`), resolves each through cfg_budget exactly as the
+# harness does (so a config with no bands row counts at the 3600s default
+# rather than at zero), and asserts the workflow's timeout-minutes exceeds
+# the largest per-area sum by at least 10 minutes, so a future budget_s bump
 # that outgrows the ceiling fails here instead of timing out on the next
 # scheduled run.
 echo "--- (u) tla-nightly.yml timeout-minutes exceeds the largest per-area exhaustive-budget sum by >=10 minutes"
 max_sum=0
 max_area=""
+FORMAL_DIR="$REPO_ROOT/formal/tla"
 for adir in "$REPO_ROOT"/formal/tla/*/; do
     aname="$(basename "$adir")"
-    bands="$adir/bands.tsv"
-    [ -f "$bands" ] || continue
-    # Both spellings: a single-spec area names its config `exhaustive.cfg`,
-    # a multi-module area `MC<Spec>.exhaustive.cfg`.
-    asum="$(awk -F'\t' 'NR>1 && $1 ~ /(^|\.)exhaustive\.cfg$/ { b=$6; if (b !~ /^[0-9]{1,9}$/ || (b+0)==0) b=3600; sum+=b } END{print sum+0}' "$bands")"
+    asum=0
+    for cfg in "$adir"exhaustive.cfg "$adir"*.exhaustive.cfg; do
+        [ -f "$cfg" ] || continue
+        b="$(cfg_budget "$aname" "$(basename "$cfg")" 3600 2>/dev/null)"
+        asum=$((asum + b))
+    done
     if [ "$asum" -gt "$max_sum" ]; then max_sum="$asum"; max_area="$aname"; fi
 done
 echo "    largest area exhaustive-budget sum: $max_area = ${max_sum}s"

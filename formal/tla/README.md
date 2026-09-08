@@ -91,7 +91,7 @@ scripts/check-tla.sh traceability     # every traceability.md source ref resolve
 scripts/check-tla.sh live             # each area's banded live.cfg (budget 300s/cfg)
 scripts/check-tla.sh ci               # smoke + negative + live + traceability, one run id (the CI lane)
 scripts/check-tla.sh all              # ci, then exhaustive, under one run id
-scripts/check-tla.sh exhaustive       # full safety + liveness (nightly, budget 3600s/cfg)
+scripts/check-tla.sh exhaustive       # full safety + liveness (nightly; 3600s/cfg unless bands.tsv sets budget_s)
 scripts/check-tla.sh smoke -a common  # scope any subcommand to one area
 ```
 
@@ -156,7 +156,7 @@ smoke or live, which always run at `SMOKE_BUDGET` (300 s) regardless of
 `bands.tsv`. Use it when one configuration is measured to need more time
 than the rest of its area's configs on the lane's actual runner (see
 `formal/tla/maintenance/bands.tsv` and its `results.md` for the worked
-example: a hosted-runner timeout measurement projecting 4,000-4,200 s
+example: a hosted-runner timeout measurement projecting 4,000 to 4,200 s
 justifies `MCMaintenanceOwnership.exhaustive.cfg`'s `budget_s = 5400`),
 rather than raising `EXHAUSTIVE_BUDGET` for every config in the lane.
 
