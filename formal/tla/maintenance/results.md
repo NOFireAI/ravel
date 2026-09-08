@@ -37,6 +37,7 @@ This verifies the protocol designs; implementation conformance is argued in
 | MCMaintenanceOwnership.smoke.cfg | 1.7.4 | 47377233 | 2773760 | 21 | 90 | fleet executor | PASS |
 | MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 136617032 | 13183990 | 20 | 1769 | fleet executor | PASS |
 | MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 116707410 | 12448134 | 17 | 3600 | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | TIMEOUT at 3600 s, 12,448,134 distinct, 1,450,354 queued, projected 4,000 to 4,200 s |
+| MCMaintenanceOwnership.exhaustive.cfg | 1.7.4 | 136617032 | 13183990 | 19 | 4285 | GitHub hosted ubuntu-24.04, workers auto, Xmx2g | PASS under the 5400 s per-config budget (run 34246991138) |
 | MCCompactionClaims.smoke.cfg | 1.7.4 | 65454526 | 11155721 | 17 | 161 | fleet executor | PASS |
 | MCCompactionClaims.exhaustive.cfg | 1.7.4 | 1972 | 543 | 11 | 2 | fleet executor | PASS |
 | negative/ownership-as-publication-authority.cfg | 1.7.4 | - | - | - | - | fleet executor | VIOLATED (exit 12) |
@@ -79,11 +80,12 @@ hosted runner is slower per distinct state. Run 34230857065
 3600 s per-configuration budget on `MCMaintenanceOwnership.exhaustive.cfg`
 before it could finish: 116,707,410 states generated, 12,448,134 distinct,
 1,450,354 states left on the queue, search depth 17, at roughly 2.4M states
-per minute and a falling 116k to 181k distinct states per minute in the last
-ten minutes before the kill (181,101 / 157,388 / 151,690 / 157,848 / 124,073
-/ 116,020) (TLC also ran its temporal-property check every six minutes, for
-about a minute each time). The recorded complete run above (136,617,032
-generated, 13,183,990 distinct, depth 20, 1769 s, fleet executor) reached
+per minute and 116k to 181k distinct states per minute over the last six
+minutes before the kill, trending down (181,101 / 157,388 / 151,690 /
+157,848 / 124,073 / 116,020) (TLC also ran its temporal-property check every
+six minutes, for about a minute each time). The recorded complete run above
+(136,617,032 generated, 13,183,990 distinct, depth 20, 1769 s, fleet
+executor) reached
 94% of its final distinct-state count by the time this run was killed; at
 this run's own distinct-state rate the remainder needs roughly 400 to 600 s
 more, a projected total of 4,000 to 4,200 s. That makes the hosted runner
@@ -92,7 +94,10 @@ figure was recorded on. The other five areas all finished well inside
 3600 s on the same run (catalog 1034 s, commit 96 s, common 287 s,
 lifecycle 1371 s, resharding 59 s), as did the maintenance area's other
 config (`MCCompactionClaims.exhaustive.cfg` 1 s), so only this one
-configuration needed headroom.
+configuration needed headroom. With the per-configuration budget at 5400 s
+the same configuration completed on the hosted runner in 4285 s
+(136,617,032 generated, 13,183,990 distinct, depth 19; run 34246991138):
+about 2% above the projection's upper end and about 20% inside the budget.
 
 `scripts/check-tla.sh` now reads an optional per-configuration budget from
 `bands.tsv`'s `budget_s` column (`check_one_model` via `cfg_budget`) instead
