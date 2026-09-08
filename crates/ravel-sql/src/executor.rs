@@ -355,6 +355,39 @@ fn ts_literal(ns: i64) -> Expr {
     lit(ScalarValue::TimestampNanosecond(Some(ns), None))
 }
 
+/// A `(range, now_ns)` pair covering every segment already in `snapshot`, for
+/// [`Executor::plan_pinned`] and [`Executor::plan_pinned_distributed`]: both
+/// take an already-resolved snapshot with no request window attached, so
+/// `Catalog::load_column_stats` (which needs a window to bound which parts it
+/// loads) is given the widest window that still reproduces the snapshot's own
+/// resolve rather than a request window these entry points were never handed.
+/// `window_hour_bounds` only widens `range.start_ns` (by `max_ingest_lag_ns`)
+/// and `now_ns` (by `clock_skew_allowance_ns`), so bracketing exactly the
+/// resolved segments' own timestamps is always at least as wide as the part
+/// set the original resolve saw. An empty snapshot returns a zero window: no
+/// segment means no part's statistics can matter.
+fn snapshot_covering_window(snapshot: &Snapshot) -> (TimeRange, i64) {
+    let min_ns = snapshot
+        .segments
+        .iter()
+        .map(|seg| seg.min_event_ts_ns)
+        .min()
+        .unwrap_or(0);
+    let max_ns = snapshot
+        .segments
+        .iter()
+        .map(|seg| seg.max_event_ts_ns)
+        .max()
+        .unwrap_or(0);
+    (
+        TimeRange {
+            start_ns: min_ns,
+            end_ns: max_ns,
+        },
+        max_ns,
+    )
+}
+
 /// Insert `ts_col >= window.start_ns AND ts_col < window.end_ns` directly
 /// above every `TableScan` in `plan` (ADR-1374 decision 3, prerequisite 2).
 ///
@@ -863,6 +896,8 @@ impl SqlExecutor {
                 snapshot,
                 &req.sql,
                 accounting,
+                req.window,
+                req.now_ns,
                 PlanExtras {
                     declared,
                     #[cfg(feature = "flight-sql")]
@@ -1029,11 +1064,14 @@ impl SqlExecutor {
         accounting: &QueryAccounting,
         declared: &[DeclaredColumn],
     ) -> Result<PinnedQuery, SqlError> {
+        let (window, now_ns) = snapshot_covering_window(&snapshot);
         self.plan_pinned_with(
             tenant_hash,
             snapshot,
             sql,
             accounting,
+            window,
+            now_ns,
             PlanExtras {
                 declared: declared.to_vec(),
                 // Explicit per-field so this compiles clean whether or not the
@@ -1068,11 +1106,14 @@ impl SqlExecutor {
         distributed: Option<DistributedScan>,
         declared: &[DeclaredColumn],
     ) -> Result<PinnedQuery, SqlError> {
+        let (window, now_ns) = snapshot_covering_window(&snapshot);
         self.plan_pinned_with(
             tenant_hash,
             snapshot,
             sql,
             accounting,
+            window,
+            now_ns,
             PlanExtras {
                 declared: declared.to_vec(),
                 distributed,
@@ -1093,6 +1134,8 @@ impl SqlExecutor {
         snapshot: Snapshot,
         sql: &str,
         accounting: &QueryAccounting,
+        window: TimeRange,
+        now_ns: i64,
         extras: PlanExtras,
     ) -> Result<PinnedQuery, SqlError> {
         // Every read of the executor's configuration below goes through this
@@ -1214,7 +1257,7 @@ impl SqlExecutor {
                     None
                 } else {
                     self.catalog
-                        .load_column_stats(&tenant_hash, Signal::Logs, accounting)
+                        .load_column_stats(&tenant_hash, Signal::Logs, window, now_ns, accounting)
                         .await?
                 };
                 SessionTable::Logs(Arc::new(
@@ -1851,6 +1894,8 @@ impl SqlExecutor {
                 snapshot,
                 &req.sql,
                 accounting,
+                req.window,
+                req.now_ns,
                 PlanExtras {
                     declared: declared.to_vec(),
                     #[cfg(feature = "flight-sql")]
