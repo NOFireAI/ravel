@@ -108,13 +108,14 @@ request signatures.
 
 ### Secrets
 
-`kind-up.sh` creates the two Secrets that the `RavelCluster` references, rather
-than commit them as manifests. A committed Secret manifest puts credentials in
-git and invites someone to copy it into a real cluster.
+`kind-up.sh` creates the three Secrets that the `RavelCluster` references,
+rather than commit them as manifests. A committed Secret manifest puts
+credentials in git and invites someone to copy it into a real cluster.
 
 - `ravel-s3-credentials`, keys `accessKeyId` and `secretAccessKey`.
 - `ravel-tenant-tokens`, where each key is a tenant name and its value is that
   tenant's bearer token.
+- `ravel-audit-token-key`, key `key` holding the query-audit token key.
 
 ### The same environment in CI
 
@@ -194,7 +195,7 @@ A minimal example is in
 | `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
 | `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
-| `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 lowercase hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set. See "Query-audit token key" below. |
+| `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set. See "Query-audit token key" below. |
 | `spec.gateway.replicas` | integer | `1` | |
 | `spec.gateway.resources` | object | none | `requests` / `limits` maps, as in a Pod spec. |
 | `spec.gateway.fold.disabled` | boolean | `false` | `--disable-fold`. Fold is a query-cost optimization only; disabling it never changes results. |
@@ -291,7 +292,7 @@ kubectl create secret generic ravel-audit-token-key \
   --from-literal="key=$(openssl rand -hex 32)"
 ```
 
-Its `key` field must hold exactly 64 lowercase hex characters (32 bytes).
+Its `key` field must hold exactly 64 hex characters (32 bytes).
 
 Omit `auditTokenKeySecretRef` when `spec.deploymentKeySecretRef` is set: the
 server derives the key from the deployment key, and nothing further is

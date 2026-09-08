@@ -79,8 +79,8 @@ pub struct RavelClusterSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deployment_key_secret_ref: Option<LocalSecretRef>,
 
-    /// Secret with a single key `key` holding 64 lowercase hex characters,
-    /// the query-audit token key the query tier reads as
+    /// Secret with a single key `key` holding 64 hex characters, the
+    /// query-audit token key the query tier reads as
     /// `RAVEL_AUDIT_TOKEN_KEY` (#1487). Query tier only: gateway and
     /// maintain never read a query-audit token. Omit on a cluster with
     /// `deploymentKeySecretRef` set -- the server derives the key from the

@@ -213,8 +213,8 @@ kubectl create secret generic "$TENANT_TOKENS_SECRET" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 # The operator does not generate this Secret (#1487: its RBAC grants
 # `secrets get` only), so the same platform-owner-provisions-it pattern as
-# the two Secrets above applies here too. One key, 64 lowercase hex
-# characters (32 bytes).
+# the two Secrets above applies here too. One key, 64 hex characters
+# (32 bytes).
 kubectl create secret generic "$AUDIT_TOKEN_KEY_SECRET" \
   --namespace "$NAMESPACE" \
   --from-literal="key=$(openssl rand -hex 32)" \

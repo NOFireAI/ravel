@@ -381,10 +381,16 @@ fn parse_deployment_key(raw: &[u8]) -> Result<[u8; 32], String> {
     ))
 }
 
-/// Validate an `auditTokenKeySecretRef` Secret's `key` field: exactly 64
-/// lowercase hex characters (32 bytes), matching `ravel-server`'s
-/// `AUDIT_TOKEN_KEY_ENV` parser (`services/ravel-server/src/config.rs`) but
-/// case-strict. Unlike [`parse_deployment_key`] there is no raw-32-byte
+/// Validate an `auditTokenKeySecretRef` Secret's `key` field: exactly 64 hex
+/// characters (any case) after trimming, matching exactly what
+/// `ravel-server` accepts for `RAVEL_AUDIT_TOKEN_KEY`
+/// (`services/ravel-server/src/config.rs`: `resolve_audit_text_policy` trims
+/// the raw value with `str::trim` before its own `parse_audit_token_key`
+/// checks `raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit())`).
+/// Trimming and case-insensitivity mirror [`parse_deployment_key`]'s own
+/// `text.trim()` step, so a value the server accepts at startup (trailing
+/// whitespace, uppercase hex) is not rejected here only to work when read
+/// directly. Unlike [`parse_deployment_key`] there is no raw-32-byte
 /// fallback: the audit-token-key field is new with this CRD version, so
 /// there is no legacy raw-bytes form to stay compatible with, and no caller
 /// needs the decoded bytes back (only the server derives anything from this
@@ -394,16 +400,13 @@ fn parse_deployment_key(raw: &[u8]) -> Result<[u8; 32], String> {
 /// fragment into a status condition or a log line.
 fn parse_audit_token_key(raw: &[u8]) -> Result<(), String> {
     let text = std::str::from_utf8(raw).map_err(|_| "value is not valid UTF-8".to_string())?;
-    if text.len() == 64
-        && text
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    let trimmed = text.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(());
     }
     Err(format!(
-        "must be exactly 64 lowercase hex characters (32 bytes); got {} characters",
-        text.len()
+        "must be exactly 64 hex characters (32 bytes); got {} characters",
+        trimmed.len()
     ))
 }
 
@@ -484,7 +487,7 @@ enum AuditTokenKeyResolution {
 ///
 /// An explicit ref is validated the same way [`resolve_deployment_key`]
 /// validates its own ref: the `key` field must exist and hold exactly 64
-/// lowercase hex characters, or the whole reconcile fails with
+/// hex characters, or the whole reconcile fails with
 /// [`Error::InvalidSecretValue`] naming the Secret and field, never the
 /// value. The operator does not generate a Secret for the `Missing` case:
 /// issue #126's `secrets get`-only RBAC posture grants no `create`/`patch`
@@ -3444,25 +3447,44 @@ mod tests {
         assert!(parse_deployment_key(b"too short").is_err());
     }
 
-    /// #1487: an `auditTokenKeySecretRef` Secret's `key` field must be
-    /// exactly 64 lowercase hex characters -- 63 chars, 65 chars, and
-    /// uppercase hex are all rejected, and the rejected value never appears
-    /// in the error text (only its length). A missing `key` field is a
-    /// separate error built directly by [`resolve_audit_token_key`] (there is
-    /// no value to validate), asserted here via its exact rendered message.
-    /// Flip [`parse_audit_token_key`]'s `text.len() == 64` to `<= 64` and the
-    /// 65-char case fails; flip `is_ascii_digit() || (b'a'..=b'f')` to
-    /// `is_ascii_hexdigit()` and the uppercase case fails.
+    /// #1487: an `auditTokenKeySecretRef` Secret's `key` field must accept
+    /// exactly what `ravel-server` accepts for `RAVEL_AUDIT_TOKEN_KEY`: 64
+    /// hex characters, either case, after trimming. A plain 64-lowercase-hex
+    /// value, an uppercase 64-hex value, and one with a trailing newline are
+    /// all ACCEPTED; 63 chars, 65 chars, and a non-hex character are all
+    /// REJECTED, and the rejected value never appears in the error text
+    /// (only its length). A missing `key` field is a different error this
+    /// test does not exercise through [`parse_audit_token_key`] at all: the
+    /// controller hand-builds it directly in [`resolve_audit_token_key`]
+    /// (that function is async and needs a live `Api<Secret>`, so this test
+    /// cannot call it), so this test constructs the same
+    /// [`Error::InvalidSecretValue`] variant by hand and pins its exact
+    /// rendered message instead. Flip [`parse_audit_token_key`]'s
+    /// `is_ascii_hexdigit()` back to
+    /// `is_ascii_digit() || (b'a'..=b'f').contains(&b)` and the uppercase
+    /// acceptance fails; drop its `.trim()` call and the trailing-newline
+    /// acceptance fails.
     #[test]
     fn audit_key_secret_with_wrong_length_or_missing_key_is_invalid_secret_value() {
+        let plain = "a".repeat(64);
+        let uppercase = "A".repeat(64);
+        let trailing_newline = format!("{}\n", "a".repeat(64));
+        for (raw, label) in [
+            (plain.as_str(), "plain lowercase hex"),
+            (uppercase.as_str(), "uppercase hex"),
+            (trailing_newline.as_str(), "trailing newline"),
+        ] {
+            parse_audit_token_key(raw.as_bytes())
+                .unwrap_or_else(|err| panic!("{label} must be accepted, got: {err}"));
+        }
+
         let too_short = "a".repeat(63);
         let too_long = "a".repeat(65);
-        let uppercase = "A".repeat(64);
-
+        let non_hex = "g".repeat(64);
         for (raw, label) in [
             (too_short.as_str(), "63 chars"),
             (too_long.as_str(), "65 chars"),
-            (uppercase.as_str(), "uppercase hex"),
+            (non_hex.as_str(), "non-hex character"),
         ] {
             let err =
                 parse_audit_token_key(raw.as_bytes()).expect_err(&format!("{label} is rejected"));
