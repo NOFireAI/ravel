@@ -561,15 +561,20 @@ throwaway key prefix:
   `list_after` and every catalog scan issues, so the suite covers both
   methods rather than reaching one only through the other's default.
 - `LexicographicListingOrder`: five keys written in non-sorted order must
-  come back in lexicographic key order, and `list_after` must resume
-  strictly after its marker in that same order, delivering exactly the keys
-  above it. A continuation token only names a position when the order is the
-  lexicographic one, which is what `S3Store::list` pagination and every
-  catalog scan built on it assume. Both passes judge the raw delivery
-  sequence, repeats included, on the rule the listing bullet above states:
-  a repeat of the last delivered key passes, a repeat of an earlier one
-  fails. Judging a deduplicated sequence instead would qualify a backend
-  whose every drain then fails with `ListOrderViolation`.
+  come back in lexicographic key order on both `list` and `list_after`, and
+  `list_after` must additionally resume strictly after its marker in that
+  same order, delivering exactly the keys above it. A continuation token only
+  names a position when the order is the lexicographic one, which is what
+  `S3Store::list` pagination and every catalog scan built on it assume.
+  `S3Store` implements `list` and `list_after` separately (the default
+  `list_after` is `list` plus a client-side filter), so a backend can be
+  ordered on one entry point and reversed on the other; the probe drains a
+  full pass through each and names the offending entry point in its failure.
+  Every pass judges the raw delivery sequence, repeats included, on the rule
+  the listing bullet above states: a repeat of the last delivered key passes,
+  a repeat of an earlier one fails. Judging a deduplicated sequence instead,
+  or only one entry point, would qualify a backend whose every drain then
+  fails with `ListOrderViolation`.
 - `CrossPageListing`: five keys written before the first page request must
   all be delivered, as exactly five distinct keys across however many pages
   the backend serves, with none lost between pages. Repeat deliveries are
