@@ -83,10 +83,9 @@ before it could finish: 116,707,410 states generated, 12,448,134 distinct,
 per minute and 116k to 181k distinct states per minute over the last six
 minutes before the kill, trending down (181,101 / 157,388 / 151,690 /
 157,848 / 124,073 / 116,020) (TLC also ran its temporal-property check every
-six minutes, for about a minute each time). The recorded complete run above
-(136,617,032 generated, 13,183,990 distinct, depth 20, 1769 s, fleet
-executor) reached
-94% of its final distinct-state count by the time this run was killed; at
+six minutes, for about a minute each time). By the time it was killed this
+run had reached 94% of the recorded complete run's distinct-state count
+(13,183,990 at depth 20 in 1769 s on the fleet executor, the row above); at
 this run's own distinct-state rate the remainder needs roughly 400 to 600 s
 more, a projected total of 4,000 to 4,200 s. That makes the hosted runner
 about 2.3x slower per distinct state than the fleet executor the 1769 s

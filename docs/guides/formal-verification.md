@@ -148,9 +148,9 @@ negative` to check that every negative control fails the way its
 `.expect` file states. Run `scripts/check-tla.sh traceability` to check
 that every Rust path and symbol in every traceability table exists. Run
 `scripts/check-tla.sh exhaustive` to check full safety and liveness
-where a configuration states a `PROPERTY`, at a 3600-second budget per
-configuration. Add `-a <area>` to any of these commands to scope the
-check to one area.
+where a configuration states a `PROPERTY`, under each configuration's
+own budget (3600 seconds unless its `bands.tsv` row sets `budget_s`).
+Add `-a <area>` to any of these commands to scope the check to one area.
 
 Run `scripts/check-tla.sh ci` to run smoke, live, negative, and
 traceability under one run ID. Run `scripts/check-tla.sh all` to run
