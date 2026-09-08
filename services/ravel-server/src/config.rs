@@ -768,8 +768,10 @@ pub struct Cli {
     /// bound independently. It bounds request COUNT, so the transient
     /// decode memory it caps is this ceiling times the largest per-request
     /// decoded body: Remote Write's 64 MiB post-decompression cap, or
-    /// OTLP's 16 MiB (docs/ingest.md, "Worst-case resident memory", term
-    /// 2). It does not by itself bound the buffered ingest bytes those
+    /// OTLP's 16 MiB (docs/ingest.md, "Worst-case resident memory", term 2).
+    /// That same 16 MiB request cap also bounds the compressed OTLP HTTP
+    /// gzip request body term 2 now lists.
+    /// It does not by itself bound the buffered ingest bytes those
     /// requests then hold, nor the OTLP HTTP gzip inflate, which
     /// `--max-ingest-buffer-bytes` charges. `0` disables the limit.
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]

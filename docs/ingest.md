@@ -651,8 +651,9 @@ terms:
    (bounded by the 16 MiB body limit), the compressed OTLP HTTP gzip request
    body itself (resident for the whole inflate, bounded by the same 16 MiB
    `MAX_REQUEST_BODY_BYTES` cap), and the OTLP gRPC and Remote Write
-   decode/decompression buffers, none of which the buffer budget charges. So the worst-case transient decode memory bounded
-   only by `--max-inflight-ingest-requests` is that ceiling times the largest
+   decode/decompression buffers, none of which the buffer budget charges. So
+   the worst-case transient decode memory bounded only by
+   `--max-inflight-ingest-requests` is that ceiling times the largest
    *uncharged* decoded body (Remote Write's 64 MiB, or OTLP gRPC / identity
    HTTP's 16 MiB); the OTLP HTTP gzip inflate is bounded by
    `--max-ingest-buffer-bytes` instead.
