@@ -233,7 +233,11 @@ consent gate, and the redaction a failure passes through on the way out. A
 transport parses its request, authenticates it, calls one operation, and
 encodes the outcome; it holds none of those controls itself. Authentication
 stays on the transport side and runs before admission, so an unauthenticated
-request cannot consume a permit. Adding a transport therefore cannot add a
+request cannot consume a permit. It is also the one thing the service layer
+does not share across listeners: a process serving both the public listener
+and the mTLS listener runs an instance of the layer per listener, identical
+in every control and differing only in the tenant resolver, because the two
+listeners derive tenant identity from different credentials. Adding a transport therefore cannot add a
 surface that queries outside the ceiling, spends without recording, or
 answers without an audit trail.
 
