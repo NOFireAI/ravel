@@ -1197,6 +1197,54 @@ async fn unauthenticated_request_consumes_no_permit() {
     assert_eq!(h.usage.records().len(), 1);
 }
 
+/// A malformed `match[]` selector on the metadata family (`/api/v1/series`
+/// here) is rejected by the transport before it ever calls the service, so it
+/// takes no admission permit and produces no audit or usage record: the same
+/// plain 400 the request gets on an unsaturated ceiling.
+///
+/// With the ceiling's one permit already held, a service-layer rejection
+/// would come back 503 ("the ceiling is full"), not 400: the assertion below
+/// only holds if the selector was rejected ahead of `admit()`. Moving the
+/// selector-parsing loop in `metadata_request`
+/// (crates/ravel-query/src/http/handlers.rs) back to after
+/// `let _permit = controls.admit()?;` in `metadata()`
+/// (crates/ravel-query/src/http/service.rs) reproduces the bug this test
+/// pins: the request then reaches `admit()` first, and with the one permit
+/// already held here it answers 503 SERVICE_UNAVAILABLE instead of 400 BAD
+/// REQUEST, failing this test's status assertion.
+#[tokio::test]
+async fn malformed_selector_rejected_before_admission_permit() {
+    use axum::body::Body;
+    use axum::http::Request;
+
+    let h = memory_harness(QueryConcurrencyLimit::Bounded(1));
+    let held = h.admission.try_admit().expect("the only permit");
+
+    let request = Request::builder()
+        .uri("/api/v1/series?match[]=%7B")
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+        .body(Body::empty())
+        .expect("request");
+
+    assert_eq!(
+        route_status(
+            ravel_query::http::router(h.transports.promql.clone()),
+            request,
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "a malformed selector is a 400, not a 503 from a saturated ceiling",
+    );
+
+    // The permit this test holds is still the only one ever taken: the
+    // malformed request never reached `admit()`.
+    assert_eq!(h.admission.in_flight(), 1);
+    // Nothing executed, so the usage sink recorded nothing either.
+    assert_eq!(h.usage.records().len(), 0);
+
+    drop(held);
+}
+
 /// Step 2 on the SQL surface, which used to skip it: `sql_execute` and
 /// `sql_explain` took the request's own deadline and budgets as given and
 /// relied on the HTTP transport having clamped them first.

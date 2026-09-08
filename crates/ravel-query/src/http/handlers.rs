@@ -279,11 +279,19 @@ async fn handle_series(state: &AppState, req: Request<Body>) -> Result<Response,
 /// The parsed form of a metadata request (`labels`, `label_values`,
 /// `series`). Every field a bad `start`/`end`/`timeout`/`min_commit_token`
 /// could reject is parsed here, before the service layer takes a permit, so a
-/// malformed request is a plain 400 that consumed nothing.
+/// malformed request is a plain 400 that consumed nothing. That includes each
+/// `match[]` selector: the service layer re-parses selectors on its own path
+/// (it needs the matchers, not just a yes/no), but validating them here first
+/// means a malformed selector is rejected before `admit()` and before any
+/// audit event, the same as every other field.
 fn metadata_request(state: &AppState, params: &Params) -> Result<MetadataRequest, ApiError> {
     let now = now_ns();
+    let selectors = params.all("match[]").to_vec();
+    for selector in &selectors {
+        parse_match_selector(selector)?;
+    }
     Ok(MetadataRequest {
-        selectors: params.all("match[]").to_vec(),
+        selectors,
         window: resolve_window(params, now)?,
         min_tokens: decode_commit_tokens(params.all("min_commit_token"))?,
         deadline: parse_deadline(params, state.engine.config().deadline)?,

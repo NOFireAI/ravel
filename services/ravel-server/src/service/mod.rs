@@ -483,7 +483,7 @@ impl QueryService {
         let deadline = self
             .controls
             .clamp_deadline(request.deadline, state.deadline);
-        let now_ns = state.clock.now_ns();
+        let now_ns = self.clock.now_ns();
 
         // The live handle each read attempt installs its own accounting into,
         // so a cancelled or timed-out exemplar query records the requests and
