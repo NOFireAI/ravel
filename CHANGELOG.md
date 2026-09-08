@@ -147,6 +147,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with retention bounded to the plan fan-out in objects times the object
   size. On ClickBench q20 that was 6,785 GETs and 21.1 GB, where a
   corpus-sized cache gives 4,533 GETs and 11.24 GB.
+- **The operator's qualified-input hash now distinguishes an absent field from an
+  empty one for the S3 `endpoint` and the credentials `resourceVersion`** (issue
+  #36). Each carries a one-byte presence marker before its value, so `endpoint:
+  null` no longer collides with `endpoint: ""` and an unresolved credentials
+  Secret no longer collides with one whose `resourceVersion` resolved to the empty
+  string. Because the hash changes, the first reconcile after upgrading the
+  operator re-qualifies each existing cluster once against its unchanged store; the
+  qualify Job is a one-shot that touches no Deployment, so no serving pod is
+  restarted and there is no downtime. Subsequent reconciles are stable.
 - **The operator now bounds qualify-Job recreations for a store that keeps
   failing qualification** (issue #36). A failing `ravel-cli store qualify` Job is
   recreated on a capped exponential backoff (30 s doubling to a 480 s ceiling)

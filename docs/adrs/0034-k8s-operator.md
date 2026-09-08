@@ -452,6 +452,19 @@ once even when the referenced Secrets are unchanged; subsequent reconciles are
 stable. Operators should schedule the operator upgrade in a maintenance window
 that tolerates one rolling restart of each serving tier.
 
+**Amendment (2026-09-08): the credentials `resourceVersion` slot in the
+qualified-input hash distinguishes absent from empty.** The credentials
+`resourceVersion` fed the hash through `unwrap_or("")`, collapsing an unresolved
+Secret (`None`) and one whose `resourceVersion` resolved to the empty string
+(`Some("")`) onto the same `""`, though they are different credential states. It
+now carries the same one-byte presence marker the endpoint slot already uses
+(`0x01` then the value when present, a lone `0x00` when absent), which the field
+separator alone cannot supply. This changes every persisted qualified-input hash
+once more, so the first reconcile after upgrading the operator re-runs store
+qualification once for every existing cluster on otherwise-unchanged inputs. The
+qualify Job is a one-shot that touches no Deployment, so there is no serving
+downtime; subsequent reconciles are stable.
+
 ## Rejected alternatives
 
 1. **Go operator (kubebuilder/controller-runtime).** The larger example
