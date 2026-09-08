@@ -253,41 +253,26 @@ impl WorkloadFile {
         self.label_dimensions.iter().find(|d| d.name == name)
     }
 
-    /// Distinct values each label carries under `profile` (ADR-0927 decision
-    /// 11): every declared label dimension's value count, plus the scaling
-    /// label ([`GeneratorConfig::scaling_label`]), which `Generator::labels_for`
-    /// stamps on every series but which the manifest never declares as an
-    /// ordinary dimension.
-    ///
-    /// The scaling label's cardinality is the UNION of the families' distinct
-    /// values, not their sum: every family shares the same
-    /// [`GeneratorConfig::scaling_label_value_prefix`], so two families
-    /// routinely emit the same scaling-label value (under the checked-in
-    /// manifest's `ci` profile, both the gauge family and the native-histogram
-    /// family emit `metricsbench-instance-0`). `Generator::labels_for` assigns
-    /// family `f`'s global instance `i` the value `prefix + i /
-    /// family_fixed_product(f)`, and `i` itself ranges over the contiguous
-    /// `0..family_instances(f)`, so the value ranges over the contiguous
-    /// `0..family_scaling_label_cardinality(f)` -- always starting at 0.  The
-    /// union of a set of ranges that all start at 0 is exactly the widest one,
-    /// so this is the MAXIMUM of [`Self::family_scaling_label_cardinality`]
-    /// over the families, never their sum -- the same figure the generator
-    /// itself would produce by counting distinct emitted values, never a
-    /// formula re-typed against the manifest.
-    pub fn label_cardinalities(&self, profile: &Profile) -> BTreeMap<String, u64> {
-        let mut out: BTreeMap<String, u64> = self
-            .label_dimensions
+    /// Distinct values each FIXED label dimension carries: every dimension
+    /// the manifest declares in `label_dimensions`, name to value count. This
+    /// deliberately excludes the scaling label
+    /// ([`GeneratorConfig::scaling_label`]): its cardinality depends on the
+    /// run's churn epochs (`Generator::generate_into` offsets each family's
+    /// instance ordinal per epoch), a single-epoch, manifest-only formula
+    /// cannot state it, and the manifest gate (`gate_workload`) refuses to
+    /// let the scaling label be declared as an ordinary dimension here in
+    /// the first place. The artifact reports the scaling label's
+    /// cardinality separately, computed by
+    /// [`crate::metrics_gen::Generator::scaling_label_cardinality`] for a
+    /// concrete step count: as `profile.scaling_label.cardinality_declared`
+    /// (evaluated at the profile's declared step count) and as
+    /// `profile.run.scaling_label_cardinality` (evaluated at the steps the
+    /// run actually generated).
+    pub fn label_cardinalities(&self) -> BTreeMap<String, u64> {
+        self.label_dimensions
             .iter()
             .map(|d| (d.name.clone(), d.values.len() as u64))
-            .collect();
-        let scaling_distinct: u64 = self
-            .families
-            .iter()
-            .map(|family| self.family_scaling_label_cardinality(profile, family))
-            .max()
-            .unwrap_or(0);
-        out.insert(self.generator.scaling_label.clone(), scaling_distinct);
-        out
+            .collect()
     }
 
     /// Cardinality of each of `family`'s fixed label dimensions, in
@@ -306,28 +291,6 @@ impl WorkloadFile {
                     .max(1)
             })
             .collect()
-    }
-
-    /// Distinct label combinations one scaling-label ordinal spans before
-    /// `Generator::labels_for` advances it: the product of `family`'s fixed
-    /// label-dimension cardinalities.
-    pub fn family_fixed_product(&self, family: &MetricFamily) -> u64 {
-        self.family_dimension_cardinalities(family)
-            .into_iter()
-            .product()
-    }
-
-    /// Distinct scaling-label values `family` uses under `profile`:
-    /// `Generator::labels_for` assigns the scaling label
-    /// `global / fixed_product`, so this is `ceil(instances /
-    /// family_fixed_product)`.
-    pub fn family_scaling_label_cardinality(
-        &self,
-        profile: &Profile,
-        family: &MetricFamily,
-    ) -> u64 {
-        let instances = self.family_instances(profile, family);
-        instances.div_ceil(self.family_fixed_product(family).max(1))
     }
 
     /// Time series one instance of `kind` emits: one for a gauge, a counter, or

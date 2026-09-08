@@ -67,13 +67,20 @@ never mistakes a non-comparable or unbilled run for a publishable result.
   (`samples_per_series`).
 - `samples_per_series`, `scrape_interval_secs`, `duration_secs`,
   `total_samples`, `churn_basis_points_per_hour`: as declared.
-- `label_cardinalities`: distinct values per label, the scaling label
-  included.
+- `label_cardinalities`: distinct values per FIXED label dimension, the
+  scaling label not included: it is not a dimension (the manifest gate
+  refuses to let it be declared as one), and its cardinality depends on the
+  run's churn epochs rather than being a fixed, manifest-only count.
+- `scaling_label`: the scaling label's `name` and its `cardinality_declared`,
+  the distinct scaling-label values the profile's full declared run would
+  emit, the generator's exact count.
 - `families`: one entry per metric family, each with `name`, `instances`,
   `series_per_instance`.
 - `run`: figures scoped to `steps_run`, never the declared full profile:
   `steps`, `total_series_created`, `logical_input_bytes`,
-  `total_samples_generated`, all the generator's exact counts for this run.
+  `total_samples_generated`, `scaling_label_cardinality` (distinct
+  scaling-label values this run actually emitted), all the generator's exact
+  counts for this run.
 
 `substrate`:
 - `store_backend`: the `--store` kind (`memory` or `s3`).
