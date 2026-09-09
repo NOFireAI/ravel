@@ -1,0 +1,80 @@
+# Nightly TLA+ exhaustive model check (ADR-1113).
+#
+# The per-PR tla job in ci.yml runs the fast lane (smoke + negative +
+# traceability) only when a formal/ or harness change is in the diff. This
+# workflow runs the full exhaustive lane (full safety plus liveness, no
+# symmetry reduction) over every area every night, since exhaustive is too
+# slow for the per-PR budget. A red run here is a real invariant break or a
+# state-count regression, never a retry: TLC is deterministic for a fixed
+# config.
+#
+# Areas run as a matrix, one job per area (issue #1358): every area used to
+# run sequentially inside one job, and a single slow area (maintenance)
+# exceeding its per-config budget put the whole job over its own
+# timeout-minutes. Each area now gets its own job and its own 160-minute
+# ceiling, and fail-fast is off so one area's failure or timeout does not
+# cancel the others mid-run. check-tla.sh's own per-config TLC budget still
+# applies inside each job (3600s default, overridable per cfg via bands.tsv's
+# budget_s column); an area can run more than one exhaustive config
+# sequentially (maintenance runs two), so the job ceiling must bound the sum
+# of that area's budgets, not any single config's. Maintenance is the
+# largest: 5400s (MCMaintenanceOwnership.exhaustive.cfg's budget_s) + 3600s
+# (MCCompactionClaims.exhaustive.cfg's default) = 9000s = 150 minutes, so
+# 160 minutes leaves 10 minutes of headroom. check-tla.test.sh's (u) case
+# sums each area's exhaustive budgets from its bands.tsv and asserts this
+# value stays at least 10 minutes above the largest sum, so a future budget
+# change that outgrows this ceiling fails the test instead of timing out
+# silently on the next nightly run.
+#
+# The area list below is the same list scripts/check-tla.sh's discover_areas
+# would find under formal/tla (every directory carrying a smoke config);
+# scripts/check-tla.test.sh asserts the two stay in sync, so a new area
+# cannot be silently skipped by the nightly matrix.
+#
+# workflow_dispatch exists to verify the job on a pushed branch (no local gate
+# can execute a workflow) and to run it ad hoc.
+name: tla-nightly
+
+on:
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tla-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  exhaustive:
+    strategy:
+      fail-fast: false
+      matrix:
+        area: [catalog, commit, common, lifecycle, maintenance, resharding]
+    runs-on: ubuntu-latest
+    timeout-minutes: 160
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Exhaustive model check
+        # State CI's resource choice rather than inheriting the script's
+        # laptop-safe default of 2 workers: `auto` is the previous behaviour
+        # on these dedicated runners, where claiming every core is fine and
+        # the default of 2 is too slow for the exhaustive budget.
+        env:
+          RAVEL_TLA_WORKERS: auto
+        run: scripts/check-tla.sh exhaustive -a ${{ matrix.area }}
+      - name: Upload TLC logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tla-nightly-logs-${{ matrix.area }}
+          path: .cache/tla/logs
+          if-no-files-found: ignore

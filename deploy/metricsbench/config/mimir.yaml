@@ -1,0 +1,97 @@
+# Grafana Mimir configuration for the MetricsBench object-storage-native
+# comparator (ADR-0927). Monolithic (-target=all) single-instance deployment.
+#
+# Every setting that changes what data a query sees, when it becomes durable, or
+# how long it is kept is disclosed in a comment next to the setting (ADR-0927
+# deliverable: no unpublished tuning, no undisclosed transformation).
+
+# Single-tenant benchmark: no per-request X-Scope-OrgID header required. The
+# harness sends the same Remote Write stream it sends every other comparator,
+# with no Mimir-specific auth header, so the portable lane stays uniform.
+multitenancy_enabled: false
+
+server:
+  http_listen_port: 9009
+  grpc_listen_port: 9095
+  # Raise gRPC message ceilings above the defaults: high-cardinality remote-write
+  # batches from the ADR-0927 cardinality profile (1,000,000 series) otherwise
+  # trip Mimir's default 4 MiB message limit. This is COMMITTED, EXPLAINED tuning
+  # to let the benchmark's own load through, not a performance optimisation.
+  grpc_server_max_recv_msg_size: 104857600
+  grpc_server_max_send_msg_size: 104857600
+
+# Single connection to MinIO shared by every S3-backed storage below. DURABILITY:
+# this points Mimir's durable state at S3 (MinIO in this stack). See the
+# durability note beside the mimir service in docker-compose.yml and ADR-0927
+# decision 10: a MinIO result is a correctness result, not a publishable one.
+common:
+  storage:
+    backend: s3
+    s3:
+      endpoint: minio:9000
+      insecure: true
+      access_key_id: mimir
+      secret_access_key: mimir-dev-secret
+
+blocks_storage:
+  s3:
+    bucket_name: mimir-blocks
+  tsdb:
+    dir: /data/tsdb
+    # DELAYED OBJECT-STORAGE VISIBILITY / MATERIALISED STATE (disclosed): the
+    # ingester keeps recent samples in a local head block plus WAL under this
+    # dir and only ships a compacted TSDB block to S3 after each 2h head range
+    # closes. So an ack is durable on the local WAL, and the S3 copy the
+    # store-gateway serves appears later. Left at the 2h default: shortening it
+    # would be undisclosed tuning that changes the ack-to-object-storage timing
+    # the benchmark is measuring.
+    retention_period: 25h
+  bucket_store:
+    sync_dir: /data/tsdb-sync
+
+compactor:
+  data_dir: /data/compactor
+  # COMPACTION / MATERIALISED STATE (disclosed): the compactor merges shipped
+  # blocks in object storage. NO DOWNSAMPLING: Mimir does not downsample blocks
+  # (unlike Thanos' optional downsampling), so stored resolution is never
+  # silently reduced. Left at defaults; no unpublished tuning.
+  sharding_ring:
+    kvstore:
+      store: memberlist
+
+ingester:
+  ring:
+    # Single-instance benchmark deployment: one replica, no cross-node
+    # replication. A real Mimir cluster runs replication_factor 3; this is a
+    # DISCLOSED single-node topology, comparable to the single-node Prometheus
+    # and VictoriaMetrics comparators, not to a replicated production cluster.
+    replication_factor: 1
+    kvstore:
+      store: memberlist
+
+store_gateway:
+  sharding_ring:
+    replication_factor: 1
+    kvstore:
+      store: memberlist
+
+ruler_storage:
+  s3:
+    bucket_name: mimir-ruler
+
+alertmanager_storage:
+  s3:
+    bucket_name: mimir-alertmanager
+
+limits:
+  # Raise ingestion ceilings so the ADR-0927 profiles' sample and series volume
+  # is admitted rather than rejected. A silent rejection would violate the
+  # "ingested == generated minus reported rejections" acceptance gate (ADR-0927
+  # bands, clause 4). COMMITTED, EXPLAINED tuning: it enlarges capacity to fit
+  # the declared load, it does not make queries faster.
+  max_global_series_per_user: 0        # 0 = unlimited active series
+  ingestion_rate: 5000000              # samples/sec
+  ingestion_burst_size: 20000000       # samples
+  # Query lookback must cover the history profile (30d); default is fine but
+  # pinned so a future default change cannot silently shorten the queryable range.
+  compactor_blocks_retention_period: 45d

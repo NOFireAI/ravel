@@ -1,0 +1,1932 @@
+//! Regression fixture for issue #761: a selective logs statement must move
+//! object-store bytes proportional to the blocks it keeps, not the full-scan
+//! bytes it once did.
+//!
+//! The mechanism (`ravel_query::log_fetcher` and `ravel_sql::logs_scan`):
+//!
+//! - A query carrying a block-level predicate (a declared-column `NumRange`
+//!   prune arm for the ClickBench q20/q37 shapes, or a `has_word` content arm) is
+//!   NOT `LogQuery::is_block_predicate_free`, so `LogsScanExec` takes the
+//!   plan-then-stripe path, never #693's whole-segment fast path. The plan phase
+//!   (`compute_plan_counts` -> `LogSegmentFetcher::plan_segment`) runs once per
+//!   segment before any partition drains a block.
+//! - Before #761 the plan slow branch read every segment WHOLE, and the scan's
+//!   `BlockRangeFetcher::fetch_object_with_footer` resolved candidates by
+//!   `SkipIndex::candidate_blocks(ts_min, ts_max, None, &[])` -- no numeric arms,
+//!   so every block was a ts candidate, the coverage crossover fired, and one
+//!   whole-object GET was issued. The selective predicate pruned blocks only at
+//!   DECODE, shrinking `blocks_scanned` but not the bytes fetched. That was
+//!   q37's "19,690 GETs / 11.7 GB to scan 144 of 17,731 blocks" against a full
+//!   scan's "8,424 GETs / 11.1 GB".
+//! - After #761 the NumRange arm is resolved against each object's FIELD_DIR and
+//!   applied to `candidate_blocks` both at fetch (so the scan reads only
+//!   surviving blocks) and in the plan phase (so it counts survivors from the
+//!   skip index and fetches no block, carrying the footer forward). A text
+//!   predicate the skip index cannot decide still falls back to a whole-object
+//!   read, counted in the `plan_full_reads` metric.
+//!
+//! `selective_numeric_reads_only_surviving_blocks` pins the fixed numeric shapes
+//! (byte cost proportional to the surviving fraction; the >= 75% coverage
+//! crossover preserved). `text_predicate_falls_back_to_full_object_read` pins the
+//! deliberately-kept fallback. `selective_third_no_partition_multiplication_\
+//! under_cache_pressure` pins that eviction no longer re-reads whole objects.
+//!
+//! # Version 4 (ADR-0699 decision 5)
+//!
+//! The writer emits version-4 objects, so the surviving blocks these figures
+//! are proportional to are no longer contiguous byte ranges: a block's pages sit
+//! one per column chunk inside its row group, and the fetch is one coalesced
+//! range per surviving `(row group, projected column)`. Every assertion below
+//! keeps its meaning; the literals are measured on version-4 objects and each
+//! says what it counts.
+//!
+//! Two fetcher settings this fixture pins deliberately, because the figures are
+//! meaningless without them:
+//!
+//! - `SUFFIX_LEN` is sized to cover the object tail (footer, SKIP_IDX, PAGE_DIR,
+//!   BLOOM), which is what `DEFAULT_LOG_SUFFIX_LEN` does at production object
+//!   sizes and what issue #766 raised it for. At the default 256 KiB a probe
+//!   would swallow this fixture's whole 81 KB object and there would be no byte
+//!   figure left to read.
+//! - `with_coalesce_gap(0)`. Under version 4 the hole between two wanted pages
+//!   of one column is the OTHER blocks' pages of that column, so the gap
+//!   threshold decides how many pruned blocks a range reads through. This
+//!   fixture's geometry is one row group of six blocks whose `body` pages are
+//!   ~12.4 KB each, so the hole between `body`'s surviving page and the next
+//!   wanted chunk is ~61.8 KB -- just under the 64 KiB default, which therefore
+//!   fuses the entire BLOCKS section into one range and puts the selective
+//!   shapes back at full-scan bytes. At the production geometry (32-block row
+//!   groups, ~6 KB pages) the same hole is ~186 KB and the default splits it.
+//!   ADR-0699 left this threshold "not decided ... until measured"; the
+//!   measurement is recorded in that ADR's as-built section, and this fixture
+//!   pins the byte proportionality rather than the threshold.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use async_trait::async_trait;
+use datafusion::catalog::TableProvider;
+use datafusion::execution::TaskContext;
+use datafusion::logical_expr::{Expr, col, lit};
+use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::prelude::{SessionConfig, SessionContext};
+use ravel_cache::{Cache, CacheLimits};
+use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
+use ravel_logseg::writer::ObjectIdentity;
+use ravel_logseg::{
+    AttrValue, ColumnSelection, LogRecord, Predicate, RlogConfig, RlogReader, RlogWriter,
+    stream_attrs_bytes,
+};
+use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, PutOptions, PutOutcome, StoreError,
+};
+use ravel_query::{
+    BlockRangeFetcher, CacheFetchError, LogQuery, LogSegmentFetcher, PhaseAccounting, QueryPhase,
+};
+use ravel_sql::{
+    DeclaredColumn, DeclaredType, FIRST_DECLARED_COL, LOG_COL_TS, LogsTableProvider, has_word_udf,
+};
+use ravel_types::TenantHash;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use uuid::Uuid;
+
+const TENANT: [u8; 16] = [7u8; 16];
+
+/// Segments in the fixture, and the partitions requested. Equal so a
+/// predicate-free full scan clears the fast path's
+/// `relevant_segments >= target_partitions` conjunct.
+const SEGMENTS: usize = 8;
+const PARTS: usize = 8;
+/// Blocks per segment (one record per block). 6 so a `code = 0` arm keeps one
+/// block per segment (the very-selective q37 shape, 8/48), `code <= 1` keeps two
+/// (the q20 shape, 16/48), and `code <= 4` keeps five (40/48, above the 0.75
+/// coverage crossover).
+const BLOCKS_PER_SEG: usize = 6;
+const TOTAL_BLOCKS: usize = SEGMENTS * BLOCKS_PER_SEG;
+
+/// Body filler bytes per record. Large enough that each object clears the small
+/// block-range threshold this fixture sets, so every read takes ADR-0107's ranged
+/// path, and large enough that `body` dominates each block: it is the column a
+/// selective read still has to fetch a page of per surviving block, so it is
+/// what makes the byte figures track the surviving fraction.
+const BODY_BYTES: usize = 16 * 1024;
+/// Suffix probe length for the ranged path: just over this fixture's 6,780-byte
+/// object tail (footer + SKIP_IDX 139 + PAGE_DIR 199 + BLOOM 6,250), so one
+/// probe per segment carries every plan section and the scan needs no second GET
+/// for them. That is what `DEFAULT_LOG_SUFFIX_LEN` does at production object
+/// sizes (issue #766); the production value would cover this whole 81 KB fixture
+/// object and leave no byte figure to read.
+const SUFFIX_LEN: u64 = 8192;
+
+/// A marker word present in exactly the first block of every segment. A
+/// `has_word` query for it survives one block per segment, but bloom is a
+/// DECODE-only prune: the skip index cannot decide a text predicate, so this
+/// shape exercises the plan-phase whole-object fallback (`plan_full_reads`) that
+/// #761 could not remove.
+const MARKER_FEW: &str = "MARKERFEW";
+
+/// A marker word present in exactly the first block of exactly the first
+/// segment (nowhere else). A `has_word` query for it is, like `MARKER_FEW`,
+/// undecidable at the skip index, so every segment's plan phase still reads
+/// the whole object to count survivors (issue #835 fixture below) -- but only
+/// one segment actually survives, so the scan opens exactly one object and the
+/// other `SEGMENTS - 1` are never opened at all.
+const MARKER_RARE: &str = "MARKERRARE";
+
+/// The declared numeric column every record carries: `code = <block index>`
+/// (0..BLOCKS_PER_SEG). A `NumRange` prune arm on it (ClickBench q20/q37 shape)
+/// is skip-index decidable, so #761's fetch-side pruning applies. `code = 0`
+/// keeps one block per segment (q37); `code <= 1` keeps two (q20); `code <= 4`
+/// keeps five of six, above the coverage crossover.
+const CODE_COL: &str = "code";
+
+fn identity(seq: u64) -> ObjectIdentity {
+    ObjectIdentity {
+        tenant_hash: TENANT,
+        shard: 0,
+        writer_id: [2u8; 16],
+        writer_epoch: 1,
+        writer_seq: seq,
+    }
+}
+
+fn one_record_blocks() -> RlogConfig {
+    RlogConfig {
+        block_target_records: 1,
+        ..RlogConfig::default()
+    }
+}
+
+/// Pseudo-random printable filler so the writer's body compression cannot shrink
+/// the object back below the block-range threshold (same trick the
+/// `logs_scan_scaling` bench uses).
+fn filler(seed: u64, len: usize) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut state = seed;
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        out.push(ALPHABET[(z & 63) as usize] as char);
+    }
+    out
+}
+
+/// Body for block `blk` of segment `seg`: the text marker (block 0 only) as a
+/// leading word, then unique filler so bloom pruning can isolate the marked
+/// block at decode.
+fn body(seg: usize, blk: usize) -> String {
+    let mut head = String::new();
+    if blk == 0 {
+        head.push_str(MARKER_FEW);
+        head.push(' ');
+    }
+    if seg == 0 && blk == 0 {
+        head.push_str(MARKER_RARE);
+        head.push(' ');
+    }
+    let seed = (seg as u64) << 32 | blk as u64;
+    format!("{head}{}", filler(seed, BODY_BYTES))
+}
+
+fn record(seg: usize, blk: usize) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("svc".to_string()),
+    )];
+    let ts = (seg * 1_000_000 + blk) as i64;
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body(seg, blk),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        // The declared numeric column: one distinct value per block, so a
+        // `NumRange` arm selects an exact block subset the skip index can prune.
+        attrs: vec![(CODE_COL.to_string(), AttrValue::I64(blk as i64))],
+    }
+}
+
+async fn write_segment(store: &dyn ObjectStoreBackend, seg: usize) -> SegmentRef {
+    let recs: Vec<LogRecord> = (0..BLOCKS_PER_SEG).map(|b| record(seg, b)).collect();
+    let mut w = RlogWriter::new(one_record_blocks(), identity((seg + 1) as u64));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let size = bytes.len() as u64;
+    let key = format!("logs/seg{seg}.rlog");
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    let min = recs.iter().map(|r| r.ts_ns).min().unwrap();
+    let max = recs.iter().map(|r| r.ts_ns).max().unwrap();
+    SegmentRef {
+        data_object_key: key,
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: 0,
+        sample_count: recs.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash,
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: (seg + 1) as u64,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
+    }
+}
+
+async fn build_snapshot(store: &dyn ObjectStoreBackend) -> Snapshot {
+    let mut segments = Vec::with_capacity(SEGMENTS);
+    for s in 0..SEGMENTS {
+        segments.push(write_segment(store, s).await);
+    }
+    Snapshot {
+        segments,
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// Body for block `blk`, byte-identical across every segment: only
+/// `MARKER_FEW` at block 0, no segment-conditional `MARKER_RARE` (unlike
+/// [`body`], whose segment-0 addition of `MARKER_RARE` makes that segment's
+/// object a few bytes larger than the rest). Issue #835's budgeted-carry test
+/// needs every relevant segment's whole-object read to be the exact same
+/// size, so its `bytesReused` figure is an exact `2 * S`, not an
+/// approximation.
+fn body_uniform(blk: usize) -> String {
+    let mut head = String::new();
+    if blk == 0 {
+        head.push_str(MARKER_FEW);
+        head.push(' ');
+    }
+    format!("{head}{}", filler(blk as u64, BODY_BYTES))
+}
+
+fn record_uniform(blk: usize) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("svc".to_string()),
+    )];
+    // Same `ts_ns` in every segment (not `seg`-offset like [`record`]):
+    // varint-style encoding of the timestamp would otherwise make segments
+    // with a larger `seg` component a different byte length, defeating the
+    // uniform-size fixture this exists for. Segment identity comes from the
+    // object key, not from a distinct ts range.
+    let ts = blk as i64;
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: body_uniform(blk),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: vec![(CODE_COL.to_string(), AttrValue::I64(blk as i64))],
+    }
+}
+
+async fn write_segment_uniform(store: &dyn ObjectStoreBackend, seg: usize) -> SegmentRef {
+    let recs: Vec<LogRecord> = (0..BLOCKS_PER_SEG).map(record_uniform).collect();
+    let mut w = RlogWriter::new(one_record_blocks(), identity((seg + 1) as u64));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let size = bytes.len() as u64;
+    let key = format!("logs/uniform_seg{seg}.rlog");
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    let min = recs.iter().map(|r| r.ts_ns).min().unwrap();
+    let max = recs.iter().map(|r| r.ts_ns).max().unwrap();
+    SegmentRef {
+        data_object_key: key,
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: 0,
+        sample_count: recs.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash,
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: (seg + 1) as u64,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
+    }
+}
+
+async fn build_snapshot_uniform(store: &dyn ObjectStoreBackend) -> Snapshot {
+    let mut segments = Vec::with_capacity(SEGMENTS);
+    for s in 0..SEGMENTS {
+        segments.push(write_segment_uniform(store, s).await);
+    }
+    Snapshot {
+        segments,
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// [`body_uniform`]'s block 0, minus the marker: the same `MARKER_FEW.len() +
+/// 1` bytes replaced by filler instead of the word, so a segment built from
+/// this has no block anywhere that a `has_word(MARKER_FEW)` predicate
+/// survives, while its block 0 body is still byte-for-byte the same length
+/// as a marker-carrying segment's -- the object comes out the same stored
+/// size either way, only the content differs (issue #835 follow-up, finding
+/// 3b's zero-survivor fixture needs this to keep its byte arithmetic exact).
+fn body_uniform_no_marker(blk: usize) -> String {
+    if blk == 0 {
+        let prefix_len = MARKER_FEW.len() + 1;
+        format!(
+            "{}{}",
+            filler(u64::MAX ^ blk as u64, prefix_len),
+            filler(blk as u64, BODY_BYTES)
+        )
+    } else {
+        body_uniform(blk)
+    }
+}
+
+/// [`write_segment_uniform`], but with `has_marker: false` swapping every
+/// record's body for [`body_uniform_no_marker`], so the segment's plan-phase
+/// whole-object read finds zero surviving blocks for `has_word(MARKER_FEW)`.
+async fn write_segment_uniform_variant(
+    store: &dyn ObjectStoreBackend,
+    seg: usize,
+    has_marker: bool,
+) -> SegmentRef {
+    let recs: Vec<LogRecord> = (0..BLOCKS_PER_SEG)
+        .map(|blk| {
+            let mut r = record_uniform(blk);
+            if !has_marker {
+                r.body = body_uniform_no_marker(blk);
+            }
+            r
+        })
+        .collect();
+    let mut w = RlogWriter::new(one_record_blocks(), identity((seg + 1) as u64));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let size = bytes.len() as u64;
+    let key = format!("logs/uniform_variant_seg{seg}.rlog");
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    let min = recs.iter().map(|r| r.ts_ns).min().unwrap();
+    let max = recs.iter().map(|r| r.ts_ns).max().unwrap();
+    SegmentRef {
+        data_object_key: key,
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: 0,
+        sample_count: recs.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash,
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: (seg + 1) as u64,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
+    }
+}
+
+/// Same corpus as [`build_snapshot_uniform`] except segment 0 carries no
+/// `MARKER_FEW` anywhere (issue #835 follow-up, finding 3b): a `has_word`
+/// query against it still forces a plan-phase whole-object read (the skip
+/// index cannot decide the predicate without reading), but finds zero
+/// surviving blocks, so `owned_work` never lets any partition open it.
+async fn build_snapshot_uniform_first_zero_survivor(store: &dyn ObjectStoreBackend) -> Snapshot {
+    let mut segments = Vec::with_capacity(SEGMENTS);
+    for s in 0..SEGMENTS {
+        segments.push(write_segment_uniform_variant(store, s, s != 0).await);
+    }
+    Snapshot {
+        segments,
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// Record for the issue #835 follow-up (Finding 2) reopen-path fixture: block
+/// `blk`'s one record always carries the `filler` attribute; block 1 also
+/// adds `tags`, which overflows [`one_record_blocks_overflow`]'s
+/// `max_dynamic_columns = 1` budget (`filler` sorts first) into an
+/// `attrs_raw` page for that block only. Every block's body carries
+/// `MARKER_FEW` so a `has_word` predicate matches both rows.
+fn record_reopen(blk: usize) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("svc".to_string()),
+    )];
+    let ts = blk as i64;
+    let mut attrs = vec![("filler".to_string(), AttrValue::Str("f".to_string()))];
+    if blk == 1 {
+        attrs.push(("tags".to_string(), AttrValue::Str(format!("spilled-{blk}"))));
+    }
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: format!("{MARKER_FEW} {}", filler(blk as u64, BODY_BYTES)),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs,
+    }
+}
+
+fn one_record_blocks_overflow() -> RlogConfig {
+    RlogConfig {
+        block_target_records: 1,
+        max_dynamic_columns: 1,
+        ..RlogConfig::default()
+    }
+}
+
+async fn write_segment_reopen(store: &dyn ObjectStoreBackend) -> SegmentRef {
+    let recs: Vec<LogRecord> = (0..2).map(record_reopen).collect();
+    let mut w = RlogWriter::new(one_record_blocks_overflow(), identity(1));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let size = bytes.len() as u64;
+    let key = "logs/reopen_seg.rlog".to_string();
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    let min = recs.iter().map(|r| r.ts_ns).min().unwrap();
+    let max = recs.iter().map(|r| r.ts_ns).max().unwrap();
+    SegmentRef {
+        data_object_key: key,
+        object_size: size,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        ingest_hour_bucket: 0,
+        sample_count: recs.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash,
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: 1,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
+    }
+}
+
+async fn build_snapshot_reopen(store: &dyn ObjectStoreBackend) -> Snapshot {
+    Snapshot {
+        segments: vec![write_segment_reopen(store).await],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+// ---- byte- and shape-counting store --------------------------------------
+
+/// Counts store `get` calls by `GetRange` shape and sums the bytes each returned,
+/// so a test can read the exact wire cost independent of `QueryAccounting` (and
+/// cross-check the two agree).
+struct CountingStore {
+    inner: Arc<MemoryStore>,
+    full: AtomicU64,
+    suffix: AtomicU64,
+    range: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl CountingStore {
+    fn new(inner: Arc<MemoryStore>) -> Arc<Self> {
+        Arc::new(CountingStore {
+            inner,
+            full: AtomicU64::new(0),
+            suffix: AtomicU64::new(0),
+            range: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        })
+    }
+    fn gets(&self) -> u64 {
+        self.full.load(Ordering::SeqCst)
+            + self.suffix.load(Ordering::SeqCst)
+            + self.range.load(Ordering::SeqCst)
+    }
+    fn full_gets(&self) -> u64 {
+        self.full.load(Ordering::SeqCst)
+    }
+    fn suffix_gets(&self) -> u64 {
+        self.suffix.load(Ordering::SeqCst)
+    }
+    fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for CountingStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        match range {
+            GetRange::Full => self.full.fetch_add(1, Ordering::SeqCst),
+            GetRange::Suffix(_) => self.suffix.fetch_add(1, Ordering::SeqCst),
+            GetRange::Range(_, _) => self.range.fetch_add(1, Ordering::SeqCst),
+        };
+        let got = self.inner.get(key, range).await?;
+        self.bytes
+            .fetch_add(got.data.len() as u64, Ordering::SeqCst);
+        Ok(got)
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+fn read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
+    let max_entries = (cache_bytes / 4096).max(64) as usize;
+    Arc::new(Cache::new(CacheLimits::new(
+        cache_bytes,
+        max_entries,
+        cache_bytes,
+    )))
+}
+
+/// A fetcher that treats every object as above the block-range threshold (ranged
+/// path), with a tail-sized suffix probe, no coalescing slack, and ADR-0046's
+/// read cache sized to `cache_bytes`. See this file's header for why those two
+/// settings are pinned rather than left at their defaults.
+fn fetcher(store: Arc<dyn ObjectStoreBackend>, cache_bytes: u64) -> LogSegmentFetcher {
+    let block_range = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_suffix_len(SUFFIX_LEN)
+        .with_coalesce_gap(0)
+        .with_whole_object_threshold(0);
+    LogSegmentFetcher::new(store)
+        .with_block_range(block_range)
+        .with_cache(read_cache(cache_bytes))
+        .with_block_range_threshold(0)
+}
+
+/// Same fetcher settings as [`fetcher`], with no read cache wired at all --
+/// the configuration issue #835 concerns, where a second wire GET for the
+/// same object cannot hide behind a cache hit of any size.
+fn fetcher_uncached(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
+    let block_range = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_suffix_len(SUFFIX_LEN)
+        .with_coalesce_gap(0)
+        .with_whole_object_threshold(0);
+    LogSegmentFetcher::new(store)
+        .with_block_range(block_range)
+        .with_block_range_threshold(0)
+}
+
+fn provider(
+    snapshot: Snapshot,
+    fetcher: LogSegmentFetcher,
+    acc: QueryAccounting,
+) -> LogsTableProvider {
+    LogsTableProvider::new(snapshot, TenantHash(TENANT), fetcher, acc)
+        .with_declared_columns(vec![DeclaredColumn::new(CODE_COL, DeclaredType::I64)])
+}
+
+fn find_scan(plan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    fn walk(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+        if plan.name() == "LogsScanExec" {
+            return Some(Arc::clone(plan));
+        }
+        plan.children().iter().find_map(|c| walk(c))
+    }
+    walk(plan).expect("a LogsScanExec leaf")
+}
+
+fn sum_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
+    let set = find_scan(plan).metrics().expect("metrics");
+    set.iter()
+        .filter(|m| m.value().name() == name)
+        .map(|m| m.value().as_usize())
+        .sum()
+}
+
+async fn drain(plan: Arc<dyn ExecutionPlan>) -> usize {
+    let batches = collect(plan, Arc::new(TaskContext::default()))
+        .await
+        .expect("collect");
+    batches.iter().map(|b| b.num_rows()).sum()
+}
+
+fn has_word(marker: &str) -> Expr {
+    has_word_udf().call(vec![col("body"), lit(marker)])
+}
+
+/// `code = v`: a point `NumRange` arm keeping the one block whose value is `v`.
+fn code_eq(v: i64) -> Expr {
+    col(CODE_COL).eq(lit(v))
+}
+
+/// `code <= v`: an upper-bounded `NumRange` arm keeping blocks `0..=v`.
+fn code_le(v: i64) -> Expr {
+    col(CODE_COL).lt_eq(lit(v))
+}
+
+/// One measured shape.
+struct Shape {
+    label: &'static str,
+    gets: u64,
+    full_gets: u64,
+    suffix_gets: u64,
+    bytes: u64,
+    blocks_scanned: usize,
+    blocks_total: usize,
+    rows: usize,
+    plan_full_reads: usize,
+    acc_gets: u64,
+    acc_bytes: u64,
+    acc_bytes_reused: u64,
+    acc_peak_intermediate_bytes: u64,
+    /// Store GET requests the fetcher's [`PhaseWireByteCounter`] attributed to
+    /// [`QueryPhase::Plan`] (issue #835 attribution): the footer/suffix probe
+    /// plus, for an undecidable predicate, the whole-object fallback read --
+    /// both issued by `plan_segment`, never by the scan.
+    plan_phase_gets: u64,
+    /// Store GET requests attributed to [`QueryPhase::Scan`]: the BLOCKS-
+    /// section data range (or a whole-object GET) a data read issues to
+    /// obtain block data. Zero on the fully-carried path; nonzero once a
+    /// segment's carry is dropped and its data read has to fetch block
+    /// bytes it can no longer take from the carry (issue #835 follow-up).
+    scan_phase_gets: u64,
+    /// Store GET requests attributed to [`QueryPhase::Probe`]: a data read's
+    /// OWN metadata GETs (suffix probe, footer chase, directories) -- issued
+    /// again whenever a segment's carry was dropped and its normal open has
+    /// to re-derive that metadata from the wire, since the carry no longer
+    /// covers it either.
+    probe_phase_gets: u64,
+    /// Blocks emitted by the fast columnar path vs. by a row-path reopen
+    /// (`LogScanState::ReopenRows`, triggered by a block's `attrs_raw`
+    /// overflow page). Both nonzero proves a segment took the columnar path
+    /// for part of its blocks and fell back to the row path partway through.
+    columnar_batches: usize,
+    rowpath_batches: usize,
+}
+
+async fn measure(label: &'static str, filters: &[Expr], cache_bytes: u64) -> Shape {
+    measure_opt(label, filters, Some(cache_bytes), PARTS).await
+}
+
+/// `cache_bytes: None` wires no read cache at all (see [`fetcher_uncached`]).
+/// `plan_concurrency` is the provider's `target_partitions`, which this
+/// codebase also uses as the plan phase's fetch fan-out (`LogsScanExec`
+/// threads one value into both roles); most callers pass [`PARTS`] to keep
+/// the two concerns decoupled from a test's assertions, but the issue #835
+/// budget test drives it down deliberately.
+async fn measure_opt(
+    label: &'static str,
+    filters: &[Expr],
+    cache_bytes: Option<u64>,
+    plan_concurrency: usize,
+) -> Shape {
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot(base.as_ref()).await;
+    measure_with_snapshot(
+        label,
+        filters,
+        cache_bytes,
+        plan_concurrency,
+        base,
+        snapshot,
+    )
+    .await
+}
+
+/// Same measurement as [`measure_opt`], against a caller-supplied snapshot
+/// instead of always building the standard (segment-0-carries-an-extra-marker)
+/// corpus -- the issue #835 budget test needs every segment's object the exact
+/// same size, which [`build_snapshot`]'s `MARKER_RARE`-on-segment-0 asymmetry
+/// does not give it.
+async fn measure_with_snapshot(
+    label: &'static str,
+    filters: &[Expr],
+    cache_bytes: Option<u64>,
+    plan_concurrency: usize,
+    base: Arc<MemoryStore>,
+    snapshot: Snapshot,
+) -> Shape {
+    let counting = CountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let acc = QueryAccounting::new();
+    let fetch = match cache_bytes {
+        Some(bytes) => fetcher(store, bytes),
+        None => fetcher_uncached(store),
+    };
+    let wire_bytes = fetch.phase_wire_byte_counter();
+    let prov = provider(snapshot, fetch, acc.clone());
+    let plan = if filters.is_empty() {
+        prov.plan(plan_concurrency).expect("plan")
+    } else {
+        prov.plan_filters(plan_concurrency, filters)
+            .expect("plan_filters")
+    };
+    let rows = drain(Arc::clone(&plan)).await;
+    let snap = acc.snapshot();
+    let phases = wire_bytes.snapshot();
+    Shape {
+        label,
+        gets: counting.gets(),
+        full_gets: counting.full_gets(),
+        suffix_gets: counting.suffix_gets(),
+        bytes: counting.bytes(),
+        blocks_scanned: sum_metric(&plan, "blocks_scanned"),
+        blocks_total: sum_metric(&plan, "blocks_total"),
+        rows,
+        plan_full_reads: sum_metric(&plan, "plan_full_reads"),
+        acc_gets: snap.s3_requests(AccountedOp::Get),
+        acc_bytes: snap.total_s3_bytes(),
+        acc_bytes_reused: snap.bytes_reused,
+        acc_peak_intermediate_bytes: snap.peak_intermediate_bytes,
+        plan_phase_gets: phases.phase_requests(QueryPhase::Plan),
+        scan_phase_gets: phases.phase_requests(QueryPhase::Scan),
+        probe_phase_gets: phases.phase_requests(QueryPhase::Probe),
+        columnar_batches: sum_metric(&plan, "columnar_batches"),
+        rowpath_batches: sum_metric(&plan, "rowpath_batches"),
+    }
+}
+
+fn report(s: &Shape) {
+    eprintln!(
+        "[{}] gets={} (full={} suffix={}) bytes={} blocks_scanned={}/{} rows={} \
+         plan_full_reads={} | accounting: gets={} bytes={} bytes_reused={} \
+         peak_intermediate_bytes={} | phases: plan_gets={} probe_gets={} scan_gets={} \
+         | path: columnar_batches={} rowpath_batches={}",
+        s.label,
+        s.gets,
+        s.full_gets,
+        s.suffix_gets,
+        s.bytes,
+        s.blocks_scanned,
+        s.blocks_total,
+        s.rows,
+        s.plan_full_reads,
+        s.acc_gets,
+        s.acc_bytes,
+        s.acc_bytes_reused,
+        s.acc_peak_intermediate_bytes,
+        s.plan_phase_gets,
+        s.probe_phase_gets,
+        s.scan_phase_gets,
+        s.columnar_batches,
+        s.rowpath_batches,
+    );
+}
+
+/// The #761 fix on the selective (q37/q20) shapes: a `NumRange` prune arm the
+/// skip index can decide reads only the surviving blocks, not the whole object.
+/// The plan phase counts survivors from the skip index (one suffix probe per
+/// segment, no whole-object GET), the scan reads only the surviving blocks, and
+/// the byte cost is proportional to the surviving fraction rather than equal to
+/// a full scan. A shape whose survivors cover >= 75% of a segment still takes
+/// the coverage crossover into a whole-object GET, so the crossover is pinned
+/// too.
+#[tokio::test]
+async fn selective_numeric_reads_only_surviving_blocks() {
+    // Cache large enough to hold the whole fixture with no eviction, so the
+    // deterministic cost is exactly the cold plan + scan reads.
+    let cache = 64 << 20;
+
+    let full = measure("full_scan", &[], cache).await;
+    // q37: one block per segment survives (8 of 48).
+    let q37 = measure("selective_few (q37)", &[code_eq(0)], cache).await;
+    // q20: two blocks per segment survive (16 of 48).
+    let q20 = measure("selective_third (q20)", &[code_le(1)], cache).await;
+    // Five of six blocks per segment survive (40 of 48): above the 0.75
+    // coverage crossover, so each scanned segment is still read whole.
+    let high = measure("high_coverage (>=75%)", &[code_le(4)], cache).await;
+    report(&full);
+    report(&q37);
+    report(&q20);
+    report(&high);
+
+    // QueryAccounting agrees with the raw store counters on both axes.
+    for s in [&full, &q37, &q20, &high] {
+        assert_eq!(
+            s.acc_gets, s.gets,
+            "{}: accounting GET count == store GETs",
+            s.label
+        );
+        assert_eq!(
+            s.acc_bytes, s.bytes,
+            "{}: accounting bytes == store bytes",
+            s.label
+        );
+        assert_eq!(
+            s.blocks_total, TOTAL_BLOCKS,
+            "{}: blocks_total is the whole snapshot",
+            s.label
+        );
+    }
+
+    // Full scan: #693 whole-segment fast path. One whole-object GET per segment,
+    // zero suffix probes, every block scanned. Unchanged by #761.
+    assert_eq!(
+        full.full_gets, SEGMENTS as u64,
+        "full scan: one whole-object GET per segment"
+    );
+    assert_eq!(full.suffix_gets, 0, "full scan: no suffix probes");
+    assert_eq!(
+        full.gets, SEGMENTS as u64,
+        "full scan: exactly one GET per segment and nothing else"
+    );
+    assert_eq!(
+        full.blocks_scanned, TOTAL_BLOCKS,
+        "full scan decodes every block"
+    );
+    assert_eq!(full.rows, TOTAL_BLOCKS, "full scan returns every record");
+    // 649,903 = the eight version-4 objects' bytes exactly (segment 0 carries
+    // `MARKER_RARE` in addition to `MARKER_FEW`, so its object is a few bytes
+    // larger than the other seven after compression). One whole-object GET
+    // per segment and nothing else, so this is the object bytes and not a
+    // byte more.
+    assert_eq!(
+        full.bytes, 649_903,
+        "full scan reads exactly the object bytes"
+    );
+    assert_eq!(full.plan_full_reads, 0, "full scan skips the plan phase");
+
+    // q37: the plan phase decides every segment from the skip index (one suffix
+    // probe per segment, no whole-object GET, no plan_full_reads), and the scan
+    // reads only the one surviving block per segment. NumRange is skip-decidable,
+    // so nothing falls back to a whole-object read.
+    assert_eq!(
+        q37.suffix_gets, SEGMENTS as u64,
+        "q37: one plan-phase probe per segment, and the scan reuses the carried \
+         footer (no scan-phase probe)"
+    );
+    assert_eq!(
+        q37.full_gets, 0,
+        "q37: no whole-object GET anywhere -- the numeric arm pruned the \
+         candidate set below the coverage crossover"
+    );
+    assert_eq!(
+        q37.plan_full_reads, 0,
+        "q37: the plan phase counted survivors from the skip index, fetching no \
+         block"
+    );
+    // Exact GET count: 8 plan probes plus 8 range GETs per segment. Under
+    // version 4 the surviving block's bytes are one page per column chunk of its
+    // row group, and this fixture's blocks carry pages in eight chunks (ts,
+    // observed_ts, stream_ref, severity_num, severity_text, body, flags, code),
+    // none of which coalesce at gap 0 because the pruned blocks' pages for the
+    // same column sit between them. The two front sections (STREAM_DIR,
+    // FIELD_DIR) and every tail section are absorbed by the probe and the 64 MiB
+    // cache. No whole-object GET anywhere.
+    assert_eq!(q37.gets, 72, "q37: exact GET count with no eviction");
+    assert_eq!(
+        q37.blocks_scanned, SEGMENTS,
+        "q37 decodes exactly one block per segment"
+    );
+    assert_eq!(q37.rows, SEGMENTS, "q37 returns one record per segment");
+    // Bytes proportional to the 8 of 48 surviving blocks (plus per-segment
+    // directory reads and 8 suffix probes), a small fraction of a full scan --
+    // NOT the full-scan bytes the pre-#761 whole-object read moved. The upper
+    // bound fails if the fetch reads whole objects (the flip), the lower bound
+    // fails if it somehow reads fewer than the surviving blocks.
+    let q37_block_bytes = full.bytes * (SEGMENTS as u64) / (TOTAL_BLOCKS as u64);
+    assert!(
+        q37.bytes >= q37_block_bytes,
+        "q37 reads at least its surviving-block bytes ({} vs {})",
+        q37.bytes,
+        q37_block_bytes
+    );
+    // 165,365 = 99,157 page bytes (the 8 surviving blocks' pages across their
+    // eight column chunks; blocks differ slightly in encoded size -- segment
+    // 0's surviving block also carries `MARKER_RARE` -- so the term is the
+    // measured sum, not blocks x a constant) + 65,536 probe bytes (8 x 8 KiB)
+    // + 672 front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR 22)). The page
+    // term is 15% of the full scan; the probe term is the fixed per-object
+    // directory cost, which on this deliberately tiny fixture is 40% of the
+    // total and on a production 1.3 MB object is a rounding error.
+    assert_eq!(
+        q37.bytes, 165_365,
+        "q37 moves the surviving blocks' page bytes plus the probe and the two \
+         front sections, not the object"
+    );
+    assert!(
+        q37.bytes <= full.bytes * 2 / 5,
+        "q37 reads well under a full scan ({} vs {}), proportional to 8/48",
+        q37.bytes,
+        full.bytes
+    );
+
+    // q20: two surviving blocks per segment. Same plan shape as q37; the scan
+    // reads twice as many blocks, so more bytes, still far under a full scan.
+    assert_eq!(
+        q20.suffix_gets, SEGMENTS as u64,
+        "q20: one probe per segment"
+    );
+    assert_eq!(q20.full_gets, 0, "q20: no whole-object GET");
+    assert_eq!(q20.plan_full_reads, 0, "q20: skip-index plan");
+    // Same shape as q37: 8 probes plus 8 chunk ranges per segment. q20's second
+    // surviving block per segment is ADJACENT to the first, so its page sits
+    // next to the first's in every chunk and the pair coalesces even at gap 0 --
+    // the range count is unchanged and only the bytes grow.
+    assert_eq!(q20.gets, 72, "q20: exact GET count with no eviction");
+    assert_eq!(
+        q20.blocks_scanned,
+        SEGMENTS * 2,
+        "q20 decodes two blocks per segment"
+    );
+    assert_eq!(
+        q20.rows,
+        SEGMENTS * 2,
+        "q20 returns two records per segment"
+    );
+    let q20_block_bytes = full.bytes * (2 * SEGMENTS as u64) / (TOTAL_BLOCKS as u64);
+    assert!(
+        q20.bytes >= q20_block_bytes,
+        "q20 reads at least its surviving-block bytes ({} vs {})",
+        q20.bytes,
+        q20_block_bytes
+    );
+    // 264,415 = 198,207 page bytes (16 surviving blocks) + the same 65,536 probe
+    // and 672 front-section bytes q37 pays: twice q37's page term, identical
+    // fixed term.
+    assert_eq!(
+        q20.bytes, 264_415,
+        "q20 moves twice q37's page bytes and the same fixed directory bytes"
+    );
+    assert!(
+        q20.bytes <= full.bytes * 3 / 5,
+        "q20 reads under a full scan ({} vs {}), proportional to 16/48",
+        q20.bytes,
+        full.bytes
+    );
+    assert!(
+        q20.bytes > q37.bytes,
+        "q20 reads more than q37 ({} vs {}): twice the surviving blocks",
+        q20.bytes,
+        q37.bytes
+    );
+
+    // High coverage (>= 75%): the numeric arm still prunes to five of six
+    // blocks, but that clears the 0.75 coverage crossover, so each scanned
+    // segment is read WHOLE -- one full GET per segment. The crossover is
+    // preserved by #761, not bypassed.
+    assert_eq!(
+        high.full_gets, SEGMENTS as u64,
+        "high coverage: the crossover still reads each scanned segment whole"
+    );
+    assert_eq!(
+        high.plan_full_reads, 0,
+        "high coverage: the plan phase is still skip-index only (the crossover \
+         is a scan-phase decision)"
+    );
+    assert_eq!(
+        high.blocks_scanned,
+        SEGMENTS * 5,
+        "high coverage decodes five blocks per segment"
+    );
+    assert_eq!(high.rows, SEGMENTS * 5, "high coverage returns 40 records");
+}
+
+/// A text predicate (`has_word`) is bloom-pruned only at DECODE: the skip index
+/// cannot decide it, so #761's fetch-side pruning does not apply. The plan phase
+/// falls back to a whole-object read per segment (`plan_full_reads`), and since
+/// #835 the scan reuses that plan-carried whole object rather than reading it
+/// again, so only the byte-decode is reduced (bloom leaves one block per
+/// segment). This pins the fallback the fix deliberately keeps for shapes the
+/// skip index cannot prune. The 64 MiB cache here is far larger than this
+/// fixture's ~650 KB corpus, which is exactly the configuration that used to
+/// mask issue #835's double wire GET as a cache hit -- see
+/// `text_predicate_no_second_wire_read_regardless_of_cache` below for the
+/// cache-size-independent assertion this test cannot make on its own.
+#[tokio::test]
+async fn text_predicate_falls_back_to_full_object_read() {
+    let cache = 64 << 20;
+    let text = measure("text_fallback (has_word)", &[has_word(MARKER_FEW)], cache).await;
+    report(&text);
+
+    assert_eq!(
+        text.plan_full_reads, SEGMENTS,
+        "every relevant segment's plan phase read the whole object: the skip \
+         index cannot decide a text predicate"
+    );
+    assert_eq!(
+        text.full_gets, SEGMENTS as u64,
+        "the whole-object read the plan fallback issues, one per segment"
+    );
+    assert_eq!(
+        text.blocks_scanned, SEGMENTS,
+        "bloom still prunes to one block per segment at decode"
+    );
+    assert_eq!(text.rows, SEGMENTS, "one matching record per segment");
+    // The whole objects are read: bytes ~ a full scan plus the probes, the
+    // amplification #761 cannot remove for a text predicate. 715,439 = 649,903
+    // object bytes + 65,536 probe bytes (8 x 8 KiB). The 176 FIELD_DIR bytes
+    // (8 x 22) this figure carried before #835 were the scan open's, not the
+    // plan's: the plan fallback selects every column, while the scan's
+    // selection is built from fixed-only builders and so is not `is_all()`,
+    // which is what makes `place_and_decode_field_dir` fire. The carry
+    // short-circuits that open, so the read goes with it.
+    let full = measure("full_scan", &[], cache).await;
+    assert_eq!(
+        text.bytes, 715_439,
+        "text fallback: the whole objects plus one plan probe each"
+    );
+    assert!(
+        text.bytes >= full.bytes,
+        "text predicate still moves the full-object bytes ({} vs {})",
+        text.bytes,
+        full.bytes
+    );
+}
+
+/// The q20 shape under a cache too small to hold the working set: eviction can
+/// only add reads, but with #761 each surviving block is read at most once per
+/// scan, so the GET count does NOT multiply by the partition count the way the
+/// pre-fix whole-object re-reads did. Bounds the per-segment scan reads rather
+/// than pinning a single eviction-dependent figure.
+#[tokio::test]
+async fn selective_third_no_partition_multiplication_under_cache_pressure() {
+    let big = measure("q20_big_cache", &[code_le(1)], 64 << 20).await;
+    // A cache five times smaller than the fixture's 650 KB of object bytes, so
+    // the probe and directory extents really are evicted between the plan pass
+    // and the per-partition scans.
+    let small = measure("q20_small_cache", &[code_le(1)], 128 << 10).await;
+    report(&big);
+    report(&small);
+
+    // No whole-object GET under either cache: the numeric arm keeps coverage
+    // below the crossover regardless of eviction.
+    assert_eq!(big.full_gets, 0, "q20 big cache: no whole-object GET");
+    assert_eq!(small.full_gets, 0, "q20 small cache: no whole-object GET");
+
+    // The plan phase's footer is carried in memory, not through the read cache,
+    // so eviction cannot make a subset open re-probe: one probe per segment
+    // under either cache size.
+    assert_eq!(
+        small.suffix_gets, SEGMENTS as u64,
+        "q20 small cache: still one probe per segment, the carried footer is \
+         not cache-resident state"
+    );
+
+    // Eviction can only add reads, never remove them.
+    assert!(
+        small.gets >= big.gets,
+        "small cache issues at least as many GETs ({} vs {})",
+        small.gets,
+        big.gets
+    );
+
+    // The decisive #761 bound: the bytes never reach even a single full scan of
+    // the objects. Each surviving block is owned by exactly one partition (the
+    // ADR-0102 stripe) and the plan phase decodes no block, so every surviving
+    // block is read once regardless of eviction; only the small directory
+    // sections are ever re-fetched. So the 17.9 GB > 11.1 GB whole-object
+    // re-read amplification the reproduction showed (bytes ~ 3x the object
+    // bytes) is gone: bytes stay below one full pass. Bytes, not GET count, is
+    // pinned here -- the raw GET count under eviction is scheduling-dependent,
+    // but no GET is ever a whole-object read (asserted above), so partitions
+    // cannot multiply the object bytes.
+    let full = measure("full_scan", &[], 64 << 20).await;
+    assert!(
+        small.bytes < full.bytes,
+        "q20 under pressure moves fewer bytes than a full scan ({} vs {}): each \
+         surviving block is read once, none of the pruned blocks at all",
+        small.bytes,
+        full.bytes
+    );
+    // 264,415 with no eviction (16 surviving blocks' page bytes plus the fixed
+    // probe and front-section bytes) against 479,157 under pressure: the
+    // difference is re-fetched probe and directory extents, never a re-read
+    // page. Both stay under the 649,903 a single full pass moves.
+    assert_eq!(big.bytes, 264_415, "q20 with no eviction");
+    assert_eq!(
+        small.bytes, 479_157,
+        "q20 under eviction: more directory re-reads, still under one full pass"
+    );
+}
+
+/// Issue #835's attribution fixture, the "prunes nothing" shape: `MARKER_FEW`
+/// matches one block in EVERY segment, so nothing is pruned at the segment
+/// level and every relevant segment's plan phase falls back to a whole-object
+/// read (same predicate as `text_predicate_falls_back_to_full_object_read`
+/// above, deliberately, so the two tests are directly comparable).
+///
+/// Before issue #835's fix, the scan phase re-opened every one of those
+/// objects from scratch: `PLAN` issued `SEGMENTS` (8) whole-object GETs,
+/// `SCAN` issued `SEGMENTS` (8) more for the identical bytes, `2 * SEGMENTS`
+/// (16) total and twice the corpus bytes on the wire -- masked to 8 and one
+/// corpus's worth of bytes only when a read cache happened to be wired AND
+/// sized larger than the whole corpus (`text_predicate_falls_back_to_full_object_read`'s
+/// 64 MiB cache is exactly that masking case; this fixture's corpus is only
+/// ~650 KB, so a real deployment's cache is not reliably bigger).
+///
+/// Since the fix, the plan's fetched bytes are carried forward
+/// (`ravel_query::CarriedWholeObject`) into the scan, so the wire cost is
+/// `SEGMENTS` (8) GETs and exactly the corpus bytes moved once, identical to
+/// the big-cache figures and now true under a cache too small to hold the
+/// corpus and with no cache at all. That equality is a property of this
+/// fixture, not of the carry: the plan fan-out here covers every segment, so
+/// every carry survives. A snapshot with more segments than partitions pays a
+/// second read for the surplus, which
+/// [`plan_carry_peak_bytes_bounded_by_plan_concurrency`] pins.
+#[tokio::test]
+async fn text_predicate_no_second_wire_read_regardless_of_cache() {
+    // Below the ~650 KB corpus: without the carry, at least some plan-phase
+    // entries would not survive to be reused by the scan.
+    let small = measure_opt(
+        "text_fallback (small cache)",
+        &[has_word(MARKER_FEW)],
+        Some(128 << 10),
+        PARTS,
+    )
+    .await;
+    let uncached = measure_opt(
+        "text_fallback (no cache)",
+        &[has_word(MARKER_FEW)],
+        None,
+        PARTS,
+    )
+    .await;
+    report(&small);
+    report(&uncached);
+
+    for s in [&small, &uncached] {
+        assert_eq!(
+            s.plan_full_reads, SEGMENTS,
+            "{}: every relevant segment's plan phase reads the whole object",
+            s.label
+        );
+        // The exact-count claim this fixture exists to pin: full_gets is
+        // SEGMENTS, NOT 2 * SEGMENTS -- the scan issues no whole-object GET of
+        // its own, regardless of cache size. (Total `gets` below is
+        // 2 * SEGMENTS because the plan phase's suffix probe, not the scan,
+        // adds the other half.)
+        assert_eq!(
+            s.full_gets, SEGMENTS as u64,
+            "{}: exactly one whole-object wire GET per segment total -- the \
+             plan's carried bytes cover the scan, never a second GET, \
+             regardless of cache size",
+            s.label
+        );
+        assert_eq!(
+            s.gets,
+            2 * SEGMENTS as u64,
+            "{}: one suffix probe plus one whole-object GET per segment, and \
+             nothing beyond that -- the scan adds no GET of any shape",
+            s.label
+        );
+        // 715,439: identical to the big-cache figure
+        // (`text_predicate_falls_back_to_full_object_read`), proving the byte
+        // cost no longer depends on cache size.
+        assert_eq!(
+            s.bytes, 715_439,
+            "{}: exactly the corpus bytes plus the fixed per-segment plan \
+             overhead, moved once, never twice",
+            s.label
+        );
+        assert_eq!(
+            s.acc_bytes, s.bytes,
+            "{}: accounting wire-bytes agrees with the raw store bytes",
+            s.label
+        );
+        assert_eq!(
+            s.acc_gets, s.gets,
+            "{}: accounting GET count agrees with the raw store GETs -- the \
+             reused read is not double-counted as a second GET",
+            s.label
+        );
+        assert_eq!(
+            s.blocks_scanned, SEGMENTS,
+            "{}: bloom still prunes to one block per segment at decode",
+            s.label
+        );
+        assert_eq!(
+            s.rows, SEGMENTS,
+            "{}: one matching record per segment",
+            s.label
+        );
+        // 649,903: the whole corpus (see `full.bytes` in the sibling test),
+        // charged as reused rather than folded into the GET-bytes figure the
+        // plan phase already recorded -- the truthful-accounting deliverable.
+        assert_eq!(
+            s.acc_bytes_reused, 649_903,
+            "{}: the scan's reuse of every carried whole object is charged via \
+             bytes_reused, not silently absorbed into acc_bytes",
+            s.label
+        );
+        // Per-phase attribution (issue #835 follow-up, finding 3a): this test
+        // drives `plan_concurrency == PARTS == SEGMENTS`, so the carry budget
+        // never drops a single segment -- every whole-object read the plan
+        // phase issues survives to be reused, and the scan phase issues no
+        // store GET of any shape. `plan_phase_gets` equals `s.gets` in full:
+        // both the suffix probe AND the undecidable predicate's whole-object
+        // fallback are plan-phase GETs (`ravel_query::QueryPhase::Plan`),
+        // never the scan's.
+        assert_eq!(
+            s.plan_phase_gets, s.gets,
+            "{}: with an unbudgeted carry, every store GET (suffix probe and \
+             whole-object fallback alike) is attributed to the plan phase",
+            s.label
+        );
+        assert_eq!(
+            s.scan_phase_gets, 0,
+            "{}: the scan phase reuses every carried whole object and issues \
+             zero store GETs of its own",
+            s.label
+        );
+    }
+}
+
+/// Issue #835, the q37-style "prunes most" shape: `MARKER_RARE` is confined to
+/// one block of one segment out of `SEGMENTS`. The skip index still cannot
+/// decide a text predicate whether or not it ultimately matches, so EVERY
+/// relevant segment's plan phase reads the whole object to find out
+/// (`plan_full_reads == SEGMENTS`) -- but only the one segment containing the
+/// marker has a surviving block, so `owned_work` assigns no partition any
+/// work in the other `SEGMENTS - 1` segments and the scan phase never opens
+/// them. The one surviving segment's scan reuses its plan-carried bytes (no
+/// second GET), so the total wire GET count is exactly `SEGMENTS`: the plan
+/// pass moves every object once, and the scan adds nothing.
+#[tokio::test]
+async fn text_predicate_prunes_most_scan_adds_no_gets() {
+    let cache = 128 << 10; // below the ~650 KB corpus
+    let s = measure(
+        "text_fallback (prunes most)",
+        &[has_word(MARKER_RARE)],
+        cache,
+    )
+    .await;
+    report(&s);
+
+    assert_eq!(
+        s.plan_full_reads, SEGMENTS,
+        "every relevant segment's plan phase reads the whole object -- the \
+         skip index cannot decide a text predicate whether or not it matches"
+    );
+    assert_eq!(
+        s.full_gets, SEGMENTS as u64,
+        "exactly one whole-object GET per segment (the plan pass); the scan \
+         adds zero GETs for the surviving segment and none of the other \
+         SEGMENTS - 1 segments are ever opened"
+    );
+    assert_eq!(
+        s.gets,
+        2 * SEGMENTS as u64,
+        "one suffix probe plus one whole-object GET per segment (the plan \
+         pass over every segment); no GET of any shape beyond that"
+    );
+    assert_eq!(
+        s.blocks_scanned, 1,
+        "only the one segment carrying the marker survives"
+    );
+    assert_eq!(s.rows, 1, "exactly one matching record, from segment 0");
+    // 81,147: segment 0's whole-object size, a few bytes larger than the
+    // other seven (its block 0 carries `MARKER_RARE` in addition to
+    // `MARKER_FEW`) -- the only segment whose carry the scan ever reuses.
+    assert_eq!(
+        s.acc_bytes_reused, 81_147,
+        "the one surviving segment's scan reuses its plan-carried bytes \
+         rather than issuing a second GET"
+    );
+}
+
+/// Issue #835's memory-bound requirement, honestly measured: peak carried-
+/// whole-object bytes retained at the plan barrier is bounded by
+/// `plan_concurrency` (in OBJECT COUNT), not by corpus size. As each
+/// `plan_segment` future completes (`buffer_unordered(plan_concurrency)`,
+/// completion order, not segment order), the first `plan_concurrency`
+/// arrivals to produce a carried whole object keep it; every later arrival
+/// has its `whole_object` forced to `None` before it is stored, so that
+/// segment's scan pays a real wire GET, exactly as it did before #835.
+///
+/// This fixture uses [`build_snapshot_uniform`] rather than the standard
+/// [`build_snapshot`]: every one of its `SEGMENTS` (8) objects is the exact
+/// same stored size `S` (no segment-conditional `MARKER_RARE`), so the
+/// dropped/retained split can be pinned as an exact byte sum (`2 * S`)
+/// instead of an inequality. `MARKER_FEW` is present in every segment's block
+/// 0, so (like the "prunes nothing" fixture above) nothing is pruned at the
+/// segment level and every segment's plan phase falls back to a whole-object
+/// read -- all 8 are candidates for the carry, only `plan_concurrency` (2) of
+/// them survive it.
+///
+/// The barrier itself is unchanged: no partition drains any block until
+/// every segment's survivor count is known (ADR-0102's flattened
+/// block-striping assignment needs all of them at once), so this test does
+/// not claim the barrier waits any less long -- only that what it retains
+/// meanwhile no longer scales with corpus size.
+#[tokio::test]
+async fn plan_carry_peak_bytes_bounded_by_plan_concurrency() {
+    const BUDGET: usize = 2;
+
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot_uniform(base.as_ref()).await;
+    let object_size = snapshot.segments[0].object_size;
+    assert!(
+        snapshot
+            .segments
+            .iter()
+            .all(|seg| seg.object_size == object_size),
+        "fixture precondition: every uniform-fixture segment is the exact \
+         same stored size"
+    );
+
+    let s = measure_with_snapshot(
+        "text_fallback (budgeted carry)",
+        &[has_word(MARKER_FEW)],
+        None,
+        BUDGET,
+        base,
+        snapshot,
+    )
+    .await;
+    report(&s);
+
+    assert_eq!(
+        s.plan_full_reads, SEGMENTS,
+        "every relevant segment's plan phase reads the whole object, \
+         regardless of whether the budget later lets it keep those bytes"
+    );
+    assert_eq!(
+        s.blocks_scanned, SEGMENTS,
+        "MARKER_FEW survives one block in every segment, so the scan opens \
+         all SEGMENTS segments"
+    );
+    assert_eq!(s.rows, SEGMENTS, "one matching record per segment");
+
+    // Exactly `BUDGET` (2) carried whole objects reused by the scan, never
+    // more: `2 * S`, not an approximation and not the corpus.
+    assert_eq!(
+        s.acc_bytes_reused,
+        BUDGET as u64 * object_size,
+        "exactly BUDGET carried whole objects are reused by the scan -- the \
+         other SEGMENTS - BUDGET segments pay a real wire re-fetch instead"
+    );
+    // The deliverable this test exists to pin: peak intermediate bytes is
+    // `BUDGET * S`, never the corpus (`SEGMENTS * S`).
+    assert_eq!(
+        s.acc_peak_intermediate_bytes,
+        BUDGET as u64 * object_size,
+        "peak carried-whole-object bytes at the plan barrier is bounded by \
+         plan_concurrency (in object count), not by corpus size"
+    );
+
+    // Wire-GET accounting: the plan phase issues one suffix probe and one
+    // whole-object read per segment regardless of the carry budget (the read
+    // already happened before the budget decides whether to keep it), so
+    // `plan_phase_gets` is `2 * SEGMENTS` unconditionally. The scan phase
+    // then re-fetches the `SEGMENTS - BUDGET` segments the budget dropped,
+    // each with its own whole-object GET, and reuses the other `BUDGET`
+    // segments' carried bytes for free.
+    assert_eq!(
+        s.plan_phase_gets,
+        2 * SEGMENTS as u64,
+        "plan phase: one suffix probe plus one whole-object read per \
+         segment, unaffected by the carry budget"
+    );
+    // Each of the SEGMENTS - BUDGET (6) dropped segments falls back to a
+    // normal (uncarried) segment open: one data read whose own metadata GETs
+    // (suffix probe + front directories, `QueryPhase::Probe`) precede its
+    // block-data range read (`QueryPhase::Scan`). Empirically 2 probe GETs
+    // and 1 scan GET per dropped segment (measured directly, not derived --
+    // the exact shape of a data read's own metadata fetch is this fetcher
+    // configuration's business, not this test's).
+    assert_eq!(
+        s.probe_phase_gets,
+        2 * (SEGMENTS - BUDGET) as u64,
+        "probe phase: each of the SEGMENTS - BUDGET segments the carry \
+         budget dropped re-derives its own open metadata from the wire"
+    );
+    assert_eq!(
+        s.scan_phase_gets,
+        (SEGMENTS - BUDGET) as u64,
+        "scan phase: exactly one block-data wire GET per segment the \
+         budget dropped, zero for the BUDGET segments whose carry survived"
+    );
+    assert_eq!(
+        s.gets,
+        s.plan_phase_gets + s.probe_phase_gets + s.scan_phase_gets,
+        "the counting store's raw total agrees with the per-phase split \
+         (no bytes land in QueryPhase::Resolve on this read path)"
+    );
+    assert_eq!(
+        s.acc_gets, s.gets,
+        "accounting GET count agrees with the raw store GETs"
+    );
+}
+
+/// Issue #835 follow-up (finding 3): the carry budget must not be spent on a
+/// segment `owned_work` was always going to drop for having zero surviving
+/// blocks -- that would retain bytes no partition ever reuses while starving
+/// a segment that would have used the slot.
+///
+/// [`build_snapshot_uniform_first_zero_survivor`] gives segment 0 no
+/// `MARKER_FEW` anywhere, so its plan phase still pays the whole-object
+/// fallback read (the skip index cannot decide the predicate without
+/// reading) but finds zero survivors; segments 1..`SEGMENTS` are otherwise
+/// identical to [`build_snapshot_uniform`] and each keep one surviving
+/// block. `plan_concurrency` (`BUDGET`, 2) is small enough, and completion
+/// order in this single-threaded fixture matches segment order closely
+/// enough, that segment 0 is always the first `plan_segment` future to
+/// complete: before this fix, its budget slot would be wasted and only
+/// `BUDGET - 1` real segments would be carried; after it, segment 0 is
+/// skipped for having no survivors and the full `BUDGET` real segments (1
+/// and 2) are carried.
+#[tokio::test]
+async fn plan_carry_skips_zero_survivor_segment_budget() {
+    const BUDGET: usize = 2;
+
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot_uniform_first_zero_survivor(base.as_ref()).await;
+    let object_size = snapshot.segments[1].object_size;
+    assert!(
+        snapshot.segments[1..]
+            .iter()
+            .all(|seg| seg.object_size == object_size),
+        "fixture precondition: every marker-carrying segment (1..SEGMENTS) is \
+         the exact same stored size"
+    );
+
+    let s = measure_with_snapshot(
+        "text_fallback (zero-survivor budget skip)",
+        &[has_word(MARKER_FEW)],
+        None,
+        BUDGET,
+        base,
+        snapshot,
+    )
+    .await;
+    report(&s);
+
+    assert_eq!(
+        s.plan_full_reads, SEGMENTS,
+        "every segment's plan phase reads the whole object, including \
+         segment 0, which the skip index cannot rule out without reading"
+    );
+    assert_eq!(
+        s.blocks_scanned,
+        SEGMENTS - 1,
+        "segment 0 has no surviving block and is never opened by any \
+         partition; segments 1..SEGMENTS each keep one"
+    );
+    assert_eq!(
+        s.rows,
+        SEGMENTS - 1,
+        "one matching record per segment, excluding segment 0"
+    );
+
+    // Exactly BUDGET (2) carried whole objects, both real (segments 1 and
+    // 2): segment 0's whole-object read is never even offered to the budget,
+    // so it cannot consume a slot a real segment would otherwise get.
+    assert_eq!(
+        s.acc_bytes_reused,
+        BUDGET as u64 * object_size,
+        "the carry budget is spent entirely on segments with a surviving \
+         block -- segment 0's zero-survivor read never competes for a slot"
+    );
+    assert_eq!(
+        s.acc_peak_intermediate_bytes,
+        BUDGET as u64 * object_size,
+        "peak carried bytes is exactly BUDGET real objects, not BUDGET \
+         objects including a wasted zero-survivor one"
+    );
+
+    // Plan phase: one suffix probe plus one whole-object read per segment,
+    // unconditionally, including segment 0 (its read still happens, only its
+    // result is never retained past this loop iteration).
+    assert_eq!(
+        s.plan_phase_gets,
+        2 * SEGMENTS as u64,
+        "plan phase pays for every segment's whole-object read regardless of \
+         survivor count or carry budget"
+    );
+    // Segment 0 is skipped by owned_work outright (zero survivors) and is
+    // never opened by anything past the plan phase, so it contributes zero
+    // probe/scan GETs whether or not its carry was retained. Segments 1 and 2
+    // are carried and reused for free. The remaining SEGMENTS - 1 - BUDGET
+    // (5) segments (3..SEGMENTS) have a surviving block but no carry left,
+    // so each pays a real re-fetch: 2 probe GETs (suffix + front directories)
+    // and 1 scan GET (block data), the same per-dropped-segment shape
+    // `plan_carry_peak_bytes_bounded_by_plan_concurrency` measures.
+    assert_eq!(
+        s.probe_phase_gets,
+        2 * (SEGMENTS - 1 - BUDGET) as u64,
+        "each of the SEGMENTS - 1 - BUDGET real segments the carry budget \
+         dropped re-derives its own open metadata from the wire"
+    );
+    assert_eq!(
+        s.scan_phase_gets,
+        (SEGMENTS - 1 - BUDGET) as u64,
+        "one block-data wire GET per real segment the budget dropped, zero \
+         for segment 0 (never opened) and zero for segments 1-2 (carried)"
+    );
+    assert_eq!(
+        s.gets,
+        s.plan_phase_gets + s.probe_phase_gets + s.scan_phase_gets,
+        "the counting store's raw total agrees with the per-phase split"
+    );
+    assert_eq!(
+        s.acc_gets, s.gets,
+        "accounting GET count agrees with the raw store GETs"
+    );
+}
+
+/// Issue #835 follow-up (Finding 2): a segment's carried whole-object read is
+/// reused once, by the fast columnar open of its first (clean) block, then
+/// abandoned mid-segment when the second block's `attrs_raw` overflow page
+/// falls the scan back to [`LogScanState::ReopenRows`]. The reopen must not
+/// charge [`QueryAccounting::add_bytes_reused`] for the same buffer a second
+/// time -- fixed by `Option::take()`ing the carry at the first open (see
+/// `logs_scan.rs`'s `current_whole_object` field), so the reopen always sees
+/// `None` and pays for a real re-fetch instead.
+///
+/// `plan_concurrency = 1` keeps this fixture's one segment inside the
+/// Finding 1 carry budget, so the buffer really is carried into the scan;
+/// the regression this test guards is specific to the reused-then-abandoned
+/// buffer, not to the budget dropping it before it ever gets here.
+///
+/// `measure_with_snapshot` (used by every other test in this file) always
+/// projects every column, including the merged `attrs` map -- which makes
+/// [`columnar_static_eligible`] false and routes straight to the row path,
+/// never touching the fast columnar path or `ReopenRows` at all. Reaching
+/// the reopen needs a projection of only `ts` and the declared `code`
+/// column, so this test drives `TableProvider::scan` directly instead
+/// (same pattern `logs_fast_path_projection_routing.rs` uses).
+#[tokio::test]
+async fn carried_object_reopen_does_not_double_charge_reused_bytes() {
+    let base = Arc::new(MemoryStore::new());
+    let snapshot = build_snapshot_reopen(base.as_ref()).await;
+    let object_size = snapshot.segments[0].object_size;
+
+    let counting = CountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let acc = QueryAccounting::new();
+    let fetch = fetcher_uncached(store);
+    let prov = Arc::new(provider(snapshot, fetch, acc.clone()));
+
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    let projection = vec![LOG_COL_TS, FIRST_DECLARED_COL];
+    let filters = vec![has_word(MARKER_FEW)];
+    let plan = TableProvider::scan(
+        prov.as_ref(),
+        &ctx.state(),
+        Some(&projection),
+        &filters,
+        None,
+    )
+    .await
+    .expect("scan");
+    let rows = drain(Arc::clone(&plan)).await;
+    let snap = acc.snapshot();
+
+    eprintln!(
+        "[attrs_raw reopen] gets={} bytes={} rows={} plan_full_reads={} \
+         bytes_reused={} peak_intermediate_bytes={} columnar_batches={} \
+         rowpath_batches={}",
+        counting.gets(),
+        counting.bytes(),
+        rows,
+        sum_metric(&plan, "plan_full_reads"),
+        snap.bytes_reused,
+        snap.peak_intermediate_bytes,
+        sum_metric(&plan, "columnar_batches"),
+        sum_metric(&plan, "rowpath_batches"),
+    );
+
+    // 5: the plan phase's one whole-object GET for the segment, plus the
+    // attrs_raw reopen's own suffix probe and BLOCKS-range GETs for block 1 --
+    // block 0's fast columnar open pays none of these, since it opens from
+    // the carry. If the reopen ever started drawing from the carried buffer
+    // instead of paying for its own re-fetch, this count would drop and
+    // `bytes_reused` above would grow past `object_size`.
+    assert_eq!(
+        counting.gets(),
+        5,
+        "the attrs_raw reopen re-fetches its own metadata and block data \
+         rather than drawing a second time on the carried buffer"
+    );
+    assert_eq!(
+        sum_metric(&plan, "plan_full_reads"),
+        1,
+        "one segment, its has_word predicate forces exactly one plan-phase \
+         whole-object read"
+    );
+    assert_eq!(
+        sum_metric(&plan, "columnar_batches"),
+        1,
+        "block 0 has no attrs_raw overflow page and is emitted by the fast \
+         columnar path"
+    );
+    assert_eq!(
+        sum_metric(&plan, "rowpath_batches"),
+        1,
+        "block 1's attrs_raw overflow page falls this segment back to the \
+         re-opened row path"
+    );
+    assert_eq!(
+        rows, 2,
+        "both blocks' one record each survive the has_word predicate -- the \
+         mid-segment attrs_raw reopen must lose or repeat none of them"
+    );
+    assert_eq!(
+        snap.bytes_reused, object_size,
+        "the carried whole object is reused exactly once, by the fast \
+         columnar open of block 0 -- the attrs_raw reopen of block 1 must \
+         pay for its own re-fetch instead of double-charging the same \
+         buffer as reused a second time"
+    );
+}
+
+// ---- issue #1401: decompressed-byte accounting follows the decode path -----
+//
+// The fixtures above use incompressible filler so every body page stays raw:
+// perfect for wire-byte proportionality, useless for decompressed bytes, which
+// only a zstd page produces. These tests use their own compressible-body
+// segment so each block's `body` page is stored COMP_ZSTD and decoding it
+// charges a nonzero, exactly-known decompressed length.
+
+/// A body zstd shrinks hard (one 12-byte phrase repeated), so its `body` page
+/// is stored COMP_ZSTD and decompresses to a nonzero, countable length.
+fn compressible_body(blk: usize) -> String {
+    format!("blk{blk} {}", "log message ".repeat(400))
+}
+
+fn compressible_record(blk: usize) -> LogRecord {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("svc".to_string()),
+    )];
+    let ts = blk as i64;
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: compressible_body(blk),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
+/// Blocks in the decompressed-accounting fixture: one record per block, distinct
+/// `ts_ns` per block, so a ts range prunes an exact block subset at the skip
+/// index (the ranged path then fetches only that subset).
+const DECOMP_BLOCKS: usize = 3;
+
+/// Build a single 3-block segment with compressible bodies and return its
+/// `SegmentRef` alongside the raw object, so a whole-object [`RlogReader`] can
+/// compute the exact decompressed reference each scan path must match.
+async fn write_compressible_segment(store: &dyn ObjectStoreBackend) -> (SegmentRef, Vec<u8>) {
+    let recs: Vec<LogRecord> = (0..DECOMP_BLOCKS).map(compressible_record).collect();
+    let mut w = RlogWriter::new(one_record_blocks(), identity(1));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+    let size = bytes.len() as u64;
+    let key = "logs/decompressed_seg.rlog".to_string();
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(
+            &key,
+            bytes::Bytes::from(bytes.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put");
+    let seg = SegmentRef {
+        data_object_key: key,
+        object_size: size,
+        min_event_ts_ns: 0,
+        max_event_ts_ns: (DECOMP_BLOCKS - 1) as i64,
+        ingest_hour_bucket: 0,
+        sample_count: recs.len() as u64,
+        series_count: 0,
+        shard: 0,
+        content_hash,
+        writer_id: Uuid::from_u128(1),
+        writer_epoch: 1,
+        writer_seq: 1,
+        created_unix_ns: 0,
+        level: SegmentLevel::L0,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        declared_column_stats: Default::default(),
+    };
+    (seg, bytes)
+}
+
+/// `ScanStats.decompressed_bytes` a whole-object [`RlogReader`] reports for a
+/// scan over the inclusive ts range `[lo, hi]`: the reference each fetcher scan
+/// path must match to the byte.
+fn reader_decompressed(obj: &[u8], lo: i64, hi: i64) -> u64 {
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(obj, &cfg).expect("open");
+    let mut scan = reader
+        .scan_blocks(
+            &Predicate::TsRange {
+                min_ns: lo,
+                max_ns: hi,
+            },
+            &[],
+            &ColumnSelection::all(),
+        )
+        .expect("scan");
+    while scan.next_block(obj).expect("next").is_some() {}
+    scan.stats().decompressed_bytes
+}
+
+/// A logs scan's `decompressed_bytes` counts exactly what the scan decoded, on
+/// both the ranged and the whole-object fetch paths, and lands in the scan
+/// phase. The whole-object statement decodes every block; the ranged statement
+/// is ts-pruned to block 0; the difference is exactly the pages of the blocks
+/// the ranged path skipped, which is the number that shows the counter follows
+/// the decode path and not the fetch (issue #1401).
+#[tokio::test]
+async fn decompressed_bytes_follows_decode_path_in_scan_phase() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let (seg, obj) = write_compressible_segment(store.as_ref()).await;
+
+    // Reader references. A ts range matching no block decodes nothing, so it
+    // reports only the object's directory decompression (the open-time seed);
+    // each single-block scan is that seed plus that block's zstd page bytes.
+    let dirs = reader_decompressed(&obj, 1_000, 1_000);
+    let b0 = reader_decompressed(&obj, 0, 0) - dirs;
+    let b1 = reader_decompressed(&obj, 1, 1) - dirs;
+    let b2 = reader_decompressed(&obj, 2, 2) - dirs;
+    let all = reader_decompressed(&obj, i64::MIN, i64::MAX);
+    assert!(
+        b0 > 0 && b1 > 0 && b2 > 0,
+        "each block carries a zstd body page"
+    );
+    assert_eq!(
+        all,
+        dirs + b0 + b1 + b2,
+        "an all-blocks scan is the directories plus every block's pages"
+    );
+
+    // Ranged path: a ts-pruned statement decoding only block 0.
+    let ranged = fetcher(Arc::clone(&store), 1 << 20);
+    let phase_r = PhaseAccounting::new();
+    let mut rscan = ranged
+        .scan_accounted_with_tenant(
+            &seg,
+            TenantHash(TENANT),
+            &LogQuery::new(0, 0),
+            &ColumnSelection::all(),
+            phase_r.scan(),
+        )
+        .await
+        .expect("ranged scan")
+        .expect("segment is ts-relevant");
+    while rscan.next_block().expect("next").is_some() {}
+    drop(rscan);
+    let r = phase_r.snapshot();
+
+    // Whole-object path: a full-window statement reading the whole object in one
+    // GET and decoding every block.
+    let whole = fetcher(Arc::clone(&store), 1 << 20);
+    let phase_w = PhaseAccounting::new();
+    let mut wscan = whole
+        .scan_whole_accounted_with_tenant(
+            &seg,
+            TenantHash(TENANT),
+            &LogQuery::new(i64::MIN, i64::MAX),
+            &ColumnSelection::all(),
+            phase_w.scan(),
+        )
+        .await
+        .expect("whole scan")
+        .expect("segment is ts-relevant");
+    while wscan.next_block().expect("next").is_some() {}
+    drop(wscan);
+    let w = phase_w.snapshot();
+
+    // The ranged (version-4) fetch path decodes SKIP_IDX and PAGE_DIR itself,
+    // to resolve candidate blocks and their pages (`fetch_object_v4`), and now
+    // charges that decode to the scan phase (issue #1401 finding 3). `open_scan`
+    // then builds its own `RlogReader` over the fetched buffer, which decodes
+    // every directory section again to open the object -- `dirs`, `b0`, `b1`,
+    // and `b2` above already include that reader-side cost. So the ranged path
+    // legitimately double-charges SKIP_IDX and PAGE_DIR: once for locating the
+    // candidate blocks before the buffer exists, once for opening the reader
+    // over the buffer it fetched. FIELD_DIR is not part of this fixture's
+    // ranged fetch (`LogQuery::new(0, 0)` carries no NumRange arm and the scan
+    // selects every column, so `fetch_object_v4` skips it, per its own doc
+    // comment), so only these two sections double-count.
+    let footer = ravel_logseg::footer::open(&obj).expect("open");
+    let mut fetch_side_dirs = 0u64;
+    for k in [
+        ravel_logseg::footer::kind::SKIP_IDX,
+        ravel_logseg::footer::kind::PAGE_DIR,
+    ] {
+        let desc = *footer.section(k).expect("section");
+        assert_eq!(
+            desc.comp,
+            ravel_logseg::footer::COMP_ZSTD,
+            "fixture section {k} must be zstd for this test"
+        );
+        fetch_side_dirs += desc.uncomp_len;
+    }
+
+    // Each path charges exactly the reader reference for the sections it
+    // decompressed, plus the ranged path's own fetch-side directory decode.
+    assert_eq!(
+        r.scan.decompressed_bytes,
+        dirs + b0 + fetch_side_dirs,
+        "the ranged path decoded only block 0, plus its own SKIP_IDX/PAGE_DIR fetch-side decode"
+    );
+    assert_eq!(
+        w.scan.decompressed_bytes, all,
+        "the whole-object path never fetch-side decodes a directory section, so it \
+         matches the reader reference exactly"
+    );
+
+    // The whole-object figure now trails the ranged figure's directory work by
+    // fetch_side_dirs: the difference is the skipped blocks' pages minus the
+    // ranged path's extra double-charged directory bytes.
+    assert_eq!(
+        w.scan.decompressed_bytes - r.scan.decompressed_bytes,
+        b1 + b2 - fetch_side_dirs,
+        "the difference is the skipped blocks' pages minus the ranged path's \
+         double-charged SKIP_IDX/PAGE_DIR"
+    );
+
+    // The figure lands in the scan phase and nowhere else: these funnels open
+    // the scan reader directly and never run a plan-phase survivor count.
+    for (name, snap) in [("ranged", &r), ("whole", &w)] {
+        assert_eq!(snap.resolve.decompressed_bytes, 0, "{name} resolve phase");
+        assert_eq!(snap.plan.decompressed_bytes, 0, "{name} plan phase");
+        assert_eq!(snap.probe.decompressed_bytes, 0, "{name} probe phase");
+        assert!(
+            snap.scan.decompressed_bytes > 0,
+            "{name} scan phase carries the decompressed bytes"
+        );
+    }
+}
