@@ -36,8 +36,7 @@
 //! `ravel_sql::SegmentPin` costs about 250 B plus base64, so the 2,000-segment
 //! admission ceiling of D6 mints a token of several hundred KiB: past the
 //! cursor's own 4 KiB bound in the envelope, and past the whole 256 KiB
-//! response floor. Evidence references are unchanged and keep that per-pin
-//! codec, which is why this module still converts a `FlightTicketError`.
+//! response floor.
 //!
 //! # The D5 wrong-tenant rule
 //!
@@ -125,7 +124,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ravel_query::erasure::ErasurePredicate;
-use ravel_sql::{DeclaredColumn, DeclaredType, FlightTicketError};
+use ravel_sql::{DeclaredColumn, DeclaredType};
 use ravel_types::{CommitToken, Signal, TenantHash};
 
 /// Length in bytes of the trailing keyed-MAC tag.
@@ -983,20 +982,6 @@ impl<'a> ByteReader<'a> {
 
     fn read_u32(&mut self) -> Result<u32, CursorError> {
         Ok(u32::from_le_bytes(self.read_array::<4>()?))
-    }
-}
-
-impl From<FlightTicketError> for CursorError {
-    /// The pin codec's encode-side length refusal is this codec's own; every
-    /// other variant is a decode failure, which is [`CursorError::Invalid`].
-    fn from(error: FlightTicketError) -> Self {
-        match error {
-            FlightTicketError::FieldTooLong(len) => CursorError::FieldTooLong {
-                len,
-                max: u32::MAX as usize,
-            },
-            _ => CursorError::Invalid,
-        }
     }
 }
 

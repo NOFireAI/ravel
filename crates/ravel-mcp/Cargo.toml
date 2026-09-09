@@ -18,7 +18,7 @@ ravel-query = { workspace = true }
 # the `ravel-mcp` member and the `rmcp` workspace dependency to the root
 # manifest, so this follows the same path-dependency convention
 # services/ravel-server and services/ravel-cli already use.
-ravel-sql = { path = "../ravel-sql", version = "0.15.0", features = ["pin-codec"] }
+ravel-sql = { path = "../ravel-sql", version = "0.15.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 schemars = { workspace = true }
@@ -27,9 +27,7 @@ blake3 = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-# Only the cursor round-trip test names this: it builds a `SegmentPin` with
-# every field non-default, which means a non-nil `Uuid`. The pin's
-# `SegmentLevel` comes from `ravel_sql`, which re-exports it beside
-# `SegmentPin`, so no `ravel-catalog` dependency is needed here.
+# Only the cursor tests name this: a `CommitToken`'s `writer_id` is a `Uuid`,
+# and they build tokens with every field non-default.
 uuid = { workspace = true }
 proptest = { workspace = true }
