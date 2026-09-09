@@ -392,8 +392,12 @@ e2e() {
   local fx="${E2E_DIR}/fx"
   rm -rf "${fx}"
   mkdir -p "${fx}"
-  printf '{"state":"OPEN","mergeStateStatus":"CLEAN","statusCheckRollup":[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}],"headRefOid":"%s"}\n' \
-    "${SHA}" >"${fx}/pr-view.json"
+  local rollup="${E2E_ROLLUP:-}"
+  if [[ -z "${rollup}" ]]; then
+    rollup='[{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]'
+  fi
+  printf '{"state":"OPEN","mergeStateStatus":"CLEAN","statusCheckRollup":%s,"headRefOid":"%s"}\n' \
+    "${rollup}" "${SHA}" >"${fx}/pr-view.json"
   printf '[{"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED","commit_id":"%s","body":%s}]\n' \
     "${SHA}" "${review_body}" >"${fx}/reviews.json"
   printf '%s\n' "${E2E_ISSUE_COMMENTS:-${FRESH_WALKTHROUGH}}" >"${fx}/issue-comments.json"
@@ -710,6 +714,42 @@ guard_noarg_rc=0
 check_eq "the guard exits 2 when given no argument at all" \
   "2" \
   "${guard_noarg_rc}"
+
+# --- skipped checks are not passes -------------------------------------
+#
+# A path-filtered pull request (a docs-only change, say) comes back with every
+# required check COMPLETED/SKIPPED. GitHub treats that as satisfying the
+# ruleset, so the merge is allowed and nothing here should block it -- but
+# folding those into the pass count reported "19 pass" for a pull request on
+# which nothing ran, which is what an operator reads as "the suite covered
+# this change".
+
+E2E_ROLLUP='[{"name":"check","status":"COMPLETED","conclusion":"SKIPPED"},{"name":"lint","status":"COMPLETED","conclusion":"SKIPPED"}]'
+all_skipped_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ROLLUP
+
+check_eq "all checks skipped: counted as skipped, not as passes" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=0 pass/0 pending/0 fail/2 skipped | CodeRabbit: risk_line=head reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${all_skipped_out}" | sed -n 1p)"
+check_eq "all checks skipped: the verdict does not claim CI green" \
+  "  -> clean: every check skipped, nothing ran, CodeRabbit's risk line names the current head with zero inline comments" \
+  "$(printf '%s\n' "${all_skipped_out}" | sed -n 2p)"
+check_eq "all checks skipped: the merge command is still offered" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "$(printf '%s\n' "${all_skipped_out}" | sed -n 3p)"
+
+# The mirror: one real pass beside one skip still says CI green, so the case
+# above is not passing because the phrase changed unconditionally.
+E2E_ROLLUP='[{"name":"check","status":"COMPLETED","conclusion":"SUCCESS"},{"name":"k8s","status":"COMPLETED","conclusion":"SKIPPED"}]'
+mixed_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ROLLUP
+
+check_eq "one pass beside one skip: both counted, separately" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail/1 skipped | CodeRabbit: risk_line=head reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${mixed_out}" | sed -n 1p)"
+check_eq "one pass beside one skip: the verdict still says CI green" \
+  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
+  "$(printf '%s\n' "${mixed_out}" | sed -n 2p)"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
