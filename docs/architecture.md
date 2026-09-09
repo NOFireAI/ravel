@@ -107,7 +107,15 @@ depends on store reachability, so a store outage cannot get healthy processes
 killed. `/readyz` gates on completed startup and then follows a background
 store probe with asymmetric hysteresis: four consecutive probe failures flip
 it to 503 and one success recovers it, and the kubelet path reads an
-in-memory atomic rather than touching the store. `/metrics` is the third
+in-memory atomic rather than touching the store. On SIGTERM this same
+`/readyz` is the drain signal: the process flips it to 503 first and waits a
+short settle interval so a probe observes the 503 while the listeners are
+still open, then closes them and flushes every ingest shard actor (metrics,
+logs, and spans) and stops the background tasks, deleting its distributed
+query heartbeat record on the way out. The whole drain is bounded by
+`--shutdown-timeout` (default 25s, deliberately below the Kubernetes pod grace
+period), so a wedged flush cannot hold the process past a SIGKILL. `/metrics`
+is the third
 unconditional route, rendering a fixed and deliberately small label set so
 Ravel's own telemetry cannot explode
 ([guides/observability.md](guides/observability.md)).
