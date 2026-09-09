@@ -433,7 +433,8 @@ impl Catalog {
                 // back to the first read's if the re-read validated under the
                 // passed-in view.
                 let revalidated = fresh_revalidated.or(revalidated);
-                let refs = parts_intersecting(&fresh_head.parts, window_start_hour, window_end_hour);
+                let refs =
+                    parts_intersecting(&fresh_head.parts, window_start_hour, window_end_hour);
                 match self.load_snapshot_parts(tenant, &refs, accounting).await {
                     PartLoadOutcome::Loaded(parts) => {
                         let postings = if want_postings {
