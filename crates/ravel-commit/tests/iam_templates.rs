@@ -155,6 +155,152 @@ fn glob_matches(pattern: &str, candidate: &str) -> bool {
     glob_to_regex(pattern).is_match(candidate)
 }
 
+// ---------------------------------------------------------------------------
+// The action vocabulary. One predicate (`action_grants`) and one operation list
+// per axis; every axis in this file routes through them.
+// ---------------------------------------------------------------------------
+
+/// The S3 operations these guards reason about that act on an OBJECT, so a
+/// statement granting one must name bucket-relative object ARNs.
+const S3_OBJECT_OPERATIONS: [&str; 4] = [
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:DeleteObjectVersion",
+];
+
+/// The S3 operations these guards reason about that act on the BUCKET, so a
+/// statement granting one must name the bare bucket ARN. `s3:ListBucket` is the
+/// only one: it is what `list_prefix_patterns` reads an `s3:prefix` Condition
+/// for, and what the Condition-presence rule keys on.
+const S3_BUCKET_OPERATIONS: [&str; 1] = ["s3:ListBucket"];
+
+/// The S3 operations that destroy a stored object. A subset of
+/// `S3_OBJECT_OPERATIONS` (pinned by `operation_vocabulary_is_consistent`), kept
+/// separate because the delete axis selects on exactly these.
+const S3_DELETE_OPERATIONS: [&str; 2] = ["s3:DeleteObject", "s3:DeleteObjectVersion"];
+
+/// The KMS operations that mint a data key, i.e. that let the holder produce new
+/// ciphertext under a tenant key. `write_roles_have_kms_generate_data_key` and
+/// `roles_writing_routed_objects_have_kms_grant` require one; ADR-0055 forbids
+/// admin any of them (`admin_has_no_kms_generate_data_key`). All four spellings
+/// are listed so the negative assertion cannot be evaded by granting a variant.
+const KMS_DATA_KEY_OPERATIONS: [&str; 4] = [
+    "kms:GenerateDataKey",
+    "kms:GenerateDataKeyWithoutPlaintext",
+    "kms:GenerateDataKeyPair",
+    "kms:GenerateDataKeyPairWithoutPlaintext",
+];
+
+/// The remaining KMS operations these guards reason about.
+const KMS_OTHER_OPERATIONS: [&str; 2] = ["kms:Decrypt", "kms:Encrypt"];
+
+/// The single action predicate every axis in this file goes through: does the
+/// policy string `action` (possibly an IAM wildcard pattern, in whatever case
+/// the template spells it) grant `operation` (a literal IAM operation name)?
+///
+/// IAM action names are case-insensitive and resolve two wildcards, `*` (any
+/// sequence) and `?` (exactly one character), so `"*"`, `"s3:*"`, `"s3:Delete*"`
+/// and `"S3:DELETEOBJECT"` all grant `s3:DeleteObject`. Before this predicate
+/// existed each axis carried its own matcher and only the delete axis resolved
+/// wildcards, so `"Action": "s3:*"` granted PutObject and ListBucket while being
+/// selected by neither -- and the Condition-presence rule, which keys on the
+/// list grant, never fired either (issue #1346, H3). There is now one place that
+/// decides, so no axis can be wildcard-aware while another is not.
+///
+/// The asymmetry is deliberate and asserted: the wildcard lives on the policy
+/// side. An `operation` carrying `*` or `?` is a caller bug, not a pattern to
+/// resolve, because a wildcarded operation would make the predicate answer a
+/// question no axis asked.
+fn action_grants(action: &str, operation: &str) -> bool {
+    assert!(
+        !operation.contains(IAM_WILDCARDS),
+        "action_grants takes a literal IAM operation name, not a pattern: {operation:?}"
+    );
+    let action = action.to_ascii_lowercase();
+    let operation = operation.to_ascii_lowercase();
+    if action == operation {
+        return true;
+    }
+    // Only a wildcard pattern grants beyond its own name: an unrelated literal
+    // action (`s3:DeleteObjectTagging`, `s3:DeleteBucket`) grants nothing else.
+    action.contains(IAM_WILDCARDS) && glob_matches(&action, &operation)
+}
+
+/// True when `action` grants at least one of `operations`.
+fn action_grants_any(action: &str, operations: &[&str]) -> bool {
+    operations.iter().any(|op| action_grants(action, op))
+}
+
+/// True when at least one of a statement's `actions` grants at least one of
+/// `operations`. Every axis's statement selection is this call.
+fn any_action_grants_any(actions: &[String], operations: &[&str]) -> bool {
+    actions.iter().any(|a| action_grants_any(a, operations))
+}
+
+/// True when `action` grants any KMS operation these guards reason about, so the
+/// statement carrying it is a KMS statement whose `Resource` the KMS resource
+/// guards own. This replaces the old case-folded `kms:` prefix test, which a
+/// wildcard action (`"*"`, `"kms:*"`) slipped past.
+fn action_selects_kms(action: &str) -> bool {
+    action_grants_any(action, &KMS_OTHER_OPERATIONS)
+        || action_grants_any(action, &KMS_DATA_KEY_OPERATIONS)
+}
+
+// ---------------------------------------------------------------------------
+// The resource vocabulary. `classify_resource` is the only place a `Resource`
+// string is interpreted; the choke point and every helper share it, so a shape
+// cannot be understood in one and dropped in the other.
+// ---------------------------------------------------------------------------
+
+/// The ARN service prefix of a KMS key resource.
+const KMS_ARN_PREFIX: &str = "arn:aws:kms:";
+
+/// What a `Resource` string names, as far as the guards in this file are
+/// concerned. `Unclassified` is not a fourth kind of resource: it is the shape
+/// `validate_statement` rejects, so no helper downstream ever has to decide what
+/// to do with one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceShape<'a> {
+    /// An object ARN under the configured bucket; carries the bucket-relative
+    /// key pattern (always non-empty).
+    ObjectKey(&'a str),
+    /// Exactly the bare bucket ARN: what an `s3:ListBucket` grant names.
+    Bucket,
+    /// A KMS key ARN.
+    KmsKey,
+    /// Anything else, including every shape issue #1346 H1 lists: an S3
+    /// access-point ARN (`arn:aws:s3:<region>:<account>:accesspoint/...`), an
+    /// Object Lambda ARN (`arn:aws:s3-object-lambda:...`), a multi-region access
+    /// point (`arn:aws:s3::<account>:accesspoint/...`), the everything-grant
+    /// `arn:*`, the bare `"*"`, another bucket's ARN, and a malformed non-ARN
+    /// such as `my-ravel-bucket/*`.
+    Unclassified,
+}
+
+/// Classify one `Resource` string. Total: every string lands in exactly one
+/// shape, and everything the guards cannot reason about lands in `Unclassified`
+/// rather than being returned as "nothing to check".
+///
+/// The bucket-relative arm requires a NON-EMPTY key pattern:
+/// `arn:aws:s3:::my-ravel-bucket/` names the object with the empty key, which no
+/// key constructor produces and no guard has a pattern for, so it is
+/// unclassified rather than an `ObjectKey("")` that matches nothing.
+fn classify_resource(resource: &str) -> ResourceShape<'_> {
+    match resource.strip_prefix(BUCKET_KEY_PREFIX) {
+        Some(key) if !key.is_empty() => return ResourceShape::ObjectKey(key),
+        _ => {}
+    }
+    if resource == BUCKET_ARN {
+        return ResourceShape::Bucket;
+    }
+    if resource.starts_with(KMS_ARN_PREFIX) {
+        return ResourceShape::KmsKey;
+    }
+    ResourceShape::Unclassified
+}
+
+#[derive(Debug)]
 struct Policy {
     role: &'static str,
     statements: serde_json::Value,
@@ -162,8 +308,8 @@ struct Policy {
 
 /// The complete set of statement keys any guard in this file reads. Sid,
 /// Effect, Action, and Resource are read directly (see `statement_actions`,
-/// `resource_key_patterns`, `delete_key_patterns`, `kms_statement_resources`,
-/// ...); Condition is read for the `s3:prefix` ListBucket block
+/// `statement_resources`, `key_patterns_for`, `kms_statement_resources`, ...);
+/// Condition is read for the `s3:prefix` ListBucket block
 /// (`list_prefix_patterns`). Nothing else is examined by any guard.
 ///
 /// This list is the guard's contract: a statement carrying any key outside it
@@ -202,8 +348,51 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 /// unhandled shape is rejected once here instead of slipping past a guard that
 /// only reads the fields it happens to know.
 ///
-/// Rejects, naming the `Sid` and the offending key or field:
+/// # The closure argument
+///
+/// Every earlier round of this guard fixed one hole and left another, because
+/// each helper decided for itself which shapes it understood and answered "no
+/// resources to check" for the rest. The fix is structural: ALL shape decisions
+/// happen here, and the helpers are total functions over the shapes that got
+/// through. Concretely, a statement reaching any guard has:
+///
+/// - a present string `Sid`, so every message can name it;
+/// - only keys in `HANDLED_STATEMENT_KEYS`, so no permission lives in a field no
+///   guard reads (`NotAction`/`NotResource`/`Principal` are rejected by name);
+/// - an `Effect` of `Allow` or `Deny`, so the effect-filtered axes partition it;
+/// - an `Action` that is a string or non-empty array of strings, EVERY element of
+///   which grants at least one operation in the vocabulary
+///   (`S3_OBJECT_OPERATIONS`, `S3_BUCKET_OPERATIONS`, `KMS_OTHER_OPERATIONS`,
+///   `KMS_DATA_KEY_OPERATIONS`), decided by the one predicate `action_grants`;
+/// - a `Resource` that is a string or non-empty array of strings, EVERY element
+///   of which `classify_resource` places in `ObjectKey`, `Bucket`, or `KmsKey`
+///   -- never `Unclassified`;
+/// - for each granted operation class, at least one resource of the matching
+///   shape, and no resource of a shape whose class the statement does not grant.
+///   So an object grant carries only bucket-relative object ARNs, a list grant
+///   carries the bare bucket ARN, a KMS grant carries only `arn:aws:kms:` ARNs,
+///   and the normal mixed idiom (ListBucket + GetObject over the bucket ARN plus
+///   an object prefix) is accepted because both classes are granted;
+/// - a `Condition` exactly when the Action grants a list operation, whose
+///   sub-shape is the one `StringLike`/`s3:prefix` block
+///   `list_prefix_patterns` reads.
+///
+/// A helper downstream can therefore no longer meet a shape it does not
+/// understand. `object_key_patterns` matches all four `ResourceShape` variants:
+/// it strips `ObjectKey`, skips `Bucket` and `KmsKey` because this function
+/// proved the same statement grants the list or KMS operation whose own guard
+/// reads that exact string, and panics on `Unclassified` because this function
+/// rejects it. Each remaining `continue` in a helper is axis selection ("this
+/// statement grants no operation on my axis"), never a shape skip: the coverage
+/// rule above means every statement is selected by at least one axis, and that
+/// axis sees every resource it carries.
+///
+/// Rejects, naming the `Sid` (and the statement index) and the offending key or
+/// field:
 /// - a statement that is not a JSON object;
+/// - a missing or non-string `Sid` (`"Sid": 123`): Sid is in the handled set,
+///   but its type went unchecked pre-fix and the `<no Sid>` fallback then named
+///   nothing (issue #1346, F3);
 /// - `NotAction`/`NotResource`/`NotPrincipal`/`Principal` (negated or
 ///   principal-scoped: the guard cannot reason about them);
 /// - any other key outside `HANDLED_STATEMENT_KEYS` (e.g. a `Resources` typo);
@@ -214,36 +403,70 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 /// - a missing `Resource` key (the exact shape #1346 records being skipped:
 ///   the resource guards read `stmt["Resource"]`, find `Null`, and drop the
 ///   statement as having nothing to check);
+/// - an `Action` element that grants no operation in the vocabulary, so no axis
+///   would select the statement (H3);
+/// - a `Resource` element `classify_resource` cannot place, quoting the value:
+///   an S3 access-point or Object Lambda or multi-region-access-point ARN, the
+///   everything-grant `arn:*`, the bare `"*"`, another bucket's ARN, or a
+///   malformed non-ARN such as `my-ravel-bucket/*` (H1);
+/// - a `Resource` whose shape belongs to an operation class the statement does
+///   not grant (an `s3:ListBucket` on an object ARN, an `s3:GetObject` on the
+///   bare bucket ARN, a KMS ARN on a statement granting no KMS operation), and
+///   conversely a granted class with no resource of its shape (an
+///   `s3:ListBucket` that names no bucket ARN -- the H2 hole, where round
+///   three's list-only exemption left a list statement's Resource read by
+///   nothing at all);
+/// - a Condition whose presence does not track the ListBucket action: a
+///   ListBucket statement with no Condition (an unconstrained bucket-wide list),
+///   or a Condition on any non-ListBucket statement (read by no guard) (F2);
 /// - a `Condition` whose sub-shape is anything other than the one block a guard
-///   reads: it must be a JSON object of handled operators
-///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike`), each mapping handled
-///   condition keys (`HANDLED_CONDITION_KEYS`, today `s3:prefix`) to a string or
-///   non-empty array of strings. A different operator, a set-qualified operator,
-///   or an unhandled key is a constraint `list_prefix_patterns` never reads, so
-///   it fails closed here rather than contributing nothing silently.
+///   reads: it must be a non-empty JSON object of handled operators
+///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike`), each a non-empty map of
+///   handled condition keys (`HANDLED_CONDITION_KEYS`, today `s3:prefix`) to a
+///   string or non-empty array of strings. A different operator, a set-qualified
+///   operator, an unhandled key, or an empty `{}`/`{"StringLike":{}}` (which
+///   constrains nothing) is a shape `list_prefix_patterns` cannot read, so it
+///   fails closed here rather than contributing nothing silently.
 fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Result<(), String> {
     let obj = stmt
         .as_object()
         .ok_or_else(|| format!("{role}: statement #{index} is not a JSON object: {stmt:?}"))?;
-    let sid = obj
-        .get("Sid")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<no Sid>");
+
+    // Sid must be a present string. Every rejection below quotes it, and every
+    // guard's own failure message names it; a missing Sid, or a non-string
+    // `"Sid": 123`, was accepted pre-fix through the `<no Sid>` fallback (Sid is
+    // in the handled set but its type was never checked), leaving a statement
+    // whose rejections could name nothing (issue #1346, F3).
+    let sid = match obj.get("Sid") {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(other) => {
+            return Err(format!(
+                "{role}: statement #{index} has a non-string Sid: {other:?} -- Sid is a \
+                 handled key and must be a string so every rejection can name it"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "{role}: statement #{index} has no Sid -- Sid is required so every \
+                 rejection names the statement it rejects"
+            ));
+        }
+    };
 
     for key in obj.keys() {
         if NEGATED_OR_PRINCIPAL_KEYS.contains(&key.as_str()) {
             return Err(format!(
-                "{role}/{sid}: statement uses {key:?}; the guards in this file \
-                 cannot reason about negated or principal-scoped statements \
-                 (they read only the positive Action/Resource sets), so a policy \
-                 carrying it must be rejected rather than silently passed"
+                "{role}/{sid} (statement #{index}): statement uses {key:?}; the guards \
+                 in this file cannot reason about negated or principal-scoped \
+                 statements (they read only the positive Action/Resource sets), so a \
+                 policy carrying it must be rejected rather than silently passed"
             ));
         }
         if !HANDLED_STATEMENT_KEYS.contains(&key.as_str()) {
             return Err(format!(
-                "{role}/{sid}: statement uses key {key:?}, which no guard in this \
-                 file handles (handled keys: {HANDLED_STATEMENT_KEYS:?}); it must \
-                 fail closed rather than sit unexamined"
+                "{role}/{sid} (statement #{index}): statement uses key {key:?}, which no \
+                 guard in this file handles (handled keys: {HANDLED_STATEMENT_KEYS:?}); it \
+                 must fail closed rather than sit unexamined"
             ));
         }
     }
@@ -252,14 +475,16 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
         Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => {}
         other => {
             return Err(format!(
-                "{role}/{sid}: Effect is neither \"Allow\" nor \"Deny\": {other:?}"
+                "{role}/{sid} (statement #{index}): Effect is neither \"Allow\" nor \
+                 \"Deny\": {other:?}"
             ));
         }
     }
 
     if !is_string_or_string_array(obj.get("Action")) {
         return Err(format!(
-            "{role}/{sid}: Action is neither a string nor an array of strings: {:?}",
+            "{role}/{sid} (statement #{index}): Action is neither a string nor a \
+             non-empty array of strings: {:?}",
             obj.get("Action")
         ));
     }
@@ -267,66 +492,265 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     match obj.get("Resource") {
         None => {
             return Err(format!(
-                "{role}/{sid}: statement has no Resource key -- a statement with no \
-                 Resource is the exact shape the resource guards skip (they read \
-                 stmt[\"Resource\"], find Null, and treat it as nothing to check)"
+                "{role}/{sid} (statement #{index}): statement has no Resource key -- a \
+                 statement with no Resource is the exact shape the resource guards skip \
+                 (they read stmt[\"Resource\"], find Null, and treat it as nothing to \
+                 check)"
             ));
         }
         resource if !is_string_or_string_array(resource) => {
             return Err(format!(
-                "{role}/{sid}: Resource is neither a string nor a non-empty array \
-                 of strings: {resource:?}"
+                "{role}/{sid} (statement #{index}): Resource is neither a string nor a \
+                 non-empty array of strings: {resource:?}"
             ));
         }
         _ => {}
     }
 
-    if let Some(condition) = obj.get("Condition") {
-        validate_condition(role, sid, condition)?;
+    // Both shape checks above have passed, so `statement_actions` and
+    // `statement_resources` now return exactly what the policy declares.
+    let actions = statement_actions(stmt);
+    let resources = statement_resources(stmt);
+    validate_actions_and_resources(role, sid, index, &actions, &resources)?;
+
+    // Condition presence must track the list action. `list_prefix_patterns`
+    // is the only Condition reader and only reads one when the Action grants
+    // s3:ListBucket, so:
+    //  - a list statement MUST carry a Condition (an unconstrained bucket-wide
+    //    list is rejected, exactly like a missing Resource), and
+    //  - a non-list statement must carry NONE (a Condition there is read by no
+    //    guard: a StringLike/s3:prefix on the protected-delete Deny would pass
+    //    validation while, in AWS, a DeleteObject request carries no s3:prefix
+    //    context key, so the Deny never fires and protects nothing).
+    // (issue #1346, F2)
+    //
+    // The list grant is decided by `action_grants`, the same predicate every
+    // other axis uses, so `"Action": "s3:*"` -- which grants ListBucket -- is
+    // required to carry a Condition here too. Under round three's exact-name
+    // detection it was not, and `list_prefix_patterns` then read nothing from it
+    // (issue #1346, H3).
+    let grants_list = any_action_grants_any(&actions, &S3_BUCKET_OPERATIONS);
+    match obj.get("Condition") {
+        Some(condition) => {
+            if !grants_list {
+                return Err(format!(
+                    "{role}/{sid} (statement #{index}): statement carries a Condition but \
+                     its Action does not include s3:ListBucket -- only the ListBucket \
+                     s3:prefix Condition is read by any guard, so a Condition on any other \
+                     statement sits unexamined and must fail closed"
+                ));
+            }
+            validate_condition(role, sid, index, condition)?;
+        }
+        None => {
+            if grants_list {
+                return Err(format!(
+                    "{role}/{sid} (statement #{index}): s3:ListBucket statement carries no \
+                     Condition -- an unconstrained bucket-wide list must be rejected, the \
+                     same as a missing Resource; it must carry a non-empty \
+                     StringLike/s3:prefix Condition"
+                ));
+            }
+        }
     }
 
     Ok(())
 }
 
+/// The Action/Resource half of the choke point: every action must grant an
+/// operation in the vocabulary, and every resource must have a shape that some
+/// granted operation class asks for, with no granted class left without one.
+///
+/// This is what makes the resource helpers total. Round three put the same
+/// question inside `bucket_relative_s3_pattern`, which meant each helper decided
+/// on its own which resources it understood, and everything else came back as
+/// "nothing to check": an access-point ARN, an Object Lambda ARN, `arn:*` and a
+/// malformed `my-ravel-bucket/*` were all real S3 object grants reaching outside
+/// the bucket and all silently dropped (H1), and the list-only exemption added to
+/// keep the bare bucket ARN from tripping the strip left list statements'
+/// Resource examined by nothing at all (H2). Asking it here instead answers it
+/// once, for every axis, before any helper runs.
+///
+/// The three classes are independent, so a statement granting several carries the
+/// resources of each. That is what makes the normal IAM idiom -- one statement
+/// granting `s3:ListBucket` and `s3:GetObject` over the bucket ARN plus an object
+/// prefix -- valid rather than a rejection with a misleading reason.
+fn validate_actions_and_resources(
+    role: &str,
+    sid: &str,
+    index: usize,
+    actions: &[String],
+    resources: &[&str],
+) -> Result<(), String> {
+    for action in actions {
+        let known = action_grants_any(action, &S3_OBJECT_OPERATIONS)
+            || action_grants_any(action, &S3_BUCKET_OPERATIONS)
+            || action_selects_kms(action);
+        if !known {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): Action {action:?} grants no operation \
+                 any guard in this file reasons about (S3 object {S3_OBJECT_OPERATIONS:?}, \
+                 S3 bucket {S3_BUCKET_OPERATIONS:?}, KMS {KMS_OTHER_OPERATIONS:?} + \
+                 {KMS_DATA_KEY_OPERATIONS:?}) -- no axis would select this statement, so \
+                 its Resource would sit unexamined"
+            ));
+        }
+    }
+
+    let grants_object = any_action_grants_any(actions, &S3_OBJECT_OPERATIONS);
+    let grants_list = any_action_grants_any(actions, &S3_BUCKET_OPERATIONS);
+    let grants_kms = actions.iter().any(|a| action_selects_kms(a));
+
+    let mut saw_object = false;
+    let mut saw_bucket = false;
+    let mut saw_kms = false;
+    for resource in resources {
+        match classify_resource(resource) {
+            ResourceShape::ObjectKey(_) => {
+                if !grants_object {
+                    return Err(format!(
+                        "{role}/{sid} (statement #{index}): Resource {resource:?} names an \
+                         object under {BUCKET_ARN:?}, but the statement's Action \
+                         {actions:?} grants no S3 object operation \
+                         ({S3_OBJECT_OPERATIONS:?}) -- an object ARN on a statement that \
+                         cannot act on an object is a shape no axis reads"
+                    ));
+                }
+                saw_object = true;
+            }
+            ResourceShape::Bucket => {
+                if !grants_list {
+                    return Err(format!(
+                        "{role}/{sid} (statement #{index}): Resource {resource:?} is the \
+                         bare bucket ARN, but the statement's Action {actions:?} grants no \
+                         S3 bucket operation ({S3_BUCKET_OPERATIONS:?}) -- an S3 object \
+                         operation must name a bucket-relative object ARN, not the bucket"
+                    ));
+                }
+                saw_bucket = true;
+            }
+            ResourceShape::KmsKey => {
+                if !grants_kms {
+                    return Err(format!(
+                        "{role}/{sid} (statement #{index}): Resource {resource:?} is a KMS \
+                         key ARN, but the statement's Action {actions:?} grants no KMS \
+                         operation -- the KMS resource guards select on the action, so this \
+                         ARN would be checked by nothing"
+                    ));
+                }
+                saw_kms = true;
+            }
+            ResourceShape::Unclassified => {
+                return Err(format!(
+                    "{role}/{sid} (statement #{index}): Resource {resource:?} is neither \
+                     bucket-relative to {BUCKET_ARN:?}, nor exactly that bucket ARN, nor \
+                     an {KMS_ARN_PREFIX:?} key ARN -- an access-point or Object Lambda or \
+                     multi-region-access-point ARN, \"*\", \"arn:*\", another bucket, or a \
+                     malformed non-ARN grants access no guard in this file can check, so \
+                     it must fail closed rather than be dropped as nothing to check \
+                     (issue #1346, H1)"
+                ));
+            }
+        }
+    }
+
+    if grants_object && !saw_object {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Action {actions:?} grants an S3 object \
+             operation but Resource {resources:?} names no object under {BUCKET_ARN:?} -- \
+             the object axis would derive an empty pattern set and skip the statement"
+        ));
+    }
+    if grants_list && !saw_bucket {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Action {actions:?} grants an S3 bucket \
+             operation but Resource {resources:?} is not the bare bucket ARN \
+             {BUCKET_ARN:?} -- a list grant on any other resource enumerates a bucket this \
+             file models nothing about, and round three's list-only exemption left exactly \
+             this shape read by no guard (issue #1346, H2)"
+        ));
+    }
+    if grants_kms && !saw_kms {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Action {actions:?} grants a KMS operation \
+             but Resource {resources:?} names no {KMS_ARN_PREFIX:?} key ARN -- \
+             kms_statement_resources would return an empty resource list and both KMS \
+             resource guards would examine nothing"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a statement's `Condition` sub-shape against the exact operators and
 /// keys the guards read (`HANDLED_CONDITION_OPERATORS` / `HANDLED_CONDITION_KEYS`).
-/// The Condition must be a JSON object; every operator in it must be handled;
-/// every key under a handled operator must be handled and map to a string or
-/// non-empty array of strings (the shape `list_prefix_patterns` reads). Anything
-/// else -- an unhandled operator such as `StringNotLike` or a set-qualified
-/// `ForAnyValue:StringLike`, an unhandled key such as `s3:delimiter`, or a
-/// non-object Condition -- is a constraint no guard reasons about and is rejected
-/// by name (issue #1346). Without this, a ListBucket statement carrying such a
-/// Condition passes validation and `list_prefix_patterns` then finds no
-/// `["StringLike"]["s3:prefix"]` array and silently contributes nothing.
-fn validate_condition(role: &str, sid: &str, condition: &serde_json::Value) -> Result<(), String> {
-    let cond_obj = condition
-        .as_object()
-        .ok_or_else(|| format!("{role}/{sid}: Condition is not a JSON object: {condition:?}"))?;
+/// The Condition must be a NON-EMPTY JSON object; every operator in it must be
+/// handled and map to a NON-EMPTY object; every key under a handled operator must
+/// be handled and map to a string or non-empty array of strings (the shape
+/// `list_prefix_patterns` reads). Anything else -- an unhandled operator such as
+/// `StringNotLike` or a set-qualified `ForAnyValue:StringLike`, an unhandled key
+/// such as `s3:delimiter`, a non-object Condition, or an empty `{}` /
+/// `{"StringLike": {}}` (a `for` over an empty map iterates zero times, so it used
+/// to return Ok and constrain nothing) -- is a shape no guard reasons about and is
+/// rejected by name (issue #1346, F2). Without this, a ListBucket statement
+/// carrying such a Condition passes validation and `list_prefix_patterns` then
+/// finds no `["StringLike"]["s3:prefix"]` array and silently contributes nothing.
+///
+/// A non-empty `StringLike` map whose every key is handled forces `s3:prefix` to
+/// be present (it is the only handled key), so no separate presence check is
+/// needed.
+fn validate_condition(
+    role: &str,
+    sid: &str,
+    index: usize,
+    condition: &serde_json::Value,
+) -> Result<(), String> {
+    let cond_obj = condition.as_object().ok_or_else(|| {
+        format!("{role}/{sid} (statement #{index}): Condition is not a JSON object: {condition:?}")
+    })?;
+    if cond_obj.is_empty() {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Condition is an empty object -- an empty \
+             Condition constrains nothing, so a ListBucket statement carrying it is an \
+             unconstrained bucket-wide list; it must be a non-empty StringLike/s3:prefix \
+             block (issue #1346, F2)"
+        ));
+    }
     for (operator, keys) in cond_obj {
         if !HANDLED_CONDITION_OPERATORS.contains(&operator.as_str()) {
             return Err(format!(
-                "{role}/{sid}: Condition uses operator {operator:?}, which no guard \
-                 in this file reads (handled operators: {HANDLED_CONDITION_OPERATORS:?}); \
-                 a different or set-qualified operator such as StringNotLike or \
-                 ForAnyValue:StringLike must fail closed rather than sit unexamined"
+                "{role}/{sid} (statement #{index}): Condition uses operator {operator:?}, \
+                 which no guard in this file reads (handled operators: \
+                 {HANDLED_CONDITION_OPERATORS:?}); a different or set-qualified operator \
+                 such as StringNotLike or ForAnyValue:StringLike must fail closed rather \
+                 than sit unexamined"
             ));
         }
         let key_obj = keys.as_object().ok_or_else(|| {
-            format!("{role}/{sid}: Condition operator {operator:?} is not a JSON object: {keys:?}")
+            format!(
+                "{role}/{sid} (statement #{index}): Condition operator {operator:?} is not a \
+                 JSON object: {keys:?}"
+            )
         })?;
+        if key_obj.is_empty() {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): Condition operator {operator:?} is an \
+                 empty object -- it must map s3:prefix to a non-empty value; an empty \
+                 operator map constrains nothing (issue #1346, F2)"
+            ));
+        }
         for (cond_key, value) in key_obj {
             if !HANDLED_CONDITION_KEYS.contains(&cond_key.as_str()) {
                 return Err(format!(
-                    "{role}/{sid}: Condition operator {operator:?} names key {cond_key:?}, \
-                     which no guard in this file reads (handled keys: {HANDLED_CONDITION_KEYS:?}); \
-                     it must fail closed rather than sit unexamined"
+                    "{role}/{sid} (statement #{index}): Condition operator {operator:?} names \
+                     key {cond_key:?}, which no guard in this file reads (handled keys: \
+                     {HANDLED_CONDITION_KEYS:?}); it must fail closed rather than sit \
+                     unexamined"
                 ));
             }
             if !is_string_or_string_array(Some(value)) {
                 return Err(format!(
-                    "{role}/{sid}: Condition {operator:?}.{cond_key:?} is neither a string \
-                     nor a non-empty array of strings: {value:?}"
+                    "{role}/{sid} (statement #{index}): Condition {operator:?}.{cond_key:?} is \
+                     neither a string nor a non-empty array of strings: {value:?}"
                 ));
             }
         }
@@ -377,40 +801,42 @@ fn build_policy(role: &'static str, source: &str, json: &serde_json::Value) -> P
     Policy { role, statements }
 }
 
-fn load_policy(role: &'static str) -> Policy {
-    let path = format!(
+/// The on-disk path of a shipped template.
+fn policy_json_path(role: &str) -> String {
+    format!(
         "{}/../../deploy/iam/{role}.json",
         env!("CARGO_MANIFEST_DIR")
-    );
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    )
+}
+
+fn load_policy(role: &'static str) -> Policy {
+    load_policy_from(role, &policy_json_path(role))
+}
+
+/// The real file-reading entry point: read the policy at `path`, parse it, and
+/// run the full per-statement validation through `build_policy`. `load_policy`
+/// is exactly this against the fixed `deploy/iam/{role}.json` paths; a
+/// regression test drives it with a synthetic invalid file so the validation is
+/// exercised through the entry point production uses, not only through
+/// `build_policy` (issue #1346, F4).
+fn load_policy_from(role: &'static str, path: &str) -> Policy {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let json: serde_json::Value =
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
-    build_policy(role, &path, &json)
-}
-
-/// IAM action names are case-insensitive: a statement granting
-/// `KMS:GenerateDataKey*` grants exactly what `kms:GenerateDataKey*` grants.
-/// Every action comparison in this file goes through this helper (or
-/// `action_has_prefix`), in both directions. A case-sensitive positive check
-/// only fails loudly, but a case-sensitive negative check reports a role
-/// unprivileged while it holds the grant.
-fn action_eq(action: &str, expected: &str) -> bool {
-    action.eq_ignore_ascii_case(expected)
-}
-
-/// Case-insensitive prefix match for action names, so `kms:GenerateDataKey`
-/// selects `KMS:GenerateDataKey*` too. Indexed with `get` rather than a slice
-/// so an action name whose bytes do not split on a char boundary at
-/// `prefix.len()` returns false instead of panicking.
-fn action_has_prefix(action: &str, prefix: &str) -> bool {
-    action
-        .get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    build_policy(role, path, &json)
 }
 
 /// Every action name in a statement's `Action` (a bare string or an array),
 /// with the policy's own capitalization preserved so a failure message quotes
 /// what the template actually says.
+///
+/// The `_ => Vec::new()` arm and the `filter_map` are unreachable for any
+/// statement that passed the choke point: `validate_statement` runs
+/// `is_string_or_string_array` on `Action` BEFORE calling this, so a non-string,
+/// a non-array, an empty array, and an array holding a non-string are all
+/// already rejected. The empty return survives only for the pre-fix fixtures,
+/// which call this on a raw `NotAction` statement precisely to pin that the
+/// action used to be invisible.
 fn statement_actions(stmt: &serde_json::Value) -> Vec<String> {
     match &stmt["Action"] {
         serde_json::Value::String(s) => vec![s.clone()],
@@ -422,21 +848,47 @@ fn statement_actions(stmt: &serde_json::Value) -> Vec<String> {
     }
 }
 
-/// `s3:prefix` patterns from every `s3:ListBucket` statement's
-/// `Condition.StringLike` block.
+/// Every resource string in a statement's `Resource` (a bare string or an
+/// array). Unreachable-arm justification is the same as `statement_actions`:
+/// `validate_statement` checks `Resource` with `is_string_or_string_array`
+/// before anything reads it.
+fn statement_resources(stmt: &serde_json::Value) -> Vec<&str> {
+    match &stmt["Resource"] {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A statement's `Sid`. Total for anything that passed the choke point, which
+/// requires a present string Sid so every message can name the statement it is
+/// about; the old `unwrap_or("<no Sid>")` fallback named nothing.
+fn statement_sid(stmt: &serde_json::Value) -> &str {
+    stmt["Sid"].as_str().expect(
+        "the choke point (validate_statement) requires a present string Sid, so any \
+         statement reaching a guard has one",
+    )
+}
+
+/// `s3:prefix` patterns from the `Condition.StringLike` block of every statement
+/// granting a list operation.
+///
+/// Selection goes through `action_grants`, so `"Action": "s3:*"` is read here
+/// too. Under round three's exact-name detection it was not, which is half of
+/// H3: an `s3:*` statement granted an unconstrained ListBucket while this
+/// function read nothing from it.
 fn list_prefix_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
-    for stmt in policy.statements.as_array().unwrap() {
-        let is_list = statement_actions(stmt)
-            .iter()
-            .any(|a| action_eq(a, "s3:ListBucket"));
-        if !is_list {
+    for stmt in policy_statements(policy) {
+        if !any_action_grants_any(&statement_actions(stmt), &S3_BUCKET_OPERATIONS) {
             continue;
         }
         // IAM allows a single `s3:prefix` value as a bare string or an array;
-        // read both so a bare-string prefix is not silently skipped (its shape
-        // is checked by validate_condition, which accepts both). Any other JSON
-        // shape here was already rejected at load_policy.
+        // read both so a bare-string prefix is not silently skipped. Any other
+        // shape is unreachable: the choke point requires a list statement to
+        // carry a non-empty StringLike/s3:prefix Condition whose value is a
+        // string or non-empty array of strings, so the panic arm fires only for
+        // a statement that never passed validation.
         match &stmt["Condition"]["StringLike"]["s3:prefix"] {
             serde_json::Value::String(s) => out.push(s.clone()),
             serde_json::Value::Array(patterns) => {
@@ -444,166 +896,146 @@ fn list_prefix_patterns(policy: &Policy) -> Vec<String> {
                     out.push(p.as_str().expect("s3:prefix entry is a string").to_string());
                 }
             }
-            _ => {}
+            other => panic!(
+                "{}/{}: list statement's Condition.StringLike.s3:prefix is {other:?} -- the \
+                 choke point requires a string or non-empty array of strings here, so \
+                 reaching this means a guard ran on an unvalidated statement",
+                policy.role,
+                statement_sid(stmt)
+            ),
         }
     }
     out
 }
 
-/// Resource-ARN key patterns (bucket prefix stripped) from every
-/// non-ListBucket statement (`GetObject`, `PutObject`, `DeleteObject`, ...).
-fn resource_key_patterns(policy: &Policy) -> Vec<String> {
-    let mut out = Vec::new();
-    for stmt in policy.statements.as_array().unwrap() {
-        let is_list_only = stmt["Action"]
-            .as_str()
-            .is_some_and(|a| action_eq(a, "s3:ListBucket"));
-        if is_list_only {
-            continue;
-        }
-        let resources = match &stmt["Resource"] {
-            serde_json::Value::Array(a) => a.clone(),
-            v @ serde_json::Value::String(_) => vec![v.clone()],
-            _ => continue,
-        };
-        for r in resources {
-            let r = r.as_str().expect("Resource entry is a string");
-            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
-                out.push(key_pattern.to_string());
-            }
-        }
-    }
-    out
+/// A policy's statement array. `Statement`-is-an-array is asserted by
+/// `build_policy` and `validate_policy_statements` before a `Policy` exists.
+fn policy_statements(policy: &Policy) -> &Vec<serde_json::Value> {
+    policy
+        .statements
+        .as_array()
+        .expect("a Policy's Statement is an array (checked by build_policy)")
 }
 
-/// Resource-ARN key patterns (bucket prefix stripped) from every statement
-/// whose `Action` grants `s3:PutObject` --- the writes that go through
-/// `KmsRoutingStore` and can select a per-tenant key. Delete/Get/Deny
-/// statements are excluded: they never route (reads and deletes delegate to
-/// the default store unconditionally, see `kms_routing.rs`).
-fn put_resource_key_patterns(policy: &Policy) -> Vec<String> {
-    let mut out = Vec::new();
-    for stmt in policy.statements.as_array().unwrap() {
-        let grants_put = statement_actions(stmt)
-            .iter()
-            .any(|a| action_eq(a, "s3:PutObject"));
-        if !grants_put {
-            continue;
-        }
-        let resources = match &stmt["Resource"] {
-            serde_json::Value::Array(a) => a.clone(),
-            v @ serde_json::Value::String(_) => vec![v.clone()],
-            _ => continue,
-        };
-        for r in resources {
-            let r = r.as_str().expect("Resource entry is a string");
-            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
-                out.push(key_pattern.to_string());
-            }
-        }
-    }
-    out
-}
-
-/// The literal S3 actions that delete a stored object, ASCII-folded. IAM action
-/// names are case-insensitive, so every comparison folds both sides.
-const DELETE_ACTION_NAMES: [&str; 2] = ["s3:deleteobject", "s3:deleteobjectversion"];
-
-/// True when an IAM `Action` grants (in an Allow) or withdraws (in a Deny) the
-/// capability to delete a stored object: one of the literal delete actions, or
-/// ANY IAM wildcard pattern (`*`/`?`) that matches one of them. This is the
-/// predicate the delete guard must use instead of an exact `s3:DeleteObject`
-/// match. `"*"`, `"s3:*"`, `"s3:Delete*"`, `"s3:DeleteObject*"`, and a
-/// mis-cased `"S3:DELETEOBJECT"` all grant the delete a bare-literal check
-/// misses, and missing one lets a delete-everywhere statement sit unexamined
-/// while the guard reports Admin scoped to the scratch prefix (issue #1372, the
-/// seventh instance of the skip-what-you-don't-recognize class #1346 tracks).
-fn action_is_delete_capable(action: &str) -> bool {
-    let folded = action.to_ascii_lowercase();
-    if DELETE_ACTION_NAMES.contains(&folded.as_str()) {
-        return true;
-    }
-    // Only a wildcard pattern can match beyond an exact name; a plain unrelated
-    // action (`s3:DeleteObjectTagging`, `s3:DeleteBucket`) is correctly not
-    // delete-capable. Fold before globbing so `S3:Delete*` is resolved too.
-    if folded.contains(IAM_WILDCARDS) {
-        return DELETE_ACTION_NAMES
-            .iter()
-            .any(|name| glob_matches(&folded, name));
-    }
-    false
-}
-
-/// Strip the configured bucket's object-ARN prefix from a delete statement's
-/// `Resource`, or fail the test naming the role, `Sid`, and resource. A
-/// delete-capable statement whose resource is `"*"`, names a different bucket,
-/// or is otherwise not bucket-relative grants (or denies) delete outside the
-/// configured bucket, and dropping it silently is the same mistake #1346
-/// records for `NotResource`: the entry you do not understand is exactly the
-/// one that must not vanish.
-fn require_bucket_relative_delete_resource(role: &str, sid: &str, resource: &str) -> String {
-    resource
-        .strip_prefix(BUCKET_KEY_PREFIX)
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            panic!(
-                "{role}/{sid}: delete-capable statement names resource {resource:?}, \
-                 which is not bucket-relative to {BUCKET_ARN:?} -- a delete grant or \
-                 deny on \"*\" or on another bucket reaches outside the configured \
-                 bucket and must not be silently dropped"
-            )
-        })
-}
-
-/// Resource key patterns (bucket prefix stripped) from every statement whose
-/// `Effect` is `effect` and whose `Action` is delete-capable (see
-/// `action_is_delete_capable`).
+/// The bucket-relative key patterns among one statement's `resources`.
 ///
-/// One function for both effects, because the two sides differ only in which
-/// `Effect` they select. The Resource-shape panic, the `Sid` fallback, and the
-/// bucket-relative requirement have to be identical on both, and a rule
-/// tightened on one copy and not the other is the failure this file keeps
-/// repeating.
+/// Total over `ResourceShape`, which is the point of the redesign: every arm is
+/// named and justified by a choke-point rule, so there is no catch-all that can
+/// quietly absorb a shape nobody thought about.
+///
+/// - `ObjectKey` is the pattern to check, returned.
+/// - `Bucket` contributes nothing to strip. Skipping it is safe because
+///   `validate_actions_and_resources` proved the same statement grants a list
+///   operation, and a list grant is checked on both counts: its Resource must be
+///   exactly this ARN, and its Condition must be the `s3:prefix` block
+///   `list_prefix_patterns` reads. This is the arm that makes the normal mixed
+///   ListBucket+GetObject idiom work without a misleading rejection, and round
+///   three's alternative -- exempting whole list statements at the caller --
+///   is what left list Resources read by nothing (H2).
+/// - `KmsKey` likewise: the choke point proved the statement grants a KMS
+///   operation, so `kms_statement_resources` selects it and both KMS resource
+///   guards run over this exact string.
+/// - `Unclassified` panics. The choke point rejects it, so reaching here means a
+///   guard ran on a statement that never passed validation (a synthetic fixture
+///   built straight from `Policy`), and the loud failure is the belt-and-braces
+///   half of the H1 fix.
+///
+/// What this does NOT close: a bucket-relative FULL-bucket grant
+/// `arn:aws:s3:::my-ravel-bucket/*` still passes. It strips to `"*"`, is not
+/// out-of-scope, and matches every representative key, so
+/// `every_in_scope_policy_pattern_matches_a_real_key_shape` -- which asserts a
+/// pattern matches AT LEAST ONE real key -- accepts it by construction: a
+/// coverage check cannot reject an over-broad pattern. Rejecting an in-bucket
+/// grant that is too wide is a separate guard, out of scope here.
+fn object_key_patterns(role: &str, sid: &str, resources: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for resource in resources {
+        match classify_resource(resource) {
+            ResourceShape::ObjectKey(key_pattern) => out.push(key_pattern.to_string()),
+            ResourceShape::Bucket | ResourceShape::KmsKey => {}
+            ResourceShape::Unclassified => panic!(
+                "{role}/{sid}: statement names resource {resource:?}, which is neither \
+                 bucket-relative to {BUCKET_ARN:?}, nor exactly that bucket ARN, nor an \
+                 {KMS_ARN_PREFIX:?} key ARN -- validate_statement rejects this shape, so \
+                 reaching here means a guard ran on an unvalidated statement (issue \
+                 #1346, H1)"
+            ),
+        }
+    }
+    out
+}
+
+/// Bucket-relative key patterns from every statement whose `Effect` matches
+/// `effect` (`None` matches any) and whose `Action` grants at least one of
+/// `operations`.
+///
+/// The single resource-collection loop every S3 axis uses. Round three had four
+/// near-copies of it (read, put, delete-Allow, delete-Deny) that differed in
+/// which actions they selected, whether the selection resolved wildcards, and
+/// what they did with a resource they could not strip; the read copy and the
+/// delete copy then disagreed about the bare bucket ARN, which is how the
+/// list-only exemption got added to one of them. There is now one loop, one
+/// action predicate, and one resource classifier.
+///
+/// The `continue`s are axis selection, not shape skips: "this statement grants
+/// no operation on my axis" and "this statement is the other Effect". The choke
+/// point's coverage rule guarantees every statement is selected by at least one
+/// axis, and whichever axis selects it sees every resource it carries.
+fn key_patterns_for(policy: &Policy, operations: &[&str], effect: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        if let Some(effect) = effect {
+            let has_effect = stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case(effect));
+            if !has_effect {
+                continue;
+            }
+        }
+        if !any_action_grants_any(&statement_actions(stmt), operations) {
+            continue;
+        }
+        out.extend(object_key_patterns(
+            policy.role,
+            statement_sid(stmt),
+            &statement_resources(stmt),
+        ));
+    }
+    out
+}
+
+/// Bucket-relative key patterns from every statement granting an S3 object
+/// operation (`GetObject`, `PutObject`, `DeleteObject`, ...), either Effect.
+///
+/// Selection is by grant, not by "not ListBucket": a list-only statement grants
+/// no object operation and is not selected, and a mixed ListBucket+GetObject
+/// statement IS selected and contributes its object patterns.
+fn resource_key_patterns(policy: &Policy) -> Vec<String> {
+    key_patterns_for(policy, &S3_OBJECT_OPERATIONS, None)
+}
+
+/// Bucket-relative key patterns from every statement whose `Action` grants
+/// `s3:PutObject` --- the writes that go through `KmsRoutingStore` and can
+/// select a per-tenant key. Delete/Get/Deny statements are excluded: they never
+/// route (reads and deletes delegate to the default store unconditionally, see
+/// `kms_routing.rs`).
+///
+/// `"Action": "s3:*"` grants PutObject and so is selected here, which round
+/// three's exact-name match missed (H3).
+fn put_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    key_patterns_for(policy, &["s3:PutObject"], None)
+}
+
+/// Bucket-relative key patterns from every statement whose `Effect` is `effect`
+/// and whose `Action` grants an S3 delete operation.
 ///
 /// `"Allow"` returns the delete capability a role actually holds. The
 /// `DenyDeleteProtected` block names delete actions too, but it withdraws
 /// capability rather than granting it (and an explicit IAM `Deny` always wins),
 /// so it is selected separately by `"Deny"`, which returns the keys that block
-/// protects (ADR-0055 §3). Either way a delete-capable statement whose Resource
-/// is not bucket-relative fails the test rather than being dropped: a Deny
-/// naming a delete on `"*"` would deny the qualification probe's own delete and
-/// one on another bucket protects nothing here.
+/// protects (ADR-0055 §3).
 fn delete_key_patterns(policy: &Policy, effect: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for stmt in policy.statements.as_array().unwrap() {
-        let has_effect = stmt["Effect"]
-            .as_str()
-            .is_some_and(|e| e.eq_ignore_ascii_case(effect));
-        if !has_effect {
-            continue;
-        }
-        let touches_delete = statement_actions(stmt)
-            .iter()
-            .any(|a| action_is_delete_capable(a));
-        if !touches_delete {
-            continue;
-        }
-        let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>");
-        let resources = match &stmt["Resource"] {
-            serde_json::Value::Array(a) => a.clone(),
-            v @ serde_json::Value::String(_) => vec![v.clone()],
-            other => panic!(
-                "{}/{sid}: delete-capable {effect} has a Resource that is neither a \
-                 string nor an array: {other:?}",
-                policy.role
-            ),
-        };
-        for r in resources {
-            let r = r.as_str().expect("Resource entry is a string");
-            out.push(require_bucket_relative_delete_resource(policy.role, sid, r));
-        }
-    }
-    out
+    key_patterns_for(policy, &S3_DELETE_OPERATIONS, Some(effect))
 }
 
 const ROLES_WITH_DISCOVERY: [&str; 3] = ["gateway", "query", "maintain"];
@@ -638,52 +1070,50 @@ const WRITE_ROLES: [&str; 3] = ["gateway", "maintain", "query"];
 /// `kms:*` action strings appearing anywhere in `policy`'s statements
 /// (`Action` as a bare string or an array), regardless of statement Sid.
 ///
-/// Selection is case-insensitive, so `KMS:GenerateDataKey*` is returned; the
-/// strings themselves keep the template's capitalization, so a caller's
-/// failure message shows what the policy said rather than a normalized form
-/// the operator would then grep for in vain. Callers compare with `action_eq`
-/// or `action_has_prefix` rather than against these strings directly.
+/// Selection goes through `action_selects_kms`, so `KMS:GenerateDataKey*` is
+/// returned and so is a wildcard action (`"*"`, `"kms:*"`) that grants a KMS
+/// operation without naming the service literally --- which the old case-folded
+/// `kms:` prefix test missed. The strings themselves keep the template's
+/// capitalization, so a caller's failure message shows what the policy said
+/// rather than a normalized form the operator would then grep for in vain.
+/// Callers ask `action_grants` what a returned string grants; none compares it
+/// literally.
 fn kms_actions(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
-    for stmt in policy.statements.as_array().unwrap() {
+    for stmt in policy_statements(policy) {
         out.extend(
             statement_actions(stmt)
                 .into_iter()
-                .filter(|a| action_has_prefix(a, "kms:")),
+                .filter(|a| action_selects_kms(a)),
         );
     }
     out
 }
 
-/// Sid and parsed `Resource` list for every statement carrying a `kms:`
-/// action. Both resource guards below go through this one selection rule, so
-/// a change to it cannot reach one guard and miss the other.
+/// Sid and KMS key ARNs for every statement granting a KMS operation. Both KMS
+/// resource guards below go through this one selection rule, so a change to it
+/// cannot reach one guard and miss the other.
 ///
-/// Panics on a `Resource` that is neither a string nor an array, as the
-/// guards did inline: a malformed template must fail the test rather than be
-/// skipped as "no resources to check".
+/// The returned resources are filtered to `ResourceShape::KmsKey`, so a mixed
+/// statement's S3 object ARNs are not handed to the KMS ARN-shape assertions
+/// (which would reject them for the wrong reason). Nothing is lost: the choke
+/// point proved a KMS-granting statement carries at least one KMS ARN, and any
+/// object ARN it also carries is read by the object axis.
 fn kms_statement_resources(policy: &Policy) -> Vec<(String, Vec<String>)> {
-    let role = policy.role;
     let mut out = Vec::new();
-    for stmt in policy.statements.as_array().unwrap() {
+    for stmt in policy_statements(policy) {
         if !statement_actions(stmt)
             .iter()
-            .any(|a| action_has_prefix(a, "kms:"))
+            .any(|a| action_selects_kms(a))
         {
             continue;
         }
-        let sid = stmt["Sid"].as_str().unwrap_or("<no Sid>").to_string();
-        let resources: Vec<String> = match &stmt["Resource"] {
-            serde_json::Value::String(s) => vec![s.clone()],
-            serde_json::Value::Array(a) => a
-                .iter()
-                .map(|v| v.as_str().expect("Resource entry is a string").to_string())
-                .collect(),
-            other => {
-                panic!("{role}/{sid}: Resource is neither a string nor an array: {other:?}")
-            }
-        };
-        out.push((sid, resources));
+        let resources: Vec<String> = statement_resources(stmt)
+            .into_iter()
+            .filter(|r| matches!(classify_resource(r), ResourceShape::KmsKey))
+            .map(str::to_string)
+            .collect();
+        out.push((statement_sid(stmt).to_string(), resources));
     }
     out
 }
@@ -704,7 +1134,7 @@ fn write_roles_have_kms_generate_data_key() {
         assert!(
             actions
                 .iter()
-                .any(|a| action_has_prefix(a, "kms:GenerateDataKey")),
+                .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
             "{role}: policy is missing kms:GenerateDataKey* -- its ingest/compaction/\
              catalog-fold PUTs under t/<hash>/... will fail closed against a \
              --tenant-kms-config tenant. Found kms actions: {actions:?}"
@@ -757,13 +1187,13 @@ fn roles_writing_routed_objects_have_kms_grant() {
         assert!(
             actions
                 .iter()
-                .any(|a| action_has_prefix(a, "kms:GenerateDataKey")),
+                .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
             "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
              kms:GenerateDataKey* -- those writes fail closed under \
              --tenant-kms-config. Found kms actions: {actions:?}"
         );
         assert!(
-            actions.iter().any(|a| action_eq(a, "kms:Encrypt")),
+            actions.iter().any(|a| action_grants(a, "kms:Encrypt")),
             "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
              kms:Encrypt -- those writes fail closed under --tenant-kms-config. \
              Found kms actions: {actions:?}"
@@ -784,7 +1214,7 @@ fn admin_has_no_kms_generate_data_key() {
     assert!(
         !actions
             .iter()
-            .any(|a| action_has_prefix(a, "kms:GenerateDataKey")),
+            .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
         "admin: policy must not carry kms:GenerateDataKey* (Decrypt-only per ADR-0055). \
          Found kms actions: {actions:?}"
     );
@@ -863,9 +1293,15 @@ fn admin_delete_grant_is_qualify_scratch_only() {
 /// pins the two holes existed independent of the fixed code: delete capability
 /// recognized only by an exact `s3:DeleteObject` match, and any resource not
 /// under the bucket prefix silently dropped (`if let Some(..)` with no `else`).
+///
+/// Every pre-fix body in this file spells its own comparisons out (here
+/// `eq_ignore_ascii_case`, below `strip_prefix` against a literal ARN) rather
+/// than calling a live helper: a pre-fix copy that reuses today's predicates
+/// stops proving the hole the moment those predicates change, which is how a
+/// fixture becomes a tautology.
 fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
-    for stmt in policy.statements.as_array().unwrap() {
+    for stmt in policy_statements(policy) {
         let is_allow = stmt["Effect"]
             .as_str()
             .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
@@ -874,7 +1310,7 @@ fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
         }
         let grants_delete = statement_actions(stmt)
             .iter()
-            .any(|a| action_eq(a, "s3:DeleteObject"));
+            .any(|a| a.eq_ignore_ascii_case("s3:DeleteObject"));
         if !grants_delete {
             continue;
         }
@@ -963,7 +1399,7 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
                 "Resource": resource,
             }]),
         };
-        let stmt = &policy.statements.as_array().unwrap()[0];
+        let stmt = &policy_statements(&policy)[0];
         let actions = statement_actions(stmt);
 
         // Observation 1 (load-bearing): the pre-fix helper returned no delete
@@ -981,16 +1417,18 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
         // ...pin WHY it was empty so the two holes stay distinguishable: either
         // the pre-fix exact match did not see a wildcard action, or it saw the
         // action but the silent drop discarded a non-bucket-relative resource.
-        let pre_fix_action_hit = actions.iter().any(|a| action_eq(a, "s3:DeleteObject"));
+        let pre_fix_action_hit = actions
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("s3:DeleteObject"));
         assert_eq!(
             pre_fix_action_hit, pre_fix_exact_recognizes,
             "fixture {sid} invalid: expected pre-fix exact action recognition = \
              {pre_fix_exact_recognizes} for {actions:?}"
         );
         assert!(
-            actions.iter().any(|a| action_is_delete_capable(a)),
-            "fixture {sid} invalid: post-fix action_is_delete_capable must \
-             recognize {actions:?} as a delete grant"
+            any_action_grants_any(&actions, &S3_DELETE_OPERATIONS),
+            "fixture {sid} invalid: the post-fix action predicate must recognize \
+             {actions:?} as a delete grant"
         );
 
         // Observation 2: the real guard fires on the synthetic policy --- either
@@ -1022,7 +1460,7 @@ fn every_role_has_kms_decrypt() {
         let policy = load_policy(role);
         let actions = kms_actions(&policy);
         assert!(
-            actions.iter().any(|a| action_eq(a, "kms:Decrypt")),
+            actions.iter().any(|a| action_grants(a, "kms:Decrypt")),
             "{role}: policy is missing kms:Decrypt -- its reads of SSE-KMS objects \
              under a --tenant-kms-config tenant will fail closed. \
              Found kms actions: {actions:?}"
@@ -1092,6 +1530,13 @@ fn no_kms_statement_grants_every_key_in_the_region() {
              would pass having examined nothing"
         );
         for (sid, resources) in statements {
+            assert!(
+                !resources.is_empty(),
+                "{role}/{sid}: statement grants a KMS operation but names no \
+                 {KMS_ARN_PREFIX:?} key ARN -- this guard would examine nothing \
+                 (validate_statement rejects the shape, so a shipped template reaching \
+                 here means the choke point was bypassed)"
+            );
             for resource in &resources {
                 assert_kms_resource_is_not_account_wide(role, &sid, resource);
             }
@@ -1115,6 +1560,13 @@ fn every_kms_statement_names_a_key_id() {
              would pass having examined nothing"
         );
         for (sid, resources) in statements {
+            assert!(
+                !resources.is_empty(),
+                "{role}/{sid}: statement grants a KMS operation but names no \
+                 {KMS_ARN_PREFIX:?} key ARN -- this guard would examine nothing \
+                 (validate_statement rejects the shape, so a shipped template reaching \
+                 here means the choke point was bypassed)"
+            );
             for resource in &resources {
                 assert_kms_resource_names_a_key_id(role, &sid, resource);
             }
@@ -1153,7 +1605,7 @@ fn mixed_case_kms_action_is_not_a_bypass() {
 
     // Observation 2: the post-fix selection catches it, through the same
     // helper the guards use.
-    let selected_after_fix = actions.iter().any(|a| action_has_prefix(a, "kms:"));
+    let selected_after_fix = actions.iter().any(|a| action_selects_kms(a));
     assert!(
         selected_after_fix,
         "fixture invalid: the post-fix matcher should select \"KMS:Decrypt\""
@@ -1244,12 +1696,12 @@ fn mixed_case_generate_data_key_is_not_missed_by_the_negative_assertion() {
     assert!(
         actions
             .iter()
-            .any(|a| action_has_prefix(a, "kms:GenerateDataKey")),
+            .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
         "the post-fix matcher must see KMS:GenerateDataKey* as the \
          kms:GenerateDataKey* grant it is. Found kms actions: {actions:?}"
     );
     assert!(
-        actions.iter().any(|a| action_eq(a, "kms:Decrypt")),
+        actions.iter().any(|a| action_grants(a, "kms:Decrypt")),
         "the post-fix matcher must see KMS:Decrypt as kms:Decrypt. \
          Found kms actions: {actions:?}"
     );
@@ -1740,9 +2192,9 @@ fn unhandled_condition_shape_fails_closed() {
                 statements: serde_json::json!([stmt.clone()]),
             };
             assert!(
-                list_prefix_patterns(&policy).is_empty(),
-                "fixture {sid}: list_prefix_patterns was expected to skip the \
-                 statement (finding no StringLike/s3:prefix); it did not"
+                pre_fix_list_prefix_patterns(&policy).is_empty(),
+                "fixture {sid}: the pre-fix list_prefix_patterns was expected to \
+                 skip the statement (finding no StringLike/s3:prefix); it did not"
             );
         }
 
@@ -1820,7 +2272,7 @@ fn list_prefix_patterns_reads_a_bare_string_prefix() {
     );
     // ...and the shipped array shape still validates and is read.
     assert!(
-        validate_statement("fixture", 0, &policy.statements.as_array().unwrap()[0]).is_ok(),
+        validate_statement("fixture", 0, &policy_statements(&policy)[0]).is_ok(),
         "a bare-string s3:prefix is a valid IAM shape and must pass validation"
     );
 }
@@ -1863,5 +2315,1039 @@ fn every_in_scope_policy_pattern_matches_a_real_key_shape() {
                 policy.role
             );
         }
+    }
+}
+
+/// The pre-fix `list_prefix_patterns` body, verbatim: an exact-name list
+/// detection and a `_ => {}` arm that contributed nothing for any Condition
+/// sub-shape it did not recognize. Kept so the Condition fixtures can pin that
+/// the constraint used to sit unread; the live helper now panics on that arm,
+/// because the choke point rejects every shape that could reach it.
+fn pre_fix_list_prefix_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let is_list = statement_actions(stmt)
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("s3:ListBucket"));
+        if !is_list {
+            continue;
+        }
+        match &stmt["Condition"]["StringLike"]["s3:prefix"] {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(patterns) => {
+                for p in patterns {
+                    out.push(p.as_str().expect("s3:prefix entry is a string").to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The pre-fix `resource_key_patterns` body, verbatim: `is_list_only` read from
+/// `stmt["Action"].as_str()` only, and a resource that did not strip the bucket
+/// prefix silently dropped (`if let Some(..)` with no `else`). Kept so the F1
+/// fixture pins the two holes existed rather than restating the fix.
+fn pre_fix_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let is_list_only = stmt["Action"]
+            .as_str()
+            .is_some_and(|a| a.eq_ignore_ascii_case("s3:ListBucket"));
+        if is_list_only {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+                out.push(key_pattern.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The pre-fix `put_resource_key_patterns` body, verbatim (same silent drop).
+fn pre_fix_put_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let grants_put = statement_actions(stmt)
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("s3:PutObject"));
+        if !grants_put {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+                out.push(key_pattern.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// F1 regression: a Resource that grants S3 object access but is not
+/// bucket-relative (`"*"`, `s3:*` on `"*"`, another bucket's ARN) must surface as
+/// a test failure naming the role and Sid, in BOTH the read and write resource
+/// helpers, not be silently dropped. Synthetic statements, not `deploy/iam/*.json`:
+/// a fixture over the (correct) shipped templates passes whichever way the strip
+/// behaves and proves nothing. Each case asserts in both directions -- that the
+/// pre-fix helper dropped it (returning an empty set, hiding the grant) and that
+/// the post-fix helper panics on it.
+#[test]
+fn out_of_bucket_resource_grant_is_not_a_bypass() {
+    // Read side (resource_key_patterns): (Sid, Action, Resource).
+    let read_cases = [
+        ("GetOnStar", serde_json::json!("s3:GetObject"), "*"),
+        (
+            "GetOnOtherBucket",
+            serde_json::json!("s3:GetObject"),
+            "arn:aws:s3:::other-bucket/t/*",
+        ),
+        ("StarActionStarResource", serde_json::json!("s3:*"), "*"),
+    ];
+    for (sid, action, resource) in &read_cases {
+        let policy = Policy {
+            role: "fixture",
+            statements: serde_json::json!([{
+                "Sid": sid,
+                "Effect": "Allow",
+                "Action": action,
+                "Resource": resource,
+            }]),
+        };
+        // Observation 1 (load-bearing): the pre-fix helper dropped the
+        // out-of-bucket resource, so the derived set was empty and every resource
+        // guard skipped the statement. If it stops being empty the fixture no
+        // longer proves the hole and must be rewritten, not deleted.
+        let pre = pre_fix_resource_key_patterns(&policy);
+        assert!(
+            pre.is_empty(),
+            "fixture {sid} invalid: pre-fix resource_key_patterns was expected to \
+             drop the out-of-bucket resource (returning nothing); returned {pre:?}"
+        );
+        // Observation 2: the post-fix helper panics naming the role and Sid.
+        let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resource_key_patterns(&policy)
+        }));
+        assert!(
+            guard.is_err(),
+            "resource_key_patterns must reject fixture {sid}: an S3 grant on \
+             {resource:?} must surface, not be silently dropped"
+        );
+    }
+
+    // Write side (put_resource_key_patterns): PutObject on "*". Dropping it left
+    // roles_writing_routed_objects_have_kms_grant an empty routed set, so it
+    // skipped the role's KMS-grant check entirely.
+    let put_policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "PutOnStar",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "*",
+        }]),
+    };
+    let pre_put = pre_fix_put_resource_key_patterns(&put_policy);
+    assert!(
+        pre_put.is_empty(),
+        "fixture PutOnStar invalid: pre-fix put_resource_key_patterns was expected \
+         to drop the \"*\" resource; returned {pre_put:?}"
+    );
+    let put_guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        put_resource_key_patterns(&put_policy)
+    }));
+    assert!(
+        put_guard.is_err(),
+        "put_resource_key_patterns must reject PutObject on \"*\": dropping it \
+         makes roles_writing_routed_objects_have_kms_grant skip the role on an \
+         empty routed set"
+    );
+
+    // Trap (must not trip the new guard): an array-form ListBucket statement's
+    // bare bucket ARN must be SKIPPED, not panicked. The pre-fix `.as_str()`
+    // is_list_only returned None for the array form, so the bare bucket ARN would
+    // reach the now-fatal strip; the post-fix statement_actions-based detection
+    // recognizes it as list-only and skips it.
+    let list_policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "ArrayFormList",
+            "Effect": "Allow",
+            "Action": ["s3:ListBucket"],
+            "Resource": "arn:aws:s3:::my-ravel-bucket",
+        }]),
+    };
+    let pre_fix_is_list_only = policy_statements(&list_policy)[0]["Action"]
+        .as_str()
+        .is_some_and(|a| a.eq_ignore_ascii_case("s3:ListBucket"));
+    assert!(
+        !pre_fix_is_list_only,
+        "fixture ArrayFormList invalid: the pre-fix as_str() detection was \
+         expected to miss the array-form ListBucket (proving the trap is real)"
+    );
+    let list_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        resource_key_patterns(&list_policy)
+    }));
+    assert_eq!(
+        list_result.ok(),
+        Some(Vec::<String>::new()),
+        "resource_key_patterns must skip an array-form ListBucket statement, not \
+         panic on its bare bucket ARN"
+    );
+
+    // A kms: ARN on a non-list statement is skipped (None), not panicked: the KMS
+    // resource guards own it. This is why the read-path strip cannot blindly
+    // panic on every non-bucket-relative resource -- every role carries a
+    // *TenantKms statement whose Resource is a kms: ARN.
+    let kms_policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "KmsResource",
+            "Effect": "Allow",
+            "Action": "kms:Decrypt",
+            "Resource": "arn:aws:kms:us-east-1:111122223333:key/abcd1234-5678-90ab-cdef-1234567890ab",
+        }]),
+    };
+    let kms_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        resource_key_patterns(&kms_policy)
+    }));
+    assert_eq!(
+        kms_result.ok(),
+        Some(Vec::<String>::new()),
+        "resource_key_patterns must skip a kms: ARN (checked by the KMS guards), \
+         not panic"
+    );
+}
+
+/// The pre-fix `validate_condition` body, verbatim (round two's version, no
+/// empty-object checks): a `for` over an empty map iterates zero times, so `{}`
+/// and `{"StringLike": {}}` both returned Ok. Kept so the F2 fixture pins the
+/// hole existed rather than restating the fix.
+fn pre_fix_validate_condition(condition: &serde_json::Value) -> Result<(), String> {
+    let cond_obj = condition
+        .as_object()
+        .ok_or_else(|| "Condition is not an object".to_string())?;
+    for (operator, keys) in cond_obj {
+        if !HANDLED_CONDITION_OPERATORS.contains(&operator.as_str()) {
+            return Err(format!("operator {operator:?}"));
+        }
+        let key_obj = keys
+            .as_object()
+            .ok_or_else(|| "operator is not an object".to_string())?;
+        for (cond_key, value) in key_obj {
+            if !HANDLED_CONDITION_KEYS.contains(&cond_key.as_str()) {
+                return Err(format!("key {cond_key:?}"));
+            }
+            if !is_string_or_string_array(Some(value)) {
+                return Err(format!("value {value:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// F2 regression (empty maps): `"Condition": {}` and `"Condition": {"StringLike":
+/// {}}` must fail closed. Pre-fix, a `for` over an empty map iterated zero times,
+/// so both returned Ok -- the vacuous-set bug round two fixed for arrays,
+/// re-created in the code that fixed it. Synthetic, not `deploy/iam/*.json`: the
+/// shipped Conditions are all non-empty StringLike/s3:prefix blocks.
+#[test]
+fn empty_condition_or_stringlike_map_fails_closed() {
+    let cases = [
+        ("EmptyCondition", serde_json::json!({})),
+        ("EmptyStringLike", serde_json::json!({"StringLike": {}})),
+    ];
+    for (sid, condition) in &cases {
+        // Observation 1 (load-bearing): the pre-fix validator accepted the empty
+        // map (zero loop iterations), so the constraint sat unexamined.
+        assert!(
+            pre_fix_validate_condition(condition).is_ok(),
+            "fixture {sid} invalid: pre-fix validate_condition was expected to \
+             accept {condition:?} (vacuous empty-map loop); it did not"
+        );
+        // Observation 2: the full statement validator rejects a ListBucket
+        // statement carrying it, naming the empty shape and the Sid.
+        let stmt = serde_json::json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::my-ravel-bucket",
+            "Condition": condition,
+        });
+        let err = validate_statement("fixture", 0, &stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        assert!(
+            err.contains("empty"),
+            "fixture {sid}: rejection must name the empty shape; got {err:?}"
+        );
+        assert!(
+            err.contains(sid),
+            "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+    }
+}
+
+/// F2 regression (Condition presence): a ListBucket statement must carry a
+/// Condition, and a non-ListBucket statement must not. Pre-fix, `validate_statement`
+/// only validated a Condition when present and never checked the Action, so a
+/// ListBucket with no Condition (an unconstrained bucket-wide list) and a
+/// StringLike/s3:prefix on the protected-delete Deny (read by no guard, and never
+/// fired in AWS since a DeleteObject request carries no s3:prefix) both passed.
+/// Synthetic for the same reason as above.
+#[test]
+fn condition_presence_must_track_list_bucket_action() {
+    // Hole: a ListBucket statement with NO Condition. list_prefix_patterns
+    // contributes nothing for it, and pre-fix validation accepted it.
+    let no_condition = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "ListNoCondition",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::my-ravel-bucket",
+        }]),
+    };
+    assert!(
+        pre_fix_list_prefix_patterns(&no_condition).is_empty(),
+        "fixture invalid: a ListBucket statement with no Condition must contribute \
+         no s3:prefix pattern (the unconstrained-list shape)"
+    );
+    let err = validate_statement("fixture", 0, &policy_statements(&no_condition)[0])
+        .expect_err("validate_statement must reject a ListBucket statement with no Condition");
+    assert!(
+        err.contains("no Condition"),
+        "rejection must name the missing Condition; got {err:?}"
+    );
+    assert!(
+        err.contains("ListNoCondition"),
+        "rejection must name the Sid; got {err:?}"
+    );
+
+    // Hole: a StringLike/s3:prefix Condition on a NON-ListBucket statement (a
+    // protected-delete Deny). list_prefix_patterns never reads it (not
+    // ListBucket), so the Condition sits unexamined while pre-fix validation
+    // blessed it.
+    let deny_with_prefix = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "DenyWithPrefix",
+            "Effect": "Deny",
+            "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+            "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+            "Condition": {"StringLike": {"s3:prefix": ["t/*"]}},
+        }]),
+    };
+    assert!(
+        list_prefix_patterns(&deny_with_prefix).is_empty(),
+        "fixture invalid: list_prefix_patterns must skip a non-ListBucket \
+         statement, so its Condition sits unread"
+    );
+    let err = validate_statement("fixture", 0, &policy_statements(&deny_with_prefix)[0])
+        .expect_err("validate_statement must reject a Condition on a non-ListBucket statement");
+    assert!(
+        err.contains("does not include s3:ListBucket"),
+        "rejection must explain the non-ListBucket Condition; got {err:?}"
+    );
+    assert!(
+        err.contains("DenyWithPrefix"),
+        "rejection must name the Sid; got {err:?}"
+    );
+}
+
+/// F3 regression (Sid): a missing or non-string Sid must fail closed. Pre-fix,
+/// `obj.get("Sid").and_then(as_str).unwrap_or("<no Sid>")` swallowed a
+/// `"Sid": 123` and an absent Sid, and the otherwise-valid statement passed while
+/// every rejection could name only `<no Sid>`. Synthetic, not `deploy/iam/*.json`:
+/// every shipped statement carries a string Sid.
+#[test]
+fn sid_must_be_a_present_string() {
+    // Non-string Sid.
+    let non_string = serde_json::json!({
+        "Sid": 123,
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::my-ravel-bucket/t/*",
+    });
+    // Observation 1 (load-bearing): the pre-fix extraction saw no string Sid, so
+    // it fell back to "<no Sid>" and validated the rest as if well-formed.
+    assert!(
+        non_string["Sid"].as_str().is_none(),
+        "fixture invalid: the pre-fix as_str() extraction was expected to see no \
+         string Sid for 123"
+    );
+    let err = validate_statement("fixture", 0, &non_string)
+        .expect_err("validate_statement must reject a non-string Sid");
+    assert!(
+        err.contains("non-string Sid"),
+        "rejection must name the non-string Sid; got {err:?}"
+    );
+
+    // Missing Sid entirely.
+    let missing = serde_json::json!({
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::my-ravel-bucket/t/*",
+    });
+    let err = validate_statement("fixture", 0, &missing)
+        .expect_err("validate_statement must reject a missing Sid");
+    assert!(
+        err.contains("no Sid"),
+        "rejection must name the missing Sid; got {err:?}"
+    );
+}
+
+/// F3 regression (index): every rejection names the statement index, so an
+/// operator can locate the offending statement in a Sid-less or duplicate-Sid
+/// array. Pre-fix, messages carried only `role/Sid`.
+#[test]
+fn rejection_message_names_the_statement_index() {
+    let statements = serde_json::json!([
+        {"Sid": "Good", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"},
+        {"Sid": "Bad", "Effect": "Permit", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"},
+    ]);
+    let err = validate_policy_statements("fixture", &statements)
+        .expect_err("the invalid second statement must be rejected");
+    assert!(
+        err.contains("#1"),
+        "rejection must name the statement index #1; got {err:?}"
+    );
+    assert!(
+        err.contains("Bad"),
+        "rejection must name the Sid; got {err:?}"
+    );
+}
+
+/// F4 wiring guard: `load_policy_from` -- `load_policy`'s real file-reading body --
+/// must reject an invalid policy. Driving a synthetic invalid file through it is
+/// what fails if the validation call is deleted from `build_policy`, or if
+/// `load_policy_from` stops calling `build_policy`; a test that only calls
+/// `validate_policy_statements` directly would keep passing. This closes the F4
+/// gap: the shipped entry point, not only the extracted body, is exercised.
+#[test]
+fn load_policy_from_rejects_a_synthetic_invalid_file() {
+    let path = std::env::temp_dir().join(format!(
+        "ravel-iam-fixture-{}-invalid.json",
+        std::process::id()
+    ));
+    let json = r#"{"Version":"2012-10-17","Statement":[{"Sid":"NegatedResource","Effect":"Allow","Action":"s3:DeleteObject","NotResource":"arn:aws:s3:::my-ravel-bucket/t/*"}]}"#;
+    std::fs::write(&path, json).expect("write synthetic policy fixture");
+    let path_str = path.to_str().expect("temp path is valid UTF-8").to_string();
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        load_policy_from("fixture", &path_str)
+    }));
+    std::fs::remove_file(&path).ok();
+    assert!(
+        built.is_err(),
+        "load_policy_from (load_policy's real file-reading body) must reject a \
+         statement whose permission lives in NotResource, a field no guard reads"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round four (issue #1346, holes H1/H2/H3): the redesign's own fixtures.
+//
+// Round three's `bucket_relative_s3_pattern` and the list-only exemption its
+// callers carried, kept verbatim, so each fixture below pins the hole it closes
+// instead of restating today's rule.
+// ---------------------------------------------------------------------------
+
+/// Round three's resource classifier, verbatim: it panicked for exactly two
+/// shapes (`"*"` and an `arn:aws:s3:::` prefix) and returned `None` for
+/// everything else. Its doc claimed `None` meant "names a different service such
+/// as a KMS ARN", but nothing checked that, so every S3 grant shape outside those
+/// two -- access point, Object Lambda, multi-region access point, `arn:*`, a
+/// malformed non-ARN -- came back as "nothing to check" (H1).
+fn round_three_bucket_relative_s3_pattern(resource: &str) -> Option<String> {
+    if let Some(key_pattern) = resource.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+        return Some(key_pattern.to_string());
+    }
+    if resource == "*" || resource.starts_with("arn:aws:s3:::") {
+        panic!("round three panicked for {resource:?}");
+    }
+    None
+}
+
+/// Round three's `resource_key_patterns`, verbatim: the list-only exemption that
+/// skipped a list statement before its Resource was looked at by anything (H2),
+/// plus the silent-drop classifier above.
+fn round_three_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let actions = statement_actions(stmt);
+        let is_list_only = !actions.is_empty()
+            && actions
+                .iter()
+                .all(|a| a.eq_ignore_ascii_case("s3:ListBucket"));
+        if is_list_only {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = round_three_bucket_relative_s3_pattern(r) {
+                out.push(key_pattern);
+            }
+        }
+    }
+    out
+}
+
+/// The message a `catch_unwind` payload carries, so a fixture can assert the
+/// rejection names the offending statement rather than only that something
+/// panicked.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    "<non-string panic payload>".to_string()
+}
+
+/// A single-statement synthetic policy.
+fn fixture_policy(stmt: serde_json::Value) -> Policy {
+    Policy {
+        role: "fixture",
+        statements: serde_json::json!([stmt]),
+    }
+}
+
+/// H1 regression: every S3 object grant whose `Resource` is not bucket-relative
+/// must be rejected by name. Round three's classifier panicked only for `"*"` and
+/// for an `arn:aws:s3:::` prefix and returned `None` for everything else, so each
+/// of these five shapes -- all real S3 object grants reaching outside the
+/// configured bucket -- was silently dropped and every resource guard derived an
+/// empty set.
+///
+/// All five shapes are covered, not one: the access-point and multi-region
+/// access-point forms carry a region and/or account and so miss the `:::` form,
+/// Object Lambda is a different service name entirely, `arn:*` is the
+/// everything-grant, and `my-ravel-bucket/*` is not an ARN at all.
+///
+/// Synthetic statements, not `deploy/iam/*.json`: the shipped templates name only
+/// bucket-relative object ARNs, so a fixture over them passes whichever way the
+/// classifier behaves. Each case asserts in both directions.
+#[test]
+fn non_bucket_relative_s3_object_resource_fails_closed() {
+    let cases = [
+        (
+            "AccessPointArn",
+            "arn:aws:s3:us-east-1:111122223333:accesspoint/ap/object/*",
+        ),
+        (
+            "ObjectLambdaArn",
+            "arn:aws:s3-object-lambda:us-east-1:111122223333:accesspoint/olap/object/*",
+        ),
+        (
+            "MultiRegionAccessPointArn",
+            "arn:aws:s3::111122223333:accesspoint/mrap/object/*",
+        ),
+        ("EverythingArn", "arn:*"),
+        ("MalformedNonArn", "my-ravel-bucket/*"),
+    ];
+
+    for (sid, resource) in cases {
+        let stmt = serde_json::json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": resource,
+        });
+        let policy = fixture_policy(stmt.clone());
+
+        // Observation 1 (load-bearing): the resource is not bucket-relative, yet
+        // round three's classifier fell through to None instead of panicking, so
+        // its callers dropped it. Written as round three's own two literal
+        // conditions, so this pins the hole rather than restating the fix.
+        assert!(
+            resource.strip_prefix(BUCKET_KEY_PREFIX).is_none(),
+            "fixture {sid} invalid: {resource:?} must NOT be bucket-relative, or it \
+             is not an out-of-bucket grant at all"
+        );
+        let round_three_panicked = resource == "*" || resource.starts_with("arn:aws:s3:::");
+        assert!(
+            !round_three_panicked,
+            "fixture {sid} invalid: round three's two panic conditions were expected \
+             to miss {resource:?} -- if one catches it, this fixture no longer proves \
+             the catch-all None hole existed"
+        );
+        assert_eq!(
+            round_three_bucket_relative_s3_pattern(resource),
+            None,
+            "fixture {sid} invalid: round three's classifier was expected to return \
+             None (silently dropping the grant) for {resource:?}"
+        );
+        assert!(
+            round_three_resource_key_patterns(&policy).is_empty(),
+            "fixture {sid} invalid: round three's resource helper was expected to \
+             derive an empty pattern set for {resource:?}, hiding the grant"
+        );
+
+        // Observation 2: the choke point rejects it, naming the role, the
+        // statement index, the Sid and the offending value.
+        let err = validate_statement("gateway", 3, &stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        for expected in [resource, sid, "#3", "gateway"] {
+            assert!(
+                err.contains(expected),
+                "fixture {sid}: rejection must name {expected:?}; got {err:?}"
+            );
+        }
+
+        // Observation 3 (belt and braces): the helper itself panics if a guard is
+        // ever run on a statement that never passed the choke point.
+        let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resource_key_patterns(&policy)
+        }));
+        let message = panic_message(guard.expect_err(&format!(
+            "resource_key_patterns must panic on fixture {sid}, not drop the resource"
+        )));
+        assert!(
+            message.contains(resource) && message.contains(sid),
+            "fixture {sid}: the helper's panic must name the Sid and the resource; \
+             got {message:?}"
+        );
+    }
+}
+
+/// H2 regression: a list statement's `Resource` must be examined. Round three
+/// made a non-bucket-relative Resource fatal and then, to stop that tripping the
+/// bare bucket ARN that `s3:ListBucket` legitimately names, exempted whole
+/// list-only statements from the resource helpers. The result was a list
+/// statement whose Resource was read by NO guard in the file: `s3:ListBucket` on
+/// `"*"` -- which enumerates every bucket in the account -- passed validation,
+/// was skipped by the resource helpers, and `list_prefix_patterns` read only its
+/// Condition. This hole did not exist before round three.
+///
+/// The fix is the choke point's resource-class rule: a list grant must name the
+/// bare bucket ARN and nothing else, so the exemption is no longer needed and the
+/// helper never has to guess.
+#[test]
+fn list_statement_resource_is_examined() {
+    let cases = [
+        // The account-wide list: no class at all, rejected as unclassified.
+        ("ListOnStar", "*", "nor exactly that bucket ARN"),
+        // A list grant naming an object ARN: legal JSON, and in AWS a ListBucket
+        // on an object ARN matches nothing, so it is a template bug either way.
+        // The resource classifies, and the mismatch with the granted class is
+        // what rejects it.
+        (
+            "ListOnObjectArn",
+            "arn:aws:s3:::my-ravel-bucket/t/*",
+            "grants no S3 object operation",
+        ),
+    ];
+
+    for (sid, resource, must_explain) in cases {
+        let stmt = serde_json::json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": resource,
+            "Condition": {"StringLike": {"s3:prefix": ["t/*"]}},
+        });
+        let policy = fixture_policy(stmt.clone());
+
+        // Observation 1 (load-bearing): round three's list-only exemption skipped
+        // the statement before its Resource was classified at all, so the
+        // resource helper derived nothing.
+        assert!(
+            round_three_resource_key_patterns(&policy).is_empty(),
+            "fixture {sid} invalid: round three's list-only exemption was expected \
+             to skip the statement entirely; it did not"
+        );
+
+        // ...and the only guard that DID look at this statement looked solely at
+        // its Condition, which is the shape of the hole: the prefix was read, the
+        // Resource was not.
+        assert_eq!(
+            pre_fix_list_prefix_patterns(&policy),
+            vec!["t/*".to_string()],
+            "fixture {sid} invalid: list_prefix_patterns was expected to read the \
+             Condition (and nothing else) for this statement"
+        );
+
+        // Observation 2: the choke point now rejects the Resource by name.
+        let err = validate_statement("admin", 0, &stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        for expected in [resource, sid, must_explain] {
+            assert!(
+                err.contains(expected),
+                "fixture {sid}: rejection must name {expected:?}; got {err:?}"
+            );
+        }
+    }
+
+    // The same hole with the list grant hidden beside an object grant, which is
+    // what makes the class-mismatch arms above insufficient on their own: the
+    // object ARN is legitimate for the GetObject half, so only the coverage rule
+    // ("grants a bucket operation, names no bucket ARN") catches the ListBucket
+    // half reaching every key in the bucket with no Resource a guard reads.
+    let hidden = serde_json::json!({
+        "Sid": "ListHiddenBesideRead",
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket", "s3:GetObject"],
+        "Resource": "arn:aws:s3:::my-ravel-bucket/t/*",
+        "Condition": {"StringLike": {"s3:prefix": ["t/*"]}},
+    });
+    let hidden_policy = fixture_policy(hidden.clone());
+
+    // Observation 1 (load-bearing): round three read this statement twice and
+    // never once asked what its list half was scoped to. The resource helper saw
+    // it (is_list_only was false, so the exemption did not apply) and derived only
+    // the object pattern; the list guard saw it and read only the Condition.
+    assert_eq!(
+        round_three_resource_key_patterns(&hidden_policy),
+        vec!["t/*".to_string()],
+        "fixture invalid: round three's resource helper was expected to derive only \
+         the object pattern here, saying nothing about the list grant"
+    );
+    assert_eq!(
+        pre_fix_list_prefix_patterns(&hidden_policy),
+        vec!["t/*".to_string()],
+        "fixture invalid: round three's list guard was expected to read only the \
+         Condition here"
+    );
+
+    // Observation 2: the coverage rule rejects it, tagged H2.
+    let err = validate_statement("query", 2, &hidden)
+        .expect_err("validate_statement must reject a list grant that names no bucket ARN");
+    for expected in ["ListHiddenBesideRead", "#2", "issue #1346, H2"] {
+        assert!(
+            err.contains(expected),
+            "the rejection must name {expected:?}; got {err:?}"
+        );
+    }
+
+    // Trap (must not trip): the shipped list shape -- exactly the bare bucket ARN
+    // with an s3:prefix Condition -- still passes, and still contributes its
+    // prefixes.
+    let shipped = serde_json::json!({
+        "Sid": "ShippedListShape",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": ["t/", "sys/*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &shipped).is_ok(),
+        "the shipped list statement shape (bare bucket ARN + s3:prefix Condition) \
+         must still pass"
+    );
+    assert_eq!(
+        list_prefix_patterns(&fixture_policy(shipped)),
+        vec!["t/".to_string(), "sys/*".to_string()],
+        "the shipped list shape must still contribute its s3:prefix patterns"
+    );
+}
+
+/// H3 regression, the predicate: `"s3:*"` and `"*"` grant PutObject, ListBucket
+/// and the delete actions, and `"*"` grants the KMS operations too. Round three
+/// resolved IAM wildcards on the delete axis only; put, list and KMS selection
+/// all compared exact names, so an `s3:*` statement was selected by none of them
+/// and the Condition-presence rule (which keys on the list grant) never fired.
+///
+/// This test is over the predicate rather than a policy because the predicate is
+/// now the only place any axis decides: if it answers all of these, no axis can
+/// be wildcard-blind.
+#[test]
+fn wildcard_action_is_selected_by_every_axis() {
+    // (action, does it grant an S3 object op, a bucket op, a KMS op)
+    let cases = [
+        ("s3:*", true, true, false),
+        ("S3:*", true, true, false),
+        ("*", true, true, true),
+        ("s3:?utObject", true, false, false),
+        ("kms:*", false, false, true),
+        // Control: a literal action grants only itself.
+        ("s3:GetObject", true, false, false),
+        // Control: an unrelated literal grants nothing in the vocabulary.
+        ("s3:DeleteObjectTagging", false, false, false),
+    ];
+
+    for (action, grants_object, grants_list, grants_kms) in cases {
+        assert_eq!(
+            action_grants_any(action, &S3_OBJECT_OPERATIONS),
+            grants_object,
+            "action_grants: {action:?} vs {S3_OBJECT_OPERATIONS:?}"
+        );
+        assert_eq!(
+            action_grants_any(action, &S3_BUCKET_OPERATIONS),
+            grants_list,
+            "action_grants: {action:?} vs {S3_BUCKET_OPERATIONS:?}"
+        );
+        assert_eq!(
+            action_selects_kms(action),
+            grants_kms,
+            "action_selects_kms: {action:?}"
+        );
+    }
+
+    // Observation 1 (load-bearing): round three's per-axis matchers -- exact
+    // case-folded equality for put and list, a case-folded `kms:` prefix for KMS
+    // -- each missed the wildcard action that grants their operation. Written as
+    // those literal expressions, so this pins the hole rather than restating the
+    // fix.
+    assert!(
+        !"s3:*".eq_ignore_ascii_case("s3:PutObject"),
+        "fixture invalid: round three's put selection was expected to miss \"s3:*\""
+    );
+    assert!(
+        !"s3:*".eq_ignore_ascii_case("s3:ListBucket"),
+        "fixture invalid: round three's list selection was expected to miss \"s3:*\""
+    );
+    assert!(
+        !"*".starts_with("kms:"),
+        "fixture invalid: round three's KMS selection was expected to miss \"*\""
+    );
+
+    // ...while the delete axis, the one round three made wildcard-aware, saw it.
+    // That asymmetry is what the single predicate removes.
+    assert!(
+        action_grants_any("s3:*", &S3_DELETE_OPERATIONS),
+        "the delete axis was already wildcard-aware and must stay so"
+    );
+}
+
+/// H3 regression, the shipped-template mutation the reviewer used: changing
+/// `GatewayWrite`'s Action from `s3:PutObject` to `s3:*` passed all 26 tests
+/// under round three. `s3:*` grants PutObject (so the routed-write KMS check
+/// should select the statement) and ListBucket (so the Condition-presence rule
+/// should demand an `s3:prefix` Condition and the resource rule should demand the
+/// bucket ARN), and round three's exact-name matchers saw neither.
+///
+/// The mutation is applied to an in-memory copy of `deploy/iam/gateway.json`; the
+/// file on disk is not touched, and the unmutated policy is asserted to still
+/// load.
+#[test]
+fn shipped_gateway_write_mutated_to_wildcard_action_fails_closed() {
+    let path = policy_json_path("gateway");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+
+    // The unmutated template still loads: this test's failure is about the
+    // mutation, not about the shipped file.
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_policy(
+            "gateway", &path, &json
+        )))
+        .is_ok(),
+        "the shipped gateway template must load unchanged"
+    );
+
+    let statements = json["Statement"]
+        .as_array_mut()
+        .expect("gateway.json Statement is an array");
+    let target = statements
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayWrite"))
+        .expect("gateway.json carries a GatewayWrite statement");
+    let original = target["Action"].clone();
+    assert_eq!(
+        original,
+        serde_json::json!("s3:PutObject"),
+        "fixture invalid: GatewayWrite's Action is no longer the s3:PutObject this \
+         mutation replaces"
+    );
+    target["Action"] = serde_json::json!("s3:*");
+
+    let mutated = Policy {
+        role: "gateway",
+        statements: json["Statement"].clone(),
+    };
+
+    // Observation 1 (load-bearing): under round three's exact-name matchers the
+    // mutated policy hid the grant in two independent places.
+    assert!(
+        pre_fix_put_resource_key_patterns(&mutated).is_empty(),
+        "fixture invalid: round three's PutObject selection was expected to derive \
+         an EMPTY routed-write set from the mutated policy (so \
+         roles_writing_routed_objects_have_kms_grant skipped the role)"
+    );
+    let round_three_list_prefixes = pre_fix_list_prefix_patterns(&mutated);
+    assert!(
+        !round_three_list_prefixes.contains(&"*".to_string()),
+        "fixture invalid: round three's list detection was expected to read nothing \
+         from the s3:* statement; got {round_three_list_prefixes:?}"
+    );
+    assert!(
+        round_three_bucket_relative_s3_pattern("arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*").is_some(),
+        "fixture invalid: the mutated statement's resources still strip cleanly, so \
+         nothing but the Action matcher could have caught this"
+    );
+
+    // Observation 2: the choke point rejects the mutated template, naming the
+    // statement, and `load_policy`'s real body is what does it.
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_policy("gateway", &path, &json)
+    }));
+    let message = panic_message(built.expect_err(
+        "build_policy must reject GatewayWrite mutated to \"s3:*\": the action grants \
+         ListBucket and PutObject, and its resources are object ARNs with no Condition",
+    ));
+    assert!(
+        message.contains("GatewayWrite") && message.contains("s3:*"),
+        "the rejection must name the mutated statement and its Action; got {message:?}"
+    );
+
+    // Observation 3: the post-fix put axis DOES select the mutated statement, so
+    // the routed-write KMS check would run on it rather than skip the role.
+    let routed: Vec<String> = put_resource_key_patterns(&mutated)
+        .into_iter()
+        .filter(|p| ravel_object_store::routes_through_tenant_key(p))
+        .collect();
+    assert!(
+        !routed.is_empty(),
+        "the post-fix put axis must select the s3:* statement's routed PUT patterns"
+    );
+}
+
+/// H3 companion: the normal IAM idiom round three's list-only exemption would
+/// have mishandled -- one statement granting both `s3:ListBucket` and
+/// `s3:GetObject`, naming both the bare bucket ARN and an object prefix -- must be
+/// ACCEPTED, and both axes must read it. Rejecting it (or rejecting it with a
+/// misleading "not bucket-relative" reason) would be a new failure of the same
+/// class, in the opposite direction.
+#[test]
+fn mixed_list_and_object_statement_is_accepted() {
+    let stmt = serde_json::json!({
+        "Sid": "MixedListAndRead",
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket", "s3:GetObject"],
+        "Resource": [BUCKET_ARN, "arn:aws:s3:::my-ravel-bucket/t/*"],
+        "Condition": {"StringLike": {"s3:prefix": ["t/*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &stmt).is_ok(),
+        "a statement granting both ListBucket and GetObject over the bucket ARN plus \
+         an object prefix is a normal IAM idiom and must be accepted: {:?}",
+        validate_statement("fixture", 0, &stmt)
+    );
+
+    let policy = fixture_policy(stmt);
+
+    // The object axis reads the object prefix and skips the bucket ARN rather
+    // than panicking on it (round three's classifier panicked for the bare bucket
+    // ARN, which is why the exemption was added at the caller).
+    assert!(
+        std::panic::catch_unwind(|| round_three_bucket_relative_s3_pattern(BUCKET_ARN)).is_err(),
+        "fixture invalid: round three's classifier was expected to panic on the bare \
+         bucket ARN (the reason the list-only exemption existed)"
+    );
+    assert_eq!(
+        resource_key_patterns(&policy),
+        vec!["t/*".to_string()],
+        "the object axis must read the object prefix and skip the bucket ARN"
+    );
+
+    // ...and the list axis reads the Condition, so neither half sits unexamined.
+    assert_eq!(
+        list_prefix_patterns(&policy),
+        vec!["t/*".to_string()],
+        "the list axis must read the mixed statement's s3:prefix Condition"
+    );
+}
+
+/// The vocabulary's own invariants, so a later edit cannot silently narrow it:
+/// every operation is a literal name (`action_grants` asserts this, and an
+/// operation carrying a wildcard would make it answer a different question), the
+/// delete axis selects a subset of the object axis (a delete that is not an
+/// object operation would be selected by the delete guard while the choke point
+/// demanded a resource shape for a class it does not grant), and the three
+/// classes are disjoint (a shape rule keyed on class would otherwise be
+/// ambiguous).
+#[test]
+fn operation_vocabulary_is_consistent() {
+    let all: Vec<&str> = S3_OBJECT_OPERATIONS
+        .iter()
+        .chain(S3_BUCKET_OPERATIONS.iter())
+        .chain(KMS_OTHER_OPERATIONS.iter())
+        .chain(KMS_DATA_KEY_OPERATIONS.iter())
+        .copied()
+        .collect();
+    for op in &all {
+        assert!(
+            !op.contains(IAM_WILDCARDS),
+            "operation {op:?} carries an IAM wildcard; operations must be literal names"
+        );
+    }
+    for op in S3_DELETE_OPERATIONS {
+        assert!(
+            S3_OBJECT_OPERATIONS.contains(&op),
+            "delete operation {op:?} is not in S3_OBJECT_OPERATIONS, so a statement \
+             granting it would be selected by the delete axis while the choke point \
+             required no object resource for it"
+        );
+    }
+    for op in &all {
+        let object = S3_OBJECT_OPERATIONS.contains(op);
+        let bucket = S3_BUCKET_OPERATIONS.contains(op);
+        let kms = action_selects_kms(op);
+        assert_eq!(
+            u8::from(object) + u8::from(bucket) + u8::from(kms),
+            1,
+            "operation {op:?} belongs to more than one resource class (object \
+             {object}, bucket {bucket}, kms {kms}), so the choke point's shape rules \
+             would be ambiguous"
+        );
+    }
+}
+
+/// Every shipped template under `deploy/iam` passes the choke point, and the set
+/// this file guards is exactly the set on disk. `ALL_ROLES` is hand-written, so
+/// without this a new template would ship unguarded.
+#[test]
+fn every_shipped_template_passes_the_choke_point() {
+    let dir = format!("{}/../../deploy/iam", env!("CARGO_MANIFEST_DIR"));
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read dir {dir}: {e}"))
+        .map(|entry| entry.expect("dir entry").file_name())
+        .filter_map(|name| {
+            name.to_str()
+                .and_then(|n| n.strip_suffix(".json"))
+                .map(str::to_string)
+        })
+        .collect();
+    on_disk.sort();
+    let mut guarded: Vec<String> = ALL_ROLES.iter().map(|r| (*r).to_string()).collect();
+    guarded.sort();
+    assert_eq!(
+        on_disk, guarded,
+        "the templates under deploy/iam and the roles ALL_ROLES guards must be the \
+         same set"
+    );
+    assert_eq!(
+        on_disk.len(),
+        4,
+        "expected 4 shipped templates: {on_disk:?}"
+    );
+
+    for role in ALL_ROLES {
+        // load_policy panics on any rejection, naming role, index, Sid and field.
+        let policy = load_policy(role);
+        assert!(
+            !policy_statements(&policy).is_empty(),
+            "{role}: policy has no statements"
+        );
     }
 }
