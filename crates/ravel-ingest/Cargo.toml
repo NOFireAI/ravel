@@ -11,7 +11,12 @@ rust-version.workspace = true
 # links the seam. On, it compiles in the `Instant`-based accumulator and wires
 # the logs pipeline's admit/route/merge/encode boundaries through it, read only
 # by the bench reporter. A CI lane must build and run this feature.
-stage-timing = []
+#
+# Also turns on `ravel-logseg/stage-timing`, which is what makes the RLOG
+# block-write loop report per-block bloom-construction nanoseconds through
+# `WriteStats::bloom_block_ns` for the `LogStage::Bloom` boundary below to
+# fold in (issue #1516).
+stage-timing = ["ravel-logseg/stage-timing"]
 
 [dependencies]
 ravel-types = { workspace = true }
