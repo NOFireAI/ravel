@@ -1111,7 +1111,12 @@ impl Envelope {
     /// which is a defect, and an `internal` failure is what says so. Cutting
     /// a MAC'd token is not an option (a cut cursor redeems as invalid), and
     /// dropping it silently would return a page the caller cannot turn while
-    /// reporting nothing wrong.
+    /// reporting nothing wrong. It only writes that failure when the envelope
+    /// carries none already: an envelope that arrives here reporting a
+    /// `budget_exceeded` or an `unavailable` is reporting why the call failed,
+    /// and replacing that with `internal` would tell the caller to file a bug
+    /// about this process instead of retrying or narrowing. The cursor is
+    /// dropped either way, so no unturnable page goes out.
     ///
     /// Scalars are capped after that check because the failure message it
     /// writes is one of the scalars the allowance covers.
@@ -1140,13 +1145,15 @@ impl Envelope {
         if cursor_len > CURSOR_BOUND {
             self.presentation.cursor = None;
             self.status = Status::Error;
-            self.failure = Some(Failure {
-                class: FailureClass::Internal,
-                message: format!(
-                    "cursor serializes to {cursor_len} B, over its {CURSOR_BOUND} B bound"
-                ),
-                counter: None,
-            });
+            if self.failure.is_none() {
+                self.failure = Some(Failure {
+                    class: FailureClass::Internal,
+                    message: format!(
+                        "cursor serializes to {cursor_len} B, over its {CURSOR_BOUND} B bound"
+                    ),
+                    counter: None,
+                });
+            }
         }
 
         self.presentation.scalars_truncated = self.cap_scalars();
@@ -2014,6 +2021,40 @@ mod tests {
         let finished = fitted.finish(true);
         assert_eq!(finished.status, Status::Error);
         assert_eq!(finished.presentation.cursor, None);
+    }
+
+    /// The same over-bound cursor on an envelope that is already reporting a
+    /// failure. The cursor is still dropped, but the existing failure's class,
+    /// message, and counter survive: a `budget_exceeded` that turned into an
+    /// `internal` would tell the caller to file a bug about this process
+    /// instead of narrowing the query that actually tripped, and the counter
+    /// naming which budget tripped would be gone with it.
+    #[test]
+    fn an_over_bound_cursor_keeps_an_existing_failure_class() {
+        let cursor = "k".repeat(CURSOR_BOUND - 1);
+        let mut envelope = Envelope::default();
+        envelope.presentation.cursor = Some(cursor);
+        envelope.presentation.row_cap_hit = true;
+        envelope.status = Status::Error;
+        envelope.failure = Some(Failure {
+            class: FailureClass::BudgetExceeded,
+            message: "scanned 4 GiB, over the 1 GiB max_bytes_scanned".to_string(),
+            counter: Some("bytes_scanned".to_string()),
+        });
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+
+        assert_eq!(fitted.presentation.cursor, None);
+        assert_eq!(fitted.cursor_serialized_len(), 0);
+        let failure = fitted.failure.as_ref().expect("the original failure");
+        assert_eq!(failure.class, FailureClass::BudgetExceeded);
+        assert_eq!(
+            failure.message,
+            "scanned 4 GiB, over the 1 GiB max_bytes_scanned"
+        );
+        assert_eq!(failure.counter.as_deref(), Some("bytes_scanned"));
+        assert_eq!(fitted.status, Status::Error);
+        assert_eq!(fitted.presentation.scalars_truncated, 0);
     }
 
     /// The last byte that is not over: a cursor serializing to exactly
