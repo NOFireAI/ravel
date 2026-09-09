@@ -453,8 +453,24 @@ into a false green. When you write or edit any such script:
   on everything).
 - Never name a variable `status`, `path`, `argv`, or `PWD`: zsh reserves
   them, and assignment kills the loop with `read-only variable`.
-- Never pipe a gate through `grep`, `head`, or `tail`, and never append
-  `&& echo MARKER`: the pipeline's exit code masks the gate's.
+- Never pipe a gate OR A GUARD through `grep`, `head`, or `tail`, and never
+  append `&& echo MARKER`: the pipeline's exit code masks the real one. The
+  rule reads as being about gates and is not. On 2026-09-09 two sessions
+  broke it on `assert-fresh-merge-base.sh` within the same hour, both while
+  shortening its output: `guard 1556 | head -3` reported exit 0 on a branch
+  three commits behind, and `out=$(guard N 2>&1 | tail -1)` reported 0 for a
+  guard that was not in that checkout and had really exited 127. A guard
+  that reports fresh on a stale branch is worse than no guard, because it
+  retires the suspicion that would have caught it. In zsh, `$pipestatus`
+  holds every stage, so `guard N | tail -1` followed by
+  `code=${pipestatus[1]}` shortens the output without lying about the
+  result.
+- A plain `out=$(cmd)` DOES propagate cmd's status, including when `$?` is
+  read on the next line; measured, not recalled. The two forms that lose it
+  are `local o=$(cmd)`, where `local`'s own success becomes the status, and
+  any pipe. Do not restructure a working assignment believing otherwise: a
+  session diagnosed its pipe bug as an assignment bug and wrote the wrong
+  mechanism into its notes.
 
 ## Fleet executor environment
 
