@@ -1,0 +1,48 @@
+{
+  "enabledPlugins": {
+    "cc-skills-golang@samber": false,
+    "chrome-devtools-mcp@claude-plugins-official": false
+  },
+  "skillOverrides": {
+    "claude-in-chrome": "off",
+    "dataviz": "off"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|MultiEdit|ScheduleWakeup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.claude/guards/pretooluse.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Checking guards"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.claude/guards/epic-status-nudge.mjs\" track",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PROJECT_DIR:-.}/.claude/guards/epic-status-nudge.mjs\" nudge",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

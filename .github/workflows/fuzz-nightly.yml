@@ -1,0 +1,269 @@
+name: fuzz-nightly
+
+# Coverage-guided cargo-fuzz lane for RSEG and RSPAN (issue #1312, nightly half).
+#
+# ci.yml's `fuzz` job runs stable-toolchain proptest mutation targets and
+# deliberately stays off cargo-fuzz/libfuzzer, which need a nightly toolchain's
+# sanitizer/coverage instrumentation flags (see the comment on that job). That
+# decision stands: this workflow does not touch it and does not run on push or
+# pull_request. It gives the six `cargo fuzz` targets under
+# crates/ravel-segment/fuzz/ and crates/ravel-rspan/fuzz/ a home instead, since
+# neither of those directories' targets ever executed before this lane existed.
+#
+# Both fuzz crates carry an empty `[workspace]` table so cargo-fuzz's
+# nightly-only instrumentation flags never leak into the main workspace build;
+# the trade-off is that `cargo check --workspace` at the repo root silently
+# skips them, so a parent-crate signature change breaks a fuzz target with
+# nothing noticing until someone happens to build it by hand. The "Check fuzz
+# workspaces compile" step below is the fix: it runs `cargo check` against
+# each fuzz crate by manifest path on the stable toolchain (no cargo-fuzz
+# instrumentation involved) so that drift fails a lane instead of rotting.
+#
+# NOT a required check and NOT gated on any PR: triggers are `schedule` and
+# `workflow_dispatch` only, matching the house style in quickstart-published.yml
+# and bench-s3.yml.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily, 05:21 UTC. Off the :00/:30 mark and distinct from every other
+    # nightly/weekly cron in this directory (0 3, 17 4 Mon, 17 3, 13 2, 29 6
+    # Sun, 43 5, 37 4) so this lane's run does not contend with another one.
+    - cron: "21 5 * * *"
+
+# Workflow-level floor: `contents: read`, what actions/checkout needs and
+# nothing more. `issues: write` is NOT granted here. It is granted on the
+# `report` job alone, which is the only job that files or comments on the
+# tracking issue and the only job that runs no third-party code. See the
+# comment on the `fuzz` job for why that split matters in this lane.
+permissions:
+  contents: read
+
+env:
+  ISSUE_LABEL: fuzz-nightly
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # Every step below executes third-party code with the job's token in the
+    # environment: a local composite action, `cargo install cargo-fuzz`, two
+    # `cargo check` runs and six libFuzzer targets, all of which run
+    # dependency build scripts, against adversarial input. So this job gets
+    # `contents: read` and nothing else. Filing the tracking issue needs
+    # `issues: write`, and that permission lives on the `report` job instead,
+    # which runs no third-party code at all. `persist-credentials: false` on
+    # the checkout below serves the same rule from the other side: the token
+    # must be neither readable on disk by that code nor powerful while it
+    # runs.
+    permissions:
+      contents: read
+    # `failed_targets` carries the space-separated names of the targets that
+    # broke, so the `report` job can name them instead of pointing at the log.
+    # It is empty whenever the job failed before or outside the fuzzing step,
+    # which the report body says explicitly rather than implying every target
+    # passed.
+    outputs:
+      failed_targets: ${{ steps.fuzz_targets.outputs.failed_targets }}
+    # Six targets budgeted at -max_total_time=60s each (6 minutes of actual
+    # fuzzing) plus cold nightly sanitizer-instrumented builds for two
+    # separate detached workspaces; 55 minutes leaves headroom under the hour
+    # without letting a hung target run indefinitely.
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # This job executes code against adversarial fuzz input and runs
+          # build scripts (cargo install/check/fuzz) before any scoped token
+          # exists. Do not persist the workflow token into local git config
+          # where those build scripts could read it.
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+
+      # Stable toolchain first (the repo's rust-toolchain.toml pin, picked up
+      # from the checkout root): proves the two detached fuzz workspaces still
+      # compile against current parent-crate signatures before spending any
+      # time on nightly sanitizer builds. This is deliverable 3: a signature
+      # change in ravel-segment or ravel-rspan fails here instead of only
+      # showing up the day someone happens to build a fuzz target by hand.
+      - name: Check fuzz workspaces compile
+        run: |
+          cargo check --manifest-path crates/ravel-segment/fuzz/Cargo.toml
+          cargo check --manifest-path crates/ravel-rspan/fuzz/Cargo.toml
+
+      # cargo-fuzz needs a nightly toolchain for libFuzzer's sanitizer/coverage
+      # instrumentation flags; the repo's own rust-toolchain.toml pin stays
+      # stable (see ci.yml's fuzz job), so nightly is installed here rather
+      # than made the default.
+      - name: Install nightly toolchain
+        run: rustup toolchain install nightly --profile minimal
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            crates/ravel-segment/fuzz -> target
+            crates/ravel-rspan/fuzz -> target
+
+      # All six targets run in one step so a crash in one does not skip the
+      # rest: six separate steps would each carry the default success()
+      # condition, so the first red target would leave the other five
+      # unfuzzed that night. Each target's exit code is captured on the same
+      # line (never read from $? after an if/fi, which reports the if), no
+      # command is piped or chained past its status, and the step fails at
+      # the end naming every target that broke so the log does not have to be
+      # opened to learn which. The five ravel-segment targets share one
+      # detached fuzz workspace; decode_rspan has its own. Each run reuses the
+      # checked-in seed corpus under fuzz/corpus/<target>/.
+      #
+      # -timeout=25 bounds a SINGLE input, which -max_total_time does not:
+      # without it libFuzzer's per-input default is 1200s, so one hanging
+      # input pins its target open until the job's own timeout-minutes kills
+      # the whole job, and a job killed by its timeout runs no later step, so
+      # the remaining targets never fuzz. The `report` job still files an
+      # issue in that case, because a timed-out job reports its result as
+      # `failure`; it just has no target list to name. A hang is exactly what
+      # a fuzzer exists to find, so a silent one is the worst failure mode.
+      # 25s is well under each target's 60s -max_total_time (a per-input
+      # timeout at or above 60 could never fire before the target finished,
+      # making it decorative)
+      # and orders of magnitude above the sub-millisecond steady-state and
+      # cold first-execution decode times these RSEG/RSPAN decoders show
+      # locally, so a legitimately slow input on a loaded shared runner does
+      # not trip it and file a false decode-bug issue. rss_limit_mb is left
+      # at libFuzzer's 2048MB default on purpose: unlike the per-input
+      # timeout default, that default already fires well inside the runner's
+      # memory and reports an unbounded-allocation OOM as a crash, so it is
+      # already protective; raising it would let the kernel OOM killer end
+      # the process silently, and lowering it without evidence would file
+      # false OOM reports.
+      - name: Fuzz all targets
+        id: fuzz_targets
+        run: |
+          failed=""
+          run_target() {
+            dir="$1"
+            target="$2"
+            echo "::group::fuzz $target"
+            code=0
+            ( cd "$dir" && cargo +nightly fuzz run "$target" -- -max_total_time=60 -timeout=25 ) || code=$?
+            echo "::endgroup::"
+            if [ "$code" -ne 0 ]; then
+              echo "::error::fuzz target $target failed (exit $code)"
+              failed="$failed $target"
+            fi
+          }
+          run_target crates/ravel-segment/fuzz parse_footer
+          run_target crates/ravel-segment/fuzz decode_catalog_v4
+          run_target crates/ravel-segment/fuzz decode_catalog_matching_v4
+          run_target crates/ravel-segment/fuzz decode_catalog_v5
+          run_target crates/ravel-segment/fuzz sparse_probe
+          run_target crates/ravel-rspan/fuzz decode_rspan
+          if [ -n "$failed" ]; then
+            echo "failed_targets=${failed# }" >> "$GITHUB_OUTPUT"
+            echo "Fuzz targets failed:$failed"
+            exit 1
+          fi
+          echo "All six fuzz targets passed."
+
+  # Failure routing, deliberately a separate job: this is the only place that
+  # needs `issues: write`, and it is the only job that runs no third-party
+  # code. It checks nothing out, installs nothing and uses no action, so the
+  # write token is never in the environment of a build script or a libFuzzer
+  # target. `gh` is preinstalled on ubuntu-latest and the issue body is built
+  # inline, so no `uses:` step is required here.
+  report:
+    needs: fuzz
+    # `needs: fuzz` alone would skip this job, because a dependent of a failed
+    # job is skipped by default. The condition has to be explicit, and it has
+    # to name a status-check function: an `if:` containing none of
+    # always()/failure()/cancelled() still gets an implicit success() ANDed in,
+    # which would never be true here. Testing the job result rather than using
+    # a step-level `if: failure()` is also what covers `fuzz` being killed by
+    # its own timeout-minutes: such a job reports `failure` but runs no
+    # further step of its own. The condition deliberately does not fire on
+    # 'cancelled': a cancellation is human-initiated, not a fuzz finding.
+    if: ${{ always() && needs.fuzz.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    # Serialize THIS job only, across runs, so the read-then-create below
+    # cannot race: a scheduled run and a workflow_dispatch run failing close
+    # together would otherwise both see an empty issue list and both create
+    # one, breaking the single-issue dedup contract. Scoped to `report`
+    # rather than declared at workflow level (as this used to be) so a
+    # second run's `fuzz` job is free to start and fuzz concurrently; only
+    # the two runs' issue-filing has to queue.
+    # cancel-in-progress stays false so a run already filing is not cancelled
+    # by a newer failing run; the newer run waits for it. Note what this does
+    # and does not guarantee: GitHub keeps at most ONE pending run per
+    # concurrency group, so if a third run arrives while one is running and
+    # one is pending, the older pending run is cancelled. So the queue does
+    # not by itself guarantee every failing run gets to file; what does is the
+    # per-marker dedup below, since whichever run survives re-reads the open
+    # issues and comments on or creates the tracking issue as needed.
+    concurrency:
+      group: fuzz-nightly-report
+      cancel-in-progress: false
+    steps:
+      # A red run files a labelled tracking issue linking this run, or
+      # comments on the existing open one so a recurring failure does not open
+      # a fresh issue every night. Modelled on quickstart-published.yml's
+      # "File or update the tracking issue" step.
+      - name: File or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so gh has no git remote to infer the
+          # repository from and every call would fail without this.
+          GH_REPO: ${{ github.repository }}
+          FAILED_TARGETS: ${{ needs.fuzz.outputs.failed_targets }}
+          # Deterministic (no run id): both the issue title and the dedup
+          # key, so a recurring failure maps to one open issue instead of one
+          # per night.
+          MARKER: "Nightly cargo-fuzz lane is red"
+        run: |
+          # GITHUB_SERVER_URL, GITHUB_REPOSITORY and GITHUB_RUN_ID identify the
+          # whole run, not the job, so they hold the same values here as they
+          # did in the fuzz job and the link is unchanged by the split.
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if [ -n "$FAILED_TARGETS" ]; then
+            what="- Failing targets: $FAILED_TARGETS"
+          else
+            what="- No failing target was reported, so the job broke before or
+            outside the fuzzing step: the \"Check fuzz workspaces compile\"
+            check, a toolchain or cargo-fuzz install, the cache step, or the
+            job hitting its 55-minute timeout."
+          fi
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "Nightly cargo-fuzz lane failures (RSEG/RSPAN, issue #1312)" \
+            2>/dev/null || true
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
+          body=$(cat <<EOF
+          The nightly \`cargo-fuzz\` lane failed.
+
+          - Run: $run_url
+          $what
+          - Targets in this lane: parse_footer, decode_catalog_v4,
+            decode_catalog_matching_v4, decode_catalog_v5, sparse_probe
+            (crates/ravel-segment/fuzz), decode_rspan (crates/ravel-rspan/fuzz)
+
+          This lane runs the six cargo-fuzz targets that decode RSEG and RSPAN
+          against untrusted bytes; every rejection must be a typed error, never a
+          panic. A failure here means either a target found a real decode bug, or
+          the "Check fuzz workspaces compile" step caught a parent-crate signature
+          change the two detached fuzz workspaces did not follow.
+
+          See the run's log for the crashing input and the stack trace.
+          EOF
+          )
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+          fi

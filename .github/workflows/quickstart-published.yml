@@ -1,0 +1,428 @@
+name: quickstart-published
+
+# Weekly published-image README check (ADR-0081 decision 8).
+#
+# The per-PR `quickstart` job in ci.yml proves the README matches the code at
+# HEAD, by building the PR's own binaries into an image and running the marked
+# README command blocks against it. It CANNOT prove the README matches the image
+# a reader actually pulls, because a merged doc change ships before the next
+# release tag does. This lane closes that window: it runs the same
+# `scripts/check-readme-commands.sh README.md` against the PUBLISHED images, on a
+# schedule, so a drift between main's README and the shipped image surfaces here
+# rather than in a stranger's terminal.
+#
+# It runs the check TWICE (ADR-0081 decisions 8 and 1), as two independent matrix
+# legs so a failure names exactly which one broke:
+#   - `latest`         -- RAVEL_IMAGE=ghcr.io/nofireai/ravel-server:latest, the
+#                         tag a reader following the README pulls.
+#   - `pinned-default` -- the compose file's own pinned default, unmodified
+#                         (RAVEL_IMAGE left unset). This is the one configuration
+#                         nothing else exercises: the per-PR job overrides
+#                         RAVEL_IMAGE with the image it just built, and the
+#                         `latest` leg overrides it with :latest, so a stale pin
+#                         in deploy/docker-compose/ravel.yml (a tag that no longer
+#                         resolves) would otherwise first fail in a reader's first
+#                         command. It fails here instead.
+# `fail-fast: false` keeps both legs running so a green `latest` never masks a red
+# pinned default, and each leg files its own tracking issue.
+#
+# NOT a required check and NOT gated on any PR: triggers are `schedule` and
+# `workflow_dispatch` ONLY, never push / pull_request / merge_group, so this lane
+# can never block a merge (house style, matching bench-s3.yml). Unlike the per-PR
+# job it builds nothing -- no cargo, no Dockerfile.prebuilt, no image assembly. It
+# pulls the published images and brings up the same compose stack the reader runs.
+#
+# ---------------------------------------------------------------------------
+# THE ONE LEGITIMATE RED STATE (read this if you are looking at a red run at 3am)
+# ---------------------------------------------------------------------------
+# There is exactly one way this lane goes red that is NOT a defect, and the lane
+# cannot tell it apart from a real one (ADR-0081 decision 8): between merging a
+# README that documents unreleased behavior and cutting the release, `:latest`
+# genuinely does not do what the README says, so the `latest` leg fails honestly.
+#
+# The policy that resolves it, quoted from decision 8:
+#
+#   "main's README documents released behavior. A change that documents behavior
+#    not yet on a release tag either waits for the tag or ships with those blocks
+#    unmarked until it lands. If the weekly lane goes red, the remediation is to
+#    cut the release or correct the README, never to wait it out."
+#
+# So: do NOT disable this lane, do NOT wait for it to clear on its own. Either cut
+# the release that publishes the documented behavior, or correct main's README to
+# describe what the current release actually does. A `latest` leg that is red
+# because main documents unreleased behavior is main's README being out of policy,
+# not this lane being noisy. (The `pinned-default` leg has no such window: it runs
+# the compose file's committed tag, so a red there is always a real defect -- a
+# stale pin or a genuine README/image mismatch.)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Sunday 06:29 UTC. Off-peak (weekend morning) and off the :00 mark,
+    # matching bench-s3.yml's convention, and on a different day/time than that
+    # lane so the two scheduled runs do not contend. One run a week is enough to
+    # catch a README/published-image drift before a reader does.
+    - cron: "29 6 * * 0"
+
+# Workflow-level floor: `contents: read`, what actions/checkout needs and
+# nothing more (fuzz-nightly.yml pattern). `issues: write` is NOT granted
+# here: it is granted on the `report` job alone, the only job that files or
+# comments on the tracking issue and the only job that runs no third-party
+# code (no checkout, no compose bring-up, no telemetrygen). Every step of
+# `check-published` -- checkout, compose, telemetrygen, the README check --
+# runs with `contents: read` and nothing else.
+permissions:
+  contents: read
+
+env:
+  COMPOSE_FILE: deploy/docker-compose/ravel.yml
+  # The check script's readiness poll and marked blocks talk to the loopback
+  # port the compose stack publishes; the token is the demo tenant token the
+  # compose file configures. Mirrors the per-PR quickstart job's env exactly.
+  RAVEL_HTTP_BASE: http://127.0.0.1:4318
+  RAVEL_TENANT_TOKEN: demo-token
+  # RAVEL_READY_QUERY_URL has NO default in check-readme-commands.sh and hard
+  # errors when empty, so it is exported explicitly here. `gen` is the series
+  # telemetrygen emits deterministically (ADR-0081 D5); no host-metric name is
+  # guaranteed non-empty across both generators, so it is the only safe readiness
+  # query. Same value the per-PR quickstart job uses.
+  RAVEL_READY_QUERY_URL: http://127.0.0.1:4318/api/v1/query?query=gen
+  # Label carried by every tracking issue this lane files, and the key it dedups
+  # on. Constant across both legs.
+  ISSUE_LABEL: quickstart-published
+
+jobs:
+  check-published:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Every step below checks out the repo, pulls and runs published images,
+    # and runs telemetrygen containers against them: none of that needs to
+    # write anything. Filing the tracking issue needs `issues: write`, and
+    # that permission lives on the `report` job instead, which runs no
+    # third-party code at all.
+    permissions:
+      contents: read
+    strategy:
+      # Never let a green leg cancel or hide a red one: both runs must complete
+      # and be diagnosable on their own.
+      fail-fast: false
+      matrix:
+        include:
+          # The tag a reader pulls when they follow the README.
+          - name: latest
+            image: ghcr.io/nofireai/ravel-server:latest
+          # The compose file's own pinned default, unmodified: RAVEL_IMAGE stays
+          # unset (empty string here), so `${RAVEL_IMAGE:-<pin>}` in ravel.yml
+          # resolves to the committed pin.
+          - name: pinned-default
+            image: ""
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Bring up the SAME compose stack the reader runs (ADR-0081 decisions 1-3),
+      # modelled on the per-PR quickstart job. `--pull always` forces the freshest
+      # published images so this lane tests what a reader actually pulls today,
+      # not a cached layer. The `latest` leg overrides RAVEL_IMAGE; the
+      # `pinned-default` leg leaves it unset so the compose file's pin is used.
+      - name: Bring up the compose stack
+        env:
+          RAVEL_IMAGE_OVERRIDE: ${{ matrix.image }}
+        run: |
+          if [ -n "$RAVEL_IMAGE_OVERRIDE" ]; then
+            echo "leg=${{ matrix.name }}: RAVEL_IMAGE=$RAVEL_IMAGE_OVERRIDE"
+            export RAVEL_IMAGE="$RAVEL_IMAGE_OVERRIDE"
+          else
+            echo "leg=${{ matrix.name }}: RAVEL_IMAGE unset, using the compose file's pinned default"
+          fi
+          docker compose -f "$COMPOSE_FILE" up -d --pull always
+
+      # Same bounded readiness loop as the per-PR quickstart job: poll /readyz
+      # until the server can serve, dumping compose logs and failing if it never
+      # comes up. A fixed sleep would race image-pull and startup time.
+      - name: Wait for ravel-server readiness
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS "${RAVEL_HTTP_BASE}/readyz" >/dev/null 2>&1; then
+              echo "ravel-server ready"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "::error::ravel-server did not become ready in time (leg=${{ matrix.name }})"
+          docker compose -f "$COMPOSE_FILE" logs --no-color || true
+          exit 1
+
+      # First of two telemetrygen steps: injects the deterministic `gen` metric
+      # series the readiness query and the marked README blocks assert on
+      # (ADR-0081 D5), alongside the collector's host metrics; the logs step
+      # below injects the deterministic log records the PromQL-over-logs block
+      # asserts on. --network host so 127.0.0.1:4318 resolves to the published
+      # loopback port. --rate 0 disables telemetrygen's default
+      # one-record-per-second-per-worker throttle so all 500 records burst out in
+      # seconds instead of 8m20s; the README assertions only require a non-empty
+      # result, so a burst satisfies them at least as easily as a trickle. Same
+      # step as the per-PR quickstart job.
+      - name: Generate deterministic telemetry with telemetrygen
+        run: |
+          docker run --rm --network host \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            metrics \
+            --otlp-http \
+            --otlp-endpoint 127.0.0.1:4318 \
+            --otlp-insecure \
+            --otlp-header 'Authorization="Bearer demo-token"' \
+            --metric-type Gauge \
+            --rate 0 \
+            --metrics 500
+
+      # Second telemetrygen step: injects deterministic LOG records so the
+      # README's PromQL-over-logs block (`sum by (job) (count_over_time(
+      # ravel_log_lines [5m]))`) has a log source to match against the PUBLISHED
+      # image. The collector's own internal-logs export is not a CI-usable source
+      # (its record count and timing depend on log level), so this lane supplies
+      # its own the same way it supplies the `gen` metric series. The resource
+      # `service.name` becomes the `job` label the query groups by
+      # (crates/ravel-query/src/log_series.rs). Mirrors the metrics step above,
+      # including --rate 0 to burst all 500 records instead of throttling to one
+      # per second.
+      - name: Generate deterministic logs with telemetrygen
+        run: |
+          docker run --rm --network host \
+            ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:latest \
+            logs \
+            --otlp-http \
+            --otlp-endpoint 127.0.0.1:4318 \
+            --otlp-insecure \
+            --otlp-header 'Authorization="Bearer demo-token"' \
+            --otlp-attributes 'service.name="quickstart-logs"' \
+            --rate 0 \
+            --logs 500
+
+      # The check itself: wait for a non-empty first query, then run every marked
+      # README block and assert its declared outcome (not its exit code). This is
+      # the whole point of the lane; a failure here is a README/published-image
+      # drift.
+      - name: Assert the README's marked command blocks
+        run: scripts/check-readme-commands.sh README.md
+
+      # Always capture logs on failure: a scheduled failure nobody can diagnose is
+      # a lane that gets disabled (ADR-0081 decisions 6 and 8). Same as the per-PR
+      # job.
+      - name: Dump compose logs on failure
+        if: failure()
+        run: docker compose -f "$COMPOSE_FILE" logs --no-color || true
+
+      - name: Tear down the compose stack
+        if: always()
+        run: docker compose -f "$COMPOSE_FILE" down -v || true
+
+  # Failure routing (ADR-0081 decision 8), deliberately a separate job on the
+  # fuzz-nightly.yml pattern: this is the only place that needs
+  # `issues: write`, and it is the only job that runs no third-party code. It
+  # checks nothing out, brings up no compose stack and runs no telemetrygen
+  # container, so the write token is never in the environment of any of that.
+  #
+  # `check-published` is a two-leg matrix (latest / pinned-default), and a
+  # matrix job's own `outputs:` collapse to a single last-writer-wins value
+  # across legs (ADR-0037 decision 13 hits the same wall for a build matrix),
+  # so which leg(s) failed cannot travel through a job output here. Instead
+  # this job asks the Actions API directly for the per-leg job conclusions
+  # of THIS run, which is unambiguous regardless of how many legs failed.
+  report:
+    needs: check-published
+    # `needs: check-published` alone would skip this job, because a dependent
+    # of a failed job is skipped by default. The condition has to be explicit
+    # and has to name a status-check function: an `if:` containing none of
+    # always()/failure()/cancelled() still gets an implicit success() ANDed
+    # in, which would never be true here. Testing the job's `result` rather
+    # than the old step-level `if: failure()` inside `check-published` is
+    # also what covers a leg's job being killed by the workflow's own
+    # timeout-minutes: such a job reports `failure` but runs no further step
+    # of its own, so the old in-job step never ran on exactly that failure
+    # mode. Deliberately does not fire on 'cancelled': a cancellation is
+    # human-initiated, not a quickstart regression.
+    if: ${{ always() && needs.check-published.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A job-level permissions block REPLACES the defaults: every scope not
+    # listed is set to `none`. This job files the tracking issue (issues:
+    # write) AND reads this run's per-leg job conclusions from the Actions API
+    # (repos/.../actions/runs/ID/jobs), an actions:read endpoint, so both
+    # scopes are listed. Matches publish-images.yml, which declares both
+    # contents:read and actions:read for its own Actions API call on this same
+    # public repository. (The fuzz-nightly and supply-chain-nightly report
+    # jobs need only issues:write: each calls gh issue/label endpoints alone
+    # and no Actions API, because a matrix job's leg conclusions are only a
+    # concern here.)
+    permissions:
+      issues: write
+      actions: read
+    # Serialize THIS job only, across runs, so the read-then-create below
+    # cannot race: two runs (e.g. the weekly schedule and a manual dispatch)
+    # failing close together would otherwise both see an empty issue list and
+    # both create one for the same leg, breaking the single-issue dedup
+    # contract. The group is a per-workflow literal with no run id, so runs
+    # serialize: a newer failing run's report waits for an in-flight one to
+    # finish. cancel-in-progress stays false so a run already filing is not
+    # cancelled by a newer one. Note what this does and does not guarantee:
+    # GitHub keeps at most ONE pending run per concurrency group, so if a
+    # third run arrives while one is running and one is pending, the older
+    # pending run is cancelled. So the queue does not by itself guarantee
+    # every failing run gets to file; what does is the per-marker dedup below,
+    # since whichever run survives re-reads the open issues and comments on or
+    # creates the tracking issue as needed.
+    concurrency:
+      group: quickstart-published-report
+      cancel-in-progress: false
+    steps:
+      # A red leg files a labelled tracking issue linking this run, or
+      # comments on the existing open one for this leg so an ongoing breakage
+      # does not open a fresh issue every week. Per-leg, so the title names
+      # which of the two runs (latest / pinned-default) failed. Which leg(s)
+      # failed is read from the run's own job list (see the job comment
+      # above), not from a job output.
+      - name: File or update the tracking issue(s)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so gh has no git remote to infer the
+          # repository from and every call would fail without this.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "Weekly published-image quickstart README check failures (ADR-0081 D8)" \
+            2>/dev/null || true
+
+          # Every job of this run, once, reused by both legs below. Keep the
+          # API's own exit code: a bare `|| jobs_json='{"jobs":[]}'` fallback
+          # would turn an auth, rate-limit or network failure into an empty
+          # jobs list, so both legs below would find no failure, skip, and this
+          # step would exit 0 having filed NOTHING -- the silent no-report
+          # fault issue #1360 exists to remove, and #1360 requires that where
+          # the job dies before routing the body says so rather than reading as
+          # everything passing (publish-images.yml's ci.yml gate documents the
+          # identical trap for its own Actions API call). This endpoint returns
+          # a single OBJECT, not an array, so it takes no `--paginate` flag:
+          # gh concatenates page objects rather than merging them, and with
+          # more than one page the per-leg filter below would emit one line per
+          # page and match nothing. This lane has three jobs, one page; the
+          # explicit per_page=100 leaves headroom without paginating.
+          api_rc=0
+          jobs_json=$(gh api "repos/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100") \
+            || api_rc=$?
+
+          # Set when the per-leg conclusions could not be attributed to any leg
+          # even though this job runs only on check-published.result=='failure'
+          # (the `if:` above): either the API call failed, or it succeeded but
+          # no leg name matched -- a renamed leg, an added job `name:`, or a
+          # matrix key reorder drifting from the hardcoded list below. Either
+          # way the work job failed and we must not exit 0 silently.
+          file_run_level=0
+          run_level_reason=""
+          if [ "$api_rc" -ne 0 ]; then
+            file_run_level=1
+            run_level_reason="the Actions run-jobs API call failed (gh exit $api_rc), so the per-leg conclusions could not be read"
+          fi
+
+          matched_failure=0
+          for leg in latest pinned-default; do
+            # Only attribute per leg when the API response was usable.
+            if [ "$api_rc" -ne 0 ]; then
+              break
+            fi
+            # The matrix job's display name is "check-published (<name>, ...)",
+            # carrying every matrix key in declaration order (name, then
+            # image); matching a prefix on "(<leg>" is robust to the exact
+            # image value that follows it, including the pinned-default leg's
+            # empty one.
+            conclusion=$(printf '%s' "$jobs_json" | jq -r --arg leg "$leg" \
+              '[.jobs[] | select(.name | startswith("check-published (" + $leg)) | .conclusion] | .[0] // empty')
+            if [ "$conclusion" != "failure" ]; then
+              continue
+            fi
+            matched_failure=1
+
+            # Deterministic (no run id): both the issue title and the dedup
+            # key, so a recurring failure for the same leg maps to one open
+            # issue. `gh --jq` takes the filter as its only argument and
+            # accepts none of jq's own variable flags, so the leg's marker
+            # reaches the filter as `env.MARKER`; exported inside the loop
+            # because it differs per leg (fuzz-nightly.yml and
+            # supply-chain-nightly.yml set the same variable in step `env:`,
+            # theirs being one constant per workflow).
+            export MARKER="Weekly quickstart-published lane is red ($leg image)"
+            existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+              --json number,title \
+              --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
+            body=$(cat <<EOF
+          The weekly \`quickstart-published\` lane failed for the **$leg** image.
+
+          - Run: $run_url
+          - Compose file: \`deploy/docker-compose/ravel.yml\`
+          - Check: \`scripts/check-readme-commands.sh README.md\`
+
+          This lane runs the README's marked command blocks against the PUBLISHED
+          image (ADR-0081 decision 8), so a failure means main's README does not
+          match the image it is claiming to describe.
+
+          **Before assuming a defect**, note the one legitimate red state for the
+          \`latest\` leg (ADR-0081 D8): between merging a README that documents
+          unreleased behavior and cutting the release, \`:latest\` genuinely does
+          not match. The policy is that *main's README documents released
+          behavior*, and the remediation is to **cut the release or correct the
+          README, never to wait it out**. The \`pinned-default\` leg has no such
+          window: a red there is always a real defect (a stale pin in the compose
+          file, or a genuine README/image mismatch).
+
+          See the \`check-published ($leg, ...)\` job's own log, including its
+          "Dump compose logs on failure" step, for stack logs. This job runs no
+          checkout of its own and cannot re-run that step.
+          EOF
+            )
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+              echo "commented on existing issue #$existing ($leg)"
+            else
+              gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+            fi
+          done
+
+          # The API call succeeded but no leg matched a failure, while this job
+          # runs only when check-published failed: the leg names no longer line
+          # up with the matrix job display names. Attribute it at run level
+          # rather than exiting 0 silently (the F1/F4 guard).
+          if [ "$api_rc" -eq 0 ] && [ "$matched_failure" -eq 0 ]; then
+            file_run_level=1
+            run_level_reason="check-published failed but no leg (latest, pinned-default) matched a failing job by name, so the failure could not be attributed to a leg"
+          fi
+
+          # Run-level fallback: never fall through to filing nothing. Its own
+          # deterministic marker (no run id) dedups it like the per-leg issues.
+          if [ "$file_run_level" -eq 1 ]; then
+            export MARKER="Weekly quickstart-published lane failed but per-leg conclusions were unreadable"
+            existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+              --json number,title \
+              --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
+            body=$(cat <<EOF
+          The weekly \`quickstart-published\` lane failed, but this report job
+          could not read the per-leg job conclusions to attribute it to the
+          \`latest\` / \`pinned-default\` leg: $run_level_reason.
+
+          - Run: $run_url
+          - Compose file: \`deploy/docker-compose/ravel.yml\`
+          - Check: \`scripts/check-readme-commands.sh README.md\`
+
+          The \`check-published\` matrix job failed (this job runs only on that
+          result), so at least one leg is red. Open the run above and read the
+          per-leg \`check-published (...)\` jobs directly, including each leg's
+          "Dump compose logs on failure" step, to see which leg broke and why.
+          EOF
+            )
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+              echo "commented on existing run-level issue #$existing"
+            else
+              gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+            fi
+          fi

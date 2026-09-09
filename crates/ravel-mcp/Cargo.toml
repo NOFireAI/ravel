@@ -1,0 +1,35 @@
+[package]
+name = "ravel-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rmcp = { workspace = true }
+ravel-types = { workspace = true }
+ravel-query = { workspace = true }
+# ravel-sql is not in [workspace.dependencies] (it is deliberately a
+# version-pinned path dependency in every crate that uses it, so each
+# consumer picks its own feature set); this task's scope covers only adding
+# the `ravel-mcp` member and the `rmcp` workspace dependency to the root
+# manifest, so this follows the same path-dependency convention
+# services/ravel-server and services/ravel-cli already use.
+ravel-sql = { path = "../ravel-sql", version = "0.15.0", features = ["pin-codec"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+# Only the cursor round-trip test names this: it builds a `SegmentPin` with
+# every field non-default, which means a non-nil `Uuid`. The pin's
+# `SegmentLevel` comes from `ravel_sql`, which re-exports it beside
+# `SegmentPin`, so no `ravel-catalog` dependency is needed here.
+uuid = { workspace = true }
+proptest = { workspace = true }

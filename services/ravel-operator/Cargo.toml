@@ -1,0 +1,70 @@
+[package]
+name = "ravel-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "ravel-operator"
+path = "src/main.rs"
+
+[dependencies]
+kube = { workspace = true }
+# unstable-runtime-stream-control gates Controller::for_stream, used in
+# controller::run to feed the primary RavelCluster watch through a
+# predicate_filter that drops status-only updates (generation unchanged). It is
+# a cargo feature only, adds no new external crate, and does not require a
+# RUSTFLAGS cfg.
+kube-runtime = { workspace = true, features = ["unstable-runtime-stream-control"] }
+k8s-openapi = { workspace = true }
+schemars = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+ravel-tracing-export = { workspace = true }
+thiserror = { workspace = true }
+# Validates spec.gc horizon strings at render time using the same parser the
+# server flags accept, so an invalid duration is a typed render error instead of
+# a flag the maintain pod rejects at startup (#1083). Already a workspace pin;
+# adds no new external crate.
+humantime = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+# sys/auth reconciliation (ADR-0072 decision 4, #897): the operator is the
+# first in-process writer of the durable bearer-token map when a
+# deploymentKeySecretRef is configured. Already a workspace pin; adds no new
+# external crate.
+ravel-catalog = { workspace = true }
+# TenantId/TenantHashScheme/Signal for the shardOverrides reconcile step
+# (#147, ADR-0052/ADR-0076 decision 2): computes a per-cluster tenant hash
+# explicitly rather than relying on the global ambient scheme, since one
+# operator process may reconcile several RavelClusters with different
+# deployment-key configurations concurrently. Already a workspace pin (used
+# by ravel-catalog and ravel-cli); adds no new external crate.
+ravel-types = { workspace = true }
+# Builds the S3 backend sys/auth reconciliation reads and writes, from the
+# same spec.storage.s3 fields ravel-server itself uses. Already a workspace
+# pin; adds no new external crate.
+ravel-object-store = { workspace = true }
+hex = { workspace = true }
+# Stable change-detection hashing for the qualified-input hash and the
+# per-tier secrets checksum (#36 finding 3). std's DefaultHasher is not stable
+# across Rust releases, so a toolchain upgrade would re-run qualification and
+# roll every tier Deployment for unchanged inputs. blake3 is a fixed algorithm,
+# so the hash depends only on the inputs. Already a workspace pin; adds no new
+# external crate.
+blake3 = { workspace = true }
+# rustls 0.23 crypto-provider selection (main.rs). kube's rustls-tls feature
+# below pins `ring`; ravel-object-store pulls `aws-lc-rs` transitively via the
+# workspace's own jsonwebtoken pin (root Cargo.toml: aws_lc_rs, chosen there to
+# avoid the `rsa` crate's RUSTSEC-2023-0071 timing side-channel). Both
+# providers end up linked into this one binary, and rustls refuses to guess
+# between them. Pinned to `ring` here, matching kube's existing selection, so
+# this is the only crate whose Cargo.toml needs to change.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[lints]
+workspace = true
