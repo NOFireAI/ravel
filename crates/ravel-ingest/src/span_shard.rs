@@ -799,7 +799,70 @@ impl SpanShardActor {
     /// An empty buffer never reaches the semaphore or a spawned task: there is
     /// nothing to encode, and a flush identity pinned for nothing would burn a
     /// `seq` for no object.
-    async fn flush_tenant(&mut self, tenant: TenantId, buf: SpanTenantBuf, trigger: FlushTrigger) {
+    async fn flush_tenant(
+        &mut self,
+        tenant: TenantId,
+        mut buf: SpanTenantBuf,
+        trigger: FlushTrigger,
+    ) {
+        if buf.spans.is_empty() {
+            // Nothing to write, so no flush task runs: dropping `charges` here
+            // is the ADR-0069 refund for this (span-less) buffer.
+            drop(buf.charges);
+            // `waiters` is empty here by construction: the span router mints a
+            // strict-mode ack only for a shard that actually received spans
+            // (`by_shard` only holds shards with at least one span, and the ack
+            // rides that same shard message), so a span-less buffer has nobody
+            // to answer. If that ever changes, this returns without acking and
+            // the router reads the dropped oneshot as a dead shard; the assert
+            // makes the invariant loud rather than silently dropping.
+            debug_assert!(buf.waiters.is_empty());
+            return;
+        }
+        let raw_ns = self.clock.now_ns();
+        // The flush-open stamp is decided before the buffer is consumed and
+        // before `record_flush`: a refused flush never touched the store, so it
+        // must not be counted as a flush that happened, and (on the retryable
+        // arm) its rows must be re-buffered rather than dropped (ADR-1307
+        // finding 1).
+        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
+            Ok(ns) => ns,
+            Err(FlushClockError::InvalidReading(msg)) => {
+                // A grossly broken raw reading is fail-loud and non-retryable
+                // (`SegmentBuild`, 400): the buffer is dropped, `charges` refund
+                // on drop.
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(SpanWriteError::SegmentBuild(msg)));
+                return;
+            }
+            Err(FlushClockError::RegressionRefused(msg)) => {
+                // Already counted as `clock_regressions_refused` inside the
+                // helper; a clock regression is a transient server condition the
+                // next flush recovers from, so it is retryable (`Abandoned`, 503),
+                // not a client `SegmentBuild` (400) that would drop the buffered
+                // rows on a conformant exporter. The floor re-anchored to `raw_ns`
+                // inside the helper, so the next trigger stamps `raw_ns` and
+                // proceeds; exactly one flush is ever refused. Re-buffer the rows
+                // so that next trigger flushes them (finding 1): `charges` ride
+                // back with the buffer (the byte budget is not refunded, the bytes
+                // are still held), and the whole buffer -- spans and the trigger
+                // bookkeeping -- is preserved intact. Only `waiters` are acked here
+                // and taken out of the re-inserted buffer: a waiter left in it
+                // would be re-acked by the next flush against an already-answered
+                // oneshot. A strict-mode waiter that retries on the 503 re-enqueues
+                // spans this buffer still holds; the query-time dedup collapses the
+                // duplicate, so the retry is safe.
+                let waiters = std::mem::take(&mut buf.waiters);
+                self.ctx
+                    .ack_waiters(waiters, Err(SpanWriteError::Abandoned(msg)));
+                self.tenants.insert(tenant, buf);
+                return;
+            }
+        };
+        let tenant_hash = tenant.hash();
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let SpanTenantBuf {
             spans,
             min_ingest_ts_ns,
@@ -808,49 +871,11 @@ impl SpanShardActor {
             charges,
             ..
         } = buf;
-        if spans.is_empty() {
-            // Nothing to write, so no flush task runs: dropping `charges` here
-            // is the ADR-0069 refund for this (span-less) buffer.
-            drop(charges);
-            // `waiters` is empty here by construction: the span router mints a
-            // strict-mode ack only for a shard that actually received spans
-            // (`by_shard` only holds shards with at least one span, and the ack
-            // rides that same shard message), so a span-less buffer has nobody
-            // to answer. If that ever changes, this returns without acking and
-            // the router reads the dropped oneshot as a dead shard; the assert
-            // makes the invariant loud rather than silently dropping.
-            debug_assert!(waiters.is_empty());
-            return;
-        }
-        let tenant_hash = tenant.hash();
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let raw_ns = self.clock.now_ns();
-        // The flush-open stamp is decided before `record_flush`: a flush refused
-        // here never touched the store, so it must not be counted as a flush that
-        // happened (ADR-1307 finding 1).
-        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
-            Ok(ns) => ns,
-            Err(FlushClockError::InvalidReading(msg)) => {
-                self.metrics.record_abandoned_input_rejected();
-                self.ctx
-                    .ack_waiters(waiters, Err(SpanWriteError::SegmentBuild(msg)));
-                return;
-            }
-            Err(FlushClockError::RegressionRefused(msg)) => {
-                // Already counted as `clock_regressions_refused` inside the
-                // helper; a clock regression is a transient server condition the
-                // next flush recovers from, so it is retryable (`Abandoned`, 503),
-                // not a client `SegmentBuild` (400) that would drop the buffered
-                // rows on a conformant exporter.
-                self.ctx
-                    .ack_waiters(waiters, Err(SpanWriteError::Abandoned(msg)));
-                return;
-            }
-        };
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
             Err(msg) => {
+                // Defensive: `flush_open_ns` was already hour-bucket-validated;
+                // if it ever fails here it is fail-loud like InvalidReading.
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(waiters, Err(SpanWriteError::SegmentBuild(msg)));
