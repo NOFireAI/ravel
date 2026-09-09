@@ -1639,7 +1639,7 @@ impl LogsScanExec {
             let seg_stats = self
                 .column_stats
                 .as_ref()
-                .and_then(|stats| stats.segments.get(&segment_identity(seg)));
+                .and_then(|stats| stats.stat_for(&seg.content_hash, &segment_identity(seg)));
             let stamps = &seg.declared_column_stats;
             for (k, a) in acc.iter_mut().enumerate() {
                 if a.declined {
@@ -1749,7 +1749,7 @@ impl LogsScanExec {
         let stats = self.column_stats.as_ref()?;
         let mut total: u64 = 0;
         for seg in self.segments.iter() {
-            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
             let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             if !stat.dictionary_present {
                 return None;
@@ -1816,7 +1816,7 @@ impl LogsScanExec {
         let mut merged: HashMap<ScalarValue, u64> = HashMap::new();
         let mut null_count: u64 = 0;
         for seg in self.segments.iter() {
-            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
             let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             if !stat.dictionary_present {
                 return None;
@@ -1876,7 +1876,7 @@ impl LogsScanExec {
         let mut sum: i128 = 0;
         let mut non_null_count: u64 = 0;
         for seg in self.segments.iter() {
-            let seg_stats = stats.segments.get(&segment_identity(seg))?;
+            let seg_stats = stats.stat_for(&seg.content_hash, &segment_identity(seg))?;
             let stat = reconciled_column_stat(seg_stats, seg, &declared.key)?;
             let seg_sum = stat.sum?;
             sum = sum.checked_add(i128::from(seg_sum))?;
@@ -4795,6 +4795,7 @@ mod cstat_reconcile_tests {
         );
         let stats = Arc::new(LoadedColumnStats {
             segments,
+            by_content_hash: HashMap::new(),
             part_blake3: Vec::new(),
         });
         let backend: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

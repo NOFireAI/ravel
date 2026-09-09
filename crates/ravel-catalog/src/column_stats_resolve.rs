@@ -1,42 +1,54 @@
-//! Column-statistics load for the query-time metadata-only path (ADR-0850).
-//! Like [`crate::covering_postings::load_covering_postings`] it fetches HEAD,
-//! follows its `column_stats` ref, and GET/blake3-verifies/tenant-checks/
-//! decodes the object, but it fetches NO snapshot part: it needs only each
-//! part's blake3 (already carried in `SnapshotHead.parts`) to bind the stats
-//! object to this HEAD's part set. Every GET runs through the caller's
-//! accounted, semaphore-bounded funnel (issue #850), so the two GETs this
-//! path issues are counted and rate-limited exactly like every other query
-//! read. A query engine (`ravel-sql`'s `LogsScanExec`) consumes the result by
-//! joining its own resolved snapshot's live segments against
-//! [`LoadedColumnStats::segments`] by identity; a segment with no entry there
-//! (never built, build failed, or the segment postdates this stats object)
-//! has no exact statistics and the query must fall back to scanning it.
+//! Column-statistics load for the query-time metadata-only path (ADR-0850,
+//! ADR-0942, ADR-1413). Like [`crate::covering_postings::load_covering_postings`]
+//! it fetches HEAD and follows the statistics refs it carries, but it fetches
+//! NO snapshot part body: it needs only each part's blake3 (already carried in
+//! `SnapshotHead.parts`) to bind an object to this HEAD's part set. Every GET
+//! runs through the caller's accounted, semaphore-bounded funnel (issue #850).
+//!
+//! ADR-1413 splits `.cstat` per snapshot part: a covered part with a
+//! `column_stats` ref (field 7, v3) is read as its own small object, keyed by
+//! content hash. A part with no such ref, or whose v3 object fails to load,
+//! falls back to the whole-tenant v2 object (`SnapshotHead.column_stats_part`,
+//! field 13), then the whole-tenant v1 object (`SnapshotHead.column_stats`,
+//! field 11), then the part is simply left uncovered and the query scans it.
+//! This is ADR-0942's reader rule (a version mismatch, a `blake3` mismatch, or
+//! a decode failure subtracts coverage and never errors the query), applied
+//! per part instead of once for the whole tenant.
+//!
+//! # Two keying schemes, one result
+//!
+//! v1 records key by the five-field `EntryIdentity` tuple
+//! (`fold::entry_identity`); v2 and v3 records key by content hash
+//! (`SegmentRef::content_hash` / `SnapshotEntry::content_hash`, ADR-0942),
+//! carried in the same `ColumnStatsSegment.writer_id` slot at 32 bytes instead
+//! of 16. [`LoadedColumnStats`] carries both maps; [`LoadedColumnStats::stat_for`]
+//! checks the content-hash map first (so a part with a per-part v3 or a
+//! whole-tenant v2 hit wins) and falls back to the identity map (v1) so
+//! `ravel-sql` need not know which version answered.
 //!
 //! # Degrade-to-`None`, one loud exception
 //!
-//! Column statistics are an OPTIONAL metadata artifact, so every failure
-//! short of an isolation breach degrades to `Ok(None)` and the query scans:
-//! no HEAD yet, no column-stats ref, any GET error, a blake3 mismatch, a
-//! decode error, or a part-binding mismatch against the current HEAD's parts.
-//! One of those degrades is not silent: a DECODE failure on the object HEAD
-//! actually references means the fold wrote an object the reader cannot open,
-//! so [`fetch_stats_object`] surfaces it as [`FetchOutcome::DecodeRefused`]
-//! (rather than folding it into a bare `None`) for the caller to log once and
-//! count. The query still scans; only its visibility changes (issue #1400).
+//! Column statistics are an OPTIONAL metadata artifact, so every failure short
+//! of an isolation breach degrades: no HEAD yet, no ref at all, any GET error,
+//! a blake3 mismatch, a decode error, or a part-binding mismatch. One of those
+//! degrades is not silent: a DECODE failure on an object HEAD (or a covered
+//! part) actually references means the fold wrote an object the reader cannot
+//! open, so the fetch path surfaces it as [`FetchOutcome::DecodeRefused`]
+//! (rather than folding it into a bare miss) for the caller to log once and
+//! count (issue #1400). The query still scans; only its visibility changes.
 //! `decode_column_stats` does not itself check part-binding against a
-//! caller-supplied part list (unlike `decode_postings`, which takes the
-//! expected part_blake3 as an argument); this loader performs that check
-//! itself, exactly as
+//! caller-supplied part list (unlike `decode_postings`); this loader performs
+//! that check itself, exactly as
 //! [`crate::column_stats_build::decode_previous_column_stats`] does on the
-//! fold side. The only two loud exceptions are a genuinely unparseable HEAD
-//! (a real catalog defect, not an optional artifact) and a column-stats
-//! object declaring a foreign `tenant_hash` (an ADR-0050 §2 isolation
-//! breach): neither is absorbed into a silent degrade.
+//! fold side. The only two loud exceptions are a genuinely unparseable HEAD (a
+//! real catalog defect, not an optional artifact) and a column-stats object
+//! declaring a foreign `tenant_hash` (an ADR-0050 §2 isolation breach): neither
+//! is absorbed into a silent degrade.
 
 use std::collections::HashMap;
 
 use prost::Message;
-use ravel_proto::catalog::v1::ColumnStatsSegment;
+use ravel_proto::catalog::v1::{ColumnStatsSegment, SnapshotPartRef};
 use ravel_types::{Signal, TenantHash};
 
 use crate::EntryIdentity;
@@ -46,18 +58,23 @@ use crate::snapshot_format::{
 };
 
 /// The owned column-statistics inputs a query-time metadata-only plan needs:
-/// exact per-segment statistics keyed by the same
-/// `(ingest_hour_bucket, shard, writer_id, writer_epoch, writer_seq)`
-/// identity `fold::entry_identity` uses, so a resolved snapshot's live
-/// segments can be looked up directly with no ordinal bookkeeping.
-#[derive(Clone, Debug)]
+/// exact per-segment statistics, assembled from every covered part a query's
+/// window touches. v1 (whole-object, tuple-keyed) records live in `segments`;
+/// v2 (whole-object) and v3 (per-part) records, both content-hash-keyed, live
+/// in `by_content_hash`. A live segment absent from both has no exact
+/// statistics and the query scans it.
+#[derive(Clone, Debug, Default)]
 pub struct LoadedColumnStats {
-    /// Every segment this column-stats object carries an entry for, keyed by
-    /// identity. A live segment absent from this map has no exact
-    /// statistics.
+    /// v1 records, keyed by the same
+    /// `(ingest_hour_bucket, shard, writer_id, writer_epoch, writer_seq)`
+    /// identity `fold::entry_identity` uses.
     pub segments: HashMap<EntryIdentity, ColumnStatsSegment>,
-    /// The covered parts' blake3 hashes, in `SnapshotHead.parts` order (the
-    /// binding this loader verifies before returning `Some`).
+    /// v2 and v3 records, keyed by content hash (`SegmentRef::content_hash`,
+    /// ADR-0942).
+    pub by_content_hash: HashMap<[u8; 32], ColumnStatsSegment>,
+    /// The covered parts' blake3 hashes this load was assembled for, in
+    /// `SnapshotHead.parts` order (the window a cache entry built from this
+    /// load remains valid against).
     pub part_blake3: Vec<[u8; 32]>,
 }
 
@@ -93,7 +110,8 @@ pub fn unique_column_stat<'a>(
 impl LoadedColumnStats {
     /// The exact byte weight this object charges against the catalog's
     /// column-statistics cache budget (issue #905): the sum of every held
-    /// segment's encoded protobuf length plus 32 bytes per covered part hash.
+    /// segment's encoded protobuf length (both maps) plus 32 bytes per covered
+    /// part hash.
     ///
     /// It counts the decoded `.cstat` payload itself, the term that scales with
     /// a tenant's declared typed columns times its live segments and with the
@@ -109,53 +127,91 @@ impl LoadedColumnStats {
             .segments
             .values()
             .map(|segment| segment.encoded_len() as u64)
-            .sum();
+            .sum::<u64>()
+            + self
+                .by_content_hash
+                .values()
+                .map(|segment| segment.encoded_len() as u64)
+                .sum::<u64>();
         let part_bytes = self.part_blake3.len() as u64 * 32;
         segment_bytes + part_bytes
     }
+
+    /// The exact statistics for a live segment, preferring the content-hash
+    /// keyed record (a per-part v3 object or the whole-tenant v2 object,
+    /// ADR-0942) and falling back to the identity-keyed v1 record. Returns
+    /// `None` when neither map carries an entry: the segment has no exact
+    /// statistics and the caller must scan it.
+    pub fn stat_for(
+        &self,
+        content_hash: &[u8; 32],
+        identity: &EntryIdentity,
+    ) -> Option<&ColumnStatsSegment> {
+        self.by_content_hash
+            .get(content_hash)
+            .or_else(|| self.segments.get(identity))
+    }
 }
 
-/// The column-stats object the current folded HEAD points at, resolved from
-/// HEAD alone (one GET) without yet fetching the object itself. Splitting the
-/// load in two lets a caller consult a reuse cache keyed by what actually
-/// identifies the resolved object -- its content hash (`blake3`) plus the
-/// HEAD's covered part set (`expected_part_blake3`, the binding a stale stats
-/// object fails) -- and skip the second GET when both still match a cached
-/// entry. A changed fold produces a different HEAD, hence a different `blake3`
-/// or part set, so it always misses and re-resolves (issue #888).
+/// A resolved reference to one column-statistics object: its key, content
+/// hash, and the part set it must be bound against. Shared shape for all
+/// three object kinds (v1 field 11, v2 field 13, v3 field 7 on one part) --
+/// only how each is built from HEAD differs.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedStatsRef {
-    /// Object key of the `.cstat` object HEAD references.
+    /// Object key of the `.cstat` object.
     pub key: String,
-    /// Content hash of the referenced object (`SnapshotColumnStatsRef.blake3`),
-    /// the fetch's blake3 gate and the cache's primary key.
+    /// Content hash of the referenced object, the fetch's blake3 gate and the
+    /// cache's primary key.
     pub blake3: [u8; 32],
-    /// The covered parts' blake3 hashes, in `SnapshotHead.parts` order. The
-    /// binding this HEAD imposes on the stats object; a fetch (or a cache hit)
-    /// is valid only against this exact part set.
+    /// The part set this object is bound to: every tenant part for v1/v2, or
+    /// exactly the one covered part for v3. A fetch is valid only against this
+    /// exact part set (ADR-0942's binding check).
     pub expected_part_blake3: Vec<[u8; 32]>,
 }
 
+/// HEAD's part list plus its two whole-object statistics refs, resolved from
+/// one HEAD GET. The per-part v3 refs live on each `SnapshotPartRef` itself
+/// (`parts[i].column_stats`) and are read directly by the caller via
+/// [`resolve_part_stats_ref`] for whichever parts its query window covers.
+pub(crate) struct ResolvedStatsHead {
+    pub parts: Vec<SnapshotPartRef>,
+    /// Whole-tenant v1 object (`SnapshotHead.column_stats`, field 11).
+    pub v1: Option<ResolvedStatsRef>,
+    /// Whole-tenant v2 object (`SnapshotHead.column_stats_part`, field 13).
+    pub v2: Option<ResolvedStatsRef>,
+}
+
 /// Outcome of [`fetch_stats_object`]: an object the reader decoded, or one of
-/// the two degrade-to-`Ok(None)` kinds the caller must tell apart. A store
-/// read that fails and a stale binding are legitimately "no statistics"
-/// ([`Self::Absent`]); a DECODE failure on the object HEAD points at is not
+/// the two degrade-to-miss kinds the caller must tell apart. A store read that
+/// fails and a stale binding are legitimately "no statistics" ([`Self::Absent`]);
+/// a DECODE failure on the object HEAD (or a covered part) points at is not
 /// ([`Self::DecodeRefused`]) and the caller logs and counts it (issue #1400).
 pub(crate) enum FetchOutcome {
     /// Fetched, hash-verified, tenant-checked, part-bound, and decoded.
-    Loaded(LoadedColumnStats),
+    Loaded(DecodedStats),
     /// No usable object, silently: the store GET failed (the object may simply
     /// not exist for this HEAD yet), the content hash did not match, a part
     /// hash was malformed, or the part binding was stale. Every one of these is
     /// an ordinary "no statistics" and stays quiet.
     Absent,
-    /// HEAD references an object the reader refused to DECODE: the fold wrote it
-    /// and HEAD points at it, but the bytes will not open (an oversized declared
-    /// body, corruption, a crc or header failure). Never normal. Carries the
-    /// decode error so the caller can name the cause and, for
-    /// [`SnapshotFormatError::ColumnStatsDecompressedTooLarge`], the declared
-    /// and cap bytes.
+    /// HEAD (or a covered part) references an object the reader refused to
+    /// DECODE: the fold wrote it and the ref points at it, but the bytes will
+    /// not open (an oversized declared body, corruption, a crc or header
+    /// failure). Never normal. Carries the decode error so the caller can name
+    /// the cause and, for [`SnapshotFormatError::ColumnStatsDecompressedTooLarge`],
+    /// the declared and cap bytes.
     DecodeRefused(SnapshotFormatError),
+}
+
+/// One fetched-and-decoded object's records, split by keying scheme. Kept
+/// separate from the public [`LoadedColumnStats`] because a single query
+/// merges records from up to several such fetches (one per covered part, plus
+/// at most one whole-object fallback) before it has a final result.
+#[derive(Default)]
+pub(crate) struct DecodedStats {
+    pub segments: HashMap<EntryIdentity, ColumnStatsSegment>,
+    pub by_content_hash: HashMap<[u8; 32], ColumnStatsSegment>,
 }
 
 /// A genuinely unparseable HEAD, or an isolation breach, encountered while
@@ -190,28 +246,21 @@ fn head_key(tenant: &TenantHash, signal: Signal) -> String {
     format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
 }
 
-/// Read the current folded snapshot HEAD for `(tenant, signal)` and return the
-/// column-stats object it points at, or `Ok(None)` when none exists right now
-/// (nothing folded yet, no configured typed columns, or the last fold's
-/// column-stats build/PUT failed). The first of the two-GET load: it issues
-/// the HEAD GET only, and never fetches the stats object -- that is
-/// [`fetch_stats_object`], so a caller can consult a reuse cache in between.
+/// Read the current folded snapshot HEAD for `(tenant, signal)` and return its
+/// part list plus both whole-object statistics refs, or `Ok(None)` when no
+/// HEAD exists yet. The first GET of the load: it never fetches a statistics
+/// object itself, so a caller can consult a reuse cache before paying for any
+/// of the per-part or whole-object fetches.
 ///
 /// The HEAD GET is issued through `getter`, so it is credited to the caller's
 /// [`QueryAccounting`](ravel_types::accounting::QueryAccounting) and bounded
 /// by the catalog request semaphore, the same funnel every other query read
 /// path uses (issue #850). It charges to `AccountedOp::Get`.
-///
-/// Unlike `load_covering_postings`, this path fetches no snapshot part: it
-/// needs only each part's blake3 (already carried in `SnapshotHead.parts`) for
-/// the binding check, and callers join against their own resolved snapshot
-/// rather than a rebuilt covered-entry universe. See the [module docs](self)
-/// for the full degrade-to-`Ok(None)` contract.
-pub(crate) async fn resolve_stats_ref(
+pub(crate) async fn resolve_stats_head(
     getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
     signal: Signal,
-) -> Result<Option<ResolvedStatsRef>, LoadColumnStatsError> {
+) -> Result<Option<ResolvedStatsHead>, LoadColumnStatsError> {
     let key = head_key(tenant, signal);
 
     let head_bytes = match getter.accounted_get_full(&key).await {
@@ -223,40 +272,68 @@ pub(crate) async fn resolve_stats_ref(
         source,
     })?;
 
-    let Some(stats_ref) = head.column_stats.clone() else {
-        return Ok(None);
-    };
-    let Ok(blake3) = <[u8; 32]>::try_from(stats_ref.blake3.as_slice()) else {
-        return Ok(None);
-    };
-
-    // The parts are NOT fetched: this loader needs only their blake3 (which
-    // HEAD already carries) to bind the stats object to this HEAD's part set.
-    // A per-part GET here would GET every snapshot part in full only to
-    // discard it, and would turn a fault in an optional metadata artifact into
-    // a hard error on the logs query path.
-    let mut expected_part_blake3: Vec<[u8; 32]> = Vec::with_capacity(head.parts.len());
+    // The parts themselves are NOT fetched here: this resolve needs only each
+    // part's blake3 (already carried in HEAD) to bind the whole-object
+    // statistics refs to this HEAD's part set.
+    let mut all_part_blake3: Vec<[u8; 32]> = Vec::with_capacity(head.parts.len());
     for part_ref in &head.parts {
         let Ok(part_blake3) = <[u8; 32]>::try_from(part_ref.blake3.as_slice()) else {
             return Ok(None);
         };
-        expected_part_blake3.push(part_blake3);
+        all_part_blake3.push(part_blake3);
     }
 
-    Ok(Some(ResolvedStatsRef {
-        key: stats_ref.key,
-        blake3,
-        expected_part_blake3,
+    let v1 = head.column_stats.as_ref().and_then(|stats_ref| {
+        <[u8; 32]>::try_from(stats_ref.blake3.as_slice())
+            .ok()
+            .map(|blake3| ResolvedStatsRef {
+                key: stats_ref.key.clone(),
+                blake3,
+                expected_part_blake3: all_part_blake3.clone(),
+            })
+    });
+    let v2 = head.column_stats_part.as_ref().and_then(|stats_ref| {
+        <[u8; 32]>::try_from(stats_ref.blake3.as_slice())
+            .ok()
+            .map(|blake3| ResolvedStatsRef {
+                key: stats_ref.key.clone(),
+                blake3,
+                expected_part_blake3: all_part_blake3.clone(),
+            })
+    });
+
+    Ok(Some(ResolvedStatsHead {
+        parts: head.parts,
+        v1,
+        v2,
     }))
 }
 
+/// The per-part v3 ref carried on `part.column_stats` (field 7), or `None`
+/// when the part has no such ref or its fields are malformed. Pure: no GET,
+/// no accounting. `expected_part_blake3` binds to exactly this one part's own
+/// blake3, matching how the fold writes it
+/// (`SnapshotColumnStatsPartRef.part_blake3 = vec![part_hash]`).
+pub(crate) fn resolve_part_stats_ref(part: &SnapshotPartRef) -> Option<ResolvedStatsRef> {
+    let stats_ref = part.column_stats.as_ref()?;
+    let blake3 = <[u8; 32]>::try_from(stats_ref.blake3.as_slice()).ok()?;
+    let part_blake3 = <[u8; 32]>::try_from(part.blake3.as_slice()).ok()?;
+    Some(ResolvedStatsRef {
+        key: stats_ref.key.clone(),
+        blake3,
+        expected_part_blake3: vec![part_blake3],
+    })
+}
+
 /// GET, blake3-verify, tenant-check, part-bind, and decode the object named by
-/// `resolved`. The second GET of the two-GET load; kept separate from
-/// [`resolve_stats_ref`] so a caller can skip it on a reuse-cache hit. Every
-/// degrade-to-`Ok(None)` case from the [module docs](self) is enforced here
-/// against `resolved`'s content hash and part binding, so a cache that keys on
-/// those two values and skips this call gets the identical answer this call
-/// would have produced.
+/// `resolved`. Every degrade-to-miss case from the [module docs](self) is
+/// enforced here against `resolved`'s content hash and part binding, so the
+/// identical check applies whether `resolved` names a v1, v2, or v3 object.
+///
+/// A record's `writer_id` selects which map it lands in: 16 bytes is the v1
+/// `EntryIdentity` tuple, 32 bytes is a v2/v3 content hash (ADR-0942's
+/// overloaded slot). Any other length is a malformed record and is dropped,
+/// exactly as before this ADR.
 pub(crate) async fn fetch_stats_object(
     getter: &impl AccountedRecordGet,
     tenant: &TenantHash,
@@ -275,10 +352,10 @@ pub(crate) async fn fetch_stats_object(
     let limits = ColumnStatsLimits::default();
     let decoded = match decode_column_stats(&data, &limits) {
         Ok(decoded) => decoded,
-        // Decode of an object HEAD references: the fold wrote it and HEAD
-        // points at it, so a failure to open it is never the ordinary
-        // not-covered case. Surface it for the caller to log once and count
-        // (issue #1400); the query still degrades to `Ok(None)` and scans.
+        // Decode of an object the ref points at: the fold wrote it, so a
+        // failure to open it is never the ordinary not-covered case. Surface
+        // it for the caller to log once and count (issue #1400); the query
+        // still degrades to a miss and scans.
         Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
     };
 
@@ -303,23 +380,33 @@ pub(crate) async fn fetch_stats_object(
         return Ok(FetchOutcome::Absent);
     }
 
-    let mut segments = HashMap::with_capacity(decoded.segments.len());
+    let mut segments = HashMap::new();
+    let mut by_content_hash = HashMap::new();
     for segment in decoded.segments {
-        let Ok(writer_id) = <[u8; 16]>::try_from(segment.writer_id.as_slice()) else {
-            continue;
-        };
-        let identity: EntryIdentity = (
-            segment.ingest_hour_bucket,
-            segment.shard,
-            writer_id,
-            segment.writer_epoch,
-            segment.writer_seq,
-        );
-        segments.insert(identity, segment);
+        match segment.writer_id.len() {
+            16 => {
+                let writer_id = <[u8; 16]>::try_from(segment.writer_id.as_slice())
+                    .expect("length checked above");
+                let identity: EntryIdentity = (
+                    segment.ingest_hour_bucket,
+                    segment.shard,
+                    writer_id,
+                    segment.writer_epoch,
+                    segment.writer_seq,
+                );
+                segments.insert(identity, segment);
+            }
+            32 => {
+                let content_hash = <[u8; 32]>::try_from(segment.writer_id.as_slice())
+                    .expect("length checked above");
+                by_content_hash.insert(content_hash, segment);
+            }
+            _ => continue,
+        }
     }
 
-    Ok(FetchOutcome::Loaded(LoadedColumnStats {
+    Ok(FetchOutcome::Loaded(DecodedStats {
         segments,
-        part_blake3: resolved.expected_part_blake3.clone(),
+        by_content_hash,
     }))
 }
