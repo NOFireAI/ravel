@@ -3572,10 +3572,20 @@ mod tests {
             .await
             .expect("load ok")
             .expect("stats present");
+        // Coverage is asserted on the map the reader actually fills. Since
+        // ADR-1413 the per-part v3 object answers this load and its records
+        // are content-hash keyed, so `segments`, which only holds the
+        // identity-keyed records of a v1 whole-object fallback, stays empty
+        // here. Asserting `segments.len() == 3` was asserting that the
+        // fallback had been taken.
         assert_eq!(
-            loaded.segments.len(),
+            loaded.by_content_hash.len(),
             3,
             "the reused baseline plus the new segment cover all three"
+        );
+        assert!(
+            loaded.segments.is_empty(),
+            "the v3 per-part object answered, so no v1 whole-object fallback was read"
         );
     }
 
