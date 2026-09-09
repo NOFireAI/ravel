@@ -2311,8 +2311,10 @@ impl ExecutionPlan for LogsScanExec {
             // ADR-0850 and ADR-0873: the same gate widens to a declared
             // column's exact min/max (and its exact NULL count, where a
             // carrier proves one), taken from the union of the `SegmentRef`
-            // stamp and the `.cstat` entry, both joined by segment identity
-            // rather than ordinal position. `declared_min_max_all` resolves
+            // stamp and the `.cstat` entry -- the stamp joined by segment
+            // identity, the `.cstat` entry by content hash first and
+            // identity as fallback (ADR-1413) -- rather than ordinal
+            // position. `declared_min_max_all` resolves
             // every declared column in one segment walk and enforces the
             // per-column fallback (a segment covered by neither carrier,
             // carriers that disagree, a refused entry, or an unsupported

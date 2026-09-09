@@ -513,13 +513,9 @@ async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
 
     let signal_num = ravel_commit::signal::to_proto(Signal::Logs) as u32;
     let part_hash = *blake3::hash(b"part-backfilled").as_bytes();
-    let stats_bytes = encode_column_stats(
-        TENANT.0,
-        signal_num,
-        vec![part_hash.to_vec()],
-        &[seg_stats],
-    )
-    .expect("encode column stats");
+    let stats_bytes =
+        encode_column_stats(TENANT.0, signal_num, vec![part_hash.to_vec()], &[seg_stats])
+            .expect("encode column stats");
     let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
     let stats_key = format!("t/{}/catalog/l/cstat/backfilled.cstat", TENANT.to_hex());
     store
