@@ -181,13 +181,20 @@ flowchart TD
   now.
 - A backwards step larger than `MAX_FLUSH_CLOCK_HOLD_NS` fails that one flush
   with a typed, retryable error (`Abandoned`, 503) and re-anchors the floor to
-  `raw_ns`, so at most one flush is ever refused. Buffered-mode data is not
-  lost: the refuse arm re-inserts the whole tenant buffer into the actor's
-  buffer map instead of dropping it, so the next trigger (a later write, the
-  age timer, or drain at shutdown) flushes those rows against the re-anchored
-  floor. The re-inserted buffer keeps its rows, exemplars, byte-budget charges,
-  and trigger bookkeeping (`est_bytes`, `oldest_arrival_ns`) intact; the byte
-  budget is held, not refunded, because the bytes are still resident. Only the
+  `raw_ns`. The bound is per backwards step, not global: because the floor
+  re-anchors to `raw_ns`, the next reading at or above `raw_ns` proceeds, so a
+  single backwards step refuses exactly one flush. It is **not** a guarantee
+  that only one flush is ever refused over the process lifetime. If the clock
+  keeps stepping back by more than the bound on every subsequent reading, every
+  flush is refused for as long as that continues; only a reading that stops
+  regressing beyond the bound ends the run.
+- Buffered-mode data is not lost across a single refusal: the refuse arm
+  re-inserts the whole tenant buffer into the actor's buffer map instead of
+  dropping it, so the next trigger (a later write, the age timer, or drain at
+  shutdown) flushes those rows against the re-anchored floor. The re-inserted
+  buffer keeps its rows, exemplars, byte-budget charges, and trigger
+  bookkeeping (`est_bytes`, `oldest_arrival_ns`) intact; the byte budget is
+  held, not refunded, because the bytes are still resident. Only the
   strict-mode `waiters` are removed and acked with the 503 before re-insert: a
   waiter left in the buffer would be re-acked by the next flush against an
   already-answered oneshot. A strict-mode writer that retries on the 503
@@ -199,6 +206,31 @@ flowchart TD
   reach the client as Bad Request. This is a deliberate, bounded availability
   cost paid only for a clock that moved more than the clock-skew allowance, in
   exchange for never stranding a writer in a future ingest hour.
+- Holding the buffer instead of dropping it is a deliberate trade against the
+  global ingest byte budget (ADR-0069). Because the charges ride back with the
+  re-inserted buffer on every refusal, a buffer under repeated refusal never
+  flushes and its held bytes are never released: they accumulate against the
+  process-wide byte budget until admission sheds at the ceiling. That shedding
+  is global, so a single tenant whose flushes are all being refused can push
+  the shared budget to its ceiling and cause admission to shed writes for
+  **every** tenant on that budget, not just the one with the bad clock. The
+  earlier design that refunded the bytes on a drop avoided this at the cost of
+  losing the acknowledged rows; the re-buffer chooses durability over that
+  refund, and this budget pressure is the price. The refused flush is still
+  counted (`clock_regressions_refused`), so a run of refusals is observable
+  before the budget pressure is diagnosed as its cause.
+- The graceful drain (`flush_all`, reached by `FlushNow`, `Shutdown`, and the
+  channel-close arm) must account for the re-buffer. It snapshots the tenant
+  key set per pass, and a refusal re-inserts a key the snapshot already
+  consumed, so a single snapshot is not exhaustive: the re-buffered tenant
+  would never be retried in that call, and on `Shutdown`/channel-close there is
+  no later trigger, so its acknowledged buffered-mode rows would be lost on a
+  graceful path. `flush_all` therefore retries over fresh snapshots until the
+  map empties, bounded by a small pass cap (`MAX_FLUSH_ALL_PASSES`). This
+  terminates because a refusal re-anchors the floor to `raw_ns`, so the next
+  pass stamps it and proceeds; the cap only guards the pathological clock that
+  steps back on every reading. Any residue left after the cap is logged at
+  ERROR and counted (`flush_all_residue_tenants`), never dropped silently.
 - No format, schema, or key layout changes. The stamp still lands in the
   existing `created_unix_ns` field; only its monotonicity within a process
   changes.

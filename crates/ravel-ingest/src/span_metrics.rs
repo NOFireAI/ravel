@@ -80,6 +80,11 @@ pub struct SpanIngestMetrics {
     /// `clock_regressions` (absorbed). Intended for Prometheus export under the
     /// name `ravel_ingest_clock_regressions_refused_total` (#1473).
     clock_regressions_refused: AtomicU64,
+    /// Tenants still buffered after `flush_all` exhausted its bounded retry
+    /// passes (ADR-1307 finding F1): a lost acknowledged buffered-mode write on
+    /// a graceful teardown. Nonzero is a durability defect, logged at ERROR
+    /// beside this bump.
+    flush_all_residue_tenants: AtomicU64,
     /// Multi-shard Strict writes that returned
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
@@ -139,6 +144,10 @@ pub struct SpanIngestMetricsSnapshot {
     /// bound (ADR-1307). Intended for export as
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     pub clock_regressions_refused: u64,
+    /// Tenants left buffered after `flush_all` exhausted its retry passes
+    /// (ADR-1307 finding F1): a lost acknowledged buffered-mode write on a
+    /// graceful teardown. Nonzero is a durability defect.
+    pub flush_all_residue_tenants: u64,
     /// Multi-shard Strict writes returned as
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): a partial
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
@@ -223,6 +232,13 @@ impl SpanIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `count` tenants still buffered after `flush_all` drained (ADR-1307
+    /// finding F1). Called once per `flush_all` that leaves a residue.
+    pub(crate) fn record_flush_all_residue(&self, count: u64) {
+        self.flush_all_residue_tenants
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably before a sibling failed. Recorded once per such write,
@@ -288,6 +304,7 @@ impl SpanIngestMetrics {
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
             clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
@@ -379,6 +396,13 @@ mod tests {
             SpanIngestMetrics::record_clock_regression_refused,
             SpanIngestMetricsSnapshot {
                 clock_regressions_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush_all_residue(3),
+            SpanIngestMetricsSnapshot {
+                flush_all_residue_tenants: 3,
                 ..Default::default()
             },
         );

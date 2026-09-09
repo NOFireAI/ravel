@@ -191,7 +191,12 @@ Loop over `select!`:
   window; only a low-volume buffered-mode tenant's PUT cadence changes.
 - channel closed (router dropped): flush the remaining buffer before
   exiting rather than discarding it; points that still fail to flush are
-  counted, never silently lost.
+  counted, never silently lost. The drain (`flush_all`, shared with
+  `FlushNow` and `Shutdown`) retries over fresh tenant snapshots until the
+  map empties, bounded by a small pass cap: a clock-refused flush re-buffers
+  its tenant (ADR-1307), so a single snapshot would strand it on this
+  graceful path. Any tenant left after the cap is logged at ERROR and counted
+  (`flush_all_residue_tenants`).
 
 Shard-actor death is observable: the router marks a shard dead when its
 channel closes or an ack receiver fails, routes subsequent points for
