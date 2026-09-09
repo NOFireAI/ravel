@@ -620,3 +620,56 @@ gives it its own bound.
 4. The shipped cursor codec (segment enumeration) is replaced by the
    resolve-input form before the first paging tool ships (#1380); until
    then no tool mints a cursor.
+
+**Amendment (2026-09-10, #1501, #1529).** Corrects the amendment above. Its
+item 1 said redemption "re-resolves the snapshot against that watermark
+deterministically" and fails `cursor_expired` when it "cannot reproduce the
+pinned watermark", without saying what reproducible means. There is no
+reading of it that a redemption can test. ADR-0010 gives no ordering over
+commit tokens to test one with: `seq` is monotonic only per (writer_id,
+epoch, shard) and gaps in it carry no meaning, and `epoch` is informational
+only, so two tokens from different writers have no relative position at
+all. The pinned watermark is a resolve input and only that: it is what page
+2 resolves against, in place of a fresh resolution, which is what makes the
+re-resolve deterministic. Whether a pinned token can still be satisfied is
+the catalog's answer at resolve time, given by resolving the token's own
+identity, and its failure is `UnsatisfiableToken`, not a cursor outcome.
+
+A redemption refuses a structurally valid, correctly bound cursor as
+`cursor_expired` in exactly two cases, which are the two the amendment above
+meant by a compaction and a newer erasure:
+
+1. Its effective deadline, already clamped to `protection_horizon - grace`
+   by the rule D5 states, has passed. Past that instant a sweep is free to
+   compact away what the pin resolves to, so the clamp already is the
+   compaction check and no second mechanism is added for it.
+2. An erasure predicate is in force at redemption that the cursor did not
+   pin, over the cursor's own signal, whose half-open event-time window
+   overlaps the cursor's half-open time range. A windowless predicate has no
+   event-time restriction and so overlaps every range. Intersection is
+   defined on the signal and the range only: a predicate's matchers are
+   tested against a record's labels or attributes, and a cursor holds no
+   records, so no matcher-level analysis is attempted. An erasure that does
+   not intersect that scope leaves the cursor redeemable, and a predicate
+   the cursor pinned that is no longer in force is not a mismatch.
+
+A tampered or wrong-tenant token stays `cursor_invalid`, unchanged. So do
+the dead-process rule, the tenant binding, and the tool and argument-hash
+binding.
+
+Two corrections to the same amendment's own text. Its item 3 said "Evidence
+references are unchanged: each pins one row's segment with a `SegmentPin`".
+That was never true. `EvidenceRef` carries the tenant hash, the tool, the
+argument hash, a `blake3_256` digest of the referenced row, and its mint and
+deadline timestamps; it has never held a `SegmentPin`, and it needs none,
+because redemption re-executes the reference's own call and compares
+digests. Its item 2 gave the maximal fixed part as 106 KiB, which counts
+only the bounds D4 documents: the metadata list bounds (100,824 B) plus the
+4 KiB scalar allowance come to 102 KiB, and the new 4 KiB cursor bound takes
+that to 106 KiB. The implementation reserves 110,600 B, because on top of
+those documented bounds it also counts the empty-envelope skeleton (852 B),
+a bounded skeleton slack for counters and status words widening (512 B), and
+the identity-warning allowance `finish` may still spend (220 B).
+`MAXIMAL_FIXED_PART` in `crates/ravel-mcp/src/envelope.rs` is the constant
+carrying that real total, and it is the figure the floor guard compares
+against the 256 KiB `max_response_bytes` floor.
