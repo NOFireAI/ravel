@@ -50,13 +50,32 @@ use axum::routing::get;
 /// `/healthz` (liveness) is deliberately independent of the probe: a store
 /// outage must never make liveness fail and get healthy processes killed and
 /// restarted (see the module docs).
+///
+/// A third input, the `draining` flag, is one-way in the opposite direction:
+/// it starts `false` and graceful shutdown flips it to `true` exactly once,
+/// before any listener closes, so a readiness probe observes 503 while the
+/// process is still routing and draining. It never flips back: a process that
+/// has begun draining is on its way out and must not re-advertise itself as a
+/// rollout target. It is intentionally distinct from the startup latch (which
+/// never reverts either, but in the other direction) so that beginning to drain
+/// cannot be confused with startup never having completed.
 #[derive(Clone, Default)]
-pub struct Readiness(Arc<AtomicBool>);
+pub struct Readiness {
+    /// One-way startup-completion latch: `false` until startup finishes, then
+    /// `true` forever.
+    startup: Arc<AtomicBool>,
+    /// One-way drain latch: `false` until graceful shutdown begins, then `true`
+    /// forever.
+    draining: Arc<AtomicBool>,
+}
 
 impl Readiness {
-    /// A new flag in the not-ready state.
+    /// A new flag in the not-ready, not-draining state.
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self {
+            startup: Arc::new(AtomicBool::new(false)),
+            draining: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Latch the startup flag to ready. Idempotent; calling it more than once is
@@ -64,22 +83,36 @@ impl Readiness {
     /// reachability is tracked separately by [`crate::store_probe`] and can flip
     /// both ways after this latches.
     pub fn mark_ready(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.startup.store(true, Ordering::SeqCst);
     }
 
-    /// Whether the startup latch alone has fired, ignoring store reachability.
-    /// Retained for tests and callers that need the latch state specifically;
-    /// `/readyz` uses [`Readiness::is_ready`], which also requires the store to
-    /// be reachable.
+    /// Latch the drain flag so `is_ready` returns false from here on. One-way:
+    /// once draining begins the process is leaving and must never re-advertise
+    /// as ready. `pub(crate)` so it is reachable only from graceful shutdown
+    /// within this crate, matching the doc: nothing outside the crate may flip a
+    /// process into draining.
+    pub(crate) fn begin_drain(&self) {
+        self.draining.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the startup latch alone has fired, ignoring store reachability
+    /// and draining. Retained for tests and callers that need the latch state
+    /// specifically; `/readyz` uses [`Readiness::is_ready`].
     pub fn startup_complete(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.startup.load(Ordering::SeqCst)
     }
 
-    /// Whether the process is ready to serve: startup has completed AND the
-    /// background store probe currently reports the store reachable (ADR-0050
-    /// section 7). Either condition false yields 503 at `/readyz`.
+    /// Whether graceful shutdown has begun draining this process.
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Whether the process is ready to serve: startup has completed, the process
+    /// is NOT draining, AND the background store probe currently reports the
+    /// store reachable (ADR-0050 section 7). Any condition false yields 503 at
+    /// `/readyz`.
     pub fn is_ready(&self) -> bool {
-        self.startup_complete() && crate::store_probe::store_reachable()
+        self.startup_complete() && !self.is_draining() && crate::store_probe::store_reachable()
     }
 }
 
@@ -104,7 +137,11 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Readiness: 200 once startup has completed, 503 before that.
+/// Readiness: 200 only when all three of [`Readiness::is_ready`]'s conditions
+/// hold (startup completed, the process is not draining, and the background
+/// store probe reports the store reachable); 503 whenever any one is false, so
+/// before startup completes, once graceful shutdown begins draining, or during a
+/// store outage.
 async fn readyz(State(readiness): State<Readiness>) -> StatusCode {
     if readiness.is_ready() {
         StatusCode::OK
@@ -133,5 +170,33 @@ mod tests {
         // A clone observes the same latched state (the flag is shared).
         let clone = readiness.clone();
         assert!(clone.is_ready(), "clone shares the latched state");
+    }
+
+    #[test]
+    fn draining_makes_is_ready_false_without_reverting_the_startup_latch() {
+        let readiness = Readiness::new();
+        readiness.mark_ready();
+        assert!(readiness.is_ready(), "ready once startup completes");
+        assert!(!readiness.is_draining(), "not draining before shutdown");
+
+        // Begin draining: readiness drops to not-ready so a probe sees 503,
+        // but the startup latch itself must NOT revert (a draining process has
+        // still completed startup; it is leaving, not un-started).
+        readiness.begin_drain();
+        assert!(readiness.is_draining(), "draining after begin_drain");
+        assert!(
+            readiness.startup_complete(),
+            "the one-way startup latch must not revert when draining begins"
+        );
+        assert!(
+            !readiness.is_ready(),
+            "a draining process is not ready even with startup complete and store reachable"
+        );
+
+        // One-way: draining stays latched, and the drain state is shared across
+        // clones (shutdown flips one handle; the /readyz handler holds another).
+        let clone = readiness.clone();
+        assert!(clone.is_draining(), "clone observes the shared drain latch");
+        assert!(!clone.is_ready(), "clone is not ready while draining");
     }
 }
