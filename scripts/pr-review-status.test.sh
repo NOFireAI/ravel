@@ -331,7 +331,13 @@ resolve() {
   esac
 }
 case "$1" in
-  fetch|update-ref|ls-remote) exit 0 ;;
+  fetch)
+    # E2E_GIT_FETCH_FAIL=1 makes the fetch fail while the remote still has the
+    # pull request ref, which is the guard's "could not answer" path.
+    if [[ "${E2E_GIT_FETCH_FAIL:-0}" == "1" ]]; then exit 1; fi
+    exit 0
+    ;;
+  update-ref|ls-remote) exit 0 ;;
   rev-parse)
     if [[ "$2" == "--short" ]]; then
       resolve "$3" | cut -c1-8
@@ -345,7 +351,7 @@ case "$1" in
     else printf '%s\n' "${tip}"; fi
     ;;
   rev-list) printf '3\n' ;;
-  log) printf 'ccccccc1 innocent\033[31mSPOOFED\033[0m\rsubject\ncccccc2 second\ncccccc3 third\n' ;;
+  log) printf 'ccccccc1 innocent\033[31mSPOOFED\033[0m\rsubject\ncccccc2 tab:\there\ncccccc3 third\n' ;;
   *) echo "unexpected git call: $*" >&2; exit 91 ;;
 esac
 SHIM
@@ -579,6 +585,17 @@ check_eq "stale merge base: no merge command offered" \
 check_eq "stale merge base: printed commit subjects carry no control bytes" \
   "0" \
   "$(printf '%s' "${stale_base_out}" | LC_ALL=C tr -cd '\000-\010\013-\037\177' | wc -c | tr -d ' ')"
+# The other half of the filter's claim. Counting bytes in the complement of the
+# code's own delete set cannot see a set that is too WIDE, and a set eating tab
+# and newline would flatten this listing into one line while still passing the
+# count above. So: the tab in the second stub subject survives, and the three
+# subjects are still three prefixed lines.
+check_eq "stale merge base: the filter keeps tab" \
+  "1" \
+  "$(printf '%s' "${stale_base_out}" | LC_ALL=C grep -cF "$(printf 'tab:\there')")"
+check_eq "stale merge base: one prefixed line per unseen commit" \
+  "3" \
+  "$(printf '%s\n' "${stale_base_out}" | grep -c '^ \{1,\}c\{1,\}[123] ')"
 
 # A guard that cannot run at all must not be reported as a stale base: one is
 # fixed by rebasing and the other by fixing the checkout, and the headline is
@@ -594,6 +611,25 @@ unset E2E_SCRIPT
 check_eq "a guard that cannot run is not reported as a stale base" \
   "  -> could not check merge-base freshness (guard exit 127); check by hand before merging" \
   "$(printf '%s\n' "${noguard_out}" | sed -n 2p)"
+
+# The guard's own half of that contract: 2 for a question it cannot answer, and
+# 1 kept for the stale verdict. The case above only exercises bash's 127 for a
+# missing file, which the guard never reaches, so without these two the guard
+# could go back to exiting 1 on every internal failure unnoticed.
+guard_direct_rc=0
+"$(dirname "$0")/guards/assert-fresh-merge-base.sh" not-a-number >/dev/null 2>&1 \
+  || guard_direct_rc=$?
+check_eq "the guard exits 2 on an argument it cannot use" \
+  "2" \
+  "${guard_direct_rc}"
+
+export E2E_GIT_FETCH_FAIL=1
+fetchfail_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_FETCH_FAIL
+
+check_eq "a fetch that fails is reported as could-not-check, not as behind" \
+  "  -> could not check merge-base freshness (guard exit 2); check by hand before merging" \
+  "$(printf '%s\n' "${fetchfail_out}" | sed -n 2p)"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
