@@ -18,6 +18,20 @@ name: supply-chain-nightly
 # quickstart-published.yml): a red run files a labelled tracking issue linking
 # the run, or comments on the existing open one, so a recurring advisory does
 # not open a fresh issue every night.
+#
+# Routing lives in its own `report` job, on the fuzz-nightly.yml pattern, not
+# in a step inside `supply-chain-nightly` guarded by `if: failure()`. A job
+# killed by its own timeout-minutes, or by a runner failure, never runs a
+# later step of its own, so a step-level guard inside that job would file
+# nothing for exactly the failures most worth knowing about. Testing
+# `needs.supply-chain-nightly.result == 'failure'` from a separate job also
+# catches that case: a timed-out job still reports `failure` as its result.
+#
+# The workflow-level permissions floor is `contents: read`, what
+# actions/checkout and `cargo deny check` need. `issues: write` is NOT granted
+# there: it lives only on the `report` job, which runs no third-party code (no
+# checkout, no cargo-deny install) so the write-capable token is never in the
+# environment of a dependency build script.
 
 on:
   workflow_dispatch:
@@ -28,12 +42,8 @@ on:
     # weekly 06:29) so none of the scheduled runs contend.
     - cron: "43 5 * * *"
 
-# Minimum permissions for the deliverable's failure routing: `issues: write`
-# lets a red run file or comment on a tracking issue; `contents: read` is what
-# actions/checkout needs. Nothing else is granted.
 permissions:
   contents: read
-  issues: write
 
 env:
   # Label carried by every tracking issue this lane files, and the key it
@@ -44,6 +54,12 @@ jobs:
   supply-chain-nightly:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Every step below runs cargo-deny (installed by a third-party action)
+    # against the workspace's own dependency graph. `contents: read` is what
+    # checkout needs; nothing else. Filing the tracking issue needs
+    # `issues: write`, and that permission lives on the `report` job instead.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install cargo-deny
@@ -53,15 +69,52 @@ jobs:
       - name: cargo deny check
         run: cargo deny check
 
-      # Failure routing (ADR-0081 decision 8): a red run files a labelled
-      # tracking issue linking this run, or comments on the existing open one
-      # for this lane so an ongoing breakage does not open a fresh issue every
-      # night. Deterministic marker (no run id) in both the issue title and the
-      # dedup key, so a recurring failure maps to one open issue.
+  # Failure routing, deliberately a separate job: this is the only place that
+  # needs `issues: write`, and it is the only job that runs no third-party
+  # code. It checks nothing out and installs nothing, so the write token is
+  # never in the environment of anything cargo-deny pulled in.
+  report:
+    needs: supply-chain-nightly
+    # `needs: supply-chain-nightly` alone would skip this job on failure (a
+    # dependent of a failed job is skipped by default); the condition has to
+    # name a status-check function explicitly. Testing the job's `result`
+    # rather than a step-level `if: failure()` is what covers
+    # `supply-chain-nightly` being killed by its own timeout-minutes: such a
+    # job reports `failure` but runs no further step of its own. Deliberately
+    # does not fire on 'cancelled': a cancellation is human-initiated, not a
+    # cargo-deny finding.
+    if: ${{ always() && needs.supply-chain-nightly.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    # Serialize THIS job only, across runs, so the read-then-create below
+    # cannot race: a scheduled run and a workflow_dispatch run failing close
+    # together would otherwise both see an empty issue list and both create
+    # one, breaking the single-issue dedup contract. cancel-in-progress stays
+    # false so a run already filing is not cancelled by a newer failing run;
+    # the newer run waits for it. Note what this does and does not guarantee:
+    # GitHub keeps at most ONE pending run per concurrency group, so if a
+    # third run arrives while one is running and one is pending, the older
+    # pending run is cancelled. So the queue does not by itself guarantee
+    # every failing run gets to file; what does is the per-marker dedup below,
+    # since whichever run survives re-reads the open issues and comments on or
+    # creates the tracking issue as needed.
+    concurrency:
+      group: supply-chain-nightly-report
+      cancel-in-progress: false
+    steps:
+      # A red run files a labelled tracking issue linking this run, or
+      # comments on the existing open one so a recurring advisory does not
+      # open a fresh issue every night. Deterministic marker (no run id) in
+      # both the issue title and the dedup key, so a recurring failure maps to
+      # one open issue.
       - name: File or update the tracking issue
-        if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
+          # No checkout in this job, so gh has no git remote to infer the
+          # repository from and every call would fail without this.
+          GH_REPO: ${{ github.repository }}
           MARKER: "Nightly supply-chain cargo deny check is red"
         run: |
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
@@ -89,7 +142,10 @@ jobs:
           an advisory, license, or ban was newly triggered (a fresh RUSTSEC
           entry, a dependency version bump, or a new transitive dependency)
           since the last green run, not necessarily anything in the commit
-          that happened to be at HEAD when the clock ticked.
+          that happened to be at HEAD when the clock ticked. It can also mean
+          the \`supply-chain-nightly\` job broke before or outside the
+          \`cargo deny check\` step (the cargo-deny install, or the job
+          hitting its 15-minute timeout).
 
           See the run's \`cargo deny check\` step output for which check
           (advisories/bans/licenses/sources) and which crate triggered it.

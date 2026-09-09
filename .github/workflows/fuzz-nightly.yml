@@ -42,19 +42,6 @@ permissions:
 env:
   ISSUE_LABEL: fuzz-nightly
 
-# Serialize runs so the `report` job's read-then-create of the tracking
-# issue cannot race. A scheduled run and a workflow_dispatch run failing at
-# once would otherwise both see an empty issue list and both create one,
-# breaking the single-issue dedup contract. The group is declared at
-# workflow level, so it covers the whole run (both `fuzz` and `report`) and
-# keeps covering both after the job split: run B cannot start its `fuzz`
-# job, let alone its `report` job, while run A holds the group.
-# cancel-in-progress stays false: cancelling a fuzz run mid-flight throws
-# away the work and could cancel the very run that found a crash.
-concurrency:
-  group: fuzz-nightly
-  cancel-in-progress: false
-
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -202,6 +189,24 @@ jobs:
     timeout-minutes: 10
     permissions:
       issues: write
+    # Serialize THIS job only, across runs, so the read-then-create below
+    # cannot race: a scheduled run and a workflow_dispatch run failing close
+    # together would otherwise both see an empty issue list and both create
+    # one, breaking the single-issue dedup contract. Scoped to `report`
+    # rather than declared at workflow level (as this used to be) so a
+    # second run's `fuzz` job is free to start and fuzz concurrently; only
+    # the two runs' issue-filing has to queue.
+    # cancel-in-progress stays false so a run already filing is not cancelled
+    # by a newer failing run; the newer run waits for it. Note what this does
+    # and does not guarantee: GitHub keeps at most ONE pending run per
+    # concurrency group, so if a third run arrives while one is running and
+    # one is pending, the older pending run is cancelled. So the queue does
+    # not by itself guarantee every failing run gets to file; what does is the
+    # per-marker dedup below, since whichever run survives re-reads the open
+    # issues and comments on or creates the tracking issue as needed.
+    concurrency:
+      group: fuzz-nightly-report
+      cancel-in-progress: false
     steps:
       # A red run files a labelled tracking issue linking this run, or
       # comments on the existing open one so a recurring failure does not open
