@@ -56,8 +56,8 @@ use uuid::Uuid;
 use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{
-    FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_CLOCK_HOLD_NS,
-    checked_ingest_hour_bucket,
+    FlushClockError, IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES,
+    MAX_FLUSH_CLOCK_HOLD_NS, checked_ingest_hour_bucket,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -1163,12 +1163,42 @@ impl LogShardActor {
         (self.tenants.len(), records)
     }
 
+    /// Drains every buffered tenant, then awaits durability (ADR-1307 finding
+    /// F1). A clock-refused flush re-buffers its tenant (`flush_tenant`'s
+    /// `RegressionRefused` arm), so a single snapshot of the key set is not
+    /// exhaustive: a tenant re-inserted after the snapshot consumed its key
+    /// would never be retried in this call. On the `Shutdown` and channel-close
+    /// paths there is no later actor tick to retry it, so the re-buffered
+    /// tenant would drop on teardown -- the exact loss the channel-close arm
+    /// forbids. Retry over fresh snapshots until the map empties, bounded by
+    /// [`MAX_FLUSH_ALL_PASSES`]. This terminates because a refusal re-anchors
+    /// the monotonic floor to the raw reading, so the next pass stamps it and
+    /// proceeds; the bound only guards a pathological clock stepping back on
+    /// every reading. Any residue after the bound is logged at ERROR and
+    /// counted, never dropped silently.
     async fn flush_all(&mut self, trigger: FlushTrigger) {
-        let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
-        for tenant in tenants {
-            if let Some(buf) = self.tenants.remove(&tenant) {
-                let _permit_wait_ns = self.flush_tenant(tenant, buf, trigger).await;
+        let mut passes = 0;
+        while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
+            let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
+            for tenant in tenants {
+                if let Some(buf) = self.tenants.remove(&tenant) {
+                    let _permit_wait_ns = self.flush_tenant(tenant, buf, trigger).await;
+                }
             }
+            passes += 1;
+        }
+        if !self.tenants.is_empty() {
+            let (tenant_count, buffered_records) = self.buffered_summary();
+            self.metrics.record_flush_all_residue(tenant_count as u64);
+            tracing::error!(
+                shard = self.shard,
+                tenant_count,
+                buffered_records,
+                passes,
+                "ravel-ingest: flush_all left buffered tenants unflushed after \
+                 exhausting retry passes; acknowledged buffered-mode rows lost \
+                 on this graceful drain"
+            );
         }
         self.join_all_flushes().await;
     }
@@ -1350,8 +1380,24 @@ impl LogShardActor {
         let payload = match content {
             BufContent::Rows(records) => FlushPayload::Rows(records),
             BufContent::Columnar(batches) => FlushPayload::Columnar(batches),
-            // Unreachable: emptiness (including `BufContent::Empty`) returned above.
-            BufContent::Empty => unreachable!("empty log buffer returns before the flush stamp"),
+            BufContent::Empty => {
+                // Emptiness (including `BufContent::Empty`) returned above, so
+                // this is unreachable today. It fails closed rather than
+                // `unreachable!`: a panic in a shard actor kills the actor and
+                // every tenant it serves, so a defensive residue here should
+                // cost one refused flush, not the shard. Refund `charges` on
+                // drop and ack any waiter with a typed error rather than
+                // dropping its oneshot (which the router reads as a dead shard).
+                self.metrics.record_abandoned_input_rejected();
+                drop(charges);
+                self.ctx.ack_waiters(
+                    waiters,
+                    Err(LogWriteError::SegmentBuild(
+                        "empty log buffer reached the flush payload stage".to_string(),
+                    )),
+                );
+                return 0;
+            }
         };
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
