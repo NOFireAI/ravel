@@ -160,7 +160,8 @@ How the result was shaped to fit the response cap: `max_rows`, whether
 `cells_truncated`, how many list entries were `metadata_elided`, the
 `effective_max_response_bytes` actually in force, whether `floor_applied`
 raised a value you sent below the server's minimum, and the paging `cursor`,
-when one exists.
+when one exists. `metadata_elided` also counts a cursor dropped for
+exceeding its own bound.
 
 ### `budget`
 

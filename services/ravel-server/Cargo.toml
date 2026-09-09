@@ -217,13 +217,10 @@ flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
 
 # The native MCP adapter at `POST /mcp` (ADR-1374 decision 9). Implies `sql`:
 # four of the nine tools execute SQL through the query service, so there is no
-# deployment that wants the MCP surface without it. `ravel-sql/pin-codec` is
-# the pinned-snapshot codec the cursor and evidence references share with
-# Flight tickets, without pulling the Flight stack in. Off by default, and
+# deployment that wants the MCP surface without it. Off by default, and
 # `--mcp` is a second, runtime opt-in on top.
 mcp = [
     "sql",
-    "ravel-sql/pin-codec",
     "dep:ravel-mcp",
     "dep:rmcp",
     "rmcp/transport-streamable-http-server",
