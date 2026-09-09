@@ -215,5 +215,55 @@ check_eq "firing: leaves another session's build alone" "alive" \
   "$(kill -0 "${pid_other}" 2>/dev/null && echo alive || echo dead)"
 kill -KILL "${pid_other}" 2>/dev/null || true
 
+# --- the dry run works ABOVE the floor, which is the only time it is used ---
+#
+# The dry run is the safe check CLAUDE.md tells sessions to use instead of
+# testing the kill path against live processes, so it is run on a healthy
+# volume. Shipped inside the floor branch it produced no output and never
+# returned, and no case saw it because every dry-run case above passes an
+# impossible floor. Default floor here, real free space.
+pid_dry="$(start_fake_build)"
+sleep 1
+dry_out=""
+if dry_out="$(WATCHDOG_DRY_RUN=1 timeout 10 "${WATCHDOG}" "${SCOPE}" 2>&1)"; then dry_rc=0; else dry_rc=$?; fi
+check_eq "dry run above the floor returns instead of looping" "0" "${dry_rc}"
+check_contains "dry run above the floor names the build it would kill" "${pid_dry}" "${dry_out}"
+check_eq "dry run above the floor kills nothing" "alive" \
+  "$(kill -0 "${pid_dry}" 2>/dev/null && echo alive || echo dead)"
+kill -KILL "${pid_dry}" 2>/dev/null || true
+
+# --- the free-space reader is real, not a constant ------------------------
+#
+# Nothing asserted on the parsed figure, so replacing free_gb's body with a
+# constant left every case green while turning the shipped watchdog into an
+# unconditional killer at the default floor. Pin the number against df.
+want_gb="$(df -Pk "${SCOPE}" | awk 'NR==2 {print int($4/1048576)}')"
+got_line="$(WATCHDOG_DRY_RUN=1 timeout 10 "${WATCHDOG}" "${SCOPE}" 2>&1)"
+check_contains "the reported free space matches df on the scope" "${want_gb} GB left" "${got_line}"
+
+# --- the marker is written BEFORE the kill --------------------------------
+#
+# Both the commit message and CLAUDE.md assert this ordering, and every other
+# case observes the marker only after the target is already dead, so moving
+# the marker below the SIGKILL left them all green. Here the victim ignores
+# SIGTERM, so it survives into the five-second window between the TERM and the
+# KILL, and records whether the marker exists while it is still alive. With
+# the marker written first it sees it; with the marker written after the kill
+# it is dead before the marker exists and never can.
+ORD="${TMP}/ordering"
+mkdir -p "${ORD}/bin"
+ln -s /bin/sh "${ORD}/bin/cargo"
+ORD_MARKER="${ORD}/.disk-watchdog-fired"
+ORD_SEEN="${ORD}/seen"
+: > "${ORD_SEEN}"
+( cd "${ORD}" && exec "${ORD}/bin/cargo" -c "trap '' TERM; while :; do if [ -e '${ORD_MARKER}' ]; then echo yes >> '${ORD_SEEN}'; fi; sleep 1; done" ) \
+  >/dev/null 2>&1 &
+pid_ord=$!
+sleep 1
+"${WATCHDOG}" "${ORD}" 999999 1000000 1 >/dev/null 2>&1
+check_eq "the marker exists while the build is still alive" "yes" \
+  "$(head -1 "${ORD_SEEN}" 2>/dev/null)"
+kill -KILL "${pid_ord}" 2>/dev/null || true
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
