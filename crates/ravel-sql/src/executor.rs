@@ -385,7 +385,11 @@ fn ts_literal(ns: i64) -> Expr {
 /// hours exactly; `window_hour_bounds` still widens the start down by
 /// `max_ingest_lag_ns` and the end up by `clock_skew_allowance_ns`, so every
 /// part holding a resolved segment intersects. An empty snapshot returns a
-/// zero window: no segment means no part's statistics can matter.
+/// zero window. That is not a short circuit: `window_hour_bounds(0, 0)` yields
+/// `Some((0, 0))`, so a legacy single-part HEAD whose `min_hour` is 0 still
+/// intersects and the loader still pays its HEAD read plus one whole-object
+/// GET. It is harmless, because an empty snapshot has no segment to join the
+/// loaded statistics against.
 fn snapshot_covering_window(snapshot: &Snapshot) -> (TimeRange, i64) {
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
     let min_hour = snapshot
@@ -400,8 +404,18 @@ fn snapshot_covering_window(snapshot: &Snapshot) -> (TimeRange, i64) {
         .map(|seg| seg.ingest_hour_bucket)
         .max()
         .unwrap_or(0);
-    let min_ns = i64::from(min_hour) * NS_PER_HOUR;
-    let max_ns = i64::from(max_hour) * NS_PER_HOUR;
+    // Saturating, not plain multiplication: `ingest_hour_bucket` is a u32 read
+    // from a catalog object, and anything at or above hour 2_562_048 overflows
+    // i64 nanoseconds. Under dev and ci, where overflow checks are on, that
+    // panics inside `plan_pinned`; under release it wraps, and a wrapped
+    // negative `now_ns` makes `window_hour_bounds` return None, which loses
+    // every column statistic silently. Saturating clamps to hour 2_562_047,
+    // which is the ceiling of the (TimeRange, now_ns) contract this pair feeds
+    // rather than a limit of this function: a part above it stays uncovered and
+    // scans, and a snapshot mixing real hours with one absurd bucket still
+    // covers all of its real parts.
+    let min_ns = i64::from(min_hour).saturating_mul(NS_PER_HOUR);
+    let max_ns = i64::from(max_hour).saturating_mul(NS_PER_HOUR);
     (
         TimeRange {
             start_ns: min_ns,
