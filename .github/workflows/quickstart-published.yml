@@ -64,12 +64,15 @@ on:
     # catch a README/published-image drift before a reader does.
     - cron: "29 6 * * 0"
 
-# Minimum permissions for the deliverable's failure routing: `issues: write` lets
-# a red leg file or comment on a tracking issue; `contents: read` is what
-# actions/checkout needs. Nothing else is granted.
+# Workflow-level floor: `contents: read`, what actions/checkout needs and
+# nothing more (fuzz-nightly.yml pattern). `issues: write` is NOT granted
+# here: it is granted on the `report` job alone, the only job that files or
+# comments on the tracking issue and the only job that runs no third-party
+# code (no checkout, no compose bring-up, no telemetrygen). Every step of
+# `check-published` -- checkout, compose, telemetrygen, the README check --
+# runs with `contents: read` and nothing else.
 permissions:
   contents: read
-  issues: write
 
 env:
   COMPOSE_FILE: deploy/docker-compose/ravel.yml
@@ -92,6 +95,13 @@ jobs:
   check-published:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Every step below checks out the repo, pulls and runs published images,
+    # and runs telemetrygen containers against them: none of that needs to
+    # write anything. Filing the tracking issue needs `issues: write`, and
+    # that permission lives on the `report` job instead, which runs no
+    # third-party code at all.
+    permissions:
+      contents: read
     strategy:
       # Never let a green leg cancel or hide a red one: both runs must complete
       # and be diagnosable on their own.
@@ -206,36 +216,96 @@ jobs:
         if: always()
         run: docker compose -f "$COMPOSE_FILE" down -v || true
 
-      # Failure routing (ADR-0081 decision 8): a red leg files a labelled tracking
-      # issue linking this run, or comments on the existing open one for this leg
-      # so an ongoing breakage does not open a fresh issue every week. Per-leg, so
-      # the title names which of the two runs (latest / pinned-default) failed.
-      - name: File or update the tracking issue
-        if: failure()
+  # Failure routing (ADR-0081 decision 8), deliberately a separate job on the
+  # fuzz-nightly.yml pattern: this is the only place that needs
+  # `issues: write`, and it is the only job that runs no third-party code. It
+  # checks nothing out, brings up no compose stack and runs no telemetrygen
+  # container, so the write token is never in the environment of any of that.
+  #
+  # `check-published` is a two-leg matrix (latest / pinned-default), and a
+  # matrix job's own `outputs:` collapse to a single last-writer-wins value
+  # across legs (ADR-0037 decision 13 hits the same wall for a build matrix),
+  # so which leg(s) failed cannot travel through a job output here. Instead
+  # this job asks the Actions API directly for the per-leg job conclusions
+  # of THIS run, which is unambiguous regardless of how many legs failed.
+  report:
+    needs: check-published
+    # `needs: check-published` alone would skip this job, because a dependent
+    # of a failed job is skipped by default. The condition has to be explicit
+    # and has to name a status-check function: an `if:` containing none of
+    # always()/failure()/cancelled() still gets an implicit success() ANDed
+    # in, which would never be true here. Testing the job's `result` rather
+    # than the old step-level `if: failure()` inside `check-published` is
+    # also what covers a leg's job being killed by the workflow's own
+    # timeout-minutes: such a job reports `failure` but runs no further step
+    # of its own, so the old in-job step never ran on exactly that failure
+    # mode. Deliberately does not fire on 'cancelled': a cancellation is
+    # human-initiated, not a quickstart regression.
+    if: ${{ always() && needs.check-published.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    # Serialize THIS job only, across runs, so the read-then-create below
+    # cannot race: two runs (e.g. the weekly schedule and a manual dispatch)
+    # failing close together would otherwise both see an empty issue list and
+    # both create one for the same leg, breaking the single-issue dedup
+    # contract. cancel-in-progress stays false for a different reason than
+    # usual: the queued run here is not stale, it is a second failure that
+    # still needs to be filed or commented, and cancelling it would silently
+    # drop that week's finding instead of just delaying its report by the
+    # few seconds this step takes.
+    concurrency:
+      group: quickstart-published-report
+      cancel-in-progress: false
+    steps:
+      # A red leg files a labelled tracking issue linking this run, or
+      # comments on the existing open one for this leg so an ongoing breakage
+      # does not open a fresh issue every week. Per-leg, so the title names
+      # which of the two runs (latest / pinned-default) failed. Which leg(s)
+      # failed is read from the run's own job list (see the job comment
+      # above), not from a job output.
+      - name: File or update the tracking issue(s)
         env:
           GH_TOKEN: ${{ github.token }}
-          # Deterministic (no run id): both the issue title and the dedup key, so
-          # a recurring failure for the same leg maps to one open issue.
-          MARKER: "Weekly quickstart-published lane is red (${{ matrix.name }} image)"
+          # No checkout in this job, so gh has no git remote to infer the
+          # repository from and every call would fail without this.
+          GH_REPO: ${{ github.repository }}
         run: |
           run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          # Best-effort: ensure the label exists so `gh issue create --label`
-          # cannot fail on a missing label. Ignores "already exists".
           gh label create "$ISSUE_LABEL" \
             --color BFD4F2 \
             --description "Weekly published-image quickstart README check failures (ADR-0081 D8)" \
             2>/dev/null || true
-          # Find an existing open issue for THIS leg by matching the deterministic
-          # marker in the title (env.MARKER inside the jq filter, literal substring
-          # via contains -- no regex escaping). Empty when none exists.
-          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
-            --json number,title \
-            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
-          body=$(cat <<EOF
-          The weekly \`quickstart-published\` lane failed for the **${{ matrix.name }}** image.
+
+          # Every job of this run, once, reused by both legs below.
+          jobs_json=$(gh api "repos/${GH_REPO}/actions/runs/${GITHUB_RUN_ID}/jobs" --paginate) \
+            || jobs_json='{"jobs":[]}'
+
+          for leg in latest pinned-default; do
+            # The matrix job's display name is "check-published (<name>, ...)",
+            # carrying every matrix key in declaration order (name, then
+            # image); matching a prefix on "(<leg>" is robust to the exact
+            # image value that follows it, including the pinned-default leg's
+            # empty one.
+            conclusion=$(printf '%s' "$jobs_json" | jq -r --arg leg "$leg" \
+              '[.jobs[] | select(.name | startswith("check-published (" + $leg)) | .conclusion] | .[0] // empty')
+            if [ "$conclusion" != "failure" ]; then
+              continue
+            fi
+
+            # Deterministic (no run id): both the issue title and the dedup
+            # key, so a recurring failure for the same leg maps to one open
+            # issue.
+            marker="Weekly quickstart-published lane is red ($leg image)"
+            existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+              --json number,title \
+              --jq --arg marker "$marker" 'map(select(.title | contains($marker))) | .[0].number // empty') || existing=""
+            body=$(cat <<EOF
+          The weekly \`quickstart-published\` lane failed for the **$leg** image.
 
           - Run: $run_url
-          - Compose file: \`$COMPOSE_FILE\`
+          - Compose file: \`deploy/docker-compose/ravel.yml\`
           - Check: \`scripts/check-readme-commands.sh README.md\`
 
           This lane runs the README's marked command blocks against the PUBLISHED
@@ -251,12 +321,15 @@ jobs:
           window: a red there is always a real defect (a stale pin in the compose
           file, or a genuine README/image mismatch).
 
-          See the run's "Dump compose logs on failure" step for stack logs.
+          See the \`check-published ($leg, ...)\` job's own log, including its
+          "Dump compose logs on failure" step, for stack logs. This job runs no
+          checkout of its own and cannot re-run that step.
           EOF
-          )
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --body "$body"
-            echo "commented on existing issue #$existing"
-          else
-            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
-          fi
+            )
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+              echo "commented on existing issue #$existing ($leg)"
+            else
+              gh issue create --title "$marker" --label "$ISSUE_LABEL" --body "$body"
+            fi
+          done
