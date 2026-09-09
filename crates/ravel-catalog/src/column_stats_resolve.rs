@@ -168,6 +168,17 @@ pub(crate) struct ResolvedStatsRef {
     /// exactly the one covered part for v3. A fetch is valid only against this
     /// exact part set (ADR-0942's binding check).
     pub expected_part_blake3: Vec<[u8; 32]>,
+    /// The envelope `format_version` (1, 2, or 3) the slot this ref was read
+    /// from promises: field 11 always names a v1 object, field 13 always v2,
+    /// and a part's field 7 always v3. `fetch_stats_object` is shared verbatim
+    /// across all three slots, and `decode_column_stats` only checks the
+    /// envelope byte against the object's OWN header, never against which
+    /// slot the caller read it from -- so without this field, a v1 object
+    /// planted (or left behind by a downgrade) under a v3 ref decodes clean
+    /// and lands in the identity-keyed `segments` map, where
+    /// `LoadedColumnStats::stat_for` then serves it as a global fallback for
+    /// every segment in the query instead of the one part it was bound to.
+    pub expected_version: u32,
 }
 
 /// HEAD's part list plus its two whole-object statistics refs, resolved from
@@ -290,6 +301,7 @@ pub(crate) async fn resolve_stats_head(
                 key: stats_ref.key.clone(),
                 blake3,
                 expected_part_blake3: all_part_blake3.clone(),
+                expected_version: 1,
             })
     });
     let v2 = head.column_stats_part.as_ref().and_then(|stats_ref| {
@@ -299,6 +311,7 @@ pub(crate) async fn resolve_stats_head(
                 key: stats_ref.key.clone(),
                 blake3,
                 expected_part_blake3: all_part_blake3.clone(),
+                expected_version: 2,
             })
     });
 
@@ -322,6 +335,7 @@ pub(crate) fn resolve_part_stats_ref(part: &SnapshotPartRef) -> Option<ResolvedS
         key: stats_ref.key.clone(),
         blake3,
         expected_part_blake3: vec![part_blake3],
+        expected_version: 3,
     })
 }
 
@@ -358,6 +372,17 @@ pub(crate) async fn fetch_stats_object(
         // still degrades to a miss and scans.
         Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
     };
+
+    // The slot `resolved` was read from (field 11, 13, or a part's field 7)
+    // promises a specific envelope version; `decode_column_stats` only checks
+    // the envelope byte against the object's OWN header, never against which
+    // slot named it. A mismatch here means the object at `resolved.key` is not
+    // the version this slot is defined to hold (a stale object left behind by
+    // a downgrade, or a future writer bug), so it must not be accepted into
+    // this version's map: degrade like any other stale binding.
+    if decoded.header.format_version != resolved.expected_version {
+        return Ok(FetchOutcome::Absent);
+    }
 
     if decoded.header.tenant_hash != tenant.0.to_vec() {
         return Err(LoadColumnStatsError::TenantHashMismatch {

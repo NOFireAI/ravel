@@ -9064,6 +9064,148 @@ mod tests {
         assert!(loaded.by_content_hash.contains_key(&content_c));
     }
 
+    /// BLOCKING regression (issue #1483 review, ADR-1413 T2): `fetch_stats_object`
+    /// is shared verbatim by field 11 (v1), field 13 (v2), and a part's field 7
+    /// (v3) refs, and `decode_column_stats` only checks an object's envelope
+    /// byte against its OWN header, never against which slot the caller read
+    /// it from. So a legacy **v1** object -- correctly hashed, correctly
+    /// tenant-scoped, and bound to exactly this part's blake3 -- planted under
+    /// this part's field-7 (v3) ref used to decode clean and land in the
+    /// identity-keyed `segments` map, which `LoadedColumnStats::stat_for`
+    /// consults as a GLOBAL fallback for every segment in the query: one
+    /// mis-versioned object under one part's v3 slot would silently defeat
+    /// per-part scoping for the whole tenant.
+    ///
+    /// This fixture has exactly one part, whose field-7 ref points at a v1-
+    /// encoded object with a matching `part_blake3` and no field 11/13 whole-
+    /// object ref anywhere on HEAD to fall back to.
+    ///
+    /// Prove-the-test: removing the `format_version` check in
+    /// `column_stats_resolve::fetch_stats_object`
+    /// (crates/ravel-catalog/src/column_stats_resolve.rs) makes this fail:
+    /// the v1 object decodes, passes tenant and part-binding checks, and
+    /// `load_column_stats` returns `Some` with the segment loaded under
+    /// `segments` (by `EntryIdentity`) instead of `None`.
+    #[tokio::test]
+    async fn v1_object_under_a_v3_field_seven_slot_is_rejected_not_loaded() {
+        let store = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_hash = *blake3::hash(b"part-mis-versioned").as_bytes();
+
+        // A well-formed v1 object: correctly hashed, correctly tenant-scoped,
+        // and bound to exactly this one part -- everything `fetch_stats_object`
+        // checks EXCEPT which slot it was read from.
+        let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    count: 1,
+                }],
+                sum: Some(1),
+            }],
+        }];
+        let v1_bytes = crate::snapshot_format::encode_column_stats(
+            tenant().0,
+            signal_num,
+            vec![part_hash.to_vec()],
+            &segments,
+        )
+        .expect("encode v1 stats");
+        let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
+        let v1_key = format!(
+            "t/{}/catalog/{prefix}/cstat/mis-versioned.cstat",
+            tenant().to_hex()
+        );
+        store
+            .put(
+                &v1_key,
+                Bytes::from(v1_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v1 stats");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 10,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: "unused".to_string(),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+                // The v1 object above wears a field-7 (v3) ref: same key,
+                // same blake3, same part binding a genuine v3 object would
+                // carry, but the object itself is v1-encoded.
+                column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                    key: v1_key.clone(),
+                    blake3: v1_hash.to_vec(),
+                    size: v1_bytes.len() as u64,
+                    segment_count: 1,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            // No field 11, no field 13: nothing for a rejected part to fall
+            // back to, so a rejection here must surface as no coverage at
+            // all, not a quiet reroute to a whole-object answer.
+            column_stats: None,
+            column_stats_part: None,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok");
+
+        assert!(
+            loaded.is_none(),
+            "the mis-versioned v1 object must be rejected, and there is no \
+             whole-object ref to fall back to, so the part is simply \
+             uncovered: {loaded:?}"
+        );
+    }
+
     /// ADR-1413 decision 2: a covered part with no v3 ref (field 7 absent)
     /// falls back to the whole-tenant object, and the fallback answers that
     /// part's segment -- the query still gets exact statistics for every
