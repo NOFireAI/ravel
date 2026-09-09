@@ -330,6 +330,20 @@ resolve() {
     *) printf '%s' "${tip}" ;;
   esac
 }
+# E2E_GIT_FAIL_AT names one call the guard makes and fails exactly that one, so
+# each of the guard's internal failure paths can be reached on its own. The two
+# rev-parse calls are distinguished by which ref they resolve, since reverting
+# only the second one's exit code is otherwise invisible.
+fail_at="${E2E_GIT_FAIL_AT:-}"
+case "$1:${2:-}" in
+  "rev-parse:refs/remotes/origin/main")
+    [[ "${fail_at}" == "rev-parse-tip" ]] && exit 1 ;;
+  "rev-parse:refs/remotes/origin/freshness-check-"*)
+    [[ "${fail_at}" == "rev-parse-local" ]] && exit 1 ;;
+esac
+case "$1" in
+  merge-base|rev-list) [[ "${fail_at}" == "$1" ]] && exit 1 ;;
+esac
 case "$1" in
   fetch)
     # E2E_GIT_FETCH_FAIL=1 makes the fetch fail while the remote still has the
@@ -630,6 +644,72 @@ unset E2E_GIT_FETCH_FAIL
 check_eq "a fetch that fails is reported as could-not-check, not as behind" \
   "  -> could not check merge-base freshness (guard exit 2); check by hand before merging" \
   "$(printf '%s\n' "${fetchfail_out}" | sed -n 2p)"
+# And which diagnostic it chose: the guard asks the remote whether the pull
+# request ref exists at all, and reporting "no such pull request" for a fetch
+# that merely failed sends the operator somewhere else entirely.
+check_eq "a fetch that fails says so, rather than blaming the pull request" \
+  "     git fetch origin (main, refs/pull/908/head) failed" \
+  "$(printf '%s\n' "${fetchfail_out}" | sed -n 3p)"
+
+# The guard's remaining internal failure paths, one at a time, so that a revert
+# of any single `exit 2` in it shows up as a verdict of "behind" here. Without
+# these only two of its seven such sites are pinned.
+for failing_call in rev-parse-tip rev-parse-local merge-base; do
+  export E2E_GIT_FAIL_AT="${failing_call}"
+  failed_call_out="$(e2e "${CLEAN_BODY_JSON}")"
+  unset E2E_GIT_FAIL_AT
+  check_eq "a failing ${failing_call} is reported as could-not-check" \
+    "  -> could not check merge-base freshness (guard exit 2); check by hand before merging" \
+    "$(printf '%s\n' "${failed_call_out}" | sed -n 2p)"
+done
+
+# rev-list runs only after the base is known to be behind, so this one needs
+# the stale mode too.
+export E2E_GIT_STALE=1 E2E_GIT_FAIL_AT=rev-list
+revlist_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_STALE E2E_GIT_FAIL_AT
+check_eq "a failing rev-list is reported as could-not-check" \
+  "  -> could not check merge-base freshness (guard exit 2); check by hand before merging" \
+  "$(printf '%s\n' "${revlist_out}" | sed -n 2p)"
+
+# The caller pins the guard to its own checkout with a `cd`, and that `cd`
+# failing is its own outcome rather than a stale base: left bare in the `&&` it
+# exits 1, the code reserved for "behind", and the operator is told to rebase
+# over a guard that never ran. Reaching it needs the script's directory to
+# disappear after the last thing the script reads from there, which is the
+# outside-diff jq filter, so this jq passes every call through to the real one
+# and removes the tree once that filter has been served.
+VANISH_DIR="${E2E_DIR}/vanish"
+mkdir -p "${VANISH_DIR}/scripts" "${VANISH_DIR}/bin"
+ln -s "$(cd "$(dirname "$0")" && pwd)/lib" "${VANISH_DIR}/scripts/lib"
+ln -s "$(cd "$(dirname "$0")" && pwd)/guards" "${VANISH_DIR}/scripts/guards"
+cp "$(dirname "$0")/pr-review-status.sh" "${VANISH_DIR}/scripts/pr-review-status.sh"
+REAL_JQ="$(command -v jq)"
+cat >"${VANISH_DIR}/bin/jq" <<SHIM
+#!/usr/bin/env bash
+"${REAL_JQ}" "\$@"
+rc=\$?
+case "\$*" in
+  *coderabbit-outside-diff.jq*) rm -rf "${VANISH_DIR}/scripts" ;;
+esac
+exit \$rc
+SHIM
+chmod +x "${VANISH_DIR}/bin/jq"
+
+vanished_out="$(E2E_SCRIPT="${VANISH_DIR}/scripts/pr-review-status.sh" \
+  PATH="${VANISH_DIR}/bin:${PATH}" e2e "${CLEAN_BODY_JSON}")"
+
+check_eq "a cd that fails is reported as could-not-check, not as behind" \
+  "  -> could not check merge-base freshness (guard exit 2); check by hand before merging" \
+  "$(printf '%s\n' "${vanished_out}" | sed -n 2p)"
+
+# The usage path, which no e2e case can reach because the caller always passes
+# the pull request number it was given.
+guard_noarg_rc=0
+"$(dirname "$0")/guards/assert-fresh-merge-base.sh" >/dev/null 2>&1 || guard_noarg_rc=$?
+check_eq "the guard exits 2 when given no argument at all" \
+  "2" \
+  "${guard_noarg_rc}"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
