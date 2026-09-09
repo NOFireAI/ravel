@@ -15,8 +15,14 @@
 //! A cursor carries the signal, the half-open time range, the minimum
 //! commit-token watermark the page was resolved against, the pending erasure
 //! predicates in force, and the declared column set (the 2026-09-09 amendment
-//! to ADR-1374 D5). Redemption re-resolves the snapshot from those inputs
-//! deterministically.
+//! to ADR-1374 D5, as corrected by the 2026-09-10 one). Redemption re-resolves
+//! the snapshot from those inputs deterministically, and refuses the cursor as
+//! [`CursorError::Expired`] in the two cases where that re-resolve would no
+//! longer answer with the page's own snapshot: its deadline has fallen outside
+//! the protection horizon less the grace, which is where a compaction becomes
+//! free to take the pin apart, or an erasure predicate is in force that the
+//! cursor did not pin and that reaches its signal and time range. Both live in
+//! [`Cursor::redeem`].
 //!
 //! The watermark is one of those inputs and nothing more. It is what page 2
 //! resolves against, not a test run against whatever watermark the redeeming
@@ -73,8 +79,9 @@
 //!
 //! A cursor whose pin is gone has nothing left to offer: page 2 of a
 //! paginated result means something only against page 1's snapshot, so
-//! [`Cursor::redeem`] reports [`CursorError::Expired`] for a passed deadline
-//! or a foreign nonce. An evidence reference is different. It names one row,
+//! [`Cursor::redeem`] reports [`CursorError::Expired`] for a passed deadline,
+//! a foreign nonce, or a newer erasure over its range. An evidence reference
+//! is different. It names one row,
 //! and every field a fresh re-execution needs (the tenant, the tool, the
 //! argument hash, and the row digest to compare the re-read row against) is
 //! in the token itself. [`EvidenceRef::redeem`] therefore answers
@@ -549,6 +556,23 @@ impl Cursor {
     /// that bounds its own work by the field cannot read past the pin's
     /// protection either.
     ///
+    /// That clamp is also the compaction check of the 2026-09-10 amendment to
+    /// ADR-1374 D5, and the only one. `protection_horizon_ns` minus
+    /// [`GRACE_NS`] is the instant past which a sweep may compact away what
+    /// the pin resolves to, so a cursor whose pin is no longer protected is
+    /// [`CursorError::Expired`] before anything else here runs. Nothing else
+    /// in this codec can observe a compaction, and a second mechanism for it
+    /// would only be a second thing to keep in agreement with this one.
+    ///
+    /// `erasure_in_force` is the pending erasure predicate set at redemption,
+    /// each paired with the signal it applies to. A predicate in force that
+    /// the cursor did not pin, whose signal is the cursor's own and whose
+    /// event-time window overlaps the cursor's half-open range, is the second
+    /// failure the amendment names: the page came from a snapshot that no
+    /// longer reproduces, so the cursor is [`CursorError::Expired`]. A
+    /// predicate outside that scope leaves it redeemable (see
+    /// [`Cursor::newer_erasure_intersects`]).
+    ///
     // Every parameter is a distinct precondition of a single redemption, and
     // a caller that omits one has skipped a check. Grouping them into a
     // struct would let a call site leave a field at its default.
@@ -559,6 +583,7 @@ impl Cursor {
         caller_tenant: TenantHash,
         tool: &str,
         argument_hash: &[u8; 32],
+        erasure_in_force: &[(Signal, ErasurePredicate)],
         now_ns: i64,
         protection_horizon_ns: i64,
     ) -> Result<Cursor, CursorError> {
@@ -576,8 +601,51 @@ impl Cursor {
         if now_ns >= cursor.deadline_ns {
             return Err(CursorError::Expired);
         }
+        if cursor.newer_erasure_intersects(erasure_in_force) {
+            return Err(CursorError::Expired);
+        }
         Ok(cursor)
     }
+
+    /// Whether an erasure predicate is in force at redemption that this
+    /// cursor did not pin and that reaches into what its page read.
+    ///
+    /// Scope is the cursor's signal and its half-open `[range_start_ns,
+    /// range_end_ns)`, and nothing else. A predicate's matchers are tested
+    /// against a record's labels or attributes, and this codec holds no
+    /// records, so no matcher-level analysis is possible here: two predicates
+    /// that name different services are both treated as reaching the cursor's
+    /// rows. Overrefusing that way costs a re-run of the query, where missing
+    /// a predicate would page against a snapshot ADR-0064 requires the erasure
+    /// to have already left.
+    ///
+    /// A predicate for another signal, or one whose window lies entirely
+    /// outside the cursor's range, cannot touch a row this page returned, so
+    /// it leaves the cursor redeemable. A windowless predicate (both bounds
+    /// unset, `ravel_query::erasure`'s zero-as-unset convention) erases
+    /// regardless of event time and so intersects every range.
+    ///
+    /// Predicates that were in force at mint and are not in force now are not
+    /// a mismatch either: an erasure that completed took its rows out of the
+    /// pinned snapshot before the page was built, and the pin already names it.
+    fn newer_erasure_intersects(&self, in_force: &[(Signal, ErasurePredicate)]) -> bool {
+        in_force.iter().any(|(signal, predicate)| {
+            *signal == self.signal
+                && !self.pending_erasure.contains(predicate)
+                && window_intersects(predicate, self.range_start_ns, self.range_end_ns)
+        })
+    }
+}
+
+/// Whether an erasure predicate's half-open event-time window overlaps the
+/// half-open `[start_ns, end_ns)` a cursor was resolved over.
+///
+/// A bound of `0` means unset on that side, the convention
+/// `ravel_query::erasure` reads a predicate's window under, so an unset bound
+/// is unbounded rather than the epoch.
+fn window_intersects(predicate: &ErasurePredicate, start_ns: i64, end_ns: i64) -> bool {
+    (predicate.window_end_ns() == 0 || predicate.window_end_ns() > start_ns)
+        && (predicate.window_start_ns() == 0 || predicate.window_start_ns() < end_ns)
 }
 
 impl EvidenceRef {
@@ -951,6 +1019,10 @@ mod tests {
     /// tests assert the embedded deadline's own behavior.
     const FAR_HORIZON_NS: i64 = NOW_NS + 365 * 24 * 3_600 * 1_000_000_000 + GRACE_NS;
 
+    /// No erasure predicate in force at redemption, so the newer-erasure
+    /// check is inert in every test but the three that exercise it.
+    const NO_ERASURE: &[(Signal, ErasurePredicate)] = &[];
+
     fn test_key() -> CursorKey {
         CursorKey::from_process_secret([0x11u8; CURSOR_KEY_LEN])
     }
@@ -1034,6 +1106,7 @@ mod tests {
             tenant_b,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1060,6 +1133,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1101,6 +1175,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1124,11 +1199,287 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             deadline,
             FAR_HORIZON_NS,
         )
         .expect_err("must be expired at exactly the deadline");
         assert_eq!(err, CursorError::Expired);
+    }
+
+    /// [`sample_cursor`]'s own pinned erasure set, paired with the signal it
+    /// was pinned for, which is what "unchanged" means at redemption.
+    fn pinned_erasure(cursor: &Cursor) -> Vec<(Signal, ErasurePredicate)> {
+        cursor
+            .pending_erasure
+            .iter()
+            .map(|predicate| (cursor.signal, predicate.clone()))
+            .collect()
+    }
+
+    /// An erasure predicate in force at redemption that the cursor did not
+    /// pin, over the cursor's own signal and reaching into its time range,
+    /// is `Expired`: the snapshot the page came from is one ADR-0064 requires
+    /// those rows to have already left, so it cannot be re-resolved.
+    ///
+    /// Five shapes of reaching in, each the pinned set plus exactly one new
+    /// predicate: windowless (no event-time restriction at all), fully inside
+    /// the range, straddling each end of it, and open-ended above from inside.
+    /// A sixth case drops the pinned predicate from the in-force set as well,
+    /// so the refusal is attributable to the predicate that was added rather
+    /// than to set equality.
+    #[test]
+    fn an_intersecting_new_erasure_is_cursor_expired() {
+        let tenant = TenantHash([0x9Du8; 16]);
+        let key = test_key();
+        let cursor = sample_cursor(tenant);
+        let token = cursor.encode(&key).expect("encodes");
+        assert_eq!(cursor.signal, Signal::Logs);
+        assert_eq!(cursor.range_start_ns, 1_699_999_000_000_000_000);
+        assert_eq!(cursor.range_end_ns, 1_700_000_000_000_000_000);
+        assert_eq!(cursor.pending_erasure.len(), 1);
+
+        let user = vec![("user.id".to_owned(), "u-42".to_owned())];
+        let newer = [
+            ErasurePredicate::windowless(user.clone()),
+            ErasurePredicate::new(
+                user.clone(),
+                cursor.range_start_ns + 1,
+                cursor.range_end_ns - 1,
+            ),
+            ErasurePredicate::new(
+                user.clone(),
+                cursor.range_start_ns - 3_600_000_000_000,
+                cursor.range_start_ns + 1,
+            ),
+            ErasurePredicate::new(
+                user.clone(),
+                cursor.range_end_ns - 1,
+                cursor.range_end_ns + 3_600_000_000_000,
+            ),
+            ErasurePredicate::new(user.clone(), cursor.range_start_ns + 1, 0),
+        ];
+        assert_eq!(newer.len(), 5);
+
+        for predicate in &newer {
+            let mut in_force = pinned_erasure(&cursor);
+            in_force.push((cursor.signal, predicate.clone()));
+            assert_eq!(in_force.len(), 2);
+
+            let err = Cursor::redeem(
+                &token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                &in_force,
+                NOW_NS,
+                FAR_HORIZON_NS,
+            )
+            .expect_err("a newer erasure over the cursor's range must be refused");
+            assert_eq!(err, CursorError::Expired);
+        }
+
+        let only_new = [(cursor.signal, newer[0].clone())];
+        let err = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            &only_new,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("a newer erasure must be refused whatever else is in force");
+        assert_eq!(err, CursorError::Expired);
+
+        // The bindings still answer first: a newer erasure does not turn a
+        // wrong-tenant token into `Expired`, which would tell its holder the
+        // token itself was well-formed.
+        let err = Cursor::redeem(
+            &token,
+            &key,
+            TenantHash([0x9Cu8; 16]),
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            &only_new,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
+    }
+
+    /// An erasure the cursor did not pin that cannot touch a row the page
+    /// returned leaves the cursor redeemable. Three ways to miss: a window
+    /// that ends exactly where the cursor's half-open range starts, one that
+    /// starts exactly where it ends, and a predicate over another signal
+    /// entirely (windowless, so only the signal keeps it out of scope).
+    ///
+    /// The two boundary cases are then moved one nanosecond into the range,
+    /// which must refuse: that is what pins the comparison as strict overlap
+    /// of half-open intervals rather than as touching endpoints.
+    #[test]
+    fn a_non_intersecting_new_erasure_still_redeems() {
+        let tenant = TenantHash([0x9Eu8; 16]);
+        let key = test_key();
+        let cursor = sample_cursor(tenant);
+        let token = cursor.encode(&key).expect("encodes");
+        assert_ne!(cursor.signal, Signal::Metrics);
+
+        let user = vec![("user.id".to_owned(), "u-42".to_owned())];
+        let outside = [
+            (
+                cursor.signal,
+                ErasurePredicate::new(
+                    user.clone(),
+                    cursor.range_start_ns - 3_600_000_000_000,
+                    cursor.range_start_ns,
+                ),
+            ),
+            (
+                cursor.signal,
+                ErasurePredicate::new(
+                    user.clone(),
+                    cursor.range_end_ns,
+                    cursor.range_end_ns + 3_600_000_000_000,
+                ),
+            ),
+            (Signal::Metrics, ErasurePredicate::windowless(user.clone())),
+        ];
+        assert_eq!(outside.len(), 3);
+
+        for entry in &outside {
+            let mut in_force = pinned_erasure(&cursor);
+            in_force.push(entry.clone());
+            let redeemed = Cursor::redeem(
+                &token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                &in_force,
+                NOW_NS,
+                FAR_HORIZON_NS,
+            )
+            .expect("an erasure outside the cursor's scope must redeem");
+            assert_eq!(redeemed, cursor);
+        }
+
+        let just_inside = [
+            ErasurePredicate::new(
+                user.clone(),
+                cursor.range_start_ns - 3_600_000_000_000,
+                cursor.range_start_ns + 1,
+            ),
+            ErasurePredicate::new(
+                user.clone(),
+                cursor.range_end_ns - 1,
+                cursor.range_end_ns + 3_600_000_000_000,
+            ),
+        ];
+        assert_eq!(just_inside.len(), 2);
+
+        for predicate in &just_inside {
+            let in_force = [(cursor.signal, predicate.clone())];
+            let err = Cursor::redeem(
+                &token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                &in_force,
+                NOW_NS,
+                FAR_HORIZON_NS,
+            )
+            .expect_err("one nanosecond inside the range is inside it");
+            assert_eq!(err, CursorError::Expired);
+        }
+    }
+
+    /// The erasure check refuses a predicate the cursor did not pin, not the
+    /// presence of one: the pinned set still in force redeems, and so does an
+    /// in-force set that has lost a predicate the cursor pinned, since an
+    /// erasure that completed already took its rows out of what the page read.
+    /// The cursor comes back whole, carrying the pinned watermark and the
+    /// pinned erasure set unchanged, so page 2 resolves from the pin rather
+    /// than from what the redeeming call happened to observe.
+    #[test]
+    fn an_unchanged_erasure_set_redeems() {
+        let tenant = TenantHash([0x9Fu8; 16]);
+        let key = test_key();
+        let cursor = sample_cursor(tenant);
+        let token = cursor.encode(&key).expect("encodes");
+
+        let mut duplicated = pinned_erasure(&cursor);
+        duplicated.extend(pinned_erasure(&cursor));
+        let in_force_sets = [pinned_erasure(&cursor), Vec::new(), duplicated];
+        assert_eq!(in_force_sets.len(), 3);
+
+        for in_force in &in_force_sets {
+            let redeemed = Cursor::redeem(
+                &token,
+                &key,
+                tenant,
+                SAMPLE_TOOL,
+                &SAMPLE_ARGS,
+                in_force,
+                NOW_NS,
+                FAR_HORIZON_NS,
+            )
+            .expect("an unchanged erasure set must redeem");
+            assert_eq!(redeemed, cursor);
+            assert_eq!(redeemed.min_commit_watermark, cursor.min_commit_watermark);
+            assert_eq!(redeemed.pending_erasure, cursor.pending_erasure);
+        }
+    }
+
+    /// The compaction case of the amendment, through the deadline re-clamp
+    /// that already implements it and not through a second mechanism. A pin
+    /// is protected until `protection_horizon - grace`; past that instant a
+    /// sweep may take apart what the cursor resolves to, so the cursor is
+    /// `Expired` however live its own embedded deadline still is.
+    ///
+    /// The embedded deadline is 29.5 s past `NOW_NS` here and is asserted so,
+    /// which is what makes the horizon the only thing that can produce the
+    /// refusal. One nanosecond of horizon either side of the boundary
+    /// separates the two outcomes.
+    #[test]
+    fn a_cursor_past_the_protection_horizon_is_expired() {
+        let tenant = TenantHash([0xA0u8; 16]);
+        let key = test_key();
+        let cursor = sample_cursor(tenant);
+        let token = cursor.encode(&key).expect("encodes");
+        assert_eq!(cursor.deadline_ns, NOW_NS + 29_500_000_000);
+
+        let horizon = NOW_NS + GRACE_NS;
+        assert_eq!(effective_deadline_ns(cursor.deadline_ns, horizon), NOW_NS);
+        let err = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NO_ERASURE,
+            NOW_NS,
+            horizon,
+        )
+        .expect_err("a pin no longer inside the protection horizon must be refused");
+        assert_eq!(err, CursorError::Expired);
+
+        let redeemed = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NO_ERASURE,
+            NOW_NS,
+            horizon + 1,
+        )
+        .expect("one nanosecond of horizon later, the pin is still protected");
+        assert_eq!(redeemed.deadline_ns, NOW_NS + 1);
     }
 
     /// Every resolve input the amendment names survives the round trip, each
@@ -1195,6 +1546,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1214,6 +1566,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1256,6 +1609,7 @@ mod tests {
             tenant,
             "ravel_query_promql",
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1281,6 +1635,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &other,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1310,6 +1665,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1363,6 +1719,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1383,6 +1740,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1418,6 +1776,7 @@ mod tests {
                 tenant,
                 SAMPLE_TOOL,
                 &SAMPLE_ARGS,
+                NO_ERASURE,
                 NOW_NS,
                 FAR_HORIZON_NS,
             )
@@ -1435,6 +1794,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1463,6 +1823,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1507,6 +1868,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1542,6 +1904,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1716,6 +2079,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             NOW_NS,
             horizon,
         )
@@ -1729,6 +2093,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             clamped,
             horizon,
         )
@@ -1741,6 +2106,7 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
+            NO_ERASURE,
             clamped,
             FAR_HORIZON_NS,
         )
