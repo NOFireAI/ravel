@@ -24,7 +24,11 @@ use ravel_object_store::fault::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
-use ravel_proto::commit::v1::{CommitRecord, Signal as ProtoSignal};
+use ravel_proto::commit::v1::{
+    CommitRecord, CompactionInputIdentity, CompactionPart, RewriteDrop, RewriteRecord,
+    Signal as ProtoSignal,
+};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -234,7 +238,7 @@ proptest! {
     ) {
         let commits: Vec<CommitRecord> =
             events.iter().map(|&ts| commit_with_max_event(ts)).collect();
-        let max = max_event_ts(&commits, &[]);
+        let max = max_event_ts(&commits, &[], &[]);
         let expired = is_expired(max, now, r);
         let threshold = now.saturating_sub(r);
 
@@ -1806,4 +1810,414 @@ async fn tombstoned_bucket_token_query_reports_tombstoned() {
         snapshot.segments.is_empty(),
         "the tombstoned flush is satisfied with zero segments, not served stale data"
     );
+}
+
+// --- Rewrite records are records for retention (issue #1321) ---------------
+//
+// A selective-erasure rewrite record (ADR-0064 decision 3) is a bucket's whole
+// live record set once the superseded-input sweep has removed its inputs, and
+// compaction refuses a bucket holding one, so rewrite-record-only is the
+// durable steady state of an erased bucket. Retention must read it when
+// computing expiry and delete it when sweeping.
+
+/// The synthetic raw-L0 input identity the seeded rewrite records supersede,
+/// and the erasure request they record as applied. Neither has to exist as an
+/// object: retention reads the rewrite record's own fields, and
+/// `erasure::decode_rewrite` validates them against the record's key.
+const REWRITE_INPUT_WRITER: u128 = 0x51;
+const REWRITE_REQUEST: u128 = 0x77;
+
+/// The bytes seeded at each rewrite output part key. Content is irrelevant to
+/// retention (it reads records, never parts), only the object's presence is.
+const REWRITE_PART_BYTES: &[u8] = b"rewrite-output-part";
+
+/// Build one rewrite record for `bucket`: `parts` gives each output part's
+/// `(min_event_ts_ns, max_event_ts_ns)`, empty for a rewrite that dropped
+/// every record in the bucket (which `RewriteRecord.parts` permits).
+fn rewrite_record_for(
+    bucket: &Bucket,
+    created_unix_ns: i64,
+    parts: &[(i64, i64)],
+) -> RewriteRecord {
+    let inputs = vec![CompactionInputIdentity {
+        writer_id: Uuid::from_u128(REWRITE_INPUT_WRITER).to_string(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    }];
+    let request_id = Uuid::from_u128(REWRITE_REQUEST).to_string();
+    let input_set_hash = ravel_commit::erasure::compute_rewrite_input_set_hash(
+        &inputs,
+        None,
+        std::slice::from_ref(&request_id),
+    );
+    RewriteRecord {
+        format_version: 1,
+        tenant_hash: bucket.tenant_hash.0.to_vec(),
+        signal: ravel_commit::signal::to_proto(bucket.signal) as i32,
+        shard: bucket.shard,
+        ingest_hour_bucket: bucket.ingest_hour_bucket,
+        inputs,
+        input_set_hash: input_set_hash.to_vec(),
+        parts: parts
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (min_event_ts_ns, max_event_ts_ns))| CompactionPart {
+                    part_index: index as u32,
+                    first_series_id: vec![0x00; 16],
+                    last_series_id: vec![0xff; 16],
+                    content_hash: vec![0xab; 32],
+                    object_size: REWRITE_PART_BYTES.len() as u64,
+                    sample_count: 1,
+                    series_count: 1,
+                    run_count: 1,
+                    min_event_ts_ns: *min_event_ts_ns,
+                    max_event_ts_ns: *max_event_ts_ns,
+                    segment_format_version: 3,
+                    declared_column_stats: Vec::new(),
+                },
+            )
+            .collect(),
+        drops: vec![RewriteDrop {
+            request_id,
+            dropped_count: 1,
+        }],
+        created_unix_ns,
+        superseded_record_key: String::new(),
+    }
+}
+
+/// Seed [`rewrite_record_for`] plus the L1 part object each of its parts
+/// names, exactly as `publish_rewrite_record` would (ADR-0064 decision 3
+/// point 2: rewrite outputs are PUT under the L1 part-key shape). Returns the
+/// record key and the part keys.
+async fn seed_rewrite_record(
+    store: &dyn ObjectStoreBackend,
+    bucket: &Bucket,
+    created_unix_ns: i64,
+    parts: &[(i64, i64)],
+) -> (String, Vec<String>) {
+    let record = rewrite_record_for(bucket, created_unix_ns, parts);
+    let record_key = keys::rewrite_record_key_for(&record).expect("rewrite record key");
+    store
+        .put(
+            &record_key,
+            ravel_commit::erasure::encode_rewrite(&record),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put rewrite record");
+    let mut part_keys = Vec::new();
+    for part in &record.parts {
+        let key = keys::reconstruct_rewrite_part_key(&record, part).expect("rewrite part key");
+        store
+            .put(
+                &key,
+                Bytes::from_static(REWRITE_PART_BYTES),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put rewrite part");
+        part_keys.push(key);
+    }
+    (record_key, part_keys)
+}
+
+/// The exact set of keys in the store, so a sweep assertion pins which objects
+/// are gone rather than how many.
+async fn key_set(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
+    list_all(store, "")
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|meta| meta.key)
+        .collect()
+}
+
+fn tombstone_key_of(bucket: &Bucket) -> String {
+    keys::retention_tombstone_key(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .expect("tombstone key")
+}
+
+/// `now`, and the tenant's window, for a bucket whose expiry threshold
+/// (`now - R`) is a workable number: sealed well past the seal margin, with
+/// `R` at the config floor.
+fn window_and_now(config: &CompactorConfig) -> (i64, i64) {
+    let window = config.retention_floor_ns(DEFAULT_MAX_INGEST_LAG_NS);
+    (window, sealed_now_ns() + window)
+}
+
+/// The expiry maximum takes the later of an L0 commit record's
+/// `max_event_ts_ns` and a rewrite record's part bounds, in both directions,
+/// and falls back to a part-less rewrite record's own `created_unix_ns`.
+///
+/// Exact values, not bands: dropping the rewrite arm of `max_event_ts` makes
+/// the first assertion return `Some(1_000)` instead of `Some(5_000)` and the
+/// third `None` instead of `Some(7_777)`.
+#[test]
+fn max_event_ts_takes_the_later_of_l0_and_rewrite() {
+    let b = bucket();
+    let rewrite = rewrite_record_for(&b, 42, &[(2_000, 5_000)]);
+
+    assert_eq!(
+        max_event_ts(
+            &[commit_with_max_event(1_000)],
+            &[],
+            std::slice::from_ref(&rewrite)
+        ),
+        Some(5_000),
+        "the rewrite record's part is the newest record in the bucket"
+    );
+    assert_eq!(
+        max_event_ts(&[commit_with_max_event(9_000)], &[], &[rewrite]),
+        Some(9_000),
+        "the L0 commit record is the newest record in the bucket"
+    );
+    assert_eq!(
+        max_event_ts(&[], &[], &[rewrite_record_for(&b, 7_777, &[])]),
+        Some(7_777),
+        "a rewrite with no surviving part contributes its own created_unix_ns"
+    );
+    assert_eq!(
+        max_event_ts(&[], &[], &[]),
+        None,
+        "a bucket with no records at all still yields no maximum"
+    );
+}
+
+/// A bucket whose only record is a rewrite record is tombstoned once the clock
+/// passes the tenant's retention window, and the horizon-gated sweep then
+/// deletes the rewrite record, its output part, and the tombstone, leaving the
+/// bucket empty.
+///
+/// Exact key sets at both steps, so a sweep that leaves the rewrite record
+/// behind (the pre-fix `SweptPartial` forever) cannot pass.
+#[tokio::test]
+async fn rewrite_record_only_bucket_is_tombstoned_then_fully_swept() {
+    let store = MemoryStore::new();
+    let config = cfg();
+    let retention = retention_at_floor(&config);
+    let (window, now) = window_and_now(&config);
+    let b = bucket();
+
+    // One nanosecond older than the expiry threshold `now - R`: expired.
+    let max_event = now - window - 1;
+    let (record_key, part_keys) =
+        seed_rewrite_record(&store, &b, max_event, &[(max_event - 1_000, max_event)]).await;
+    assert_eq!(part_keys.len(), 1, "one output part seeded");
+    let seeded: BTreeSet<String> = [record_key.clone(), part_keys[0].clone()]
+        .into_iter()
+        .collect();
+    assert_eq!(key_set(&store).await, seeded, "exactly what was seeded");
+
+    let clock = FixedClock::new(now);
+    let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+        .await
+        .expect("retention pass");
+    assert_eq!(outcome, RetentionOutcome::Tombstoned);
+
+    let tombstone_key = tombstone_key_of(&b);
+    let mut tombstoned = seeded.clone();
+    tombstoned.insert(tombstone_key.clone());
+    assert_eq!(
+        key_set(&store).await,
+        tombstoned,
+        "the tombstone is the only new object; nothing is deleted yet"
+    );
+
+    // The tombstone counts the rewrite record as a record observed.
+    let bytes = store
+        .get(&tombstone_key, ravel_object_store::GetRange::Full)
+        .await
+        .expect("get tombstone")
+        .data;
+    let tombstone = ravel_commit::record::decode_tombstone(bytes.as_ref()).expect("decode");
+    assert_eq!(
+        tombstone.record_count_observed, 1,
+        "the rewrite record is the one record the bucket held"
+    );
+    assert_eq!(tombstone.retired_at_ns, now);
+    assert_eq!(tombstone.retention_window_ns, window as u64);
+
+    // Horizon elapsed: the physical sweep finishes the bucket.
+    let after_horizon = FixedClock::new(now + config.protection_horizon_ns);
+    let outcome =
+        retention_sweep_bucket(&store, &after_horizon, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("sweep pass");
+    assert_eq!(outcome, RetentionOutcome::Swept);
+    assert_eq!(
+        key_set(&store).await,
+        BTreeSet::new(),
+        "rewrite record, its part, and the tombstone are all gone"
+    );
+}
+
+/// A rewrite-record-only bucket still inside its retention window is not
+/// tombstoned, at the threshold (`max_event_ts == now - R`, which
+/// [`is_expired`] treats as live) and strictly inside it.
+#[tokio::test]
+async fn rewrite_record_only_bucket_inside_its_window_is_not_tombstoned() {
+    for past_threshold in [0i64, 1] {
+        let store = MemoryStore::new();
+        let config = cfg();
+        let retention = retention_at_floor(&config);
+        let (window, now) = window_and_now(&config);
+        let b = bucket();
+
+        let max_event = now - window + past_threshold;
+        let (record_key, part_keys) =
+            seed_rewrite_record(&store, &b, max_event, &[(max_event - 1_000, max_event)]).await;
+        let seeded: BTreeSet<String> = [record_key, part_keys[0].clone()].into_iter().collect();
+
+        let clock = FixedClock::new(now);
+        let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("retention pass");
+        assert_eq!(
+            outcome,
+            RetentionOutcome::NotExpired,
+            "max_event_ts {max_event} is not older than the threshold {}",
+            now - window
+        );
+        assert!(!has_tombstone(&store, &b).await, "no tombstone was written");
+        assert_eq!(
+            key_set(&store).await,
+            seeded,
+            "an unexpired bucket is untouched: exact key set unchanged"
+        );
+    }
+}
+
+/// A bucket holding a rewrite record plus a live L0 commit record expires on
+/// the later of the two timestamps, whichever record carries it. The
+/// rewrite-is-younger direction is what fails when `max_event_ts` ignores
+/// rewrite records: the bucket then looks expired and is tombstoned while a
+/// surviving rewrite output part is still inside the window.
+#[tokio::test]
+async fn rewrite_record_plus_live_l0_expires_on_the_later_timestamp() {
+    // (label, rewrite part max_event offset from the threshold, L0 offset)
+    let cases = [
+        ("rewrite is younger", 1i64, -1i64),
+        ("l0 is younger", -1, 1),
+    ];
+    for (label, rewrite_offset, l0_offset) in cases {
+        let store = MemoryStore::new();
+        let config = cfg();
+        let retention = retention_at_floor(&config);
+        let (window, now) = window_and_now(&config);
+        let threshold = now - window;
+        let b = bucket();
+
+        let l0_max = threshold + l0_offset;
+        let commit_key = seed_input(
+            &store,
+            &InputSpec::new(
+                Uuid::from_u128(0x71),
+                4,
+                1,
+                vec![raw_series(
+                    "m",
+                    &[("k", "a")],
+                    &[(l0_max - 1_000, 1.0), (l0_max, 2.0)],
+                )],
+            ),
+        )
+        .await;
+        let rewrite_max = threshold + rewrite_offset;
+        let (record_key, part_keys) = seed_rewrite_record(
+            &store,
+            &b,
+            rewrite_max,
+            &[(rewrite_max - 1_000, rewrite_max)],
+        )
+        .await;
+
+        let clock = FixedClock::new(now);
+        let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("retention pass");
+        assert_eq!(
+            outcome,
+            RetentionOutcome::NotExpired,
+            "{label}: the later of {rewrite_max} (rewrite) and {l0_max} (L0) is not \
+             older than the threshold {threshold}"
+        );
+        assert!(
+            !has_tombstone(&store, &b).await,
+            "{label}: no tombstone was written"
+        );
+        let expected: BTreeSet<String> = [commit_key, record_key, part_keys[0].clone()]
+            .into_iter()
+            .chain(
+                list_all(
+                    &store,
+                    &format!("t/{}/{}/l0/", b.tenant_hash.to_hex(), b.signal.key_prefix()),
+                )
+                .await
+                .expect("list l0")
+                .into_iter()
+                .map(|meta| meta.key),
+            )
+            .collect();
+        assert_eq!(
+            key_set(&store).await,
+            expected,
+            "{label}: an unexpired bucket is untouched"
+        );
+    }
+}
+
+/// A rewrite that dropped every record in its bucket leaves a part-less
+/// rewrite record: no event timestamp anywhere in the bucket. It expires on
+/// the record's own `created_unix_ns`, so the metadata is not retained
+/// forever, and it is swept the same way.
+#[tokio::test]
+async fn part_less_rewrite_record_expires_on_its_created_ts() {
+    let config = cfg();
+    let (window, now) = window_and_now(&config);
+    let b = bucket();
+
+    // Inside the window: the record's creation instant is the threshold
+    // itself, which is not strictly older than it.
+    let store = MemoryStore::new();
+    let retention = retention_at_floor(&config);
+    let (record_key, part_keys) = seed_rewrite_record(&store, &b, now - window, &[]).await;
+    assert!(part_keys.is_empty(), "a part-less rewrite seeds no part");
+    let clock = FixedClock::new(now);
+    let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+        .await
+        .expect("retention pass");
+    assert_eq!(outcome, RetentionOutcome::NotExpired);
+    assert_eq!(
+        key_set(&store).await,
+        BTreeSet::from([record_key.clone()]),
+        "the rewrite record is untouched"
+    );
+
+    // One nanosecond older: expired, then swept away entirely.
+    let store = MemoryStore::new();
+    let (record_key, _) = seed_rewrite_record(&store, &b, now - window - 1, &[]).await;
+    let outcome = retention_sweep_bucket(&store, &clock, &config, &retention, &NoLeases, &b)
+        .await
+        .expect("retention pass");
+    assert_eq!(outcome, RetentionOutcome::Tombstoned);
+    assert_eq!(
+        key_set(&store).await,
+        BTreeSet::from([record_key, tombstone_key_of(&b)]),
+        "the tombstone joins the rewrite record"
+    );
+
+    let after_horizon = FixedClock::new(now + config.protection_horizon_ns);
+    let outcome =
+        retention_sweep_bucket(&store, &after_horizon, &config, &retention, &NoLeases, &b)
+            .await
+            .expect("sweep pass");
+    assert_eq!(outcome, RetentionOutcome::Swept);
+    assert_eq!(key_set(&store).await, BTreeSet::new());
 }

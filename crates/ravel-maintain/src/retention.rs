@@ -7,21 +7,31 @@
 //! new snapshots (the resolver's job, ravel-catalog), then a horizon-gated
 //! physical sweep here.
 //!
-//! 1. **Expiry evaluation** decodes the bucket's already-listed commit and
-//!    compaction records and takes `max(max_event_ts_ns)` across all of them
-//!    (no footer reads). A bucket is expired when it is sealed and that
-//!    maximum is `< now - R`, so no sample younger than `R` is ever excluded
-//!    (ADR-0019 decision 1; the impossibility floor).
+//! 1. **Expiry evaluation** decodes the bucket's already-listed commit,
+//!    compaction, and selective-erasure rewrite records and takes
+//!    `max(max_event_ts_ns)` across all of them (no footer reads). A bucket is
+//!    expired when it is sealed and that maximum is `< now - R`, so no sample
+//!    younger than `R` is ever excluded (ADR-0019 decision 1; the
+//!    impossibility floor). ADR-0019 decision 1 names only L0 commit records
+//!    and compaction records because selective erasure (ADR-0064) postdates
+//!    it; a rewrite record is a live record set exactly as a compaction record
+//!    is, and rewrite-record-only is the durable steady state of an erased
+//!    bucket once the superseded-input sweep has removed its inputs, so
+//!    omitting it retained erased-and-rewritten data past `R` forever
+//!    (issue #1321).
 //! 2. **Tombstone** is written `CreateIfAbsent` at the fixed per-bucket key
 //!    with an injected `retired_at_ns`. It is durable and irreversible:
 //!    raising `R` later never resurrects a tombstoned bucket (ADR-0019
 //!    decision 2).
 //! 3. **Physical sweep** runs once `now >= retired_at_ns + protection_horizon`,
-//!    deleting in the fixed order L0 commit records, compaction records, L0
-//!    data objects, L1 parts, then the tombstone last, and only after a
-//!    verifying LIST shows the bucket's commit prefix holds only the tombstone
-//!    and its `l1/` prefix is empty. Any residue leaves the tombstone in place
-//!    for the next pass (ADR-0019 decision 4).
+//!    deleting in the fixed order L0 commit records, compaction records,
+//!    rewrite records, L0 data objects, L1 parts, then the tombstone last, and
+//!    only after a verifying LIST shows the bucket's commit prefix holds only
+//!    the tombstone and its `l1/` prefix is empty. Any residue leaves the
+//!    tombstone in place for the next pass (ADR-0019 decision 4). The rewrite
+//!    record is deleted with the other records for the same reason it is read
+//!    during expiry evaluation: without it the verifying LIST always found
+//!    residue and the sweep never got past `SweptPartial` (issue #1321).
 //!
 //! Retention runs before compaction ([`maintain_bucket`], ADR-0019 decision
 //! 6): an expired bucket is tombstoned, never compacted first. That ordering
@@ -34,12 +44,13 @@
 //! measure only": its absence would only waste work, never corrupt data.
 
 use prost::Message;
+use ravel_commit::erasure;
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_object_store::{
     GetRange, ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all,
 };
-use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone};
+use ravel_proto::commit::v1::{CommitRecord, CompactionRecord, RetentionTombstone, RewriteRecord};
 use ravel_types::TenantHash;
 
 use crate::bucket::Bucket;
@@ -216,7 +227,11 @@ pub async fn retention_sweep_bucket_with_reach(
     for key in &listing.compaction_record_keys {
         compaction_records.push(get_compaction_record(store, key).await?);
     }
-    let max_event = max_event_ts(&commit_records, &compaction_records);
+    let mut rewrite_records = Vec::with_capacity(listing.rewrite_record_keys.len());
+    for key in &listing.rewrite_record_keys {
+        rewrite_records.push(get_rewrite_record(store, key).await?);
+    }
+    let max_event = max_event_ts(&commit_records, &compaction_records, &rewrite_records);
     if !is_expired(max_event, now, window_ns) {
         return Ok(RetentionOutcome::NotExpired);
     }
@@ -279,11 +294,27 @@ pub async fn maintain_bucket_with_reach(
     Ok((outcome, compaction))
 }
 
-/// The maximum `max_event_ts_ns` across a bucket's L0 commit records and
-/// compaction-record parts. `None` when the bucket holds no records.
+/// The maximum `max_event_ts_ns` across a bucket's L0 commit records,
+/// compaction-record parts, and rewrite-record parts. `None` when the bucket
+/// holds no records.
+///
+/// Every record kind `keys::partition_bucket_entry` can classify inside a
+/// bucket's commit prefix contributes here except the tombstone (whose own
+/// presence short-circuits expiry evaluation entirely). A rewrite record left
+/// out of this maximum is a bucket that can never expire: once the
+/// protection-horizon sweep has removed a rewrite's superseded inputs, the
+/// rewrite record is the bucket's whole live record set (issue #1321).
+///
+/// A rewrite record with no parts (an erasure that dropped every record in the
+/// bucket, which `RewriteRecord.parts` explicitly permits) carries no event
+/// timestamp at all, so it contributes its own `created_unix_ns` instead. It
+/// holds no sample, so no sample younger than `R` can hide behind it, and
+/// anchoring on the instant the record was published is what keeps such a
+/// bucket expirable rather than permanently retained metadata.
 pub fn max_event_ts(
     commit_records: &[CommitRecord],
     compaction_records: &[CompactionRecord],
+    rewrite_records: &[RewriteRecord],
 ) -> Option<i64> {
     let mut max: Option<i64> = None;
     let mut bump = |v: i64| max = Some(max.map_or(v, |m: i64| m.max(v)));
@@ -291,6 +322,15 @@ pub fn max_event_ts(
         bump(rec.max_event_ts_ns);
     }
     for rec in compaction_records {
+        for part in &rec.parts {
+            bump(part.max_event_ts_ns);
+        }
+    }
+    for rec in rewrite_records {
+        if rec.parts.is_empty() {
+            bump(rec.created_unix_ns);
+            continue;
+        }
         for part in &rec.parts {
             bump(part.max_event_ts_ns);
         }
@@ -322,7 +362,13 @@ async fn write_tombstone(
     listing: &BucketListing,
     dry_run: bool,
 ) -> Result<()> {
-    let record_count = (listing.commit_keys.len() + listing.compaction_record_keys.len()) as u64;
+    // Every record kind the bucket can hold counts, rewrite records included:
+    // `record_count_observed` is the audit evidence for what was in the bucket
+    // when it was retired, and a rewrite-record-only bucket reporting zero
+    // records observed reads as an empty bucket that was never written to.
+    let record_count = (listing.commit_keys.len()
+        + listing.compaction_record_keys.len()
+        + listing.rewrite_record_keys.len()) as u64;
     let tombstone = RetentionTombstone {
         format_version: 1,
         tenant_hash: bucket.tenant_hash.0.to_vec(),
@@ -350,10 +396,15 @@ async fn write_tombstone(
 }
 
 /// Horizon-gated physical sweep (ADR-0019 decision 4). Deletes in the
-/// fixed order L0 commit records, compaction records, L0 data objects, L1
-/// parts, then the tombstone last, and only after a verifying LIST shows the
-/// bucket's commit prefix holds only the tombstone and its `l1/` prefix is
-/// empty. Any residue leaves the tombstone in place.
+/// fixed order L0 commit records, compaction records, rewrite records, L0 data
+/// objects, L1 parts, then the tombstone last, and only after a verifying LIST
+/// shows the bucket's commit prefix holds only the tombstone and its `l1/`
+/// prefix is empty. Any residue leaves the tombstone in place.
+///
+/// The record deletes cover every non-tombstone shape
+/// `keys::partition_bucket_entry` classifies in the commit prefix, which is
+/// the same set [`bucket_is_empty_but_tombstone`] refuses to call empty: a
+/// shape deleted by neither is residue forever (issue #1321).
 async fn physical_sweep(
     reach: &mut SnapshotReachability,
     store: &dyn ObjectStoreBackend,
@@ -398,6 +449,10 @@ async fn physical_sweep(
             Err(e) => return Err(MaintainError::Store(e)),
         }
     }
+    // Rewrite output parts need no separate resolution step: ADR-0064 decision
+    // 3 point 2 PUTs them under the same `l1/` part-key shape a compaction
+    // record's parts use, so the fresh LIST below already covers them.
+    //
     // Discover L1 parts by a fresh LIST of the bucket's own l1/ prefix (the
     // same LIST bucket_is_empty_but_tombstone uses), not by reconstructing
     // keys from compaction records. This makes the L1 delete independent of
@@ -418,6 +473,7 @@ async fn physical_sweep(
     // decision 4): records, then data objects, then L1 parts, tombstone last.
     delete_all(store, lease, &listing.commit_keys, dry_run).await?;
     delete_all(store, lease, &listing.compaction_record_keys, dry_run).await?;
+    delete_all(store, lease, &listing.rewrite_record_keys, dry_run).await?;
     delete_all(store, lease, &l0_data_keys, dry_run).await?;
     delete_all(store, lease, &l1_part_keys, dry_run).await?;
 
@@ -466,6 +522,14 @@ async fn delete_all(
 /// tombstone: the commit prefix contains only the tombstone entry, and the
 /// `l1/` prefix for this bucket is empty (ADR-0019 decision 4's verifying
 /// LIST).
+///
+/// This enumerates by exclusion rather than by listing the shapes it expects,
+/// so it needs no change when a new record kind appears: anything
+/// `keys::partition_bucket_entry` classifies as other than the tombstone is
+/// residue, and an unclassifiable key is layout drift. What that costs is
+/// silence about which shape the sweeper forgot to delete -- a rewrite record
+/// held this check false on every pass forever until the delete list above
+/// learned about it (issue #1321).
 async fn bucket_is_empty_but_tombstone(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -522,6 +586,20 @@ async fn get_compaction_record(
     let record = record::decode_compaction(got.data.as_ref())
         .map_err(|e| MaintainError::Invariant(format!("compaction record decode failed: {e}")))?;
     keys::verify_compaction_record_key(&record, key)?;
+    Ok(record)
+}
+
+/// GET, decode, and key-verify one selective-erasure rewrite record (ADR-0064
+/// decision 3, ADR-0010 §7). Decoded through
+/// [`ravel_commit::erasure::decode_rewrite`], never a raw `prost` decode: that
+/// is the reader with the `format_version` gate (ADR-0066 decision 2), and it
+/// also re-verifies the record's own `input_set_hash` and the bucket its
+/// `superseded_record_key` names.
+async fn get_rewrite_record(store: &dyn ObjectStoreBackend, key: &str) -> Result<RewriteRecord> {
+    let got = store.get(key, GetRange::Full).await?;
+    let record = erasure::decode_rewrite(got.data.as_ref())
+        .map_err(|e| MaintainError::Invariant(format!("rewrite record decode failed: {e}")))?;
+    keys::verify_rewrite_record_key(&record, key)?;
     Ok(record)
 }
 
