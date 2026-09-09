@@ -674,10 +674,10 @@ fn flatten_join(joined: Result<anyhow::Result<()>, tokio::task::JoinError>) -> a
 /// rest of the drain must proceed. A listener held open by an in-flight request
 /// (a query can run to its own wall deadline, which the shipped defaults put
 /// ABOVE `--shutdown-timeout`) must not spend the whole budget joining sockets:
-/// the ingest flush is ATTEMPTED BEFORE this join, so a join that
-/// overruns this fraction is abandoned and the remaining shutdown steps still
-/// run within the overall budget. Four fifths leaves a reserve for those steps
-/// while still giving connections almost the full window to close cleanly.
+/// the ingest flush is ATTEMPTED BEFORE this join, so a join that overruns this
+/// fraction is abandoned and the remaining shutdown steps still run within the
+/// overall budget. Four fifths leaves a reserve for those steps while still
+/// giving connections almost the full window to close cleanly.
 fn listener_join_budget(shutdown_timeout: Duration) -> Duration {
     shutdown_timeout * 4 / 5
 }
@@ -805,11 +805,10 @@ impl Running {
     }
 
     /// Gracefully stop the server: flip readiness to draining so a probe sees
-    /// 503 before any listener closes, delete the ADR-0071 heartbeat concurrently
-    /// with a short settle wait, then attempt to flush ingest buffers before
-    /// joining the listeners, join the listeners under their own sub-budget, and
-    /// join the
-    /// shard actors and background tasks.
+    /// 503 before any listener closes, delete the ADR-0071 heartbeat
+    /// concurrently with a short settle wait, then attempt to flush ingest
+    /// buffers before joining the listeners, join the listeners under their own
+    /// sub-budget, and join the shard actors and background tasks.
     ///
     /// Every step carries a bound. The drain from the listener close signal
     /// onwards is bounded by `--shutdown-timeout`, with the listener join carved
@@ -818,9 +817,10 @@ impl Running {
     /// bound instead. Nothing on the path awaits an object-store operation
     /// without a bound above it.
     ///
-    /// The flush runs BEFORE the listener join precisely so a connection
-    /// held open to its wall deadline (above `--shutdown-timeout` by default)
-    /// cannot cost buffered records. A listener error is surfaced only after the
+    /// The flush runs BEFORE the listener join precisely so the listener join
+    /// cannot consume the budget the flush needs: a connection held open to its
+    /// wall deadline (above `--shutdown-timeout` by default) cannot stop the
+    /// flush from being attempted. A listener error is surfaced only after the
     /// drain runs, never in place of it; a drain that overruns the timeout
     /// returns an error so the process exits non-zero rather than reporting a
     /// clean shutdown it did not achieve. The query-audit pipeline is drained
@@ -966,11 +966,12 @@ impl Running {
             // there was nothing left unflushed.
             flush_completed_writer.store(true, std::sync::atomic::Ordering::SeqCst);
 
-            // Join the listeners under their own budget. Records are already
-            // durable above, so a join that overruns is abandoned (logged) and
-            // the rest of the drain still runs within the overall budget. A
-            // listener error is parked and surfaced by the caller only after the
-            // whole drain has run, never in place of it.
+            // Join the listeners under their own budget. The flush above has
+            // already been attempted for every buffered record, so a join that
+            // overruns is abandoned (logged) and the rest of the drain still
+            // runs within the overall budget. A listener error is parked and
+            // surfaced by the caller only after the whole drain has run, never
+            // in place of it.
             match tokio::time::timeout(
                 listener_join_budget(shutdown_timeout),
                 join_listeners(listener_tasks),
@@ -3013,13 +3014,15 @@ mod shutdown_drain_tests {
         }
     }
 
-    /// `drain_router` flushes buffers DURABLY even when another task still holds
-    /// a clone of the router, and in that case flushes-but-does-not-join. Holding
-    /// a second `Arc` clone live across the call forces the `try_unwrap` join to
-    /// fail, which is exactly the "flushed but not joined" branch: the flush must
-    /// still have run (durability), the join must not have (the clone is alive).
+    /// `drain_router` calls the router's flush even when another task still
+    /// holds a clone of the router, and in that case flushes-but-does-not-join.
+    /// Holding a second `Arc` clone live across the call forces the `try_unwrap`
+    /// join to fail, which is exactly the "flushed but not joined" branch: the
+    /// flush must still have been called (the counter reads 1), the join must
+    /// not have (the clone is alive). The fake's flush only bumps a counter, so
+    /// this pins that the call happens, not that any record reached a store.
     #[tokio::test]
-    async fn drain_router_flushes_durably_even_with_an_outstanding_clone() {
+    async fn drain_router_calls_flush_but_not_join_with_an_outstanding_clone() {
         let flushed = Arc::new(AtomicUsize::new(0));
         let joined = Arc::new(AtomicBool::new(false));
         let router = Arc::new(FakeRouter {
@@ -3033,7 +3036,7 @@ mod shutdown_drain_tests {
         assert_eq!(
             flushed.load(Ordering::SeqCst),
             1,
-            "the durable flush must run even with an outstanding router clone"
+            "the flush must be called even with an outstanding router clone"
         );
         assert!(
             !joined.load(Ordering::SeqCst),
