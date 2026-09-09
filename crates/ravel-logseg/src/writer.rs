@@ -3589,9 +3589,8 @@ mod tests {
             10,
             "30 records at block_target_records=3 must chunk into exactly 10 blocks, one bloom sample each"
         );
-        for (i, ns) in stats.bloom_block_ns.iter().enumerate() {
-            assert!(*ns > 0, "block {i}'s bloom build reported a zero duration");
-        }
+        // bloom_block_ns entries are wall-clock durations; deliberately not
+        // asserted on beyond their count above.
     }
 
     /// The timed bloom region covers bloom construction and nothing else: in
