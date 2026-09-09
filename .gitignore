@@ -20,3 +20,7 @@ graft/
 
 # Local, per-checkout state for .claude/guards/epic-status-nudge.mjs.
 .claude/.epic-status-nudge-state.json
+
+# The disk watchdog drops this in the scope directory when it fires; the
+# harness commit-on-death sweeps an unignored file into a wip commit.
+.disk-watchdog-fired

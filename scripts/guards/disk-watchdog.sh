@@ -52,14 +52,21 @@ warn_gb=${3:-15}
 sample=${4:-45}
 marker="${SCOPE}/.disk-watchdog-fired"
 warned=0
+starved=0
 
 # Arm: clear any marker from a previous firing, so its presence always refers
 # to this run.
 rm -f "${marker}" 2>/dev/null || true
 
 free_gb() {
-    # BSD df -g reports whole gibibytes; field 4 is available.
-    df -g /System/Volumes/Data | awk 'NR==2 {print $4}'
+    # The volume backing the SCOPE, not a hardcoded one: what fills is the
+    # target dir, and CARGO_TARGET_DIR need not sit on the same mount as the
+    # system volume. `df -Pk` is POSIX and gives KiB, matching
+    # check-disk-headroom.sh; `df -g` is a BSD spelling that errors on Linux,
+    # where every sample would then read empty and the watchdog would loop
+    # forever looking armed. Integer division floors, so the effective floor
+    # is never higher than the documented one.
+    df -Pk "${SCOPE}" 2>/dev/null | awk 'NR==2 {print int($4/1048576)}'
 }
 
 # The cargo/rustc processes whose cwd is inside SCOPE. Two stages on purpose:
@@ -68,8 +75,14 @@ free_gb() {
 scoped_pids() {
     for pid in $(ps -eo pid,comm= | awk '{ n = split($2, p, "/"); if (p[n] == "cargo" || p[n] == "rustc") print $1 }'); do
         cwd=$(lsof -a -d cwd -p "${pid}" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+        # The scope root itself, or a path UNDER it. A bare "${SCOPE}"*
+        # prefix also matches a sibling whose name merely starts with the
+        # same string, so a scope of .../wt matches a build in .../wt2 and
+        # kills another session's work: the exact thing this script exists
+        # to prevent. Subdirectories must still match, since a build's cwd
+        # is normally a crate directory rather than the worktree root.
         case "${cwd}" in
-            "${SCOPE}"*) printf '%s ' "${pid}" ;;
+            "${SCOPE}"|"${SCOPE}"/*) printf '%s ' "${pid}" ;;
         esac
     done
 }
@@ -86,14 +99,34 @@ while :; do
 
     if [ "${avail}" -lt "${floor_gb}" ]; then
         pids=$(scoped_pids | sed 's/ *$//')
-        if [ -z "${pids}" ]; then
-            echo "watchdog: ${avail} GB left, below the floor, but no cargo/rustc under ${SCOPE} is running"
-            exit 0
-        fi
         if [ "${WATCHDOG_DRY_RUN:-0}" = "1" ]; then
-            echo "watchdog: DRY RUN, ${avail} GB left, would kill: ${pids}"
+            # A dry run is a diagnostic: it answers "what would you kill right
+            # now" and returns. It must terminate whether or not anything
+            # matched, or the very invocation meant for checking the matcher
+            # hangs on the answer "nothing", which is the answer being checked.
+            if [ -n "${pids}" ]; then
+                echo "watchdog: DRY RUN, ${avail} GB left, would kill: ${pids}"
+            else
+                echo "watchdog: DRY RUN, ${avail} GB left, no cargo/rustc under ${SCOPE}"
+            fi
             exit 0
         fi
+        if [ -z "${pids}" ]; then
+            # Nothing of ours to kill YET. Do not exit: the common way to
+            # arm this is alongside a gate that has not spawned cargo yet,
+            # or during a gap between two of gates.sh's sequential lanes,
+            # which is exactly when free space is lowest. Exiting here
+            # disarms the watchdog at the moment it is most needed, and with
+            # the same status a successful firing returns, so no caller can
+            # tell the two apart. Say it once, then keep sampling.
+            if [ "${starved}" -eq 0 ]; then
+                echo "watchdog: ${avail} GB left, below the ${floor_gb} GB floor, but no cargo/rustc under ${SCOPE} yet; still watching"
+                starved=1
+            fi
+            sleep "${sample}"
+            continue
+        fi
+        starved=0
         # Marker first: see the header.
         {
             echo "fired_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
