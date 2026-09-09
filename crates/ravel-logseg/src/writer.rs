@@ -146,8 +146,10 @@ pub struct WriteStats {
     /// Nanoseconds spent building each block's bloom filter: the
     /// `BloomBuilder::new` through `finish` window in the block-write loop,
     /// one entry per block in block order. Excludes `write_block` /
-    /// `write_block_columnar` (block assembly) and everything else
-    /// `build_object` / `build_object_columnar` does. Only present with the
+    /// `write_block_columnar` (block assembly), POSTINGS term accumulation
+    /// (which both paths run in a pass of its own ahead of that window, so a
+    /// tenant with indexed fields is not charged for it here), and everything
+    /// else `build_object` / `build_object_columnar` does. Only present with the
     /// `stage-timing` feature; the caller (`ravel_ingest::log_shard`) folds
     /// each entry in as its own `LogStage::Bloom` sample, nested inside (not
     /// subtracted from) the `LogStage::Encode` window that already times the
@@ -594,6 +596,37 @@ impl RlogWriter {
 
             let out = write_block(block_rows, &plans, self.cfg.zstd_level)?;
 
+            // POSTINGS: index each row's merged-view values (resource +
+            // scope + per-record, the record winning on a key collision),
+            // precomputed in `resolve_row` as `indexed_terms`. That view is
+            // what SQL's `attrs` column exposes, so a v2 posting list
+            // answers the merged-view query directly
+            // (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
+            // `indexed_terms` only ever names indexed columns, so no
+            // `indexed_column_ids` check is needed here; the per-field
+            // distinct-value cap (decision 4) now counts merged values.
+            //
+            // This runs in its own pass ahead of the timed bloom region
+            // below, never inside it: `bloom_block_ns` reports bloom
+            // construction alone, and a tenant with indexed fields would
+            // otherwise see term accounting charged to bloom (issue #1516).
+            for row in block_rows {
+                for (cid, v) in &row.indexed_terms {
+                    if postings_capped.contains(cid) {
+                        continue;
+                    }
+                    let field_map = postings_terms.entry(*cid).or_default();
+                    field_map
+                        .entry(term_key(v))
+                        .or_default()
+                        .insert(blk_idx_u32);
+                    if field_map.len() > self.cfg.postings_max_distinct {
+                        postings_terms.remove(cid);
+                        postings_capped.insert(*cid);
+                    }
+                }
+            }
+
             // Bloom over body, severity_text, and string columns.
             #[cfg(feature = "stage-timing")]
             let bloom_start = std::time::Instant::now();
@@ -608,29 +641,6 @@ impl RlogWriter {
                 for (cid, v) in &row.columns {
                     if let ColumnValue::Str(bytes) = v {
                         insert_text(&mut builder, *cid, bytes);
-                    }
-                }
-                // POSTINGS: index each row's merged-view values (resource +
-                // scope + per-record, the record winning on a key collision),
-                // precomputed in `resolve_row` as `indexed_terms`. That view is
-                // what SQL's `attrs` column exposes, so a v2 posting list
-                // answers the merged-view query directly
-                // (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
-                // `indexed_terms` only ever names indexed columns, so no
-                // `indexed_column_ids` check is needed here; the per-field
-                // distinct-value cap (decision 4) now counts merged values.
-                for (cid, v) in &row.indexed_terms {
-                    if postings_capped.contains(cid) {
-                        continue;
-                    }
-                    let field_map = postings_terms.entry(*cid).or_default();
-                    field_map
-                        .entry(term_key(v))
-                        .or_default()
-                        .insert(blk_idx_u32);
-                    if field_map.len() > self.cfg.postings_max_distinct {
-                        postings_terms.remove(cid);
-                        postings_capped.insert(*cid);
                     }
                 }
             }
@@ -1416,15 +1426,12 @@ impl RlogWriter {
             };
             let out = write_block_columnar(&input, self.cfg.zstd_level)?;
 
-            // Bloom over body, severity_text, and string columns; POSTINGS over
-            // each row's merged-view indexed terms.
-            #[cfg(feature = "stage-timing")]
-            let bloom_start = std::time::Instant::now();
-            let mut builder = BloomBuilder::new(self.cfg.bloom_seed);
+            // POSTINGS over each row's merged-view indexed terms, in its own
+            // pass ahead of the timed bloom region below and never inside it,
+            // for the same reason as the row path: `bloom_block_ns` reports
+            // bloom construction alone (issue #1516).
             let mut terms_start = 0usize;
-            for (li, &g) in block_rows.iter().enumerate() {
-                insert_text(&mut builder, COL_BODY, g_body[g]);
-                insert_text(&mut builder, COL_SEVERITY_TEXT, g_sevtext[g]);
+            for li in 0..block_rows.len() {
                 let terms_end = blk_indexed_ends
                     .get(li)
                     .map_or(terms_start, |end| *end as usize);
@@ -1444,6 +1451,15 @@ impl RlogWriter {
                         postings_capped.insert(*cid);
                     }
                 }
+            }
+
+            // Bloom over body, severity_text, and string columns.
+            #[cfg(feature = "stage-timing")]
+            let bloom_start = std::time::Instant::now();
+            let mut builder = BloomBuilder::new(self.cfg.bloom_seed);
+            for &g in block_rows {
+                insert_text(&mut builder, COL_BODY, g_body[g]);
+                insert_text(&mut builder, COL_SEVERITY_TEXT, g_sevtext[g]);
             }
             // String-column bloom from the value pages. Bloom bit setting is
             // idempotent, so plan-major insertion sets the same bits the per-row
@@ -3578,6 +3594,115 @@ mod tests {
         }
     }
 
+    /// The timed bloom region covers bloom construction and nothing else: in
+    /// neither build path does POSTINGS term accumulation sit between the
+    /// `Instant::now()` and the `elapsed()` sample (issue #1516).
+    ///
+    /// Asserted over this file's own source, not over durations. The
+    /// contamination being excluded is a few `BTreeMap` inserts per row, so
+    /// any duration-based check would be a wall-clock band, which this repo
+    /// treats as a defect (`scripts/check-injected-clock-helpers.sh`), and
+    /// comparing an indexed-field workload against a bare one cannot separate
+    /// that cost from run-to-run noise. What the claim is really about is
+    /// which statements the timing window encloses, and that is exact.
+    ///
+    /// The region delimiters are assembled with `concat!` so this test's own
+    /// source does not contain them and cannot match itself.
+    #[test]
+    fn timed_bloom_region_excludes_postings_work() {
+        const SRC: &str = include_str!("writer.rs");
+        let open = concat!("bloom_start = std::time::", "Instant::now();");
+        let close = concat!("bloom_start.", "elapsed()");
+
+        let mut regions: Vec<&str> = Vec::new();
+        let mut rest = SRC;
+        while let Some(i) = rest.find(open) {
+            let after = &rest[i + open.len()..];
+            let end = after
+                .find(close)
+                .expect("every timed bloom region closes with an elapsed() sample");
+            regions.push(&after[..end]);
+            rest = &after[end..];
+        }
+        assert_eq!(
+            regions.len(),
+            2,
+            "exactly two timed bloom regions exist, one per build path"
+        );
+        // One region per path, not the same path counted twice: the row path
+        // blooms `row.body`, the columnar path blooms `g_body`.
+        assert_eq!(
+            regions[0].matches("row.body").count(),
+            1,
+            "the first timed region is `build_object`'s"
+        );
+        assert_eq!(
+            regions[1].matches("g_body").count(),
+            1,
+            "the second timed region is `build_object_columnar`'s"
+        );
+        for (i, region) in regions.iter().enumerate() {
+            assert_eq!(
+                region.matches("BloomBuilder::new(").count(),
+                1,
+                "timed region {i} opens on exactly one bloom builder"
+            );
+            assert_eq!(
+                region.matches(concat!("builder.", "finish()")).count(),
+                1,
+                "timed region {i} closes on exactly one bloom finish"
+            );
+            assert_eq!(
+                region.matches("postings").count(),
+                0,
+                "timed region {i} must not touch POSTINGS: bloom timing would \
+                 overstate bloom by the term-accumulation cost for any tenant \
+                 with indexed fields"
+            );
+        }
+    }
+
+    /// The runtime half of [`timed_bloom_region_excludes_postings_work`]: the
+    /// same records written with and without indexed fields produce the same
+    /// number of bloom samples, and the indexed write really did do POSTINGS
+    /// work (its counters are exact and nonzero), so the exclusion above is
+    /// about a workload that has something to exclude.
+    #[cfg(feature = "stage-timing")]
+    #[test]
+    fn bloom_sample_count_is_unchanged_by_indexed_fields() {
+        let cfg = RlogConfig {
+            block_target_records: 3,
+            ..RlogConfig::default()
+        };
+        let records: Vec<LogRecord> = (0..30i64)
+            .map(|i| {
+                let mut r = base_record(0, i);
+                r.attrs
+                    .push(("svc".into(), AttrValue::Str(format!("s{}", i % 5))));
+                r
+            })
+            .collect();
+
+        let mut bare = RlogWriter::new(cfg, identity());
+        let mut indexed = RlogWriter::new(cfg, identity()).with_indexed_fields(vec!["svc".into()]);
+        for r in &records {
+            bare.push(r.clone()).expect("push bare");
+            indexed.push(r.clone()).expect("push indexed");
+        }
+        let (_, bare_stats) = bare.finish_with_stats().expect("finish bare");
+        let (_, indexed_stats) = indexed.finish_with_stats().expect("finish indexed");
+
+        assert_eq!(bare_stats.postings_indexed_fields, 0);
+        assert_eq!(indexed_stats.postings_indexed_fields, 1, "svc");
+        assert_eq!(indexed_stats.postings_distinct_total, 5, "s0..s4");
+        assert_eq!(bare_stats.bloom_block_ns.len(), 10);
+        assert_eq!(
+            indexed_stats.bloom_block_ns.len(),
+            bare_stats.bloom_block_ns.len(),
+            "POSTINGS work adds no bloom sample"
+        );
+    }
+
     #[test]
     fn postings_cap_drops_field_and_raises_counter() {
         // 50 distinct values, cap of 2: the field must be dropped, the
@@ -4030,6 +4155,7 @@ mod tests {
         use super::*;
         use crate::columnar_batch::ColumnarLogBatch;
         use proptest::prelude::*;
+        use proptest::test_runner::TestCaseError;
 
         fn arb_attr_value() -> impl Strategy<Value = AttrValue> {
             let leaf = prop_oneof![
@@ -4102,6 +4228,69 @@ mod tests {
             ]
         }
 
+        /// Assert the row and columnar builds agree on every deterministic
+        /// [`WriteStats`] field, and on the SAMPLE COUNT (not the durations)
+        /// of `bloom_block_ns`.
+        ///
+        /// `bloom_block_ns` holds wall-clock measurements, so a full-struct
+        /// `prop_assert_eq!(rs, cs)` under `stage-timing` compares two
+        /// independently measured timing vectors and fails whenever the
+        /// machine is loaded, even though both encoders emitted
+        /// byte-identical output. Its length is deterministic (one sample per
+        /// block, and both paths cut the same blocks, which
+        /// `columnar_cuts_identical_blocks` pins), so length is what parity
+        /// means here.
+        ///
+        /// The destructuring binds are the add-a-field guard: neither uses
+        /// `..`, so a new `WriteStats` field stops this function compiling
+        /// until the field is compared here or deliberately excluded.
+        fn prop_stats_match(rs: &WriteStats, cs: &WriteStats) -> Result<(), TestCaseError> {
+            let WriteStats {
+                postings_capped_fields: r_capped,
+                postings_bytes: r_bytes,
+                postings_indexed_fields: r_indexed,
+                postings_distinct_total: r_distinct_total,
+                postings_distinct_max: r_distinct_max,
+                dynamic_columns_used: r_dyn_used,
+                dynamic_columns_overflowed: r_dyn_overflowed,
+                #[cfg(feature = "stage-timing")]
+                    bloom_block_ns: r_bloom_ns,
+            } = rs;
+            let WriteStats {
+                postings_capped_fields: c_capped,
+                postings_bytes: c_bytes,
+                postings_indexed_fields: c_indexed,
+                postings_distinct_total: c_distinct_total,
+                postings_distinct_max: c_distinct_max,
+                dynamic_columns_used: c_dyn_used,
+                dynamic_columns_overflowed: c_dyn_overflowed,
+                #[cfg(feature = "stage-timing")]
+                    bloom_block_ns: c_bloom_ns,
+            } = cs;
+            prop_assert_eq!(r_capped, c_capped, "postings_capped_fields");
+            prop_assert_eq!(r_bytes, c_bytes, "postings_bytes");
+            prop_assert_eq!(r_indexed, c_indexed, "postings_indexed_fields");
+            prop_assert_eq!(
+                r_distinct_total,
+                c_distinct_total,
+                "postings_distinct_total"
+            );
+            prop_assert_eq!(r_distinct_max, c_distinct_max, "postings_distinct_max");
+            prop_assert_eq!(r_dyn_used, c_dyn_used, "dynamic_columns_used");
+            prop_assert_eq!(
+                r_dyn_overflowed,
+                c_dyn_overflowed,
+                "dynamic_columns_overflowed"
+            );
+            #[cfg(feature = "stage-timing")]
+            prop_assert_eq!(
+                r_bloom_ns.len(),
+                c_bloom_ns.len(),
+                "bloom_block_ns sample count (one per block); durations are wall clock and are not compared"
+            );
+            Ok(())
+        }
+
         fn row_object(cfg: RlogConfig, recs: &[LogRecord]) -> (Vec<u8>, WriteStats) {
             let mut w = RlogWriter::new(cfg, identity()).with_indexed_fields(indexed());
             for r in recs {
@@ -4169,7 +4358,7 @@ mod tests {
                 };
                 let (rb, rs) = row_object(cfg, &records);
                 let (cb, cs) = columnar_object(cfg, &records, nbatches);
-                prop_assert_eq!(rs, cs);
+                prop_stats_match(&rs, &cs)?;
                 prop_assert!(rb == cb, "object bytes differ: row {} vs col {}", rb.len(), cb.len());
             }
         }
@@ -4213,7 +4402,7 @@ mod tests {
                 };
                 let (rb, rs) = row_object(cfg, &records);
                 let (cb, cs) = columnar_object_dict(cfg, &records, nbatches);
-                prop_assert_eq!(rs, cs);
+                prop_stats_match(&rs, &cs)?;
                 prop_assert!(rb == cb, "object bytes differ: row {} vs col {}", rb.len(), cb.len());
             }
         }

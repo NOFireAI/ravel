@@ -71,7 +71,9 @@ mod imp {
         /// window in `ravel_logseg::RlogWriter`'s `build_object` /
         /// `build_object_columnar`, one sample per block. It covers the bloom
         /// build only, excluding `write_block` / `write_block_columnar`
-        /// (block assembly) and everything else those functions do.
+        /// (block assembly), POSTINGS term accumulation for indexed fields,
+        /// and everything else those functions do. A tenant with indexed
+        /// fields therefore reports the same bloom figure as one without.
         ///
         /// This window is INSIDE [`LogStage::Encode`], not subtracted from
         /// it: `Encode` still times the whole `RlogWriter::push` +
