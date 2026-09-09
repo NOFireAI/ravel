@@ -462,10 +462,11 @@ into a false green. When you write or edit any such script:
   three commits behind, and `out=$(guard N 2>&1 | tail -1)` reported 0 for a
   guard that was not in that checkout and had really exited 127. A guard
   that reports fresh on a stale branch is worse than no guard, because it
-  retires the suspicion that would have caught it. In zsh, `$pipestatus`
-  holds every stage, so `guard N | tail -1` followed by
-  `code=${pipestatus[1]}` shortens the output without lying about the
-  result.
+  retires the suspicion that would have caught it. The PreToolUse hook now refuses both forms rather than
+  leaving this to memory. When you genuinely want short output and the
+  truth, redirect to a file and read it separately; if you must pipe, bash
+  keeps every stage in `${PIPESTATUS[0]}` (zsh spells it `${pipestatus[1]}`,
+  and every script under scripts/ is bash).
 - A plain `out=$(cmd)` DOES propagate cmd's status, including when `$?` is
   read on the next line; measured, not recalled. The two forms that lose it
   are `local o=$(cmd)`, where `local`'s own success becomes the status, and

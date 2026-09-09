@@ -41,9 +41,18 @@ function readStdin() {
 
 // Commands whose exit code is a gate. Matched only in command position, so
 // a gate name quoted inside a grep pattern is not a gate.
-const GATE_HEAD = /^(cargo\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?scripts\/(gates|affected-tests|verify-dispatch-gates)\.sh)\b/;
+const GATE_HEAD =
+  /^(cargo\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9-]+\.sh))\b/;
 // Things that may legitimately precede a gate on the same command line.
-const HARMLESS_PREFIX = /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=[^\s]+|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh)\s*)+/;
+// A bare assignment may precede a gate (`FOO=1 cargo test`). A command
+// substitution assignment is stripped too, but as its own alternative, so the
+// command INSIDE it is what gets matched: `out=$(scripts/guards/x.sh | tail
+// -1)` is a masked guard whose exit code the caller then reads, and a single
+// `[^\s]+` value swallowed `out=$(scripts/guards/x.sh` whole, leaving the
+// pipe unseen. Ordered before the bare-assignment alternative, which is
+// guarded against `$(` so it cannot re-swallow it.
+const HARMLESS_PREFIX =
+  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=\$\(|[A-Za-z_][A-Za-z0-9_]*=(?!\$\()[^\s]*|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh)\s*)+/;
 const MASKING_FILTER = /^\s*(tail|head|grep|rg|sed)\b/;
 const MASKING_ECHO = /&&\s*echo\b/;
 

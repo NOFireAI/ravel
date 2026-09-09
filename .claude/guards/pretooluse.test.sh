@@ -40,6 +40,17 @@ check allow "cargo test alone"                "$(bash_payload 'cargo test -p rav
 check allow "cargo test redirected to a file" "$(bash_payload 'cargo test -p ravel-sql > /tmp/out.txt 2>&1')"
 check allow "grep for the words cargo test"   "$(bash_payload 'grep -rn "cargo test" docs/ | head -5')"
 check allow "cargo metadata into jq"          "$(bash_payload 'cargo metadata --format-version 1 | jq -r .packages')"
+# The rule reads as being about gates and is not: a guard's exit code is read
+# the same way. Both of these were run by real sessions on 2026-09-09 and both
+# reported a false pass, one on a stale branch and one on a guard that was not
+# in the checkout at all.
+check deny  "guard piped to head"              "$(bash_payload 'scripts/guards/assert-fresh-merge-base.sh 1556 | head -3')"
+check deny  "guard captured through a pipe"    "$(bash_payload 'out=$(scripts/guards/assert-fresh-merge-base.sh 1556 2>&1 | tail -1)')"
+check deny  "guard piped to grep"              "$(bash_payload 'scripts/guards/check-disk-headroom.sh . 20 | grep LOW')"
+check allow "guard with no pipe"               "$(bash_payload 'scripts/guards/assert-fresh-merge-base.sh 1556')"
+check allow "guard output read from a file"    "$(bash_payload 'scripts/guards/assert-fresh-merge-base.sh 1556 > /tmp/g.txt 2>&1')"
+check allow "an env prefix before a gate"      "$(bash_payload 'CARGO_INCREMENTAL=0 cargo test -p ravel-sql')"
+
 check allow "git log into head"               "$(bash_payload 'git log --oneline | head -5')"
 check allow "grepping a saved gate log"       "$(bash_payload 'grep -c FAILED /tmp/gate.log')"
 
