@@ -385,8 +385,9 @@ pub(crate) async fn fetch_stats_object(
     for segment in decoded.segments {
         match segment.writer_id.len() {
             16 => {
-                let writer_id = <[u8; 16]>::try_from(segment.writer_id.as_slice())
-                    .expect("length checked above");
+                let Ok(writer_id) = <[u8; 16]>::try_from(segment.writer_id.as_slice()) else {
+                    continue;
+                };
                 let identity: EntryIdentity = (
                     segment.ingest_hour_bucket,
                     segment.shard,
@@ -397,8 +398,9 @@ pub(crate) async fn fetch_stats_object(
                 segments.insert(identity, segment);
             }
             32 => {
-                let content_hash = <[u8; 32]>::try_from(segment.writer_id.as_slice())
-                    .expect("length checked above");
+                let Ok(content_hash) = <[u8; 32]>::try_from(segment.writer_id.as_slice()) else {
+                    continue;
+                };
                 by_content_hash.insert(content_hash, segment);
             }
             _ => continue,

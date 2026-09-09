@@ -1115,7 +1115,8 @@ impl Catalog {
         // changes this fingerprint, so a stale entry always misses -- the
         // same guarantee issue #888 gives the single-whole-object case,
         // extended per part.
-        let fingerprint = Self::column_stats_fingerprint(&covered, head.v2.as_ref(), head.v1.as_ref());
+        let fingerprint =
+            Self::column_stats_fingerprint(&covered, head.v2.as_ref(), head.v1.as_ref());
         let cache_key: ColumnStatsCacheKey = (*tenant, signal, window_start_hour, window_end_hour);
         let cache_hit = self
             .column_stats_cache
@@ -1125,8 +1126,10 @@ impl Catalog {
             return Ok(Some(stats));
         }
 
-        let mut segments: HashMap<crate::EntryIdentity, ravel_proto::catalog::v1::ColumnStatsSegment> =
-            HashMap::new();
+        let mut segments: HashMap<
+            crate::EntryIdentity,
+            ravel_proto::catalog::v1::ColumnStatsSegment,
+        > = HashMap::new();
         let mut by_content_hash: HashMap<[u8; 32], ravel_proto::catalog::v1::ColumnStatsSegment> =
             HashMap::new();
         let mut needs_fallback: Vec<&ravel_proto::catalog::v1::SnapshotPartRef> = Vec::new();
@@ -8010,7 +8013,13 @@ mod tests {
         let (range, now_ns) = full_window();
         for _ in 0..3 {
             let got = catalog
-                .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
+                .load_column_stats(
+                    &tenant(),
+                    Signal::Logs,
+                    range,
+                    now_ns,
+                    &QueryAccounting::new(),
+                )
                 .await
                 .expect("load ok");
             assert!(got.is_none(), "a refused decode degrades to Ok(None)");
@@ -8073,7 +8082,13 @@ mod tests {
 
         let (range, now_ns) = full_window();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok");
         assert!(first.is_none());
@@ -8118,7 +8133,13 @@ mod tests {
         }
 
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok");
         assert!(second.is_none());
@@ -8158,7 +8179,13 @@ mod tests {
 
         let (range, now_ns) = full_window();
         let first = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok");
         assert!(first.is_none());
@@ -8177,7 +8204,13 @@ mod tests {
         .await;
 
         let second = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok");
         assert!(second.is_none());
@@ -8207,7 +8240,13 @@ mod tests {
 
         let (range, now_ns) = full_window();
         let got = catalog
-            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, &QueryAccounting::new())
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
             .await
             .expect("load ok");
         assert!(got.is_none(), "no HEAD means no statistics");
