@@ -16,9 +16,15 @@
 //! commit-token watermark the page was resolved against, the pending erasure
 //! predicates in force, and the declared column set (the 2026-09-09 amendment
 //! to ADR-1374 D5). Redemption re-resolves the snapshot from those inputs
-//! deterministically; when the re-resolve cannot reproduce the pinned
-//! watermark, the cursor is [`CursorError::Expired`] and the caller re-runs
-//! the query.
+//! deterministically.
+//!
+//! The watermark is one of those inputs and nothing more. It is what page 2
+//! resolves against, not a test run against whatever watermark the redeeming
+//! call happens to observe: ADR-0010 gives no ordering to run such a test
+//! with, since `seq` is monotonic only per (writer_id, epoch, shard) with
+//! gaps carrying no meaning and `epoch` is informational only. The catalog is
+//! what answers whether a commit token can be satisfied, and it answers by
+//! resolving the token's own identity rather than by comparing positions.
 //!
 //! Enumerating the pinned segments instead is what the amendment replaced. One
 //! `ravel_sql::SegmentPin` costs about 250 B plus base64, so the 2,000-segment
@@ -67,9 +73,8 @@
 //!
 //! A cursor whose pin is gone has nothing left to offer: page 2 of a
 //! paginated result means something only against page 1's snapshot, so
-//! [`Cursor::redeem`] reports [`CursorError::Expired`] for a passed deadline,
-//! a foreign nonce, or a pinned watermark the redeeming call's observed
-//! watermark cannot reproduce. An evidence reference is different. It names one row,
+//! [`Cursor::redeem`] reports [`CursorError::Expired`] for a passed deadline
+//! or a foreign nonce. An evidence reference is different. It names one row,
 //! and every field a fresh re-execution needs (the tenant, the tool, the
 //! argument hash, and the row digest to compare the re-read row against) is
 //! in the token itself. [`EvidenceRef::redeem`] therefore answers
@@ -293,10 +298,15 @@ pub struct Cursor {
     /// The minimum commit-token watermark the page was resolved against, one
     /// token per shard the read-your-write lower bound covers.
     ///
-    /// This is what makes the re-resolve deterministic rather than a fresh
-    /// resolution: page 2 resolves against this same watermark, and a
-    /// re-resolve that cannot reproduce it is [`CursorError::Expired`]
-    /// (see [`Cursor::redeem`]).
+    /// This is a resolve input, not a validity test. It is what makes the
+    /// re-resolve deterministic rather than a fresh resolution: page 2
+    /// resolves against this same watermark instead of against whatever the
+    /// redeeming call observes. [`Cursor::redeem`] never compares it with
+    /// anything, because ADR-0010 defines no ordering over commit tokens to
+    /// compare it with: `seq` is monotonic only per (writer_id, epoch,
+    /// shard), gaps in it carry no meaning, and `epoch` is informational
+    /// only. Whether these tokens can still be satisfied is the catalog's
+    /// answer to give at resolve time, not this codec's.
     pub min_commit_watermark: Vec<CommitToken>,
     pub pending_erasure: Vec<ErasurePredicate>,
     pub declared_columns: Vec<DeclaredColumn>,
@@ -539,13 +549,6 @@ impl Cursor {
     /// that bounds its own work by the field cannot read past the pin's
     /// protection either.
     ///
-    /// `current_watermark` is the watermark the redeeming call observes now.
-    /// A cursor whose pinned watermark that one cannot reproduce (see
-    /// [`Cursor::watermark_is_reproducible`]) is [`CursorError::Expired`]: the
-    /// snapshot the page was resolved from is no longer reachable, which is
-    /// the same answer a passed deadline gets and for the same reason.
-    /// Nothing is resolved here; the comparison is against what the caller
-    /// supplies.
     // Every parameter is a distinct precondition of a single redemption, and
     // a caller that omits one has skipped a check. Grouping them into a
     // struct would let a call site leave a field at its default.
@@ -556,7 +559,6 @@ impl Cursor {
         caller_tenant: TenantHash,
         tool: &str,
         argument_hash: &[u8; 32],
-        current_watermark: &[CommitToken],
         now_ns: i64,
         protection_horizon_ns: i64,
     ) -> Result<Cursor, CursorError> {
@@ -574,34 +576,7 @@ impl Cursor {
         if now_ns >= cursor.deadline_ns {
             return Err(CursorError::Expired);
         }
-        if !cursor.watermark_is_reproducible(current_watermark) {
-            return Err(CursorError::Expired);
-        }
         Ok(cursor)
-    }
-
-    /// Whether a re-resolve against `current` can reproduce the pinned
-    /// watermark.
-    ///
-    /// It can when every shard the pin names appears in `current` at a
-    /// position at least as advanced, ordered by `(epoch, seq)`. A commit
-    /// sequence only moves forward within an epoch and an epoch only
-    /// increases, so a pinned position `current` has already passed is a
-    /// point in a history the re-resolve can still cut at. A shard the pin
-    /// names and `current` does not, or one whose position sits behind the
-    /// pin, means the opposite: the observed history never contained the
-    /// pinned point, so no re-resolve can reproduce it.
-    ///
-    /// Extra shards in `current` are not a mismatch. The pin is a lower
-    /// bound on what the page saw, not an assertion about shards it did not
-    /// read from.
-    pub fn watermark_is_reproducible(&self, current: &[CommitToken]) -> bool {
-        self.min_commit_watermark.iter().all(|pinned| {
-            current
-                .iter()
-                .filter(|now| now.shard == pinned.shard)
-                .any(|now| (now.epoch, now.seq) >= (pinned.epoch, pinned.seq))
-        })
     }
 }
 
@@ -1030,13 +1005,6 @@ mod tests {
         }
     }
 
-    /// A current watermark that reproduces [`sample_cursor`]'s pin exactly, so
-    /// the reproducibility check is inert in every test but the two that
-    /// exercise it.
-    fn live_watermark() -> Vec<CommitToken> {
-        vec![sample_token(0)]
-    }
-
     fn sample_token(shard: u32) -> CommitToken {
         CommitToken {
             shard,
@@ -1066,7 +1034,6 @@ mod tests {
             tenant_b,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1093,7 +1060,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1135,7 +1101,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1159,126 +1124,11 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             deadline,
             FAR_HORIZON_NS,
         )
         .expect_err("must be expired at exactly the deadline");
         assert_eq!(err, CursorError::Expired);
-    }
-
-    /// A cursor pins the watermark its page was resolved against, and page 2
-    /// resolves against that same watermark. When the watermark the redeeming
-    /// call observes cannot reproduce the pinned one, the answer is `Expired`
-    /// and not `Invalid`: the token is intact and correctly bound, the
-    /// snapshot behind it is not, and a client can act on the difference.
-    ///
-    /// Both directions of unreproducible are covered: a shard whose observed
-    /// position sits behind the pin, and a shard the pin names that the
-    /// observed watermark does not carry at all.
-    #[test]
-    fn a_watermark_that_cannot_be_reproduced_is_cursor_expired() {
-        let tenant = TenantHash([0x9Du8; 16]);
-        let key = test_key();
-        let cursor = sample_cursor(tenant);
-        let token = cursor.encode(&key).expect("encodes");
-        assert_eq!(cursor.min_commit_watermark.len(), 1);
-        assert_eq!(cursor.min_commit_watermark[0].shard, 0);
-        assert_eq!(cursor.min_commit_watermark[0].seq, 2);
-
-        let mut behind = sample_token(0);
-        behind.seq = 1;
-        let mut other_shard = sample_token(7);
-        other_shard.seq = 900;
-
-        for current in [vec![behind], vec![other_shard], Vec::new()] {
-            let err = Cursor::redeem(
-                &token,
-                &key,
-                tenant,
-                SAMPLE_TOOL,
-                &SAMPLE_ARGS,
-                &current,
-                NOW_NS,
-                FAR_HORIZON_NS,
-            )
-            .expect_err("an unreproducible watermark must be refused");
-            assert_eq!(err, CursorError::Expired);
-        }
-
-        // The bindings still answer first: an unreproducible watermark does
-        // not turn a wrong-tenant or tampered token into `Expired`, which
-        // would tell its holder the token itself was well-formed.
-        let err = Cursor::redeem(
-            &token,
-            &key,
-            TenantHash([0x9Cu8; 16]),
-            SAMPLE_TOOL,
-            &SAMPLE_ARGS,
-            &[],
-            NOW_NS,
-            FAR_HORIZON_NS,
-        )
-        .expect_err("must be refused");
-        assert_eq!(err, CursorError::Invalid);
-
-        let mut bytes = token_bytes(&token);
-        let last = bytes.len() - 1;
-        bytes[last] ^= 0xFF;
-        let tampered = URL_SAFE_NO_PAD.encode(bytes);
-        let err = Cursor::redeem(
-            &tampered,
-            &key,
-            tenant,
-            SAMPLE_TOOL,
-            &SAMPLE_ARGS,
-            &[],
-            NOW_NS,
-            FAR_HORIZON_NS,
-        )
-        .expect_err("must be refused");
-        assert_eq!(err, CursorError::Invalid);
-    }
-
-    /// The other side of the same check: an observed watermark at or past the
-    /// pinned position on every pinned shard redeems, and the cursor comes
-    /// back carrying the pinned watermark unchanged, so page 2 resolves from
-    /// the pin rather than from what the redeeming call happened to see. An
-    /// extra shard the pin does not name is not a mismatch.
-    #[test]
-    fn a_reproducible_watermark_redeems() {
-        let tenant = TenantHash([0x9Eu8; 16]);
-        let key = test_key();
-        let cursor = sample_cursor(tenant);
-        let token = cursor.encode(&key).expect("encodes");
-
-        let mut ahead = sample_token(0);
-        ahead.seq = 3;
-        let mut newer_epoch = sample_token(0);
-        newer_epoch.epoch = 2;
-        newer_epoch.seq = 0;
-        let currents = [
-            live_watermark(),
-            vec![ahead],
-            vec![newer_epoch],
-            vec![sample_token(0), sample_token(7)],
-        ];
-        assert_eq!(currents.len(), 4);
-
-        for current in currents {
-            let redeemed = Cursor::redeem(
-                &token,
-                &key,
-                tenant,
-                SAMPLE_TOOL,
-                &SAMPLE_ARGS,
-                &current,
-                NOW_NS,
-                FAR_HORIZON_NS,
-            )
-            .expect("a reproducible watermark must redeem");
-            assert_eq!(redeemed.min_commit_watermark, cursor.min_commit_watermark);
-        }
     }
 
     /// Every resolve input the amendment names survives the round trip, each
@@ -1345,7 +1195,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &cursor.min_commit_watermark,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1365,7 +1214,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &ranged.min_commit_watermark,
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1408,7 +1256,6 @@ mod tests {
             tenant,
             "ravel_query_promql",
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1434,7 +1281,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &other,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1464,7 +1310,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1518,7 +1363,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1539,7 +1383,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1575,7 +1418,6 @@ mod tests {
                 tenant,
                 SAMPLE_TOOL,
                 &SAMPLE_ARGS,
-                &live_watermark(),
                 NOW_NS,
                 FAR_HORIZON_NS,
             )
@@ -1593,7 +1435,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1622,7 +1463,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1667,7 +1507,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1703,7 +1542,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             FAR_HORIZON_NS,
         )
@@ -1878,7 +1716,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             NOW_NS,
             horizon,
         )
@@ -1892,7 +1729,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             clamped,
             horizon,
         )
@@ -1905,7 +1741,6 @@ mod tests {
             tenant,
             SAMPLE_TOOL,
             &SAMPLE_ARGS,
-            &live_watermark(),
             clamped,
             FAR_HORIZON_NS,
         )
