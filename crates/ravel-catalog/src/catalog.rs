@@ -9973,7 +9973,11 @@ mod tests {
             tenant().to_hex()
         );
         inner
-            .put(&v2_key, Bytes::from(v2_bytes.clone()), PutOptions::default())
+            .put(
+                &v2_key,
+                Bytes::from(v2_bytes.clone()),
+                PutOptions::default(),
+            )
             .await
             .expect("put v2");
 
@@ -10010,7 +10014,11 @@ mod tests {
             tenant().to_hex()
         );
         inner
-            .put(&v1_key, Bytes::from(v1_bytes.clone()), PutOptions::default())
+            .put(
+                &v1_key,
+                Bytes::from(v1_bytes.clone()),
+                PutOptions::default(),
+            )
             .await
             .expect("put v1");
 
