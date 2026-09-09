@@ -275,7 +275,13 @@ impl HexId {
 pub enum Cell {
     Null,
     Bool(bool),
-    Int(i64),
+    /// A carrier wide enough for the union of the signed and unsigned 64-bit
+    /// ranges, not a general 128-bit integer: every value that reaches it
+    /// came from an `i64` or a `u64`, so it lies in
+    /// `i64::MIN..=u64::MAX`. The width exists so a `u64` above
+    /// `i64::MAX` stays an integer instead of being widened to a float or
+    /// carried as a string.
+    Int(i128),
     Timestamp(i64),
     Float(f64),
     HexId(HexId),
@@ -2224,7 +2230,10 @@ mod tests {
         prop_oneof![
             Just(Cell::Null),
             any::<bool>().prop_map(Cell::Bool),
-            any::<i64>().prop_map(Cell::Int),
+            // Both halves of the carrier's range, since a u64 above i64::MAX
+            // is the case that made it wider than an i64.
+            any::<i64>().prop_map(|n| Cell::Int(i128::from(n))),
+            any::<u64>().prop_map(|n| Cell::Int(i128::from(n))),
             any::<i64>().prop_map(Cell::Timestamp),
             any::<f64>().prop_map(Cell::Float),
             (0usize..=MAX_HEX_ID_LEN)
@@ -2262,7 +2271,7 @@ mod tests {
             requested_cap in 0u64..(400 * 1024),
         ) {
             let mut row: Row = cells;
-            row.extend((0..uncuttable).map(|i| Cell::Int(i as i64 * 1_000_000_009)));
+            row.extend((0..uncuttable).map(|i| Cell::Int(i as i128 * 1_000_000_009)));
             let mut envelope = Envelope::default();
             envelope.data.columns = (0..row.len().min(MAX_PROJECTION_COLUMNS))
                 .map(|i| Column {
@@ -2325,22 +2334,67 @@ mod tests {
     /// 2^53 + 1 does not round-trip through `f64`; the wire form must be a
     /// JSON string so the exact integer survives. A nanosecond timestamp is
     /// the same rule applied to the same representation.
+    ///
+    /// Every digit string is asserted literally. Parsing the cell back into
+    /// an integer and comparing would agree with any serialization the same
+    /// parser accepts, including one that dropped or added a digit the
+    /// parser then re-derived, and it cannot check a value the parser's own
+    /// type has no room for.
     #[test]
     fn integers_and_timestamps_serialize_as_strings() {
-        let big_int: i64 = (1i64 << 53) + 1;
-        let ts_ns: i64 = 1_700_000_000_123_456_789;
-        let row = vec![Cell::Int(big_int), Cell::Timestamp(ts_ns)];
+        let row = vec![
+            Cell::Int(i128::from((1u64 << 53) + 1)),
+            Cell::Timestamp(1_700_000_000_123_456_789),
+            // Both ends of the carrier's range, and the first value above
+            // i64::MAX, which is what a u64 column can reach.
+            Cell::Int(i128::from(u64::MAX)),
+            Cell::Int(i128::from(i64::MAX as u64 + 1)),
+            Cell::Int(i128::from(i64::MIN)),
+            // A small integer travels the identical path, so the string form
+            // is the rule for every magnitude and not a large-value escape.
+            Cell::Int(1),
+        ];
 
         let value = serde_json::to_value(&row).expect("row serializes");
         let cells = value.as_array().expect("row is a JSON array");
+        let text: Vec<&str> = cells
+            .iter()
+            .map(|cell| cell.as_str().expect("every cell must be a JSON string"))
+            .collect();
 
-        let int_cell = cells[0].as_str().expect("int cell must be a JSON string");
-        assert_eq!(int_cell.parse::<i64>().expect("round-trips"), big_int);
+        assert_eq!(
+            text,
+            vec![
+                "9007199254740993",
+                "1700000000123456789",
+                "18446744073709551615",
+                "9223372036854775808",
+                "-9223372036854775808",
+                "1",
+            ]
+        );
+    }
 
-        let ts_cell = cells[1]
-            .as_str()
-            .expect("timestamp cell must be a JSON string");
-        assert_eq!(ts_cell.parse::<i64>().expect("round-trips"), ts_ns);
+    /// The widest integer the carrier holds is still a number, so `fit` never
+    /// cuts it, however small the per-cell budget gets. A string cell of the
+    /// same serialized size under the same budget is cut, which is what makes
+    /// this a claim about the variant rather than about the size.
+    #[test]
+    fn an_oversized_integer_cell_is_never_shortened() {
+        let widest = i128::from(u64::MAX);
+        let equally_long = "1".repeat(u64::MAX.to_string().len());
+        assert_eq!(
+            serialized_str_len(&widest.to_string()),
+            serialized_str_len(&equally_long)
+        );
+        let mut row = vec![Cell::Int(widest), Cell::Str(equally_long)];
+
+        // One byte under the 22 B both cells serialize to.
+        let truncated = shorten_row(&mut row, 21);
+
+        assert_eq!(truncated, 1, "the string alone was cut");
+        assert_eq!(row[0], Cell::Int(widest));
+        assert_eq!(row[1], Cell::Str(format!("11111{TRUNCATION_MARKER}")));
     }
 
     /// JSON has no NaN or infinity, so the three non-finite floats travel
@@ -2394,7 +2448,7 @@ mod tests {
         assert_eq!(finished.status, Status::Ok);
         assert_eq!(finished.presentation.cursor, None);
 
-        let mut envelope = envelope_with_rows(3, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(3, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.max_rows = 200;
         let finished = envelope.finish(true);
         assert_eq!(finished.status, Status::Ok);
@@ -2406,13 +2460,13 @@ mod tests {
     /// came back and nothing points at them.
     #[test]
     fn finish_is_ok_bounded_when_a_cap_stopped_the_result_without_a_cursor() {
-        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.row_cap_hit = true;
         let finished = envelope.finish(false);
         assert_eq!(finished.status, Status::OkBounded);
         assert_eq!(finished.presentation.cursor, None);
 
-        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.bytes_cap_hit = true;
         envelope.presentation.rows_omitted = 7;
         let finished = envelope.finish(false);
@@ -2425,7 +2479,7 @@ mod tests {
     /// the cursor survives for the caller to redeem.
     #[test]
     fn finish_is_ok_page_when_a_cap_stopped_the_result_and_a_cursor_exists() {
-        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.row_cap_hit = true;
         envelope.presentation.cursor = Some("cursor-token".to_string());
 
@@ -2445,7 +2499,7 @@ mod tests {
     /// disagree.
     #[test]
     fn finish_drops_a_cursor_when_the_ordering_is_not_total() {
-        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.row_cap_hit = true;
         envelope.presentation.cursor = Some("cursor-token".to_string());
 
@@ -2459,7 +2513,7 @@ mod tests {
     /// dropped and the result is the plain `ok` it is.
     #[test]
     fn finish_drops_a_cursor_when_no_cap_stopped_the_result() {
-        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.cursor = Some("cursor-token".to_string());
 
         let finished = envelope.finish(true);
@@ -2478,7 +2532,7 @@ mod tests {
     /// bounded, which is what keeps the flag from being decoration.
     #[test]
     fn finish_is_ok_when_the_cap_was_hit_but_nothing_was_dropped() {
-        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.bytes_cap_hit = true;
         envelope.presentation.cursor = Some("cursor-token".to_string());
 
@@ -2487,12 +2541,12 @@ mod tests {
         assert_eq!(finished.status, Status::Ok);
         assert_eq!(finished.presentation.cursor, None);
 
-        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.bytes_cap_hit = true;
         envelope.presentation.rows_omitted = 1;
         assert_eq!(envelope.finish(false).status, Status::OkBounded);
 
-        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(2, |i| vec![Cell::Int(i as i128)]);
         envelope.presentation.bytes_cap_hit = true;
         envelope.presentation.cells_truncated = 1;
         assert_eq!(envelope.finish(false).status, Status::OkBounded);
@@ -2506,7 +2560,7 @@ mod tests {
     /// warning list is exactly the fields still missing.
     #[test]
     fn finish_warns_about_unmeasured_identity_fields() {
-        let envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i64)]);
+        let envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i128)]);
 
         let finished = envelope.finish(false);
 
@@ -2520,7 +2574,7 @@ mod tests {
             ]
         );
 
-        let mut measured = envelope_with_rows(1, |i| vec![Cell::Int(i as i64)]);
+        let mut measured = envelope_with_rows(1, |i| vec![Cell::Int(i as i128)]);
         measured.visibility.snapshot_id = "snap-7".to_string();
 
         let finished = measured.finish(false);
@@ -2544,7 +2598,7 @@ mod tests {
     /// `finish` runs.
     #[test]
     fn identity_warnings_are_inside_the_cap_and_the_count_bound() {
-        let mut envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i128)]);
         envelope.warnings = (0..MAX_WARNINGS)
             .map(|i| format!("{i:0>2}_{}", "w".repeat(507)))
             .collect();
@@ -2577,7 +2631,7 @@ mod tests {
     /// with both caps set, and loses any cursor on it.
     #[test]
     fn finish_preserves_an_error_status_and_drops_its_cursor() {
-        let mut envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i64)]);
+        let mut envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i128)]);
         envelope.status = Status::Error;
         envelope.failure = Some(Failure {
             class: FailureClass::BudgetExceeded,
