@@ -1,0 +1,109 @@
+# OpenTelemetry Collector config for the container-first quickstart
+# (ADR-0081 decision 3). Scrapes host metrics and exports the collector's own
+# internal logs, both to ravel-server over OTLP/HTTP, authenticating with the
+# demo bearer token. The internal-logs export gives a reader who runs a plain
+# `docker compose up` a log source, so the README's PromQL-over-logs example
+# (`ravel_log_lines`) has records to match when no telemetrygen is involved
+# (issue #1334). CI's quickstart lanes do not rely on this export: they inject
+# their own deterministic log records with `telemetrygen logs`, the same way
+# they inject the `gen` metric series, so the README assertion does not depend
+# on the collector's log level or emit timing.
+#
+# The upstream image (otel/opentelemetry-collector-contrib) is built FROM
+# scratch and runs as uid 10001: every directory shipped in it is owned by
+# root with mode 0755, and the quickstart mounts no writable volume. There is
+# no path in the container that uid 10001 can create a file in, including
+# /tmp, which does not exist in the image at all. A `filelog` receiver
+# tailing a file the collector writes itself therefore cannot work here at
+# any path; the collector's logger fails at startup trying to open the sink
+# ("failed to create logger: open sink ...: no such file or directory"),
+# which is why it never starts (issue #1336). Internal logs are exported
+# directly via OTLP instead (service.telemetry.logs.processors below), which
+# touches no filesystem.
+#
+# SECURITY: `demo-token` is a fixed development credential, matching the
+# `--tenant-token demo-token=demo-tenant` ravel-server runs with in
+# deploy/docker-compose/ravel.yml. It is not a secret and is not for any
+# network-reachable deployment.
+extensions:
+  # Injects `Authorization: Bearer demo-token` on the exporter's requests, the
+  # same tenant credential ravel-server maps to `demo-tenant`.
+  bearertokenauth:
+    scheme: Bearer
+    token: demo-token
+
+receivers:
+  # Only scrapers that read /proc work in a container with no host mounts:
+  # cpu (/proc/stat), load (/proc/loadavg), memory (/proc/meminfo), and
+  # network (/proc/net/dev). disk/filesystem are omitted deliberately; they
+  # need host device mounts the quickstart does not grant.
+  hostmetrics:
+    collection_interval: 10s
+    scrapers:
+      cpu:
+      load:
+      memory:
+      network:
+
+processors:
+  batch:
+
+exporters:
+  # OTLP/HTTP posts to ravel-server's /v1/metrics or /v1/logs (the exporter
+  # appends the signal path to this base). Protobuf encoding, which is what
+  # ExportMetricsServiceRequest::decode / ExportLogsServiceRequest::decode
+  # expect.
+  otlphttp:
+    endpoint: http://ravel-server:4318
+    auth:
+      authenticator: bearertokenauth
+
+service:
+  extensions: [bearertokenauth]
+  pipelines:
+    metrics:
+      receivers: [hostmetrics]
+      processors: [batch]
+      exporters: [otlphttp]
+  telemetry:
+    logs:
+      output_paths: ["stdout"]
+      # Ships the collector's own internal logs to ravel-server over
+      # OTLP/HTTP, bypassing pipelines entirely (no filesystem involved, so
+      # this works regardless of what the container's writable paths are).
+      # The exported resource always carries `service.name: otelcol-contrib`,
+      # which ravel-otlp turns into the `job` label
+      # (crates/ravel-otlp/src/normalize.rs, mirrored for logs in
+      # crates/ravel-query/src/log_series.rs), so a
+      # `sum by (job) (count_over_time(ravel_log_lines[5m]))` query groups
+      # these records without any extra resource-stamping processor.
+      #
+      # service.telemetry doesn't wire extensions, so the bearer token is a
+      # plain header here rather than the bearertokenauth extension the
+      # metrics pipeline exporter uses below.
+      processors:
+        - batch:
+            exporter:
+              otlp:
+                protocol: http/protobuf
+                endpoint: http://ravel-server:4318
+                headers:
+                  Authorization: "Bearer demo-token"
+    # The collector's own delivery counters, on a Prometheus endpoint.
+    #
+    # This exists so that "is the collector actually delivering?" is a
+    # question with a numeric answer. It is the assertion CI needs (#209) and
+    # the first thing to read when the Grafana dashboard is empty: a non-zero
+    # `otelcol_exporter_send_failed_metric_points` says the collector is
+    # running and Ravel is refusing its exports, which is a different fault
+    # from the collector not scraping at all.
+    #
+    # The address must be 0.0.0.0, not the default localhost. localhost binds
+    # the container's own loopback, which no port mapping can reach.
+    metrics:
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

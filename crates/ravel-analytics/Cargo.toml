@@ -1,0 +1,19 @@
+[package]
+name = "ravel-analytics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The library depends on std only, by ADR-0028 decision 1: every result is a
+# deterministic function of the input slice, so there is no clock, IO, or
+# object-store dependency, and PELT/BIC and the summary statistics are all
+# implemented in-crate. proptest is the only dev-dependency (the fixture and
+# property gate of ADR-0028 decision 6).
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

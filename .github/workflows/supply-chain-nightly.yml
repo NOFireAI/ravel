@@ -1,0 +1,103 @@
+name: supply-chain-nightly
+
+# Nightly `cargo deny check` (issue #1310). The per-PR `supply-chain` job in
+# ci.yml (needs: changes, if: docs_only != 'true') skips on a documentation-only
+# change, so a new advisory, license violation, or banned dependency that lands
+# only via a docs-only PR (or via a dependency bump with no other code change,
+# on a day nobody happens to touch Cargo.lock in a non-docs PR) is never
+# rechecked until the next code change touches it. ci.yml itself has no
+# `schedule:` trigger at all, so nothing gives that drift a clock. This lane is
+# that clock: it runs unconditionally, every night, with no docs-only skip.
+#
+# Deliberately its own workflow file rather than a `schedule:` trigger added to
+# ci.yml: ci.yml's single `on:` block is shared by all fourteen of its jobs, so
+# a schedule added there would fire every one of them nightly (including the
+# k8s and coverage lanes) just to get one `cargo deny` run on a clock.
+#
+# Failure routing (ADR-0081 decision 8 pattern, copied from
+# quickstart-published.yml): a red run files a labelled tracking issue linking
+# the run, or comments on the existing open one, so a recurring advisory does
+# not open a fresh issue every night.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly, 05:43 UTC. Off-peak and off the :00/:30 marks, and distinct from
+    # every other scheduled lane in this repo (sim-nightly 03:17, k8s-nightly
+    # 03:00, tla-nightly 04:37, bench-s3 weekly 04:17, quickstart-published
+    # weekly 06:29) so none of the scheduled runs contend.
+    - cron: "43 5 * * *"
+
+# Minimum permissions for the deliverable's failure routing: `issues: write`
+# lets a red run file or comment on a tracking issue; `contents: read` is what
+# actions/checkout needs. Nothing else is granted.
+permissions:
+  contents: read
+  issues: write
+
+env:
+  # Label carried by every tracking issue this lane files, and the key it
+  # dedups on.
+  ISSUE_LABEL: supply-chain-nightly
+
+jobs:
+  supply-chain-nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: cargo-deny
+      - name: cargo deny check
+        run: cargo deny check
+
+      # Failure routing (ADR-0081 decision 8): a red run files a labelled
+      # tracking issue linking this run, or comments on the existing open one
+      # for this lane so an ongoing breakage does not open a fresh issue every
+      # night. Deterministic marker (no run id) in both the issue title and the
+      # dedup key, so a recurring failure maps to one open issue.
+      - name: File or update the tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MARKER: "Nightly supply-chain cargo deny check is red"
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # Best-effort: ensure the label exists so `gh issue create --label`
+          # cannot fail on a missing label. Ignores "already exists".
+          gh label create "$ISSUE_LABEL" \
+            --color BFD4F2 \
+            --description "Nightly cargo-deny supply-chain check failures (issue #1310)" \
+            2>/dev/null || true
+          # Find an existing open issue by matching the deterministic marker in
+          # the title (env.MARKER inside the jq filter, literal substring via
+          # contains -- no regex escaping). Empty when none exists.
+          existing=$(gh issue list --state open --label "$ISSUE_LABEL" \
+            --json number,title \
+            --jq 'map(select(.title | contains(env.MARKER))) | .[0].number // empty') || existing=""
+          body=$(cat <<EOF
+          The nightly \`supply-chain-nightly\` lane failed running \`cargo deny check\`.
+
+          - Run: $run_url
+          - Config: \`deny.toml\`
+
+          This lane runs unconditionally every night (no documentation-only
+          skip), closing the gap left by the per-PR \`supply-chain\` job in
+          ci.yml, which skips when a change is docs-only. A failure here means
+          an advisory, license, or ban was newly triggered (a fresh RUSTSEC
+          entry, a dependency version bump, or a new transitive dependency)
+          since the last green run, not necessarily anything in the commit
+          that happened to be at HEAD when the clock ticked.
+
+          See the run's \`cargo deny check\` step output for which check
+          (advisories/bans/licenses/sources) and which crate triggered it.
+          EOF
+          )
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+            echo "commented on existing issue #$existing"
+          else
+            gh issue create --title "$MARKER" --label "$ISSUE_LABEL" --body "$body"
+          fi

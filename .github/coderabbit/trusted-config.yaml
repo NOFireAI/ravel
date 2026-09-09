@@ -1,0 +1,293 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# Trusted CodeRabbit policy for NOFireAI/ravel (ADR-0091).
+#
+# This file is loaded ONLY from a checkout of the trusted `main` branch, copied
+# to a directory outside the pull-request worktree, and passed to the CLI by
+# absolute path:
+#
+#   coderabbit review --agent \
+#     --config /abs/trusted/trusted-config.yaml /abs/trusted/ravel-review-instructions.md
+#
+# Verified against CodeRabbit CLI 0.7.3 by reading the shipped bundle: when
+# `--config` is given a non-empty list, that list REPLACES the built-in
+# discovery list `[".coderabbit.yaml", ".coderabbit.yml", "coderabbit.yaml",
+# "coderabbit.yml"]`, absolute paths are used verbatim, and every listed file is
+# read. A `.coderabbit.yaml` in the pull request is therefore never loaded as
+# configuration. Because the trusted paths live outside the worktree they also
+# cannot collide with a changed file and silently replace its diff.
+#
+# The repository-root `.coderabbit.yaml` is a SEPARATE file with a separate job:
+# it constrains the CodeRabbit GitHub App, which reads configuration from the
+# pull request's own head branch and is therefore defence in depth only. Keep
+# the two files consistent; neither one can stand in for the other.
+#
+# Everything here that can write to the repository, open an issue, talk back, or
+# generate unbounded follow-up work is off. This integration produces read-only
+# review findings.
+
+language: en-US
+
+# Highest-signal profile. Ravel's review policy (below and in
+# ravel-review-instructions.md) is correctness first, not nit volume.
+tone_instructions: >-
+  Ravel is a telemetry database whose only durable backend is object storage.
+  Report critical and major defects in durability, consistency, compatibility,
+  concurrency, security, and operability. No style, no praise, no
+  low-confidence guesses.
+
+early_access: false
+
+reviews:
+  profile: assertive
+  # Never let CodeRabbit hold a merge. Authorization for this integration is the
+  # workflow's job; a review that can block is a review that can be weaponised.
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: false
+  commit_status: false
+  fail_commit_status: false
+  poem: false
+  in_progress_fortune: false
+  sequence_diagrams: false
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  auto_apply_labels: false
+  suggested_reviewers: false
+  auto_assign_reviewers: false
+  abort_on_close: true
+
+  # The CLI path is dispatched by hand, one review per exact head SHA. Nothing
+  # here may start a review on its own.
+  auto_review:
+    enabled: false
+    auto_incremental_review: false
+    drafts: false
+    base_branches: []
+    labels: []
+    ignore_title_keywords: []
+    ignore_usernames: []
+
+  # Every write-capable finishing touch, off. These are the surfaces that can
+  # push commits, open pull requests, or rewrite a contributor's branch.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+    custom: []
+
+  # Pre-merge checks are a gating surface. Ravel gates on scripts/gates.sh and
+  # the required status checks in the `protect-main` ruleset, not on a vendor.
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+    custom_checks: []
+
+  post_merge_actions: []
+
+  path_filters:
+    - "!Cargo.lock"
+    - "!**/*.svg"
+    - "!docs/explorer/**"
+    - "!graft/**"
+    - "!proto/otel-arrow/**"
+
+  path_instructions:
+    - path: "crates/ravel-object-store/**"
+      instructions: >-
+        Object storage is the source of truth. Flag any durability that depends
+        on local disk, any recovery path that reads state another process wrote
+        locally, any assumption that a LIST is immediately consistent or
+        complete without pagination, and any retry that can duplicate a write
+        without being idempotent. docs/object-store-contract.md is normative.
+    - path: "crates/{ravel-commit,ravel-catalog}/**"
+      instructions: >-
+        Commit records, manifests, and index objects are immutable. Flag any
+        in-place mutation, any acknowledgement that precedes durability of both
+        the data object and the commit record, and any commit-token or MVCC
+        change that can break read-your-write. docs/catalog-and-mvcc.md is
+        normative.
+    - path: "crates/{ravel-segment,ravel-logseg,ravel-types,ravel-proto}/**"
+      instructions: >-
+        These carry frozen persistent contracts: the RSEG and RLOG layouts, the
+        protobuf schemas, canonical series identity, and commit tokens. Any
+        change to a persisted byte layout, field number, or identity derivation
+        needs an ADR and a version bump, never an in-place edit. Flag a change
+        that silently breaks reading objects written by an older build.
+    - path: "crates/ravel-ingest/**"
+      instructions: >-
+        docs/ingest.md and docs/consistency-model.md are normative for
+        acknowledgement, visibility, and crash behaviour. Flag any path that
+        acknowledges a write before it is durable, any unbounded queue or
+        buffer, and any missing admission or backpressure limit.
+    - path: "services/ravel-operator/**"
+      instructions: >-
+        Review reconciliation for idempotency and for requeue behaviour on
+        partial failure, finalizers for leaks and for deleting durable data,
+        RBAC for privilege beyond what the controller needs, and secret handling
+        for values that reach logs, status, or events.
+    - path: ".github/workflows/**"
+      instructions: >-
+        Review as supply chain. Flag an unpinned action reference, a
+        `pull_request_target` or `workflow_run` trigger that checks out or
+        executes untrusted code, a secret exposed to a job that runs
+        contributor-controlled code, a writable `GITHUB_TOKEN` permission that
+        the job does not need, and any script interpolating an untrusted GitHub
+        expression directly into a shell command.
+    - path: "**/*.rs"
+      instructions: >-
+        Flag `unsafe`, and `unwrap`/`expect`/`panic!` on a production path.
+        Flag integer overflow, timestamp arithmetic that can wrap or lose
+        precision, and deserialization of untrusted bytes without a length or
+        type check. Flag async cancellation that can drop a durability step,
+        task leaks, lock ordering that can deadlock, and lock guards held across
+        an await point.
+
+  tools:
+    # Every static tool that reads a configuration file out of the reviewed
+    # tree is a configuration-controlled execution surface. Off.
+    ast-grep:
+      essential_rules: false
+      rule_dirs: []
+      util_dirs: []
+      packages: []
+    eslint: { enabled: false }
+    ruff: { enabled: false }
+    pylint: { enabled: false }
+    flake8: { enabled: false }
+    rubocop: { enabled: false }
+    brakeman: { enabled: false }
+    golangci-lint: { enabled: false }
+    phpstan: { enabled: false }
+    phpmd: { enabled: false }
+    phpcs: { enabled: false }
+    swiftlint: { enabled: false }
+    detekt: { enabled: false }
+    pmd: { enabled: false }
+    semgrep: { enabled: false }
+    opengrep: { enabled: false }
+    sqlfluff: { enabled: false }
+    squawk: { enabled: false }
+    biome: { enabled: false }
+    oxc: { enabled: false }
+    stylelint: { enabled: false }
+    htmlhint: { enabled: false }
+    luacheck: { enabled: false }
+    prismaLint: { enabled: false }
+    shopifyThemeCheck: { enabled: false }
+    emberTemplateLint: { enabled: false }
+    smartyLint: { enabled: false }
+    blinter: { enabled: false }
+    dotenvLint: { enabled: false }
+    psscriptanalyzer: { enabled: false }
+    fbinfer: { enabled: false }
+    fortitudeLint: { enabled: false }
+    reactDoctor: { enabled: false }
+    circleci: { enabled: false }
+    oasdiff: { enabled: false }
+    buf: { enabled: false }
+    regal: { enabled: false }
+    checkmake: { enabled: false }
+    checkov: { enabled: false }
+    tflint: { enabled: false }
+    trivy: { enabled: false }
+    osvScanner: { enabled: false }
+    presidio: { enabled: false }
+    skillspector: { enabled: false }
+    languagetool: { enabled: false }
+    markdownlint: { enabled: false }
+    yamllint: { enabled: false }
+    hadolint: { enabled: false }
+    shellcheck: { enabled: false }
+    clang: { enabled: false }
+    cppcheck: { enabled: false }
+    # `github-checks` pulls Ravel's own CI results in as review context. The
+    # workflow deliberately gives CodeRabbit no view of, and no hand in, CI.
+    github-checks:
+      enabled: false
+    # Clippy already runs as a required check with `-D warnings`. A second
+    # opinion adds duplicate findings and consumes files against the OSS
+    # allowance for output Ravel already treats as blocking.
+    clippy: { enabled: false }
+    # Secret scanners stay on: a leaked credential in a diff is exactly the
+    # class of defect worth spending the allowance on. Neither reads a
+    # configuration file from the reviewed tree.
+    gitleaks: { enabled: true }
+    trufflehog: { enabled: true }
+    # actionlint and zizmor read only the workflow files themselves.
+    actionlint: { enabled: true }
+    zizmor: { enabled: true }
+
+# No conversational surface at all. Nothing may reply, and nothing may be
+# triggered by a comment.
+chat:
+  auto_reply: false
+  allow_non_org_members: false
+  art: false
+  integrations:
+    jira:
+      usage: disabled
+    linear:
+      usage: disabled
+
+# No cross-run memory, no external fetches, no ticket systems, no linking to
+# other repositories. A "learning" is state a contributor's pull request could
+# steer, and it would outlive the review that created it.
+knowledge_base:
+  opt_out: true
+  web_search:
+    enabled: false
+  code_guidelines:
+    enabled: false
+    filePatterns: []
+  learnings:
+    scope: local
+  issues:
+    scope: local
+  jira:
+    usage: disabled
+  linear:
+    usage: disabled
+  pull_requests:
+    scope: local
+  mcp:
+    usage: disabled
+    disabled_servers: []
+  automatic_repository_linking: false
+  linked_repositories: []
+
+code_generation:
+  docstrings:
+    path_instructions: []
+  unit_tests:
+    path_instructions: []
+
+# Nothing may create, enrich, plan, or label an issue.
+issue_enrichment:
+  auto_enrich:
+    enabled: false
+  planning:
+    enabled: false
+    auto_planning:
+      enabled: false
+      labels: []
+  labeling:
+    labeling_instructions: []
+    auto_apply_labels: false

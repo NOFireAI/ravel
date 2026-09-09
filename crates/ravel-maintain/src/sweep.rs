@@ -1,0 +1,4291 @@
+//! The sweeper: one component, five eligibility rules
+//! (docs/consistency-model.md "Deletion
+//! and GC"). This is the first implementation of any deletion in Ravel.
+//!
+//! 1. **Orphan GC** (ADR-0010 §11): an `l0/` data object with no commit
+//!    record, older than `grace + max_flush_lifetime`. The writer interlock
+//!    (a writer abandons any flush older than `max_flush_lifetime` and never
+//!    publishes it afterward) is what makes this safe: a record-less object
+//!    that old can never gain a commit record later, so deleting it cannot
+//!    orphan a future reader. Commit-record absence is re-verified with one
+//!    fresh strongly consistent LIST shared by every candidate in the pass
+//!    (ADR-0048 decision 5), then gated by a mass-orphan circuit breaker
+//!    (ADR-0048 decision 4): a pass that would delete at least
+//!    `orphan_breaker_min_count` candidates AND more than
+//!    `orphan_breaker_max_ratio` of the shard's listed L0 objects deletes
+//!    nothing and halts, because that shape is the signature of an
+//!    out-of-band commit-record loss, not routine cleanup.
+//! 2. **Superseded-input sweep** (ADR-0018): the L0 commit records and data
+//!    objects a compaction record names in its input list, once
+//!    `now >= record.created_unix_ns + protection_horizon` AND the live catalog
+//!    HEAD snapshot no longer names the input (the ADR-0020 delete blocker,
+//!    the same gate retention uses, [`crate::reachability`]). Records are
+//!    deleted before data objects, so a crash mid-sweep never leaves a commit
+//!    record pointing at a deleted data object visible to a resolver. The
+//!    horizon alone is not enough: a selective-erasure rewrite record can land
+//!    in any sealed hour, including one the fold's fixed reconcile window and
+//!    retention-frontier band both miss, and the snapshot part covering that
+//!    hour then keeps naming the pre-rewrite inputs. Deleting them on schedule
+//!    would fail every query over that hour closed until the fold caught up, so
+//!    a still-named input is held for a later pass instead.
+//! 3. **Unreferenced-part cleanup**: an `l1/` object referenced by no
+//!    compaction record in its bucket, once the object is older than `grace +
+//!    max_compaction_lifetime` and one of two branch conditions holds:
+//!    (a) a compaction record already exists for the bucket, so any object no
+//!    record names is a leftover; or (b) a retention tombstone exists for the
+//!    bucket and no compaction record does, which makes any future compaction
+//!    impossible (`compact_bucket`'s tombstone gate returns before building or
+//!    publishing, ADR-0019), so every record-less `l1/` object in the bucket
+//!    can never be re-referenced by a legal future publish. A
+//!    bucket with neither a record nor a tombstone keeps its record-less
+//!    parts: a future compaction over the same sealed, content-addressed input
+//!    set will republish the identical keys and name them. The exact branch
+//!    condition is re-verified with a fresh strongly consistent LIST
+//!    immediately before each delete.
+//! 4. **Idempotency marker sweep** (ADR-0051 §5): a `t/<tenant_hash>/<signal>/
+//!    idem/` marker (logs and spans only, ravel-ingest's post-flush dedup
+//!    cache) whose `<ingest_hour>` -- encoded in the key name itself, not read
+//!    from `last_modified` -- is more than `idem_dedup_window_hours` behind
+//!    the clock's current ingest-hour bucket. Stateless and signal-generic
+//!    like the other three, but its age signal is the pinned ingest hour a
+//!    retry could still land in, not object age, because a marker's whole
+//!    purpose is keyed to that hour, not to when it happened to get written.
+//!    A key under the prefix that fails to parse as
+//!    `<keyhash32>.<ingest_hour>.idm` is logged and skipped, never deleted and
+//!    never fatal: the prefix is additive, so the `c/`-prefix fail-loud
+//!    unknown-shape rule (rules 1-3) does not apply to it.
+//! 5. **Unreferenced catalog-object sweep**: a snapshot part under
+//!    `t/<tenant_hash>/catalog/<signal>/snap/` or a name-postings object under
+//!    the sibling `.../idx/` prefix that the current
+//!    `.../catalog/<signal>/HEAD` does not name (neither a `parts[].key` nor
+//!    the optional `postings.key`), once the object's `last_modified` age
+//!    exceeds the protection horizon. Every fold that rewrites a part or
+//!    postings object supersedes the old one by writing a new
+//!    content-addressed key and swapping HEAD; the superseded object is left
+//!    in place (plan 4 step 8, the "orphan part" crash-matrix row) and leaks
+//!    until this rule collects it. Per (tenant, signal), not per shard:
+//!    catalog objects and HEAD carry no shard dimension, so the rule LISTs the
+//!    two coarse prefixes first and only then reads one HEAD, exactly the
+//!    coarse-prefix shape rule 4 uses for `idem/`. A present, decodable HEAD is
+//!    the rule's only anchor: an absent HEAD sweeps nothing for that
+//!    (tenant, signal), mirroring rule 3's neither-record-nor-tombstone bucket
+//!    (a recovery fold with no HEAD recomputes and re-PUTs every part under
+//!    keys byte-identical to any surviving old object, adopting it via
+//!    `AlreadyExists` without rewriting it, then names it in the HEAD it is
+//!    about to CAS -- so record-less catalog objects with no HEAD to compare
+//!    against may belong to a fold in flight). A HEAD that is present but fails
+//!    to decode aborts the pass without deleting, so a corrupt HEAD can never
+//!    cause the live snapshot to be read as unreferenced and swept.
+//!
+//! All five are **signal-generic**: rules 1-3 operate only on commit-record,
+//! compaction-record, and object *keys* plus store `last_modified`, rule 4
+//! only on marker keys, and rule 5 only on catalog object keys plus the HEAD
+//! it decodes to a referenced-key set, never on a segment byte, so nothing
+//! here needs to know RSEG from RLOG. All five are stateless per pass,
+//! restartable from zero, and every delete is idempotent (the object-store
+//! contract makes deleting a missing key a success). The clock is always
+//! injected; rules 1-3 and rule 5 read object age from `last_modified` (which
+//! the object-store contract restricts to exactly GC age checks), while rule 4
+//! reads it from the ingest hour encoded in the marker's own key.
+//!
+//! The [`LeaseCheck`] hook is consulted before every delete in all five
+//! rules. It ships as the no-op [`NoLeases`] ("nothing is ever protected"):
+//! the consistency-model's "not lease-protected" precondition is then
+//! vacuously satisfied everywhere. It is a seam for future slow-consumer work,
+//! not live logic; no lease machinery is built behind it.
+//!
+//! [`sweep_shard_zoned`] scopes rules 2 and 3 to a given hour set, mirroring
+//! the unit scan's zone split (ADR-0065 decision 3): the caller's per-tick
+//! pass lists only its head+tail hours, and a full pass on the slow
+//! safety-net cadence still uses [`sweep_shard`] to eventually cover every
+//! hour. Rule 1 cannot be scoped this way and always lists the whole shard
+//! (L0 keys carry no ingest-hour component); see [`sweep_shard_zoned`]'s doc
+//! for that deviation.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use ravel_catalog::select_authoritative_compaction_records;
+use ravel_commit::keys::{self, BucketEntry, KeyError, parse_ingest_hour_string};
+use ravel_commit::record;
+use ravel_object_store::{GetRange, ObjectMeta, ObjectStoreBackend, StoreError, list_all};
+use ravel_proto::commit::v1::{
+    CompactionInputIdentity, CompactionRecord, ErasureCompletion, RewriteRecord,
+};
+use ravel_types::{Signal, TenantHash};
+use uuid::Uuid;
+
+use crate::clock::Clock;
+use crate::config::{CompactorConfig, NS_PER_HOUR};
+use crate::error::{MaintainError, Result};
+use crate::reachability::{
+    SnapshotBlock, SnapshotGate, SnapshotObject, SnapshotReachability, catalog_head_key,
+};
+use crate::read::verify_commit_key;
+
+use ravel_ingest::{IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, MARKER_SUFFIX};
+
+/// A hook the sweeper consults before every delete, in all five rules. The
+/// only implementation today is [`NoLeases`] (nothing is ever protected); this
+/// is a seam for future reader-lease / slow-consumer work, never
+/// a correctness dependency of the current design (the protection horizon and
+/// the age gates are what protect in-flight readers).
+pub trait LeaseCheck: Send + Sync {
+    /// Return `true` if `key` is protected by an active reader lease and must
+    /// not be deleted this pass.
+    fn is_protected(&self, key: &str) -> bool;
+}
+
+/// The shipped [`LeaseCheck`]: nothing is ever protected, so the
+/// consistency-model's "not lease-protected" GC precondition is vacuously
+/// satisfied everywhere.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoLeases;
+
+impl LeaseCheck for NoLeases {
+    fn is_protected(&self, _key: &str) -> bool {
+        false
+    }
+}
+
+/// What one sweep pass over a `(tenant, signal, shard)` deleted, per rule.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SweepReport {
+    /// Rule 1: record-less `l0/` data objects deleted (orphan GC).
+    pub orphans_deleted: usize,
+    /// Rule 2: superseded L0 commit records deleted.
+    pub superseded_records_deleted: usize,
+    /// Rule 2: superseded L0 data objects deleted.
+    pub superseded_data_deleted: usize,
+    /// Rule 3: unreferenced `l1/` part objects deleted.
+    pub unreferenced_parts_deleted: usize,
+    /// Rule 1's mass-orphan circuit breaker tripped this pass (ADR-0048
+    /// decision 4): `orphans_deleted` is `0` and `orphans_withheld` carries
+    /// what would have been deleted. Rules 2 and 3 above are unaffected and
+    /// still ran, since they are anchored on durable records an operator or
+    /// compactor deliberately wrote, never on record absence.
+    pub orphan_breaker_tripped: bool,
+    /// Orphan candidates withheld by a tripped breaker this pass. Always `0`
+    /// when `orphan_breaker_tripped` is `false`.
+    pub orphans_withheld: usize,
+    /// This pass deleted orphans despite exceeding the breaker's threshold,
+    /// because `CompactorConfig::force_orphan_gc` overrode it (ADR-0048
+    /// decision 4's one-shot operator override). Always `false` when
+    /// `orphan_breaker_tripped` is `true`.
+    pub orphan_breaker_overridden: bool,
+    /// `true` if this pass listed the whole shard (rule 1 always does; rules
+    /// 2 and 3 did here too, either because the caller used [`sweep_shard`]
+    /// or because [`sweep_shard_zoned`] was asked to widen to every hour).
+    /// `false` for a [`sweep_shard_zoned`] pass scoped to a hour subset.
+    /// Counter seam for `ravel_maintain_full_sweep_passes_total`: a
+    /// caller running the slow safety-net cadence increments its own counter
+    /// when this is `true`.
+    pub full_pass: bool,
+}
+
+/// Run all three sweep rules over one `(tenant, signal, shard)` and report
+/// what each deleted. Stateless and idempotent: a crashed pass re-run from
+/// scratch converges (every delete is a no-op if the object is already gone).
+///
+/// Order: superseded, then unreferenced parts, then orphan GC last. Orphan GC
+/// runs last so it mops up any record-less data object a crash left behind
+/// mid-superseded-sweep (row 8), rather than racing the same object with the
+/// superseded rule in one pass. The rules are independent, so the order only
+/// affects which rule's counter claims a crash remnant, never correctness.
+pub async fn sweep_shard(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<SweepReport> {
+    let (report, _holds) =
+        sweep_shard_with_holds(store, clock, config, lease, tenant, signal, shard).await?;
+    Ok(report)
+}
+
+/// [`sweep_shard`], also returning what rule 2 held this pass in the form
+/// [`sweep_erasure_requests_with_holds`] consumes. A caller that sweeps several
+/// shards of one signal per tick unions these with [`SupersededHolds::absorb`]
+/// and passes the union to that function, so rule 6 decides from what rule 2
+/// actually held instead of walking the chains a second time.
+pub async fn sweep_shard_with_holds(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<(SweepReport, SupersededHolds)> {
+    let superseded = sweep_superseded(store, clock, config, lease, tenant, signal, shard).await?;
+    log_superseded_holds(tenant, signal, shard, &superseded);
+    let mut superseded_holds = SupersededHolds::default();
+    superseded_holds.absorb(&superseded);
+    let unreferenced_parts_deleted =
+        sweep_unreferenced_parts(store, clock, config, lease, tenant, signal, shard).await?;
+    let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
+        match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
+            Ok(outcome) => (outcome.deleted, false, 0, outcome.breaker_overridden),
+            Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
+                (0, true, candidates, false)
+            }
+            Err(e) => return Err(e),
+        };
+    Ok((
+        SweepReport {
+            orphans_deleted,
+            superseded_records_deleted: superseded.records_deleted,
+            superseded_data_deleted: superseded.data_deleted,
+            unreferenced_parts_deleted,
+            orphan_breaker_tripped,
+            orphans_withheld,
+            orphan_breaker_overridden,
+            full_pass: true,
+        },
+        superseded_holds,
+    ))
+}
+
+/// Zone-scoped sweep pass (ADR-0065 decision 3): rules 2 and 3 list only the
+/// given `hours`' commit and L1 prefixes instead of the whole shard,
+/// mirroring the unit scan's zone split so a per-tick pass never re-lists
+/// interior hours a tick's zone recomputation already decided to skip.
+/// `hours` is the caller's current head+tail set for this unit.
+///
+/// Rule 1 (orphan GC) always lists the whole shard regardless of `hours`: L0
+/// data keys carry no ingest-hour component (`ravel_commit::keys::data_key`),
+/// so there is no hour-scoped prefix to list. This is a structural limit, not
+/// an oversight -- flagged as a deviation from a literal reading of the ADR,
+/// which does not distinguish rule 1 from rules 2 and 3 when describing the
+/// per-tick sweep as hour-scoped.
+///
+/// The caller is responsible for the slow safety-net cadence: call
+/// [`sweep_shard`] instead of this function on that cadence so rules 2 and 3
+/// eventually cover every hour, including one a bug or a missed invalidation
+/// left permanently out of `hours`. [`SweepReport::full_pass`] is always
+/// `false` on the report this function returns.
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_shard_zoned(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: &[u32],
+) -> Result<SweepReport> {
+    let (report, _holds) =
+        sweep_shard_zoned_with_holds(store, clock, config, lease, tenant, signal, shard, hours)
+            .await?;
+    Ok(report)
+}
+
+/// [`sweep_shard_zoned`], also returning what rule 2 held this pass, exactly as
+/// [`sweep_shard_with_holds`] does for the full pass.
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_shard_zoned_with_holds(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: &[u32],
+) -> Result<(SweepReport, SupersededHolds)> {
+    let mut reach = SnapshotReachability::new();
+    let superseded = sweep_superseded_impl(
+        &mut reach,
+        store,
+        clock,
+        config,
+        lease,
+        tenant,
+        signal,
+        shard,
+        Some(hours),
+        SweepMode::Delete,
+    )
+    .await?;
+    log_superseded_holds(tenant, signal, shard, &superseded);
+    let mut superseded_holds = SupersededHolds::default();
+    superseded_holds.absorb(&superseded);
+    let unreferenced_parts_deleted = sweep_unreferenced_parts_impl(
+        store,
+        clock,
+        config,
+        lease,
+        tenant,
+        signal,
+        shard,
+        Some(hours),
+    )
+    .await?;
+    let (orphans_deleted, orphan_breaker_tripped, orphans_withheld, orphan_breaker_overridden) =
+        match sweep_orphans(store, clock, config, lease, tenant, signal, shard).await {
+            Ok(outcome) => (outcome.deleted, false, 0, outcome.breaker_overridden),
+            Err(MaintainError::OrphanBreakerTripped { candidates, .. }) => {
+                (0, true, candidates, false)
+            }
+            Err(e) => return Err(e),
+        };
+    Ok((
+        SweepReport {
+            orphans_deleted,
+            superseded_records_deleted: superseded.records_deleted,
+            superseded_data_deleted: superseded.data_deleted,
+            unreferenced_parts_deleted,
+            orphan_breaker_tripped,
+            orphans_withheld,
+            orphan_breaker_overridden,
+            full_pass: false,
+        },
+        superseded_holds,
+    ))
+}
+
+/// Surface a superseded-input hold to an operator running the combined
+/// [`sweep_shard`] / [`sweep_shard_zoned`] pass. [`SweepReport`] carries no
+/// hold counter: the structured counters live on [`SupersededSweepOutcome`], which
+/// [`sweep_superseded`] returns directly, and this log line is what a caller
+/// that only has the combined report sees. Silent on a pass that held nothing,
+/// which is every ordinary pass.
+fn log_superseded_holds(
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    outcome: &SupersededSweepOutcome,
+) {
+    if outcome.held() == 0 && outcome.chain_groups_held_by_legal_hold == 0 {
+        return;
+    }
+    tracing::warn!(
+        tenant_hash = %tenant.to_hex(),
+        signal = signal.key_prefix(),
+        shard,
+        held_by_snapshot = outcome.held_by_snapshot,
+        held_by_unreadable_head = outcome.held_by_unreadable_head,
+        chain_groups_held_by_legal_hold = outcome.chain_groups_held_by_legal_hold,
+        held_requests = outcome.held_request_ids.len(),
+        held_truncated_buckets = outcome.held_truncated_buckets.len(),
+        "superseded-input sweep: held inputs the live catalog HEAD snapshot still names \
+         (or could not be read, or a legal hold protects); they are collected once the fold \
+         reconciles their hour, HEAD is rebuilt, or the hold is released"
+    );
+}
+
+// --- Rule 1: orphan GC (ADR-0010 §11) --------------------------------------
+
+/// What one orphan-GC pass did (ADR-0048 decisions 4 and 5). A pass that
+/// trips the mass-orphan breaker without an override returns
+/// [`MaintainError::OrphanBreakerTripped`] instead of this type, and deletes
+/// nothing; [`sweep_shard`] folds that error into [`SweepReport`]'s breaker
+/// fields for callers that run the whole shard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanSweepOutcome {
+    /// Record-less `l0/` data objects deleted this pass.
+    pub deleted: usize,
+    /// This pass exceeded the breaker's threshold but proceeded anyway
+    /// because [`CompactorConfig::force_orphan_gc`] was set (ADR-0048
+    /// decision 4's one-shot operator override).
+    pub breaker_overridden: bool,
+}
+
+/// Delete every record-less `l0/` data object older than the orphan age
+/// gate. Three phases (ADR-0048 decisions 4 and 5): (a) candidate selection
+/// over one listing of the shard's L0 data objects, filtered by the
+/// commit-record identities already present, the age gate, and lease
+/// protection; (b) one fresh strongly consistent LIST of the commit prefix,
+/// shared by every candidate, dropping any whose identity now appears
+/// (replacing the old per-candidate full-shard LIST, the dominant request
+/// cost of a sweep); (c) the mass-orphan circuit breaker gate; (d) delete.
+/// A tripped, non-overridden breaker returns
+/// [`MaintainError::OrphanBreakerTripped`] before phase (d), so the pass is
+/// all-or-nothing: either every surviving candidate is deleted, or none are.
+pub async fn sweep_orphans(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<OrphanSweepOutcome> {
+    let now = clock.now_ns();
+    let gate = config.orphan_age_gate_ns();
+
+    // Phase (a): candidate selection over one listing of the shard's L0 data
+    // objects, checked against the commit-record identities from one initial
+    // commit-prefix LIST.
+    let prefix = l0_data_prefix(tenant, signal, shard)?;
+    let objects = list_all(store, &prefix).await?;
+    let l0_objects_listed = objects.len();
+    let referenced = referenced_l0_identities(store, tenant, signal, shard).await?;
+
+    let mut candidates: Vec<(ObjectMeta, (Uuid, u64, u64))> = Vec::new();
+    for meta in objects {
+        let parsed = keys::parse_data_key(&meta.key)?;
+        let identity = (parsed.writer_id, parsed.epoch, parsed.seq);
+        if referenced.contains(&identity) {
+            continue;
+        }
+        if object_age_ns(now, &meta) <= gate {
+            continue;
+        }
+        if lease.is_protected(&meta.key) {
+            continue;
+        }
+        candidates.push((meta, identity));
+    }
+
+    // Phase (b): one fresh, batched re-verify LIST of the commit prefix,
+    // shared by every candidate this pass (ADR-0048 decision 5): a commit
+    // record may have landed for a candidate's identity since the first
+    // listing. Skipped when there is nothing to re-verify.
+    if !candidates.is_empty() {
+        let fresh = referenced_l0_identities(store, tenant, signal, shard).await?;
+        candidates.retain(|(_, identity)| !fresh.contains(identity));
+    }
+
+    // Phase (c): the mass-orphan circuit breaker (ADR-0048 decision 4). Both
+    // conditions must hold: a tiny shard's small orphan count never trips on
+    // ratio alone, and any genuinely mass orphan population trips regardless
+    // of shard size.
+    let candidate_count = candidates.len();
+    let would_trip = candidate_count >= config.orphan_breaker_min_count
+        && (candidate_count as f64) > config.orphan_breaker_max_ratio * (l0_objects_listed as f64);
+
+    if would_trip && !config.force_orphan_gc {
+        return Err(MaintainError::OrphanBreakerTripped {
+            tenant_hash: tenant.to_hex(),
+            signal: signal.key_prefix().to_string(),
+            shard,
+            candidates: candidate_count,
+            l0_objects_listed,
+            min_count: config.orphan_breaker_min_count,
+            max_ratio: config.orphan_breaker_max_ratio,
+        });
+    }
+
+    // Phase (d): delete. All-or-nothing: phase (c) already returned if the
+    // pass should delete zero.
+    for (meta, _) in &candidates {
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
+    }
+
+    Ok(OrphanSweepOutcome {
+        deleted: candidate_count,
+        breaker_overridden: would_trip && config.force_orphan_gc,
+    })
+}
+
+/// The set of L0 commit-record identities `(writer_id, epoch, seq)` present in
+/// a shard, across every hour. Read from commit-record *keys* only (no GET):
+/// an `l0/` data object whose identity is in this set is referenced. A data
+/// object and its commit record share `(writer_id, epoch, seq)`; a leftover
+/// with the same identity but a different content hash (a forbidden split
+/// brain) is conservatively treated as referenced and never deleted.
+async fn referenced_l0_identities(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<HashSet<(Uuid, u64, u64)>> {
+    let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+    let metas = list_all(store, &prefix).await?;
+    let mut out = HashSet::new();
+    for meta in metas {
+        match keys::partition_bucket_entry(&meta.key) {
+            Ok(BucketEntry::CommitRecord(pk)) => {
+                out.insert((pk.writer_id, pk.epoch, pk.seq));
+            }
+            // Only L0 commit identities are collected here; a compaction,
+            // rewrite (ADR-0064), or tombstone record contributes none.
+            Ok(
+                BucketEntry::CompactionRecord(_)
+                | BucketEntry::RewriteRecord(_)
+                | BucketEntry::Tombstone(_),
+            ) => {}
+            Err(KeyError::UnknownBucketEntryShape(k)) => {
+                return Err(MaintainError::UnknownBucketEntry(k));
+            }
+            Err(e) => return Err(MaintainError::Key(e)),
+        }
+    }
+    Ok(out)
+}
+
+// --- Rule 2: superseded-input sweep (ADR-0018) -----------------------------
+
+/// One `(shard, ingest hour)` bucket in which a sweep pass held part of a
+/// supersession chain it could not walk to the end (a generation's record was
+/// already gone). The requests the missing generation applied are not
+/// discoverable from any surviving record, so the erasure-request sweep holds
+/// every `.dreq` that could name such a bucket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HeldBucket {
+    pub shard: u32,
+    pub ingest_hour_bucket: u32,
+}
+
+/// What one superseded-input sweep pass did.
+///
+/// The two `held_*` counters are the object-granular counterpart of
+/// retention's [`crate::retention::RetentionOutcome::BlockedBySnapshot`]: a
+/// count plus the blocked reason, so an operator watching inputs pile up can
+/// tell the ordinary lagging-fold case ([`SnapshotBlock::Named`]) from an
+/// unreadable HEAD or snapshot part ([`SnapshotBlock::Unreadable`]).
+///
+/// `held_request_ids` and `held_truncated_buckets` are what the
+/// erasure-request sweep consumes: this pass is the only component that
+/// already knows, per chain group, both which erasure requests the group's
+/// generations applied and whether the group was held. Publishing that here
+/// is what lets rule 6 decide without a walk of its own, and without depending
+/// on a completion record's optional per-bucket drop list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupersededSweepOutcome {
+    /// Superseded commit, compaction, and rewrite records deleted (or, under
+    /// `dry_run`, that would have been).
+    pub records_deleted: usize,
+    /// Superseded data objects and L1 parts deleted (or, under `dry_run`, that
+    /// would have been).
+    pub data_deleted: usize,
+    /// Objects (records plus data) held this pass because the live catalog HEAD
+    /// snapshot still names them: a query over that hour would fail closed if
+    /// they were deleted now. Counter seam for
+    /// `ravel_maintain_superseded_inputs_held_total{reason="named"}`.
+    pub held_by_snapshot: usize,
+    /// Objects held this pass because HEAD, or a snapshot part covering the
+    /// record's hour, was present but could not be read: fail-closed, since
+    /// non-reachability cannot be proven from data that cannot be read. A
+    /// persistent nonzero value here is an operator signal, not the ordinary
+    /// lagging-fold case. Counter seam for
+    /// `ravel_maintain_superseded_inputs_held_total{reason="unreadable_head"}`.
+    pub held_by_unreadable_head: usize,
+    /// Chain groups skipped whole this pass because the [`LeaseCheck`] protects
+    /// at least one key in them. The unit is the group, not the object: a
+    /// group is one indivisible deletion unit, so a hold over any single key in
+    /// it stops all of it. Counter seam for
+    /// `ravel_maintain_superseded_groups_held_by_legal_hold_total`.
+    pub chain_groups_held_by_legal_hold: usize,
+    /// Every erasure request id applied anywhere on a chain group this pass
+    /// held, for any of the three reasons above. While a request is in this
+    /// set an object that predates its rewrite is still in the store, so its
+    /// `.dreq` (and with it the query-time exclusion filter) must survive.
+    pub held_request_ids: BTreeSet<String>,
+    /// The buckets in which this pass held a group whose supersession chain it
+    /// could not walk to the end. The requests the missing generation applied
+    /// are not in `held_request_ids`, because no surviving record names them,
+    /// so rule 6 falls back to the bucket.
+    pub held_truncated_buckets: BTreeSet<HeldBucket>,
+}
+
+impl SupersededSweepOutcome {
+    /// Objects held this pass for any reason.
+    pub fn held(&self) -> usize {
+        self.held_by_snapshot + self.held_by_unreadable_head
+    }
+
+    /// Record what a held group means for rule 6: every request the group's
+    /// objects predate must keep its `.dreq`, and a group whose chain could
+    /// not be walked to the end names requests no surviving record does, so
+    /// its bucket is reported instead.
+    fn note_hold(&mut self, group: &SupersededGroup, shard: u32) {
+        self.held_request_ids
+            .extend(group.request_ids.iter().cloned());
+        if group.truncated {
+            self.held_truncated_buckets.insert(HeldBucket {
+                shard,
+                ingest_hour_bucket: group.ingest_hour_bucket,
+            });
+        }
+    }
+}
+
+/// What a superseded-input sweep held, in the form rule 6 consumes: the union
+/// over however many shards the caller swept.
+///
+/// This is the whole input to the erasure-request guard. Rule 6 asks no
+/// question of its own about supersession chains: rule 2 already walked them,
+/// already gated them, and already knows which requests the objects it held
+/// predate. A completion record's `bucket_drops` plays no part in it at all,
+/// neither to decide a hold nor to narrow which buckets are observed: the
+/// field is optional on the wire, and a list that is present but partial is
+/// indistinguishable from a complete one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupersededHolds {
+    /// [`SupersededSweepOutcome::held_request_ids`], unioned across shards.
+    pub request_ids: BTreeSet<String>,
+    /// [`SupersededSweepOutcome::held_truncated_buckets`], unioned across
+    /// shards.
+    pub truncated_buckets: BTreeSet<HeldBucket>,
+}
+
+impl SupersededHolds {
+    /// Fold one shard's outcome into the union.
+    pub fn absorb(&mut self, outcome: &SupersededSweepOutcome) {
+        self.request_ids
+            .extend(outcome.held_request_ids.iter().cloned());
+        self.truncated_buckets
+            .extend(outcome.held_truncated_buckets.iter().copied());
+    }
+
+    /// `true` when nothing was held: every `.dreq` past its horizon is
+    /// collectable, which is the ordinary steady state.
+    pub fn is_empty(&self) -> bool {
+        self.request_ids.is_empty() && self.truncated_buckets.is_empty()
+    }
+}
+
+/// Delete the L0 commit records and data objects named in each horizon-passed
+/// compaction record's input list, records before data objects, skipping any
+/// the live catalog HEAD snapshot still names (the ADR-0020 delete blocker).
+pub async fn sweep_superseded(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<SupersededSweepOutcome> {
+    let mut reach = SnapshotReachability::new();
+    sweep_superseded_impl(
+        &mut reach,
+        store,
+        clock,
+        config,
+        lease,
+        tenant,
+        signal,
+        shard,
+        None,
+        SweepMode::Delete,
+    )
+    .await
+}
+
+/// Whether a [`sweep_superseded_impl`] pass deletes what it cleared, or only
+/// computes the gate and the holds.
+///
+/// [`SweepMode::GateOnly`] is what makes the erasure-request guard reachable
+/// from a caller that has no rule-2 outcome to hand. It is not `dry_run`,
+/// which reports what a deleting pass would have removed: `records_deleted`
+/// and `data_deleted` are always zero here, and the only outputs a caller
+/// reads are [`SupersededSweepOutcome::held_request_ids`] and
+/// [`SupersededSweepOutcome::held_truncated_buckets`].
+///
+/// An observing pass gathers strictly more than a deleting one. The two
+/// filters that decide whether a chain is *collectable yet*, the protection
+/// horizon and the skip of a record another present rewrite supersedes, say
+/// nothing about whether a HEAD-named part still resolves that chain's inputs,
+/// which is the only question the erasure filter's hold turns on. So both
+/// filters apply to deletion alone, and every chain in scope is gathered and
+/// gated for the holds. A chain the gate clears contributes nothing either
+/// way; a chain the gate blocks contributes the same request ids and buckets
+/// whatever its age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepMode {
+    Delete,
+    GateOnly,
+}
+
+impl SweepMode {
+    /// Whether this pass may skip a chain the horizon, or a present successor,
+    /// keeps from being deleted this pass. Only a deleting pass may: an
+    /// observing pass has to see every chain, because a young chain's inputs
+    /// are more resolvable than an aged one's, not less.
+    fn gathers_only_deletable(self) -> bool {
+        matches!(self, SweepMode::Delete)
+    }
+}
+
+/// Shared implementation behind [`sweep_superseded`] (whole-shard, `hours:
+/// None`) and [`sweep_shard_zoned`] (hour-scoped, `hours: Some(_)`).
+///
+/// `reach` is the pass's [`SnapshotReachability`] cache: HEAD is read at most
+/// once for the pass and each covering snapshot part at most once, never once
+/// per input, and a pass with no horizon-passed record reads neither.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_superseded_impl(
+    reach: &mut SnapshotReachability,
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: Option<&[u32]>,
+    mode: SweepMode,
+) -> Result<SupersededSweepOutcome> {
+    let now = clock.now_ns();
+    // Both skips below narrow what this pass may DELETE. An observing pass
+    // (`SweepMode::GateOnly`) applies neither: see [`SweepMode`].
+    let deleting = mode.gathers_only_deletable();
+    let entries = list_commit_entries_scoped(store, tenant, signal, shard, hours).await?;
+    // Every rewrite record in scope, read once for the pass, plus the set of
+    // record keys those rewrites supersede. In a deleting pass a record another
+    // present rewrite supersedes is not processed from its own listing entry:
+    // it belongs to that rewrite's chain group, which is gated and deleted as
+    // one unit. Doing both would let the gate clear a predecessor from its own
+    // entry (where the group holds only that predecessor's outputs) while the
+    // same predecessor's raw inputs are held from another entry, which is
+    // exactly how a record could vanish ahead of the inputs it superseded.
+    let rewrites = load_rewrite_records(store, &entries).await?;
+    let superseded_by_present: HashSet<&str> = rewrites
+        .values()
+        .map(|r| r.superseded_record_key.as_str())
+        .filter(|k| !k.is_empty())
+        .collect();
+    // Every compaction record in scope, read once for the pass, and the input
+    // identities the AUTHORITATIVE records of each bucket name. A record whose
+    // inputs overlap another's may be the loser of its overlap component, and
+    // the resolver serves an input only the loser names as a raw L0 segment
+    // rather than from any part: see [`AuthoritativeInputs`].
+    let compactions = load_compaction_records(store, &entries).await?;
+    let authoritative = AuthoritativeInputs::from_records(&compactions);
+
+    // Phase A: gather every group this pass could delete, deduplicated by
+    // chain identity across the whole pass. Two live rewrites naming the same
+    // `superseded_record_key` gather the identical chain, so without the
+    // dedup every key in it is gated twice and counted twice, and
+    // `records_deleted` / `data_deleted` exceed the number of distinct objects
+    // the pass removed.
+    let mut groups: Vec<SupersededGroup> = Vec::new();
+    let mut by_identity: HashMap<String, usize> = HashMap::new();
+    for (key, entry) in &entries {
+        // An observing pass gathers this entry too. The successor's own gather
+        // covers the same chain only when the successor superseded a whole
+        // record; a successor that superseded raw L0 inputs directly never
+        // walks back past them, so skipping the predecessor here would drop
+        // its chain from the holds entirely.
+        if deleting && superseded_by_present.contains(key.as_str()) {
+            continue;
+        }
+        // Both a compaction record and a selective-erasure rewrite record
+        // (ADR-0064 decision 3 point 6) render their superseded inputs
+        // collectable by this one rule; a raw commit record or tombstone names
+        // no superseded input. A compaction record is fetched NotFound-
+        // tolerantly, and a rewrite absent from `rewrites` is skipped the same
+        // way: a crash-interrupted prior pass can leave a listed key gone.
+        //
+        // `applied` is the live record's own drops. Everything in the groups it
+        // gathers predates them: a group's L1 parts are the pre-image this
+        // record erased a subject out of, and its raw L0 inputs are the
+        // pre-image below that. So a hold on the group is a hold on those
+        // requests' `.dreq`s, on top of whatever the generations inside the
+        // group applied themselves.
+        let (gathered, applied) = match entry {
+            BucketEntry::CompactionRecord(_) => {
+                let Some(record) = compactions.get(key) else {
+                    continue;
+                };
+                // Horizon gate anchored on the durable created_unix_ns. It
+                // bounds when the inputs may be DELETED; an observing pass
+                // gathers them whatever the record's age.
+                if deleting
+                    && now
+                        < record
+                            .created_unix_ns
+                            .saturating_add(config.protection_horizon_ns)
+                {
+                    continue;
+                }
+                let superseded = authoritative.superseded_view(record);
+                (
+                    gather_l0_inputs(store, tenant, signal, shard, &superseded).await?,
+                    Vec::new(),
+                )
+            }
+            BucketEntry::RewriteRecord(_) => {
+                let Some(record) = rewrites.get(key) else {
+                    continue;
+                };
+                // Horizon gate anchored on the rewrite's own durable
+                // created_unix_ns: that is the instant it superseded its
+                // inputs, so a query pinned before it is drained by the
+                // protection horizon exactly as for a compaction record. An
+                // observing pass skips the gate: a rewrite still inside its
+                // horizon is the case where a stale HEAD is MOST likely to
+                // resolve the chain's inputs, so the erasure filter's hold has
+                // to see it.
+                if deleting
+                    && now
+                        < record
+                            .created_unix_ns
+                            .saturating_add(config.protection_horizon_ns)
+                {
+                    continue;
+                }
+                let applied: Vec<String> = record
+                    .drops
+                    .iter()
+                    .map(|d| d.request_id.clone())
+                    .filter(|id| !id.is_empty())
+                    .collect();
+                if !record.inputs.is_empty() {
+                    // RawL0 rewrite: the same L0 commit records + data objects
+                    // a compaction over the same inputs would supersede.
+                    (
+                        gather_l0_inputs(store, tenant, signal, shard, record).await?,
+                        applied,
+                    )
+                } else {
+                    // Predecessor rewrite: the whole supersession chain behind
+                    // it, down to the raw L0 inputs the oldest generation
+                    // superseded. Rule 3 cannot collect a superseded
+                    // generation's parts while its record still references
+                    // them, so this rule removes records and parts together.
+                    (
+                        gather_superseded_chain(
+                            store,
+                            tenant,
+                            signal,
+                            shard,
+                            &record.superseded_record_key,
+                        )
+                        .await?,
+                        applied,
+                    )
+                }
+            }
+            BucketEntry::CommitRecord(_) | BucketEntry::Tombstone(_) => continue,
+        };
+
+        for mut group in gathered {
+            group.request_ids.extend(applied.iter().cloned());
+            match by_identity.get(&group.identity) {
+                Some(&index) => groups[index].absorb_duplicate(group),
+                None => {
+                    by_identity.insert(group.identity.clone(), groups.len());
+                    groups.push(group);
+                }
+            }
+        }
+    }
+
+    // Phase B: gate every group, once. Nothing is deleted before every group
+    // has an answer, so a held group never splits a delete phase.
+    //
+    // The lease/legal-hold check is per group, not per key: a group is one
+    // indivisible deletion unit, and its phase order exists so a record always
+    // outlives the objects it superseded. Skipping only the protected keys
+    // inside the phases breaks that order, and a prefix-scoped legal hold
+    // covering the data keys but not the commit prefix is exactly the shape
+    // that does it -- the records that erased a subject go while the bytes
+    // holding it stay.
+    //
+    // The HEAD-reachability gate (ADR-0020 delete blocker) is object-granular
+    // because this rule deletes individual objects out of a bucket whose
+    // surviving compaction or rewrite outputs the snapshot legitimately still
+    // names. A group is indivisible there too: a predecessor record must
+    // outlive every part it names, or rule 3 would collect those parts on the
+    // next pass and undo the hold; and a whole supersession chain is one group
+    // so a HEAD that still names the oldest generation's raw inputs holds
+    // every record above them too.
+    let mut outcome = SupersededSweepOutcome::default();
+    let mut cleared: Vec<&SupersededGroup> = Vec::with_capacity(groups.len());
+    for group in &groups {
+        if let Some(protected) = group.protected_key(lease) {
+            tracing::warn!(
+                tenant_hash = %tenant.to_hex(),
+                signal = signal.key_prefix(),
+                shard,
+                ingest_hour_bucket = group.ingest_hour_bucket,
+                protected_key = %protected,
+                group_objects = group.object_count(),
+                "superseded-input sweep: a lease or legal hold protects a key in a supersession \
+                 chain, so the whole chain is skipped this pass; deleting the unprotected part of \
+                 it would break the order that keeps a record alive until the objects it \
+                 superseded are gone"
+            );
+            outcome.chain_groups_held_by_legal_hold += 1;
+            outcome.note_hold(group, shard);
+            continue;
+        }
+        match reach
+            .object_gate(
+                store,
+                tenant,
+                signal,
+                group.ingest_hour_bucket,
+                &group.objects,
+            )
+            .await?
+        {
+            SnapshotGate::Clear => cleared.push(group),
+            SnapshotGate::Blocked(SnapshotBlock::Named) => {
+                outcome.held_by_snapshot += group.object_count();
+                outcome.note_hold(group, shard);
+            }
+            SnapshotGate::Blocked(SnapshotBlock::Unreadable) => {
+                outcome.held_by_unreadable_head += group.object_count();
+                outcome.note_hold(group, shard);
+            }
+        }
+    }
+
+    if !deleting {
+        // Nothing is deleted, and nothing in the outcome says which of these
+        // groups a deleting pass could have collected: an observing pass
+        // answers one question, "does a HEAD-named part still resolve this
+        // chain", and a young chain answers it exactly as an aged one does.
+        // The two object counters can exceed the number of distinct objects
+        // here, because a predecessor is gathered both from its own entry and
+        // from its successor's chain walk; only the held request ids and
+        // buckets are consumed.
+        return Ok(outcome);
+    }
+
+    // Phase C: every cleared group's superseded-input records first, then every
+    // cleared group's data objects (docs/consistency-model.md): a crash
+    // between the two phases leaves record-less data (orphan GC) or an
+    // unreferenced part (rule 3), never a record pointing at a deleted
+    // object.
+    //
+    // The chains' own records go last of all, oldest generation first, so a
+    // rewrite record outlives every input it superseded: a crash inside this
+    // rule leaves the record still naming inputs that are already gone
+    // (harmless, and the next pass finishes the job), never a surviving input
+    // with the record that erased a subject out of it deleted, which would
+    // leave the erasure request's filter with nothing durable to discover it
+    // by.
+    for group in &cleared {
+        for k in &group.record_keys {
+            if !config.dry_run {
+                store.delete(k).await?;
+            }
+            outcome.records_deleted += 1;
+        }
+    }
+    for group in &cleared {
+        for k in &group.data_keys {
+            if !config.dry_run {
+                store.delete(k).await?;
+            }
+            outcome.data_deleted += 1;
+        }
+    }
+    for group in &cleared {
+        for k in &group.chain_record_keys {
+            if !config.dry_run {
+                store.delete(k).await?;
+            }
+            outcome.records_deleted += 1;
+        }
+    }
+    Ok(outcome)
+}
+
+/// GET every rewrite record among `entries`, keyed by its commit key, tolerant
+/// of a key that vanished between the pass's LIST and now.
+async fn load_rewrite_records(
+    store: &dyn ObjectStoreBackend,
+    entries: &[(String, BucketEntry)],
+) -> Result<HashMap<String, RewriteRecord>> {
+    let mut out: HashMap<String, RewriteRecord> = HashMap::new();
+    for (key, entry) in entries {
+        if !matches!(entry, BucketEntry::RewriteRecord(_)) {
+            continue;
+        }
+        if let Some(record) = get_rewrite_record_opt(store, key).await? {
+            out.insert(key.clone(), record);
+        }
+    }
+    Ok(out)
+}
+
+/// GET every compaction record among `entries`, keyed by its commit key,
+/// tolerant of a key that vanished between the pass's LIST and now.
+async fn load_compaction_records(
+    store: &dyn ObjectStoreBackend,
+    entries: &[(String, BucketEntry)],
+) -> Result<HashMap<String, CompactionRecord>> {
+    let mut out: HashMap<String, CompactionRecord> = HashMap::new();
+    for (key, entry) in entries {
+        if !matches!(entry, BucketEntry::CompactionRecord(_)) {
+            continue;
+        }
+        if let Some(record) = get_compaction_record_opt(store, key).await? {
+            out.insert(key.clone(), record);
+        }
+    }
+    Ok(out)
+}
+
+/// The input identities the authoritative compaction records of each
+/// ingest-hour bucket name.
+///
+/// Compaction records whose input sets overlap resolve to one authoritative
+/// record per overlap component
+/// ([`select_authoritative_compaction_records`], the same function the
+/// snapshot resolver and the index fold use). The losers' parts are served
+/// from nowhere, and an input only a loser names is served as a raw L0
+/// segment: it is the sole server of its rows. So an input is superseded only
+/// where an authoritative record names it. Treating a loser's whole input set
+/// as superseded deletes that sole server and turns duplicate rows into
+/// missing rows. A loser's own parts stay referenced for as long as the losing
+/// record exists (the reference map does not distinguish winners from losers,
+/// and a node that has not adopted this rule may still serve them), so this
+/// pass reclaims nothing of the loser's.
+#[derive(Default)]
+struct AuthoritativeInputs {
+    by_bucket: HashMap<u32, HashSet<(String, u64, u64)>>,
+}
+
+impl AuthoritativeInputs {
+    fn from_records(records: &HashMap<String, CompactionRecord>) -> Self {
+        // Per bucket, because an overlap component is a property of one
+        // ingest-hour bucket: that is the unit the resolver reads.
+        let mut per_bucket: HashMap<u32, Vec<(&str, &CompactionRecord)>> = HashMap::new();
+        for (key, record) in records {
+            per_bucket
+                .entry(record.ingest_hour_bucket)
+                .or_default()
+                .push((key.as_str(), record));
+        }
+        let mut by_bucket: HashMap<u32, HashSet<(String, u64, u64)>> = HashMap::new();
+        for (bucket, in_bucket) in per_bucket {
+            let losing = select_authoritative_compaction_records(&in_bucket);
+            let mut identities: HashSet<(String, u64, u64)> = HashSet::new();
+            for (key, record) in &in_bucket {
+                if losing.contains(key) {
+                    continue;
+                }
+                for input in &record.inputs {
+                    identities.insert((
+                        input.writer_id.clone(),
+                        input.writer_epoch,
+                        input.writer_seq,
+                    ));
+                }
+            }
+            by_bucket.insert(bucket, identities);
+        }
+        Self { by_bucket }
+    }
+
+    /// The subset of `record`'s inputs this rule may treat as superseded: the
+    /// ones an authoritative record of the same bucket also names. For a
+    /// winner that is its whole input set; for a loser it is the overlap with
+    /// its winner.
+    fn superseded_view(&self, record: &CompactionRecord) -> SupersededSubset {
+        let authoritative = self.by_bucket.get(&record.ingest_hour_bucket);
+        let inputs = record
+            .inputs
+            .iter()
+            .filter(|input| {
+                authoritative.is_some_and(|set| {
+                    set.contains(&(
+                        input.writer_id.clone(),
+                        input.writer_epoch,
+                        input.writer_seq,
+                    ))
+                })
+            })
+            .cloned()
+            .collect();
+        SupersededSubset {
+            inputs,
+            ingest_hour_bucket: record.ingest_hour_bucket,
+        }
+    }
+}
+
+/// The superseded-input view of one compaction record: its inputs narrowed to
+/// the ones an authoritative record names. Carries the record's own bucket so
+/// [`gather_l0_inputs`] reconstructs the same keys it would from the record.
+struct SupersededSubset {
+    inputs: Vec<CompactionInputIdentity>,
+    ingest_hour_bucket: u32,
+}
+
+/// One indivisible deletion unit for rule 2: the records to delete first, the
+/// data objects to delete after them, and the snapshot identities those
+/// objects carry so the HEAD-reachability gate can decide the whole unit at
+/// once.
+///
+/// A raw-L0 input is its own group (one commit record plus one data object),
+/// so a still-named input holds only itself. A whole supersession chain is one
+/// group: every superseded generation's record and parts plus the raw L0 inputs
+/// the oldest generation superseded, because deleting a record without the
+/// objects below it would expose them to rule 3 or leave them resolvable with
+/// nothing durable naming them as erased.
+struct SupersededGroup {
+    /// The ingest hour every object in the group sits in: the parent record's
+    /// own bucket, which is also the hour whose covering snapshot parts the
+    /// gate must read.
+    ingest_hour_bucket: u32,
+    record_keys: Vec<String>,
+    data_keys: Vec<String>,
+    /// The supersession chain's own compaction/rewrite records, oldest
+    /// generation first, deleted after every object they superseded.
+    chain_record_keys: Vec<String>,
+    objects: Vec<SnapshotObject>,
+    /// Every erasure request id the objects in this group predate: the drops of
+    /// the live record that superseded the group, plus the drops of every
+    /// generation inside it. A hold on the group is a hold on each of these
+    /// requests' `.dreq`s.
+    request_ids: BTreeSet<String>,
+    /// The chain walk stopped at a generation whose record was already gone,
+    /// so whatever requests that generation applied are named by no surviving
+    /// record and cannot appear in `request_ids`.
+    truncated: bool,
+    /// Dedup key: the oldest record this group deletes, which is the one thing
+    /// two live rewrites over the same predecessor gather identically.
+    identity: String,
+}
+
+impl SupersededGroup {
+    /// Objects this group would delete, for the held counters.
+    fn object_count(&self) -> usize {
+        self.record_keys.len() + self.data_keys.len() + self.chain_record_keys.len()
+    }
+
+    /// Every key this group deletes, in delete order.
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.record_keys
+            .iter()
+            .chain(self.data_keys.iter())
+            .chain(self.chain_record_keys.iter())
+    }
+
+    /// The first key in this group the `lease` protects, if any.
+    fn protected_key(&self, lease: &dyn LeaseCheck) -> Option<&str> {
+        self.keys()
+            .find(|k| lease.is_protected(k))
+            .map(String::as_str)
+    }
+
+    /// Fold in a second gather of the same group (a sibling live rewrite over
+    /// the same predecessor, or, in an observing pass, a predecessor gathered
+    /// from its own entry and again through a successor's walk). Only the two
+    /// facts a duplicate can add are taken: the sibling's own applied requests,
+    /// and a truncation either gather saw. The two gathers may differ in the
+    /// parts they collected when they started from different links, and that
+    /// difference is not merged: the first gather's keys and objects stand,
+    /// which is all a deleting pass acts on, and the observation consumes only
+    /// the request ids and the truncation flag.
+    fn absorb_duplicate(&mut self, other: SupersededGroup) {
+        self.request_ids.extend(other.request_ids);
+        self.truncated |= other.truncated;
+    }
+}
+
+/// Gather one [`SupersededGroup`] per input a compaction or rewrite record
+/// names in its `inputs` list: the input's commit record, its data object, and
+/// the level-0 snapshot identity both share. Shared by rule 2's compaction and
+/// rewrite-RawL0 arms (ADR-0018, ADR-0064 decision 3 point 6): both name the
+/// same raw-L0 input shape. The data key needs each input record's content
+/// hash, so each input record is read before it is deleted; an input already
+/// gone (a crash-interrupted prior pass) yields no group and its data object,
+/// if any, is collected by orphan GC (row 8).
+///
+/// One group per input, not one for the whole record: an input the live HEAD
+/// no longer names is still collectable in a pass where a sibling input is
+/// held.
+async fn gather_l0_inputs(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    // Generic rather than `&dyn`: the reference is held across the input GETs'
+    // `.await`, and a `&dyn SupersededInputs` there is not `Send` (the trait
+    // object is not `Sync`), which would make the whole sweep future non-`Send`
+    // and unspawnable from the server's maintain loop. A concrete `&R` over the
+    // two `Sync` proto record types is `Send`.
+    record: &impl SupersededInputs,
+) -> Result<Vec<SupersededGroup>> {
+    let mut groups: Vec<SupersededGroup> = Vec::new();
+    for commit_key in superseded_input_commit_keys(tenant, signal, shard, record)? {
+        match store.get(&commit_key, GetRange::Full).await {
+            Ok(got) => {
+                let rec = record::decode(&got.data)?;
+                // The record's key must reconstruct to the key we fetched it at
+                // (ADR-0010 §7): a corrupted-but-decodable input record's own
+                // fields, which reconstruct_data_key trusts, must not name a
+                // data object outside the bucket this key implies (mirrors
+                // read::load_inputs).
+                verify_commit_key(&rec, &commit_key)?;
+                let data_key = keys::reconstruct_data_key(&rec)?;
+                let writer_id = Uuid::parse_str(&rec.writer_id).map_err(|_| {
+                    MaintainError::Key(KeyError::InvalidWriterId(rec.writer_id.clone()))
+                })?;
+                groups.push(SupersededGroup {
+                    ingest_hour_bucket: rec.ingest_hour_bucket,
+                    identity: commit_key.clone(),
+                    record_keys: vec![commit_key],
+                    data_keys: vec![data_key],
+                    chain_record_keys: Vec::new(),
+                    objects: vec![SnapshotObject::L0 {
+                        shard: rec.shard,
+                        ingest_hour_bucket: rec.ingest_hour_bucket,
+                        writer_id: writer_id.into_bytes(),
+                        writer_epoch: rec.writer_epoch,
+                        writer_seq: rec.writer_seq,
+                    }],
+                    request_ids: BTreeSet::new(),
+                    truncated: false,
+                });
+            }
+            Err(StoreError::NotFound) => {}
+            Err(e) => return Err(MaintainError::Store(e)),
+        }
+    }
+    Ok(groups)
+}
+
+/// Reconstruct the commit key of every raw-L0 input a compaction or rewrite
+/// record explicitly names, in `inputs` order. This is rule 2's supersession
+/// predicate on its own, with no store access: a commit record whose key this
+/// returns is superseded by `record` and is a pre-compaction leftover, and one
+/// whose key it does not return is not, whatever bucket either sits in.
+///
+/// It is deliberately keyed on the record's own input list rather than on the
+/// bucket the record lives in. The two coincide today only because a
+/// compaction or rewrite refuses an unsealed bucket and a sealed bucket's L0
+/// set is frozen, so a record over that bucket necessarily covers all of it.
+/// Any caller that needs "is this L0 record superseded" must ask this
+/// question, not the bucket-membership question, or it inherits that seal
+/// invariant as a silent premise: a partial-coverage record (one naming some
+/// but not all of its bucket's L0 set) makes the two answers differ, and the
+/// bucket-membership answer is the wrong one.
+///
+/// Shared by rule 2's own [`gather_l0_inputs`] and by the migrate floor-raise
+/// re-audit ([`crate::migrate::count_below_target`]), so the
+/// definition of supersession has exactly one implementation and the re-audit
+/// stays an independent check of input-set coverage rather than a restatement
+/// of the walk's assumptions.
+pub(crate) fn superseded_input_commit_keys(
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    record: &impl SupersededInputs,
+) -> Result<Vec<String>> {
+    let mut keys_out = Vec::with_capacity(record.inputs().len());
+    for input in record.inputs() {
+        let writer_id = Uuid::parse_str(&input.writer_id)
+            .map_err(|_| MaintainError::Key(KeyError::InvalidWriterId(input.writer_id.clone())))?;
+        keys_out.push(keys::commit_key(
+            tenant,
+            signal,
+            shard,
+            record.ingest_hour_bucket(),
+            writer_id,
+            input.writer_epoch,
+            input.writer_seq,
+        )?);
+    }
+    Ok(keys_out)
+}
+
+/// A record that names raw-L0 superseded inputs (a compaction record, or a
+/// rewrite record whose live input set was raw L0). Abstracts over the two
+/// proto types so [`gather_l0_inputs`] and
+/// [`superseded_input_commit_keys`] serve both without duplication.
+pub(crate) trait SupersededInputs {
+    fn inputs(&self) -> &[CompactionInputIdentity];
+    fn ingest_hour_bucket(&self) -> u32;
+}
+
+impl SupersededInputs for CompactionRecord {
+    fn inputs(&self) -> &[CompactionInputIdentity] {
+        &self.inputs
+    }
+    fn ingest_hour_bucket(&self) -> u32 {
+        self.ingest_hour_bucket
+    }
+}
+
+impl SupersededInputs for RewriteRecord {
+    fn inputs(&self) -> &[CompactionInputIdentity] {
+        &self.inputs
+    }
+    fn ingest_hour_bucket(&self) -> u32 {
+        self.ingest_hour_bucket
+    }
+}
+
+impl SupersededInputs for SupersededSubset {
+    fn inputs(&self) -> &[CompactionInputIdentity] {
+        &self.inputs
+    }
+    fn ingest_hour_bucket(&self) -> u32 {
+        self.ingest_hour_bucket
+    }
+}
+
+/// One generation on a supersession chain: the compaction or rewrite record a
+/// newer rewrite superseded (ADR-0064 amendment: `superseded_record_key` names
+/// either an `l1.<hash>.cmt` compaction record or an `rw.<hash>.cmt` rewrite
+/// record, recursive supersession included).
+enum ChainLink {
+    Compaction(CompactionRecord),
+    Rewrite(RewriteRecord),
+}
+
+impl ChainLink {
+    fn ingest_hour_bucket(&self) -> u32 {
+        match self {
+            ChainLink::Compaction(r) => r.ingest_hour_bucket,
+            ChainLink::Rewrite(r) => r.ingest_hour_bucket,
+        }
+    }
+
+    /// Whether this generation superseded raw L0 inputs (the end of the
+    /// chain), rather than another compaction/rewrite record.
+    fn names_raw_l0_inputs(&self) -> bool {
+        match self {
+            ChainLink::Compaction(_) => true,
+            ChainLink::Rewrite(r) => !r.inputs.is_empty(),
+        }
+    }
+
+    /// The record this generation itself superseded, or `None` at the end of
+    /// the chain.
+    fn superseded_record_key(&self) -> Option<&str> {
+        match self {
+            ChainLink::Compaction(_) => None,
+            ChainLink::Rewrite(r) if r.superseded_record_key.is_empty() => None,
+            ChainLink::Rewrite(r) => Some(&r.superseded_record_key),
+        }
+    }
+
+    /// The erasure request ids this generation applied (empty for a compaction
+    /// record, which applies none).
+    fn applied_request_ids(&self) -> Vec<&str> {
+        match self {
+            ChainLink::Compaction(_) => Vec::new(),
+            ChainLink::Rewrite(r) => r.drops.iter().map(|d| d.request_id.as_str()).collect(),
+        }
+    }
+
+    /// This generation's output L1 part keys and their snapshot identities.
+    fn part_targets(&self) -> Result<Vec<(String, SnapshotObject)>> {
+        match self {
+            ChainLink::Compaction(record) => {
+                let input_set_hash = input_set_hash_array(&record.input_set_hash)?;
+                record
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        Ok((
+                            keys::reconstruct_l1_part_key(record, part)?,
+                            SnapshotObject::L1 {
+                                shard: record.shard,
+                                ingest_hour_bucket: record.ingest_hour_bucket,
+                                input_set_hash,
+                                part_index: part.part_index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+            ChainLink::Rewrite(record) => {
+                let input_set_hash = input_set_hash_array(&record.input_set_hash)?;
+                record
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        Ok((
+                            keys::reconstruct_rewrite_part_key(record, part)?,
+                            SnapshotObject::L1 {
+                                shard: record.shard,
+                                ingest_hour_bucket: record.ingest_hour_bucket,
+                                input_set_hash,
+                                part_index: part.part_index,
+                            },
+                        ))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// The raw-L0 input groups this generation superseded, one per input still
+    /// present in the store. Empty unless [`Self::names_raw_l0_inputs`].
+    async fn raw_l0_input_groups(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+    ) -> Result<Vec<SupersededGroup>> {
+        match self {
+            ChainLink::Compaction(r) => gather_l0_inputs(store, tenant, signal, shard, r).await,
+            ChainLink::Rewrite(r) if !r.inputs.is_empty() => {
+                gather_l0_inputs(store, tenant, signal, shard, r).await
+            }
+            ChainLink::Rewrite(_) => Ok(Vec::new()),
+        }
+    }
+}
+
+/// GET, decode, and key-verify the compaction or rewrite record at `key`.
+/// `Ok(None)` means the chain is truncated there: the record was swept by a
+/// crash-interrupted prior pass, or by an older sweep that did not yet hold a
+/// predecessor for its inputs.
+async fn load_chain_link(store: &dyn ObjectStoreBackend, key: &str) -> Result<Option<ChainLink>> {
+    match keys::partition_bucket_entry(key) {
+        Ok(BucketEntry::CompactionRecord(_)) => Ok(get_compaction_record_opt(store, key)
+            .await?
+            .map(ChainLink::Compaction)),
+        Ok(BucketEntry::RewriteRecord(_)) => Ok(get_rewrite_record_opt(store, key)
+            .await?
+            .map(ChainLink::Rewrite)),
+        Ok(BucketEntry::CommitRecord(_) | BucketEntry::Tombstone(_)) => {
+            Err(MaintainError::Invariant(format!(
+                "rewrite superseded_record_key {key} names a non-compaction, non-rewrite entry"
+            )))
+        }
+        Err(KeyError::UnknownBucketEntryShape(k)) => Err(MaintainError::UnknownBucketEntry(k)),
+        Err(e) => Err(MaintainError::Key(e)),
+    }
+}
+
+/// Gather the deletion targets for a rewrite record that superseded a whole
+/// prior compaction/rewrite record: the entire supersession chain behind
+/// `predecessor_key`, walked back generation by generation to the raw L0 inputs
+/// the oldest generation superseded. Returns at most one group holding, in
+/// deletion order, those inputs' commit records, their data objects together
+/// with every generation's L1 parts, and last the generations' own records
+/// oldest first.
+///
+/// One group, not one per generation or per part, for two reasons. Deleting a
+/// record while a still-named part of its own is held would leave that part
+/// unreferenced and rule 3 would collect it on the next pass, undoing the hold.
+/// And gating a generation on its own outputs alone is not enough: a HEAD that
+/// has not been re-folded since the rewrite still names the raw L0 inputs at
+/// the end of the chain, not any generation's parts, so a per-generation gate
+/// clears while the inputs stay resolvable. The whole chain shares one gate, so
+/// a HEAD naming anything in it holds all of it.
+///
+/// A chain truncated by an absent record yields whatever it reached before the
+/// gap, flagged [`SupersededGroup::truncated`] so a hold on it can be reported
+/// per bucket rather than per request; an absent `predecessor_key` yields no
+/// group at all, and any surviving parts below it are unreferenced under the
+/// live record and collected by rule 3.
+///
+/// The group also carries every erasure request the generations it covers
+/// applied. Those requests' `.dreq`s cannot be retired while the group is
+/// held, because the objects in it are the pre-image the requests erased a
+/// subject out of.
+async fn gather_superseded_chain(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    predecessor_key: &str,
+) -> Result<Vec<SupersededGroup>> {
+    let mut chain_record_keys: Vec<String> = Vec::new();
+    let mut chain_part_keys: Vec<String> = Vec::new();
+    let mut input_record_keys: Vec<String> = Vec::new();
+    let mut input_data_keys: Vec<String> = Vec::new();
+    let mut objects: Vec<SnapshotObject> = Vec::new();
+    let mut ingest_hour_bucket: Option<u32> = None;
+    let mut request_ids: BTreeSet<String> = BTreeSet::new();
+    let mut truncated = false;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut cursor = Some(predecessor_key.to_string());
+
+    while let Some(key) = cursor {
+        if !seen.insert(key.clone()) {
+            return Err(MaintainError::Invariant(format!(
+                "supersession chain from {predecessor_key} revisits {key}"
+            )));
+        }
+        let Some(link) = load_chain_link(store, &key).await? else {
+            truncated = true;
+            break;
+        };
+        // The gate reads one hour's covering snapshot parts, so a chain that
+        // spanned two ingest hours could not be gated as one unit. A rewrite
+        // record's decode already verifies that its `superseded_record_key`
+        // sits in its own bucket, so this is a redundant local check on a
+        // durable invariant rather than a new rule.
+        match ingest_hour_bucket {
+            None => ingest_hour_bucket = Some(link.ingest_hour_bucket()),
+            Some(hour) if hour == link.ingest_hour_bucket() => {}
+            Some(hour) => {
+                return Err(MaintainError::Invariant(format!(
+                    "supersession chain from {predecessor_key} spans ingest hours {hour} and {}",
+                    link.ingest_hour_bucket()
+                )));
+            }
+        }
+        for id in link.applied_request_ids() {
+            if !id.is_empty() {
+                request_ids.insert(canonical_request_id(id));
+            }
+        }
+        for (part_key, object) in link.part_targets()? {
+            chain_part_keys.push(part_key);
+            objects.push(object);
+        }
+        chain_record_keys.push(key);
+        if link.names_raw_l0_inputs() {
+            for group in link
+                .raw_l0_input_groups(store, tenant, signal, shard)
+                .await?
+            {
+                input_record_keys.extend(group.record_keys);
+                input_data_keys.extend(group.data_keys);
+                objects.extend(group.objects);
+            }
+            break;
+        }
+        cursor = link.superseded_record_key().map(str::to_string);
+    }
+
+    let Some(ingest_hour_bucket) = ingest_hour_bucket else {
+        return Ok(Vec::new());
+    };
+    // Oldest generation first: a record is deleted only after every object the
+    // generations below it superseded, and after the generation it superseded.
+    chain_record_keys.reverse();
+    input_data_keys.extend(chain_part_keys);
+    // The oldest generation's record is the group's identity: it is what every
+    // live rewrite over this same predecessor walks down to.
+    let identity = chain_record_keys
+        .first()
+        .cloned()
+        .unwrap_or_else(|| predecessor_key.to_string());
+    Ok(vec![SupersededGroup {
+        ingest_hour_bucket,
+        record_keys: input_record_keys,
+        data_keys: input_data_keys,
+        chain_record_keys,
+        objects,
+        request_ids,
+        truncated,
+        identity,
+    }])
+}
+
+/// A record's `input_set_hash` as the 32-byte array a level-1 snapshot entry
+/// carries in its `writer_id` slot. A wrong length is the same fatal invariant
+/// breach `reconstruct_l1_part_key` reports for it.
+fn input_set_hash_array(bytes: &[u8]) -> Result<[u8; 32]> {
+    bytes.try_into().map_err(|_| {
+        MaintainError::Invariant(format!(
+            "superseded record input_set_hash is {} bytes, expected 32",
+            bytes.len()
+        ))
+    })
+}
+
+/// [`get_compaction_record`] tolerant of a NotFound (Ok(None)): the record was
+/// swept between this pass's LIST and now (e.g. a superseding rewrite processed
+/// earlier in the same pass removed it, or a crash-interrupted prior pass).
+async fn get_compaction_record_opt(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<Option<CompactionRecord>> {
+    match store.get(key, GetRange::Full).await {
+        Ok(got) => {
+            let record = record::decode_compaction(got.data.as_ref()).map_err(|e| {
+                MaintainError::Invariant(format!("compaction record decode failed: {e}"))
+            })?;
+            keys::verify_compaction_record_key(&record, key)?;
+            Ok(Some(record))
+        }
+        Err(StoreError::NotFound) => Ok(None),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+/// [`get_rewrite_record`] tolerant of a NotFound (Ok(None)); see
+/// [`get_compaction_record_opt`] for when that happens.
+async fn get_rewrite_record_opt(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<Option<RewriteRecord>> {
+    match store.get(key, GetRange::Full).await {
+        Ok(got) => {
+            let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref()).map_err(|e| {
+                MaintainError::Invariant(format!("rewrite record decode failed: {e}"))
+            })?;
+            keys::verify_rewrite_record_key(&record, key)?;
+            Ok(Some(record))
+        }
+        Err(StoreError::NotFound) => Ok(None),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+// --- Rule 3: unreferenced-part cleanup -------------------------------------
+
+/// Delete every `l1/` object older than the unreferenced-part age gate that a
+/// legal future publish can never name, re-verifying the exact branch
+/// condition with a fresh strongly consistent LIST immediately before each
+/// delete. Two branches make an object collectable (see [`PartBranch`]): its
+/// bucket holds a compaction record and no record references it, or its bucket
+/// holds a retention tombstone and no compaction record. A bucket
+/// with neither is left alone: its record-less parts belong to a future
+/// compaction that will republish the identical content-addressed keys.
+/// Returns the number deleted.
+pub async fn sweep_unreferenced_parts(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<usize> {
+    sweep_unreferenced_parts_impl(store, clock, config, lease, tenant, signal, shard, None).await
+}
+
+/// Shared implementation behind [`sweep_unreferenced_parts`] (whole-shard,
+/// `hours: None`) and [`sweep_shard_zoned`] (hour-scoped, `hours: Some(_)`).
+/// When scoped, both the commit-prefix listing that builds the reference map
+/// and the `l1/` listing are restricted to `hours`: an interior bucket this
+/// tick's zone recomputation skipped is never listed by either.
+#[allow(clippy::too_many_arguments)]
+async fn sweep_unreferenced_parts_impl(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: Option<&[u32]>,
+) -> Result<usize> {
+    let now = clock.now_ns();
+    let gate = config.unreferenced_part_age_gate_ns();
+    let (referenced, tombstoned) =
+        bucket_reference_map_scoped(store, tenant, signal, shard, hours).await?;
+
+    let objects = list_l1_scoped(store, tenant, signal, shard, hours).await?;
+    let mut deleted = 0usize;
+    for meta in objects {
+        let parsed = keys::parse_l1_part_key(&meta.key)?;
+        let bucket = parsed.ingest_hour_bucket;
+        let Some(branch) = classify_part(&meta.key, bucket, &referenced, &tombstoned) else {
+            continue;
+        };
+        if object_age_ns(now, &meta) <= gate {
+            continue;
+        }
+        if lease.is_protected(&meta.key) {
+            continue;
+        }
+        // Re-verify the exact branch condition immediately before the delete,
+        // via a fresh strongly consistent LIST. Requiring the same branch (not
+        // merely "still collectable") preserves the record-present rule's old
+        // skip-when-the-bucket-is-absent-from-the-fresh-map behavior: if the
+        // bucket's compaction record vanished between the two listings, the
+        // fresh classification is no longer `UnreferencedWithRecord`, so the
+        // delete is skipped.
+        let (fresh_ref, fresh_tomb) =
+            bucket_reference_map_scoped(store, tenant, signal, shard, hours).await?;
+        if classify_part(&meta.key, bucket, &fresh_ref, &fresh_tomb) != Some(branch) {
+            continue;
+        }
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
+/// Why an `l1/` object is a rule-3 deletion candidate. The pre-delete
+/// re-verify re-checks the exact condition of the branch that first admitted
+/// the object, never a weaker "still collectable somehow" test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PartBranch {
+    /// The bucket holds at least one compaction record and none of them names
+    /// this object: a leftover (a losing/superseded build's part, or a part
+    /// whose split boundary changed). Safe because a sealed bucket's input set
+    /// is frozen, so no record will ever start naming it.
+    UnreferencedWithRecord,
+    /// The bucket holds a retention tombstone and no compaction record. The
+    /// tombstone makes any future compaction impossible (`compact_bucket`
+    /// returns `Tombstoned` before it builds or publishes, ADR-0019), so no
+    /// legal future publish can name this object.
+    TombstonedRecordless,
+}
+
+/// Classify one `l1/` object for rule 3, or `None` if it must not be swept.
+/// A bucket with a compaction record protects the parts its records name and
+/// exposes the rest ([`PartBranch::UnreferencedWithRecord`]); a bucket with a
+/// tombstone but no record exposes every part ([`PartBranch::TombstonedRecordless`]);
+/// a bucket with neither exposes nothing (a future compaction may still name
+/// its record-less parts).
+fn classify_part(
+    key: &str,
+    bucket: u32,
+    referenced: &HashMap<u32, HashSet<String>>,
+    tombstoned: &HashSet<u32>,
+) -> Option<PartBranch> {
+    match referenced.get(&bucket) {
+        Some(refs) if refs.contains(key) => None,
+        Some(_) => Some(PartBranch::UnreferencedWithRecord),
+        None if tombstoned.contains(&bucket) => Some(PartBranch::TombstonedRecordless),
+        None => None,
+    }
+}
+
+/// One LIST of the shard's commit prefix, reduced to what rule 3 needs: for
+/// each bucket that holds at least one compaction record, the set of L1 part
+/// keys those records reference; and the set of buckets that hold a retention
+/// tombstone. A bucket in neither collection has no compaction record and no
+/// tombstone, so its `l1/` objects are never swept by rule 3 (a future
+/// compaction may still publish a record naming them).
+async fn bucket_reference_map_scoped(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: Option<&[u32]>,
+) -> Result<(HashMap<u32, HashSet<String>>, HashSet<u32>)> {
+    let entries = list_commit_entries_scoped(store, tenant, signal, shard, hours).await?;
+    let mut referenced: HashMap<u32, HashSet<String>> = HashMap::new();
+    let mut tombstoned: HashSet<u32> = HashSet::new();
+    for (key, entry) in &entries {
+        match entry {
+            BucketEntry::CompactionRecord(_) => {
+                let record = get_compaction_record(store, key).await?;
+                let set = referenced.entry(record.ingest_hour_bucket).or_default();
+                for part in &record.parts {
+                    set.insert(keys::reconstruct_l1_part_key(&record, part)?);
+                }
+            }
+            // A selective-erasure rewrite record (ADR-0064 decision 3) names
+            // live L1 output parts exactly as a compaction record does. They
+            // must be marked referenced, or the unreferenced-part GC would
+            // delete an erased subject's surviving rewritten data.
+            BucketEntry::RewriteRecord(_) => {
+                let record = get_rewrite_record(store, key).await?;
+                let set = referenced.entry(record.ingest_hour_bucket).or_default();
+                for part in &record.parts {
+                    set.insert(keys::reconstruct_rewrite_part_key(&record, part)?);
+                }
+            }
+            BucketEntry::Tombstone(pk) => {
+                tombstoned.insert(pk.ingest_hour_bucket);
+            }
+            BucketEntry::CommitRecord(_) => {}
+        }
+    }
+    Ok((referenced, tombstoned))
+}
+
+// --- Rule 4: idempotency marker sweep (ADR-0051 §5) ------------------------
+
+/// What one idempotency-marker sweep pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IdemSweepOutcome {
+    /// Markers past the dedup window, deleted (or, under `dry_run`, that
+    /// would have been).
+    pub deleted: usize,
+    /// Markers within the dedup window, left alone.
+    pub kept: usize,
+    /// Keys under the `idem/` prefix that did not parse as
+    /// `<keyhash32>.<ingest_hour>.idm` and were skipped without deleting or
+    /// erroring (the `idem/` prefix is additive and not subject to the
+    /// fail-loud unknown-key rule the `c/` prefix uses, ADR-0051 §5 /
+    /// docs/catalog-and-mvcc.md).
+    pub skipped_malformed: usize,
+}
+
+/// Delete every idempotency marker under `t/<tenant_hash>/<signal>/idem/`
+/// (ADR-0051 §5) whose `<ingest_hour>` is more than
+/// `config.idem_dedup_window_hours` plus [`IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS`]
+/// behind the clock's current ingest-hour bucket. The extra margin mirrors
+/// `ravel_ingest::idempotency::read_marker`'s own forward-skew tolerance on
+/// the read side: without it, a sweeper process whose clock leads an ingest
+/// node's by up to that many hours could reap a marker the read path would
+/// still honor, ahead of a legitimate retry replaying it (fail-open per
+/// ADR-0051, not data loss, but a real gap against this rule's promise that
+/// a marker the read path would still honor is never swept out from under
+/// it). One LIST of the coarse `idem/` prefix -- coarser than
+/// `ravel_ingest::idempotency::read_marker`'s per-key-hash prefix, since the
+/// sweep has no client key to scope by and must cover every marker in the
+/// signal -- then a per-key age check and delete. A key that does not parse
+/// as `<keyhash32>.<ingest_hour>.idm` is logged and skipped, never deleted and
+/// never a fatal error: the prefix is additive and no dual-reader question
+/// exists for it (unlike the `c/` prefix's fail-loud unknown-shape rule).
+pub async fn sweep_idempotency_markers(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<IdemSweepOutcome> {
+    let now = clock.now_ns();
+    let now_hour = u32::try_from(now.div_euclid(NS_PER_HOUR)).map_err(|_| {
+        MaintainError::Invariant(format!("clock reading {now} out of hour-bucket range"))
+    })?;
+    let min_hour = now_hour
+        .saturating_sub(config.idem_dedup_window_hours)
+        .saturating_sub(IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS);
+
+    let prefix = idem_prefix(tenant, signal);
+    let objects = list_all(store, &prefix).await?;
+
+    let mut deleted = 0usize;
+    let mut kept = 0usize;
+    let mut skipped_malformed = 0usize;
+    for meta in objects {
+        let Some(hour) = parse_marker_hour(&meta.key, &prefix) else {
+            tracing::warn!(
+                key = %meta.key,
+                "idempotency sweep: marker key does not parse as <keyhash32>.<ingest_hour>.idm, skipping"
+            );
+            skipped_malformed += 1;
+            continue;
+        };
+
+        if hour >= min_hour {
+            kept += 1;
+            continue;
+        }
+        if lease.is_protected(&meta.key) {
+            kept += 1;
+            continue;
+        }
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
+        deleted += 1;
+    }
+
+    Ok(IdemSweepOutcome {
+        deleted,
+        kept,
+        skipped_malformed,
+    })
+}
+
+/// `t/<tenant_hash_hex>/<signal>/idem/` -- the prefix covering every
+/// idempotency marker for one `(tenant, signal)`, across every client key and
+/// ingest hour (ADR-0051 §5, docs/catalog-and-mvcc.md). Coarser than
+/// `ravel_ingest::idempotency`'s own (private) per-key-hash prefix builder,
+/// which this sweep cannot call (it has no client key to scope by) and does
+/// not need to: it reconstructs the same key-layout convention directly.
+fn idem_prefix(tenant: &TenantHash, signal: Signal) -> String {
+    format!("t/{}/{}/idem/", tenant.to_hex(), signal.key_prefix())
+}
+
+/// Parse a listed marker key's `<ingest_hour>` back to its hour bucket, or
+/// `None` if the key (with `prefix` stripped) does not match
+/// `<keyhash32>.<ingest_hour>.idm`: either segment failing its own shape
+/// check is a skip, never a delete. `keyhash32` and the ingest-hour string
+/// both contain no `.`, so splitting on the last `.` before the `.idm` suffix
+/// isolates the hour segment unambiguously.
+fn parse_marker_hour(key: &str, prefix: &str) -> Option<u32> {
+    let basename = key.strip_prefix(prefix)?;
+    let rest = basename.strip_suffix(&format!(".{MARKER_SUFFIX}"))?;
+    let (keyhash, hour_text) = rest.rsplit_once('.')?;
+    if !is_keyhash32(keyhash) {
+        return None;
+    }
+    parse_ingest_hour_string(hour_text).ok()
+}
+
+/// `true` if `s` is exactly 32 lowercase ASCII hex digits: the shape
+/// `ravel_ingest::idempotency::keyhash32` always produces. Rejects anything
+/// else -- wrong length, uppercase, non-hex, or (since `/` is never a hex
+/// digit) a key with an extra path segment before the hour -- so a
+/// non-marker object that merely ends in `.<ingest_hour>.idm` is skipped,
+/// never deleted (docs/catalog-and-mvcc.md, ADR-0051 §5).
+fn is_keyhash32(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+// --- Rule 5: unreferenced catalog-object sweep ----------
+
+/// What one unreferenced-catalog-object sweep pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogSweepOutcome {
+    /// Superseded snapshot parts / postings objects deleted (or, under
+    /// `dry_run`, that would have been).
+    pub deleted: usize,
+    /// Objects left in place: named by the current HEAD, younger than the
+    /// protection horizon, lease-protected, or spared because there was no
+    /// present HEAD to anchor the sweep (the no-anchor case, in which every
+    /// listed object is kept).
+    pub kept: usize,
+}
+
+/// Delete every snapshot part (`t/<tenant_hash>/catalog/<signal>/snap/`) and
+/// name-postings object (sibling `.../idx/`) that the current
+/// `.../catalog/<signal>/HEAD` does not name, once the object's `last_modified`
+/// age exceeds `config.protection_horizon_ns`.
+///
+/// A fold supersedes a part or postings object by writing a fresh
+/// content-addressed key and swapping HEAD; the old object is deliberately left
+/// in place (plan 4 step 8) and would otherwise leak on every content-changing
+/// fold. This rule is the GC track's side of that contract.
+///
+/// Ordering and safety, mirroring the other physical-delete rules:
+/// - **LIST before HEAD, then re-verify HEAD before deleting.** The two coarse
+///   prefixes are listed first; HEAD is read *after* the LIST, and a fresh
+///   batched re-verify GET of HEAD is taken immediately before the delete loop
+///   (the same batched shape rule 1 uses for its commit-prefix re-verify LIST).
+///   A candidate the fresh HEAD now names -- a fold's HEAD CAS that landed
+///   between the two reads -- is dropped, so a part a completed fold just
+///   published is never swept.
+/// - **Reference set from a present, decodable HEAD only.** The referenced set
+///   is HEAD's `parts[].key`, its optional `postings.key`, and its optional
+///   column-statistics keys (`column_stats.key` field 11, `column_stats_part.key`
+///   field 13). An object under the two prefixes but not in that set is
+///   superseded or orphaned.
+/// - **No anchor, no sweep.** An absent HEAD sweeps nothing for the
+///   (tenant, signal), matching rule 3's neither-record-nor-tombstone bucket
+///   exactly. This is not an over-abundance of caution: a recovery fold with no
+///   HEAD (`HeadState::Absent`/`Corrupt`) recomputes and re-PUTs every part,
+///   and because a non-tail span keys on its stable `watermark_hour` the
+///   recomputed key is byte-identical to any surviving old object, so the PUT
+///   returns `AlreadyExists` and the fold *adopts the old object without
+///   rewriting it* (crates/ravel-catalog/src/fold.rs) before naming it in the
+///   HEAD it is about to CAS. With no HEAD to compare against, a record-less
+///   catalog object is indistinguishable from a part such a fold is mid-flight
+///   on, so it must be left alone.
+/// - **Age gate is a reader-pinning buffer, NOT a writer interlock.** The
+///   `protection_horizon_ns` term is `max_query_duration + grace`: it
+///   spares an object a query resolved just before the fold still has pinned.
+///   Unlike [`CompactorConfig::orphan_age_gate_ns`] (`grace +
+///   max_flush_lifetime`) and [`CompactorConfig::unreferenced_part_age_gate_ns`]
+///   (`grace + max_compaction_lifetime`), whose lifetime terms mirror a real
+///   writer *abandonment deadline* and so on their own guarantee no future
+///   writer can re-reference an object past the gate, the horizon carries no
+///   fold-lifetime term and does NOT establish such an interlock here: a fold
+///   has no abandonment deadline, and adoption-via-`AlreadyExists` never
+///   refreshes `last_modified`, so an object's age says nothing about whether a
+///   fold is about to adopt and name it. What bounds the writer race instead is
+///   the two points above -- the no-anchor rule (a fold rebuilding from no HEAD
+///   adopts old keys, so we never sweep without a HEAD) and the pre-delete HEAD
+///   re-verify (a fold that has completed its CAS is seen). The remaining
+///   window between the re-verify GET and the delete is the seam the
+///   [`LeaseCheck`] hook / future reader-lease work closes; it is
+///   not closed by an age gate, and this comment does not claim otherwise.
+/// - **Lease/legal-hold gate.** Every delete consults the [`LeaseCheck`] hook,
+///   like every other physical delete here.
+/// - **Fail-closed on a corrupt HEAD.** A HEAD present but undecodable aborts
+///   the pass with an error and deletes nothing, so a corrupt HEAD can never
+///   make the live snapshot look unreferenced.
+///
+/// Per (tenant, signal), not per shard: catalog objects carry no shard
+/// dimension, so a driver calls this once per (tenant, signal) per tick, like
+/// [`sweep_idempotency_markers`], not inside the per-shard [`sweep_shard`]
+/// loop.
+///
+/// The production driver is `ravel-server`'s maintenance tick
+/// (`services/ravel-server/src/maintain.rs`), which calls this once per
+/// (tenant, signal) for every signal, gated on ownership of shard 0 of that
+/// pair, alongside [`sweep_idempotency_markers`] and
+/// [`sweep_erasure_requests`].
+pub async fn sweep_unreferenced_catalog_objects(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<CatalogSweepOutcome> {
+    let now = clock.now_ns();
+    let horizon = config.protection_horizon_ns;
+
+    // LIST the two coarse prefixes first, before reading HEAD (finding 3: the
+    // reference set must be read *after* the listing, matching rules 1 and 3;
+    // reading HEAD first is the widest possible race window).
+    let mut listed: Vec<ObjectMeta> = Vec::new();
+    for prefix in [
+        catalog_snap_prefix(tenant, signal),
+        catalog_idx_prefix(tenant, signal),
+    ] {
+        listed.extend(list_all(store, &prefix).await?);
+    }
+
+    // Reference set from HEAD, read after the LIST. An absent HEAD is the
+    // no-anchor case: sweep nothing (finding 2), never the old "collect every
+    // orphan" behavior, because a recovery fold rebuilding from no HEAD adopts
+    // surviving old keys via `AlreadyExists` and is about to name them.
+    let referenced = match read_head_reference(store, tenant, signal).await? {
+        HeadReference::Present(set) => set,
+        HeadReference::Absent => {
+            return Ok(CatalogSweepOutcome {
+                deleted: 0,
+                kept: listed.len(),
+            });
+        }
+    };
+
+    let mut kept = 0usize;
+    let mut candidates: Vec<ObjectMeta> = Vec::new();
+    for meta in listed {
+        // Named by the current HEAD: a live part or the live postings object.
+        // Never delete; this is the whole safety property.
+        if referenced.contains(&meta.key) {
+            kept += 1;
+            continue;
+        }
+        // Younger than the protection horizon: spare it (a part a still-running
+        // query pinned; see the age-gate caveat above -- this is a
+        // reader-pinning buffer, not a writer interlock).
+        if object_age_ns(now, &meta) <= horizon {
+            kept += 1;
+            continue;
+        }
+        if lease.is_protected(&meta.key) {
+            kept += 1;
+            continue;
+        }
+        candidates.push(meta);
+    }
+
+    // Fresh batched re-verify GET of HEAD immediately before the delete loop
+    // (finding 3), the same batched shape rule 1 uses for its re-verify LIST: a
+    // fold's HEAD CAS may have landed since the first read and now name one of
+    // these candidates. A HEAD that vanished between the two reads is again the
+    // no-anchor case -- spare everything rather than delete without a HEAD.
+    if !candidates.is_empty() {
+        let fresh = match read_head_reference(store, tenant, signal).await? {
+            HeadReference::Present(set) => set,
+            HeadReference::Absent => {
+                return Ok(CatalogSweepOutcome {
+                    deleted: 0,
+                    kept: kept + candidates.len(),
+                });
+            }
+        };
+        let mut survivors = Vec::with_capacity(candidates.len());
+        for meta in candidates {
+            if fresh.contains(&meta.key) {
+                kept += 1;
+            } else {
+                survivors.push(meta);
+            }
+        }
+        candidates = survivors;
+    }
+
+    let mut deleted = 0usize;
+    for meta in &candidates {
+        if !config.dry_run {
+            store.delete(&meta.key).await?;
+        }
+        deleted += 1;
+    }
+
+    Ok(CatalogSweepOutcome { deleted, kept })
+}
+
+/// The outcome of reading the catalog HEAD for one `(tenant, signal)`.
+/// [`Self::Absent`] is the no-anchor case rule 5 must not sweep against; a
+/// present but undecodable HEAD is not represented here at all, because
+/// [`read_head_reference`] fails the whole pass on it (fail-closed).
+enum HeadReference {
+    /// HEAD is present and decoded: the set of keys it names (every
+    /// `parts[].key`, the optional `postings.key`, and the optional
+    /// column-statistics keys `column_stats.key`/`column_stats_part.key`).
+    Present(HashSet<String>),
+    /// HEAD is absent. There is no anchor to compare against, so rule 5 sweeps
+    /// nothing for this (tenant, signal) (a fold rebuilding from no HEAD adopts
+    /// surviving old keys and is about to name them).
+    Absent,
+}
+
+/// Read the catalog HEAD for one `(tenant, signal)` into a [`HeadReference`].
+/// An absent HEAD is [`HeadReference::Absent`] (the no-anchor case, swept
+/// nothing); a present but undecodable HEAD is a fail-closed error so the pass
+/// deletes nothing rather than treat a live snapshot as unreferenced.
+async fn read_head_reference(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<HeadReference> {
+    let head_key = catalog_head_key(tenant, signal);
+    match store.get(&head_key, GetRange::Full).await {
+        Ok(got) => {
+            let head = ravel_catalog::decode_head(got.data.as_ref()).map_err(|e| {
+                MaintainError::Invariant(format!(
+                    "catalog sweep: HEAD at {head_key} failed to decode ({e}); deleting \
+                     nothing this pass rather than treating a live snapshot as unreferenced"
+                ))
+            })?;
+            let mut referenced = HashSet::with_capacity(
+                head.parts.len() * 2
+                    + usize::from(head.postings.is_some())
+                    + usize::from(head.column_stats.is_some())
+                    + usize::from(head.column_stats_part.is_some()),
+            );
+            for part in &head.parts {
+                referenced.insert(part.key.clone());
+                // Additive, ADR-1413. `part.column_stats` (field 7,
+                // `SnapshotColumnStatsPartRef`) names a per-part v3
+                // column-stats object living under the same `idx/` prefix
+                // this sweep lists. It is reachable only through the part
+                // that carries it, never through SnapshotHead field 11/13, so
+                // it must be added to the set here or a live v3 object goes
+                // unreferenced and is swept once its age crosses the
+                // protection horizon, even though a sealed part never gets
+                // rewritten and the HEAD still names it (issue #1482).
+                if let Some(column_stats) = &part.column_stats {
+                    referenced.insert(column_stats.key.clone());
+                }
+            }
+            if let Some(postings) = &head.postings {
+                referenced.insert(postings.key.clone());
+            }
+            // A live snapshot's column-statistics object is an immutable,
+            // reachable object under the same `idx/` prefix this sweep lists
+            // (fold.rs writes `.cstat` there), so omitting it lets the sweep
+            // delete an object a resolvable snapshot still references (#958).
+            // All three carriers are covered: field 11 `column_stats`
+            // (`SnapshotColumnStatsRef`, ADR-0850) and field 13
+            // `column_stats_part` (`SnapshotColumnStatsPartRef`, ADR-0942's
+            // part-hash re-keying) are whole-object refs on the HEAD itself;
+            // `parts[].column_stats` (field 7, ADR-1413) is the per-part v3
+            // ref handled in the loop above. Whichever a HEAD carries names a
+            // `.cstat` key that must be spared exactly like a part or the
+            // postings object.
+            if let Some(column_stats) = &head.column_stats {
+                referenced.insert(column_stats.key.clone());
+            }
+            if let Some(column_stats_part) = &head.column_stats_part {
+                referenced.insert(column_stats_part.key.clone());
+            }
+            Ok(HeadReference::Present(referenced))
+        }
+        Err(StoreError::NotFound) => Ok(HeadReference::Absent),
+        Err(e) => Err(MaintainError::Store(e)),
+    }
+}
+
+/// `t/<tenant_hash_hex>/catalog/<signal>/snap/` -- the prefix covering every
+/// snapshot part for one `(tenant, signal)`, across every watermark.
+fn catalog_snap_prefix(tenant: &TenantHash, signal: Signal) -> String {
+    format!(
+        "t/{}/catalog/{}/snap/",
+        tenant.to_hex(),
+        signal.key_prefix()
+    )
+}
+
+/// `t/<tenant_hash_hex>/catalog/<signal>/idx/` -- the prefix covering every
+/// name-postings object for one `(tenant, signal)`, across every watermark.
+fn catalog_idx_prefix(tenant: &TenantHash, signal: Signal) -> String {
+    format!("t/{}/catalog/{}/idx/", tenant.to_hex(), signal.key_prefix())
+}
+
+// --- Rule 6: erasure-request (.dreq) removal (ADR-0064 decision 5) -----------
+
+/// What one erasure-request sweep pass did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ErasureRequestSweepOutcome {
+    /// `.dreq` objects deleted (or, under `dry_run`, that would have been).
+    pub deleted: usize,
+    /// `.dreq` objects left in place: no `.done` yet (erasure not complete),
+    /// still inside the post-completion protection horizon, lease/legal-hold
+    /// protected, or held because an input one of its rewrites superseded is
+    /// still in the store (`held_by_superseded_inputs` below counts that
+    /// subset).
+    pub kept: usize,
+    /// The subset of `kept` held past their horizon because an input a rewrite
+    /// applying that request superseded is still physically present. Retiring
+    /// the query-time exclusion filter while such an input exists would let a
+    /// snapshot that still resolves it serve the erased subject again, so the
+    /// `.dreq` outlives every input its own rewrites superseded. Counter seam
+    /// for `ravel_maintain_dreq_held_by_superseded_inputs_total`.
+    pub held_by_superseded_inputs: usize,
+}
+
+/// Delete every erasure request `t/<tenant_hash>/<signal>/del/<request_id>.dreq`
+/// whose erasure is complete and past the post-completion horizon (ADR-0064
+/// decision 5, docs/consistency-model.md "Deletion guarantees").
+///
+/// A `.dreq` carries the subject identifier, so it must not outlive its
+/// purpose. Its matching `.done` completion record carries only a predicate
+/// hash and per-bucket counts (no subject identifier) and is permanent,
+/// deny-delete audit evidence: this rule never deletes a `.done`.
+///
+/// A `.dreq` is deleted only when ALL hold:
+/// - its matching `.done` completion exists (erasure is verified complete);
+/// - `now >= done.completed_unix_ns + protection_horizon` -- the same horizon
+///   that gates every superseded-input delete (rule 2), anchored on the
+///   durable completion timestamp, never on wall-clock at sweep time. This
+///   wait is what makes removal safe: retiring the query-time exclusion filter
+///   (which happens the instant the `.dreq` disappears, since the resolver's
+///   `del/` listing no longer finds it) can never resurrect the subject,
+///   because after the horizon no resolvable snapshot can still reference a
+///   pre-rewrite input (ADR-0064 §3.5 race window, closed durably). Deleting
+///   the `.dreq` a nanosecond early would reopen exactly that window.
+/// - rule 2 did not hold anything this request's rewrites superseded. The
+///   horizon on its own does not imply that: rule 2 holds an input the live
+///   HEAD snapshot still names, an input under a snapshot part it cannot read,
+///   and a whole chain any legal hold over the shard's data prefixes touches
+///   (such a hold does not cover `del/`, so it does not pin the `.dreq`
+///   itself). In every one of those cases a snapshot can still resolve the
+///   pre-rewrite object, so retiring the filter would serve the erased subject
+///   again. The decision is read straight off [`SupersededHolds`], which rule
+///   2 fills while it gates: `request_ids` when a held group names the request,
+///   and `truncated_buckets` when a held group's chain could not be walked to
+///   the end, in which case the requests the missing generation applied are
+///   named by no surviving record and the bucket stands in for them. This
+///   costs no LIST and no GET of its own beyond rule 2's own pass. The holds
+///   cover every supersession chain in the signal, not only the ones old
+///   enough to delete: an object's age says nothing about whether a snapshot
+///   still resolves it, and a chain still inside its own protection horizon is
+///   the likeliest one a stale HEAD names.
+/// - the [`LeaseCheck`] passes: a legal hold over the `del/` keyspace pins the
+///   request exactly as it pins any other object.
+///
+/// A completion's `bucket_drops` is informational only. No part of this rule
+/// reads it: not the hold decision, and not the scope of the observation the
+/// six-argument entry runs. The field is optional on the wire, is written
+/// empty by the production writer, and a writer that does populate it is not
+/// obliged to enumerate every bucket it touched, so a present list can be
+/// partial. Any truncated bucket in the signal therefore holds any candidate.
+///
+/// A completion whose `completed_unix_ns` is zero is treated fail-safe as "not
+/// yet a valid horizon anchor" and its `.dreq` is kept: a zero anchor would
+/// collapse the horizon gate to always-past and could retire the filter early.
+///
+/// Per (tenant, signal), not per shard (the `del/` prefix carries no shard
+/// dimension): `ravel-server`'s maintenance tick calls this once per (tenant,
+/// signal), alongside [`sweep_idempotency_markers`] and after that signal's
+/// erasure rewrite pass and completion (`.done`) write, not inside the
+/// per-shard [`sweep_shard`] loop. That order is what makes the rule safe:
+/// the `.done` this rule waits on is written by the same tick that verified
+/// the rewrite, so a `.dreq` is only ever removed after its erasure is
+/// durably complete. ([`sweep_unreferenced_catalog_objects`] runs at the same
+/// granularity in that same tick; see its own doc.) A listing entry under
+/// `del/` that is neither a `.dreq` nor a `.done` is layout drift and fails
+/// the pass loud, matching the resolver's and the rewrite pass's fail-loud
+/// discipline for this keyspace.
+/// Run rule 6 for a caller that has no rule-2 outcome to hand, observing the
+/// holds itself.
+///
+/// This is the production entry (`ravel-server`'s maintenance tick), and it is
+/// what makes the guard reachable there: it runs rule 2 in
+/// [`SweepMode::GateOnly`] over every shard of the signal and decides from the
+/// holds that pass reports, instead of from a completion field a production
+/// writer may leave empty. The observation costs one rule-2-shaped pass and
+/// nothing more; a caller that already swept the signal's shards this tick
+/// should sweep with [`sweep_shard_with_holds`], union the holds it returns,
+/// and call [`sweep_erasure_requests_with_holds`] instead, which costs nothing
+/// at all.
+///
+/// The observation runs only when there is a `.dreq` past its horizon to
+/// decide about. An ordinary pass, where every request is either incomplete or
+/// still inside its horizon, reads nothing but the `del/` listing and the
+/// completions.
+pub async fn sweep_erasure_requests(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<ErasureRequestSweepOutcome> {
+    sweep_erasure_requests_inner(store, clock, config, lease, tenant, signal, None).await
+}
+
+/// Run rule 6 against the holds a caller's own rule-2 passes already reported
+/// (`holds`), adding no request of its own.
+///
+/// This is the shape the per-tick maintenance loop wants: sweep the signal's
+/// shards with [`sweep_shard_with_holds`], union each returned
+/// [`SupersededHolds`], and pass the union here. Rule 2 walked every
+/// supersession chain in those shards while it gated them, so rule 6 needs no
+/// walk of its own.
+///
+/// `holds` must cover every shard of `signal` the caller swept, and the caller
+/// must have swept them with the same `config` horizon. A `holds` that omits a
+/// shard rule 2 held in is the one unsafe input to this function: it would let
+/// a `.dreq` retire while a pre-rewrite object in that shard is still
+/// resolvable. [`sweep_erasure_requests`] exists for callers that cannot make
+/// that guarantee.
+pub async fn sweep_erasure_requests_with_holds(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    holds: &SupersededHolds,
+) -> Result<ErasureRequestSweepOutcome> {
+    sweep_erasure_requests_inner(store, clock, config, lease, tenant, signal, Some(holds)).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sweep_erasure_requests_inner(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    holds: Option<&SupersededHolds>,
+) -> Result<ErasureRequestSweepOutcome> {
+    let now = clock.now_ns();
+    let prefix = keys::del_prefix(tenant, signal);
+    let objects = list_all(store, &prefix).await?;
+
+    // One LIST, split into pending requests and their completions. Both
+    // suffixes share the `del/` prefix, so this needs no second listing.
+    let mut dreq_keys: Vec<(Uuid, String)> = Vec::new();
+    let mut completions: HashMap<Uuid, ErasureCompletion> = HashMap::new();
+    for meta in &objects {
+        if let Ok(parsed) = keys::parse_erasure_request_key(&meta.key) {
+            dreq_keys.push((parsed.request_id, meta.key.clone()));
+        } else if let Ok(parsed) = keys::parse_erasure_completion_key(&meta.key) {
+            let got = store.get(&meta.key, GetRange::Full).await?;
+            let completion = ravel_commit::erasure::decode_completion(&got.data).map_err(|e| {
+                MaintainError::Invariant(format!("erasure completion decode failed: {e}"))
+            })?;
+            keys::verify_erasure_completion_key(&completion, &meta.key)?;
+            completions.insert(parsed.request_id, completion);
+        } else {
+            return Err(MaintainError::UnknownBucketEntry(meta.key.clone()));
+        }
+    }
+
+    // Split the requests into the ones this pass could delete and the ones a
+    // cheaper condition already keeps, before any hold is observed: an
+    // ordinary pass has no candidate and does no further work.
+    let mut candidates: Vec<(&Uuid, &String)> = Vec::new();
+    let mut kept = 0usize;
+    for (request_id, dreq_key) in &dreq_keys {
+        let Some(completion) = completions.get(request_id) else {
+            // No `.done`: the erasure is not verified complete, so the request
+            // (and its query-time exclusion filter) must stay live.
+            kept += 1;
+            continue;
+        };
+        let completed_ns = completion.completed_unix_ns;
+        // Fail-safe: a zero completion timestamp is not a valid horizon anchor.
+        if completed_ns == 0 {
+            kept += 1;
+            continue;
+        }
+        if now < completed_ns.saturating_add(config.protection_horizon_ns) {
+            kept += 1;
+            continue;
+        }
+        if lease.is_protected(dreq_key) {
+            kept += 1;
+            continue;
+        }
+        candidates.push((request_id, dreq_key));
+    }
+
+    if candidates.is_empty() {
+        return Ok(ErasureRequestSweepOutcome {
+            deleted: 0,
+            kept,
+            held_by_superseded_inputs: 0,
+        });
+    }
+
+    let observed;
+    let holds = match holds {
+        Some(holds) => holds,
+        None => {
+            observed =
+                observe_superseded_holds(store, clock, config, lease, tenant, signal).await?;
+            &observed
+        }
+    };
+
+    let mut deleted = 0usize;
+    let mut held_by_superseded_inputs = 0usize;
+    for (request_id, dreq_key) in candidates {
+        // The horizon has elapsed, but rule 2 may have held an object one of
+        // this request's rewrites superseded: an input the live HEAD still
+        // names, one under an unreadable snapshot part, or a chain a legal
+        // hold over the data prefixes touches. A snapshot can still resolve
+        // such an object, so the filter stays.
+        // A held chain rule 2 could not walk to the end names requests no
+        // surviving record does, so any such bucket stands in for them. The
+        // completion's own `bucket_drops` are not consulted: the field is
+        // optional on the wire, a production writer leaves it empty, and
+        // nothing forces a writer that does fill it to enumerate every bucket
+        // it touched. Narrowing on a list that may be partial would release a
+        // filter over a bucket the request did touch.
+        let request_id_s = request_id.to_string();
+        let held = holds.request_ids.contains(&request_id_s) || !holds.truncated_buckets.is_empty();
+        if held {
+            tracing::warn!(
+                tenant_hash = %tenant.to_hex(),
+                signal = signal.key_prefix(),
+                request_id = %request_id,
+                held_requests = holds.request_ids.len(),
+                held_truncated_buckets = holds.truncated_buckets.len(),
+                "erasure-request sweep: holding a .dreq past its horizon because the \
+                 superseded-input sweep held an object its rewrite superseded; the query-time \
+                 exclusion filter must outlive it"
+            );
+            kept += 1;
+            held_by_superseded_inputs += 1;
+            continue;
+        }
+        if !config.dry_run {
+            store.delete(dreq_key).await?;
+        }
+        deleted += 1;
+    }
+
+    Ok(ErasureRequestSweepOutcome {
+        deleted,
+        kept,
+        held_by_superseded_inputs,
+    })
+}
+
+/// Observe what rule 2 holds, without deleting anything, for a rule-6 caller
+/// that has no [`SupersededHolds`] of its own.
+///
+/// The observation always covers the whole signal: the commit keyspace is
+/// listed once to enumerate its shards, and every shard is observed across
+/// every hour. It is never narrowed by a candidate completion's `bucket_drops`.
+/// That field is optional on the wire and nothing makes a writer that fills it
+/// enumerate every bucket it touched, so a partial list would silently exclude
+/// the bucket whose chain holds the request. Shard enumeration is one LIST for
+/// the pass, and a shard with no commit key holds nothing, so the whole-signal
+/// scope costs listing, never correctness.
+///
+/// The pass runs only when there is a `.dreq` past its horizon to decide about.
+async fn observe_superseded_holds(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    config: &CompactorConfig,
+    lease: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<SupersededHolds> {
+    // One pass, one reachability cache: HEAD is read at most once no matter how
+    // many shards are observed.
+    let mut reach = SnapshotReachability::new();
+    let mut holds = SupersededHolds::default();
+
+    for shard in signal_shards(store, tenant, signal).await? {
+        let outcome = sweep_superseded_impl(
+            &mut reach,
+            store,
+            clock,
+            config,
+            lease,
+            tenant,
+            signal,
+            shard,
+            None,
+            SweepMode::GateOnly,
+        )
+        .await?;
+        holds.absorb(&outcome);
+    }
+    Ok(holds)
+}
+
+/// Every shard with at least one commit-prefix key for one `(tenant, signal)`,
+/// from one LIST of `t/<tenant_hash_hex>/<signal>/c/`.
+///
+/// A shard with no commit key holds no supersession chain and so can hold
+/// nothing, which is why key presence is the right enumeration and no shard
+/// count needs to be configured or guessed.
+async fn signal_shards(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+) -> Result<Vec<u32>> {
+    let prefix = format!("t/{}/{}/c/", tenant.to_hex(), signal.key_prefix());
+    let mut shards: BTreeSet<u32> = BTreeSet::new();
+    for meta in list_all(store, &prefix).await? {
+        match keys::partition_bucket_entry(&meta.key) {
+            Ok(BucketEntry::CommitRecord(pk)) => {
+                shards.insert(pk.shard);
+            }
+            Ok(BucketEntry::CompactionRecord(pk)) => {
+                shards.insert(pk.shard);
+            }
+            Ok(BucketEntry::RewriteRecord(pk)) => {
+                shards.insert(pk.shard);
+            }
+            Ok(BucketEntry::Tombstone(pk)) => {
+                shards.insert(pk.shard);
+            }
+            Err(KeyError::UnknownBucketEntryShape(k)) => {
+                return Err(MaintainError::UnknownBucketEntry(k));
+            }
+            Err(e) => return Err(MaintainError::Key(e)),
+        }
+    }
+    Ok(shards.into_iter().collect())
+}
+
+// --- shared helpers --------------------------------------------------------
+
+/// List a shard's commit prefix and classify every key by shape, failing loud
+/// on any unknown shape. Returns `(key, entry)` pairs.
+///
+/// `hours: None` lists the whole shard, across every hour, in one LIST (the
+/// pre-zone-split behavior). `hours: Some(hs)` issues one LIST per hour in
+/// `hs` against [`keys::commit_shard_hour_prefix`] instead, and concatenates
+/// the results: an hour not in `hs` is never listed, which is the request-
+/// count saving the zone split (ADR-0065 decision 3) exists for.
+async fn list_commit_entries_scoped(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: Option<&[u32]>,
+) -> Result<Vec<(String, BucketEntry)>> {
+    let metas = match hours {
+        None => {
+            let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+            list_all(store, &prefix).await?
+        }
+        Some(hs) => {
+            let mut metas = Vec::new();
+            for hour in hs {
+                let prefix = keys::commit_shard_hour_prefix(tenant, signal, shard, *hour)?;
+                metas.extend(list_all(store, &prefix).await?);
+            }
+            metas
+        }
+    };
+    let mut out = Vec::with_capacity(metas.len());
+    for meta in metas {
+        match keys::partition_bucket_entry(&meta.key) {
+            Ok(entry) => out.push((meta.key, entry)),
+            Err(KeyError::UnknownBucketEntryShape(k)) => {
+                return Err(MaintainError::UnknownBucketEntry(k));
+            }
+            Err(e) => return Err(MaintainError::Key(e)),
+        }
+    }
+    Ok(out)
+}
+
+/// List a shard's `l1/` objects. `hours: None` lists the whole shard in one
+/// LIST via [`l1_prefix`] (the pre-zone-split behavior); `hours: Some(hs)`
+/// issues one LIST per hour in `hs` against an hour-scoped prefix instead.
+async fn list_l1_scoped(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    hours: Option<&[u32]>,
+) -> Result<Vec<ObjectMeta>> {
+    match hours {
+        None => {
+            let prefix = l1_prefix(tenant, signal, shard)?;
+            Ok(list_all(store, &prefix).await?)
+        }
+        Some(hs) => {
+            let mut metas = Vec::new();
+            for hour in hs {
+                let prefix = l1_hour_prefix(tenant, signal, shard, *hour)?;
+                metas.extend(list_all(store, &prefix).await?);
+            }
+            Ok(metas)
+        }
+    }
+}
+
+/// GET, decode, and key-verify a compaction record (ADR-0010 §7).
+async fn get_compaction_record(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+) -> Result<CompactionRecord> {
+    let got = store.get(key, GetRange::Full).await?;
+    let record = record::decode_compaction(got.data.as_ref())
+        .map_err(|e| MaintainError::Invariant(format!("compaction record decode failed: {e}")))?;
+    keys::verify_compaction_record_key(&record, key)?;
+    Ok(record)
+}
+
+/// GET, decode, validate, and key-verify a rewrite record (ADR-0064 decision
+/// 3, ADR-0010 §7). `decode_rewrite` also re-verifies the record's own
+/// `input_set_hash` and `superseded_record_key` bucket-match on decode.
+async fn get_rewrite_record(store: &dyn ObjectStoreBackend, key: &str) -> Result<RewriteRecord> {
+    let got = store.get(key, GetRange::Full).await?;
+    let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref())
+        .map_err(|e| MaintainError::Invariant(format!("rewrite record decode failed: {e}")))?;
+    keys::verify_rewrite_record_key(&record, key)?;
+    Ok(record)
+}
+
+/// Age of an object in nanoseconds from its `last_modified` (ms), against an
+/// injected `now_ns`. The object-store contract restricts `last_modified` to
+/// exactly this use (GC age checks); it is never used to order commits.
+fn object_age_ns(now_ns: i64, meta: &ObjectMeta) -> i64 {
+    now_ns.saturating_sub(meta.last_modified_unix_ms.saturating_mul(1_000_000))
+}
+
+/// `t/<tenant_hash_hex>/<signal>/l0/<shard>/` -- the prefix covering every L0
+/// data object for one `(tenant, signal, shard)`, across all ingest hours (L0
+/// data keys are not hour-bucketed, ADR-0010 §1). No public builder exists in
+/// ravel-commit for this prefix, so it is constructed here from the same
+/// pieces `keys::data_key` uses.
+fn l0_data_prefix(tenant: &TenantHash, signal: Signal, shard: u32) -> Result<String> {
+    Ok(format!(
+        "t/{}/{}/l0/{}/",
+        tenant.to_hex(),
+        signal.key_prefix(),
+        format_shard(shard)?
+    ))
+}
+
+/// `t/<tenant_hash_hex>/<signal>/l1/<shard>/` -- the prefix covering every L1
+/// part object for one `(tenant, signal, shard)`, across all ingest hours.
+fn l1_prefix(tenant: &TenantHash, signal: Signal, shard: u32) -> Result<String> {
+    Ok(format!(
+        "t/{}/{}/{}/{}/",
+        tenant.to_hex(),
+        signal.key_prefix(),
+        keys::L1_DIR,
+        format_shard(shard)?
+    ))
+}
+
+/// `t/<tenant_hash_hex>/<signal>/l1/<shard>/<hour>/` -- the prefix covering
+/// one hour's L1 part objects. L1 keys are hour-bucketed (unlike L0), so this
+/// is the zone-scoped sweep's narrower alternative to [`l1_prefix`]; composed
+/// from existing `pub` pieces (`l1_prefix`, `keys::ingest_hour_string`), no
+/// new ravel-commit API needed.
+fn l1_hour_prefix(tenant: &TenantHash, signal: Signal, shard: u32, hour: u32) -> Result<String> {
+    Ok(format!(
+        "{}{}/",
+        l1_prefix(tenant, signal, shard)?,
+        keys::ingest_hour_string(hour)
+    ))
+}
+
+/// The 4-digit shard segment used in every key shape (mirrors ravel-commit's
+/// private `format_shard`). Rejects shards past the 4-digit width so a prefix
+/// can never silently under-match.
+fn format_shard(shard: u32) -> Result<String> {
+    if shard > 9999 {
+        return Err(MaintainError::Key(KeyError::ShardOutOfRange(shard)));
+    }
+    Ok(format!("{shard:04}"))
+}
+
+/// The form a request id takes in the hold set and in the `.dreq` check: the
+/// hyphenated UUID text, which is what a parsed `.dreq` key renders. A rewrite
+/// record carries the id as the string its writer supplied, and a UUID has
+/// more than one accepted text form, so both sides are normalised through the
+/// parser before they are compared. A string that is not a UUID is kept as
+/// written: normalising it would only make an unrelated pair compare equal.
+fn canonical_request_id(id: &str) -> String {
+    match Uuid::parse_str(id) {
+        Ok(uuid) => uuid.hyphenated().to_string(),
+        Err(_) => id.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    /// A drop that names its request in the simple UUID form still matches
+    /// the hyphenated form a `.dreq` key renders; a non-UUID id is kept as
+    /// written. Without the normalisation the first assertion fails: the two
+    /// strings differ and the hold set would miss the request.
+    #[test]
+    fn request_ids_compare_in_the_hyphenated_form() {
+        let hyphenated = "6f1c9a2e-0d3b-4b5a-9e7f-1c2d3e4f5a6b";
+        let simple = "6f1c9a2e0d3b4b5a9e7f1c2d3e4f5a6b";
+        assert_eq!(super::canonical_request_id(simple), hyphenated);
+        assert_eq!(super::canonical_request_id(hyphenated), hyphenated);
+        assert_eq!(
+            super::canonical_request_id(&simple.to_uppercase()),
+            hyphenated,
+            "case is normalised too"
+        );
+        assert_eq!(super::canonical_request_id("not-a-uuid"), "not-a-uuid");
+    }
+
+    use bytes::Bytes;
+    use ravel_ingest::{IdempotencyReceipt, LookupOutcome, marker_key, read_marker, write_marker};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_proto::catalog::v1::{
+        SnapshotColumnStatsPartRef, SnapshotColumnStatsRef, SnapshotHead, SnapshotPartRef,
+        SnapshotPostingsRef,
+    };
+    use ravel_types::TenantId;
+
+    use super::*;
+    use crate::clock::FixedClock;
+
+    fn tenant() -> TenantHash {
+        TenantHash([0u8; 16])
+    }
+
+    /// A record-less `l0/` data object at a unique identity: no commit record
+    /// is ever written for it, so it is an orphan candidate as soon as it
+    /// clears the age gate.
+    async fn put_orphan(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        seq: u64,
+    ) {
+        let writer_id = Uuid::from_u128(u128::from(seq) + 1);
+        let content_hash = [7u8; 32];
+        let key = keys::data_key(tenant, signal, shard, writer_id, 1, seq, &content_hash)
+            .expect("valid data key");
+        store
+            .put(&key, Bytes::new(), PutOptions::default())
+            .await
+            .expect("seed put");
+    }
+
+    /// `MemoryStore`'s fake clock defaults to `0`, so every seeded object's
+    /// `last_modified` is `0`; setting the injected clock just past the
+    /// orphan age gate makes every seeded object old enough without touching
+    /// the store's clock at all.
+    fn aged_clock(config: &CompactorConfig) -> FixedClock {
+        FixedClock::new(config.orphan_age_gate_ns() + 1)
+    }
+
+    #[tokio::test]
+    async fn mass_orphan_trips_breaker_and_deletes_nothing() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 1;
+        let store = MemoryStore::new();
+        for seq in 0..60u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let err = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect_err("60 orphans out of 60 listed objects trips the breaker");
+        match err {
+            MaintainError::OrphanBreakerTripped {
+                candidates,
+                l0_objects_listed,
+                min_count,
+                max_ratio,
+                ..
+            } => {
+                assert_eq!(candidates, 60);
+                assert_eq!(l0_objects_listed, 60);
+                assert_eq!(min_count, config.orphan_breaker_min_count);
+                assert_eq!(max_ratio, config.orphan_breaker_max_ratio);
+            }
+            other => panic!("expected OrphanBreakerTripped, got {other:?}"),
+        }
+
+        let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            60,
+            "a tripped breaker deletes nothing at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn below_threshold_pass_still_deletes_normally() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 2;
+        let store = MemoryStore::new();
+        for seq in 0..3u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig::default();
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("3 candidates is below orphan_breaker_min_count: no trip");
+        assert_eq!(outcome.deleted, 3);
+        assert!(!outcome.breaker_overridden);
+
+        let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "all orphans deleted normally");
+    }
+
+    #[tokio::test]
+    async fn forced_pass_deletes_and_reports_override() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 4;
+        let store = MemoryStore::new();
+        for seq in 0..60u64 {
+            put_orphan(&store, &tenant, signal, shard, seq).await;
+        }
+        let config = CompactorConfig {
+            force_orphan_gc: true,
+            ..CompactorConfig::default()
+        };
+        let clock = aged_clock(&config);
+
+        let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect("force_orphan_gc overrides a would-have-tripped breaker");
+        assert_eq!(outcome.deleted, 60);
+        assert!(
+            outcome.breaker_overridden,
+            "reports that it deleted under override"
+        );
+
+        let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+            .await
+            .unwrap();
+        assert!(remaining.is_empty(), "forced pass deletes everything");
+    }
+
+    #[tokio::test]
+    async fn batched_reverify_lists_commit_prefix_once_per_pass() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 3;
+        // Four candidates, comfortably below orphan_breaker_min_count, so the
+        // breaker never interferes with either half of this test.
+        let config = CompactorConfig::default();
+
+        // The second commit-prefix LIST is the batched re-verify (ADR-0048
+        // decision 5): faulting it aborts the pass before any delete, which
+        // proves it happens exactly once, not zero times.
+        {
+            let mem = MemoryStore::new();
+            for seq in 0..4u64 {
+                put_orphan(&mem, &tenant, signal, shard, seq).await;
+            }
+            let clock = aged_clock(&config);
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Timeout)
+                    .with_key_contains("/c/")
+                    .with_occurrence(Occurrence::Nth(2)),
+            );
+            let store = FaultStore::new(mem, plan);
+
+            let err = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+                .await
+                .expect_err("the batched re-verify LIST faults the pass");
+            assert!(matches!(err, MaintainError::Store(_)));
+            assert_eq!(
+                store.fault_count(Op::List, FaultKind::Timeout),
+                1,
+                "exactly the batched re-verify LIST faulted"
+            );
+
+            let remaining = list_all(&store, &l0_data_prefix(&tenant, signal, shard).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                remaining.len(),
+                4,
+                "nothing deleted when the re-verify faults"
+            );
+        }
+
+        // A third commit-prefix LIST never happens, no matter how many
+        // candidates survived to the delete phase: the re-verify is batched
+        // once per pass, not once per candidate.
+        {
+            let mem = MemoryStore::new();
+            for seq in 0..4u64 {
+                put_orphan(&mem, &tenant, signal, shard, seq).await;
+            }
+            let clock = aged_clock(&config);
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(Op::List, ScriptedFault::Timeout)
+                    .with_key_contains("/c/")
+                    .with_occurrence(Occurrence::Nth(3)),
+            );
+            let store = FaultStore::new(mem, plan);
+
+            let outcome = sweep_orphans(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+                .await
+                .expect("no third commit-prefix LIST: the pass completes");
+            assert_eq!(outcome.deleted, 4);
+            assert_eq!(
+                store.fault_count(Op::List, FaultKind::Timeout),
+                0,
+                "batched: only two commit-prefix LISTs per pass, regardless of candidate count"
+            );
+        }
+    }
+
+    fn idem_receipt(written_count: u64) -> IdempotencyReceipt {
+        IdempotencyReceipt {
+            written_count,
+            commit_token: "v2:token".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn idem_markers_past_window_swept_recent_kept() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant_hash = tenant_id.hash();
+        let signal = Signal::Logs;
+        let now_hour = 10_000u32;
+        let window = 24u32;
+        let config = CompactorConfig {
+            idem_dedup_window_hours: window,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
+
+        // The sweep's min_hour also subtracts the shared forward-skew
+        // tolerance (forward-skew tolerance): a marker
+        // is only strictly past the window once
+        // now_hour - hour > window + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS,
+        // the same margin read_marker grants on its own upper bound, so the
+        // sweep never reaps a marker the read path would still honor.
+        let skew = IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS;
+        let old_hours = [now_hour - window - skew - 1, now_hour - 200];
+        // Within the window (plus skew tolerance), including the exact
+        // boundary: now_hour - hour <= window + skew.
+        let recent_hours = [now_hour - window - skew, now_hour - 1];
+
+        for (i, hour) in old_hours.iter().enumerate() {
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                format!("old-key-{i}").as_bytes(),
+                *hour,
+                &idem_receipt(i as u64),
+            )
+            .await
+            .expect("seed old marker");
+        }
+        for (i, hour) in recent_hours.iter().enumerate() {
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                format!("recent-key-{i}").as_bytes(),
+                *hour,
+                &idem_receipt(100 + i as u64),
+            )
+            .await
+            .expect("seed recent marker");
+        }
+
+        let outcome =
+            sweep_idempotency_markers(&store, &clock, &config, &NoLeases, &tenant_hash, signal)
+                .await
+                .expect("sweep must succeed");
+        assert_eq!(outcome.deleted, old_hours.len());
+        assert_eq!(outcome.kept, recent_hours.len());
+        assert_eq!(outcome.skipped_malformed, 0);
+
+        for (i, _hour) in old_hours.iter().enumerate() {
+            // A generous window (covering the whole range) turns this lookup into a
+            // pure existence check: a Hit here would mean the sweep failed to
+            // delete the object, regardless of the sweep's own window.
+            let looked_up = read_marker(
+                &store,
+                &tenant_id,
+                signal,
+                format!("old-key-{i}").as_bytes(),
+                now_hour,
+                now_hour,
+            )
+            .await
+            .expect("lookup must succeed");
+            assert_eq!(
+                looked_up,
+                LookupOutcome::Miss,
+                "past-window marker {i} must be gone"
+            );
+        }
+        for (i, hour) in recent_hours.iter().enumerate() {
+            // Checked as a direct store existence check, not via read_marker:
+            // read_marker's own min bound (now_hour - dedup_window) carries no
+            // forward-skew margin -- only its upper bound does -- so the
+            // boundary case (hour == now_hour - window - skew) sits in a gap
+            // the sweep deliberately still protects (for a reader whose clock
+            // lags the sweeper's by up to `skew`) but a same-clock
+            // `read_marker` call would itself already call a Miss. The
+            // sweep's own guarantee is that the object still exists; that is
+            // what this asserts.
+            let key = marker_key(
+                &tenant_id,
+                signal,
+                format!("recent-key-{i}").as_bytes(),
+                *hour,
+            );
+            assert!(
+                store.get(&key, GetRange::Full).await.is_ok(),
+                "recent marker {i} at hour {hour} must remain in the store"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idem_sweep_never_touches_other_prefixes() {
+        let tenant_a = TenantId::new("acme");
+        let tenant_a_hash = tenant_a.hash();
+        let tenant_b = TenantId::new("other-tenant");
+        let tenant_b_hash = tenant_b.hash();
+        let signal = Signal::Logs;
+        let other_signal = Signal::Spans;
+
+        let now_hour = 10_000u32;
+        let window = 24u32;
+        let old_hour = now_hour - 200;
+
+        let mem = MemoryStore::new();
+        // The one marker the sweep is allowed to touch.
+        write_marker(
+            &mem,
+            &tenant_a,
+            signal,
+            b"key-a",
+            old_hour,
+            &idem_receipt(1),
+        )
+        .await
+        .expect("seed tenant_a/logs marker");
+
+        // Decoys seeded directly into the underlying store, bypassing
+        // FaultStore's key-substring rules entirely: these prove isolation
+        // structurally (the decoys are still readable afterward), not just
+        // by asserting no fault fired. An implementation that widened its
+        // LIST prefix or delete loop -- e.g. listing the bare `t/<tenant>/`
+        // prefix instead of the (tenant, signal) idem prefix -- would delete
+        // one of these and this test would catch it even though none of the
+        // FaultPlan rules below would ever trigger.
+        let l0_decoy_key = keys::data_key(
+            &tenant_a_hash,
+            signal,
+            0,
+            Uuid::from_u128(1),
+            0,
+            0,
+            &[0xAB; 32],
+        )
+        .expect("build decoy l0 data key");
+        mem.put(
+            &l0_decoy_key,
+            Bytes::from_static(b"l0-decoy"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("seed l0 decoy");
+
+        let commit_decoy_key = keys::commit_key(
+            &tenant_a_hash,
+            signal,
+            0,
+            old_hour,
+            Uuid::from_u128(2),
+            0,
+            0,
+        )
+        .expect("build decoy commit key");
+        mem.put(
+            &commit_decoy_key,
+            Bytes::from_static(b"commit-decoy"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("seed commit decoy");
+
+        write_marker(
+            &mem,
+            &tenant_b,
+            signal,
+            b"key-b",
+            old_hour,
+            &idem_receipt(2),
+        )
+        .await
+        .expect("seed tenant_b/logs decoy marker");
+
+        write_marker(
+            &mem,
+            &tenant_a,
+            other_signal,
+            b"key-a-spans",
+            old_hour,
+            &idem_receipt(3),
+        )
+        .await
+        .expect("seed tenant_a/spans decoy marker");
+
+        let config = CompactorConfig {
+            idem_dedup_window_hours: window,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
+
+        let other_tenant_prefix = idem_prefix(&tenant_b_hash, signal);
+        let other_signal_prefix = idem_prefix(&tenant_a_hash, other_signal);
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::List, ScriptedFault::Timeout).with_key_contains("/l0/"))
+            .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains("/l0/"))
+            .with_rule(Rule::new(Op::List, ScriptedFault::Timeout).with_key_contains("/c/"))
+            .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout).with_key_contains("/c/"))
+            .with_rule(
+                Rule::new(Op::List, ScriptedFault::Timeout)
+                    .with_key_contains(other_tenant_prefix.clone()),
+            )
+            .with_rule(
+                Rule::new(Op::Delete, ScriptedFault::Timeout)
+                    .with_key_contains(other_tenant_prefix),
+            )
+            .with_rule(
+                Rule::new(Op::List, ScriptedFault::Timeout)
+                    .with_key_contains(other_signal_prefix.clone()),
+            )
+            .with_rule(
+                Rule::new(Op::Delete, ScriptedFault::Timeout)
+                    .with_key_contains(other_signal_prefix),
+            );
+        let store = FaultStore::new(mem, plan);
+
+        let outcome =
+            sweep_idempotency_markers(&store, &clock, &config, &NoLeases, &tenant_a_hash, signal)
+                .await
+                .expect("sweep must touch only its own (tenant, signal) idem prefix");
+        assert_eq!(outcome.deleted, 1);
+
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Timeout),
+            0,
+            "no LIST outside the swept (tenant, signal) idem prefix"
+        );
+        assert_eq!(
+            store.fault_count(Op::Delete, FaultKind::Timeout),
+            0,
+            "no DELETE outside the swept (tenant, signal) idem prefix"
+        );
+
+        for decoy_key in [&l0_decoy_key, &commit_decoy_key] {
+            assert!(
+                store.get(decoy_key, GetRange::Full).await.is_ok(),
+                "decoy {decoy_key} must survive the sweep"
+            );
+        }
+        for (decoy_tenant, decoy_signal, key_hint) in [
+            (&tenant_b, signal, b"key-b" as &[u8]),
+            (&tenant_a, other_signal, b"key-a-spans"),
+        ] {
+            let decoy_marker_key = marker_key(decoy_tenant, decoy_signal, key_hint, old_hour);
+            assert!(
+                store.get(&decoy_marker_key, GetRange::Full).await.is_ok(),
+                "decoy marker {decoy_marker_key} must survive the sweep"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn idem_sweep_skips_malformed_marker_key_without_deleting() {
+        let store = MemoryStore::new();
+        let tenant_hash = TenantId::new("acme").hash();
+        let signal = Signal::Logs;
+
+        let prefix = idem_prefix(&tenant_hash, signal);
+        let wrong_suffix_key = format!("{prefix}deadbeefdeadbeefdeadbeefdeadbeef.txt");
+        let bad_hour_key = format!("{prefix}deadbeefdeadbeefdeadbeefdeadbeef.notahexhour.idm");
+        // Real bug this guards against: a key whose pre-hour segment is not a
+        // genuine 32-char lowercase-hex keyhash must be skipped, never
+        // deleted, exactly like a bad hour string already is (fix for issue
+        // #531's adversarial checkpoint).
+        let short_keyhash_key = format!("{prefix}deadbeef.19700101T00.idm");
+        let uppercase_keyhash_key =
+            format!("{prefix}DEADBEEFDEADBEEFDEADBEEFDEADBEEF.19700101T00.idm");
+        let not_hex_keyhash_key = format!("{prefix}not-hex-at-all.19700101T00.idm");
+        let nested_path_key =
+            format!("{prefix}backup/deadbeefdeadbeefdeadbeefdeadbeef.19700101T00.idm");
+        let malformed_keys = [
+            &wrong_suffix_key,
+            &bad_hour_key,
+            &short_keyhash_key,
+            &uppercase_keyhash_key,
+            &not_hex_keyhash_key,
+            &nested_path_key,
+        ];
+        for key in malformed_keys {
+            store
+                .put(key, Bytes::from_static(b"garbage"), PutOptions::default())
+                .await
+                .expect("seed malformed key");
+        }
+
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(0);
+
+        let outcome =
+            sweep_idempotency_markers(&store, &clock, &config, &NoLeases, &tenant_hash, signal)
+                .await
+                .expect("malformed keys are skipped, never fatal");
+        assert_eq!(outcome.deleted, 0);
+        assert_eq!(outcome.kept, 0);
+        assert_eq!(outcome.skipped_malformed, malformed_keys.len());
+
+        for key in malformed_keys {
+            let remaining = store.get(key, GetRange::Full).await;
+            assert!(remaining.is_ok(), "malformed key {key} must not be deleted");
+        }
+
+        for key in [&wrong_suffix_key, &bad_hour_key] {
+            let remaining = store.get(key, GetRange::Full).await;
+            assert!(remaining.is_ok(), "malformed key must not be deleted");
+        }
+    }
+
+    #[tokio::test]
+    async fn idem_sweep_dry_run_counts_without_deleting() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant_hash = tenant_id.hash();
+        let signal = Signal::Logs;
+        let now_hour = 10_000u32;
+        let window = 24u32;
+        let old_hour = now_hour - 200;
+
+        write_marker(
+            &store,
+            &tenant_id,
+            signal,
+            b"key",
+            old_hour,
+            &idem_receipt(1),
+        )
+        .await
+        .expect("seed old marker");
+
+        let config = CompactorConfig {
+            idem_dedup_window_hours: window,
+            dry_run: true,
+            ..CompactorConfig::default()
+        };
+        let clock = FixedClock::new(i64::from(now_hour) * NS_PER_HOUR);
+
+        let outcome =
+            sweep_idempotency_markers(&store, &clock, &config, &NoLeases, &tenant_hash, signal)
+                .await
+                .expect("dry run must not error");
+        assert_eq!(
+            outcome.deleted, 1,
+            "dry run still counts what would be deleted"
+        );
+        assert_eq!(outcome.kept, 0);
+
+        let key = marker_key(&tenant_id, signal, b"key", old_hour);
+        let still_there = store.get(&key, GetRange::Full).await;
+        assert!(still_there.is_ok(), "dry_run must not actually delete");
+    }
+
+    // --- Rule 5: unreferenced catalog-object sweep -----------
+
+    /// A [`LeaseCheck`] that protects any key under one prefix. Stands in for a
+    /// real [`crate::legal_hold::LegalHoldCheck`] snapshot holding that prefix,
+    /// exercising the sweep's per-delete lease gate without seeding audit
+    /// records.
+    struct HoldPrefix(String);
+
+    impl LeaseCheck for HoldPrefix {
+        fn is_protected(&self, key: &str) -> bool {
+            key.starts_with(self.0.as_str())
+        }
+    }
+
+    /// A part ref under the snap prefix. The sweep matches on `key` alone;
+    /// `blake3` only has to be 32 bytes for `encode_head`'s own validation.
+    fn part_ref(key: &str, blake3: [u8; 32]) -> SnapshotPartRef {
+        SnapshotPartRef {
+            key: key.to_string(),
+            blake3: blake3.to_vec(),
+            size: 1,
+            entry_count: 1,
+            watermark_hour: 100,
+            min_hour: 0,
+            column_stats: None,
+        }
+    }
+
+    /// Encode a valid single-or-multi-part HEAD and PUT it at the catalog HEAD
+    /// key, so the sweep's `referenced_catalog_keys` GET returns it.
+    async fn put_head(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        parts: Vec<SnapshotPartRef>,
+        postings: Option<SnapshotPostingsRef>,
+    ) {
+        let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
+        let head = SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour,
+            parts,
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings,
+            column_stats: None,
+            column_stats_part: None,
+            shard_generation_count: 1,
+        };
+        let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
+        store
+            .put(
+                &catalog_head_key(tenant, signal),
+                Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+    }
+
+    /// Like [`put_head`] but also names a column-statistics object through
+    /// field 11 (`SnapshotColumnStatsRef`) and/or field 13
+    /// (`SnapshotColumnStatsPartRef`). Each ref's `part_blake3` mirrors the
+    /// parts' hashes, as `encode_head`'s own validation requires.
+    async fn put_head_with_column_stats(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        parts: Vec<SnapshotPartRef>,
+        column_stats_key: Option<&str>,
+        column_stats_part_key: Option<&str>,
+    ) {
+        let watermark_hour = parts.iter().map(|p| p.watermark_hour).max().unwrap_or(0);
+        let part_blake3: Vec<Vec<u8>> = parts.iter().map(|p| p.blake3.clone()).collect();
+        let head = SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour,
+            parts,
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            column_stats: column_stats_key.map(|key| SnapshotColumnStatsRef {
+                key: key.to_string(),
+                blake3: [9u8; 32].to_vec(),
+                size: 1,
+                segment_count: 1,
+                part_blake3: part_blake3.clone(),
+            }),
+            column_stats_part: column_stats_part_key.map(|key| SnapshotColumnStatsPartRef {
+                key: key.to_string(),
+                blake3: [9u8; 32].to_vec(),
+                size: 1,
+                segment_count: 1,
+                part_blake3: part_blake3.clone(),
+            }),
+            shard_generation_count: 1,
+        };
+        let bytes = ravel_catalog::encode_head(&head).expect("valid HEAD encodes");
+        store
+            .put(
+                &catalog_head_key(tenant, signal),
+                Bytes::from(bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+    }
+
+    /// Seed a catalog object (snapshot part or postings) at `key` with whatever
+    /// the store's current fake clock stamps as `last_modified`.
+    async fn put_catalog_object(store: &dyn ObjectStoreBackend, key: &str) {
+        store
+            .put(
+                key,
+                Bytes::from_static(b"catalog-object"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed catalog object");
+    }
+
+    /// Assert an object is present / absent in the store.
+    async fn present(store: &dyn ObjectStoreBackend, key: &str) -> bool {
+        store.get(key, GetRange::Full).await.is_ok()
+    }
+
+    /// The acceptance test: a snapshot part named by the current HEAD is
+    /// spared even when it is far older than the protection horizon, and an
+    /// unreferenced part younger than the horizon is spared by the age gate.
+    /// Neither delete fires; both objects survive.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_and_young() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let horizon = config.protection_horizon_ns;
+        let now_ns = horizon.saturating_mul(2);
+
+        // Old (store clock 0) referenced part, named by HEAD.
+        let referenced_old = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &referenced_old).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced_old, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        // Young (store clock at now) unreferenced part.
+        store.set_clock_ms((now_ns / 1_000_000) as u64);
+        let unreferenced_young = format!(
+            "{}20260201T00.bbbb.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &unreferenced_young).await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 0, "nothing eligible: referenced or young");
+        assert_eq!(outcome.kept, 2);
+        assert!(
+            present(&store, &referenced_old).await,
+            "an old part the HEAD still names must never be swept"
+        );
+        assert!(
+            present(&store, &unreferenced_young).await,
+            "an unreferenced part younger than the horizon is spared by the age gate"
+        );
+    }
+
+    /// An old, unreferenced snapshot part is swept; the referenced part the
+    /// HEAD names is spared in the same pass.
+    #[tokio::test]
+    async fn catalog_sweep_deletes_old_unreferenced() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        // Both seeded at store clock 0, so both are old.
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let superseded = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &referenced).await;
+        put_catalog_object(&store, &superseded).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(outcome.kept, 1);
+        assert!(
+            !present(&store, &superseded).await,
+            "the old unreferenced part must be swept"
+        );
+        assert!(
+            present(&store, &referenced).await,
+            "the HEAD-named part must be spared"
+        );
+    }
+
+    /// A postings object named by `HEAD.postings.key` is spared like a part ref;
+    /// an unreferenced old postings object under `idx/` is swept.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_postings() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part_blake3 = [7u8; 32];
+        let part = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let referenced_postings = format!(
+            "{}20260101T00.pppp.npost",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let stale_postings = format!(
+            "{}20251231T00.qqqq.npost",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &part).await;
+        put_catalog_object(&store, &referenced_postings).await;
+        put_catalog_object(&store, &stale_postings).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&part, part_blake3)],
+            Some(SnapshotPostingsRef {
+                key: referenced_postings.clone(),
+                blake3: [9u8; 32].to_vec(),
+                size: 1,
+                name_count: 1,
+                part_blake3: vec![part_blake3.to_vec()],
+            }),
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 1, "only the stale postings object");
+        assert!(
+            present(&store, &referenced_postings).await,
+            "a postings object the HEAD names must be spared"
+        );
+        assert!(
+            !present(&store, &stale_postings).await,
+            "an old unreferenced postings object must be swept"
+        );
+        assert!(
+            present(&store, &part).await,
+            "the HEAD-named part is spared"
+        );
+    }
+
+    /// #958: a column-statistics `.cstat` object named by `HEAD.column_stats`
+    /// (field 11, ADR-0850) is immutable and reachable and must survive the
+    /// sweep, exactly like a part or the postings object. It lives under the
+    /// `idx/` prefix the sweep lists, so before the fix its key was absent from
+    /// the reachability set and the sweep deleted it. An unrelated old `.cstat`
+    /// not named by HEAD is still swept. The exact surviving/deleted key sets
+    /// are asserted.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_column_stats() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part_blake3 = [7u8; 32];
+        let part = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        // The live column-stats object HEAD references (fold.rs keys `.cstat`
+        // under `idx/`), and an unrelated stale one no HEAD names.
+        let referenced_cstat = format!(
+            "{}20260101T00.cccc.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let stale_cstat = format!(
+            "{}20251231T00.dddd.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &part).await;
+        put_catalog_object(&store, &referenced_cstat).await;
+        put_catalog_object(&store, &stale_cstat).await;
+        put_head_with_column_stats(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&part, part_blake3)],
+            Some(&referenced_cstat),
+            None,
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        // Exact sets: only the stale, unreferenced `.cstat` is deleted; the
+        // part, the referenced `.cstat`, and the HEAD survive.
+        assert_eq!(outcome.deleted, 1, "only the stale column-stats object");
+        assert_eq!(outcome.kept, 2, "the part and the referenced .cstat");
+        assert!(
+            present(&store, &referenced_cstat).await,
+            "a column-stats object the live HEAD names must never be swept (#958)"
+        );
+        assert!(
+            present(&store, &part).await,
+            "the HEAD-named part is spared"
+        );
+        assert!(
+            !present(&store, &stale_cstat).await,
+            "an old unreferenced column-stats object must be swept"
+        );
+    }
+
+    /// The ADR-0942 part-hash-keyed carrier, field 13
+    /// (`SnapshotColumnStatsPartRef`): a `.cstat` named there is reachable and
+    /// spared just like the field-11 form, so the fix does not depend on which
+    /// field a fold chose to write.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_column_stats_part() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part_blake3 = [7u8; 32];
+        let part = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let referenced_cstat = format!(
+            "{}20260101T00.eeee.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &part).await;
+        put_catalog_object(&store, &referenced_cstat).await;
+        put_head_with_column_stats(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&part, part_blake3)],
+            None,
+            Some(&referenced_cstat),
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 0, "nothing unreferenced to delete");
+        assert_eq!(outcome.kept, 2, "the part and the field-13 .cstat");
+        assert!(
+            present(&store, &referenced_cstat).await,
+            "a field-13 column-stats object the live HEAD names must be spared (#958)"
+        );
+        assert!(
+            present(&store, &part).await,
+            "the HEAD-named part is spared"
+        );
+    }
+
+    /// A part ref carrying a per-part v3 column-stats ref (field 7,
+    /// `SnapshotColumnStatsPartRef`, ADR-1413).
+    fn part_ref_with_v3_stats(
+        key: &str,
+        blake3: [u8; 32],
+        min_hour: u32,
+        watermark_hour: u32,
+        v3_stats_key: &str,
+    ) -> SnapshotPartRef {
+        SnapshotPartRef {
+            min_hour,
+            watermark_hour,
+            column_stats: Some(SnapshotColumnStatsPartRef {
+                key: v3_stats_key.to_string(),
+                blake3: [9u8; 32].to_vec(),
+                size: 1,
+                segment_count: 1,
+                part_blake3: vec![blake3.to_vec()],
+            }),
+            ..part_ref(key, blake3)
+        }
+    }
+
+    /// Issue #1482: a per-part v3 column-stats object (`SnapshotPartRef.
+    /// column_stats`, field 7, ADR-1413) is reachable only through the part
+    /// that carries it, never through `SnapshotHead.column_stats` (field 11)
+    /// or `column_stats_part` (field 13). Before the fix, `read_head_reference`
+    /// only walked those two HEAD-level fields, so a live v3 object crossed
+    /// the protection horizon and was swept out from under a sealed part the
+    /// current HEAD still names -- and, unlike a `.csnap` part, a sealed part
+    /// is never rewritten, so the object was never recreated. Two parts each
+    /// carry a field-7 ref; a third, unrelated `.cstat` is unreferenced. All
+    /// three are older than the horizon. Only the unreferenced one is swept.
+    #[tokio::test]
+    async fn catalog_sweep_spares_referenced_v3_per_part_column_stats() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part_a = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let part_b = format!(
+            "{}20260102T00.bbbb.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let v3_stats_a = format!(
+            "{}20260101T00.aaaa.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let v3_stats_b = format!(
+            "{}20260102T00.bbbb.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+        let unreferenced_cstat = format!(
+            "{}20251231T00.zzzz.cstat",
+            catalog_idx_prefix(&tenant, signal)
+        );
+
+        put_catalog_object(&store, &part_a).await;
+        put_catalog_object(&store, &part_b).await;
+        put_catalog_object(&store, &v3_stats_a).await;
+        put_catalog_object(&store, &v3_stats_b).await;
+        put_catalog_object(&store, &unreferenced_cstat).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![
+                part_ref_with_v3_stats(&part_a, [1u8; 32], 0, 100, &v3_stats_a),
+                part_ref_with_v3_stats(&part_b, [2u8; 32], 101, 200, &v3_stats_b),
+            ],
+            None,
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        // Exact key set: only the unreferenced `.cstat` is deleted; both
+        // parts and both field-7-referenced v3 objects survive. Without the
+        // field-7 walk this assertion fails: `outcome.deleted == 3`,
+        // with `v3_stats_a` and `v3_stats_b` both gone, because
+        // `read_head_reference` never walked `part.column_stats` -- only the
+        // line adding it to `referenced` inside the `for part in &head.parts`
+        // loop distinguishes the two runs.
+        assert_eq!(outcome.deleted, 1, "only the unreferenced v3 object");
+        assert_eq!(outcome.kept, 4, "both parts and both referenced v3 objects");
+        assert!(
+            present(&store, &v3_stats_a).await,
+            "a v3 object a live part still references (field 7) must survive (#1482)"
+        );
+        assert!(
+            present(&store, &v3_stats_b).await,
+            "a v3 object a live part still references (field 7) must survive (#1482)"
+        );
+        assert!(
+            present(&store, &part_a).await,
+            "the HEAD-named part a is spared"
+        );
+        assert!(
+            present(&store, &part_b).await,
+            "the HEAD-named part b is spared"
+        );
+        assert!(
+            !present(&store, &unreferenced_cstat).await,
+            "an old v3 object no part references must still be swept"
+        );
+    }
+
+    /// A legal hold over the object's prefix spares an otherwise-eligible old
+    /// unreferenced part, exactly as it does in every other sweep rule.
+    #[tokio::test]
+    async fn catalog_sweep_spares_legal_hold() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let held = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &referenced).await;
+        put_catalog_object(&store, &held).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        // Control: without the hold, `held` would be swept (proven by
+        // `catalog_sweep_deletes_old_unreferenced`). With a hold over the whole
+        // catalog prefix, it survives.
+        let hold = HoldPrefix(format!("t/{}/catalog/", tenant.to_hex()));
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &hold, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(outcome.deleted, 0, "the hold blocks the delete");
+        assert!(
+            present(&store, &held).await,
+            "a held object must never be swept"
+        );
+    }
+
+    /// Under `dry_run`, the sweep counts what it would delete but calls
+    /// `delete` on nothing.
+    #[tokio::test]
+    async fn catalog_sweep_dry_run_reports_without_deleting() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig {
+            dry_run: true,
+            ..CompactorConfig::default()
+        };
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let superseded = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &referenced).await;
+        put_catalog_object(&store, &superseded).await;
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("dry run must not error");
+
+        assert_eq!(
+            outcome.deleted, 1,
+            "dry run still counts what it would delete"
+        );
+        assert!(
+            present(&store, &superseded).await,
+            "dry_run must not actually delete"
+        );
+    }
+
+    /// With no HEAD present, rule 5 sweeps NOTHING, even for an
+    /// object far older than the horizon. An absent HEAD is the no-anchor case
+    /// (mirroring rule 3's neither-record-nor-tombstone bucket): a recovery
+    /// fold rebuilding from no HEAD recomputes and re-PUTs every part, adopting
+    /// any surviving old object via `AlreadyExists` (which never rewrites it,
+    /// so its `last_modified` stays old) and is about to name it in the HEAD it
+    /// CASes. With no HEAD to compare against, an old record-less catalog
+    /// object is indistinguishable from a part such a fold is mid-flight on, so
+    /// deleting it could race that fold's CAS and orphan the new HEAD.
+    #[tokio::test]
+    async fn catalog_sweep_absent_head_sweeps_nothing() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        // Old (store clock 0) object under snap/, with NO HEAD anywhere.
+        let orphan = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &orphan).await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("an absent HEAD is not an error");
+
+        assert_eq!(
+            outcome.deleted, 0,
+            "no HEAD is the no-anchor case: sweep nothing"
+        );
+        assert_eq!(outcome.kept, 1, "the old object is kept, not collected");
+        assert!(
+            present(&store, &orphan).await,
+            "an old object with no HEAD to anchor the sweep must survive (a \
+             recovery fold may be about to adopt and name it)"
+        );
+    }
+
+    /// A minimal store wrapper that installs a replacement HEAD just before the
+    /// Nth GET of the HEAD key, simulating a concurrent fold's HEAD CAS landing
+    /// between the sweep's first HEAD read and its pre-delete re-verify read.
+    /// Every other operation delegates straight to the inner [`MemoryStore`].
+    struct HeadSwapStore {
+        inner: MemoryStore,
+        head_key: String,
+        new_head: Bytes,
+        swap_on_get: usize,
+        head_gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HeadSwapStore {
+        fn new(inner: MemoryStore, head_key: String, new_head: Bytes, swap_on_get: usize) -> Self {
+            HeadSwapStore {
+                inner,
+                head_key,
+                new_head,
+                swap_on_get,
+                head_gets: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn head_get_count(&self) -> usize {
+            self.head_gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for HeadSwapStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> std::result::Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> std::result::Result<ravel_object_store::GetOutcome, StoreError> {
+            if key == self.head_key {
+                let n = self
+                    .head_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if n == self.swap_on_get {
+                    // The fold's CAS lands: install the new HEAD that names the
+                    // adopted-old object, immediately before the sweep's
+                    // re-verify GET reads it.
+                    self.inner
+                        .put(&self.head_key, self.new_head.clone(), PutOptions::default())
+                        .await
+                        .expect("install swapped HEAD");
+                }
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> std::result::Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// An old, unreferenced object that a concurrent fold adopts
+    /// via `AlreadyExists` (so its `last_modified` stays old) and names in a
+    /// HEAD it CASes *after* the sweep's first HEAD read must NOT be deleted.
+    /// The pre-delete re-verify GET of HEAD sees the fold's just-published HEAD
+    /// and spares the object. Without the re-verify (the pre-fix single stale
+    /// HEAD read), the object clears the horizon age gate and would be swept --
+    /// its age says nothing about the in-flight fold, because adoption never
+    /// rewrote it. The control is `catalog_sweep_deletes_old_unreferenced`: the
+    /// same-shaped old unreferenced object IS deleted when no later HEAD names
+    /// it.
+    #[tokio::test]
+    async fn catalog_sweep_reverify_spares_object_a_racing_fold_adopts() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let inner = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        // Both objects seeded at store clock 0, so both are far older than the
+        // horizon. `referenced` is named by the first HEAD; `adopted` is not.
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let adopted = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&inner, &referenced).await;
+        put_catalog_object(&inner, &adopted).await;
+        // First HEAD: names only `referenced`, so `adopted` is an old
+        // unreferenced candidate on the first read.
+        put_head(
+            &inner,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        // The fold's post-CAS HEAD, installed at the re-verify GET: it names
+        // the adopted old object (a single-part HEAD is enough -- the
+        // re-verify only re-checks the surviving candidate, which is
+        // `adopted`; `referenced` was already counted kept on the first read).
+        let swapped_head = {
+            let head = SnapshotHead {
+                format_version: 1,
+                tenant_hash: tenant.0.to_vec(),
+                signal: 0,
+                shard_count: 1,
+                watermark_hour: 100,
+                parts: vec![part_ref(&adopted, [2u8; 32])],
+                folder_id: vec![0u8; 16],
+                created_unix_ns: 0,
+                postings: None,
+                column_stats: None,
+                column_stats_part: None,
+                shard_generation_count: 1,
+            };
+            Bytes::from(ravel_catalog::encode_head(&head).expect("valid swapped HEAD"))
+        };
+
+        // swap_on_get == 2: the new HEAD is installed just before the sweep's
+        // second HEAD GET, which is the pre-delete re-verify.
+        let store = HeadSwapStore::new(inner, catalog_head_key(&tenant, signal), swapped_head, 2);
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(
+            store.head_get_count(),
+            2,
+            "HEAD is read twice: once for the reference set, once to re-verify \
+             immediately before deleting"
+        );
+        assert_eq!(
+            outcome.deleted, 0,
+            "the object the fold's re-verify-time HEAD names is spared"
+        );
+        assert!(
+            present(&store, &adopted).await,
+            "an old object a racing fold adopted and named must not be swept"
+        );
+        assert!(present(&store, &referenced).await);
+    }
+
+    /// The pre-delete re-verify GET of HEAD actually happens. Fault
+    /// the second HEAD GET (the re-verify) and the pass aborts before any
+    /// delete, exactly as rule 1's and rule 3's re-verify-fault tests prove for
+    /// their re-verify LIST. Mirrors
+    /// `batched_reverify_lists_commit_prefix_once_per_pass`.
+    #[tokio::test]
+    async fn catalog_sweep_reverify_head_get_faults_before_delete() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let mem = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let referenced = format!(
+            "{}20260101T00.aaaa.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        let superseded = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&mem, &referenced).await;
+        put_catalog_object(&mem, &superseded).await;
+        put_head(
+            &mem,
+            &tenant,
+            signal,
+            vec![part_ref(&referenced, [1u8; 32])],
+            None,
+        )
+        .await;
+
+        // The second GET of the HEAD key is the batched re-verify: faulting it
+        // aborts the pass before any delete, proving it happens exactly once
+        // (not zero times) between candidate selection and the delete loop.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Timeout)
+                .with_key_contains("/HEAD")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = FaultStore::new(mem, plan);
+
+        let clock = FixedClock::new(now_ns);
+        let err =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect_err("the re-verify HEAD GET faults the pass");
+        assert!(matches!(err, MaintainError::Store(_)), "got: {err:?}");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Timeout),
+            1,
+            "exactly the re-verify HEAD GET faulted"
+        );
+        assert!(
+            present(&store, &superseded).await,
+            "nothing deleted when the re-verify HEAD GET faults"
+        );
+    }
+
+    /// A HEAD that is present but does not decode aborts the pass with an error
+    /// and deletes nothing: a corrupt HEAD must never make the live snapshot
+    /// look unreferenced.
+    #[tokio::test]
+    async fn catalog_sweep_corrupt_head_deletes_nothing() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+
+        let part = format!(
+            "{}20251231T00.cccc.csnap",
+            catalog_snap_prefix(&tenant, signal)
+        );
+        put_catalog_object(&store, &part).await;
+        store
+            .put(
+                &catalog_head_key(&tenant, signal),
+                Bytes::from_static(b"not a valid HEAD"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt HEAD");
+
+        let clock = FixedClock::new(now_ns);
+        let err =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect_err("a corrupt HEAD must fail the pass, not sweep the snapshot");
+        assert!(matches!(err, MaintainError::Invariant(_)), "got: {err:?}");
+        assert!(
+            present(&store, &part).await,
+            "no object is deleted when the HEAD cannot be decoded"
+        );
+    }
+
+    /// A compaction record stamped a future `format_version` in a bucket is
+    /// refused by the superseded sweep's bucket read (ADR-0066 decision 2), not
+    /// read as version 1: the pass fails before it deletes anything, so the
+    /// record and every input it would have named survive. The record is
+    /// otherwise fully self-consistent (its identity fields reconstruct its own
+    /// key), so the version gate is the only thing that can reject it. Removing
+    /// that gate makes this test fail: the record then decodes as version 1,
+    /// the pass proceeds, and `sweep_superseded` returns `Ok`.
+    #[tokio::test]
+    async fn superseded_sweep_refuses_a_future_version_compaction_record() {
+        let tenant = tenant();
+        let signal = Signal::Metrics;
+        let shard = 0;
+        let store = MemoryStore::new();
+
+        let mut record = CompactionRecord {
+            format_version: 2,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal).into(),
+            shard,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x22; 32],
+            ..Default::default()
+        };
+        record.parts.clear();
+        let key = keys::compaction_record_key_for(&record).expect("key");
+        store
+            .put(
+                &key,
+                record::encode_compaction(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed put");
+
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(config.orphan_age_gate_ns() + 1);
+        let err = sweep_superseded(&store, &clock, &config, &NoLeases, &tenant, signal, shard)
+            .await
+            .expect_err("a version-2 compaction record must fail the pass, not read as v1");
+        match &err {
+            MaintainError::Invariant(msg) => assert!(
+                msg.contains("format_version") && msg.contains("2"),
+                "the failure names the version gate and the version seen: {msg}"
+            ),
+            other => panic!("expected Invariant from the version gate, got {other:?}"),
+        }
+        assert!(
+            present(&store, &key).await,
+            "a failed superseded pass deletes nothing from the bucket"
+        );
+    }
+}
