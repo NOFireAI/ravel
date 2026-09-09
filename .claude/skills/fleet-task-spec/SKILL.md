@@ -83,6 +83,40 @@ tool-result can report a false "affected-tests passed" while a test
 actually failed. If the output is long, redirect it to a file and grep or
 read the file separately; the exit code check and the output-size problem
 are independent, solve them independently.
+Where that file goes is itself a rule, because both wrong answers have
+already cost a task. Run exactly these four commands first, substituting
+nothing:
+
+    LOGDIR="$HOME/gate-logs/$(basename "$PWD")"
+    mkdir -p "$LOGDIR"
+    scripts/guards/check-disk-headroom.sh "$LOGDIR" 5
+    df -h /tmp "$LOGDIR"
+
+If the guard exits non-zero, say so in your report and stop rather than
+picking another directory: a host without 5 GB for a log has no room for
+the gate either, and the run would die mid-link with a fake compiler
+error. Then redirect every long gate to `"$LOGDIR/<step>.log"`.
+The two constraints that path satisfies, both of which have cost a task:
+it is outside the git checkout, and it is not under `/tmp`. Inside the
+checkout, the harness's commit-on-death runs `git add -A`, so a killed
+task sweeps the log into a wip commit and the merge script folds it
+forward into the PR; `.gitignore` carries no `*.log`, and the executor's
+own stray-files self-check below cannot see a commit the harness makes.
+It is also per-task by construction, since the basename of the checkout
+carries the task id, which matters because several tasks can share a
+host. Under `/tmp`, the evidence says the harness's capture filesystem
+lives there rather than on the host disk: issue #1526 records the error
+(`the temp filesystem at /tmp/claude-996/... is full (0MB free)`) and
+`df -h /` reporting 56 GB available at the start of that same run. Once
+it fills, every Bash call fails with ENOSPC, including `true` and `df`,
+so the task cannot run a command to diagnose itself while the host's own
+disk figures look healthy. That is why `df -h /tmp` is in the block
+above: no run has yet captured it on an executor, and the next incident
+needs the datum this one lacked. Quote both `df` lines in your report.
+`CLAUDE_CODE_TMPDIR` is NOT the executor's lever: the harness reads it
+when it creates the per-call capture directory, before the task's first
+Bash call, so exporting it from inside a task changes nothing. Setting it
+on the executor image is the real fix and is tracked on #1526.
 Commit with trailer "Refs: #N".
 Self-check before the commit (see the checklist below): no tool-call
 artifacts in files, no debug_assert-only guards, generated docs
