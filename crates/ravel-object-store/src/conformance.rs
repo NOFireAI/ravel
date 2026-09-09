@@ -1084,6 +1084,15 @@ async fn drain_probe_pages(
     listing: ProbeListing<'_>,
 ) -> Result<(Vec<String>, usize), String> {
     let method = listing.method();
+    // The call the failure detail names, carrying the `start_after` marker for a
+    // tail drain so a `list_after` tail failure reads distinctly from a full
+    // `list_after` drain failure over the same prefix.
+    let call = match listing {
+        ProbeListing::After(Some(start_after)) => {
+            format!("{method}({prefix}, start_after={start_after})")
+        }
+        _ => format!("{method}({prefix})"),
+    };
     let mut delivered: Vec<String> = Vec::new();
     let mut pages = 0usize;
     let mut token = None;
@@ -1092,7 +1101,7 @@ async fn drain_probe_pages(
             ProbeListing::List => store.list(prefix, token).await,
             ProbeListing::After(start_after) => store.list_after(prefix, start_after, token).await,
         };
-        let page = result.map_err(|err| format!("{method}({prefix}) failed: {err}"))?;
+        let page = result.map_err(|err| format!("{call} failed: {err}"))?;
         pages += 1;
         delivered.extend(page.objects.into_iter().map(|meta| meta.key));
         match page.next {
@@ -1101,8 +1110,8 @@ async fn drain_probe_pages(
         }
         if pages >= MAX_PROBE_PAGES {
             return Err(format!(
-                "{method}({prefix}) still returned a continuation token after {pages} pages over \
-                 far fewer keys; this backend's pagination does not terminate"
+                "{call} still returned a continuation token after {pages} pages over far fewer \
+                 keys; this backend's pagination does not terminate"
             ));
         }
     }
@@ -1184,11 +1193,11 @@ async fn probe_lexicographic_listing_order(
     // the other. Draining only one qualified a backend no caller can list:
     // `drain_pages` hard-fails with `ListOrderViolation` on the very sequence
     // the un-judged entry point would have waved through. The detail names the
-    // offending entry point so a qualification report says which call is broken.
-    for (entry_point, listing) in [
-        ("list", ProbeListing::List),
-        ("list_after", ProbeListing::After(None)),
-    ] {
+    // offending entry point via `listing.method()`, so the label a report shows
+    // is owned by the one function every drain already routes through, not a
+    // second literal restated beside the value it must agree with.
+    for listing in [ProbeListing::List, ProbeListing::After(None)] {
+        let entry_point = listing.method();
         let (delivered, _pages) = match drain_probe_pages(store, &list_prefix, listing).await {
             Ok(result) => result,
             Err(detail) => return ProbeResult::fail(property, detail),
@@ -1225,16 +1234,21 @@ async fn probe_lexicographic_listing_order(
     // exactly the last three, still in order.
     let marker = expected[1].clone();
     let expected_tail: Vec<String> = expected[2..].to_vec();
-    let (tail_delivered, _pages) =
-        match drain_probe_pages(store, &list_prefix, ProbeListing::After(Some(&marker))).await {
-            Ok(result) => result,
-            Err(detail) => return ProbeResult::fail(property, detail),
-        };
+    // The tail names its entry point through the same `method()` the full drain
+    // uses, so the ordering probe never hardcodes `list_after`: one function
+    // owns the label on every path.
+    let tail_listing = ProbeListing::After(Some(&marker));
+    let tail_method = tail_listing.method();
+    let (tail_delivered, _pages) = match drain_probe_pages(store, &list_prefix, tail_listing).await
+    {
+        Ok(result) => result,
+        Err(detail) => return ProbeResult::fail(property, detail),
+    };
     if let Some(key) = tail_delivered.iter().find(|key| *key <= &marker) {
         return ProbeResult::fail(
             property,
             format!(
-                "list_after({list_prefix}, start_after={marker}) returned {key}, which does not \
+                "{tail_method}({list_prefix}, start_after={marker}) returned {key}, which does not \
                  compare strictly greater than the marker (docs/object-store-contract.md: \
                  start_after is exclusive)"
             ),
@@ -1246,7 +1260,7 @@ async fn probe_lexicographic_listing_order(
         return ProbeResult::fail(
             property,
             format!(
-                "list_after({list_prefix}, start_after={marker}) delivered {after} after \
+                "{tail_method}({list_prefix}, start_after={marker}) delivered {after} after \
                  {before}, which sorts before it"
             ),
         );
@@ -1256,7 +1270,7 @@ async fn probe_lexicographic_listing_order(
         return ProbeResult::fail(
             property,
             format!(
-                "list_after({list_prefix}, start_after={marker}) returned {} distinct keys, \
+                "{tail_method}({list_prefix}, start_after={marker}) returned {} distinct keys, \
                  expected exactly {}: got {distinct_tail:?}, expected {expected_tail:?}",
                 distinct_tail.len(),
                 expected_tail.len()
@@ -2213,6 +2227,173 @@ mod tests {
                 .contains("acknowledges deletes it has not applied"),
             "the failure must say what is wrong: {}",
             failure.detail
+        );
+    }
+
+    /// Wraps `MemoryStore` and really applies every delete -- so `get` and
+    /// `list` see the key gone -- but re-injects the deleted key into every
+    /// `list_after` page. Models a backend with a stale index on the
+    /// separately implemented `list_after` path alone: a delete is visible
+    /// through `get` and `list`, invisible through `list_after`. The mirror of
+    /// [`WeakOnlyOnListStore`] (defect confined to `list`) and of
+    /// `ReversedOrderStore(ReversedEntryPoint::ListAfter)` (ordering defect
+    /// confined to `list_after`), aimed at the delete probe's `list_after`
+    /// drain, which nothing else reaches.
+    ///
+    /// Violated invariant: `DeleteIdempotent`
+    /// (formal/tla/common/traceability.md `Delete / DeleteIdempotent`) as
+    /// observed through `list_after`: the key must be absent from every access
+    /// path after a delete.
+    struct WeakDeleteOnListAfterStore {
+        inner: MemoryStore,
+        /// Deleted keys, with the metadata they had at delete time, re-injected
+        /// into `list_after` pages under their prefix.
+        resurrected_on_list_after: Mutex<HashMap<String, ObjectMeta>>,
+    }
+
+    impl WeakDeleteOnListAfterStore {
+        fn new() -> Self {
+            WeakDeleteOnListAfterStore {
+                inner: MemoryStore::new(),
+                resurrected_on_list_after: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for WeakDeleteOnListAfterStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let mut page_result = self.inner.list_after(prefix, start_after, page).await?;
+            let resurrected = self.resurrected_on_list_after.lock();
+            for (key, meta) in resurrected.iter() {
+                let after_marker = start_after.is_none_or(|marker| key.as_str() > marker);
+                if key.starts_with(prefix)
+                    && after_marker
+                    && !page_result
+                        .objects
+                        .iter()
+                        .any(|existing| &existing.key == key)
+                {
+                    page_result.objects.push(meta.clone());
+                }
+            }
+            page_result.objects.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok(page_result)
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            if let Ok(meta) = self.inner.head(key).await {
+                self.resurrected_on_list_after
+                    .lock()
+                    .insert(key.to_string(), meta);
+            }
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The delete probe drains BOTH `list` and `list_after` and requires the
+    /// deleted key absent from each, so a delete visible through `list` but not
+    /// through the separately implemented `list_after` fails qualification,
+    /// named against `list_after`. Without the `list_after` drain the delete
+    /// probe passed `list` and never looked, and the tightening rested on there
+    /// being no `list_after` caller outside this crate.
+    #[tokio::test]
+    async fn a_backend_with_a_delete_stale_on_list_after_fails_qualification() {
+        let store = WeakDeleteOnListAfterStore::new();
+        let report = run_conformance_suite(&store, "sys/qualify/delete-stale-list-after/").await;
+        assert!(
+            !report.passed(),
+            "a delete invisible through list_after must not qualify even when list is correct"
+        );
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(
+            failed,
+            vec![Property::DeleteVisibility],
+            "only delete visibility should be named: get, list, and every non-delete probe are \
+             untouched"
+        );
+        let failure = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::DeleteVisibility)
+            .expect("the delete probe ran");
+        assert!(
+            failure.detail.starts_with("list_after(")
+                && failure
+                    .detail
+                    .contains("returned 2 keys, expected exactly 1"),
+            "the failure must name the list_after entry point that still re-delivers the deleted \
+             key: {}",
+            failure.detail
+        );
+    }
+
+    /// The delete probe's PASS detail wording is pinned verbatim, so the claim
+    /// it makes -- that BOTH `list` and `list_after` held exactly one key after
+    /// the delete -- is asserted somewhere and cannot drift silently.
+    #[tokio::test]
+    async fn delete_probe_pass_detail_is_pinned() {
+        let store = MemoryStore::new();
+        let prefix = "sys/qualify/delete-pass-detail/";
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(
+            report.passed(),
+            "the oracle must pass every probe, got: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let list_prefix = format!("{prefix}delete/");
+        let kept = format!("{list_prefix}kept");
+        let gone = format!("{list_prefix}gone");
+        let delete = report
+            .results
+            .iter()
+            .find(|r| r.property == Property::DeleteVisibility)
+            .expect("the delete probe ran");
+        assert_eq!(
+            delete.detail,
+            format!(
+                "after deleting {gone}, a get returned NotFound and both list and list_after held \
+                 exactly 1 key ({kept}); a second delete of the absent key succeeded and changed \
+                 nothing"
+            )
         );
     }
 
@@ -3250,6 +3431,98 @@ mod tests {
             ]
         );
         assert_eq!(distinct_in_delivery_order(&tail_delivered), tail_delivered);
+    }
+
+    /// Wraps `MemoryStore` and errors every `list_after` call that carries a
+    /// `start_after` marker, delegating every other operation (including the
+    /// marker-free full drains) to the oracle. Reaches the ordering probe's
+    /// `start_after` tail drain alone, so its failure detail is the one the
+    /// drain builds for a tail call.
+    struct TailErrorStore {
+        inner: MemoryStore,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for TailErrorStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<crate::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            if start_after.is_some() {
+                return Err(StoreError::Timeout);
+            }
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A `list_after` tail drain failure names the `start_after` marker, so it
+    /// reads distinctly from a full `list_after` drain failure over the same
+    /// prefix (both once said only `list_after({prefix}) failed`). Reaches the
+    /// tail-labeling arm of the drain's failure detail, which the marker-free
+    /// full and `list` drains never take.
+    #[tokio::test]
+    async fn list_after_tail_drain_failure_names_the_start_after_marker() {
+        let store = TailErrorStore {
+            inner: MemoryStore::new(),
+        };
+        let prefix = "sys/qualify/tail-error/";
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(!report.passed());
+        let failed: Vec<Property> = report.failures().map(|r| r.property).collect();
+        assert_eq!(
+            failed,
+            vec![Property::LexicographicListingOrder],
+            "only the ordering probe drains list_after with a start_after marker; every other \
+             probe uses list or a marker-free list_after and is untouched"
+        );
+        let list_prefix = format!("{prefix}order/");
+        // The ordering probe resumes strictly after the second sorted key.
+        let marker = format!("{list_prefix}b");
+        assert_eq!(
+            order_probe_result(&report).detail,
+            format!("list_after({list_prefix}, start_after={marker}) failed: timeout"),
+            "the tail drain failure must name the start_after marker, not read like a full drain \
+             failure over the same prefix"
+        );
     }
 
     /// The `list` twin of
