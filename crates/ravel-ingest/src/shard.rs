@@ -43,8 +43,8 @@ use uuid::Uuid;
 use crate::budget::IngestByteCharge;
 use crate::clock::Clock;
 use crate::config::{
-    FlushClockError, IngestConfig, MAX_FLUSH_CLOCK_HOLD_NS, SEGMENT_FORMAT_VERSION,
-    checked_ingest_hour_bucket,
+    DrainIntent, FlushClockError, IngestConfig, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
+    SEGMENT_FORMAT_VERSION, checked_ingest_hour_bucket,
 };
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
@@ -988,11 +988,16 @@ impl ShardActor {
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
                         }
                         Some(ShardMsg::FlushNow { done }) => {
-                            self.flush_all(FlushTrigger::Manual).await;
+                            // Not a teardown: this arm does not break, so the
+                            // actor keeps running and anything the drain could
+                            // not stamp is retried by a later trigger.
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Retryable)
+                                .await;
                             let _ = done.send(());
                         }
                         Some(ShardMsg::Shutdown { done }) => {
-                            self.flush_all(FlushTrigger::Manual).await;
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
+                                .await;
                             let _ = done.send(());
                             break;
                         }
@@ -1018,7 +1023,8 @@ impl ShardActor {
                                      flushing buffered tenants before stopping"
                                 );
                             }
-                            self.flush_all(FlushTrigger::Manual).await;
+                            self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
+                                .await;
                             break;
                         }
                     }
@@ -1186,11 +1192,63 @@ impl ShardActor {
         (self.tenants.len(), points)
     }
 
-    async fn flush_all(&mut self, trigger: FlushTrigger) {
-        let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
-        for tenant in tenants {
-            if let Some(buf) = self.tenants.remove(&tenant) {
-                self.flush_tenant(tenant, buf, trigger).await;
+    /// Drains every buffered tenant, then awaits durability (ADR-1307 finding
+    /// F1). A clock-refused flush re-buffers its tenant (`flush_tenant`'s
+    /// `RegressionRefused` arm), so a single snapshot of the key set is not
+    /// exhaustive: a tenant re-inserted after the snapshot consumed its key
+    /// would never be retried in this call. On the `Shutdown` and channel-close
+    /// paths there is no later actor tick to retry it, so the re-buffered
+    /// tenant would drop on teardown -- the exact loss the channel-close arm
+    /// forbids. Retry over fresh snapshots until the map empties, bounded by
+    /// [`MAX_FLUSH_ALL_PASSES`]. This terminates because a refusal re-anchors
+    /// the monotonic floor to the raw reading, so the next pass stamps it and
+    /// proceeds; the bound only guards a pathological clock stepping back on
+    /// every reading.
+    ///
+    /// Residue left by the bound is never dropped silently, but it is only a
+    /// durability defect when nothing will retry it, so `intent` decides how it
+    /// is reported: an ERROR and the `flush_all_residue_tenants` bump on a
+    /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
+    /// the residue is still in the tenant map with its arrival bookkeeping and
+    /// the actor is still running to flush it.
+    async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
+        let mut passes = 0;
+        while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
+            let tenants: Vec<TenantId> = self.tenants.keys().cloned().collect();
+            for tenant in tenants {
+                if let Some(buf) = self.tenants.remove(&tenant) {
+                    self.flush_tenant(tenant, buf, trigger).await;
+                }
+            }
+            passes += 1;
+        }
+        if !self.tenants.is_empty() {
+            let (tenant_count, buffered_points) = self.buffered_summary();
+            match intent {
+                DrainIntent::Teardown => {
+                    self.metrics.record_flush_all_residue(tenant_count as u64);
+                    tracing::error!(
+                        shard = self.shard,
+                        tenant_count,
+                        buffered_points,
+                        passes,
+                        "ravel-ingest: flush_all left buffered tenants unflushed after \
+                         exhausting retry passes; acknowledged buffered-mode rows lost \
+                         on this graceful drain"
+                    );
+                }
+                DrainIntent::Retryable => {
+                    tracing::warn!(
+                        shard = self.shard,
+                        tenant_count,
+                        buffered_points,
+                        passes,
+                        "ravel-ingest: flush_all left buffered tenants unflushed after \
+                         exhausting retry passes; the actor keeps running and these \
+                         tenants stay buffered, so the next trigger (age tick or \
+                         explicit flush) retries them"
+                    );
+                }
             }
         }
         self.join_all_flushes().await;
@@ -1344,8 +1402,16 @@ impl ShardActor {
                 // next flush recovers from, so it is retryable (`Abandoned`, 503),
                 // not a client `SegmentBuild` (400) that would drop the buffered
                 // rows on a conformant exporter. The floor re-anchored to `raw_ns`
-                // inside the helper, so the next trigger stamps `raw_ns` and
-                // proceeds; exactly one flush is ever refused. Re-buffer the rows
+                // inside the helper, so the next reading at or above `raw_ns`
+                // proceeds: the bound is per backwards step, not global, and a
+                // single backwards step refuses exactly one flush. It is not a
+                // guarantee that only one flush is refused over the process
+                // lifetime (ADR-1307 Consequences). A clock that keeps stepping
+                // back beyond the bound refuses every flush for as long as that
+                // continues, and within one drain the absorb path returns the held
+                // stamp without advancing the floor, so a receding clock can refuse
+                // one tenant, absorb the next few against the re-anchored value,
+                // and refuse again. Re-buffer the rows
                 // so that next trigger flushes them (finding 1): `charges` ride
                 // back with the buffer (the byte budget is not refunded, the bytes
                 // are still held), and the whole buffer -- series, exemplars, and

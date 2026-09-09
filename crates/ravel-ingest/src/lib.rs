@@ -40,7 +40,7 @@ pub use attribution::{MAX_TRACKED_TENANTS, PUTS_PER_FLUSH, TenantPutAttribution,
 pub use budget::{IngestByteBudget, IngestByteBudgetLimit, IngestByteCharge, IngestByteShed};
 pub use clock::{Clock, SystemClock};
 pub use config::{
-    IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_CLOCK_HOLD_NS,
+    IngestConfig, LOG_SEGMENT_FORMAT_VERSION, MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS,
     MIN_PLAUSIBLE_INGEST_CLOCK_NS, SEGMENT_FORMAT_VERSION, SPAN_SEGMENT_FORMAT_VERSION,
     STRICT_VISIBILITY_RESERVE_NS, plausible_ingest_clock,
 };

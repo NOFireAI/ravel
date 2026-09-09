@@ -230,6 +230,13 @@ impl LogIngestRouter {
         &self.metrics
     }
 
+    /// The counter registry as a shared handle, for a caller that must read the
+    /// same registry after [`Self::shutdown`] consumes the router (the graceful
+    /// drain counts into it).
+    pub fn metrics_handle(&self) -> Arc<LogIngestMetrics> {
+        self.metrics.clone()
+    }
+
     /// Resolve the tenant's active shard-actor set for a write at `now_ns`,
     /// re-reading the provisioning record when the cached view is older than the
     /// refresh interval `C` (ADR-0052 section 3). When the re-read cannot

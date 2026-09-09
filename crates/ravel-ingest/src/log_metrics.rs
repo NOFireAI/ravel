@@ -94,6 +94,14 @@ pub struct LogIngestMetrics {
     /// `clock_regressions` (absorbed). Intended for Prometheus export under the
     /// name `ravel_ingest_clock_regressions_refused_total` (#1473).
     clock_regressions_refused: AtomicU64,
+    /// Tenants still buffered after a TEARDOWN `flush_all` (`Shutdown`, channel
+    /// close) exhausted its bounded retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect, logged at ERROR beside this bump. Residue on a
+    /// `FlushNow` drain is not counted here: the actor keeps running with those
+    /// tenants buffered, so the next trigger retries them and nothing is lost
+    /// (logged at WARN instead).
+    flush_all_residue_tenants: AtomicU64,
     /// Multi-shard Strict writes that returned
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably and at least one sibling then failed in the same
@@ -234,6 +242,12 @@ pub struct LogIngestMetricsSnapshot {
     /// bound (ADR-1307). Intended for export as
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     pub clock_regressions_refused: u64,
+    /// Tenants left buffered after a teardown `flush_all` (`Shutdown`, channel
+    /// close) exhausted its retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect. A `FlushNow` drain does not bump it (the actor keeps
+    /// running and retries the residue).
+    pub flush_all_residue_tenants: u64,
     /// Multi-shard Strict writes returned as
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): a partial
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
@@ -441,6 +455,15 @@ impl LogIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `count` tenants still buffered after a teardown `flush_all` drained
+    /// (ADR-1307 finding F1). Called once per teardown drain that leaves a
+    /// residue; never from the `FlushNow` drain, which retries its residue on
+    /// the next trigger.
+    pub(crate) fn record_flush_all_residue(&self, count: u64) {
+        self.flush_all_residue_tenants
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
     /// committed durably before a sibling failed. Recorded once per such write,
@@ -551,6 +574,7 @@ impl LogIngestMetrics {
             stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
             clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
             clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
@@ -660,6 +684,13 @@ mod tests {
             LogIngestMetrics::record_clock_regression_refused,
             LogIngestMetricsSnapshot {
                 clock_regressions_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush_all_residue(3),
+            LogIngestMetricsSnapshot {
+                flush_all_residue_tenants: 3,
                 ..Default::default()
             },
         );

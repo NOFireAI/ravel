@@ -22,12 +22,13 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{TestClock, make_point, tenant};
+use common::{RecedingClock, TestClock, build_labels, make_point, tenant};
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_ingest::{
-    IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, MAX_FLUSH_CLOCK_HOLD_NS,
-    SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
+    IngestConfig, IngestExemplar, IngestPoint, IngestRouter, LogIngestRouter, LogWriteError,
+    MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS, SpanIngestRouter, SpanWriteError, WriteError,
+    WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
@@ -36,7 +37,7 @@ use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_rspan::StatusCode;
 use ravel_types::logstream::{AttrValue, log_stream_id};
-use ravel_types::{CommitToken, Signal, TenantId};
+use ravel_types::{CommitToken, Exemplar, METRIC_NAME_LABEL, SeriesId, Signal, TenantId};
 
 const T0: i64 = 1_700_000_000_000_000_000;
 const TEN_MINUTES_NS: i64 = 600_000_000_000;
@@ -76,6 +77,39 @@ fn flush_per_write_config() -> IngestConfig {
         max_flush_delay: Duration::from_secs(3600),
         flush_tick: Duration::from_millis(20),
         ..IngestConfig::default()
+    }
+}
+
+/// A config where a write buffers rather than flushing: the byte target and
+/// both age delays are large and the age tick is long, so nothing flushes until
+/// `flush_all`/`shutdown` drains it. Lets a test hold a buffered-mode row across
+/// a graceful teardown, which is where the F1 drain-time refusal lives.
+fn buffered_config() -> IngestConfig {
+    IngestConfig {
+        shard_count: 1,
+        target_bytes: 64 * 1024 * 1024,
+        max_flush_delay: Duration::from_secs(3600),
+        max_flush_delay_idle: Duration::from_secs(3600),
+        flush_tick: Duration::from_secs(3600),
+        ..IngestConfig::default()
+    }
+}
+
+/// One exemplar for `metric`'s series (no extra labels, so its `series_id`
+/// matches `make_point(tenant, metric, &[], ..)`), for the InvalidReading-arm
+/// exemplar-drop test.
+fn metrics_exemplar(tenant: &TenantId, metric: &str, ts_ns: i64, tag: u8) -> IngestExemplar {
+    let labels = build_labels(&[(METRIC_NAME_LABEL, metric)]);
+    let series_id = SeriesId::compute(tenant, metric, &labels).expect("series id");
+    IngestExemplar {
+        series_id,
+        exemplar: Exemplar {
+            ts_ns,
+            value_bits: 1.0f64.to_bits(),
+            trace_id: [tag; 16],
+            span_id: [tag; 8],
+            filtered_attributes: Vec::new(),
+        },
     }
 }
 
@@ -1286,4 +1320,862 @@ async fn spans_sub_floor_reading_after_floor_armed_fails_before_the_floor() {
     );
 
     router.shutdown().await;
+}
+
+/// Logs: mirror of `metrics_refused_flush_re_buffers_rows_for_the_next_flush`.
+/// A refused flush re-buffers its records rather than dropping them, so the
+/// drain flush at `shutdown` publishes them (ADR-1307 finding 1). Flipping the
+/// log refuse arm from `self.tenants.insert(tenant, buf)` to `drop(buf)` leaves
+/// the tenant empty at shutdown: only the first two flushes' four objects exist,
+/// so this assertion of six fails.
+#[tokio::test]
+async fn logs_refused_flush_re_buffers_records_for_the_next_flush() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "boot")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("baseline flush arms the floor at T0");
+
+    clock.set_ns(T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS);
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(2_000, "glitch")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a forward step stamps raw and ratchets the floor");
+
+    let before = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        before.len(),
+        4,
+        "two successful flushes: two data objects and two commit records: {before:?}"
+    );
+
+    clock.set_ns(T0 + ONE_MINUTE_NS);
+    let refused = router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(3_000, "correction")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await;
+    let err = refused.expect_err("a backwards step beyond the bound must fail the flush");
+    assert!(
+        err.is_retryable(),
+        "the refusal is retryable so the caller re-drives the write; got: {err:?}"
+    );
+
+    let after_refuse = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_refuse.len(),
+        4,
+        "the refused flush published nothing itself: {after_refuse:?}"
+    );
+    assert_eq!(router.metrics().snapshot().clock_regressions_refused, 1);
+
+    // The drain flush reads the clock at T0 + 1m, equal to the re-anchored
+    // floor, so it proceeds and publishes the re-buffered records.
+    router.shutdown().await;
+
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        6,
+        "the re-buffered records reached the store on the drain flush (one more \
+         data object and commit record); had the refuse arm dropped the buffer, \
+         only four objects would exist: {objects:?}"
+    );
+}
+
+/// Spans: mirror of `metrics_refused_flush_re_buffers_rows_for_the_next_flush`.
+/// A refused flush re-buffers its spans rather than dropping them, so the drain
+/// flush at `shutdown` publishes them (ADR-1307 finding 1). Flipping the span
+/// refuse arm from `self.tenants.insert(tenant, buf)` to `drop(buf)` leaves the
+/// tenant empty at shutdown: only the first two flushes' four objects exist, so
+/// this assertion of six fails.
+#[tokio::test]
+async fn spans_refused_flush_re_buffers_spans_for_the_next_flush() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("baseline flush arms the floor at T0");
+
+    clock.set_ns(T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS);
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(2_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a forward step stamps raw and ratchets the floor");
+
+    let before = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        before.len(),
+        4,
+        "two successful flushes: two data objects and two commit records: {before:?}"
+    );
+
+    clock.set_ns(T0 + ONE_MINUTE_NS);
+    let refused = router
+        .write(
+            tenant.clone(),
+            vec![norm_span(3_000, StatusCode::Error)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await;
+    let err = refused.expect_err("a backwards step beyond the bound must fail the flush");
+    assert!(
+        err.is_retryable(),
+        "the refusal is retryable so the caller re-drives the write; got: {err:?}"
+    );
+
+    let after_refuse = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_refuse.len(),
+        4,
+        "the refused flush published nothing itself: {after_refuse:?}"
+    );
+    assert_eq!(router.metrics().snapshot().clock_regressions_refused, 1);
+
+    router.shutdown().await;
+
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        6,
+        "the re-buffered spans reached the store on the drain flush (one more \
+         data object and commit record); had the refuse arm dropped the buffer, \
+         only four objects would exist: {objects:?}"
+    );
+}
+
+/// F1 (metrics): a refusal that happens DURING the graceful drain, not on a
+/// write. A buffered-mode row sits unflushed; `shutdown`'s own drain flush is
+/// the one refused, because a forward glitch armed the floor far above the
+/// drain's clock reading. `flush_all` must retry over a fresh snapshot -- the
+/// refusal re-anchored the floor to the drain reading, so the second pass stamps
+/// it and proceeds -- so the buffered row still reaches the store. Reverting
+/// `flush_all` to a single snapshot drops the re-buffered tenant on teardown:
+/// the row never publishes and only the floor-arming flush's two objects exist,
+/// so this assertion of four fails.
+#[tokio::test]
+async fn metrics_flush_all_retries_a_refusal_during_the_drain() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    // Arm the floor far ahead so the later drain reading is a backwards step
+    // beyond the hold bound.
+    let armed_ns = T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS;
+    let clock = TestClock::new(armed_ns);
+    let router = IngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+    // The refusal is counted during `shutdown`, which consumes the router, so
+    // read the counter through a shared handle taken beforehand.
+    let metrics = router.metrics_handle();
+
+    // Buffered write A, then flush it: this arms the floor at `armed_ns`.
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                1_000,
+                1.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+
+    let after_arm = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_arm.len(),
+        2,
+        "flushing A arms the floor and publishes one data object and commit record: {after_arm:?}"
+    );
+
+    // Buffered write B stays in the shard buffer (large byte target, long
+    // delays): only the drain will flush it.
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                2_000,
+                2.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    // The clock corrects far back: the drain's first flush attempt for B is a
+    // backwards step beyond the bound, so it is refused inside `flush_all`.
+    clock.set_ns(T0);
+    router.shutdown().await;
+
+    assert_eq!(
+        metrics.snapshot().clock_regressions_refused,
+        1,
+        "the drain's first flush attempt for B is refused exactly once"
+    );
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        4,
+        "the drain retried the refusal and published B (one more data object and \
+         commit record); a single-snapshot flush_all would have dropped B and \
+         left only two objects: {objects:?}"
+    );
+}
+
+/// F1 (logs): the log drain retries a refusal that happens during it. Same shape
+/// as the metrics F1 test; reverting the log `flush_all` to a single snapshot
+/// drops the re-buffered tenant and this assertion of four fails.
+#[tokio::test]
+async fn logs_flush_all_retries_a_refusal_during_the_drain() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let armed_ns = T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS;
+    let clock = TestClock::new(armed_ns);
+    let router = LogIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+    let metrics = router.metrics_handle();
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "a")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+
+    let after_arm = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_arm.len(),
+        2,
+        "flushing A arms the floor: {after_arm:?}"
+    );
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(2_000, "b")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    clock.set_ns(T0);
+    router.shutdown().await;
+
+    assert_eq!(
+        metrics.snapshot().clock_regressions_refused,
+        1,
+        "the drain's first flush attempt for B is refused exactly once"
+    );
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        4,
+        "the drain retried the refusal and published B; a single-snapshot \
+         flush_all would have left only two objects: {objects:?}"
+    );
+}
+
+/// F1 (spans): the span drain retries a refusal that happens during it. Same
+/// shape as the metrics F1 test; reverting the span `flush_all` to a single
+/// snapshot drops the re-buffered tenant and this assertion of four fails.
+#[tokio::test]
+async fn spans_flush_all_retries_a_refusal_during_the_drain() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let armed_ns = T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS;
+    let clock = TestClock::new(armed_ns);
+    let router = SpanIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+    let metrics = router.metrics_handle();
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000, StatusCode::Unset)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+
+    let after_arm = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_arm.len(),
+        2,
+        "flushing A arms the floor: {after_arm:?}"
+    );
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(2_000, StatusCode::Unset)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    clock.set_ns(T0);
+    router.shutdown().await;
+
+    assert_eq!(
+        metrics.snapshot().clock_regressions_refused,
+        1,
+        "the drain's first flush attempt for B is refused exactly once"
+    );
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        4,
+        "the drain retried the refusal and published B; a single-snapshot \
+         flush_all would have left only two objects: {objects:?}"
+    );
+}
+
+/// F2 (metrics): the `InvalidReading` refuse arm counts every buffered exemplar
+/// as dropped, so the drop stays visible when a grossly broken clock reading
+/// abandons the flush. A sub-floor reading fails `checked_ingest_hour_bucket` at
+/// the helper entry, so the flush is abandoned before the buffer is built and
+/// its two buffered exemplars never reach `admit_exemplars`; the arm counts them.
+/// Removing `self.metrics.record_exemplars(0, buf.exemplars.len())` from the
+/// `InvalidReading` arm drops the count to zero and this assertion fails.
+#[tokio::test]
+async fn metrics_invalid_reading_arm_counts_dropped_exemplars() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    // A sub-floor reading: below MIN_PLAUSIBLE_INGEST_CLOCK_NS, so the flush's
+    // clock read fails at the helper entry (InvalidReading), not the floor.
+    let clock = TestClock::new(1_000);
+    let router = IngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+
+    // One point plus two exemplars for its series, in windows far enough apart
+    // that both would be admitted if the flush ever built: it does not, so both
+    // are counted dropped by the refuse arm.
+    let point = IngestPoint::from(make_point(&tenant, "cpu_usage", &[], 1_000, 1.0));
+    let exemplars = vec![
+        metrics_exemplar(&tenant, "cpu_usage", 1_000, 1),
+        metrics_exemplar(&tenant, "cpu_usage", 20_000_000_000, 2),
+    ];
+    let refused = router
+        .write_values_with_exemplars(
+            tenant.clone(),
+            vec![point],
+            exemplars,
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await;
+    let err = refused.expect_err("a sub-floor flush reading must fail the flush");
+    assert!(
+        matches!(err, WriteError::SegmentBuild(_)),
+        "a sub-floor reading is fail-loud SegmentBuild; got: {err:?}"
+    );
+
+    let snap = router.metrics().snapshot();
+    assert_eq!(
+        snap.exemplars_dropped_total, 2,
+        "both buffered exemplars are counted dropped by the InvalidReading arm"
+    );
+    assert_eq!(
+        snap.exemplars_written_total, 0,
+        "the abandoned flush wrote no exemplars"
+    );
+    assert_eq!(
+        snap.abandoned_input_rejected, 1,
+        "the sub-floor flush is abandoned as input-rejected"
+    );
+
+    router.shutdown().await;
+}
+
+/// A backwards step per reading large enough that the floor cannot absorb it,
+/// so a [`RecedingClock`] armed with it refuses every drain pass instead of
+/// letting the second one proceed. Derived from the production bound, never a
+/// literal.
+const RECEDING_STEP_NS: i64 = 2 * MAX_FLUSH_CLOCK_HOLD_NS;
+
+/// F1 (metrics, teardown): a drain whose refusals outlive the pass cap. The
+/// clock steps back beyond the hold bound on *every* reading, so each of the
+/// `MAX_FLUSH_ALL_PASSES` passes is refused and the tenant is still buffered
+/// when the drain gives up. On `Shutdown` the actor breaks straight after the
+/// drain, so nothing retries that residue: it is an acknowledged buffered-mode
+/// row lost on a graceful teardown, which is what the ERROR log and
+/// `flush_all_residue_tenants` report. Flipping the `Shutdown` arm's
+/// `DrainIntent::Teardown` to `DrainIntent::Retryable` leaves the counter at
+/// zero and this assertion of one fails.
+#[tokio::test]
+async fn metrics_teardown_drain_reports_residue_after_the_pass_cap() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let armed_ns = T0 + RECEDING_STEP_NS;
+    let clock = RecedingClock::new(armed_ns);
+    let router = IngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+    let metrics = router.metrics_handle();
+
+    // Write A and flush it while the clock is still frozen: this arms the floor
+    // at `armed_ns`.
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                1_000,
+                1.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+    let after_arm = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_arm.len(),
+        2,
+        "flushing A arms the floor and publishes one data object and commit record: {after_arm:?}"
+    );
+
+    // Write B stays buffered: only a drain will flush it.
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                2_000,
+                2.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    // Arm the recession: the drain's first reading is `T0` (a backwards step of
+    // `RECEDING_STEP_NS` below the armed floor) and every later reading is
+    // another `RECEDING_STEP_NS` lower, so re-anchoring the floor never lets a
+    // pass through.
+    clock.recede_from(T0, RECEDING_STEP_NS);
+    router.shutdown().await;
+
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
+        "every drain pass is refused, once per pass, so the cap is what ends the drain"
+    );
+    assert_eq!(
+        snap.clock_regressions, 0,
+        "every step is beyond the hold bound, so none is absorbed"
+    );
+    assert_eq!(
+        snap.flush_all_residue_tenants, 1,
+        "the one tenant still buffered when a teardown drain gave up is reported as residue"
+    );
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        2,
+        "B never published: only A's data object and commit record exist: {objects:?}"
+    );
+}
+
+/// F1 (metrics, `FlushNow`): the same residue on the drain the actor OUTLIVES
+/// is not a lost row and must not be reported as one. The `FlushNow` arm does
+/// not break: the tenant stays in the buffer map with its arrival bookkeeping,
+/// so a later trigger flushes it. This asserts the counter whose own doc calls
+/// a nonzero value a durability defect stays at zero across such a drain, and
+/// then that the row does publish once the clock stops receding. Flipping the
+/// `FlushNow` arm's `DrainIntent::Retryable` to `DrainIntent::Teardown` bumps
+/// the counter to one and the first assertion of zero fails.
+#[tokio::test]
+async fn metrics_flush_now_drain_does_not_report_residue_and_retries_it() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let armed_ns = T0 + RECEDING_STEP_NS;
+    let clock = RecedingClock::new(armed_ns);
+    let router = IngestRouter::new(
+        buffered_config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+    let metrics = router.metrics_handle();
+
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                1_000,
+                1.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+    let after_arm = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_arm.len(),
+        2,
+        "flushing A arms the floor: {after_arm:?}"
+    );
+
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                2_000,
+                2.0,
+            )],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    clock.recede_from(T0, RECEDING_STEP_NS);
+    router.flush_all().await;
+
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
+        "the FlushNow drain is refused on every pass too, so it hits the same cap"
+    );
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "the actor keeps running after FlushNow, so its residue is not a lost write"
+    );
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        2,
+        "B has not published yet; it is still buffered: {objects:?}"
+    );
+
+    // The clock stops receding: the next reading is forward of the re-anchored
+    // floor, so the retained buffer flushes on the next trigger.
+    clock.freeze_at(armed_ns);
+    router.flush_all().await;
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        4,
+        "the retained B published on the next flush: one more data object and \
+         commit record: {objects:?}"
+    );
+
+    router.shutdown().await;
+    assert_eq!(
+        metrics.snapshot().flush_all_residue_tenants,
+        0,
+        "nothing was buffered by the time of the teardown drain, so no residue there either"
+    );
+}
+
+/// F1 (logs, teardown): mirror of
+/// `metrics_teardown_drain_reports_residue_after_the_pass_cap` in the log shard
+/// actor. Flipping the log `Shutdown` arm's `DrainIntent::Teardown` to
+/// `DrainIntent::Retryable` leaves the counter at zero and this fails.
+#[tokio::test]
+async fn logs_teardown_drain_reports_residue_after_the_pass_cap() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let armed_ns = T0 + RECEDING_STEP_NS;
+    let clock = RecedingClock::new(armed_ns);
+    let router = LogIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+    let metrics = router.metrics_handle();
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "a")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+    let after_arm = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_arm.len(),
+        2,
+        "flushing A arms the floor: {after_arm:?}"
+    );
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(2_000, "b")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    clock.recede_from(T0, RECEDING_STEP_NS);
+    router.shutdown().await;
+
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
+        "every drain pass is refused, once per pass"
+    );
+    assert_eq!(
+        snap.flush_all_residue_tenants, 1,
+        "the tenant still buffered when the teardown drain gave up is reported as residue"
+    );
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(objects.len(), 2, "B never published: {objects:?}");
+}
+
+/// F1 (logs, `FlushNow`): mirror of
+/// `metrics_flush_now_drain_does_not_report_residue_and_retries_it` in the log
+/// shard actor. Flipping the log `FlushNow` arm's `DrainIntent::Retryable` to
+/// `DrainIntent::Teardown` bumps the counter to one and this fails.
+#[tokio::test]
+async fn logs_flush_now_drain_does_not_report_residue_and_retries_it() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let armed_ns = T0 + RECEDING_STEP_NS;
+    let clock = RecedingClock::new(armed_ns);
+    let router = LogIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+    let metrics = router.metrics_handle();
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "a")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(2_000, "b")],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    clock.recede_from(T0, RECEDING_STEP_NS);
+    router.flush_all().await;
+
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
+        "the FlushNow drain is refused on every pass too"
+    );
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "the actor keeps running after FlushNow, so its residue is not a lost write"
+    );
+
+    clock.freeze_at(armed_ns);
+    router.flush_all().await;
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        4,
+        "the retained B published on the next flush: {objects:?}"
+    );
+
+    router.shutdown().await;
+    assert_eq!(
+        metrics.snapshot().flush_all_residue_tenants,
+        0,
+        "nothing was buffered by the time of the teardown drain"
+    );
+}
+
+/// F1 (spans, teardown): mirror of
+/// `metrics_teardown_drain_reports_residue_after_the_pass_cap` in the span
+/// shard actor. Flipping the span `Shutdown` arm's `DrainIntent::Teardown` to
+/// `DrainIntent::Retryable` leaves the counter at zero and this fails.
+#[tokio::test]
+async fn spans_teardown_drain_reports_residue_after_the_pass_cap() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let armed_ns = T0 + RECEDING_STEP_NS;
+    let clock = RecedingClock::new(armed_ns);
+    let router = SpanIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+    let metrics = router.metrics_handle();
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000, StatusCode::Unset)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+    let after_arm = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_arm.len(),
+        2,
+        "flushing A arms the floor: {after_arm:?}"
+    );
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(2_000, StatusCode::Unset)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    clock.recede_from(T0, RECEDING_STEP_NS);
+    router.shutdown().await;
+
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
+        "every drain pass is refused, once per pass"
+    );
+    assert_eq!(
+        snap.flush_all_residue_tenants, 1,
+        "the tenant still buffered when the teardown drain gave up is reported as residue"
+    );
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(objects.len(), 2, "B never published: {objects:?}");
+}
+
+/// F1 (spans, `FlushNow`): mirror of
+/// `metrics_flush_now_drain_does_not_report_residue_and_retries_it` in the span
+/// shard actor. Flipping the span `FlushNow` arm's `DrainIntent::Retryable` to
+/// `DrainIntent::Teardown` bumps the counter to one and this fails.
+#[tokio::test]
+async fn spans_flush_now_drain_does_not_report_residue_and_retries_it() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let armed_ns = T0 + RECEDING_STEP_NS;
+    let clock = RecedingClock::new(armed_ns);
+    let router = SpanIngestRouter::new(buffered_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+    let metrics = router.metrics_handle();
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000, StatusCode::Unset)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write A accepted");
+    router.flush_all().await;
+
+    router
+        .write(
+            tenant.clone(),
+            vec![norm_span(2_000, StatusCode::Unset)],
+            WriteMode::Buffered,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("buffered write B accepted");
+
+    clock.recede_from(T0, RECEDING_STEP_NS);
+    router.flush_all().await;
+
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.clock_regressions_refused, MAX_FLUSH_ALL_PASSES as u64,
+        "the FlushNow drain is refused on every pass too"
+    );
+    assert_eq!(
+        snap.flush_all_residue_tenants, 0,
+        "the actor keeps running after FlushNow, so its residue is not a lost write"
+    );
+
+    clock.freeze_at(armed_ns);
+    router.flush_all().await;
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        4,
+        "the retained B published on the next flush: {objects:?}"
+    );
+
+    router.shutdown().await;
+    assert_eq!(
+        metrics.snapshot().flush_all_residue_tenants,
+        0,
+        "nothing was buffered by the time of the teardown drain"
+    );
 }
