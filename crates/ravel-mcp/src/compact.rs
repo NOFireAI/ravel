@@ -129,7 +129,8 @@ fn cell_display(cell: &Cell) -> String {
     match cell {
         Cell::Null => "null".to_string(),
         Cell::Bool(b) => b.to_string(),
-        Cell::Int(n) | Cell::Timestamp(n) => n.to_string(),
+        Cell::Int(n) => n.to_string(),
+        Cell::Timestamp(n) => n.to_string(),
         Cell::Float(f) if f.is_nan() => "NaN".to_string(),
         Cell::Float(f) if *f == f64::INFINITY => "+Inf".to_string(),
         Cell::Float(f) if *f == f64::NEG_INFINITY => "-Inf".to_string(),
@@ -310,7 +311,7 @@ mod tests {
             r#type: "int64".to_string(),
         }];
         envelope.data.rows = (0..row_count)
-            .map(|i| vec![Cell::Int(i as i64 + 1)])
+            .map(|i| vec![Cell::Int(i as i128 + 1)])
             .collect();
         envelope.data.row_count = row_count as u64;
         envelope
