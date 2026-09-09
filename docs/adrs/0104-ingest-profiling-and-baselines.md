@@ -120,11 +120,33 @@ pipeline's own boundaries rather than transplanted by analogy from the other.
 | route | router | seam | both |
 | merge | shard actor | seam | both, different impls |
 | encode | flush task | seam | both, different impls |
+| bloom | flush task, nested inside `encode` | seam | logs only |
 | PUT | flush task, object store | `InstrumentedStore` (decision 5) | both |
 
 Decode and normalize need no seam: the bench drives them and can time them
-directly. Only `admit`, `route`, `merge` and `encode` need instrumentation,
-which keeps the seam's surface small.
+directly. Five stages need instrumentation: `admit`, `route`, `merge`,
+`encode`, and, on the logs pipeline only, `bloom`. That keeps the seam's
+surface small.
+
+**These stages are not a partition, and summing them double-counts.** The
+first four are disjoint and consecutive, so `admit + route + merge + encode`
+is a meaningful total. `bloom` is not a fifth slice alongside them: it is
+measured *inside* `encode`, with the enclosing `encode` timer still running
+(issue #1516). The `RlogWriter` block-write loop times each block's
+`BloomBuilder` insert-plus-`finish` window and reports the sum through
+`WriteStats::bloom_block_ns`, which `log_shard` folds into the `bloom`
+accumulator; every one of those nanoseconds is also counted in `encode`. So
+`admit + route + merge + encode + bloom` exceeds the wall time the pipeline
+actually spent, by exactly the bloom figure. Read `bloom` as a breakdown of
+`encode`, never as a term in a total. The table lists it after `encode`
+because it is contained by it, not because it runs after it.
+
+The nesting is deliberate rather than an artefact. Carving bloom out of
+`encode` as a disjoint slice would mean starting and stopping the `encode`
+timer around every block's bloom window, which puts two `Instant::now()`
+reads per block into the path whose cost is under measurement. Measuring the
+inner window separately costs the same two reads but leaves `encode`
+comparable to the figure it reported before this stage existed.
 
 **Caveat on `admit` — CORRECTED after T1 (#504) measured it.** The original
 text here said the bulk-load path bypasses the per-tenant
@@ -247,7 +269,10 @@ flowchart LR
     end
     RTE --> MRG
     subgraph actor["shard actor (stage-timing seam)"]
-        MRG[merge] --> ENC[encode]
+        MRG[merge] --> ENC
+        subgraph ENC["encode (one timer spans this whole box)"]
+            BLM["bloom (logs only)<br/>inner timer, not a slice of encode"]
+        end
     end
     ENC --> PUT[PUT]
     PUT --> STORE[(object store)]
@@ -256,11 +281,17 @@ flowchart LR
     RTE -.-> ACC
     MRG -.-> ACC
     ENC -.-> ACC
+    BLM -.->|"also counted in encode"| ACC
     ACC --> REP[bench report JSON]
     INST --> REP
     ALLOC["stats_alloc: e2e ingest + query"] --> REP
     REP -->|"consumed by, not built here"| CMP["epic #51 bench_compare"]
 ```
+
+The left-to-right arrows are pipeline order and the boxes they connect are
+disjoint, so those figures sum. `bloom` is drawn inside the `encode` box
+rather than on the chain because it is contained by `encode`, not sequenced
+with it; see decision 2 on why summing all five double-counts.
 
 ## Rejected alternatives
 
