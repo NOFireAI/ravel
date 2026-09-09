@@ -555,6 +555,14 @@ impl LogFlushCtx {
         }
         let bytes = match writer.finish_with_stats() {
             Ok((bytes, stats)) => {
+                // Per-block bloom-construction time (issue #1516), nested inside
+                // the `Encode` window this whole match arm sits in: one sample
+                // per block, read before `record_postings` moves `stats`.
+                #[cfg(feature = "stage-timing")]
+                for bloom_ns in &stats.bloom_block_ns {
+                    self.stage_timings
+                        .record(LogStage::Bloom, Duration::from_nanos(*bloom_ns));
+                }
                 // Write-side POSTINGS metrics: section bytes, per-field distinct
                 // counts, and the cap-exceeded counter.
                 self.metrics.record_postings(stats);
