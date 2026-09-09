@@ -380,16 +380,16 @@ pub(crate) async fn fetch_stats_object(
     // the version this slot is defined to hold (a stale object left behind by
     // a downgrade, or a future writer bug), so it must not be accepted into
     // this version's map: degrade like any other stale binding.
-    if decoded.header.format_version != resolved.expected_version {
-        return Ok(FetchOutcome::Absent);
-    }
-
     if decoded.header.tenant_hash != tenant.0.to_vec() {
         return Err(LoadColumnStatsError::TenantHashMismatch {
             key: resolved.key.clone(),
             expected: tenant.to_hex(),
             actual: hex::encode(&decoded.header.tenant_hash),
         });
+    }
+
+    if decoded.header.format_version != resolved.expected_version {
+        return Ok(FetchOutcome::Absent);
     }
 
     let actual_part_blake3: Result<Vec<[u8; 32]>, _> = decoded
