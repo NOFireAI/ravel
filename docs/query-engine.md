@@ -2064,12 +2064,16 @@ leftover request, so the model is one round too many. The same sliding
   whether or not a fold has run, so folding can never remove that cost and
   counting it here would overstate the fold benefit.
 - `unfoldedRecordsServedFromCache`: the EXACT count of COMMIT RECORDS this
-  query's resolve served from the catalog's local decoded commit-record
-  cache, read straight from accounting
+  query's resolve found already resident during its listing prewarm pass,
+  read straight from accounting
   (`QueryAccountingSnapshot::commit_record_cache_hits`) rather than inferred
-  from any pooled cache counter. A RECORD count, not a segment count, and the
-  two differ for the same reason `unfoldedSegmentsResolved` above is a
-  segment count: the listing window is padded by `max_ingest_lag_ns` and
+  from any pooled cache counter. The prewarm pass is the whole of it: a
+  record served afterwards through a read-your-write token lookup is not
+  counted, and neither are the records an attempt abandoned to a snapshot
+  invalidation had warmed. A RECORD count, not a segment count, diverging
+  from `unfoldedSegmentsResolved` by its own mechanism and in the opposite
+  direction to the compaction-part expansion described above: the listing
+  window is padded by `max_ingest_lag_ns` and
   runs to the current hour regardless of the query's end, so a resolve
   prewarms commit-record buckets its range never touches and
   `include_l0_if_overlaps` drops those records afterwards -- on a live
