@@ -387,7 +387,13 @@ there before changing a rule.
   proceed anyway. It exits 1 for a base that is behind and 2 when it could
   not tell (bad argument, no such pull request, git failed), so a caller
   reporting to a human can say which it got; a caller that only needs "may
-  I merge" treats any non-zero as no. Note it fetches with an explicit destination refspec: a
+  I merge" treats any non-zero as no, and MUST, because 126 and 127 come
+  from the shell rather than the guard and mean it never ran. That is not
+  hypothetical: the guard is newer than most checkouts, a primary checkout
+  here is routinely dozens of commits behind, and one lacking the file
+  exits 127, which a caller switching on 1 versus 2 falls straight
+  through. Run it from a worktree that is on current main; asking a stale
+  tree whether a branch is stale is the same mistake one level up. Note it fetches with an explicit destination refspec: a
   hand-rolled version using `git fetch origin main <other-ref>` and then
   `rev-parse FETCH_HEAD` reads back MAIN, so it compares main with itself
   and reports every branch fresh.

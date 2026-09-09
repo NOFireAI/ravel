@@ -23,6 +23,12 @@
 # non-zero as no; one that reports to a human should say which of the two it
 # got, since "behind" and "could not tell" have different fixes.
 #
+# A caller must treat any non-zero as no rather than switching on 1 versus 2,
+# because 126 and 127 never reach this script: they come from the shell when
+# this file is not executable or not there at all, and a checkout behind the
+# commit that added it has neither. Run this from a worktree on current main
+# for the same reason.
+#
 # Fetches with an explicit destination refspec rather than reading FETCH_HEAD.
 # `git fetch origin main <other-ref>` leaves FETCH_HEAD naming main, so a check
 # written that way compares main with itself and reports success for any branch.
