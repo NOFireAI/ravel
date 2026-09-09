@@ -59,7 +59,28 @@ mod imp {
         /// `finish_with_stats` in the spawned flush. `RlogWriter`, not
         /// `SegmentWriter`; it excludes the object-store PUT, which decision 5
         /// measures separately.
+        ///
+        /// [`LogStage::Bloom`] construction happens inside this window: it is
+        /// a nested sub-phase, not a slice cut out of it, so `Encode`'s total
+        /// is unchanged by `Bloom` existing. Summing every [`LogStage`]
+        /// variant's `total_ns` double-counts bloom time for exactly that
+        /// reason.
         Encode,
+        /// Per-block bloom construction inside the RLOG block-write loop
+        /// (issue #1516): each block's `BloomBuilder::new`-through-`finish`
+        /// window in `ravel_logseg::RlogWriter`'s `build_object` /
+        /// `build_object_columnar`, one sample per block. It covers the bloom
+        /// build only, excluding `write_block` / `write_block_columnar`
+        /// (block assembly) and everything else those functions do.
+        ///
+        /// This window is INSIDE [`LogStage::Encode`], not subtracted from
+        /// it: `Encode` still times the whole `RlogWriter::push` +
+        /// `finish_with_stats` call, bloom construction included. `Bloom` is
+        /// reported anyway, nested, because a profile (#1511) found bloom
+        /// construction is 61% of `Encode` and the only way to see that
+        /// number before this stage existed was hand-instrumenting two crates
+        /// and reverting the patch afterward.
+        Bloom,
     }
 
     impl LogStage {
@@ -70,6 +91,7 @@ mod imp {
                 LogStage::Route => "route",
                 LogStage::Merge => "merge",
                 LogStage::Encode => "encode",
+                LogStage::Bloom => "bloom",
             }
         }
     }
@@ -101,6 +123,7 @@ mod imp {
         route: StageCell,
         merge: StageCell,
         encode: StageCell,
+        bloom: StageCell,
     }
 
     impl LogStageTimings {
@@ -114,6 +137,7 @@ mod imp {
                 LogStage::Route => &self.route,
                 LogStage::Merge => &self.merge,
                 LogStage::Encode => &self.encode,
+                LogStage::Bloom => &self.bloom,
             }
         }
 
@@ -137,6 +161,7 @@ mod imp {
                 LogStage::Route,
                 LogStage::Merge,
                 LogStage::Encode,
+                LogStage::Bloom,
             ] {
                 let cell = self.cell(stage);
                 let samples = cell.samples.load(Ordering::Relaxed);
@@ -409,13 +434,15 @@ mod tests {
     }
 
     /// Drives a real logs write through the router to a flush and asserts the
-    /// wired stage set is EXACTLY {admit, route, merge, encode} -- no missing
-    /// stage, no extra one -- and every stage recorded a nonzero duration.
+    /// wired stage set is EXACTLY {admit, route, merge, encode, bloom} -- no
+    /// missing stage, no extra one -- and every stage recorded a nonzero
+    /// duration.
     ///
     /// The set is pinned exactly on purpose: a "the map is non-empty" assertion
-    /// would still pass with three of the four stages silently unwired, which is
-    /// the failure this test exists to catch (ADR-0104 decision 2 wires four
-    /// logs stages).
+    /// would still pass with several of the five stages silently unwired,
+    /// which is the failure this test exists to catch (ADR-0104 decision 2
+    /// wires the original four logs stages; issue #1516 adds `bloom` as a
+    /// fifth, nested inside `encode`).
     #[cfg(feature = "stage-timing")]
     #[tokio::test]
     async fn logs_pipeline_records_every_wired_stage() {
@@ -451,12 +478,13 @@ mod tests {
             LogStage::Route,
             LogStage::Merge,
             LogStage::Encode,
+            LogStage::Bloom,
         ];
         let recorded: Vec<LogStage> = snap.stages().collect();
         assert_eq!(
             recorded,
             wired.to_vec(),
-            "recorded stage set must be exactly the four wired logs stages, got {:?}",
+            "recorded stage set must be exactly the five wired logs stages, got {:?}",
             recorded.iter().map(|s| s.name()).collect::<Vec<_>>(),
         );
 

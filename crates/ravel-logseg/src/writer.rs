@@ -110,7 +110,8 @@ pub struct RlogWriter {
 /// allowlist forbids: `postings_distinct_total` over `postings_indexed_fields`
 /// yields a mean distinct-per-field, and `postings_distinct_max` the tail,
 /// with no field name ever leaving this struct.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(feature = "stage-timing"), derive(Copy))]
 pub struct WriteStats {
     /// Indexed fields dropped from POSTINGS in this object for exceeding
     /// `RlogConfig::postings_max_distinct`
@@ -142,6 +143,17 @@ pub struct WriteStats {
     /// budget, which is otherwise silent (ADR-0100 decision 1). Same
     /// aggregate-only, no-per-field-label shaping as the fields above.
     pub dynamic_columns_overflowed: u32,
+    /// Nanoseconds spent building each block's bloom filter: the
+    /// `BloomBuilder::new` through `finish` window in the block-write loop,
+    /// one entry per block in block order. Excludes `write_block` /
+    /// `write_block_columnar` (block assembly) and everything else
+    /// `build_object` / `build_object_columnar` does. Only present with the
+    /// `stage-timing` feature; the caller (`ravel_ingest::log_shard`) folds
+    /// each entry in as its own `LogStage::Bloom` sample, nested inside (not
+    /// subtracted from) the `LogStage::Encode` window that already times the
+    /// whole `finish_with_stats` call (issue #1516).
+    #[cfg(feature = "stage-timing")]
+    pub bloom_block_ns: Vec<u64>,
 }
 
 /// The maximum byte length of a string value inserted into the bloom by exact
@@ -520,6 +532,8 @@ impl RlogWriter {
 
         let mut blocks = BlocksBuilder::new(layout);
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
+        #[cfg(feature = "stage-timing")]
+        let mut bloom_block_ns: Vec<u64> = Vec::new();
 
         // POSTINGS accumulation: per indexed column, term -> sorted block
         // indices. `BTreeMap`/`BTreeSet` throughout, never `HashMap`, so
@@ -581,6 +595,8 @@ impl RlogWriter {
             let out = write_block(block_rows, &plans, self.cfg.zstd_level)?;
 
             // Bloom over body, severity_text, and string columns.
+            #[cfg(feature = "stage-timing")]
+            let bloom_start = std::time::Instant::now();
             let mut builder = BloomBuilder::new(self.cfg.bloom_seed);
             for row in block_rows {
                 insert_text(&mut builder, COL_BODY, row.body.as_bytes());
@@ -619,6 +635,9 @@ impl RlogWriter {
                 }
             }
             bloom_entries.push(builder.finish());
+            #[cfg(feature = "stage-timing")]
+            bloom_block_ns
+                .push(u64::try_from(bloom_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
 
             // Accounting.
             for row in block_rows {
@@ -801,6 +820,8 @@ impl RlogWriter {
                 postings_distinct_max,
                 dynamic_columns_used,
                 dynamic_columns_overflowed,
+                #[cfg(feature = "stage-timing")]
+                bloom_block_ns,
             },
         ))
     }
@@ -1177,6 +1198,8 @@ impl RlogWriter {
         let mut last_blk: HashMap<u32, u32> = HashMap::new();
         let mut blocks = BlocksBuilder::new(layout);
         let mut bloom_entries: Vec<Vec<u8>> = Vec::new();
+        #[cfg(feature = "stage-timing")]
+        let mut bloom_block_ns: Vec<u64> = Vec::new();
         let mut postings_terms: BTreeMap<u32, BTreeMap<Vec<u8>, BTreeSet<u32>>> = BTreeMap::new();
         let mut postings_capped: BTreeSet<u32> = BTreeSet::new();
         let mut min_ts = i64::MAX;
@@ -1395,6 +1418,8 @@ impl RlogWriter {
 
             // Bloom over body, severity_text, and string columns; POSTINGS over
             // each row's merged-view indexed terms.
+            #[cfg(feature = "stage-timing")]
+            let bloom_start = std::time::Instant::now();
             let mut builder = BloomBuilder::new(self.cfg.bloom_seed);
             let mut terms_start = 0usize;
             for (li, &g) in block_rows.iter().enumerate() {
@@ -1456,6 +1481,9 @@ impl RlogWriter {
                 }
             }
             bloom_entries.push(builder.finish());
+            #[cfg(feature = "stage-timing")]
+            bloom_block_ns
+                .push(u64::try_from(bloom_start.elapsed().as_nanos()).unwrap_or(u64::MAX));
 
             for &g in block_rows {
                 min_ts = min_ts.min(g_ts[g]);
@@ -1617,6 +1645,8 @@ impl RlogWriter {
                 postings_distinct_max,
                 dynamic_columns_used,
                 dynamic_columns_overflowed,
+                #[cfg(feature = "stage-timing")]
+                bloom_block_ns,
             },
         ))
     }
@@ -3504,13 +3534,48 @@ mod tests {
         let mut w = RlogWriter::new(RlogConfig::default(), identity());
         w.push(base_record(0, 0)).expect("push");
         let (_obj, stats) = w.finish_with_stats().expect("finish");
+        // Field-by-field, not a full-struct `assert_eq!` against
+        // `WriteStats::default()`: with `stage-timing` on, this single-record
+        // write still builds one block's bloom, so `bloom_block_ns` is
+        // genuinely non-empty here and a full-struct comparison against the
+        // all-default value would fail for a reason this test isn't about.
+        assert_eq!(stats.postings_capped_fields, 0);
+        assert_eq!(stats.postings_bytes, 0);
+        assert_eq!(stats.postings_indexed_fields, 0);
+        assert_eq!(stats.postings_distinct_total, 0);
+        assert_eq!(stats.postings_distinct_max, 0);
+        assert_eq!(stats.dynamic_columns_used, 1);
+        assert_eq!(stats.dynamic_columns_overflowed, 0);
+    }
+
+    /// One `bloom_block_ns` sample per block, no more, no fewer (issue #1516).
+    /// `block_target_records: 3` chunks 30 pushed records into exactly 10
+    /// blocks (`chunk_blocks` splits by record count alone here;
+    /// `block_max_bytes`'s default 8MB is nowhere near reached at this
+    /// scale), so the sample count is pinned to 10, not merely asserted
+    /// non-empty: a build that recorded one sample for the whole write
+    /// instead of one per block would still pass a `> 0` check but fails
+    /// this one.
+    #[cfg(feature = "stage-timing")]
+    #[test]
+    fn bloom_block_ns_reports_exactly_one_sample_per_block() {
+        let cfg = RlogConfig {
+            block_target_records: 3,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity());
+        for i in 0..30i64 {
+            w.push(base_record(0, i)).expect("push");
+        }
+        let (_obj, stats) = w.finish_with_stats().expect("finish");
         assert_eq!(
-            stats,
-            WriteStats {
-                dynamic_columns_used: 1,
-                ..WriteStats::default()
-            }
+            stats.bloom_block_ns.len(),
+            10,
+            "30 records at block_target_records=3 must chunk into exactly 10 blocks, one bloom sample each"
         );
+        for (i, ns) in stats.bloom_block_ns.iter().enumerate() {
+            assert!(*ns > 0, "block {i}'s bloom build reported a zero duration");
+        }
     }
 
     #[test]
