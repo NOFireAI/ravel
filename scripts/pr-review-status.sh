@@ -193,11 +193,16 @@ cr_comments=$(echo "${comments_json}" | jq '[.[] | select(.user.login=="coderabb
 cr_outside_diff=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" \
   -f "$(dirname "$0")/lib/coderabbit-outside-diff.jq")
 
-# "CI green" is a claim about checks that RAN. On a pull request whose paths
-# excluded every one of them, the honest phrase is that nothing ran: the merge
-# is still allowed, since GitHub treats a skipped required check as satisfied,
-# but an operator reading "CI green" would conclude the suite covered this
-# change when it did not.
+# "CI green" is a claim about checks that RAN, so a rollup of nothing but
+# skips should not make it. This branch is DEFENSIVE, not a case this
+# repository currently reaches: no workflow here carries an `on.*.paths`
+# filter, and ci.yml's `changes` job has neither `needs:` nor `if:`, so it and
+# the other ungated lanes run and pass on every pull request. A docs-only PR
+# therefore reads 4 pass / 15 skipped, not 0 / 19, and "CI green" is honest on
+# it. What was wrong there was only the COUNT, which said 19 pass. Keep this
+# branch anyway: it costs three lines and it is what stops the phrase lying if
+# a path filter is ever added, which is the change that would make it
+# reachable.
 ci_phrase="CI green"
 if [[ "${success}" == "0" && "${skipped}" != "0" ]]; then
   ci_phrase="every check skipped, nothing ran"

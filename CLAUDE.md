@@ -274,7 +274,8 @@ connection, a pushed-but-broken main).
   commit ids, not the tree, so the tree-hash-keyed receipt still matches.
 - `scripts/pr-review-status.sh <pr-number>`: one-line status for the
   wait-for-CodeRabbit-then-merge-by-hand flow -- `mergeStateStatus`, the
-  CI check rollup (pass/pending/fail counts, failing check names), and
+  CI check rollup (pass/pending/fail counts, a skipped count when it is
+  nonzero, and failing check names), and
   the `coderabbitai[bot]` review count plus its inline-comment count. The
   REST comments endpoint carries no resolved/unresolved field (that's a
   GraphQL review-thread concept), so a nonzero comment count needs a
