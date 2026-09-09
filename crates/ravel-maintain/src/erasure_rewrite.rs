@@ -861,12 +861,23 @@ fn first_dropping_request(
 /// sample counts [`MaintainError::ErasureConservationViolation`]'s gate
 /// checks, and the `drops[]` entries for every request in the input batch
 /// (including `dropped_count: 0` ones, ADR-0064 §4).
+///
+/// `exemplars_kept`/`exemplars_dropped` are an additive exemplar-disposition
+/// report, deliberately SEPARATE from the sample conservation gate: exemplars
+/// are not samples, so they never enter that gate's arithmetic (ADR-0064
+/// decision 3 point 4 counts samples only). They exist so a regression that
+/// silently drops or silently retains exemplars moves a visible figure --
+/// the round-one over-retention was silent precisely because nothing counted
+/// exemplars. Always zero on the logs/spans build paths, which carry no
+/// metrics-style exemplar section.
 #[derive(Debug)]
 pub struct RewriteBuild {
     pub parts: Vec<BuiltPart>,
     pub input_sample_count: u64,
     pub output_sample_count: u64,
     pub drops: Vec<RewriteDrop>,
+    pub exemplars_kept: u64,
+    pub exemplars_dropped: u64,
 }
 
 /// Decode-filter-reencode one bucket's live record set against every
@@ -927,7 +938,11 @@ pub async fn build_rewrite(
     // sample loop uses ([`first_dropping_request`]) against an exemplar's own
     // series labels. `ExemplarInput` carries only `series_id`, not labels, so
     // this is the resolution the exemplar filter reuses rather than deriving a
-    // second matching path.
+    // second matching path. Built only when some input actually carries an
+    // exemplar; per read.rs an empty EXEMPLARS section is the common case, so
+    // the common no-exemplar rewrite never clones a per-series `LabelSet`/
+    // applicable set into a map it would only consult for exemplars.
+    let any_exemplars = catalogs.iter().any(|c| !c.exemplars.is_empty());
     let mut series_meta: HashMap<[u8; 16], (LabelSet, Vec<usize>)> = HashMap::new();
 
     for (_id, contributions) in by_series {
@@ -942,7 +957,9 @@ pub async fn build_rewrite(
             .map(|(i, _)| i)
             .collect();
 
-        series_meta.insert(series_id.0, (labels.clone(), applicable.clone()));
+        if any_exemplars {
+            series_meta.insert(series_id.0, (labels.clone(), applicable.clone()));
+        }
 
         let mut runs_out = Vec::new();
         for (idx, series) in &contributions {
@@ -1078,9 +1095,12 @@ pub async fn build_rewrite(
     // that only PARTIALLY survives (a windowed request drops only its in-window
     // samples, leaving the series in `series_out`). A series-level survival
     // test would carry every such in-window exemplar forward verbatim, value,
-    // trace_id, span_id and attrs, which is an unrecoverable leak: ADR-0064 §5
-    // removes the `.dreq` once `.done` is written, so no query-time filter
-    // applies afterward.
+    // trace_id, span_id and attrs, which is an unrecoverable leak: ADR-0064 §2's
+    // query-time exclusion filter applies only while the request's `.dreq` is
+    // pending, and §5 releases that `.dreq` once erasure completes (its `.done`
+    // is written, the protection horizon has elapsed, and no superseded input
+    // is still resolvable), after which nothing filters the carried-forward
+    // record at query time.
     //
     // An exemplar is kept only when BOTH hold:
     //   1. its series survives into the output at all -- the writer rejects an
@@ -1101,19 +1121,28 @@ pub async fn build_rewrite(
     // is borrowed; read.rs bounds each input's exemplar set to the
     // catalog-metadata memory term, so one copy stays inside that bound.
     let surviving_series: HashSet<[u8; 16]> = series_out.iter().map(|s| s.series_id.0).collect();
+    // Tally kept vs dropped exemplars as an additive report (see `RewriteBuild`).
+    // This is NOT folded into the sample conservation gate: exemplars are not
+    // samples and that gate's arithmetic must not change.
+    let mut exemplars_kept: u64 = 0;
+    let mut exemplars_dropped: u64 = 0;
     let exemplars: Vec<ExemplarInput> = catalogs
         .iter()
         .flat_map(|catalog| catalog.exemplars.iter())
         .filter(|e| {
-            if !surviving_series.contains(&e.series_id.0) {
-                return false;
+            let keep = surviving_series.contains(&e.series_id.0)
+                && match series_meta.get(&e.series_id.0) {
+                    Some((labels, applicable)) => {
+                        first_dropping_request(applicable, requests, labels, e.ts_ns).is_none()
+                    }
+                    None => false,
+                };
+            if keep {
+                exemplars_kept += 1;
+            } else {
+                exemplars_dropped += 1;
             }
-            match series_meta.get(&e.series_id.0) {
-                Some((labels, applicable)) => {
-                    first_dropping_request(applicable, requests, labels, e.ts_ns).is_none()
-                }
-                None => false,
-            }
+            keep
         })
         .cloned()
         .collect();
@@ -1144,6 +1173,8 @@ pub async fn build_rewrite(
         input_sample_count,
         output_sample_count,
         drops,
+        exemplars_kept,
+        exemplars_dropped,
     })
 }
 
@@ -1366,6 +1397,9 @@ pub async fn build_rewrite_logs(
         input_sample_count: merged.input_record_count,
         output_sample_count: merged.output_record_count,
         drops,
+        // Logs/spans carry no metrics-style exemplar section on this path.
+        exemplars_kept: 0,
+        exemplars_dropped: 0,
     })
 }
 
@@ -1487,6 +1521,9 @@ pub async fn build_rewrite_spans(
         input_sample_count: merged.input_record_count,
         output_sample_count: merged.output_record_count,
         drops,
+        // Logs/spans carry no metrics-style exemplar section on this path.
+        exemplars_kept: 0,
+        exemplars_dropped: 0,
     })
 }
 
@@ -1620,6 +1657,19 @@ pub async fn publish_rewrite_record(
             build.parts.len()
         )));
     }
+
+    // Exemplar disposition surfaces here as an additive observation, separate
+    // from the sample conservation gate above (ADR-0064 decision 3 point 4
+    // counts samples only). Zero on logs/spans, which have no exemplar section.
+    tracing::debug!(
+        tenant_hash = %hex::encode(bucket.tenant_hash.0),
+        signal = bucket.signal.key_prefix(),
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        exemplars_kept = build.exemplars_kept,
+        exemplars_dropped = build.exemplars_dropped,
+        "erasure rewrite exemplar disposition"
+    );
 
     let (inputs, superseded_record_key) = match &supersession {
         RewriteSupersession::RawL0(identities) => (identities.clone(), String::new()),
@@ -2510,15 +2560,19 @@ mod tests {
     }
 
     /// One exemplar naming `metric`'s series, at `ts_ns` with `value` and one
-    /// attribute pair, non-zero trace/span ids so the record is distinguishable
-    /// on read-back.
+    /// attribute pair. The trace/span ids are non-zero AND vary with `ts_ns`,
+    /// so two exemplars differing only in timestamp stay distinguishable on
+    /// read-back -- which [`read_output_exemplars`] and [`exemplar_key`] assert,
+    /// rather than collapsing every record to `(series_id, ts_ns)`.
     fn exemplar(metric: &str, ts_ns: i64, value: f64) -> ExemplarInput {
+        let mut trace_id = [0x11u8; 16];
+        trace_id[..8].copy_from_slice(&ts_ns.to_be_bytes());
         ExemplarInput {
             series_id: series_id(metric),
             ts_ns,
             value,
-            trace_id: [0x11; 16],
-            span_id: [0x22; 8],
+            trace_id,
+            span_id: ts_ns.to_be_bytes(),
             attrs: vec![("k".to_string(), metric.to_string())],
         }
     }
@@ -2777,6 +2831,8 @@ mod tests {
                 request_id: Uuid::from_u128(9).to_string(),
                 dropped_count: 3,
             }],
+            exemplars_kept: 0,
+            exemplars_dropped: 0,
         };
 
         let err = publish_rewrite_record(
@@ -3620,6 +3676,8 @@ mod tests {
                 request_id: Uuid::from_u128(9).to_string(),
                 dropped_count: 1,
             }],
+            exemplars_kept: 0,
+            exemplars_dropped: 0,
         };
 
         let err = publish_rewrite_record(
@@ -4673,6 +4731,8 @@ mod tests {
                 request_id: Uuid::from_u128(9).to_string(),
                 dropped_count: 1,
             }],
+            exemplars_kept: 0,
+            exemplars_dropped: 0,
         };
 
         let err = publish_rewrite_record(
@@ -6321,23 +6381,29 @@ mod tests {
         );
     }
 
-    /// Every exemplar on the rewrite output part, `series_id` resolved, sorted
-    /// by `(series_id, ts_ns)` for a deterministic exact-count/exact-content
-    /// assertion.
+    /// The read-back identity of one exemplar: `series_id`, `ts_ns`, and the
+    /// `trace_id`/`span_id` that the [`exemplar`] helper's own docstring says
+    /// exist to keep records distinguishable. Asserting the full tuple (not
+    /// just `(series_id, ts_ns)`) is what makes two exemplars on the same
+    /// series and timestamp distinguishable to these tests.
+    fn exemplar_key(e: &ExemplarInput) -> (SeriesId, i64, [u8; 16], [u8; 8]) {
+        (e.series_id, e.ts_ns, e.trace_id, e.span_id)
+    }
+
+    /// Every exemplar on the rewrite output part, resolved to its full
+    /// [`exemplar_key`] identity, sorted by `(series_id, ts_ns)` for a
+    /// deterministic exact-count/exact-content assertion.
     async fn read_output_exemplars(
         store: &dyn ObjectStoreBackend,
         config: &CompactorConfig,
         part_key: &str,
-    ) -> Vec<(SeriesId, i64)> {
+    ) -> Vec<(SeriesId, i64, [u8; 16], [u8; 8])> {
         let catalog =
             crate::read::load_catalog_from_object(store, config, part_key.to_string(), 0, 0, 0)
                 .await
                 .expect("load output catalog");
-        let mut out: Vec<(SeriesId, i64)> = catalog
-            .exemplars
-            .iter()
-            .map(|e| (e.series_id, e.ts_ns))
-            .collect();
+        let mut out: Vec<(SeriesId, i64, [u8; 16], [u8; 8])> =
+            catalog.exemplars.iter().map(exemplar_key).collect();
         out.sort_by_key(|a| (a.0, a.1));
         out
     }
@@ -6417,9 +6483,9 @@ mod tests {
         let got = read_output_exemplars(&store, &config, &part_key).await;
 
         let mut expected = vec![
-            (series_id("beta"), 15),
-            (series_id("beta"), 16),
-            (series_id("gamma"), 30),
+            exemplar_key(&exemplar("beta", 15, 9.5)),
+            exemplar_key(&exemplar("beta", 16, 9.6)),
+            exemplar_key(&exemplar("gamma", 30, 3.0)),
         ];
         expected.sort_by_key(|a| (a.0, a.1));
         assert_eq!(
@@ -6435,13 +6501,19 @@ mod tests {
     /// carry exactly `beta`'s one exemplar.
     ///
     /// Flip-line proof: an implementation that carries everything (deleting the
-    /// `.filter(|e| surviving_series.contains(&e.series_id.0))` in
-    /// `build_rewrite`) hands `alpha`'s exemplar -- naming a series absent from
-    /// the output -- to `write_v5_with_exemplars`, which fails with
-    /// `WriteError::ExemplarUnknownSeries`; the rewrite then errors and the
-    /// `.expect("rewrite")` below panics. So a test that only proved
-    /// carry-forward would not distinguish this fix from carry-everything; this
-    /// one does.
+    /// whole exemplar filter in `build_rewrite`, both the `surviving_series`
+    /// guard and the per-record predicate) hands `alpha`'s exemplar -- naming a
+    /// series absent from the output -- to `write_v5_with_exemplars`, which
+    /// fails with `WriteError::ExemplarUnknownSeries`; the rewrite then errors
+    /// and the `.expect("rewrite")` below panics.
+    ///
+    /// What this test does NOT pin: the `surviving_series` guard on its own.
+    /// `alpha`'s erasing request is windowless, so the per-record predicate
+    /// ([`first_dropping_request`]) already matches `alpha`'s exemplar by its
+    /// own `ts_ns` and drops it even with the guard removed. The guard is only
+    /// load-bearing for an exemplar the predicate would KEEP on a series that
+    /// nonetheless does not survive; that case is pinned by
+    /// [`rewrite_drops_out_of_window_exemplar_of_fully_erased_series`].
     #[tokio::test]
     async fn rewrite_drops_exemplar_of_fully_erased_series() {
         let store = MemoryStore::new();
@@ -6485,7 +6557,7 @@ mod tests {
         let got = read_output_exemplars(&store, &config, &part_key).await;
         assert_eq!(
             got,
-            vec![(series_id("beta"), 15)],
+            vec![exemplar_key(&exemplar("beta", 15, 9.5))],
             "only beta's exemplar survives; alpha's must be dropped with its samples"
         );
     }
@@ -6550,7 +6622,7 @@ mod tests {
         let got = read_output_exemplars(&store, &config, &part_key).await;
         assert_eq!(
             got,
-            vec![(series_id("alpha"), 40)],
+            vec![exemplar_key(&exemplar("alpha", 40, 4.0))],
             "the in-window exemplar (ts 20, inside [15,35)) must be erased with \
              its samples; only the out-of-window exemplar (ts 40) survives"
         );
@@ -6613,9 +6685,152 @@ mod tests {
         let got = read_output_exemplars(&store, &config, &part_key).await;
         assert_eq!(
             got,
-            vec![(series_id("alpha"), 35)],
+            vec![exemplar_key(&exemplar("alpha", 35, 3.5))],
             "half-open [15,35): the exemplar at exactly window_start_ns (15) drops, \
              the one at exactly window_end_ns (35) survives"
+        );
+    }
+
+    /// The `surviving_series` guard's own coverage: an exemplar the per-record
+    /// predicate would KEEP, on a series that does NOT survive. `alpha`'s only
+    /// samples (20, 30) both fall inside the erasure window `[15,35)`, so every
+    /// `alpha` sample is dropped and `alpha` leaves the output entirely. Its
+    /// lone exemplar sits at `ts_ns` 40, OUTSIDE the window, so
+    /// [`first_dropping_request`] returns `None` for it -- the per-record
+    /// predicate alone would carry it forward. `beta` is untouched and
+    /// survives, so the output part is non-empty and the writer actually runs.
+    ///
+    /// With the guard, `alpha`'s exemplar is dropped (its series is absent from
+    /// `surviving_series`) and only `beta`'s survives. Without the guard, the
+    /// predicate keeps `alpha`'s exemplar, `write_v5_with_exemplars` is handed a
+    /// record naming a series absent from the output part, and it fails with
+    /// `WriteError::ExemplarUnknownSeries` -- the rewrite errors and the
+    /// `.expect("rewrite")` below panics. Deleting the guard leaves the four
+    /// prior exemplar tests green (each erases its dead series with a windowless
+    /// or in-window request, so the predicate drops the exemplar too), so this
+    /// is the only test that pins it.
+    #[tokio::test]
+    async fn rewrite_drops_out_of_window_exemplar_of_fully_erased_series() {
+        let store = MemoryStore::new();
+        seed_with_exemplars(
+            &store,
+            1,
+            vec![
+                series("alpha", &[(20, 2.0), (30, 3.0)]),
+                series("beta", &[(100, 9.5)]),
+            ],
+            vec![exemplar("alpha", 40, 4.0), exemplar("beta", 100, 9.5)],
+        )
+        .await;
+
+        let mut request = erasure_request(1, "alpha");
+        request.window_start_ns = 15;
+        request.window_end_ns = 35;
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            &store,
+            &clock,
+            &config,
+            &NoLeases,
+            &bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("rewrite");
+        assert!(
+            matches!(outcome, ErasureRewriteOutcome::Rewritten { parts: 1, .. }),
+            "expected a one-part rewrite, got {outcome:?}"
+        );
+
+        let part_key = output_part_key(&store).await;
+        let got = read_output_exemplars(&store, &config, &part_key).await;
+        assert_eq!(
+            got,
+            vec![exemplar_key(&exemplar("beta", 100, 9.5))],
+            "alpha is fully erased, so its out-of-window exemplar (ts 40) must be \
+             dropped by the surviving_series guard even though the per-record \
+             predicate would keep it; only beta's exemplar survives"
+        );
+    }
+
+    /// Exemplar disposition is reported as an exact count, separate from the
+    /// sample conservation gate. `alpha` survives with an erased window
+    /// `[15,35)`: the exemplar at `ts_ns` 20 is inside it and dropped, the ones
+    /// at 10 and 40 are outside and kept. `build_rewrite` must report
+    /// `exemplars_dropped == 1` and `exemplars_kept == 2`.
+    ///
+    /// Undercount proof: removing the `exemplars_dropped += 1` increment in
+    /// `build_rewrite` makes the reported drop count 0 and fails the exact
+    /// `assert_eq!` below -- the additive counter is what makes a silent
+    /// exemplar regression visible, where the sample conservation gate cannot
+    /// see it (exemplars are not samples).
+    #[tokio::test]
+    async fn build_rewrite_reports_exemplar_disposition() {
+        let store = MemoryStore::new();
+        seed_with_exemplars(
+            &store,
+            1,
+            vec![series(
+                "alpha",
+                &[(10, 1.0), (20, 2.0), (30, 3.0), (40, 4.0)],
+            )],
+            vec![
+                exemplar("alpha", 10, 1.0),
+                exemplar("alpha", 20, 2.0),
+                exemplar("alpha", 40, 4.0),
+            ],
+        )
+        .await;
+
+        let mut request = erasure_request(2, "alpha");
+        request.window_start_ns = 15;
+        request.window_end_ns = 35;
+        let applicable = vec![ApplicableRequest {
+            request_id: request.request_id.clone(),
+            matcher: ErasureMatcher::from_request(&request),
+        }];
+
+        let b = bucket();
+        let config = CompactorConfig::default();
+        let listing = crate::read::list_bucket(&store, &b)
+            .await
+            .expect("list bucket");
+        let live = resolve_live_inputs(&store, &b, &listing, 1)
+            .await
+            .expect("resolve live inputs");
+        let (catalogs, supersession) = load_live_catalogs_and_target(&store, &config, live)
+            .await
+            .expect("load live catalogs");
+
+        let mut ids: Vec<String> = applicable.iter().map(|r| r.request_id.clone()).collect();
+        ids.sort();
+        let input_set_hash = match &supersession {
+            RewriteSupersession::RawL0(idents) => {
+                erasure::compute_rewrite_input_set_hash(idents, None, &ids)
+            }
+            RewriteSupersession::Existing(key) => {
+                erasure::compute_rewrite_input_set_hash(&[], Some(key.as_str()), &ids)
+            }
+        };
+
+        let build = build_rewrite(&store, &b, &config, &catalogs, &applicable, &input_set_hash)
+            .await
+            .expect("build");
+        assert_eq!(
+            build.exemplars_dropped, 1,
+            "exactly the in-window exemplar (ts 20) is dropped"
+        );
+        assert_eq!(
+            build.exemplars_kept, 2,
+            "the two out-of-window exemplars (ts 10, 40) are kept"
         );
     }
 }
