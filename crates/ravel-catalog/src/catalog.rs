@@ -1053,11 +1053,22 @@ impl Catalog {
     /// reader rule): the part's own v3 object (`parts[i].column_stats`, field
     /// 7) is tried first. A part with no such ref, or whose object fails to
     /// load (blake3 mismatch, decode refusal, missing object), needs the
-    /// whole-tenant v2 object (`column_stats_part`, field 13), then the
-    /// whole-tenant v1 object (`column_stats`, field 11); a part answered by
-    /// none of the three is simply left uncovered and the caller scans it.
-    /// The whole-object fallback is fetched at most once per call, and only
-    /// when at least one covered part actually needs it. Every failure
+    /// whole-tenant v2 object (`column_stats_part`, field 13). A decoded v2
+    /// object can legitimately omit a covered part's segment (the fold's
+    /// per-entry build has its own warn-and-omit path), so loading v2 alone
+    /// does not prove every still-needed part was answered. No v2 record
+    /// field identifies which physical part it belongs to (`writer_id` is a
+    /// content hash, unrelated to any part's own blake3), so this compares
+    /// the number of segments v2 actually decoded against the sum of
+    /// `entry_count` declared across every part in the HEAD -- the total v2
+    /// claims to cover -- and only falls through to the whole-tenant v1
+    /// object (`column_stats`, field 11) when the decoded count falls short
+    /// of that total. A part answered by none of the three is simply left
+    /// uncovered and the caller scans it.
+    /// Each whole-object ref is fetched at most once per call, and only when
+    /// at least one covered part still needs it -- so one call can issue
+    /// both a v2 GET and a v1 GET when v2 leaves a gap, which is the
+    /// intended cost of closing that gap, not a regression. Every failure
     /// degrades silently EXCEPT a decode refusal, which emits one
     /// `tracing::warn!` per object key and increments
     /// [`Catalog::column_stats_decode_refusals`] before degrading (issue
@@ -1169,17 +1180,41 @@ impl Catalog {
             // Insert-if-absent only: a part already answered by its own v3
             // object above must never be overwritten by a whole-object
             // record for the same key, so v3 always wins on collision.
-            let mut whole_loaded = false;
+            //
+            // A decoded v2 object can legitimately OMIT a covered part's
+            // segment (fold.rs's per-entry v3/v2 loop warns and omits a
+            // segment whose build failed, then still publishes), so a
+            // successful v2 decode does not mean every part in
+            // `needs_fallback` was actually answered. There is no way to
+            // attribute a specific decoded segment to a specific part from
+            // here (`writer_id` is a content hash, architecturally unrelated
+            // to any `SnapshotPartRef.blake3`, and fetching part bodies to
+            // find out is exactly what this whole-object fallback exists to
+            // avoid). What IS available without an extra GET is each part's
+            // own declared `entry_count` on the HEAD (the count fold.rs
+            // populates for every part) and how many segments v2 actually
+            // decoded: if the decoded count falls short of the total entries
+            // declared across every part in the HEAD -- the full set v2
+            // claims to cover -- at least one segment was dropped somewhere,
+            // so `needs_fallback` is left as-is and v1 is still consulted;
+            // if it meets or exceeds that total, v2 fully answered every
+            // part and v1 is skipped, same as before this fix.
             if let Some(v2) = &head.v2 {
                 match column_stats_resolve::fetch_stats_object(&getter, tenant, v2).await? {
                     column_stats_resolve::FetchOutcome::Loaded(decoded) => {
+                        let declared_entries: u64 =
+                            head.parts.iter().map(|part| part.entry_count).sum();
+                        let decoded_entries =
+                            (decoded.segments.len() + decoded.by_content_hash.len()) as u64;
                         for (k, v) in decoded.segments {
                             segments.entry(k).or_insert(v);
                         }
                         for (k, v) in decoded.by_content_hash {
                             by_content_hash.entry(k).or_insert(v);
                         }
-                        whole_loaded = true;
+                        if decoded_entries >= declared_entries {
+                            needs_fallback.clear();
+                        }
                     }
                     column_stats_resolve::FetchOutcome::Absent => {}
                     column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
@@ -1187,7 +1222,7 @@ impl Catalog {
                     }
                 }
             }
-            if !whole_loaded && let Some(v1) = &head.v1 {
+            if !needs_fallback.is_empty() && let Some(v1) = &head.v1 {
                 match column_stats_resolve::fetch_stats_object(&getter, tenant, v1).await? {
                     column_stats_resolve::FetchOutcome::Loaded(decoded) => {
                         for (k, v) in decoded.segments {
@@ -10136,6 +10171,205 @@ mod tests {
                 .and_then(|v| v.kind.as_ref()),
             Some(&ravel_proto::catalog::v1::column_value::Kind::I64(200)),
             "v2's value (200), never v1's disagreeing value (901)"
+        );
+    }
+
+    /// A single-part HEAD with no field-7 (v3) ref on its one part, a
+    /// field-13 (v2) object that OMITS that part's segment (the fold's
+    /// per-entry build has its own warn-and-omit path: a segment whose
+    /// build fails is dropped and the fold still publishes), and a
+    /// field-11 (v1) object that carries it. Before the fix, the old code
+    /// set `whole_loaded = true` on ANY `FetchOutcome::Loaded` from v2,
+    /// including an empty one, so v1 was never even attempted and the part
+    /// was left with zero statistics -- a silent full scan, even though
+    /// field 11 had the answer the whole time.
+    ///
+    /// Prove-the-test (the flipped line): `cstat_gets` below pins
+    /// `vec![v2_key.clone(), v1_key.clone()]`. Against the pre-fix
+    /// `whole_loaded` short-circuit this is `vec![v2_key.clone()]` --
+    /// field 11 is never attempted -- and the GET count pinned two lines
+    /// below is 2, not 3. Under the pre-fix code `loaded` doesn't merely
+    /// come back short a segment: `load_column_stats` returns `Ok(None)`
+    /// entirely (both `segments` and `by_content_hash` are empty), so
+    /// `.expect("stats present")` below panics outright and the query
+    /// this fixture represents falls back to a full scan.
+    #[tokio::test]
+    async fn v2_gap_left_by_warn_and_omit_falls_back_to_field_eleven() {
+        let inner = MemoryStore::new();
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_hash = *blake3::hash(b"gap-part").as_bytes();
+        let all_parts = vec![part_hash.to_vec()];
+
+        // field 13 (v2): a structurally valid object that covers this
+        // part's blake3 in its header binding but carries zero segments --
+        // exactly what the fold's warn-and-omit path produces when this
+        // part's one segment failed to build.
+        let v2_bytes = crate::snapshot_format::encode_column_stats_v2(
+            tenant().0,
+            signal_num,
+            all_parts.clone(),
+            &[],
+        )
+        .expect("encode v2");
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+        let v2_key = format!(
+            "t/{}/catalog/{prefix}/cstat/gap-v2.cstat",
+            tenant().to_hex()
+        );
+        inner
+            .put(
+                &v2_key,
+                Bytes::from(v2_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v2");
+
+        // field 11 (v1), identity-keyed: the record v2 dropped.
+        let v1_segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xBB; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(555)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(555)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(555)),
+                    }),
+                    count: 1,
+                }],
+                sum: Some(555),
+            }],
+        }];
+        let v1_bytes = crate::snapshot_format::encode_column_stats(
+            tenant().0,
+            signal_num,
+            all_parts.clone(),
+            &v1_segments,
+        )
+        .expect("encode v1");
+        let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
+        let v1_key = format!(
+            "t/{}/catalog/{prefix}/cstat/gap-v1.cstat",
+            tenant().to_hex()
+        );
+        inner
+            .put(
+                &v1_key,
+                Bytes::from(v1_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v1");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 19,
+            parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+                key: "unused-gap".to_string(),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 1,
+                watermark_hour: 19,
+                min_hour: 0,
+                column_stats: None,
+            }],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsRef {
+                key: v1_key.clone(),
+                blake3: v1_hash.to_vec(),
+                size: v1_bytes.len() as u64,
+                segment_count: 1,
+                part_blake3: all_parts.clone(),
+            }),
+            column_stats_part: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                key: v2_key.clone(),
+                blake3: v2_hash.to_vec(),
+                size: v2_bytes.len() as u64,
+                segment_count: 0,
+                part_blake3: all_parts.clone(),
+            }),
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        inner
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let store = Arc::new(KeyLoggingStore::new(inner));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+
+        let cstat_gets: Vec<String> = store
+            .get_keys()
+            .into_iter()
+            .filter(|k| k.ends_with(".cstat"))
+            .collect();
+        assert_eq!(
+            cstat_gets,
+            vec![v2_key.clone(), v1_key.clone()],
+            "v2's empty coverage of a declared, entry-carrying part forces \
+             field 11 to be read too: {cstat_gets:?}"
+        );
+        assert_eq!(
+            acc.snapshot().s3_requests(AccountedOp::Get),
+            3,
+            "HEAD, the v2 GET that comes back empty, and the v1 GET that fills the gap"
+        );
+
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            0,
+            "v2 contributed no content-hash-keyed record for this part"
+        );
+        assert_eq!(
+            loaded.segments.len(),
+            1,
+            "exactly the one identity-keyed record field 11 carried, no more"
+        );
+        let seg = loaded
+            .segments
+            .values()
+            .next()
+            .expect("the one v1 segment");
+        assert_eq!(
+            column_stats_resolve::unique_column_stat(seg, "status")
+                .and_then(|c| c.min.as_ref())
+                .and_then(|v| v.kind.as_ref()),
+            Some(&ravel_proto::catalog::v1::column_value::Kind::I64(555)),
+            "the value field 11 carried for the part v2 omitted"
         );
     }
 }

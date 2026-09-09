@@ -534,23 +534,38 @@ to the fallback below rather than left silently missing.
 
 Once every covered part has been tried, if any part still needs coverage the
 reader fetches the whole-tenant field-13 (v2) object once, if HEAD has one,
-and merges every part's segment in with `.or_insert` -- a part that already
-got its own v3 record keeps it; the whole-object entry only fills a gap.
-Only if the v2 object was absent, refused, or HEAD carries no field 13 does
-the reader also fetch and merge the whole-tenant field-11 (v1) object once,
-the same way. A part that still has no coverage after all three sources is
-left uncovered: the query scans for it, exactly as if no statistics existed
-for that part at all. A HEAD whose parts carry no field-7 ref anywhere (a
-snapshot folded before ADR-1413) never attempts a per-part GET: every
-covered part is immediately deferred to the fallback, so the reader costs
-the same one whole-object GET the reader charged before this ADR,
-regardless of how many parts the window covers.
+and merges every decoded segment in with `.or_insert` -- a part that already
+got its own v3 record keeps it; the whole-object entry only fills a gap. A
+decoded v2 object does not by itself prove every still-needed part was
+answered: the fold's per-entry column-stats build has a warn-and-omit path
+(one segment's build failing degrades that segment out of the published
+object rather than failing the whole fold), so v2 can decode successfully
+while silently missing a covered part's segment. No v2 record identifies
+which physical part it belongs to (its key is the entry's own content hash,
+unrelated to any part's blake3), so the reader cannot check per-part
+coverage directly; instead it compares the number of segments v2 actually
+decoded against the sum of `entry_count` declared across every part on
+HEAD -- the total v2's whole-tenant build claims to cover. Only when that
+comparison shows a shortfall (or the v2 object was absent, refused, or HEAD
+carries no field 13) does the reader also fetch and merge the whole-tenant
+field-11 (v1) object once, the same way and with the same precedence: a part
+already covered by v3 or v2 is never displaced by v1. A part that still has
+no coverage after all three sources is left uncovered: the query scans for
+it, exactly as if no statistics existed for that part at all. A HEAD whose
+parts carry no field-7 ref anywhere (a snapshot folded before ADR-1413)
+never attempts a per-part GET: every covered part is immediately deferred to
+the fallback, so the reader still evaluates the v2-then-v1 coverage check
+described above rather than assuming one whole-object GET always suffices.
 
 Cost, in accounted GETs: one HEAD GET, plus exactly one GET per covered part
-that carries its own field-7 ref, plus at most one whole-object GET (v2, or
-v1 if v2 did not answer) when some covered part still needs coverage after
-the per-part pass. The reader never issues more than one v2 GET and one v1
-GET per call regardless of how many parts fall back to it.
+that carries its own field-7 ref, plus up to one v2 GET and, when v2 leaves
+a covered part uncovered (absent, refused, missing from HEAD, or decoded
+short of the declared entry-count total), one further v1 GET, each fetched
+at most once per call. A query can therefore legitimately issue both the v2
+and the v1 whole-object GET in the same call -- this is intended behavior
+for a v2 object that omitted a segment via the fold's warn-and-omit path,
+not a cost regression. The reader never issues more than one v2 GET and one
+v1 GET per call regardless of how many parts fall back to it.
 
 The fold writes one v3 object per part it actually re-encodes this fold
 (never for a part carried forward by reference, since that part's `.csnap`
