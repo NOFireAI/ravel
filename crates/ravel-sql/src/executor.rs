@@ -369,24 +369,39 @@ fn ts_literal(ns: i64) -> Expr {
 /// `Catalog::load_column_stats` (which needs a window to bound which parts it
 /// loads) is given the widest window that still reproduces the snapshot's own
 /// resolve rather than a request window these entry points were never handed.
-/// `window_hour_bounds` only widens `range.start_ns` (by `max_ingest_lag_ns`)
-/// and `now_ns` (by `clock_skew_allowance_ns`), so bracketing exactly the
-/// resolved segments' own timestamps is always at least as wide as the part
-/// set the original resolve saw. An empty snapshot returns a zero window: no
-/// segment means no part's statistics can matter.
+///
+/// Built from each segment's `ingest_hour_bucket` (unix hours, pinned at flush
+/// open), never from `min_event_ts_ns`/`max_event_ts_ns`. `Catalog::
+/// window_hour_bounds` divides this pair by `NS_PER_HOUR` and
+/// `crate::snapshot_resolve::parts_intersecting` compares the result against
+/// `SnapshotPartRef`'s `min_hour`/`watermark_hour`, both ingest-hour buckets --
+/// so the pair this function returns has to already be in ingest-hour units.
+/// Event time and ingest time are different clocks (a tenant backfilling
+/// today data whose events happened years ago is the ordinary case, not an
+/// edge one), so a pair built from event timestamps can land on ingest hours
+/// no part in `snapshot` covers, and `load_column_stats` then silently
+/// returns `Ok(None)` for a snapshot that plainly has segments. Deriving from
+/// `ingest_hour_bucket` instead brackets the resolved segments' own ingest
+/// hours exactly; `window_hour_bounds` still widens the start down by
+/// `max_ingest_lag_ns` and the end up by `clock_skew_allowance_ns`, so every
+/// part holding a resolved segment intersects. An empty snapshot returns a
+/// zero window: no segment means no part's statistics can matter.
 fn snapshot_covering_window(snapshot: &Snapshot) -> (TimeRange, i64) {
-    let min_ns = snapshot
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    let min_hour = snapshot
         .segments
         .iter()
-        .map(|seg| seg.min_event_ts_ns)
+        .map(|seg| seg.ingest_hour_bucket)
         .min()
         .unwrap_or(0);
-    let max_ns = snapshot
+    let max_hour = snapshot
         .segments
         .iter()
-        .map(|seg| seg.max_event_ts_ns)
+        .map(|seg| seg.ingest_hour_bucket)
         .max()
         .unwrap_or(0);
+    let min_ns = i64::from(min_hour) * NS_PER_HOUR;
+    let max_ns = i64::from(max_hour) * NS_PER_HOUR;
     (
         TimeRange {
             start_ns: min_ns,

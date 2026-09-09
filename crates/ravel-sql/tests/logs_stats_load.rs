@@ -469,3 +469,130 @@ async fn eligible_not_equal_count_answers_from_metadata_with_two_gets() {
         "exactly the HEAD GET and the one column-stats GET; no scan"
     );
 }
+
+/// BLOCKING regression (issue #1483 review, ADR-1413 T2): `plan_pinned`'s
+/// `(range, now_ns)` pair for `Catalog::load_column_stats` used to come from
+/// segments' EVENT timestamps (`min_event_ts_ns`/`max_event_ts_ns`), while
+/// every downstream consumer -- `Catalog::window_hour_bounds` and
+/// `crate::snapshot_resolve::parts_intersecting` -- compares the pair against
+/// INGEST-hour buckets (`SnapshotPartRef::min_hour`/`watermark_hour`). A
+/// tenant backfilling data whose events happened long before they were
+/// ingested (the ClickBench `hits` shape this ADR exists to rescue: event
+/// timestamps in 2013-2014, ingested in 2026) then resolves a window that
+/// intersects no part at all: `load_column_stats` returns `Ok(None)` and the
+/// query gets zero column statistics, silently, on every pinned/Flight SQL
+/// query over that tenant.
+///
+/// This fixture's one segment has event time at hour 10 and
+/// `ingest_hour_bucket` 500_000 -- a gap far past `max_ingest_lag_ns`
+/// (the catalog default, 2h) in either direction. Its HEAD part covers
+/// ingest hours `[499_990, 500_010]`, bracketing the segment's ingest hour
+/// but nowhere near its event hour.
+///
+/// Pre-fix demonstration: reverting `snapshot_covering_window`
+/// (crates/ravel-sql/src/executor.rs) to derive its pair from
+/// `seg.min_event_ts_ns`/`seg.max_event_ts_ns` instead of
+/// `seg.ingest_hour_bucket` makes this fail: the window built from event
+/// hour 10 never intersects the part's ingest-hour range `[499_990,
+/// 500_010]`, so `load_column_stats` returns `Ok(None)`, the plan falls back
+/// to a `LogsScanExec`, and the test panics trying to fetch the (never
+/// written) segment data object the scan then needs -- proof no stats were
+/// loaded and no exact answer was possible.
+#[tokio::test]
+async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+
+    let seg = SegmentRef {
+        min_event_ts_ns: 10 * NS_PER_HOUR,
+        max_event_ts_ns: 10 * NS_PER_HOUR + 1_000,
+        ingest_hour_bucket: 500_000,
+        ..seg_ref(1, 5)
+    };
+    let seg_stats = stats_segment(&seg, vec![i64_stat("status", &[(200, 3), (404, 2)], 0)]);
+
+    let signal_num = ravel_commit::signal::to_proto(Signal::Logs) as u32;
+    let part_hash = *blake3::hash(b"part-backfilled").as_bytes();
+    let stats_bytes = encode_column_stats(
+        TENANT.0,
+        signal_num,
+        vec![part_hash.to_vec()],
+        &[seg_stats],
+    )
+    .expect("encode column stats");
+    let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
+    let stats_key = format!("t/{}/catalog/l/cstat/backfilled.cstat", TENANT.to_hex());
+    store
+        .put(
+            &stats_key,
+            bytes::Bytes::from(stats_bytes.clone()),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put stats");
+
+    // Same shape as `install_head_and_stats`, but with the one part's ingest
+    // hour coverage placed at the segment's ingest hour bucket (500_000)
+    // rather than at hour 0: every other fixture in this file has its
+    // segment's event hour and ingest hour both at 0, which is exactly why
+    // it cannot tell the two clocks apart.
+    let head = SnapshotHead {
+        format_version: HEAD_FORMAT_VERSION,
+        tenant_hash: TENANT.0.to_vec(),
+        signal: signal_num,
+        shard_count: 1,
+        watermark_hour: 500_010,
+        parts: vec![SnapshotPartRef {
+            key: format!("t/{}/catalog/l/snap/backfilled.csnap", TENANT.to_hex()),
+            blake3: part_hash.to_vec(),
+            size: 1,
+            entry_count: 0,
+            watermark_hour: 500_010,
+            min_hour: 499_990,
+            column_stats: None,
+        }],
+        folder_id: Uuid::new_v4().into_bytes().to_vec(),
+        created_unix_ns: 0,
+        postings: None,
+        shard_generation_count: 1,
+        column_stats: Some(SnapshotColumnStatsRef {
+            key: stats_key,
+            blake3: stats_hash.to_vec(),
+            size: stats_bytes.len() as u64,
+            segment_count: 1,
+            part_blake3: vec![part_hash.to_vec()],
+        }),
+        column_stats_part: None,
+    };
+    let head_bytes = encode_head(&head).expect("encode head");
+    store
+        .put(
+            &head_key(),
+            bytes::Bytes::from(head_bytes),
+            PutOptions::default(),
+        )
+        .await
+        .expect("put head");
+
+    let executor = executor(&store);
+
+    let (plan, batches) = run(
+        &executor,
+        snapshot_of(vec![seg]),
+        "SELECT min(status), max(status) FROM logs",
+        &status_col(),
+    )
+    .await;
+
+    assert!(
+        !plan.contains("LogsScanExec"),
+        "min/max must answer from stats, not a scan; plan was:\n{plan}"
+    );
+    assert_eq!(scalar(&batches, 0), Some(200), "min(status)");
+    assert_eq!(scalar(&batches, 1), Some(404), "max(status)");
+    assert_eq!(
+        store.gets(),
+        2,
+        "exactly the HEAD GET and the one column-stats GET; no scan"
+    );
+}
