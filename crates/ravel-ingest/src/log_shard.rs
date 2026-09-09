@@ -1267,9 +1267,77 @@ impl LogShardActor {
     async fn flush_tenant(
         &mut self,
         tenant: TenantId,
-        buf: LogTenantBuf,
+        mut buf: LogTenantBuf,
         trigger: FlushTrigger,
     ) -> u64 {
+        // `waiters` is empty on the record-less path below by construction: the
+        // log router mints a strict-mode ack only for a shard that actually
+        // received records (`by_shard`/the columnar partition only holds shards
+        // with at least one row, and the ack rides that same shard message), so
+        // a record-less buffer has nobody to answer. If that ever changes, this
+        // returns without acking and the router reads the dropped oneshot as a
+        // dead shard; the assert makes the invariant loud rather than silently
+        // dropping. Dropping `charges` on that path is the ADR-0069 refund.
+        //
+        // Emptiness is checked by reference, before the flush clock is read and
+        // before the buffer is consumed: an empty buffer must neither advance the
+        // monotonic floor nor be re-buffered on the refuse arm below, and the
+        // retryable arm re-inserts `buf` whole (ADR-1307 finding 1).
+        let is_empty = match &buf.content {
+            BufContent::Empty => true,
+            BufContent::Rows(records) => records.is_empty(),
+            BufContent::Columnar(batches) => batches.iter().all(|b| b.is_empty()),
+        };
+        if is_empty {
+            drop(buf.charges);
+            debug_assert!(buf.waiters.is_empty());
+            return 0;
+        }
+        let raw_ns = self.clock.now_ns();
+        // The flush-open stamp is decided before the buffer is consumed and before
+        // `record_flush`: a refused flush never touched the store, so it must not
+        // be counted as a flush that happened, and (on the retryable arm) its rows
+        // must be re-buffered rather than dropped (ADR-1307 finding 1).
+        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
+            Ok(ns) => ns,
+            Err(FlushClockError::InvalidReading(msg)) => {
+                // A grossly broken raw reading is fail-loud and non-retryable
+                // (`SegmentBuild`, 400): the buffer is dropped, `charges` refund
+                // on drop.
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(LogWriteError::SegmentBuild(msg)));
+                return 0;
+            }
+            Err(FlushClockError::RegressionRefused(msg)) => {
+                // Already counted as `clock_regressions_refused` inside the
+                // helper; a clock regression is a transient server condition the
+                // next flush recovers from, so it is retryable (`Abandoned`, 503),
+                // not a client `SegmentBuild` (400) that would drop the buffered
+                // rows on a conformant exporter. The floor re-anchored to `raw_ns`
+                // inside the helper, so the next trigger stamps `raw_ns` and
+                // proceeds; exactly one flush is ever refused. Re-buffer the rows
+                // so that next trigger flushes them (finding 1): `charges` ride
+                // back with the buffer (the byte budget is not refunded, the bytes
+                // are still held), and the whole buffer -- content, declared-column
+                // stats, and the trigger bookkeeping (`est_bytes`,
+                // `oldest_arrival_ns`) -- is preserved intact. Only `waiters` are
+                // acked here and taken out of the re-inserted buffer: a waiter left
+                // in it would be re-acked by the next flush against an
+                // already-answered oneshot. A strict-mode waiter that retries on the
+                // 503 re-enqueues records this buffer still holds; logs do not dedup
+                // at query time, so the retry can duplicate a record, which is the
+                // at-least-once contract strict mode already carries on any retry.
+                let waiters = std::mem::take(&mut buf.waiters);
+                self.ctx
+                    .ack_waiters(waiters, Err(LogWriteError::Abandoned(msg)));
+                self.tenants.insert(tenant, buf);
+                return 0;
+            }
+        };
+        let tenant_hash = tenant.hash();
+        let seq = self.next_seq;
+        self.next_seq += 1;
         let LogTenantBuf {
             content,
             min_ingest_ts_ns,
@@ -1279,66 +1347,17 @@ impl LogShardActor {
             declared_stats,
             ..
         } = buf;
-        // `waiters` is empty on the record-less paths below by construction: the
-        // log router mints a strict-mode ack only for a shard that actually
-        // received records (`by_shard`/the columnar partition only holds shards
-        // with at least one row, and the ack rides that same shard message), so
-        // a record-less buffer has nobody to answer. If that ever changes, this
-        // returns without acking and the router reads the dropped oneshot as a
-        // dead shard; the assert makes the invariant loud rather than silently
-        // dropping. Dropping `charges` on those paths is the ADR-0069 refund.
         let payload = match content {
-            BufContent::Empty => {
-                drop(charges);
-                debug_assert!(waiters.is_empty());
-                return 0;
-            }
-            BufContent::Rows(records) => {
-                if records.is_empty() {
-                    drop(charges);
-                    debug_assert!(waiters.is_empty());
-                    return 0;
-                }
-                FlushPayload::Rows(records)
-            }
-            BufContent::Columnar(batches) => {
-                if batches.iter().all(|b| b.is_empty()) {
-                    drop(charges);
-                    debug_assert!(waiters.is_empty());
-                    return 0;
-                }
-                FlushPayload::Columnar(batches)
-            }
-        };
-        let tenant_hash = tenant.hash();
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let raw_ns = self.clock.now_ns();
-        // The flush-open stamp is decided before `record_flush`: a flush refused
-        // here never touched the store, so it must not be counted as a flush that
-        // happened (ADR-1307 finding 1).
-        let flush_open_ns = match self.monotonic_flush_open_ns(raw_ns) {
-            Ok(ns) => ns,
-            Err(FlushClockError::InvalidReading(msg)) => {
-                self.metrics.record_abandoned_input_rejected();
-                self.ctx
-                    .ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
-                return 0;
-            }
-            Err(FlushClockError::RegressionRefused(msg)) => {
-                // Already counted as `clock_regressions_refused` inside the
-                // helper; a clock regression is a transient server condition the
-                // next flush recovers from, so it is retryable (`Abandoned`, 503),
-                // not a client `SegmentBuild` (400) that would drop the buffered
-                // rows on a conformant exporter.
-                self.ctx
-                    .ack_waiters(waiters, Err(LogWriteError::Abandoned(msg)));
-                return 0;
-            }
+            BufContent::Rows(records) => FlushPayload::Rows(records),
+            BufContent::Columnar(batches) => FlushPayload::Columnar(batches),
+            // Unreachable: emptiness (including `BufContent::Empty`) returned above.
+            BufContent::Empty => unreachable!("empty log buffer returns before the flush stamp"),
         };
         let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
             Ok(bucket) => bucket,
             Err(msg) => {
+                // Defensive: `flush_open_ns` was already hour-bucket-validated;
+                // if it ever fails here it is fail-loud like InvalidReading.
                 self.metrics.record_abandoned_input_rejected();
                 self.ctx
                     .ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
