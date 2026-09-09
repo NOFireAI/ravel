@@ -351,10 +351,26 @@ there before changing a rule.
   build. A session that read 82 GB free, started a cold gate, and took
   the volume to 886 MiB still passed this guard: another session was
   building at the same time. For anything longer than a few minutes,
-  also arm a watchdog that samples free space every 45 s or so and kills
-  its OWN `cargo`/`rustc` below a floor of about 8 GB. Killing your build
-  costs a retry; letting the volume reach zero stops every Bash command
-  in every session on the host, including the ones that would clean up.
+  also arm `scripts/guards/disk-watchdog.sh <your-worktree>` alongside it.
+  Killing your build costs a retry; letting the volume reach zero stops
+  every Bash command in every session on the host, including the ones
+  that would clean up.
+- `scripts/guards/disk-watchdog.sh <scope-dir> [floor_gb] [warn_gb]
+  [sample_s]`: samples free space and kills the `cargo`/`rustc`
+  processes whose cwd is inside `scope-dir` once it drops below the floor
+  (default 9 GB, warning at 15). The scope is REQUIRED and it is what
+  makes the thing safe here: a watchdog that matches by command name
+  kills every session's build on this box and reports it as killing
+  yours. Two sessions wrote that version independently within one hour on
+  2026-09-09 and one killed the other's compile with it, which is why
+  this exists as a script rather than as the paragraph above.
+  `WATCHDOG_DRY_RUN=1` names the pids and kills nothing; use it rather
+  than testing the kill path against live processes. On firing it writes
+  `<scope-dir>/.disk-watchdog-fired` BEFORE killing anything: a gate whose
+  run overlaps that marker is INVALID rather than red, because a runner
+  reports a SIGTERM'd test as a failure and the next reader cannot tell
+  the two apart. It never touches the gate's own exit code. Cases in
+  `scripts/guards/disk-watchdog.test.sh`.
 - This host is itself a fleet executor. `~/.fleet/executor` holds the
   cargo target of whatever task it has claimed from the queue, which no
   session here chose and which grows without warning; it has been observed
