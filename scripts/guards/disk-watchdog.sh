@@ -69,11 +69,16 @@ free_gb() {
     df -Pk "${SCOPE}" 2>/dev/null | awk 'NR==2 {print int($4/1048576)}'
 }
 
-# The cargo/rustc processes whose cwd is inside SCOPE. Two stages on purpose:
-# `ps comm` is the full toolchain path on macOS, so the basename decides what
-# is a build, and lsof decides whose it is.
+# The build processes whose cwd is inside SCOPE. Two stages on purpose: `ps
+# comm` is the full toolchain path on macOS, so the basename decides what is a
+# build, and lsof decides whose it is.
+#
+# The linker children are in the set deliberately. SIGKILL to rustc does not
+# kill the cc/ld/collect2/rust-lld it spawned, and the link is the phase that
+# writes the largest artifacts, so a matcher of cargo and rustc alone reports
+# success while the volume keeps draining.
 scoped_pids() {
-    for pid in $(ps -eo pid,comm= | awk '{ n = split($2, p, "/"); if (p[n] == "cargo" || p[n] == "rustc") print $1 }'); do
+    for pid in $(ps -eo pid,comm= | awk '{ n = split($2, p, "/"); if (p[n] == "cargo" || p[n] == "rustc" || p[n] == "cc" || p[n] == "ld" || p[n] == "collect2" || p[n] == "rust-lld" || p[n] == "clang" || p[n] == "clang++") print $1 }'); do
         cwd=$(lsof -a -d cwd -p "${pid}" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
         # The scope root itself, or a path UNDER it. A bare "${SCOPE}"*
         # prefix also matches a sibling whose name merely starts with the
@@ -97,20 +102,23 @@ while :; do
             ;;
     esac
 
+    if [ "${WATCHDOG_DRY_RUN:-0}" = "1" ]; then
+        # Before the floor comparison on purpose. This is the check CLAUDE.md
+        # tells every session to run instead of testing the kill path against
+        # live processes, and it is run on a healthy volume, which is exactly
+        # when the floor branch is not taken. Inside it, the dry run produced
+        # no output and never returned.
+        dry_pids=$(scoped_pids | sed 's/ *$//')
+        if [ -n "${dry_pids}" ]; then
+            echo "watchdog: DRY RUN, ${avail} GB left (floor ${floor_gb}), would kill: ${dry_pids}"
+        else
+            echo "watchdog: DRY RUN, ${avail} GB left (floor ${floor_gb}), no build under ${SCOPE}"
+        fi
+        exit 0
+    fi
+
     if [ "${avail}" -lt "${floor_gb}" ]; then
         pids=$(scoped_pids | sed 's/ *$//')
-        if [ "${WATCHDOG_DRY_RUN:-0}" = "1" ]; then
-            # A dry run is a diagnostic: it answers "what would you kill right
-            # now" and returns. It must terminate whether or not anything
-            # matched, or the very invocation meant for checking the matcher
-            # hangs on the answer "nothing", which is the answer being checked.
-            if [ -n "${pids}" ]; then
-                echo "watchdog: DRY RUN, ${avail} GB left, would kill: ${pids}"
-            else
-                echo "watchdog: DRY RUN, ${avail} GB left, no cargo/rustc under ${SCOPE}"
-            fi
-            exit 0
-        fi
         if [ -z "${pids}" ]; then
             # Nothing of ours to kill YET. Do not exit: the common way to
             # arm this is alongside a gate that has not spawned cargo yet,
@@ -142,6 +150,26 @@ while :; do
         sleep 5
         # shellcheck disable=SC2086
         kill -KILL ${pids} 2>/dev/null || true
+        # Confirm rather than assume. A process can be spawned between the
+        # scan and the kill, and a child can outlive the parent that was
+        # matched, so re-scan and kill again until the scoped set is empty.
+        # Reporting a free-space figure straight after the first SIGKILL reads
+        # it while an in-flight link is still writing.
+        round=0
+        while [ "${round}" -lt 5 ]; do
+            sleep 2
+            remaining=$(scoped_pids | sed 's/ *$//')
+            [ -z "${remaining}" ] && break
+            echo "watchdog: still running under ${SCOPE} after the kill: ${remaining}"
+            # shellcheck disable=SC2086
+            kill -KILL ${remaining} 2>/dev/null || true
+            round=$((round + 1))
+        done
+        if [ -n "${remaining:-}" ]; then
+            echo "watchdog: gave up with these still running under ${SCOPE}: ${remaining}" >&2
+            echo "watchdog: free space now $(free_gb) GB."
+            exit 1
+        fi
         echo "watchdog: killed; marker at ${marker}; free space now $(free_gb) GB."
         exit 0
     fi
