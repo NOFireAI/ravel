@@ -3557,6 +3557,33 @@ mod tests {
         );
 
         // Reuse still produced a complete artifact covering all three segments.
+        //
+        // Coverage is asserted on the map the reader actually fills: since
+        // ADR-1413 the per-part v3 object answers this load and its records
+        // are content-hash keyed, so `segments`, which holds only the
+        // identity-keyed records of a v1 whole-object fallback, stays empty.
+        // The old `segments.len() == 3` was asserting that the fallback had
+        // been taken.
+        //
+        // Emptiness of `segments` is NOT the thing to assert in its place: it
+        // survives the failure that matters. If the per-part path is lost,
+        // the v2 whole-object (field 13) answers instead, which is also
+        // content-hash keyed, so the count is still 3 and `segments` is still
+        // empty. What pins the per-part path is that both whole-object
+        // fallbacks exist here and neither is read.
+        let head_after = read_logs_head(store.as_ref()).await;
+        let v1_key = head_after
+            .column_stats
+            .as_ref()
+            .map(|r| r.key.clone())
+            .expect("the fold dual-publishes a v1 whole-object artifact");
+        let v2_key = head_after
+            .column_stats_part
+            .as_ref()
+            .map(|r| r.key.clone())
+            .expect("the fold dual-publishes a v2 whole-object artifact");
+
+        store.clear_gets();
         let acc = QueryAccounting::new();
         let loaded = catalog
             .load_column_stats(
@@ -3572,20 +3599,20 @@ mod tests {
             .await
             .expect("load ok")
             .expect("stats present");
-        // Coverage is asserted on the map the reader actually fills. Since
-        // ADR-1413 the per-part v3 object answers this load and its records
-        // are content-hash keyed, so `segments`, which only holds the
-        // identity-keyed records of a v1 whole-object fallback, stays empty
-        // here. Asserting `segments.len() == 3` was asserting that the
-        // fallback had been taken.
         assert_eq!(
             loaded.by_content_hash.len(),
             3,
             "the reused baseline plus the new segment cover all three"
         );
-        assert!(
-            loaded.segments.is_empty(),
-            "the v3 per-part object answered, so no v1 whole-object fallback was read"
+        assert_eq!(
+            store.count_gets_of(&v1_key),
+            0,
+            "the v1 whole-object artifact exists and must not be read: the per-part object answers"
+        );
+        assert_eq!(
+            store.count_gets_of(&v2_key),
+            0,
+            "the v2 whole-object artifact exists and must not be read: the per-part object answers"
         );
     }
 
