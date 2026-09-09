@@ -377,6 +377,22 @@ and the CAS read/write helpers.
   unclassified `rw.` key would have had its supersession of the erased inputs
   ignored by the index fold, letting erased records reappear in a folded
   snapshot.
+- Age-based retention (ADR-0019) reads and deletes all three record shapes.
+  ADR-0019 decision 1 names only L0 commit records and compaction records as
+  the inputs to a bucket's expiry maximum, and decision 4 names only those two
+  in the physical sweep's delete list, because selective erasure (ADR-0064)
+  postdates it. Both include rewrite records: a bucket's expiry maximum is
+  `max(max_event_ts_ns)` over L0 commit records, compaction-record parts, and
+  rewrite-record parts, and the sweep deletes the rewrite record with the other
+  records, before the data objects and parts and before the tombstone last. A
+  rewrite record with no parts (an erasure that dropped every record in the
+  bucket) carries no event timestamp and contributes its own `created_unix_ns`
+  to that maximum instead. Rewrite-record-only is the durable steady state of
+  an erased bucket -- the superseded-input sweep removes the rewrite's inputs
+  once their protection horizon elapses, and compaction refuses a bucket
+  holding a live rewrite record -- so a retention pass blind to that shape
+  retains erased-and-rewritten data past `R` with no path to deletion, and a
+  sweep blind to it can never see the bucket empty.
 - Format-version gate on read (ADR-0066 decision 2). A compaction record and a
   retention tombstone each carry a `format_version` (= 1), and every production
   reader decodes them through `ravel_commit::record::decode_compaction` and
