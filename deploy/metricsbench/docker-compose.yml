@@ -1,0 +1,198 @@
+# MetricsBench comparator set (ADR-0927, issue #934).
+#
+# Launches every cross-engine comparator required by the MetricsBench portable
+# lane, each pinned to an immutable image DIGEST and each given identical CPU and
+# memory limits so no comparator wins on hardware. Bring the set up with:
+#
+#   docker compose -f deploy/metricsbench/docker-compose.yml up -d
+#
+# The MetricsBench harness (crates/ravel-bench, sibling task M1) drives every
+# comparator here over Prometheus Remote Write 1.0 for ingest and the Prometheus
+# HTTP query API for reads. ADR-0927 decision 1: the portable lane is the only
+# basis for cross-engine comparison, and every participating system receives the
+# same logical samples and the same queries. Remote Read (/api/v1/read) is NOT
+# used by the harness (ADR-0927 decision 2) and none of these systems is
+# configured to rely on it.
+#
+# PINS. Every `image:` below carries both a human-readable tag AND an
+# `@sha256:` manifest digest. The digest is authoritative; the tag is kept only
+# so a reader sees the version without resolving the hash. A tag alone is a
+# moving reference and would make a run unreproducible, so
+# tests/every_comparator_pins_an_image_digest.sh fails the set if any reference
+# loses its digest. Digest provenance is recorded in README.md.
+#
+# DURABILITY AND STORAGE ARCHITECTURE differ per system and are NOT
+# interchangeable. Prometheus and VictoriaMetrics here persist to a local-disk
+# TSDB. Mimir is object-storage-native and writes its blocks to S3 (backed by
+# MinIO in this stack). Per ADR-0927 decision 10 (ADR-0075 decision 3), MinIO
+# removes per-request fees and is therefore valid ONLY for correctness and CI,
+# never for a publishable performance or cost claim. A local-disk or MinIO
+# result here is never an S3-equivalent result; each service block below states
+# its own durability so the distinction is readable without the ADR open.
+#
+# SECURITY: every credential here is a fixed local-development value and every
+# published port binds loopback (127.0.0.1) only. Nothing here is for a
+# network-reachable deployment.
+
+services:
+  # --- Prometheus --------------------------------------------------------
+  # The reference PromQL engine. ADR-0927 decision 4 pins Prometheus v3.13.1 as
+  # the correctness oracle (crates/ravel-promql-difftest), so the comparator
+  # Prometheus is pinned to the SAME version: a comparator on a different
+  # Prometheus than the oracle would compare two Prometheus builds, not the
+  # engine under test against the oracle.
+  #
+  # DURABILITY: local-disk TSDB at /prometheus. A 2xx on remote write means the
+  # sample is in the in-memory head block and the write-ahead log on local disk.
+  # This is NOT an object-storage durability guarantee and must never be placed
+  # in the same column as Ravel's durable-on-ack S3 result (ADR-0927 decision 3).
+  prometheus:
+    image: prom/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      # Remote Write 1.0 receiver. Without this flag /api/v1/write returns 404
+      # and Prometheus cannot participate in the portable ingest lane.
+      - "--web.enable-remote-write-receiver"
+      - "--storage.tsdb.path=/prometheus"
+      # RETENTION (disclosed transformation): Prometheus deletes blocks older
+      # than 30d. Set generously above every ADR-0927 profile duration (history
+      # is 30d) so retention never silently drops benchmark samples mid-run.
+      - "--storage.tsdb.retention.time=45d"
+      # DELAYED COMPACTION / MATERIALISED STATE (disclosed): Prometheus holds
+      # incoming samples in an in-memory head block and only cuts a persistent,
+      # compacted on-disk block every 2h (fixed head-chunk range, not tunable).
+      # A query issued seconds after ingest reads the head, not a compacted
+      # block; a query issued later reads compacted, deduplicated blocks. The
+      # storage state a query sees therefore depends on wall-clock age of the
+      # data. Tuning here is limited to the flags above; no unpublished tuning.
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    deploy:
+      resources:
+        limits:
+          # Identical envelope across all three engines (see victoriametrics and
+          # mimir): equal CPU and memory is a portable-lane fairness precondition.
+          cpus: "2.0"
+          memory: 4g
+
+  # --- VictoriaMetrics ---------------------------------------------------
+  # Single-node VictoriaMetrics. Accepts Prometheus Remote Write 1.0 natively at
+  # /api/v1/write and serves the Prometheus query API under /prometheus.
+  #
+  # DURABILITY: local-disk storage at /victoria-metrics-data. An ack means the
+  # sample is written to VictoriaMetrics' local storage; like Prometheus this is
+  # a local-disk guarantee, not an object-storage one.
+  victoriametrics:
+    image: victoriametrics/victoria-metrics:v1.115.0@sha256:d8ac3a1776c8a9beead8bbd42a489c82249b1bfe9071dfd4813f34ebe36354bb
+    command:
+      - "-storageDataPath=/victoria-metrics-data"
+      # RETENTION (disclosed): drop data older than 45d, above the history
+      # profile's 30d, so retention never silently drops benchmark samples.
+      - "-retentionPeriod=45d"
+      # DEDUPLICATION (disclosed, OFF): -dedup.minScrapeInterval defaults to 0
+      # (disabled). Set explicitly to 0 so no sample is silently coalesced; the
+      # portable lane sends each logical sample once and expects each stored once.
+      - "-dedup.minScrapeInterval=0"
+      # DOWNSAMPLING (disclosed, ABSENT): downsampling is a VictoriaMetrics
+      # Enterprise feature and does not exist in this OSS single-node image, so
+      # no automatic resolution reduction occurs. Stated here so its absence is
+      # a recorded fact, not an assumption.
+      #
+      # BACKGROUND MERGES / MATERIALISED STATE (disclosed): VictoriaMetrics
+      # continuously merges its on-disk parts (LSM-style). Like Prometheus'
+      # block compaction this means recently ingested data and older data may
+      # live in differently-merged parts; the merge cadence is internal and not
+      # tuned here. No unpublished tuning: every flag that changes behaviour is
+      # on this command line.
+    ports:
+      - "127.0.0.1:8428:8428"
+    volumes:
+      - victoriametrics-data:/victoria-metrics-data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+
+  # --- Object storage for the object-storage-native comparator -----------
+  # MinIO backing Mimir's S3 blocks storage. NOTE (ADR-0927 decision 10): MinIO
+  # is local-disk-backed and free of per-request fees, so any Mimir figure taken
+  # against this MinIO is a correctness/functional result, NOT a publishable
+  # cost or performance result. A real-S3 substrate is required for that, exactly
+  # as Ravel's own publishable lane requires real S3.
+  minio:
+    image: minio/minio:RELEASE.2025-04-08T15-41-24Z@sha256:8834ae47a2de3509b83e0e70da9369c24bbbc22de42f2a2eddc530eee88acd1b
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9101:9001"
+    environment:
+      MINIO_ROOT_USER: mimir
+      MINIO_ROOT_PASSWORD: mimir-dev-secret
+    volumes:
+      - minio-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2g
+
+  createbuckets:
+    image: minio/mc:RELEASE.2025-04-08T15-39-49Z@sha256:7e3efb09c22c0882fbf341b9d99f61f94ae6c4c20a06f2f1a2b20ea8993d8952
+    depends_on: [minio]
+    # Mimir's `all` target opens blocks, ruler and alertmanager storage; create
+    # all three buckets so a fresh MinIO does not stall Mimir startup. The
+    # until-loop is the readiness wait: this one-shot exits 0 only once the
+    # buckets exist, which mimir depends_on below.
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 mimir mimir-dev-secret; do
+        echo 'waiting for minio'; sleep 1;
+      done &&
+      mc mb -p local/mimir-blocks local/mimir-ruler local/mimir-alertmanager"
+
+  # --- Mimir (object-storage-native PromQL system) -----------------------
+  # Grafana Mimir in monolithic mode (-target=all): a single process running the
+  # distributor (Remote Write receiver), ingester, querier, store-gateway and
+  # compactor. Chosen as the ADR-0927 object-storage-native comparator because,
+  # like Ravel, its durable state lives in S3 rather than on local disk.
+  #
+  # DURABILITY AND STORAGE ARCHITECTURE: the distributor accepts Remote Write at
+  # /api/v1/push; the ingester holds recent samples in an in-memory head with a
+  # local write-ahead log, then the compactor ships compacted TSDB blocks to S3
+  # (MinIO here). So an ack is a local-WAL guarantee and the S3 copy appears
+  # LATER, after block upload. This ack-vs-object-storage-visibility gap is a
+  # material difference from Ravel's strict-mode Remote Write, where a 2xx means
+  # the data object and commit record are already durable in object storage
+  # (ADR-0927 decision 3). Do not compare Mimir's ack latency against Ravel's on
+  # the same row without this distinction.
+  mimir:
+    image: grafana/mimir:2.14.2@sha256:2d3912435771d356ec03ae4729fb584b4d76a5f035d9dda40b563a55bb6760e3
+    depends_on:
+      createbuckets:
+        condition: service_completed_successfully
+    command:
+      - "-config.file=/etc/mimir/mimir.yaml"
+      # Monolithic: every Mimir component in one process. The alternative
+      # (microservices) would spread the comparator across many containers with
+      # per-component limits and make the equal-envelope fairness rule above
+      # meaningless.
+      - "-target=all"
+    ports:
+      - "127.0.0.1:9009:9009"
+    volumes:
+      - ./config/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir-data:/data
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+
+volumes:
+  prometheus-data:
+  victoriametrics-data:
+  minio-data:
+  mimir-data:
