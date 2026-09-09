@@ -4211,9 +4211,10 @@ type = "i64"
     }
 
     /// A real `load --parquet` run wires and records every stage of the logs
-    /// pipeline, not a subset: admit, route, merge, and encode all recorded at
-    /// least one sample. Drop `#[cfg(feature = "stage-timing")]` from
-    /// `LogIngestRouter::stage_timings` (or from any one stage boundary) and
+    /// pipeline, not a subset: admit, route, merge, encode, and bloom all
+    /// recorded at least one sample. Drop `#[cfg(feature = "stage-timing")]`
+    /// from `LogIngestRouter::stage_timings` (or from any one stage boundary,
+    /// including the `LogStage::Bloom` recording added for issue #1516) and
     /// this fails, either at compile time or on an empty/partial stage set.
     #[cfg(feature = "stage-timing")]
     #[tokio::test]
@@ -4227,6 +4228,7 @@ type = "i64"
                 ravel_ingest::LogStage::Route,
                 ravel_ingest::LogStage::Merge,
                 ravel_ingest::LogStage::Encode,
+                ravel_ingest::LogStage::Bloom,
             ],
             "a real load must wire and record every stage, not a subset"
         );
