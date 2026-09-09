@@ -515,10 +515,42 @@ own content hash), but scoped to exactly the one snapshot part that owns it
 and `ColumnStatsHeader.segment_count` is that part's segment count. Field 7
 is absent (proto3 default) for a part with no per-part statistics; the reader
 falls back to field 13, then field 11, then to scan (ADR-1413 decision 2).
-Absence is never an error. Field 7 is writer-only until the reader half of
-ADR-1413 lands: no query path loads a v3 object yet, and queries keep
-reading field 13, then field 11, as before; the fallback order above is the
-contract that reader will implement.
+Absence is never an error.
+
+**Reader (`Catalog::load_column_stats`, ADR-1413 decision 2).** A query
+resolves its window to an hour range and narrows HEAD's parts to the ones
+`parts_intersecting` that window covers -- the same narrowing
+`load_snapshot` uses for segment refs. For each covered part, independently:
+try that part's own field-7 ref first. If it is present and the v3 object
+loads and decodes, that part's segment lands in the loaded statistics keyed
+by its own content hash and the reader is done with that part -- one GET,
+no whole-object read triggered by it. If the ref is absent, or the GET comes
+back not-found, or the object fails to decode
+(`FetchOutcome::DecodeRefused`, the same warn-once-and-count-once decode
+refusal the whole-object reader already applies, extended per part: logged
+once via `tracing::warn!` and counted once in
+`Catalog::column_stats_decode_refusals`), that part's coverage is deferred
+to the fallback below rather than left silently missing.
+
+Once every covered part has been tried, if any part still needs coverage the
+reader fetches the whole-tenant field-13 (v2) object once, if HEAD has one,
+and merges every part's segment in with `.or_insert` -- a part that already
+got its own v3 record keeps it; the whole-object entry only fills a gap.
+Only if the v2 object was absent, refused, or HEAD carries no field 13 does
+the reader also fetch and merge the whole-tenant field-11 (v1) object once,
+the same way. A part that still has no coverage after all three sources is
+left uncovered: the query scans for it, exactly as if no statistics existed
+for that part at all. A HEAD whose parts carry no field-7 ref anywhere (a
+snapshot folded before ADR-1413) never attempts a per-part GET: every
+covered part is immediately deferred to the fallback, so the reader costs
+the same one whole-object GET the reader charged before this ADR,
+regardless of how many parts the window covers.
+
+Cost, in accounted GETs: one HEAD GET, plus exactly one GET per covered part
+that carries its own field-7 ref, plus at most one whole-object GET (v2, or
+v1 if v2 did not answer) when some covered part still needs coverage after
+the per-part pass. The reader never issues more than one v2 GET and one v1
+GET per call regardless of how many parts fall back to it.
 
 The fold writes one v3 object per part it actually re-encodes this fold
 (never for a part carried forward by reference, since that part's `.csnap`
@@ -567,9 +599,8 @@ truncated object for a reader to silently trust.
 objects: retiring field 13 at the first v3 publish would be the
 writers-before-readers change ADR-0066 decision 1 forbids, since an older
 reader that ignores field 7 must still find field 13. The decoder's accepted
-set of `.cstat` envelope versions is `{1, 2, 3}` for this window (version 3
-is decodable today; it is loaded by a query only once the reader half
-lands); the set narrows to
+set of `.cstat` envelope versions is `{1, 2, 3}` for this window; the set
+narrows to
 `{2, 3}` and then `{3}` only as field 13's and field 11's own reviewed
 retirement changes, each citing the recorded format floors (ADR-0066
 decision 3), independently of each other.
