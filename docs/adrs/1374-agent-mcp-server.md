@@ -673,3 +673,35 @@ the identity-warning allowance `finish` may still spend (220 B).
 `MAXIMAL_FIXED_PART` in `crates/ravel-mcp/src/envelope.rs` is the constant
 carrying that real total, and it is the figure the floor guard compares
 against the 256 KiB `max_response_bytes` floor.
+
+**Amendment (2026-09-11).** Three corrections.
+
+1. The 2026-09-09 amendment reports an over-bound cursor as an `internal`
+   failure. That holds only when the envelope carries no other failure. An
+   envelope that already failed keeps its class, message, and counter, which
+   say why the call failed. The cursor is dropped on both paths. On the
+   second, the drop increments `presentation.metadata_elided` and pushes a
+   warning naming the bound. So a dropped cursor is never silent.
+2. D9 says the cursor codec reuses the Flight pin codec, and that
+   `flight-sql` and `mcp` both enable `pin-codec`. Neither is true. The
+   cursor codec follows the Flight ticket pattern but shares no code with
+   it. `ravel-mcp` enables no `ravel-sql` feature and reads nothing from
+   `flight_ticket`. An `mcp` build needs no pin codec. The 2026-09-09
+   amendment kept that reuse for evidence references. They never used it: a
+   reference carries a digest, and redemption re-executes its own call.
+3. The erasure check above sees only predicates in force at redemption. An
+   erasure that arrives after a mint and completes before the redemption is
+   in neither set. The check is sound only while the maximum cursor lifetime
+   is shorter than the minimum time an erasure takes to complete. The
+   maximum cursor lifetime is a deployment's protection horizon minus a 24 h
+   grace. The horizon is operator-set and defaults to 25 h 05 m, so the
+   lifetime is 1 h 05 m. The grace is a constant in
+   `crates/ravel-mcp/src/cursor.rs` that no configuration moves. The minimum
+   erasure completion is the seal wait in
+   `crates/ravel-maintain/src/erasure_rewrite.rs`. It is the ingest lag plus
+   one bucket span plus the seal margin, 4 h 05 m with defaults. Nothing
+   asserts the relationship. `ravel-mcp` cannot assert it either: the horizon
+   reaches the crate per call as an absolute instant. Raising the horizon to
+   30 h leaves a 6 h cursor lifetime and opens the window. The 2026-09-10
+   amendment says a redemption refuses a cursor in exactly two cases. Those
+   are the two a redemption can detect, not every case that breaks a page.
