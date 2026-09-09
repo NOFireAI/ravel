@@ -569,7 +569,9 @@ throwaway key prefix:
   `S3Store` implements `list` and `list_after` separately (the default
   `list_after` is `list` plus a client-side filter), so a backend can be
   ordered on one entry point and reversed on the other; the probe drains a
-  full pass through each and names the offending entry point in its failure.
+  full pass through each and names the offending entry point in its failure,
+  including when the failure is the drain itself (a `list`/`list_after` error,
+  or pagination that never terminates), not only an out-of-order delivery.
   Every pass judges the raw delivery sequence, repeats included, on the rule
   the listing bullet above states: a repeat of the last delivered key passes,
   a repeat of an earlier one fails. Judging a deduplicated sequence instead,
@@ -582,8 +584,11 @@ throwaway key prefix:
 - `DeleteVisibility`: after a successful delete, a `get` of the key returns
   `NotFound` and a listing of its prefix omits it while still holding the
   sibling key that was not deleted; a second delete of the now-absent key
-  succeeds and changes nothing. Retention sweep, GC, and ADR-0064 erasure
-  all read a delete's acknowledgement as the object being gone.
+  succeeds and changes nothing. The listing side is drained through both
+  `list` and `list_after`, so a delete visible through one entry point but not
+  the other is caught here rather than depending on which path a caller
+  happens to use. Retention sweep, GC, and ADR-0064 erasure all read a
+  delete's acknowledgement as the object being gone.
 
 Each probe returns a `ProbeResult` naming which `Property` it checked, so a
 failure reads "this backend cannot do conditional writes" or "this backend's

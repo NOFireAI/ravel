@@ -784,8 +784,8 @@ async fn probe_consistent_list_after_write(
                     );
                 }
             }
-            // Already a reportable detail naming the prefix and the backend's
-            // own error, like the sibling drains below.
+            // Already a reportable detail naming the entry point, the prefix,
+            // and the backend's own error, like the sibling drains below.
             Err(detail) => return ProbeResult::fail(property, detail),
         }
     }
@@ -1056,6 +1056,20 @@ enum ProbeListing<'a> {
     After(Option<&'a str>),
 }
 
+impl ProbeListing<'_> {
+    /// The backend method this drain issues. Threaded into every failure
+    /// detail so a listing probe names which of the two separately implemented
+    /// entry points is broken, not merely the prefix -- a backend whose `list`
+    /// fails or never terminates while `list_after` is fine must not yield a
+    /// report that cannot say which call broke.
+    fn method(&self) -> &'static str {
+        match self {
+            ProbeListing::List => "list",
+            ProbeListing::After(_) => "list_after",
+        }
+    }
+}
+
 /// Drain every page of `prefix` through `listing` and return the keys in
 /// delivery order together with the number of pages served.
 ///
@@ -1069,6 +1083,7 @@ async fn drain_probe_pages(
     prefix: &str,
     listing: ProbeListing<'_>,
 ) -> Result<(Vec<String>, usize), String> {
+    let method = listing.method();
     let mut delivered: Vec<String> = Vec::new();
     let mut pages = 0usize;
     let mut token = None;
@@ -1077,7 +1092,7 @@ async fn drain_probe_pages(
             ProbeListing::List => store.list(prefix, token).await,
             ProbeListing::After(start_after) => store.list_after(prefix, start_after, token).await,
         };
-        let page = result.map_err(|err| format!("listing {prefix} failed: {err}"))?;
+        let page = result.map_err(|err| format!("{method}({prefix}) failed: {err}"))?;
         pages += 1;
         delivered.extend(page.objects.into_iter().map(|meta| meta.key));
         match page.next {
@@ -1086,7 +1101,7 @@ async fn drain_probe_pages(
         }
         if pages >= MAX_PROBE_PAGES {
             return Err(format!(
-                "listing {prefix} still returned a continuation token after {pages} pages over \
+                "{method}({prefix}) still returned a continuation token after {pages} pages over \
                  far fewer keys; this backend's pagination does not terminate"
             ));
         }
@@ -1325,7 +1340,10 @@ async fn probe_cross_page_listing(store: &dyn ObjectStoreBackend, prefix: &str) 
 }
 
 /// Delete visibility: after a delete the key is gone from both access paths a
-/// caller has, and deleting it again changes nothing.
+/// caller has, and deleting it again changes nothing. The listing side is
+/// checked through both `list` and `list_after`, since they are separately
+/// implemented methods and a delete visible through one but not the other is a
+/// real defect the property must catch itself.
 ///
 /// Nothing probed delete at all, so a backend that acknowledged a delete
 /// without performing it, or performed it lazily, could qualify. Ravel's
@@ -1375,25 +1393,32 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
     }
 
     let expected = vec![kept.clone()];
-    // Drain `list`: retention sweeps and GC enumerate survivors through `list`,
-    // so a delete that `get` reports gone but `list` still re-delivers (a stale
-    // index on the list path) is exactly what a sweep would re-process. The
-    // path the enumeration production runs uses is the one to judge here.
-    let (delivered, _pages) = match drain_probe_pages(store, &list_prefix, ProbeListing::List).await
-    {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
-    let distinct = distinct_in_delivery_order(&delivered);
-    if distinct != expected {
-        return ProbeResult::fail(
-            property,
-            format!(
-                "listing {list_prefix} after deleting {gone} returned {} keys, expected exactly \
-                 1 ({kept}): got {distinct:?}",
-                distinct.len()
-            ),
-        );
+    // Drain BOTH entry points and require the deleted key absent from each.
+    // Retention sweeps and GC enumerate survivors through `list`, so a delete
+    // that `get` reports gone but `list` still re-delivers (a stale index on
+    // the list path) is exactly what a sweep would re-process; `list_after` is
+    // a separately implemented method (`S3Store` overrides each natively), so a
+    // delete visible through one path and not the other is a real defect the
+    // property must catch on its own rather than lean on there being no
+    // `list_after` caller outside this crate. Naming the entry point tells an
+    // operator which path still re-delivers the deleted key.
+    for listing in [ProbeListing::List, ProbeListing::After(None)] {
+        let (delivered, _pages) = match drain_probe_pages(store, &list_prefix, listing).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
+        let distinct = distinct_in_delivery_order(&delivered);
+        if distinct != expected {
+            return ProbeResult::fail(
+                property,
+                format!(
+                    "{}({list_prefix}) after deleting {gone} returned {} keys, expected exactly \
+                     1 ({kept}): got {distinct:?}",
+                    listing.method(),
+                    distinct.len()
+                ),
+            );
+        }
     }
 
     // Idempotence: a second delete of an absent key succeeds and changes no
@@ -1406,27 +1431,30 @@ async fn probe_delete_visibility(store: &dyn ObjectStoreBackend, prefix: &str) -
             ),
         );
     }
-    let (delivered, _pages) = match drain_probe_pages(store, &list_prefix, ProbeListing::List).await
-    {
-        Ok(result) => result,
-        Err(detail) => return ProbeResult::fail(property, detail),
-    };
-    let distinct = distinct_in_delivery_order(&delivered);
-    if distinct != expected {
-        return ProbeResult::fail(
-            property,
-            format!(
-                "a second delete of the absent {gone} changed the listing of {list_prefix} to \
-                 {distinct:?}, expected it to still hold exactly 1 key ({kept})"
-            ),
-        );
+    for listing in [ProbeListing::List, ProbeListing::After(None)] {
+        let (delivered, _pages) = match drain_probe_pages(store, &list_prefix, listing).await {
+            Ok(result) => result,
+            Err(detail) => return ProbeResult::fail(property, detail),
+        };
+        let distinct = distinct_in_delivery_order(&delivered);
+        if distinct != expected {
+            return ProbeResult::fail(
+                property,
+                format!(
+                    "a second delete of the absent {gone} changed the {}({list_prefix}) listing \
+                     to {distinct:?}, expected it to still hold exactly 1 key ({kept})",
+                    listing.method()
+                ),
+            );
+        }
     }
 
     ProbeResult::pass(
         property,
         format!(
-            "after deleting {gone}, a get returned NotFound and the listing held exactly 1 key \
-             ({kept}); a second delete of the absent key succeeded and changed nothing"
+            "after deleting {gone}, a get returned NotFound and both list and list_after held \
+             exactly 1 key ({kept}); a second delete of the absent key succeeded and changed \
+             nothing"
         ),
     )
 }
@@ -1865,14 +1893,15 @@ mod tests {
         );
         let verbatim = |subprefix: &str| {
             format!(
-                "listing {prefix}{subprefix} still returned a continuation token after \
+                "list({prefix}{subprefix}) still returned a continuation token after \
                  {MAX_PROBE_PAGES} pages over far fewer keys; this backend's pagination does \
                  not terminate"
             )
         };
         // The membership probe reports the drain's own detail verbatim under
         // its `law/` subprefix, and the ordering probe under `order/`: the
-        // detail is not re-wrapped, and it names the subprefix that drained.
+        // detail is not re-wrapped, it names the `list` entry point that
+        // drained, and it names the subprefix.
         let membership = report
             .results
             .iter()
@@ -2920,6 +2949,64 @@ mod tests {
         .expect("a drain over a permitted repeat must succeed");
         assert_eq!(
             keys,
+            vec![
+                format!("{list_prefix}a"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}e"),
+            ]
+        );
+    }
+
+    /// The `list` twin of
+    /// [`listing_order_probe_accepts_a_repeat_of_the_last_delivered_key`]: a
+    /// backend that re-delivers its own last key across a page boundary on
+    /// `list` (the path every catalog scan drains) keeps the raw sequence
+    /// non-decreasing, so it is the repeat the contract permits and must
+    /// qualify. The reject case has a `list` twin, but nothing pinned that the
+    /// `list` pass still TOLERATES the permitted repeat, only that it rejects
+    /// the earlier-key one.
+    #[tokio::test]
+    async fn listing_order_probe_accepts_a_repeat_of_the_last_delivered_key_on_list() {
+        let store = PageBoundaryStore::new_on_list(PageBoundary::RepeatLastKey);
+        let prefix = "sys/qualify/order-repeat-last-on-list/";
+        let report = run_conformance_suite(&store, prefix).await;
+        assert!(
+            report.passed(),
+            "a repeat of the last delivered key on list is a permitted delivery, so every probe \
+             must pass, got: {:?}",
+            report.failures().collect::<Vec<_>>()
+        );
+        let list_prefix = format!("{prefix}order/");
+        assert_eq!(
+            order_probe_result(&report).detail,
+            expected_order_pass_detail(&list_prefix)
+        );
+
+        // The repeat fired on the list pass: seven deliveries of five keys
+        // across three pages, never decreasing, with each repeat adjacent to
+        // the key it repeats.
+        let (delivered, pages) = drain_probe_pages(&store, &list_prefix, ProbeListing::List)
+            .await
+            .expect("draining the probe's own prefix through list");
+        assert_eq!(
+            delivered,
+            vec![
+                format!("{list_prefix}a"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}b"),
+                format!("{list_prefix}c"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}d"),
+                format!("{list_prefix}e"),
+            ]
+        );
+        assert_eq!(pages, 3, "5 keys at page size 2 is exactly 3 pages");
+        assert_eq!(first_order_violation(&delivered), None);
+        // And the verdict a caller gets: the same five keys, once each.
+        assert_eq!(
+            distinct_in_delivery_order(&delivered),
             vec![
                 format!("{list_prefix}a"),
                 format!("{list_prefix}b"),
