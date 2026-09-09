@@ -76,7 +76,8 @@ normalized="$(echo "${pr_json}" | jq '
          else "other" end)
       elif has("status") then
         (if .status!="COMPLETED" then "pending"
-         elif (.conclusion=="SUCCESS" or .conclusion=="NEUTRAL" or .conclusion=="SKIPPED") then "success"
+         elif .conclusion=="SKIPPED" then "skipped"
+         elif (.conclusion=="SUCCESS" or .conclusion=="NEUTRAL") then "success"
          elif (.conclusion=="FAILURE" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT") then "failing"
          else "other" end)
       else "other" end
@@ -86,7 +87,13 @@ pending=$(echo "${normalized}" | jq '[.[] | select(.class=="pending")] | length'
 success=$(echo "${normalized}" | jq '[.[] | select(.class=="success")] | length')
 failing=$(echo "${normalized}" | jq '[.[] | select(.class=="failing")] | length')
 failing_names=$(echo "${normalized}" | jq -r '[.[] | select(.class=="failing") | .name] | join(",")')
-# Every check must land in success/pending/failing above (an ACTION_REQUIRED
+# A skipped check is not a failure and does not block a merge -- GitHub's own
+# ruleset treats a path-filtered required check as satisfied -- but it is not
+# a pass either, and folding it into the pass count reports "19 pass" for a
+# pull request on which nothing ran at all. Counted on its own so the line
+# says which it was.
+skipped=$(echo "${normalized}" | jq '[.[] | select(.class=="skipped")] | length')
+# Every check must land in success/skipped/pending/failing above (an ACTION_REQUIRED
 # or STALE conclusion, an unrecognized state value, or a shape this script
 # has never seen) before CI counts as settled; this catches whatever falls
 # through all three.
@@ -186,7 +193,19 @@ cr_comments=$(echo "${comments_json}" | jq '[.[] | select(.user.login=="coderabb
 cr_outside_diff=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" \
   -f "$(dirname "$0")/lib/coderabbit-outside-diff.jq")
 
+# "CI green" is a claim about checks that RAN. On a pull request whose paths
+# excluded every one of them, the honest phrase is that nothing ran: the merge
+# is still allowed, since GitHub treats a skipped required check as satisfied,
+# but an operator reading "CI green" would conclude the suite covered this
+# change when it did not.
+ci_phrase="CI green"
+if [[ "${success}" == "0" && "${skipped}" != "0" ]]; then
+  ci_phrase="every check skipped, nothing ran"
+fi
 summary="PR #${pr} @ ${head_sha}: state=${state} mergeState=${merge_state} CI=${success} pass/${pending} pending/${failing} fail"
+if [[ "${skipped}" != "0" ]]; then
+  summary="${summary}/${skipped} skipped"
+fi
 if [[ "${other}" != "0" ]]; then
   summary="${summary}/${other} unrecognized"
 fi
@@ -252,13 +271,13 @@ elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
 else
   if [[ "${cr_comments}" != "0" && "${cr_outside_diff}" != "0" ]]; then
-    echo "  -> clean (operator confirmed all ${cr_comments} inline comment(s) and ${cr_outside_diff} outside-diff body finding(s) addressed): CI green, CodeRabbit's risk line names the current head"
+    echo "  -> clean (operator confirmed all ${cr_comments} inline comment(s) and ${cr_outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, CodeRabbit's risk line names the current head"
   elif [[ "${cr_comments}" != "0" ]]; then
-    echo "  -> clean (operator confirmed all ${cr_comments} inline comment(s) addressed): CI green, CodeRabbit's risk line names the current head"
+    echo "  -> clean (operator confirmed all ${cr_comments} inline comment(s) addressed): ${ci_phrase}, CodeRabbit's risk line names the current head"
   elif [[ "${cr_outside_diff}" != "0" ]]; then
-    echo "  -> clean (operator confirmed all ${cr_outside_diff} outside-diff body finding(s) addressed): CI green, CodeRabbit's risk line names the current head"
+    echo "  -> clean (operator confirmed all ${cr_outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, CodeRabbit's risk line names the current head"
   else
-    echo "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments"
+    echo "  -> clean: ${ci_phrase}, CodeRabbit's risk line names the current head with zero inline comments"
   fi
   # The freshness check above proved the base current at the moment it ran, not
   # for however long the operator takes to run this line; `--match-head-commit`
