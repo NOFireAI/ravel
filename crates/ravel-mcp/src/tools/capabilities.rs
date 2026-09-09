@@ -262,6 +262,30 @@ mod tests {
         );
     }
 
+    /// `ravel_capabilities` never resolves a snapshot, a watermark, a query
+    /// id, or an audit ref: it answers from compile-time facts and the
+    /// call's own context, reading no object storage. So it always carries
+    /// all four D4 identity fields as warnings, in the same wording and
+    /// order `finish` uses everywhere else, rather than shipping them as the
+    /// empty strings D4's typing would otherwise force.
+    #[test]
+    fn capabilities_warns_about_its_unmeasured_identity_fields() {
+        let key = CursorKey::from_process_secret([11u8; CURSOR_KEY_LEN]);
+        let ctx = test_context(&key);
+
+        let envelope = run(json!({}), &ctx);
+
+        assert_eq!(
+            envelope.warnings,
+            vec![
+                "visibility.snapshot_id is not reported by this operation".to_string(),
+                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "ids.query_id is not reported by this operation".to_string(),
+                "ids.audit_ref is not reported by this operation".to_string(),
+            ]
+        );
+    }
+
     /// A non-object argument is the caller's mistake, and it comes back as a
     /// D4 `invalid_argument` envelope rather than a protocol error, because
     /// D4 reserves protocol errors for malformed JSON-RPC and unknown tools.

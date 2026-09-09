@@ -170,10 +170,13 @@ fn published_accounting(stats: &Value) -> Option<Value> {
 /// stops its own stream at a row cap this layer never sees.
 ///
 /// Every identity field the operation left unmeasured is named in `warnings`
-/// first (see [`warn_unreported_identity`]), so the empty string D4's typing
-/// forces there is never read as a value.
+/// by [`Envelope::finish`](ravel_mcp::envelope::Envelope::finish) itself, so
+/// the empty string D4's typing forces there is never read as a value. That
+/// warning lives on `finish` rather than here so every envelope reaching a
+/// caller carries it, including one a crate builds and calls `fit`/`finish`
+/// on directly without going through this wrapper (`ravel_capabilities` is
+/// exactly that case).
 pub(crate) fn finish(mut envelope: Envelope, budgets: &McpEffectiveBudgets) -> Envelope {
-    warn_unreported_identity(&mut envelope);
     let produced_rows = envelope.data.row_count;
     let max_rows = budgets.max_rows as usize;
     let row_cap_omitted = envelope.data.rows.len().saturating_sub(max_rows) as u64;
@@ -184,39 +187,6 @@ pub(crate) fn finish(mut envelope: Envelope, budgets: &McpEffectiveBudgets) -> E
     fitted.presentation.row_cap_hit |= row_cap_omitted > 0;
     fitted.data.row_count = produced_rows;
     fitted.finish(false)
-}
-
-/// The four identity fields D4 declares as strings, in the order they are
-/// warned about.
-const IDENTITY_FIELDS: [&str; 4] = [
-    "visibility.snapshot_id",
-    "visibility.watermark_hour",
-    "ids.query_id",
-    "ids.audit_ref",
-];
-
-/// Name every identity field this operation did not measure.
-///
-/// D4 types all four as strings, so an operation that does not resolve one
-/// serializes `""`. An empty string is a value: a caller cannot tell it apart
-/// from an id that really is empty, and a reader collecting snapshot ids
-/// across calls would collect blanks as if they were measurements. Saying in
-/// `warnings` that the field is not reported by this operation is the honest
-/// form, and it runs before `fit` so the warnings are inside the byte cap.
-fn warn_unreported_identity(envelope: &mut Envelope) {
-    let reported = [
-        !envelope.visibility.snapshot_id.is_empty(),
-        !envelope.visibility.watermark_hour.is_empty(),
-        !envelope.ids.query_id.is_empty(),
-        !envelope.ids.audit_ref.is_empty(),
-    ];
-    for (field, reported) in IDENTITY_FIELDS.iter().zip(reported) {
-        if !reported {
-            envelope
-                .warnings
-                .push(format!("{field} is not reported by this operation"));
-        }
-    }
 }
 
 /// The D4 failure class of a service error. Every service kind has one, so

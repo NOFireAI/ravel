@@ -162,15 +162,27 @@ const LIST_ALLOWANCE: usize = MAX_PROJECTION_COLUMNS * (COLUMN_ENTRY_BOUND + 1)
     + MAX_EVIDENCE * (EVIDENCE_ENTRY_BOUND + 1);
 
 /// The largest fixed part -- the whole envelope but `data.rows` -- that can
-/// survive [`Envelope::cap_metadata_lists`] and [`Envelope::cap_scalars`].
-const MAXIMAL_FIXED_PART: usize =
-    EMPTY_ENVELOPE_SERIALIZED_LEN + SKELETON_SLACK + LIST_ALLOWANCE + SCALAR_ALLOWANCE;
+/// survive [`Envelope::cap_metadata_lists`] and [`Envelope::cap_scalars`],
+/// plus the room [`Envelope::finish`] needs afterward for the
+/// [`IDENTITY_WARNINGS_ALLOWANCE`] it can still add. `finish` runs after
+/// `fit`, so a row-packed envelope that `fit` measured as exactly at its cap
+/// has zero slack of its own; folding the identity-warning allowance in here
+/// is what lets `fit` reserve that room up front (see [`Envelope::fit`]'s
+/// `cap` calculation) rather than leaving `finish` to add bytes `fit` never
+/// accounted for.
+const MAXIMAL_FIXED_PART: usize = EMPTY_ENVELOPE_SERIALIZED_LEN
+    + SKELETON_SLACK
+    + LIST_ALLOWANCE
+    + SCALAR_ALLOWANCE
+    + IDENTITY_WARNINGS_ALLOWANCE;
 
 /// What makes [`Envelope::fit`] total. `fit` floors its cap at
 /// [`MAX_RESPONSE_BYTES_FLOOR`] and, as a last resort, empties `data.rows`;
 /// the result is the fixed part alone, which the caps hold under
 /// [`MAXIMAL_FIXED_PART`]. So a zero-row envelope over the cap is
-/// arithmetically impossible and `fit` needs no failure channel.
+/// arithmetically impossible and `fit` needs no failure channel, even once
+/// `finish` adds the identity warnings [`MAXIMAL_FIXED_PART`] now reserves
+/// room for.
 const _: () = assert!(
     MAXIMAL_FIXED_PART < MAX_RESPONSE_BYTES_FLOOR as usize,
     "a zero-row envelope must fit the smallest cap fit can be given"
@@ -697,6 +709,75 @@ const CURSOR_DROPPED_NEXT_STEP_ACTION: &str = "narrow the query";
 const CURSOR_DROPPED_NEXT_STEP_DETAIL: &str =
     "the cursor did not fit the response; request a narrower time_range or fewer rows per page";
 
+/// The four identity fields D4 declares as strings, in the order
+/// [`Envelope::warn_unreported_identity`] warns about them.
+const IDENTITY_FIELDS: [&str; 4] = [
+    "visibility.snapshot_id",
+    "visibility.watermark_hour",
+    "ids.query_id",
+    "ids.audit_ref",
+];
+
+/// The fixed text [`Envelope::warn_unreported_identity`] appends to each
+/// field name in [`IDENTITY_FIELDS`].
+const IDENTITY_WARNING_SUFFIX: &str = " is not reported by this operation";
+
+/// Serialized JSON string length of one byte inside a string, mirroring
+/// [`escaped_char_len`] for the ASCII range: every byte
+/// [`IDENTITY_FIELDS`] and [`IDENTITY_WARNING_SUFFIX`] can contain today.
+/// Kept separate from `escaped_char_len` because a `const fn` cannot decode
+/// UTF-8 through `str::chars` on stable Rust, and these two string sources
+/// are ASCII by construction (field names and fixed English prose).
+const fn ascii_escaped_byte_len(b: u8) -> usize {
+    match b {
+        b'"' | b'\\' => 2,
+        b if b < 0x20 => 6,
+        _ => 1,
+    }
+}
+
+/// Exact serialized JSON string length of `a` immediately followed by `b`,
+/// as one string value: the two surrounding quotes plus every byte of both
+/// pieces escaped the way `serialized_str_len` measures every other entry
+/// in this module.
+const fn ascii_pair_serialized_len(a: &str, b: &str) -> usize {
+    let mut len = 2; // the surrounding quotes
+    let a = a.as_bytes();
+    let mut i = 0;
+    while i < a.len() {
+        len += ascii_escaped_byte_len(a[i]);
+        i += 1;
+    }
+    let b = b.as_bytes();
+    i = 0;
+    while i < b.len() {
+        len += ascii_escaped_byte_len(b[i]);
+        i += 1;
+    }
+    len
+}
+
+/// Worst-case serialized cost of the four
+/// [`Envelope::warn_unreported_identity`] entries together, as `warnings`
+/// list entries: each field's own message (its name from [`IDENTITY_FIELDS`]
+/// plus [`IDENTITY_WARNING_SUFFIX`]), plus one list separator per entry, the
+/// same `+ 1` every other per-entry term in [`LIST_ALLOWANCE`] carries.
+/// Derived from the strings themselves so a changed field name or a changed
+/// wording cannot drift silently from what [`Envelope::fit`] reserves room
+/// for.
+const fn identity_warnings_allowance() -> usize {
+    let mut total = 0usize;
+    let mut i = 0usize;
+    while i < IDENTITY_FIELDS.len() {
+        total += ascii_pair_serialized_len(IDENTITY_FIELDS[i], IDENTITY_WARNING_SUFFIX) + 1;
+        i += 1;
+    }
+    total
+}
+
+/// See [`identity_warnings_allowance`].
+const IDENTITY_WARNINGS_ALLOWANCE: usize = identity_warnings_allowance();
+
 /// Serialized size of `s` as a JSON string value, quotes and every escape
 /// sequence included. This is the number every budget in this module is
 /// measured in: a source byte count is not it, because one source byte can
@@ -1052,6 +1133,17 @@ impl Envelope {
     /// `fit` total, and it needs no failure channel because the fixed part
     /// that remains is under [`MAXIMAL_FIXED_PART`], which is under the
     /// smallest cap `fit` can be given.
+    ///
+    /// Every decision below (the already-fits check, the row-packing target,
+    /// the first-row shortening) is made against `cap`, which is the
+    /// caller's resolved [`Envelope::presentation`]`.effective_max_response_bytes`
+    /// minus [`IDENTITY_WARNINGS_ALLOWANCE`], not that figure itself. A
+    /// row-packed envelope this method measures as sitting exactly at the
+    /// reported cap has no slack of its own left for
+    /// [`Envelope::finish`](Self::finish) to spend on the identity warnings
+    /// it adds afterward; reserving that room here, once, is what keeps the
+    /// envelope `finish` returns inside the cap it reports, without `finish`
+    /// having to re-measure or re-cut anything.
     pub fn fit(mut self, requested_max_response_bytes: u64) -> Envelope {
         self.presentation.scalars_truncated = self.cap_scalars();
         let caps = self.cap_metadata_lists();
@@ -1061,7 +1153,7 @@ impl Envelope {
         let effective_cap = requested_max_response_bytes.max(MAX_RESPONSE_BYTES_FLOOR);
         self.presentation.effective_max_response_bytes = effective_cap;
         self.presentation.floor_applied = requested_max_response_bytes < MAX_RESPONSE_BYTES_FLOOR;
-        let cap = effective_cap as usize;
+        let cap = (effective_cap as usize).saturating_sub(IDENTITY_WARNINGS_ALLOWANCE);
 
         if serialized_len(&self) <= cap {
             self.presentation.bytes_cap_hit = false;
@@ -1170,6 +1262,48 @@ impl Envelope {
         truncated
     }
 
+    /// Names every D4 identity field this envelope did not measure.
+    ///
+    /// D4 types `visibility.snapshot_id`, `visibility.watermark_hour`,
+    /// `ids.query_id`, and `ids.audit_ref` as strings, so an operation that
+    /// never resolved one serializes `""`. An empty string is a value: a
+    /// caller cannot tell it apart from an id that really is empty, and a
+    /// reader collecting snapshot ids across calls would collect blanks as if
+    /// they were measurements. Saying in `warnings` that the field is not
+    /// reported by this operation is the honest form.
+    ///
+    /// Every envelope that reaches a caller goes through [`finish`](Self::finish),
+    /// which is what calls this: a crate that built its own envelope and
+    /// called `fit` directly used to ship these four fields as silent empty
+    /// strings with no warning, because the warning lived only in the one
+    /// call path that ran `fit` and this check as separate steps.
+    ///
+    /// Inserted at the front, not appended: `finish` runs this after `fit`
+    /// has already applied the D4 count bound to `warnings`, and re-applies
+    /// that same bound afterward (see `finish`'s own doc comment). Putting
+    /// the identity warnings first means they are what survives that second
+    /// pass when a caller's own warnings already filled the list, the same
+    /// kept-first reasoning [`Envelope::cap_scalars`] uses for the
+    /// dropped-cursor announcement.
+    fn warn_unreported_identity(&mut self) {
+        let reported = [
+            !self.visibility.snapshot_id.is_empty(),
+            !self.visibility.watermark_hour.is_empty(),
+            !self.ids.query_id.is_empty(),
+            !self.ids.audit_ref.is_empty(),
+        ];
+        let mut identity_warnings: Vec<String> = IDENTITY_FIELDS
+            .iter()
+            .zip(reported)
+            .filter(|(_, reported)| !reported)
+            .map(|(field, _)| format!("{field}{IDENTITY_WARNING_SUFFIX}"))
+            .collect();
+        if !identity_warnings.is_empty() {
+            identity_warnings.append(&mut self.warnings);
+            self.warnings = identity_warnings;
+        }
+    }
+
     /// Resolves `status` from what the caps and the cursor actually did, the
     /// last step before a result is returned.
     ///
@@ -1202,13 +1336,35 @@ impl Envelope {
     /// the same reason -- there is no next page to point at.
     ///
     /// An `Error` envelope keeps its status and loses its cursor: a failure
-    /// is never a page.
+    /// is never a page. Since a failed operation never measured anything,
+    /// [`warn_unreported_identity`](Self::warn_unreported_identity) does not
+    /// run on that path either.
+    ///
+    /// Every unmeasured identity field is named in `warnings` here, so every
+    /// crate that builds an envelope and calls this method gets the warning
+    /// once rather than each having to remember to ask for it. This runs
+    /// after [`fit`](Self::fit) in every call site that uses both, so the
+    /// bytes it adds are not run back through `fit`'s own caps; two things
+    /// make that sound rather than an exception to them. `fit` reserves
+    /// [`IDENTITY_WARNINGS_ALLOWANCE`] bytes of headroom below its cap for
+    /// exactly this addition (see [`fit`](Self::fit)'s own doc comment), so
+    /// the byte cap still holds once these warnings are in. And `warnings`
+    /// itself is re-bounded to [`MAX_WARNINGS`] right here, the same
+    /// [`truncate_vec`] call `fit`'s own metadata capping uses, with
+    /// anything that still does not fit counted into
+    /// `presentation.metadata_elided` exactly the way that capping counts
+    /// every other over-the-bound entry; the identity warnings are inserted
+    /// first, so they are what survives that bound when a caller's own
+    /// warnings already filled the list.
     pub fn finish(mut self, has_total_order: bool) -> Envelope {
         if self.status == Status::Error || self.failure.is_some() {
             self.status = Status::Error;
             self.presentation.cursor = None;
             return self;
         }
+
+        self.warn_unreported_identity();
+        self.presentation.metadata_elided += truncate_vec(&mut self.warnings, MAX_WARNINGS);
 
         let bytes_cap_took_something =
             self.presentation.rows_omitted > 0 || self.presentation.cells_truncated > 0;
@@ -1274,11 +1430,14 @@ mod tests {
     /// first from 1 digit to 6 while `bytes_cap_hit` narrows from `false` to
     /// `true`, a net +4 B. From that fixed part the running total is 150,860
     /// after the first row and 300,865 after the second (one more byte for
-    /// the comma between them); a cap set to exactly that second total must
-    /// keep exactly those two rows and omit the other two, and the fitted
-    /// envelope's real serialized size must land on that same total: the
-    /// prefix-sum model and the true serialization agree exactly, not
-    /// approximately.
+    /// the comma between them). `fit` packs rows against its cap minus
+    /// [`IDENTITY_WARNINGS_ALLOWANCE`] (the room it reserves for
+    /// [`Envelope::finish`]'s identity warnings), so the requested cap here
+    /// is that total plus the allowance: internally `fit` targets exactly
+    /// 300,865 again, keeps exactly those two rows and omits the other two,
+    /// and the fitted envelope's real serialized size lands on that same
+    /// total, unaffected by the reservation because `finish` is never called
+    /// in this test.
     #[test]
     fn row_prefix_is_chosen_from_measured_sizes() {
         let sizes = [150_000usize, 150_000, 150_000, 150_000];
@@ -1288,7 +1447,7 @@ mod tests {
             .map(|&n| vec![Cell::Str("a".repeat(n))])
             .collect();
 
-        let fitted = envelope.fit(300_865);
+        let fitted = envelope.fit(300_865 + IDENTITY_WARNINGS_ALLOWANCE as u64);
 
         assert_eq!(fitted.presentation.rows_omitted, 2);
         assert_eq!(fitted.data.rows.len(), 2);
@@ -1301,16 +1460,19 @@ mod tests {
     /// 856 B fixed part as above (the 256 KiB floor is a 6-digit cap too)
     /// and 204 B rows (a 200-byte `Cell::Str` plus its two bytes of
     /// brackets and two of quotes), the running total after `k` rows is
-    /// `855 + 205*k`, which crosses the 256 KiB floor between the 1,274th
-    /// and 1,275th row -- except `rows_omitted` (3,726, four digits) is
-    /// itself part of the returned envelope and widens it by 3 B over the
-    /// one-digit `0` it held while `fixed` above was measured, so the
-    /// returned envelope's real size is 3 B over that running total. This
-    /// is the boundedness test the task calls for in place of counting
-    /// `serialized_len` calls directly: there is no call counter to hook,
-    /// so this instead pins the one thing a quadratic re-serialize-per-drop
-    /// implementation could still get wrong at this row count -- the exact
-    /// kept prefix -- without any wall-clock timing.
+    /// `855 + 205*k`. `fit` packs rows against the floor minus
+    /// [`IDENTITY_WARNINGS_ALLOWANCE`], not the floor itself, so the
+    /// crossing point is one row earlier than it would be without that
+    /// reservation: between the 1,273rd and 1,274th row -- except
+    /// `rows_omitted` (3,727, four digits) is itself part of the returned
+    /// envelope and widens it by 3 B over the one-digit `0` it held while
+    /// `fixed` above was measured, so the returned envelope's real size is
+    /// 3 B over that running total. This is the boundedness test the task
+    /// calls for in place of counting `serialized_len` calls directly: there
+    /// is no call counter to hook, so this instead pins the one thing a
+    /// quadratic re-serialize-per-drop implementation could still get wrong
+    /// at this row count -- the exact kept prefix -- without any wall-clock
+    /// timing.
     #[test]
     fn row_prefix_scan_is_exact_at_the_row_count_ceiling() {
         let mut envelope = Envelope::default();
@@ -1320,10 +1482,10 @@ mod tests {
 
         let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
 
-        assert_eq!(fitted.data.rows.len(), 1_274);
-        assert_eq!(fitted.presentation.rows_omitted, 5_000 - 1_274);
+        assert_eq!(fitted.data.rows.len(), 1_273);
+        assert_eq!(fitted.presentation.rows_omitted, 5_000 - 1_273);
         assert_eq!(fitted.presentation.cells_truncated, 0);
-        assert_eq!(serialized_len(&fitted), 855 + 205 * 1_274 + 3);
+        assert_eq!(serialized_len(&fitted), 855 + 205 * 1_273 + 3);
         assert!(serialized_len(&fitted) <= MAX_RESPONSE_BYTES_FLOOR as usize);
     }
 
@@ -1387,17 +1549,19 @@ mod tests {
     /// three tests detect a cut measured in source bytes: such a cut either
     /// overruns the cap or, once the re-measure loop has clamped it, lands on
     /// the 256 B floor instead of this figure.
-    const KEPT_CELL_SERIALIZED_LEN: usize = 261_248;
+    const KEPT_CELL_SERIALIZED_LEN: usize = 261_028;
     /// The whole envelope's exact serialized size for those same cases.
-    const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 262_138;
+    const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 261_918;
 
-    /// The one body that lands a byte short of [`KEPT_CELL_SERIALIZED_LEN`]:
     /// `\n ` alternates a character that serializes to two bytes with one
-    /// that serializes to one, so the last character the budget could hold is
-    /// the two-byte one and it does not fit. A cut never spends a partial
-    /// character to reach the figure exactly.
-    const KEPT_CONTROL_CELL_SERIALIZED_LEN: usize = 261_247;
-    const FITTED_CONTROL_ENVELOPE_SERIALIZED_LEN: usize = 262_137;
+    /// that serializes to one. At this cap the shrink loop's convergence
+    /// lands the kept cell on the same exact serialized length as the pure
+    /// quote body above: both bodies have more than enough source characters
+    /// to hit the budget precisely regardless of their escape ratio, so the
+    /// two constants below are not required to differ, and today they do
+    /// not.
+    const KEPT_CONTROL_CELL_SERIALIZED_LEN: usize = 261_028;
+    const FITTED_CONTROL_ENVELOPE_SERIALIZED_LEN: usize = 261_918;
 
     /// Serialized size of a 200-row page of one hex id column, every id at
     /// the 64-character bound: 13,801 B of rows (200 cells of 68 B, their
@@ -2395,6 +2559,81 @@ mod tests {
         envelope.presentation.bytes_cap_hit = true;
         envelope.presentation.cells_truncated = 1;
         assert_eq!(envelope.finish(false).status, Status::OkBounded);
+    }
+
+    /// Every envelope that reaches a caller goes through `finish`, so the
+    /// four D4 identity fields it left unmeasured are named in `warnings`
+    /// there, whole and in order, regardless of which crate built the
+    /// envelope or whether that crate calls a server-side wrapper around
+    /// `finish` at all. A field the caller did measure is excluded, so the
+    /// warning list is exactly the fields still missing.
+    #[test]
+    fn finish_warns_about_unmeasured_identity_fields() {
+        let envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i64)]);
+
+        let finished = envelope.finish(false);
+
+        assert_eq!(
+            finished.warnings,
+            vec![
+                "visibility.snapshot_id is not reported by this operation".to_string(),
+                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "ids.query_id is not reported by this operation".to_string(),
+                "ids.audit_ref is not reported by this operation".to_string(),
+            ]
+        );
+
+        let mut measured = envelope_with_rows(1, |i| vec![Cell::Int(i as i64)]);
+        measured.visibility.snapshot_id = "snap-7".to_string();
+
+        let finished = measured.finish(false);
+
+        assert_eq!(
+            finished.warnings,
+            vec![
+                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "ids.query_id is not reported by this operation".to_string(),
+                "ids.audit_ref is not reported by this operation".to_string(),
+            ]
+        );
+    }
+
+    /// An envelope that already carries `MAX_WARNINGS` warnings, each at the
+    /// per-entry bound, and was fitted at the smallest cap `fit` can be
+    /// given: adding the four identity warnings in `finish` must neither
+    /// push `warnings` past its D4 count bound nor push the envelope's
+    /// serialized size past the cap it was fitted to, even though nothing
+    /// about this envelope has any headroom left on either dimension before
+    /// `finish` runs.
+    #[test]
+    fn identity_warnings_are_inside_the_cap_and_the_count_bound() {
+        let mut envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i64)]);
+        envelope.warnings = (0..MAX_WARNINGS)
+            .map(|i| format!("{i:0>2}_{}", "w".repeat(507)))
+            .collect();
+        for warning in &envelope.warnings {
+            assert_eq!(serialized_str_len(warning), WARNING_ENTRY_BOUND);
+        }
+
+        let fitted = envelope.fit(MAX_RESPONSE_BYTES_FLOOR);
+        assert_eq!(
+            fitted.warnings.len(),
+            MAX_WARNINGS,
+            "nothing was elided yet"
+        );
+
+        let finished = fitted.finish(false);
+
+        assert_eq!(finished.warnings.len(), MAX_WARNINGS);
+        for field in IDENTITY_FIELDS {
+            let expected = format!("{field}{IDENTITY_WARNING_SUFFIX}");
+            assert!(
+                finished.warnings.contains(&expected),
+                "{expected:?} is missing from {:?}",
+                finished.warnings
+            );
+        }
+        assert!(serialized_len(&finished) <= MAX_RESPONSE_BYTES_FLOOR as usize);
     }
 
     /// A failure is never a page: an `Error` envelope keeps its status even
