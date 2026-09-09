@@ -38,14 +38,10 @@ case "$pr" in
     ;;
 esac
 
-# Both fetches name their destination, per the note above: relying on the
+# Both refspecs name their destination, per the note above: relying on the
 # opportunistic remote-tracking update would make this depend on the clone's
 # `remote.<name>.fetch` refspec being the standard one.
 tip_ref="refs/remotes/${remote}/${branch}"
-git fetch "$remote" "+${branch}:${tip_ref}" >/dev/null 2>&1 || {
-  echo "guard: git fetch $remote $branch failed" >&2
-  exit 1
-}
 
 # refs/pull/<n>/head needs no branch name, so this works for a PR from any
 # branch and cannot be aimed at the wrong ref by a stale local copy. The
@@ -68,8 +64,15 @@ trap cleanup 0
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-git fetch "$remote" "+refs/pull/${pr}/head:${local_ref}" >/dev/null 2>&1 || {
-  echo "guard: git fetch $remote refs/pull/${pr}/head failed (is $pr a pull request on $remote?)" >&2
+# One fetch for both refs: two round trips to the same remote buy nothing, and
+# callers document this guard as costing one.
+git fetch "$remote" "+${branch}:${tip_ref}" "+refs/pull/${pr}/head:${local_ref}" \
+  >/dev/null 2>&1 || {
+  if ! git ls-remote --exit-code "$remote" "refs/pull/${pr}/head" >/dev/null 2>&1; then
+    echo "guard: $remote has no refs/pull/${pr}/head (is $pr a pull request on $remote?)" >&2
+  else
+    echo "guard: git fetch $remote ($branch, refs/pull/${pr}/head) failed" >&2
+  fi
   exit 1
 }
 
@@ -89,7 +92,12 @@ behind=$(git rev-list --count "$base".."$tip") || {
 echo "guard: PR #$pr is $behind commit(s) behind $remote/$branch." >&2
 echo "guard: its CI ran against $(git rev-parse --short "$base"), not $(git rev-parse --short "$tip")." >&2
 echo "guard: most recent unseen commits:" >&2
-git log --oneline --max-count=10 "$base".."$tip" 2>/dev/null | sed 's/^/guard:   /' >&2
+# A commit subject is attacker-controlled text and reaches a terminal or a CI
+# log from here, so strip the control bytes that could rewrite what the reader
+# sees. Tab and newline stay.
+git log --oneline --max-count=10 "$base".."$tip" 2>/dev/null |
+  LC_ALL=C tr -d '\001-\010\013\014\016-\037\177' |
+  sed 's/^/guard:   /' >&2
 if [ "$behind" -gt 10 ]; then
   echo "guard:   ... and $((behind - 10)) more" >&2
 fi

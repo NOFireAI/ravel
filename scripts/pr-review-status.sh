@@ -237,5 +237,9 @@ else
   else
     echo "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments"
   fi
-  echo "  -> gh pr merge ${pr} --rebase --delete-branch --match-head-commit ${head_sha}"
+  # The freshness check above proved the base current at the moment it ran, not
+  # for however long the operator takes to run this line; `--match-head-commit`
+  # pins the PR head, not `main`. So the printed command re-runs the guard and
+  # merges only if it still passes.
+  echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} && gh pr merge ${pr} --rebase --delete-branch --match-head-commit ${head_sha}"
 fi
