@@ -3559,7 +3559,16 @@ mod tests {
         // Reuse still produced a complete artifact covering all three segments.
         let acc = QueryAccounting::new();
         let loaded = catalog
-            .load_column_stats(&tenant(), Signal::Logs, &acc)
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                ravel_types::TimeRange {
+                    start_ns: 0,
+                    end_ns: 50 * NS_PER_HOUR,
+                },
+                50 * NS_PER_HOUR,
+                &acc,
+            )
             .await
             .expect("load ok")
             .expect("stats present");

@@ -157,6 +157,7 @@ fn loaded_cstat(seg: &SegmentRef, min: i64, max: i64, null_count: u64) -> Arc<Lo
     );
     Arc::new(LoadedColumnStats {
         segments,
+        by_content_hash: HashMap::new(),
         part_blake3: Vec::new(),
     })
 }
