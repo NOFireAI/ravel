@@ -1381,6 +1381,18 @@ pub struct Cli {
     #[arg(long, value_name = "DURATION")]
     pub store_probe_interval: Option<String>,
 
+    /// Upper bound on the graceful-shutdown drain, as a humantime duration
+    /// (e.g. `25s`). On SIGTERM the process flips readiness to draining, waits
+    /// for probes to observe 503, then flushes ingest buffers and joins its
+    /// background tasks; this bounds that whole drain so the process still
+    /// exits before Kubernetes escalates SIGTERM to SIGKILL. Matches the
+    /// humantime-duration flag convention of `--store-probe-interval`. Omitted
+    /// defaults to `DEFAULT_SHUTDOWN_TIMEOUT`, deliberately below the
+    /// Kubernetes default `terminationGracePeriodSeconds` (30s). A zero
+    /// duration is rejected. (default: 25s)
+    #[arg(long, value_name = "DURATION")]
+    pub shutdown_timeout: Option<String>,
+
     /// OTLP/gRPC endpoint this process exports its own query-path `tracing`
     /// spans to (ADR-0060). Absent by default: with no endpoint the subscriber
     /// is byte-identical to before, spans stay on the local log stream only.
@@ -3106,6 +3118,27 @@ impl Cli {
                     anyhow::bail!(
                         "--store-probe-interval '{s}' must be a positive duration: a zero \
                          interval would probe the store in a tight loop"
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
+    /// Parse `--shutdown-timeout` into a duration, defaulting to
+    /// [`crate::DEFAULT_SHUTDOWN_TIMEOUT`] when unset. Rejects a zero or
+    /// unparseable duration rather than a zero-length drain that would skip the
+    /// buffer flush entirely, mirroring [`Self::parse_store_probe_interval`].
+    pub fn parse_shutdown_timeout(&self) -> anyhow::Result<Duration> {
+        match self.shutdown_timeout.as_deref() {
+            None => Ok(crate::DEFAULT_SHUTDOWN_TIMEOUT),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --shutdown-timeout '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--shutdown-timeout '{s}' must be a positive duration: a zero timeout \
+                         would cut the drain off before any ingest buffer is flushed"
                     );
                 }
                 Ok(dur)
