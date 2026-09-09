@@ -21,10 +21,12 @@ order against each other.
 
 So a backwards wall-clock step small enough to stay above the floor inverts
 duplicate resolution. Concretely: a writer flushes `(S, ts=100) = 1.0` at clock
-`T0`, stamping `created_unix_ns = T0`. NTP then steps the host back ten minutes.
-The correction `(S, ts=100) = 2.0` flushes and stamps `created_unix_ns =
-T0 - 600s`, which is less than `T0`. At query time the stale `1.0` now outranks
-its own correction and wins every read, silently and permanently.
+`T0`, stamping `created_unix_ns = T0`. NTP then steps the host back two minutes,
+within the `MAX_FLUSH_CLOCK_HOLD_NS` bound this decision introduces. The
+correction `(S, ts=100) = 2.0` flushes and, without this decision, would stamp
+`created_unix_ns = T0 - 120s`, which is less than `T0`. At query time the stale
+`1.0` would then outrank its own correction and win every read, silently and
+permanently.
 
 This is not a durability defect. Both writes are durably committed and both
 acknowledgements are honest. It is broken last-write-wins for duplicates: the
@@ -178,9 +180,20 @@ flowchart TD
   follow-up (#1473); the counters are present in the ingest metrics snapshot
   now.
 - A backwards step larger than `MAX_FLUSH_CLOCK_HOLD_NS` fails that one flush
-  with a typed, retryable error (`Abandoned`, 503): strict-mode waiters see it
-  and retry the whole write; buffered-mode data is not lost, since the flush is
-  retried on the next trigger once the floor has re-anchored. Surfacing it as
+  with a typed, retryable error (`Abandoned`, 503) and re-anchors the floor to
+  `raw_ns`, so at most one flush is ever refused. Buffered-mode data is not
+  lost: the refuse arm re-inserts the whole tenant buffer into the actor's
+  buffer map instead of dropping it, so the next trigger (a later write, the
+  age timer, or drain at shutdown) flushes those rows against the re-anchored
+  floor. The re-inserted buffer keeps its rows, exemplars, byte-budget charges,
+  and trigger bookkeeping (`est_bytes`, `oldest_arrival_ns`) intact; the byte
+  budget is held, not refunded, because the bytes are still resident. Only the
+  strict-mode `waiters` are removed and acked with the 503 before re-insert: a
+  waiter left in the buffer would be re-acked by the next flush against an
+  already-answered oneshot. A strict-mode writer that retries on the 503
+  re-enqueues rows this buffer still holds; metrics collapse the duplicate at
+  query time by `(series_id, ts)`, and logs carry the at-least-once contract
+  that strict mode already exposes on any retry. Surfacing the refusal as
   retryable rather than as a client `SegmentBuild` (400) matters: a conformant
   OTLP exporter drops a batch on 4xx, so a transient clock condition must not
   reach the client as Bad Request. This is a deliberate, bounded availability

@@ -26,8 +26,8 @@ use common::{TestClock, make_point, tenant};
 use ravel_commit::keys;
 use ravel_commit::record;
 use ravel_ingest::{
-    IngestConfig, IngestRouter, LogIngestRouter, MAX_FLUSH_CLOCK_HOLD_NS, SpanIngestRouter,
-    WriteMode,
+    IngestConfig, IngestRouter, LogIngestRouter, LogWriteError, MAX_FLUSH_CLOCK_HOLD_NS,
+    SpanIngestRouter, SpanWriteError, WriteError, WriteMode,
 };
 use ravel_logseg::stream_attrs_bytes;
 use ravel_object_store::memory::MemoryStore;
@@ -273,6 +273,127 @@ async fn metrics_forward_step_stamps_raw_and_counts_nothing() {
         router.metrics().snapshot().clock_regressions,
         0,
         "a forward step is not a regression"
+    );
+
+    router.shutdown().await;
+}
+
+/// Logs: mirror of `metrics_forward_step_stamps_raw_and_counts_nothing` in the
+/// log shard actor. A forward step stamps the raw reading verbatim and moves
+/// neither counter. The log actor's forward-step behaviour otherwise appears
+/// only as an unasserted intermediate step inside the refuse tests (ADR-1307
+/// finding 4). Flipping `monotonic_flush_open_ns` back to a raw `now_ns()` read
+/// leaves the stamp unchanged here (a forward step already stamps raw), so this
+/// test guards the counter contract; the backward-step test guards the stamp.
+#[tokio::test]
+async fn logs_forward_step_stamps_raw_and_counts_nothing() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = LogIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+
+    let first = router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(1_000, "boot")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("first record flushes");
+    let first_token = first.tokens.first().expect("one token").clone();
+
+    clock.set_ns(T0 + TEN_MINUTES_NS);
+    let second = router
+        .write(
+            tenant.clone(),
+            vec![norm_log_record(2_000, "later")],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("second record flushes");
+    let second_token = second.tokens.first().expect("one token").clone();
+
+    let (first_created, _) =
+        created_and_seq(store.as_ref(), &tenant, Signal::Logs, &first_token).await;
+    let (second_created, _) =
+        created_and_seq(store.as_ref(), &tenant, Signal::Logs, &second_token).await;
+
+    assert_eq!(first_created, T0);
+    assert_eq!(
+        second_created,
+        T0 + TEN_MINUTES_NS,
+        "a forward step stamps the raw reading, not the floor"
+    );
+    assert!(second_created > first_created);
+    assert_eq!(
+        router.metrics().snapshot().clock_regressions,
+        0,
+        "a forward step is not a regression"
+    );
+    assert_eq!(
+        router.metrics().snapshot().clock_regressions_refused,
+        0,
+        "a forward step is not refused"
+    );
+
+    router.shutdown().await;
+}
+
+/// Spans: mirror of `metrics_forward_step_stamps_raw_and_counts_nothing` in the
+/// span shard actor (ADR-1307 finding 4).
+#[tokio::test]
+async fn spans_forward_step_stamps_raw_and_counts_nothing() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = SpanIngestRouter::new(flush_per_write_config(), Arc::clone(&store), clock.clone());
+    let tenant = tenant("acme");
+
+    let first = router
+        .write(
+            tenant.clone(),
+            vec![norm_span(1_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("first span flushes");
+    let first_token = first.tokens.first().expect("one token").clone();
+
+    clock.set_ns(T0 + TEN_MINUTES_NS);
+    let second = router
+        .write(
+            tenant.clone(),
+            vec![norm_span(2_000, StatusCode::Unset)],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("second span flushes");
+    let second_token = second.tokens.first().expect("one token").clone();
+
+    let (first_created, _) =
+        created_and_seq(store.as_ref(), &tenant, Signal::Spans, &first_token).await;
+    let (second_created, _) =
+        created_and_seq(store.as_ref(), &tenant, Signal::Spans, &second_token).await;
+
+    assert_eq!(first_created, T0);
+    assert_eq!(
+        second_created,
+        T0 + TEN_MINUTES_NS,
+        "a forward step stamps the raw reading, not the floor"
+    );
+    assert!(second_created > first_created);
+    assert_eq!(
+        router.metrics().snapshot().clock_regressions,
+        0,
+        "a forward step is not a regression"
+    );
+    assert_eq!(
+        router.metrics().snapshot().clock_regressions_refused,
+        0,
+        "a forward step is not refused"
     );
 
     router.shutdown().await;
@@ -619,6 +740,9 @@ async fn forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors() {
     // The clock corrects back to T0 + 1m: a backwards step from the ratcheted
     // floor of nearly twice the hold bound, so it is refused.
     clock.set_ns(T0 + ONE_MINUTE_NS);
+    // F3: `record_flush` runs only after the stamp is decided, so a refused
+    // flush does not move the flush counter. Capture it across the refusal.
+    let flushes_before_refuse = router.metrics().snapshot().flushes_by_size;
     let refused = router
         .write(
             tenant.clone(),
@@ -643,6 +767,19 @@ async fn forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors() {
         "a refused clock regression is a transient server condition: it must be \
          retryable (Abandoned, 503), not a client SegmentBuild (400) that drops \
          the buffered rows on a conformant exporter (ADR-1307 finding 1); got: {err:?}"
+    );
+    // F5: retryability alone would pass for a wrong retryable variant; pin the
+    // variant itself to the refuse path's `Abandoned`.
+    assert!(
+        matches!(err, WriteError::Abandoned(_)),
+        "a refused clock regression must be the Abandoned variant, not merely \
+         some retryable error; got: {err:?}"
+    );
+    assert_eq!(
+        router.metrics().snapshot().flushes_by_size,
+        flushes_before_refuse,
+        "a refused flush is not counted as a flush: the flush counter is flat \
+         across it (ADR-1307 finding 1)"
     );
 
     // The floor re-anchored to T0 + 1m on refusal, so a normal reading above it
@@ -676,6 +813,119 @@ async fn forward_glitch_beyond_bound_is_refused_and_the_floor_re_anchors() {
     );
 
     router.shutdown().await;
+}
+
+/// Metrics: a refused flush re-buffers its rows rather than dropping them, so
+/// they reach the store on the next flush (ADR-1307 finding 1). A forward
+/// glitch ratchets the floor; the correction back toward wall time is refused
+/// (a backwards step beyond the bound) and re-anchors the floor to that raw
+/// reading. The refused write's rows are re-inserted into the tenant buffer, so
+/// the drain flush at `shutdown` -- reading the clock at the re-anchored floor,
+/// which now passes -- publishes them. The whole-tenant buffer for that shard is
+/// preserved, not just the triggering request. Flipping the refuse arm from
+/// re-inserting the buffer to dropping it (the pre-fix behaviour) leaves the
+/// tenant empty at shutdown: only the first two flushes' four objects exist and
+/// this asserts six.
+#[tokio::test]
+async fn metrics_refused_flush_re_buffers_rows_for_the_next_flush() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(T0);
+    let router = IngestRouter::new(
+        flush_per_write_config(),
+        Arc::clone(&store),
+        Signal::Metrics,
+        clock.clone(),
+    );
+    let tenant = tenant("acme");
+
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                1_000,
+                1.0,
+            )],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("baseline flush arms the floor at T0");
+
+    // A forward glitch of twice the hold bound ratchets the floor far ahead.
+    clock.set_ns(T0 + 2 * MAX_FLUSH_CLOCK_HOLD_NS);
+    router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                2_000,
+                2.0,
+            )],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a forward step stamps raw and ratchets the floor");
+
+    let before = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        before.len(),
+        4,
+        "two successful flushes: two data objects and two commit records: {before:?}"
+    );
+
+    // The clock corrects back to T0 + 1m: a backwards step beyond the bound, so
+    // it is refused. Its rows are re-buffered, the floor re-anchors to T0 + 1m.
+    clock.set_ns(T0 + ONE_MINUTE_NS);
+    let refused = router
+        .write(
+            tenant.clone(),
+            vec![make_point(
+                &tenant,
+                "cpu_usage",
+                &[("host", "a")],
+                3_000,
+                3.0,
+            )],
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await;
+    let err = refused.expect_err("a backwards step beyond the bound must fail the flush");
+    assert!(
+        err.is_retryable(),
+        "the refusal is retryable so the caller re-drives the write; got: {err:?}"
+    );
+
+    let after_refuse = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        after_refuse.len(),
+        4,
+        "the refused flush published nothing itself: {after_refuse:?}"
+    );
+    assert_eq!(
+        router.metrics().snapshot().clock_regressions_refused,
+        1,
+        "exactly the one over-bound step is refused"
+    );
+
+    // The drain flush reads the clock at T0 + 1m, equal to the re-anchored
+    // floor, so it proceeds and publishes the re-buffered rows.
+    router.shutdown().await;
+
+    let objects = list_all(store.as_ref(), "t/").await.expect("list");
+    assert_eq!(
+        objects.len(),
+        6,
+        "the re-buffered rows reached the store on the drain flush (one more data \
+         object and commit record); had the refuse arm dropped the buffer, the \
+         tenant would be empty at shutdown and only four objects would exist: {objects:?}"
+    );
 }
 
 /// Metrics: the abandonment deadline derives from the raw reading, not the
@@ -809,6 +1059,11 @@ async fn logs_forward_glitch_beyond_bound_is_refused_and_retryable() {
         err.is_retryable(),
         "a refused clock regression is retryable (Abandoned, 503), not a client \
          SegmentBuild (400); got: {err:?}"
+    );
+    // F5: pin the variant, not just retryability.
+    assert!(
+        matches!(err, LogWriteError::Abandoned(_)),
+        "a refused clock regression must be the Abandoned variant; got: {err:?}"
     );
 
     // Re-anchored to T0 + 1m, so a normal reading above it proceeds.
@@ -945,6 +1200,11 @@ async fn spans_forward_glitch_beyond_bound_is_refused_and_retryable() {
         err.is_retryable(),
         "a refused clock regression is retryable (Abandoned, 503), not a client \
          SegmentBuild (400); got: {err:?}"
+    );
+    // F5: pin the variant, not just retryability.
+    assert!(
+        matches!(err, SpanWriteError::Abandoned(_)),
+        "a refused clock regression must be the Abandoned variant; got: {err:?}"
     );
 
     clock.set_ns(T0 + 2 * ONE_MINUTE_NS);
