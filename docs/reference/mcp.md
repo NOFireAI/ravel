@@ -75,14 +75,21 @@ its magnitude, so parse them as strings.
 
 Three counters say what the fit removed outside `data.rows`.
 `metadata_elided` counts list entries dropped because their list was over
-its count bound. `entries_truncated` counts entries kept but cut because
+its count bound, plus the cursor when it was dropped for being over its own
+bound. `entries_truncated` counts entries kept but cut because
 the entry was over its own size bound; a cut entry carries a truncation
 marker. `scalars_truncated` counts scalar cuts. Sub-bounded scalars are
 cut to their own bounds first. The allowance pass then cuts `plan`, the
 failure message, and the budget values. The cursor carries its own 4 KiB
 bound, separate from the scalar allowance. A cursor over its bound is
 never cut, because cutting a token breaks its authentication code; it is
-a server defect reported as an `internal` failure.
+a server defect, and the cursor is dropped. On a result that carries no
+other failure, that defect is the failure and its class is `internal`. On
+a result that already failed, the original class, message, and counter
+stay: they say why the call failed, and an `internal` in their place would
+send you to file a bug instead of retrying or narrowing. The dropped
+cursor is then reported by `metadata_elided` and by a warning naming the
+bound, so the defect is visible either way.
 
 The first-row guarantee applies to the byte cap. It does not apply to
 the row cap. When the equal-group rule leaves no complete group inside
@@ -152,6 +159,17 @@ query. Only the process that minted a cursor can redeem it, so a load
 balancer needs sticky routing to a paging client. A tampered or
 wrong-tenant token fails with `cursor_invalid`.
 
+Those are the two cases a redemption can detect. An erasure that arrives
+after a cursor is minted and finishes before it is redeemed is in neither
+set, so no check sees it. That case stays empty only while a cursor cannot
+outlive an erasure: a cursor lives at most the protection horizon minus a
+24 h grace, 1 h 05 m under the default horizon, and an erasure cannot
+finish before its seal wait, 4 h 05 m under the default ingest lag. An
+operator who raises the protection horizon lengthens the first without
+moving the second, and the grace this server subtracts is a fixed 24 h. A
+30 h horizon leaves a 6 h cursor lifetime, above the 4 h 05 m floor, and
+page two can then come from a snapshot an erasure has changed.
+
 `ravel_query_sql` mints a cursor only when the statement's `ORDER BY`,
 plus a tiebreak the tool appends, is a total order over the projection.
 When the tiebreak is not unique, the equal-group rule applies exactly
@@ -201,7 +219,7 @@ failure.
 | `max_response_bytes` | 512 KiB | floor 256 KiB | yes, raised to the floor if lower |
 | `max_response_bytes` ceiling | 4 MiB | an operator may configure a lower one | no; a larger request clamps to it |
 | cursor or evidence token length | 1 MiB | fixed | no; a longer token is refused unread |
-| `presentation.cursor` in the envelope | 4 KiB | fixed | no; a cursor over its bound is an `internal` failure |
+| `presentation.cursor` in the envelope | 4 KiB | fixed | no; a cursor over its bound is dropped, as an `internal` failure on an otherwise-successful result and as a counted drop with a warning on one that already failed |
 | metric families per `ravel_describe_data` page | 100 | fixed | no |
 | segments admitted for `ravel_find_labels` resolution | 2,000 | fixed | no |
 

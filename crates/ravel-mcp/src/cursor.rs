@@ -24,6 +24,12 @@
 //! cursor did not pin and that reaches its signal and time range. Both live in
 //! [`Cursor::redeem`].
 //!
+//! Those two are what a redemption can detect. A third case exists that it
+//! cannot: an erasure that arrives after the mint and completes before the
+//! redemption is neither pinned nor in force. It stays empty only while a
+//! cursor's lifetime is shorter than an erasure's completion time, which
+//! [`Cursor::redeem`] states as an assumption with both quantities named.
+//!
 //! The watermark is one of those inputs and nothing more. It is what page 2
 //! resolves against, not a test run against whatever watermark the redeeming
 //! call happens to observe: ADR-0010 gives no ordering to run such a test
@@ -220,6 +226,12 @@ pub const MAX_TOKEN_BYTES: usize = 1024 * 1024;
 /// extend how long a token may name that segment. Subtracting it leaves
 /// `max_query_duration + clock_skew_allowance`, which is the part of the
 /// window a redemption starting now may still use.
+///
+/// This constant is also what bounds a cursor's lifetime, and through that
+/// what keeps [`Cursor::redeem`]'s erasure check sound. Raising a
+/// deployment's protection horizon without raising this value lengthens that
+/// lifetime; [`Cursor::redeem`] states the bound the lifetime must stay
+/// under.
 pub const GRACE_NS: i64 = 24 * 3_600 * 1_000_000_000;
 
 /// Typed failure for both [`Cursor`] and [`EvidenceRef`]. The two decode
@@ -572,6 +584,48 @@ impl Cursor {
     /// predicate outside that scope leaves it redeemable (see
     /// [`Cursor::newer_erasure_intersects`]).
     ///
+    /// That erasure check is sound only while the maximum cursor lifetime is
+    /// shorter than the minimum time an erasure takes to complete.
+    /// `erasure_in_force` carries the predicates still pending at redemption.
+    /// An erasure that arrived after the cursor was minted and whose rewrite
+    /// completed before it was redeemed is in neither set: the cursor did not
+    /// pin it and it is no longer in force, so nothing here can observe it,
+    /// and page two is served from a snapshot it changed. The two quantities
+    /// are configured in different crates and nothing asserts the
+    /// relationship between them:
+    ///
+    /// - Maximum cursor lifetime is `protection_horizon_ns` minus
+    ///   [`GRACE_NS`]. The horizon is the deployment's own
+    ///   (`CatalogConfig::protection_horizon_ns` in
+    ///   `crates/ravel-catalog/src/config.rs`, default
+    ///   `DEFAULT_PROTECTION_HORIZON_NS` = 25 h 05 m), set by an operator
+    ///   through `ravel-cli gc-config set --protection-horizon`, which writes
+    ///   durable `sys/gc`. [`GRACE_NS`] is a constant of this crate, 24 h,
+    ///   that no configuration moves. With the default horizon a cursor lives
+    ///   at most 1 h 05 m.
+    /// - Minimum erasure completion is the seal wait,
+    ///   `erasure_seal_wait_bound_ns` in
+    ///   `crates/ravel-maintain/src/erasure_rewrite.rs`: `max_ingest_lag`
+    ///   (2 h by `ravel_catalog::DEFAULT_MAX_INGEST_LAG_NS`, also operator-set)
+    ///   plus one 1 h bucket span plus the seal margin (`max_flush_lifetime`
+    ///   1 h + `clock_skew_allowance` 5 m), 4 h 05 m with defaults. A rewrite
+    ///   cannot acknowledge before the bucket open at the request seals.
+    ///
+    /// 1 h 05 m under 4 h 05 m is what closes the window today. The operator
+    /// action that opens it is raising `--protection-horizon`, because
+    /// [`GRACE_NS`] cannot be raised with it. `gc-config set` accepts any
+    /// horizon at or above `max_query_duration + grace +
+    /// clock_skew_allowance`, so a 30 h horizon is a valid deployment; it
+    /// leaves a 6 h cursor lifetime, above the 4 h 05 m floor, and an erasure
+    /// can then complete inside one cursor's life. Lowering `max_ingest_lag`
+    /// moves the same floor down.
+    ///
+    /// The relationship is not expressible as an assertion in this crate. The
+    /// crate never sees the horizon as a duration: `protection_horizon_ns`
+    /// arrives per call as an absolute instant, the crate has no startup step
+    /// of its own, and it holds no ravel-catalog or ravel-maintain dependency
+    /// to read either configured value from.
+    ///
     // Every parameter is a distinct precondition of a single redemption, and
     // a caller that omits one has skipped a check. Grouping them into a
     // struct would let a call site leave a field at its default.
@@ -627,6 +681,11 @@ impl Cursor {
     /// Predicates that were in force at mint and are not in force now are not
     /// a mismatch either: an erasure that completed took its rows out of the
     /// pinned snapshot before the page was built, and the pin already names it.
+    ///
+    /// An erasure that both arrived and completed between mint and redemption
+    /// is in neither set and is invisible here. What keeps that case empty is
+    /// a timing relationship this method cannot check; [`Cursor::redeem`]
+    /// states it and names both quantities.
     fn newer_erasure_intersects(&self, in_force: &[(Signal, ErasurePredicate)]) -> bool {
         in_force.iter().any(|(signal, predicate)| {
             *signal == self.signal
