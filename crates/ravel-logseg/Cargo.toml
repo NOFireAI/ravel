@@ -6,7 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# Per-block bloom-construction timing (issue #1516, ADR-0104 decision 2c). Off
+# Per-block bloom-construction timing (issue #1516; ADR-0104 decision 1 for the
+# feature-gated monotonic seam, decision 2 for the `bloom` stage itself). Off
 # by default: with it off, `WriteStats` carries no bloom timing field and no
 # `Instant` is read in the block-write loop, so the crate compiles and behaves
 # exactly as today. On, `RlogWriter` measures each block's `BloomBuilder`

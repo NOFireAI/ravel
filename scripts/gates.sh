@@ -243,9 +243,11 @@ run_feature_lane() {
 
 want_features=0
 want_bench=0
+want_stage_timing=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_features=1
   want_bench=1
+  want_stage_timing=1
 else
   for arg in "${crate_args[@]}"; do
     case "${arg}" in
@@ -255,6 +257,11 @@ else
     # scope should pay for the bench lanes.
     case "${arg}" in
       ravel-bench | ravel-sql | ravel-query | ravel-ingest) want_bench=1 ;;
+    esac
+    # The crates that DECLARE stage-timing, and whose own cfg-gated tests the
+    # ravel-bench lane below cannot reach.
+    case "${arg}" in
+      ravel-bench | ravel-ingest | ravel-logseg) want_stage_timing=1 ;;
     esac
   done
 fi
@@ -275,6 +282,19 @@ if [[ ${want_bench} -eq 1 ]]; then
   cargo check --locked -p ravel-bench --features stage-timing --all-targets
   echo "==> cargo test --locked -p ravel-bench --features stage-timing"
   cargo test --locked -p ravel-bench --features stage-timing
+fi
+
+# stage-timing tests in the crates that declare the feature. The ravel-bench
+# lane above enables ravel-logseg/stage-timing and ravel-ingest/stage-timing
+# transitively, so it type-checks their production code, but a `-p ravel-bench`
+# selection builds both as library dependencies and cargo never compiles a
+# dependency's `#[cfg(test)]` module. Every `#[cfg(feature = "stage-timing")]`
+# test in those two crates was therefore unreachable from any lane. This runs
+# them. Not extended to services/ravel-cli: its stage-timing test is broken on
+# main under issue #1522, and a lane running it would be red for an unrelated
+# reason.
+if [[ ${want_stage_timing} -eq 1 ]]; then
+  run_feature_lane stage-timing -p ravel-logseg -p ravel-ingest
 fi
 
 # --- Gates-pass receipt ---------------------------------------------------
