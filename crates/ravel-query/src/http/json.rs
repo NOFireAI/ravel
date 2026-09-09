@@ -390,18 +390,20 @@ pub struct IoShapeJson {
     /// underlying records (`crate::io_shape` module docs).
     #[serde(rename = "unfoldedSegmentsResolved")]
     pub unfolded_segments_resolved: u64,
-    /// EXACT count of COMMIT RECORDS this query's resolve served from the
-    /// catalog's local decoded commit-record cache
+    /// EXACT count of COMMIT RECORDS this query's resolve found already
+    /// resident during its listing prewarm pass
     /// (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
-    /// from accounting. A RECORD count, not a segment count: the listing
-    /// window is padded by `max_ingest_lag_ns` and runs to the current hour
-    /// regardless of the query's end, so a resolve prewarms buckets its
-    /// range never touches and `include_l0_if_overlaps` drops those records
-    /// afterwards -- on a live tenant a narrow range counts records from
-    /// hours that contribute no segment at all, so this figure reads above
-    /// any segment-based cache count. Meant as the numerator of a
-    /// cold-resolve fraction (records served from cache over records the
-    /// resolve touched), not a segment total.
+    /// from accounting; a record served afterwards through
+    /// `resolve_min_token` is outside it, as are the records an attempt
+    /// abandoned to `SnapshotInvalidated` had warmed. A RECORD count, not a
+    /// segment count: the listing window is padded by `max_ingest_lag_ns`
+    /// and runs to the current hour regardless of the query's end, so a
+    /// resolve prewarms buckets its range never touches and
+    /// `include_l0_if_overlaps` drops those records afterwards -- on a live
+    /// tenant a narrow range counts records from hours that contribute no
+    /// segment at all. Meant as the numerator of a cold-resolve fraction
+    /// (records served from cache over records the resolve touched), not a
+    /// segment total.
     #[serde(rename = "unfoldedRecordsServedFromCache")]
     pub unfolded_records_served_from_cache: u64,
     /// Pre-execution access-pattern classification: `metadata_only`,

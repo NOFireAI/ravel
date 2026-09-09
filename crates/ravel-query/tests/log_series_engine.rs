@@ -649,6 +649,79 @@ async fn log_lane_never_escalates_a_selectively_indexed_metrics_lane_to_exhausti
     );
 }
 
+/// `unfolded_records_served_from_cache` is a SUM over the two lanes, and the
+/// log lane's term is the one no other test pins: the metrics-lane tests
+/// exercise the other `into_shape` call site only.
+///
+/// The fixture makes the two adjacent `u64` arguments of that call differ on
+/// purpose. Three log commit records sit in the resolve's padded listing
+/// window and are prewarmed; only two of them name a segment this query's
+/// range overlaps, so `include_l0_if_overlaps` drops the third and it never
+/// becomes a resolved segment. The metrics lane contributes to neither count,
+/// its records having been folded into a snapshot part.
+///
+/// FLIP: in `engine.rs`'s log-lane `into_shape` call, replacing
+/// `log_resolve_snapshot.commit_record_cache_hits` with `0` makes the warm
+/// figure 0, and transposing that argument with the segment one makes it 2.
+/// Both fail the warm assertions below.
+#[tokio::test]
+async fn mixed_lane_records_served_from_cache_sums_the_log_lane_term() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-a");
+    let th = tid.hash();
+    fixture(&store, th).await;
+    // A third log commit record in the same ingest hour, so the resolve's
+    // listing pass prewarms it, carrying a record after this query's range end
+    // so nothing of it is resolved as a segment.
+    let s1 = [("service.name", AttrValue::Str("api".to_string()))];
+    let late = vec![record(&s1, BASE + 30 * NS, "ERROR", "z", &[])];
+    publish_log_segment(&store, th, 2, &late).await;
+    publish_metric(&store, &tid, th, BASE + 2 * NS, 3.0).await;
+
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let catalog = Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog");
+
+    let hour = u32::try_from(BASE / NS_PER_HOUR).expect("hour fits u32");
+    let fold_now_ns = (i64::from(hour) + 1) * NS_PER_HOUR
+        + DEFAULT_MAX_FLUSH_LIFETIME_NS
+        + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+        + DEFAULT_FOLD_SAFETY_MARGIN_NS;
+    catalog
+        .fold(&th, Signal::Metrics, Uuid::new_v4(), fold_now_ns, &[], None)
+        .await
+        .expect("fold");
+
+    let engine = QueryEngine::new(Arc::new(catalog), backend, EngineConfig::default());
+    let query =
+        r#"sum by (job) (count_over_time(ravel_log_lines{job="api"}[1h])) - target_rps{job="api"}"#;
+
+    let (_value, cold) = engine
+        .instant_with_stats(th, query, ms(BASE + 20 * NS), &[], fold_now_ns, DEADLINE)
+        .await
+        .expect("cold query succeeds");
+    assert_eq!(
+        cold.io_shape.unfolded_records_served_from_cache, 0,
+        "nothing is resident before the first query, so every commit record this resolve \
+         prewarms is a miss"
+    );
+
+    let (_value, warm) = engine
+        .instant_with_stats(th, query, ms(BASE + 20 * NS), &[], fold_now_ns, DEADLINE)
+        .await
+        .expect("warm query succeeds");
+    assert_eq!(
+        warm.io_shape.unfolded_records_served_from_cache, 3,
+        "the log lane's resolve prewarms all three log commit records in the padded listing \
+         window and finds every one resident; the metrics lane adds none, its records being \
+         folded into a snapshot part"
+    );
+    assert_eq!(
+        warm.io_shape.unfolded_segments_resolved, 2,
+        "only two of those three records name a segment overlapping the query's range, so the \
+         record count and the segment count differ and a transposed argument cannot pass"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Nameless selectors and ordinary metric queries never touch Signal::Logs.
 // ---------------------------------------------------------------------------

@@ -153,12 +153,18 @@
 //! - [`plan_class`](QueryIoShape::plan_class): decided before any segment is
 //!   opened, from the query's shape and the resolve's own pruning outcome.
 //! - [`unfolded_records_served_from_cache`](QueryIoShape::unfolded_records_served_from_cache):
-//!   the EXACT count of COMMIT RECORDS this query's resolve served from the
-//!   catalog's local decoded commit-record cache
+//!   the EXACT count of COMMIT RECORDS this query's resolve found already
+//!   resident during its listing prewarm pass
 //!   (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
-//!   from accounting, never inferred from the pooled cache counters. A
-//!   RECORD count, not a segment count, and the two differ for the same
-//!   reason `unfolded_segments_resolved` above is a segment count: the
+//!   from accounting, never inferred from the pooled cache counters. That
+//!   prewarm pass is the whole of it: a record served afterwards through
+//!   `resolve_min_token`'s own cache lookup is not counted, nor are the
+//!   records an attempt abandoned to `SnapshotInvalidated` had warmed. The
+//!   counter's contract in `ravel-types` states both exclusions and is the
+//!   normative description.
+//!   A RECORD count, not a segment count, diverging from
+//!   `unfolded_segments_resolved` by its own mechanism rather than by the L1
+//!   part expansion described above, and in the opposite direction: the
 //!   listing window is padded by `max_ingest_lag_ns` and runs to the current
 //!   hour regardless of the query's end, so a resolve prewarms buckets its
 //!   range never touches and `include_l0_if_overlaps` drops those records
@@ -226,14 +232,15 @@ pub struct QueryIoShape {
     pub list_page_depth: u32,
     pub service_batches: u32,
     pub unfolded_segments_resolved: u64,
-    /// EXACT count of commit records this query's resolve served from the
-    /// catalog's local decoded commit-record cache
+    /// EXACT count of commit records this query's resolve found already
+    /// resident during its listing prewarm pass
     /// (`QueryAccountingSnapshot::commit_record_cache_hits`), read straight
     /// from accounting for the resolve(s) this query ran. A RECORD count,
     /// not a segment count -- see the module docs' entry of the same name
     /// for why a padded listing window makes the two diverge on a live
-    /// tenant. Meant as the numerator of a cold-resolve fraction, not a
-    /// segment total.
+    /// tenant, and the counter's own contract in `ravel-types` for the two
+    /// serves it leaves out. Meant as the numerator of a cold-resolve
+    /// fraction, not a segment total.
     pub unfolded_records_served_from_cache: u64,
     pub plan_class: PlanClass,
 }
