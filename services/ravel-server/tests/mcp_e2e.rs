@@ -670,7 +670,7 @@ mod with_mcp {
     ///
     /// Driven through the [`ServiceBackend`] the adapter hands the tool layer
     /// rather than through the transport, because the only tool this build
-    /// ships (`ravel_capabilities`) reaches no backend at all: it takes no
+    /// serves (`ravel_capabilities`) reaches no backend at all: it takes no
     /// permit, so cancelling it could not show one being released. The
     /// transport hop above it is what
     /// [`capabilities_over_streamable_http_with_bearer`] covers, and the
