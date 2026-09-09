@@ -522,21 +522,25 @@ fn string_field(value: &Value, field: &str) -> String {
 /// cell variant of its own so it keeps its JSON text.
 ///
 /// `serde_json` parses a JSON integer above `i64::MAX` as a `u64`, and
-/// `Number::as_f64` succeeds on it with precision loss. `Cell` has no
-/// unsigned variant, so a number that fails `as_i64` only becomes a float
-/// when it actually is one (`is_f64`); otherwise its exact digits go out as
-/// `Cell::Str`, matching the string-precision rule integers already get.
+/// `Number::as_f64` succeeds on it with precision loss. `Cell::Int` carries
+/// the union of the two 64-bit ranges, so both `as_i64` and `as_u64` land in
+/// it and an integer stays an integer whichever side it came from. Only a
+/// genuine float becomes `Cell::Float`.
 fn json_to_cell(value: &Value) -> Cell {
     match value {
         Value::Null => Cell::Null,
         Value::Bool(b) => Cell::Bool(*b),
-        Value::Number(number) => match number.as_i64() {
-            Some(n) => Cell::Int(n),
-            None if number.is_f64() => match number.as_f64() {
+        Value::Number(number) => match (number.as_i64(), number.as_u64()) {
+            (Some(n), _) => Cell::Int(i128::from(n)),
+            (None, Some(n)) => Cell::Int(i128::from(n)),
+            (None, None) => match number.as_f64() {
                 Some(f) => Cell::Float(f),
+                // Not an i64, not a u64, and not representable as an f64:
+                // serde_json has no fourth number shape, so this arm is
+                // unreachable. It keeps the digits rather than losing them if
+                // one is ever added.
                 None => Cell::Str(number.to_string()),
             },
-            None => Cell::Str(number.to_string()),
         },
         Value::String(s) => Cell::Str(s.clone()),
         Value::Object(map) => Cell::Map(map.clone()),
@@ -938,24 +942,46 @@ mod tests {
         assert_eq!(data.rows[0][0], Cell::Str("9007199254740993".to_string()));
         assert_eq!(data.rows[0][1], Cell::Null);
         assert_eq!(data.rows[1][0], Cell::Int(9007199254740993));
+        assert_eq!(cell_text(&data.rows[1][0]), "9007199254740993");
         assert_eq!(data.rows[1][1], Cell::Float(1.5));
     }
 
-    /// A JSON integer above `i64::MAX` parses as a `u64`, and `Cell` has no
-    /// unsigned variant. Rendering it through `as_f64` would lose precision
-    /// (D4's exact-semantics-by-default rule), so it must come out as the
-    /// exact digits in `Cell::Str`, the same way an out-of-range `i64` does.
-    /// An ordinary float is unaffected and still becomes `Cell::Float`.
+    /// The digits a cell puts on the wire. Asserting these rather than a
+    /// value parsed back out of them is what catches a digit lost between the
+    /// carrier and the JSON string, which a parse would silently re-derive.
+    fn cell_text(cell: &Cell) -> String {
+        serde_json::to_value(cell)
+            .expect("a cell serializes")
+            .as_str()
+            .expect("an integer cell is a JSON string")
+            .to_string()
+    }
+
+    /// A JSON integer above `i64::MAX` parses as a `u64`. `Cell::Int` carries
+    /// the union of the two 64-bit ranges, so it stays an integer cell with
+    /// every digit intact, instead of going out as a float (which would lose
+    /// precision, against D4's exact-semantics rule) or as a plain string
+    /// (which would give an unsigned column a different wire type from a
+    /// signed one). Both ends of the range and an ordinary small value travel
+    /// the same path, and a genuine float is still `Cell::Float`.
     #[test]
     fn a_large_unsigned_integer_is_not_downgraded_to_a_float() {
-        assert_eq!(
-            json_to_cell(&json!(u64::MAX)),
-            Cell::Str(u64::MAX.to_string())
-        );
-        assert_eq!(
-            json_to_cell(&json!(i64::MAX as u64 + 1)),
-            Cell::Str((i64::MAX as u64 + 1).to_string())
-        );
+        let widest = json_to_cell(&json!(u64::MAX));
+        assert_eq!(widest, Cell::Int(i128::from(u64::MAX)));
+        assert_eq!(cell_text(&widest), "18446744073709551615");
+
+        let first_unsigned = json_to_cell(&json!(i64::MAX as u64 + 1));
+        assert_eq!(first_unsigned, Cell::Int(i128::from(i64::MAX as u64 + 1)));
+        assert_eq!(cell_text(&first_unsigned), "9223372036854775808");
+
+        let smallest = json_to_cell(&json!(i64::MIN));
+        assert_eq!(smallest, Cell::Int(i128::from(i64::MIN)));
+        assert_eq!(cell_text(&smallest), "-9223372036854775808");
+
+        let small = json_to_cell(&json!(1));
+        assert_eq!(small, Cell::Int(1));
+        assert_eq!(cell_text(&small), "1");
+
         assert_eq!(json_to_cell(&json!(1.5f64)), Cell::Float(1.5));
     }
 

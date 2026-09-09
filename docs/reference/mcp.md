@@ -70,6 +70,9 @@ than dropping it. A number, a timestamp, a boolean, and a hex-encoded
 binary id never shorten; a string or a structured value that exceeds the
 per-cell budget is cut to that budget.
 
+Integers and timestamps travel as JSON strings for every value, whatever
+its magnitude, so parse them as strings.
+
 Three counters say what the fit removed outside `data.rows`.
 `metadata_elided` counts list entries dropped because their list was over
 its count bound. `entries_truncated` counts entries kept but cut because
