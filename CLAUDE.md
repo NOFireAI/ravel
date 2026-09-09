@@ -97,7 +97,13 @@ cargo test   -p ravel-server -p ravel-sql --features flight-sql
 `scripts/gates.sh` runs these when the crates are in scope. It also runs a
 ravel-bench lane (`--features sql-latency,profiling,flight-lane` clippy and
 tests, plus `--features stage-timing`) whenever ravel-bench, ravel-sql,
-ravel-query, or ravel-ingest is in scope, matching CI's `features` job. Do
+ravel-query, or ravel-ingest is in scope, and a `-p ravel-logseg -p
+ravel-ingest --features stage-timing` lane whenever ravel-bench,
+ravel-ingest, or ravel-logseg is in scope, matching CI's `features` job. The
+second lane exists because the first cannot replace it: it enables
+stage-timing in both crates transitively, but a `-p ravel-bench` selection
+builds them as dependencies and cargo never compiles a dependency's
+`#[cfg(test)]` module, so their own gated tests run in neither. Do
 not skip them: a workspace gate can print "All gates passed" on a tree where
 `--features sql` fails to compile, because the broken call site sits in a
 target the default feature set never builds.
