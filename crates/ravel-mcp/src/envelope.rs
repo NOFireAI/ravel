@@ -92,8 +92,10 @@ const SCALAR_ALLOWANCE: usize = 4096;
 ///
 /// With its own bound nothing else can crowd it out, and the only way to
 /// exceed it is for this process to mint a cursor over its own limit, which
-/// is a server defect and is reported as an `internal` failure rather than
-/// papered over with a warning.
+/// is a server defect. On an otherwise-successful envelope that defect is the
+/// `internal` failure. On one that already carries a failure the class stays
+/// what it was, and the defect is reported as a counted drop plus a warning:
+/// see [`Envelope::fit`].
 ///
 /// Measured the same way the scalar allowance is: the serialized JSON size of
 /// the token string, not its source characters. Distinct from
@@ -445,7 +447,13 @@ pub struct Presentation {
     pub bytes_cap_hit: bool,
     pub rows_omitted: u64,
     pub cells_truncated: u64,
-    /// Metadata entries dropped because their list was over its count bound.
+    /// Metadata entries dropped because their list was over its count bound,
+    /// plus the cursor when it was dropped for being over [`CURSOR_BOUND`] on
+    /// an envelope that already carried a failure. Both are the same fact: a
+    /// field the response bounds would not carry is gone from it. The cursor
+    /// case cannot be reported as a failure class there without displacing the
+    /// one that says why the call failed, so this counter and a warning are
+    /// what make it observable.
     pub metadata_elided: u64,
     /// Metadata entries kept but cut because the entry was over its own
     /// per-entry serialized-size bound. Distinct from `metadata_elided`: a
@@ -1118,6 +1126,14 @@ impl Envelope {
     /// about this process instead of retrying or narrowing. The cursor is
     /// dropped either way, so no unturnable page goes out.
     ///
+    /// On that second path the defect is still reported, through the two
+    /// channels that displace nothing: `presentation.metadata_elided` counts
+    /// the dropped cursor, and a warning names it. A drop that wrote neither
+    /// would leave the one input this method treats as a defect invisible on
+    /// every envelope that already carries a failure, which is the reverse of
+    /// what the bound is for. The warning goes in at the front of `warnings`
+    /// so the bound on that list cannot be what drops it.
+    ///
     /// Scalars are capped after that check because the failure message it
     /// writes is one of the scalars the allowance covers.
     ///
@@ -1142,6 +1158,7 @@ impl Envelope {
     /// having to re-measure or re-cut anything.
     pub fn fit(mut self, requested_max_response_bytes: u64) -> Envelope {
         let cursor_len = self.cursor_serialized_len();
+        let mut cursor_dropped_over_bound = false;
         if cursor_len > CURSOR_BOUND {
             self.presentation.cursor = None;
             self.status = Status::Error;
@@ -1153,12 +1170,21 @@ impl Envelope {
                     ),
                     counter: None,
                 });
+            } else {
+                cursor_dropped_over_bound = true;
+                self.warnings.insert(
+                    0,
+                    format!(
+                        "cursor dropped: it serializes to {cursor_len} B, over its \
+                         {CURSOR_BOUND} B bound; this is a server defect"
+                    ),
+                );
             }
         }
 
         self.presentation.scalars_truncated = self.cap_scalars();
         let caps = self.cap_metadata_lists();
-        self.presentation.metadata_elided = caps.elided;
+        self.presentation.metadata_elided = caps.elided + u64::from(cursor_dropped_over_bound);
         self.presentation.entries_truncated = caps.entries_truncated;
 
         let effective_cap = requested_max_response_bytes.max(MAX_RESPONSE_BYTES_FLOOR);
@@ -2029,8 +2055,14 @@ mod tests {
     /// `internal` would tell the caller to file a bug about this process
     /// instead of narrowing the query that actually tripped, and the counter
     /// naming which budget tripped would be gone with it.
+    ///
+    /// Keeping that class is not licence to drop the cursor quietly. The
+    /// defect is still reported through the two channels that displace nothing:
+    /// `metadata_elided` counts the drop and a warning names it. Without them
+    /// this envelope would be indistinguishable from one that never had a
+    /// cursor, which is the state the bound exists to make visible.
     #[test]
-    fn an_over_bound_cursor_keeps_an_existing_failure_class() {
+    fn an_over_bound_cursor_on_a_failed_envelope_is_still_observable() {
         let cursor = "k".repeat(CURSOR_BOUND - 1);
         let mut envelope = Envelope::default();
         envelope.presentation.cursor = Some(cursor);
@@ -2055,6 +2087,23 @@ mod tests {
         assert_eq!(failure.counter.as_deref(), Some("bytes_scanned"));
         assert_eq!(fitted.status, Status::Error);
         assert_eq!(fitted.presentation.scalars_truncated, 0);
+
+        assert_eq!(
+            fitted.presentation.metadata_elided, 1,
+            "the dropped cursor is the one elided field"
+        );
+        assert_eq!(fitted.warnings.len(), 1);
+        assert_eq!(
+            fitted.warnings[0],
+            "cursor dropped: it serializes to 4097 B, over its 4096 B bound; \
+             this is a server defect"
+        );
+
+        // `finish` returns an error envelope untouched, so both channels are
+        // still there when the caller reads the result.
+        let finished = fitted.finish(true);
+        assert_eq!(finished.presentation.metadata_elided, 1);
+        assert_eq!(finished.warnings.len(), 1);
     }
 
     /// The last byte that is not over: a cursor serializing to exactly
