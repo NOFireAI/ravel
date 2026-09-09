@@ -5,6 +5,16 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Per-block bloom-construction timing (issue #1516, ADR-0104 decision 2c). Off
+# by default: with it off, `WriteStats` carries no bloom timing field and no
+# `Instant` is read in the block-write loop, so the crate compiles and behaves
+# exactly as today. On, `RlogWriter` measures each block's `BloomBuilder`
+# insert-plus-`finish` window and reports it through `WriteStats::bloom_block_ns`
+# for `ravel-ingest` to fold into its `LogStage::Bloom` accumulator. Enabled
+# transitively by `ravel-ingest/stage-timing`.
+stage-timing = []
+
 [dependencies]
 ravel-codec = { workspace = true }
 ravel-proto = { workspace = true }
