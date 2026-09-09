@@ -108,7 +108,7 @@ server minted no cursor. A genuinely empty result is `ok` with
 | `deadline` | The call passed its effective deadline. |
 | `unavailable` | A transient storage or catalog fault. Retryable. |
 | `snapshot_invalidated` | The pinned snapshot was invalidated by concurrent maintenance. Retryable once. |
-| `cursor_expired` | The cursor's minting process, or its deadline, is gone. |
+| `cursor_expired` | The cursor's minting process or its deadline is gone, or an erasure it did not pin now reaches its signal and time range. |
 | `cursor_invalid` | The cursor does not match the tenant, the tool, or the arguments presented with it. |
 | `internal` | An unexpected fault. The message is fixed and carries no storage detail. |
 
@@ -129,13 +129,27 @@ resolve inputs, not by enumerating segments.
 
 A cursor stays valid until the earlier of the call's remaining deadline
 and the protection horizon minus the grace period. Redeeming a cursor
-re-resolves the snapshot deterministically from the pinned watermark and
+resolves the snapshot against the pinned watermark rather than against a
+fresh observation, which is what makes the re-resolve deterministic, and
 re-executes the original statement against it with a keyset predicate; the
-server holds nothing in between calls. Only the process that minted a
-cursor can redeem it, so a load balancer needs sticky routing to a paging
-client. When the re-resolve cannot reproduce the pinned watermark, because
-a compaction or a newer erasure moved past it, redemption fails with
-`cursor_expired` and the caller re-runs the query. A tampered or
+server holds nothing in between calls. The pinned watermark is that resolve
+input and nothing more: redemption never compares it against a watermark
+observed later, because commit tokens from different writers have no
+ordering between them to compare, and whether a pinned token is still
+satisfiable is the catalog's answer at resolve time.
+
+Redemption refuses a structurally valid, correctly bound cursor with
+`cursor_expired` in two cases. The first is that its effective deadline has
+passed: because that deadline is already clamped to the protection horizon
+minus the grace period, this is also the check for a compaction having
+become free to take the pinned data apart. The second is that an erasure
+predicate is in force which the cursor did not pin, over the cursor's own
+signal, whose event-time window overlaps the cursor's time range; a
+windowless predicate overlaps every range. That overlap is judged on the
+signal and the range only, never on the predicate's matchers, since a
+cursor holds no records to match. In both cases the caller re-runs the
+query. Only the process that minted a cursor can redeem it, so a load
+balancer needs sticky routing to a paging client. A tampered or
 wrong-tenant token fails with `cursor_invalid`.
 
 `ravel_query_sql` mints a cursor only when the statement's `ORDER BY`,
