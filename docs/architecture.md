@@ -107,9 +107,30 @@ depends on store reachability, so a store outage cannot get healthy processes
 killed. `/readyz` gates on completed startup and then follows a background
 store probe with asymmetric hysteresis: four consecutive probe failures flip
 it to 503 and one success recovers it, and the kubelet path reads an
-in-memory atomic rather than touching the store. `/metrics` is the third
-unconditional route, rendering a fixed and deliberately small label set so
-Ravel's own telemetry cannot explode
+in-memory atomic rather than touching the store. On SIGTERM this same
+`/readyz` is the drain signal: the process flips it to 503 first and deletes
+its distributed query heartbeat record while it waits a short settle interval,
+so a probe observes the 503 and a sibling coordinator drops this worker from
+its live set while the listeners are still open. It then signals the listeners
+closed, flushes every ingest shard actor (metrics, logs, and spans) durably
+before waiting on those sockets, and stops the background tasks. The drain
+from that close signal onwards is bounded by `--shutdown-timeout` (default
+25s), and the heartbeat delete, which runs ahead of it, carries a tenth of
+that as its own bound (2.5s), so neither a wedged flush nor an unreachable
+object store can hold the *drain* past 27.5s at the defaults. That is not the
+whole SIGTERM-to-exit budget: after the drain returns, `main` flushes the OTLP
+trace exporter, whose provider shutdown is hard-capped at 5s, and with a trace
+endpoint set and its collector unreachable that step runs the full 5s. The
+worst case an operator must size `terminationGracePeriodSeconds` against is
+therefore 27.5s + 5s = 32.5s (25s drain + 2.5s heartbeat stop + 5s trace
+flush), ABOVE the 30s Kubernetes default: an unreachable trace collector can
+push the process past the grace period and cost it a SIGKILL. That overrun
+costs traces and a clean exit, not buffered records, which the drain has
+already flushed. The operator half of issue #1291 sets the pod grace period
+above 32.5s accordingly.
+
+`/metrics` is the third unconditional route, rendering a fixed and
+deliberately small label set so Ravel's own telemetry cannot explode
 ([guides/observability.md](guides/observability.md)).
 
 ## How ingest, query, and maintenance interact
