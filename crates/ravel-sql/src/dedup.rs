@@ -38,7 +38,7 @@ use datafusion::physical_plan::{
 use futures::{Stream, StreamExt};
 
 use crate::error::SqlError;
-use crate::schema::{PUBLIC_COLUMNS, public_schema};
+use crate::schema::{COL_LABELS, PUBLIC_COLUMNS, public_schema};
 
 /// The winner-selection key: greater wins. Value bits are the final
 /// tiebreak, exactly as `is_greater` orders candidates.
@@ -227,6 +227,15 @@ impl DedupStream {
         let batch = concat_batches(&self.schema, self.out.iter()).map_err(DataFusionError::from)?;
         self.out.clear();
         self.out_rows = 0;
+        // Concatenating the accumulated one-row slices appends each slice's
+        // whole retained labels dictionary, so the concatenated dictionary
+        // grows with the row count. Compact it back to one entry per distinct
+        // series the flushed rows reference; the schema and every decoded
+        // label set are unchanged.
+        let mut columns = batch.columns().to_vec();
+        columns[COL_LABELS] = crate::labels::compact_labels(&columns[COL_LABELS])?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)
+            .map_err(DataFusionError::from)?;
         Ok(batch)
     }
 
