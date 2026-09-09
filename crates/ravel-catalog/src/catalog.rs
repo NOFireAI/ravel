@@ -4265,6 +4265,7 @@ mod tests {
         FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{Capabilities, DelimitedList, ListPage, PageToken, PutOutcome};
 
     use super::*;
 
@@ -8660,5 +8661,901 @@ mod tests {
             },
             other => panic!("expected CompactionRecordDecode, got {other:?}"),
         }
+    }
+
+    /// Test-only decorator that records every `get()` key, in call order, so
+    /// a test can assert the EXACT set of objects a load fetched -- not just
+    /// how many, which `QueryAccounting`'s `AccountedOp::Get` counter alone
+    /// cannot distinguish (it counts, it does not name). Every method
+    /// delegates to `inner` unchanged; only `get` is observed.
+    struct KeyLoggingStore<S> {
+        inner: S,
+        get_keys: Mutex<Vec<String>>,
+    }
+
+    impl<S> KeyLoggingStore<S> {
+        fn new(inner: S) -> Self {
+            KeyLoggingStore {
+                inner,
+                get_keys: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Every key `get()` was called with, in call order.
+        fn get_keys(&self) -> Vec<String> {
+            self.get_keys.lock().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for KeyLoggingStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.get_keys.lock().push(key.to_string());
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Write a **v3** per-part column-stats object covering exactly
+    /// `part_hash` with one segment carrying an I64 `status` column at
+    /// min == max == `value` (one non-null row), content-hash-keyed at
+    /// `content_hash` (v3's 32-byte `writer_id` scheme). Returns the
+    /// `SnapshotColumnStatsPartRef` a `SnapshotPartRef.column_stats` (field 7)
+    /// entry should carry.
+    async fn install_v3_part_stats(
+        store: &impl ObjectStoreBackend,
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        content_hash: [u8; 32],
+        value: i64,
+        key: &str,
+    ) -> ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+        let signal_num = signal::to_proto(signal) as u32;
+        let segments = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: content_hash.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(value)),
+                    }),
+                    count: 1,
+                }],
+                sum: Some(value),
+            }],
+        }];
+        let stats_bytes = crate::snapshot_format::encode_column_stats_v3(
+            tenant.0,
+            signal_num,
+            part_hash,
+            &segments,
+            crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+        )
+        .expect("encode v3 column stats");
+        let stats_hash = *blake3::hash(&stats_bytes).as_bytes();
+        store
+            .put(key, Bytes::from(stats_bytes.clone()), PutOptions::default())
+            .await
+            .expect("put v3 stats");
+        ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+            key: key.to_string(),
+            blake3: stats_hash.to_vec(),
+            size: stats_bytes.len() as u64,
+            segment_count: 1,
+            part_blake3: vec![part_hash.to_vec()],
+        }
+    }
+
+    /// A well-framed **v3** column-statistics envelope (single `part_blake3`,
+    /// matching [`crate::snapshot_format::encode_column_stats_v3`]'s shape)
+    /// whose header DECLARES `declared_len` uncompressed body bytes over an
+    /// empty body -- the same issue #1400 shape [`frame_oversized_cstat`]
+    /// builds for v1, adapted to v3's single-part header so a per-part decode
+    /// refusal can be tested the same way a whole-tenant one already is.
+    fn frame_oversized_cstat_v3(
+        tenant: TenantHash,
+        signal: Signal,
+        part_hash: [u8; 32],
+        declared_len: u64,
+    ) -> Vec<u8> {
+        use crate::snapshot_format::{COLUMN_STATS_MAGIC, COLUMN_STATS_RESERVED, ZSTD_LEVEL};
+
+        let version: u8 = 3;
+        let body = zstd::bulk::compress(b"", ZSTD_LEVEL).expect("compress empty body");
+        let header = ravel_proto::catalog::v1::ColumnStatsHeader {
+            format_version: u32::from(version),
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal::to_proto(signal) as u32,
+            part_blake3: vec![part_hash.to_vec()],
+            segment_count: 0,
+            body_uncompressed_len: declared_len,
+        };
+        let header_bytes = header.encode_to_vec();
+        let header_len = header_bytes.len() as u32;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&COLUMN_STATS_MAGIC);
+        out.push(version);
+        out.extend_from_slice(&COLUMN_STATS_RESERVED);
+        out.extend_from_slice(&header_len.to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        let header_crc = crc32c::crc32c(&out);
+
+        out.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        out.extend_from_slice(&body);
+        let body_crc = crc32c::crc32c(&body);
+        out.extend_from_slice(&body_crc.to_le_bytes());
+        out.extend_from_slice(&header_crc.to_le_bytes());
+        out
+    }
+
+    /// ADR-1413 decision 2: a query window covering exactly K of a tenant's
+    /// N (here 3) snapshot parts issues exactly one per-part v3 GET for each
+    /// of the K covered parts, plus the one HEAD GET -- never a whole-object
+    /// (field 13 or field 11) GET, and never a GET for an uncovered part.
+    ///
+    /// Prove-the-test: this pins `Catalog::load_column_stats`'s per-part loop
+    /// (`for part in &covered`) actually consulting `parts_intersecting`'s
+    /// narrowed set rather than HEAD's full `parts` list. Flip that loop's
+    /// `for part in &covered` to `for part in &head.parts` and the key-set
+    /// assertion below fails: three `.cstat` GETs fire (including the
+    /// excluded part's), not two.
+    #[tokio::test]
+    async fn query_over_k_of_n_parts_issues_exactly_k_per_part_gets_and_no_whole_object_get() {
+        let inner = MemoryStore::new();
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_a_hash = *blake3::hash(b"part-a").as_bytes();
+        let part_b_hash = *blake3::hash(b"part-b").as_bytes();
+        let part_c_hash = *blake3::hash(b"part-c").as_bytes();
+        let content_b = *blake3::hash(b"content-b").as_bytes();
+        let content_c = *blake3::hash(b"content-c").as_bytes();
+
+        let b_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-b.cstat",
+            tenant().to_hex()
+        );
+        let c_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-c.cstat",
+            tenant().to_hex()
+        );
+        let b_ref =
+            install_v3_part_stats(&inner, tenant(), signal, part_b_hash, content_b, 10, &b_key)
+                .await;
+        let c_ref =
+            install_v3_part_stats(&inner, tenant(), signal, part_c_hash, content_c, 20, &c_key)
+                .await;
+
+        // Poison whole-tenant v1/v2 objects, bound to all three parts: if the
+        // reader ever fell back to either, its key would show up in the log
+        // below and the accounted GET count would climb past 3.
+        let all_parts = vec![
+            part_a_hash.to_vec(),
+            part_b_hash.to_vec(),
+            part_c_hash.to_vec(),
+        ];
+        let poison_segments_v1 = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xAA; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![],
+        }];
+        let v1_bytes = crate::snapshot_format::encode_column_stats(
+            tenant().0,
+            signal_num,
+            all_parts.clone(),
+            &poison_segments_v1,
+        )
+        .expect("encode v1 poison");
+        let v1_hash = *blake3::hash(&v1_bytes).as_bytes();
+        let v1_key = format!(
+            "t/{}/catalog/{prefix}/cstat/poison-v1.cstat",
+            tenant().to_hex()
+        );
+        inner
+            .put(
+                &v1_key,
+                Bytes::from(v1_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v1 poison");
+
+        let poison_segments_v2 = vec![ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: vec![0xBB; 32],
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![],
+        }];
+        let v2_bytes = crate::snapshot_format::encode_column_stats_v2(
+            tenant().0,
+            signal_num,
+            all_parts.clone(),
+            &poison_segments_v2,
+        )
+        .expect("encode v2 poison");
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+        let v2_key = format!(
+            "t/{}/catalog/{prefix}/cstat/poison-v2.cstat",
+            tenant().to_hex()
+        );
+        inner
+            .put(
+                &v2_key,
+                Bytes::from(v2_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v2 poison");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 29,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-a".to_string(),
+                    blake3: part_a_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: None,
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-b".to_string(),
+                    blake3: part_b_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: Some(b_ref),
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-c".to_string(),
+                    blake3: part_c_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 29,
+                    min_hour: 20,
+                    column_stats: Some(c_ref),
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsRef {
+                key: v1_key.clone(),
+                blake3: v1_hash.to_vec(),
+                size: v1_bytes.len() as u64,
+                segment_count: 1,
+                part_blake3: all_parts.clone(),
+            }),
+            column_stats_part: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                key: v2_key.clone(),
+                blake3: v2_hash.to_vec(),
+                size: v2_bytes.len() as u64,
+                segment_count: 1,
+                part_blake3: all_parts.clone(),
+            }),
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        inner
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let store = Arc::new(KeyLoggingStore::new(inner));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+
+        // window [12h, 29h] widens (2h max_ingest_lag_ns) to hours [10, 29]:
+        // covers parts b and c (watermark 19 and 29, both >= 10) but not a
+        // (watermark 9 < 10).
+        let range = TimeRange {
+            start_ns: 12 * NS_PER_HOUR,
+            end_ns: 29 * NS_PER_HOUR,
+        };
+        let now_ns = 29 * NS_PER_HOUR;
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+
+        let cstat_gets: Vec<String> = store
+            .get_keys()
+            .into_iter()
+            .filter(|k| k.ends_with(".cstat"))
+            .collect();
+        assert_eq!(
+            cstat_gets.len(),
+            2,
+            "exactly the two covered parts' v3 objects: {cstat_gets:?}"
+        );
+        let cstat_set: HashSet<&str> = cstat_gets.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            cstat_set,
+            HashSet::from([b_key.as_str(), c_key.as_str()]),
+            "the exact key set is the two covered parts, no more, no less"
+        );
+        assert!(
+            !cstat_set.contains(v1_key.as_str()),
+            "field 11 (v1) object never fetched"
+        );
+        assert!(
+            !cstat_set.contains(v2_key.as_str()),
+            "field 13 (v2) object never fetched"
+        );
+
+        assert_eq!(
+            acc.snapshot().s3_requests(AccountedOp::Get),
+            3,
+            "HEAD plus exactly two per-part GETs, no whole-object fallback"
+        );
+
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            2,
+            "both covered parts' segments loaded, and only theirs"
+        );
+        assert!(loaded.by_content_hash.contains_key(&content_b));
+        assert!(loaded.by_content_hash.contains_key(&content_c));
+    }
+
+    /// ADR-1413 decision 2: a covered part with no v3 ref (field 7 absent)
+    /// falls back to the whole-tenant object, and the fallback answers that
+    /// part's segment -- the query still gets exact statistics for every
+    /// live segment, not just the parts that got their own object. The
+    /// whole-object GET fires exactly once even though only one covered part
+    /// needed it.
+    ///
+    /// Prove-the-test: this pins the per-part loop's
+    /// `None => needs_fallback.push(part)` arm (`resolve_part_stats_ref`
+    /// returning `None`). Flip that arm to `None => {}` (silently drop a part
+    /// with no ref instead of falling back for it) and the
+    /// "every segment covered" assertion below fails: the fallback GET never
+    /// fires and part y's segment is missing from `by_content_hash`.
+    #[tokio::test]
+    async fn a_part_without_field_seven_falls_back_to_the_whole_object() {
+        let inner = MemoryStore::new();
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_x_hash = *blake3::hash(b"part-x").as_bytes();
+        let part_y_hash = *blake3::hash(b"part-y").as_bytes();
+        let content_x = *blake3::hash(b"content-x").as_bytes();
+        let content_y = *blake3::hash(b"content-y").as_bytes();
+
+        let x_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-x.cstat",
+            tenant().to_hex()
+        );
+        let x_ref =
+            install_v3_part_stats(&inner, tenant(), signal, part_x_hash, content_x, 1, &x_key)
+                .await;
+
+        // The whole-tenant v2 object, bound to BOTH parts (the binding is
+        // every part in HEAD, not just covered ones), carrying only part y's
+        // segment -- x already has its own v3 object and must not need this.
+        let y_segment = ravel_proto::catalog::v1::ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: content_y.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                name: "status".to_string(),
+                declared_type: 2,
+                non_null_count: 1,
+                null_count: 0,
+                min: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                }),
+                max: Some(ravel_proto::catalog::v1::ColumnValue {
+                    kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                }),
+                dictionary_present: true,
+                dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                    value: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                    }),
+                    count: 1,
+                }],
+                sum: Some(2),
+            }],
+        };
+        let v2_bytes = crate::snapshot_format::encode_column_stats_v2(
+            tenant().0,
+            signal_num,
+            vec![part_x_hash.to_vec(), part_y_hash.to_vec()],
+            &[y_segment],
+        )
+        .expect("encode v2");
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+        let v2_key = format!("t/{}/catalog/{prefix}/cstat/whole.cstat", tenant().to_hex());
+        inner
+            .put(
+                &v2_key,
+                Bytes::from(v2_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v2");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 19,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-x".to_string(),
+                    blake3: part_x_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: Some(x_ref),
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-y".to_string(),
+                    blake3: part_y_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: None,
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: None,
+            column_stats_part: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                key: v2_key.clone(),
+                blake3: v2_hash.to_vec(),
+                size: v2_bytes.len() as u64,
+                segment_count: 1,
+                part_blake3: vec![part_x_hash.to_vec(), part_y_hash.to_vec()],
+            }),
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        inner
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let store = Arc::new(KeyLoggingStore::new(inner));
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+
+        let v2_gets = store.get_keys().iter().filter(|k| *k == &v2_key).count();
+        assert_eq!(
+            v2_gets, 1,
+            "the whole-object fallback is fetched exactly once"
+        );
+        assert_eq!(
+            acc.snapshot().s3_requests(AccountedOp::Get),
+            3,
+            "HEAD, part x's own v3 object, and one whole-object fallback"
+        );
+
+        assert!(
+            loaded.by_content_hash.contains_key(&content_x),
+            "part x's own v3 record loaded"
+        );
+        assert!(
+            loaded.by_content_hash.contains_key(&content_y),
+            "part y's fallback record loaded"
+        );
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            2,
+            "every covered segment has exact statistics"
+        );
+    }
+
+    /// Issue #1400 extended per part (ADR-1413 decision 2): a covered part
+    /// whose own v3 object fails to DECODE (not merely absent) subtracts
+    /// that part's coverage from the loaded statistics, while the query
+    /// still succeeds -- and the well-formed sibling part's statistics still
+    /// load. The refusal warns once and counts once, exactly like the
+    /// whole-tenant case (`column_stats_decode_refusal_warns_once_and_counts_each`).
+    ///
+    /// Prove-the-test: this pins the per-part loop's
+    /// `FetchOutcome::DecodeRefused(err) => { self.note_column_stats_decode_refusal(...);
+    /// needs_fallback.push(part); }` arm actually excluding the refused
+    /// part's records. Flip that arm to a bare `needs_fallback.push(part)`
+    /// with no `note_column_stats_decode_refusal` call and the refusal-count
+    /// and WARN assertions below both fail: `column_stats_decode_refusals()`
+    /// reads 0 against the expected 1 and `count_containing` reads 0 against
+    /// the expected 1.
+    #[tokio::test]
+    async fn a_part_whose_v3_object_fails_to_decode_subtracts_its_coverage_and_warns() {
+        let store = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_p_hash = *blake3::hash(b"part-p").as_bytes();
+        let part_q_hash = *blake3::hash(b"part-q").as_bytes();
+        let content_q = *blake3::hash(b"content-q").as_bytes();
+
+        let p_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-p.cstat",
+            tenant().to_hex()
+        );
+        let corrupt_bytes = frame_oversized_cstat_v3(tenant(), signal, part_p_hash, 2_000_102_795);
+        let corrupt_hash = *blake3::hash(&corrupt_bytes).as_bytes();
+        store
+            .put(
+                &p_key,
+                Bytes::from(corrupt_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put corrupt v3");
+
+        let q_key = format!(
+            "t/{}/catalog/{prefix}/cstat/part-q.cstat",
+            tenant().to_hex()
+        );
+        let q_ref = install_v3_part_stats(
+            store.as_ref(),
+            tenant(),
+            signal,
+            part_q_hash,
+            content_q,
+            7,
+            &q_key,
+        )
+        .await;
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 19,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-p".to_string(),
+                    blake3: part_p_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                        key: p_key.clone(),
+                        blake3: corrupt_hash.to_vec(),
+                        size: corrupt_bytes.len() as u64,
+                        segment_count: 0,
+                        part_blake3: vec![part_p_hash.to_vec()],
+                    }),
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-q".to_string(),
+                    blake3: part_q_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: Some(q_ref),
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: None,
+            column_stats_part: None,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let capture = WarnCapture::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (range, now_ns) = full_window();
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &QueryAccounting::new())
+            .await
+            .expect("load ok")
+            .expect("part q's statistics still load");
+
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            1,
+            "only part q's segment loaded; part p's coverage was subtracted"
+        );
+        assert!(loaded.by_content_hash.contains_key(&content_q));
+
+        assert_eq!(
+            catalog.column_stats_decode_refusals(),
+            1,
+            "counted once for the one refused part"
+        );
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            1,
+            "warned once for the one refused part"
+        );
+        let warn = capture
+            .lines()
+            .into_iter()
+            .find(|line| line.contains(DECODE_REFUSAL_WARN))
+            .expect("the one decode-refusal WARN");
+        assert!(
+            warn.contains(&p_key),
+            "WARN names the refused part's own key: {warn}"
+        );
+    }
+
+    /// A HEAD folded before ADR-1413 (or by an older writer): every part
+    /// carries no `column_stats` ref (field 7 absent everywhere), the
+    /// pre-#1413 shape. The reader must behave exactly as it did before this
+    /// change -- one whole-object GET regardless of how many parts the
+    /// window covers, never a wasted per-part attempt -- so the accounted
+    /// GET count for a two-part legacy HEAD is the same 2 (HEAD plus the one
+    /// whole-object GET) the single-part
+    /// `load_column_stats_charges_exactly_two_accounted_gets` test already
+    /// pins for the pre-#1413 shape.
+    ///
+    /// Prove-the-test: this pins `resolve_part_stats_ref` returning `None`
+    /// for a part with no ref translating directly into `needs_fallback`,
+    /// never a wasted GET attempt. Flip `resolve_part_stats_ref`
+    /// (column_stats_resolve.rs) to fabricate a ref out of the part's own
+    /// blake3 instead of reading `part.column_stats`, and this test's GET
+    /// count climbs to 4 (two failed per-part GET attempts before falling
+    /// back), against the 2 pinned below.
+    #[tokio::test]
+    async fn old_snapshot_head_with_no_field_seven_matches_pre_change_get_count() {
+        let store = Arc::new(MemoryStore::new());
+        let signal = Signal::Logs;
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+
+        let part_1_hash = *blake3::hash(b"legacy-part-1").as_bytes();
+        let part_2_hash = *blake3::hash(b"legacy-part-2").as_bytes();
+        let content_1 = *blake3::hash(b"legacy-content-1").as_bytes();
+        let content_2 = *blake3::hash(b"legacy-content-2").as_bytes();
+
+        let segments = vec![
+            ravel_proto::catalog::v1::ColumnStatsSegment {
+                ingest_hour_bucket: 1,
+                shard: 0,
+                writer_id: content_1.to_vec(),
+                writer_epoch: 1,
+                writer_seq: 1,
+                columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                    name: "status".to_string(),
+                    declared_type: 2,
+                    non_null_count: 1,
+                    null_count: 0,
+                    min: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    max: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                    }),
+                    dictionary_present: true,
+                    dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                        value: Some(ravel_proto::catalog::v1::ColumnValue {
+                            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(1)),
+                        }),
+                        count: 1,
+                    }],
+                    sum: Some(1),
+                }],
+            },
+            ravel_proto::catalog::v1::ColumnStatsSegment {
+                ingest_hour_bucket: 1,
+                shard: 0,
+                writer_id: content_2.to_vec(),
+                writer_epoch: 1,
+                writer_seq: 1,
+                columns: vec![ravel_proto::catalog::v1::ColumnStat {
+                    name: "status".to_string(),
+                    declared_type: 2,
+                    non_null_count: 1,
+                    null_count: 0,
+                    min: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                    }),
+                    max: Some(ravel_proto::catalog::v1::ColumnValue {
+                        kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                    }),
+                    dictionary_present: true,
+                    dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                        value: Some(ravel_proto::catalog::v1::ColumnValue {
+                            kind: Some(ravel_proto::catalog::v1::column_value::Kind::I64(2)),
+                        }),
+                        count: 1,
+                    }],
+                    sum: Some(2),
+                }],
+            },
+        ];
+        let v2_bytes = crate::snapshot_format::encode_column_stats_v2(
+            tenant().0,
+            signal_num,
+            vec![part_1_hash.to_vec(), part_2_hash.to_vec()],
+            &segments,
+        )
+        .expect("encode v2");
+        let v2_hash = *blake3::hash(&v2_bytes).as_bytes();
+        let v2_key = format!(
+            "t/{}/catalog/{prefix}/cstat/legacy.cstat",
+            tenant().to_hex()
+        );
+        store
+            .put(
+                &v2_key,
+                Bytes::from(v2_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put v2");
+
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour: 19,
+            parts: vec![
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-1".to_string(),
+                    blake3: part_1_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 9,
+                    min_hour: 0,
+                    column_stats: None,
+                },
+                ravel_proto::catalog::v1::SnapshotPartRef {
+                    key: "unused-2".to_string(),
+                    blake3: part_2_hash.to_vec(),
+                    size: 1,
+                    entry_count: 0,
+                    watermark_hour: 19,
+                    min_hour: 10,
+                    column_stats: None,
+                },
+            ],
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+            column_stats: None,
+            column_stats_part: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                key: v2_key.clone(),
+                blake3: v2_hash.to_vec(),
+                size: v2_bytes.len() as u64,
+                segment_count: 2,
+                part_blake3: vec![part_1_hash.to_vec(), part_2_hash.to_vec()],
+            }),
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant(), signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+
+        let loaded = catalog
+            .load_column_stats(&tenant(), signal, range, now_ns, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+
+        assert_eq!(
+            acc.snapshot().s3_requests(AccountedOp::Get),
+            2,
+            "HEAD plus the one whole-object GET, exactly as the pre-#1413 reader charged"
+        );
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            2,
+            "both legacy parts' statistics loaded"
+        );
+        assert!(loaded.by_content_hash.contains_key(&content_1));
+        assert!(loaded.by_content_hash.contains_key(&content_2));
     }
 }
