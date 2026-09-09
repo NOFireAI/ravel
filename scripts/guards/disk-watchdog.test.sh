@@ -77,9 +77,16 @@ check_contains "no scope argument: says what it wanted" "usage" "${out}"
 pid_a="$(start_fake_build)"
 sleep 1
 mkdir -p "${TMP}/no-builds-here"
-out="$(WATCHDOG_DRY_RUN=1 "${WATCHDOG}" "${TMP}/no-builds-here" 999999 1000000 1 2>&1)"
-check_contains "out of scope: reports no build under that path" "no cargo/rustc under" "${out}"
-check_eq "out of scope: the process is still alive" "alive" \
+# Backgrounded, because below the floor with nothing of ours running the
+# watchdog keeps sampling rather than exiting; see the no-disarm case below
+# for why. A foreground run here would hang the suite.
+"${WATCHDOG}" "${TMP}/no-builds-here" 999999 1000000 1 >"${TMP}/oos.out" 2>&1 &
+pid_oos=$!
+sleep 3
+kill -KILL "${pid_oos}" 2>/dev/null || true
+check_contains "out of scope: reports no build under that path" "no cargo/rustc under" \
+  "$(cat "${TMP}/oos.out" 2>/dev/null)"
+check_eq "out of scope: the build outside it is untouched" "alive" \
   "$(kill -0 "${pid_a}" 2>/dev/null && echo alive || echo dead)"
 
 # --- a scope that does not exist is refused -------------------------------
@@ -133,6 +140,60 @@ check_contains "marker: carries the free-space figure" "free_gb=" "${marker}"
 # The reason the marker exists at all: a runner reports a SIGTERM'd test as a
 # failure, and the next reader cannot tell that from a real one.
 check_contains "marker: says an overlapping gate is invalid, not red" "INVALID" "${marker}"
+
+# --- a sibling whose name starts with the scope is NOT in scope -----------
+#
+# The defect this pins, reproduced on the first version of this script: a
+# bare "${SCOPE}"* prefix match also matches a sibling directory whose name
+# merely begins with the same string, so a scope of .../wt named a build
+# running in .../wt2 for killing. That is another session's work, and it is
+# precisely what the scoping exists to prevent. Every other case here puts
+# its build at the scope root or under it, so none of them can see this.
+SIB="${TMP}/scope2"
+mkdir -p "${SIB}/bin"
+ln -s /bin/sh "${SIB}/bin/cargo"
+( cd "${SIB}" && exec "${SIB}/bin/cargo" -c 'while :; do sleep 1; done' ) \
+  >/dev/null 2>&1 &
+pid_sibling=$!
+sleep 1
+out="$(WATCHDOG_DRY_RUN=1 "${WATCHDOG}" "${SCOPE}" 999999 1000000 1 2>&1)"
+check_eq "a name-prefix sibling of the scope is not matched" "0" \
+  "$(printf '%s' "${out}" | grep -c "${pid_sibling}")"
+kill -KILL "${pid_sibling}" 2>/dev/null || true
+
+# --- a build in a SUBDIRECTORY of the scope IS in scope --------------------
+#
+# The obvious over-correction to the case above is an exact match, which
+# passes every other case here while silently narrowing the watchdog to
+# processes sitting at the worktree root. A real build's cwd is a crate
+# directory, so this is the normal case, not the exotic one.
+SUB="${SCOPE}/crates/ravel-sql"
+mkdir -p "${SUB}"
+( cd "${SUB}" && exec "${SCOPE}/bin/cargo" -c 'while :; do sleep 1; done' ) \
+  >/dev/null 2>&1 &
+pid_sub=$!
+sleep 1
+out="$(WATCHDOG_DRY_RUN=1 "${WATCHDOG}" "${SCOPE}" 999999 1000000 1 2>&1)"
+check_eq "a build in a subdirectory of the scope is matched" "1" \
+  "$(printf '%s' "${out}" | grep -c "${pid_sub}")"
+kill -KILL "${pid_sub}" 2>/dev/null || true
+
+# --- below the floor with no build yet: keep watching, do not disarm -------
+#
+# Arming happens alongside a gate that has not spawned cargo yet, and
+# gates.sh runs its lanes as separate processes, so a sample can legitimately
+# find nothing of ours while the volume is already low. Exiting there would
+# disarm the watchdog at the moment it is most needed, returning the same
+# status a successful firing returns.
+mkdir -p "${TMP}/empty-scope"
+"${WATCHDOG}" "${TMP}/empty-scope" 999999 1000000 1 >"${TMP}/starve.out" 2>&1 &
+pid_wd=$!
+sleep 3
+check_eq "below the floor with nothing of ours: still running" "alive" \
+  "$(kill -0 "${pid_wd}" 2>/dev/null && echo alive || echo dead)"
+check_contains "below the floor with nothing of ours: says it is still watching" \
+  "still watching" "$(cat "${TMP}/starve.out" 2>/dev/null)"
+kill -KILL "${pid_wd}" 2>/dev/null || true
 
 # --- a build outside the scope survives a real firing ---------------------
 #
