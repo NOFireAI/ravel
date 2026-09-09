@@ -221,6 +221,13 @@ jobs:
         run: bash scripts/tests/check-injected-clock-helpers.test.sh
       - name: Injected-clock helper guard (issue #1260)
         run: bash scripts/check-injected-clock-helpers.sh
+      # The merge-readiness script's own cases: its jq filters, its verdict
+      # order, and the end-to-end runs that drive the real script against
+      # fixtures with stand-in gh and git. Bash and jq only, no toolchain. It
+      # ran in no job until now, which is how it went stale and non-hermetic
+      # without anything noticing.
+      - name: pr-review-status.sh cases
+        run: bash scripts/pr-review-status.test.sh
       - name: Python script unit tests
         run: make test-python
 

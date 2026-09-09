@@ -30,12 +30,16 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # belongs to while every other check here is pinned to ${repo} by `gh --repo`,
 # so it runs with the cwd pinned to this script's own checkout; otherwise the
 # two halves of the verdict can be about different repositories.
+#
+# The `cd` failing is its own outcome, not a stale base: left bare in the `&&`
+# it would exit 1, which is the code reserved for "behind", and the operator
+# would be told to rebase over a guard that never ran.
 guard_rc=0
 guard_out=""
 merge_base_guard() {
   guard_rc=0
-  guard_out="$(cd "${script_dir}/.." && \
-    "${script_dir}/guards/assert-fresh-merge-base.sh" "${pr}" 2>&1)" || guard_rc=$?
+  guard_out="$( { { cd "${script_dir}/.." || exit 2; } && \
+    "${script_dir}/guards/assert-fresh-merge-base.sh" "${pr}"; } 2>&1)" || guard_rc=$?
   return "${guard_rc}"
 }
 
