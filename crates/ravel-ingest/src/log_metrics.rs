@@ -677,6 +677,8 @@ mod tests {
                     postings_distinct_max: 25,
                     dynamic_columns_used: 7,
                     dynamic_columns_overflowed: 2,
+                    #[cfg(feature = "stage-timing")]
+                    bloom_block_ns: Vec::new(),
                 })
             },
             LogIngestMetricsSnapshot {
