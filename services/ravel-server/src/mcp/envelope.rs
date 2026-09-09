@@ -520,16 +520,23 @@ fn string_field(value: &Value, field: &str) -> String {
 /// type. An integer keeps its exact value as a string (D4: a nanosecond
 /// epoch exceeds 2^53), a float follows the float rules, and an array has no
 /// cell variant of its own so it keeps its JSON text.
+///
+/// `serde_json` parses a JSON integer above `i64::MAX` as a `u64`, and
+/// `Number::as_f64` succeeds on it with precision loss. `Cell` has no
+/// unsigned variant, so a number that fails `as_i64` only becomes a float
+/// when it actually is one (`is_f64`); otherwise its exact digits go out as
+/// `Cell::Str`, matching the string-precision rule integers already get.
 fn json_to_cell(value: &Value) -> Cell {
     match value {
         Value::Null => Cell::Null,
         Value::Bool(b) => Cell::Bool(*b),
         Value::Number(number) => match number.as_i64() {
             Some(n) => Cell::Int(n),
-            None => match number.as_f64() {
+            None if number.is_f64() => match number.as_f64() {
                 Some(f) => Cell::Float(f),
                 None => Cell::Str(number.to_string()),
             },
+            None => Cell::Str(number.to_string()),
         },
         Value::String(s) => Cell::Str(s.clone()),
         Value::Object(map) => Cell::Map(map.clone()),
@@ -932,6 +939,24 @@ mod tests {
         assert_eq!(data.rows[0][1], Cell::Null);
         assert_eq!(data.rows[1][0], Cell::Int(9007199254740993));
         assert_eq!(data.rows[1][1], Cell::Float(1.5));
+    }
+
+    /// A JSON integer above `i64::MAX` parses as a `u64`, and `Cell` has no
+    /// unsigned variant. Rendering it through `as_f64` would lose precision
+    /// (D4's exact-semantics-by-default rule), so it must come out as the
+    /// exact digits in `Cell::Str`, the same way an out-of-range `i64` does.
+    /// An ordinary float is unaffected and still becomes `Cell::Float`.
+    #[test]
+    fn a_large_unsigned_integer_is_not_downgraded_to_a_float() {
+        assert_eq!(
+            json_to_cell(&json!(u64::MAX)),
+            Cell::Str(u64::MAX.to_string())
+        );
+        assert_eq!(
+            json_to_cell(&json!(i64::MAX as u64 + 1)),
+            Cell::Str((i64::MAX as u64 + 1).to_string())
+        );
+        assert_eq!(json_to_cell(&json!(1.5f64)), Cell::Float(1.5));
     }
 
     /// The per-phase figures are every phase exactly once, in
