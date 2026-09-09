@@ -384,7 +384,10 @@ there before changing a rule.
   function take six, both PRs green), and a gate added to `main` after a PR
   went green has never run against that PR at all. Four PRs were CI-green
   and behind simultaneously on 2026-09-06. `ALLOW_STALE_MERGE_BASE=1` to
-  proceed anyway. Note it fetches with an explicit destination refspec: a
+  proceed anyway. It exits 1 for a base that is behind and 2 when it could
+  not tell (bad argument, no such pull request, git failed), so a caller
+  reporting to a human can say which it got; a caller that only needs "may
+  I merge" treats any non-zero as no. Note it fetches with an explicit destination refspec: a
   hand-rolled version using `git fetch origin main <other-ref>` and then
   `rev-parse FETCH_HEAD` reads back MAIN, so it compares main with itself
   and reports every branch fresh.
