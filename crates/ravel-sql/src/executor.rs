@@ -169,7 +169,6 @@ pub(crate) type DistributedScan = (
 /// positional arguments) so the field set can grow, and so it compiles to a
 /// zero-field value when `flight-sql` is off -- the local-only build carries no
 /// distributed machinery.
-#[derive(Default)]
 struct PlanExtras {
     /// The tenant's declared typed attribute columns (ADR-0090), resolved once
     /// per plan at the entry point and threaded down here. Empty for a
@@ -187,6 +186,15 @@ struct PlanExtras {
     /// This request's lowered budgets ([`SqlRequest::budgets`]). `None` plans
     /// under the executor's own configuration unchanged.
     budgets: Option<RequestBudgets>,
+    /// The window `Catalog::load_column_stats` bounds its per-part reads
+    /// against (ADR-1413): the request's own window where one exists
+    /// (`explain_inner`, `attempt`), or [`snapshot_covering_window`]'s
+    /// derived cover for the two entry points planning an already-resolved
+    /// snapshot with no request window attached.
+    column_stats_window: TimeRange,
+    /// The injected clock reading paired with `column_stats_window`, same
+    /// provenance rule.
+    column_stats_now_ns: i64,
 }
 
 /// One SQL request, fully resolved from its transport.
@@ -896,14 +904,14 @@ impl SqlExecutor {
                 snapshot,
                 &req.sql,
                 accounting,
-                req.window,
-                req.now_ns,
                 PlanExtras {
                     declared,
                     #[cfg(feature = "flight-sql")]
                     distributed: None,
                     row_window: req.row_window.then_some(req.window),
                     budgets: req.budgets,
+                    column_stats_window: req.window,
+                    column_stats_now_ns: req.now_ns,
                 },
             )
             .await?;
@@ -1070,8 +1078,6 @@ impl SqlExecutor {
             snapshot,
             sql,
             accounting,
-            window,
-            now_ns,
             PlanExtras {
                 declared: declared.to_vec(),
                 // Explicit per-field so this compiles clean whether or not the
@@ -1081,6 +1087,8 @@ impl SqlExecutor {
                 distributed: None,
                 row_window: None,
                 budgets: None,
+                column_stats_window: window,
+                column_stats_now_ns: now_ns,
             },
         )
         .await
@@ -1112,13 +1120,13 @@ impl SqlExecutor {
             snapshot,
             sql,
             accounting,
-            window,
-            now_ns,
             PlanExtras {
                 declared: declared.to_vec(),
                 distributed,
                 row_window: None,
                 budgets: None,
+                column_stats_window: window,
+                column_stats_now_ns: now_ns,
             },
         )
         .await
@@ -1134,8 +1142,6 @@ impl SqlExecutor {
         snapshot: Snapshot,
         sql: &str,
         accounting: &QueryAccounting,
-        window: TimeRange,
-        now_ns: i64,
         extras: PlanExtras,
     ) -> Result<PinnedQuery, SqlError> {
         // Every read of the executor's configuration below goes through this
@@ -1257,7 +1263,13 @@ impl SqlExecutor {
                     None
                 } else {
                     self.catalog
-                        .load_column_stats(&tenant_hash, Signal::Logs, window, now_ns, accounting)
+                        .load_column_stats(
+                            &tenant_hash,
+                            Signal::Logs,
+                            extras.column_stats_window,
+                            extras.column_stats_now_ns,
+                            accounting,
+                        )
                         .await?
                 };
                 SessionTable::Logs(Arc::new(
@@ -1894,14 +1906,14 @@ impl SqlExecutor {
                 snapshot,
                 &req.sql,
                 accounting,
-                req.window,
-                req.now_ns,
                 PlanExtras {
                     declared: declared.to_vec(),
                     #[cfg(feature = "flight-sql")]
                     distributed: None,
                     row_window: req.row_window.then_some(req.window),
                     budgets: req.budgets,
+                    column_stats_window: req.window,
+                    column_stats_now_ns: req.now_ns,
                 },
             )
             .await
