@@ -1381,6 +1381,20 @@ pub struct Cli {
     #[arg(long, value_name = "DURATION")]
     pub store_probe_interval: Option<String>,
 
+    /// Upper bound on the graceful-shutdown drain, as a humantime duration
+    /// (e.g. `25s`). On SIGTERM the process flips readiness to draining, waits
+    /// for probes to observe 503, then flushes ingest buffers and joins its
+    /// background tasks; this bounds that whole drain so the process still
+    /// exits before Kubernetes escalates SIGTERM to SIGKILL. Matches the
+    /// humantime-duration flag convention of `--store-probe-interval`. Omitted
+    /// defaults to `DEFAULT_SHUTDOWN_TIMEOUT`, deliberately below the
+    /// Kubernetes default `terminationGracePeriodSeconds` (30s). A zero
+    /// duration is rejected, and so is a value above `MAX_SHUTDOWN_TIMEOUT`
+    /// (1h): a larger timeout serves no grace period and overflows the listener
+    /// sub-budget at shutdown. (default: 25s)
+    #[arg(long, value_name = "DURATION")]
+    pub shutdown_timeout: Option<String>,
+
     /// OTLP/gRPC endpoint this process exports its own query-path `tracing`
     /// spans to (ADR-0060). Absent by default: with no endpoint the subscriber
     /// is byte-identical to before, spans stay on the local log stream only.
@@ -3106,6 +3120,38 @@ impl Cli {
                     anyhow::bail!(
                         "--store-probe-interval '{s}' must be a positive duration: a zero \
                          interval would probe the store in a tight loop"
+                    );
+                }
+                Ok(dur)
+            }
+        }
+    }
+
+    /// Parse `--shutdown-timeout` into a duration, defaulting to
+    /// [`crate::DEFAULT_SHUTDOWN_TIMEOUT`] when unset. Rejects a zero or
+    /// unparseable duration rather than a zero-length drain that would skip the
+    /// buffer flush entirely, mirroring [`Self::parse_store_probe_interval`].
+    /// Also rejects a value above [`crate::MAX_SHUTDOWN_TIMEOUT`]: the shutdown
+    /// path multiplies this by four for the listener sub-budget, so an absurd
+    /// value would panic on a `Duration` overflow at shutdown rather than being
+    /// caught at startup.
+    pub fn parse_shutdown_timeout(&self) -> anyhow::Result<Duration> {
+        match self.shutdown_timeout.as_deref() {
+            None => Ok(crate::DEFAULT_SHUTDOWN_TIMEOUT),
+            Some(s) => {
+                let dur = humantime::parse_duration(s)
+                    .map_err(|e| anyhow::anyhow!("invalid --shutdown-timeout '{s}': {e}"))?;
+                if dur.is_zero() {
+                    anyhow::bail!(
+                        "--shutdown-timeout '{s}' must be a positive duration: a zero timeout \
+                         would cut the drain off before any ingest buffer is flushed"
+                    );
+                }
+                if dur > crate::MAX_SHUTDOWN_TIMEOUT {
+                    anyhow::bail!(
+                        "--shutdown-timeout '{s}' exceeds the maximum of {:?}: a larger value \
+                         serves no grace period and overflows the listener sub-budget at shutdown",
+                        crate::MAX_SHUTDOWN_TIMEOUT
                     );
                 }
                 Ok(dur)
@@ -8800,6 +8846,53 @@ mod tests {
         cli(&["--mtls-enabled", "--mtls-listener", "127.0.0.1:9443"])
             .validate()
             .expect("a distinct --mtls-listener with --mtls-enabled is fine");
+    }
+
+    #[test]
+    fn shutdown_timeout_defaults_when_unset() {
+        assert_eq!(
+            cli(&[])
+                .parse_shutdown_timeout()
+                .expect("an unset --shutdown-timeout defaults"),
+            crate::DEFAULT_SHUTDOWN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_rejects_zero() {
+        let err = cli(&["--shutdown-timeout", "0s"])
+            .parse_shutdown_timeout()
+            .expect_err("a zero --shutdown-timeout must be rejected");
+        assert!(
+            err.to_string().contains("must be a positive duration"),
+            "the zero rejection must name the reason, got: {err}"
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_accepts_the_maximum() {
+        let at_max = humantime::format_duration(crate::MAX_SHUTDOWN_TIMEOUT).to_string();
+        assert_eq!(
+            cli(&["--shutdown-timeout", &at_max])
+                .parse_shutdown_timeout()
+                .expect("the maximum --shutdown-timeout is accepted"),
+            crate::MAX_SHUTDOWN_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn shutdown_timeout_rejects_above_the_maximum() {
+        // Above the cap but well within what `humantime` parses, so the value
+        // reaches the cap check rather than being rejected as unparseable, and
+        // far below the `Duration`-overflow point the cap exists to head off.
+        let err = cli(&["--shutdown-timeout", "2h"])
+            .parse_shutdown_timeout()
+            .expect_err("a --shutdown-timeout above the cap must be rejected at startup");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds the maximum"),
+            "the cap rejection must name the maximum, got: {msg}"
+        );
     }
 
     #[test]
