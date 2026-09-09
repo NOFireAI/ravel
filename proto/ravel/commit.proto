@@ -1,0 +1,296 @@
+// Immutable commit records. Persistent contract: field numbers are frozen.
+syntax = "proto3";
+
+package ravel.commit.v1;
+
+enum Signal {
+  SIGNAL_UNSPECIFIED = 0;
+  SIGNAL_METRICS = 1;
+  SIGNAL_LOGS = 2;
+  SIGNAL_SPANS = 3;
+  SIGNAL_PROFILES = 4;
+  SIGNAL_ALERTS = 5;
+  SIGNAL_AUDIT = 6;
+}
+
+message CommitRecord {
+  uint32 format_version = 1;  // = 1
+  bytes tenant_hash = 2;      // 16 bytes
+  Signal signal = 3;
+  uint32 shard = 4;
+  string writer_id = 5;       // uuid
+  uint64 writer_epoch = 6;
+  uint64 writer_seq = 7;
+  string object_key = 8;
+  uint64 object_size = 9;
+  bytes content_hash = 10;    // blake3, 32 bytes
+  uint64 sample_count = 11;
+  uint64 series_count = 12;
+  sfixed64 min_event_ts_ns = 13;
+  sfixed64 max_event_ts_ns = 14;
+  sfixed64 min_ingest_ts_ns = 15;
+  sfixed64 max_ingest_ts_ns = 16;
+  uint32 segment_format_version = 17;
+  sfixed64 created_unix_ns = 18;
+  // Pinned at flush open (unix hours); names the commit key's hour bucket.
+  // Never recomputed on retry (ADR-0010).
+  uint32 ingest_hour_bucket = 19;
+  // Exact whole-object min/max and null count per stamp-eligible declared
+  // typed attribute column (ADR-0873 decision 1). Additive and permanently
+  // optional: an empty list means this object is uncovered for every declared
+  // column, which is a normal state forever (every record written before
+  // ADR-0873, every metrics/spans record, and any column declared after the
+  // flush opened), never an error and never a value to guess at.
+  // `format_version` stays 1: a reader that ignores this field loses the
+  // statistics shortcut and never gets a wrong answer (ADR-0873 decision 5,
+  // migration class C).
+  repeated DeclaredColumnMinMax declared_column_stats = 20;
+}
+
+// The min or max of one declared column's non-null values in one object
+// (ADR-0873 decision 1). Restricted to the stamp-eligible declared types
+// (decision 2: I64 and BOOL); a new eligible type adds a oneof arm,
+// additively. STR/BYTES extrema are unbounded user bytes on the hot resolve
+// path and F64 needs a decided comparator first, so neither is
+// representable here rather than merely rejected.
+message DeclaredColumnStatValue {
+  oneof kind {
+    sint64 i64 = 1;
+    bool b = 2;
+  }
+}
+
+// Exact whole-object min/max (and null count) for one declared typed
+// attribute column (ADR-0090), computed by the writer that encoded the
+// object. min/max are message-typed for presence: both absent means the
+// column had zero non-null values in this object, which is still an exact
+// statement. An entry is only ever written for a column that resolved to a
+// real FIELD_DIR column covering the whole object (the ADR-0850 attrs_raw
+// rule); a column that overflowed gets no entry, never an entry with a
+// guess.
+message DeclaredColumnMinMax {
+  string name = 1;
+  // ravel.sys.v1.TypedAttrColumnType's number as a uint32 (no cross-file
+  // proto import in this repo; same convention as SnapshotPartHeader.signal).
+  // Every defined number is non-negative, so no negative discriminant is
+  // representable here: an out-of-range value is a decode-time drop, never a
+  // sign question.
+  uint32 declared_type = 2;
+  DeclaredColumnStatValue min = 3;
+  DeclaredColumnStatValue max = 4;
+  // Rows in this object where the declared column reads NULL (name absent,
+  // or the stored variant mismatches declared_type). non_null = the
+  // record's row count minus this.
+  uint64 null_count = 5;
+}
+
+// One input segment identity folded into a CompactionRecord's input list
+// (ADR-0018 §Decision 4). Mirrors the identity fields a CommitRecord is
+// keyed by, sorted canonically by (writer_id, writer_epoch, writer_seq).
+message CompactionInputIdentity {
+  string writer_id = 1;    // uuid
+  uint64 writer_epoch = 2;
+  uint64 writer_seq = 3;
+}
+
+// One RSEG v3 output object of a compaction run.
+message CompactionPart {
+  uint32 part_index = 1;
+  bytes first_series_id = 2;   // 16 bytes, inclusive
+  bytes last_series_id = 3;    // 16 bytes, inclusive
+  bytes content_hash = 4;      // blake3, 32 bytes
+  uint64 object_size = 5;
+  uint64 sample_count = 6;
+  uint64 series_count = 7;
+  uint64 run_count = 8;
+  sfixed64 min_event_ts_ns = 9;
+  sfixed64 max_event_ts_ns = 10;
+  uint32 segment_format_version = 11;  // = 3
+  // Per-declared-column exact statistics for this part, recomputed over the
+  // rows this part actually holds and never copied from an input's stamp
+  // (ADR-0873 decision 3: a copied stamp could report an erased row's value
+  // as the extremum). Same permanently-optional semantics as
+  // CommitRecord.declared_column_stats. `RewriteRecord.parts` and
+  // `CompactionRecord.parts` both carry CompactionPart, so erasure-rewrite
+  // outputs get the field with no further wire change.
+  repeated DeclaredColumnMinMax declared_column_stats = 12;
+}
+
+// L0 to L1 compaction record (ADR-0018). Additive; lives in the same key
+// prefix as CommitRecord (docs/catalog-and-mvcc.md) so the existing one
+// LIST per bucket discovers both. Immutable once published.
+message CompactionRecord {
+  uint32 format_version = 1;   // = 1
+  bytes tenant_hash = 2;       // 16 bytes
+  Signal signal = 3;
+  uint32 shard = 4;
+  uint32 ingest_hour_bucket = 5;
+  uint32 level = 6;            // = 1
+  // Sorted canonically by (writer_id, writer_epoch, writer_seq).
+  repeated CompactionInputIdentity inputs = 7;
+  bytes input_set_hash = 8;    // blake3 over the sorted inputs, 32 bytes
+  repeated CompactionPart parts = 9;
+  sfixed64 created_unix_ns = 10;
+}
+
+// Age-based retention tombstone for one sealed ingest-hour bucket
+// (ADR-0019). Additive; written once, CreateIfAbsent, to a fixed key in
+// the same prefix as CommitRecord. Durable and irreversible: raising the
+// retention window later never resurrects a tombstoned bucket.
+message RetentionTombstone {
+  uint32 format_version = 1;         // = 1
+  bytes tenant_hash = 2;             // 16 bytes
+  Signal signal = 3;
+  uint32 shard = 4;
+  uint32 ingest_hour_bucket = 5;
+  sfixed64 retired_at_ns = 6;
+  uint64 retention_window_ns = 7;    // the R applied
+  uint64 record_count_observed = 8;
+}
+
+// --- Selective subject erasure (ADR-0064). All additive: new messages and a
+// new enum only; no existing message or field number is touched. Three
+// durable record types plus their helper messages. The `.dreq` request
+// necessarily names the subject and is therefore deletable after completion
+// (ADR-0064 decision 5); the `.done` completion record is permanent audit
+// evidence and, by construction, carries no subject identifier. ---
+
+// One exact-match label/attribute equality matcher in an ErasureRequest
+// predicate (ADR-0064 decision 1). A request's predicate is the conjunction
+// (logical AND) of all its matchers: a record matches only when, for every
+// matcher, the record's label/attribute named `key` equals `value` exactly.
+// v1 is equality-only (no regex): erasure is irreversible, so over-matching
+// is unrecoverable (ADR-0064 rejected alternatives).
+message ErasurePredicateMatcher {
+  string key = 1;
+  string value = 2;
+}
+
+// A durable, immutable selective-erasure request (ADR-0064 decision 1).
+// Additive; written once, CreateIfAbsent, to the object key
+// `t/<tenant_hash>/<signal>/del/<request_id>.dreq`. Immutable once acked.
+// It necessarily contains the subject identifier (the predicate values),
+// which is itself personal data, so it is NOT retained forever: a sweep rule
+// deletes it once its `.done` exists and the protection horizon has passed
+// (ADR-0064 decision 5). The permanent, PII-free audit record is
+// ErasureCompletion.
+message ErasureRequest {
+  uint32 format_version = 1;   // = 1
+  bytes tenant_hash = 2;       // 16 bytes
+  Signal signal = 3;
+  // UUID-shaped opaque request id (string, matching CommitRecord.writer_id's
+  // precedent). It names this request's `.dreq` and `.done` object keys.
+  string request_id = 4;
+  sfixed64 created_unix_ns = 5;   // injected clock; ack time starts every bound
+  // Conjunction (AND) of exact-match matchers. Never empty: an empty
+  // conjunction would match every record, so decoders reject it.
+  repeated ErasurePredicateMatcher predicate = 6;
+  // Optional event-time restriction, a half-open [window_start_ns,
+  // window_end_ns) interval. proto3 scalars have no presence, so both fields
+  // zero is the documented "no range restriction" sentinel (the whole
+  // retained history is in scope), matching this file's zero-as-unset
+  // convention for CommitRecord's timestamp fields.
+  sfixed64 window_start_ns = 7;
+  sfixed64 window_end_ns = 8;
+  // Optional free-text operator reason (may be empty).
+  string reason = 9;
+}
+
+// Why a request's physical erasure was deferred (ADR-0064 decision 6).
+// Deliberately a closed enum, not free text, so ErasureCompletion cannot
+// carry an operator-supplied string that might leak a subject identifier.
+enum ErasureDeferralCause {
+  ERASURE_DEFERRAL_CAUSE_UNSPECIFIED = 0;   // not deferred; completed cleanly
+  ERASURE_DEFERRAL_CAUSE_LEGAL_HOLD = 1;    // paused under an overlapping legal hold
+}
+
+// Per-bucket dropped-record accounting inside an ErasureCompletion. Names a
+// sealed bucket by (signal, shard, ingest_hour_bucket) under the completion's
+// implied tenant, and how many records the rewrite pass dropped from it for
+// this request. Carries no subject identifier.
+message ErasureBucketDrop {
+  Signal signal = 1;
+  uint32 shard = 2;
+  uint32 ingest_hour_bucket = 3;
+  uint64 dropped_count = 4;
+}
+
+// Permanent, immutable completion record for a selective-erasure request
+// (ADR-0064 decision 1 and 4). Additive; written once, CreateIfAbsent, to
+// `t/<tenant_hash>/<signal>/del/<request_id>.done`. Unlike the `.dreq`, this
+// record is permanent audit evidence and MUST NOT carry any plaintext subject
+// identifier. Its PII-exclusion is structural, not conventional: there is
+// deliberately no field here that can hold a predicate key or value. The
+// predicate is represented only by `predicate_hash` (a blake3 digest, not
+// reversible), the deferral cause is a closed enum, and the only string field
+// is the UUID-shaped `request_id`.
+message ErasureCompletion {
+  uint32 format_version = 1;   // = 1
+  bytes tenant_hash = 2;       // 16 bytes
+  Signal signal = 3;
+  string request_id = 4;       // UUID-shaped; names this `.done`'s own key
+  // blake3 over the canonical predicate encoding of the originating request
+  // (ADR-0064 decision 1). 32 bytes. NOT the plaintext predicate.
+  bytes predicate_hash = 5;
+  repeated ErasureBucketDrop bucket_drops = 6;
+  sfixed64 requested_unix_ns = 7;   // copied from the `.dreq`'s created_unix_ns
+  sfixed64 completed_unix_ns = 8;   // when the pass verified completion
+  ErasureDeferralCause deferral_cause = 9;
+}
+
+// One (request_id, dropped_count) pair inside a RewriteRecord: how many
+// records the rewrite dropped for one applied erasure request. A nested pair,
+// not two parallel arrays, so a request id can never fall out of step with
+// its count.
+message RewriteDrop {
+  string request_id = 1;    // UUID-shaped; a `.dreq` this rewrite applied
+  uint64 dropped_count = 2;
+}
+
+// L0/L1 to L1 selective-erasure rewrite record (ADR-0064 decision 3). The
+// rewrite pass reads a sealed bucket's live segments, drops records matching
+// one or more erasure predicates, and re-encodes the survivors into new parts
+// of the same frozen segment format. Additive; lives in the same `c/` prefix
+// as CommitRecord and CompactionRecord (key
+// `t/<tenant_hash>/<signal>/c/<shard>/<hour>/rw.<input_set_hash16>.cmt`) so the
+// existing single LIST per bucket discovers it. Immutable once published. It
+// excludes its inputs from new snapshots exactly as a CompactionRecord does,
+// but overlap is NOT harmless (the outputs deliberately lack records the
+// inputs contain), so the resolver keeps the query-time predicate filter
+// active until the `.dreq` is removed (ADR-0064 decision 3.5).
+message RewriteRecord {
+  uint32 format_version = 1;   // = 1
+  bytes tenant_hash = 2;       // 16 bytes
+  Signal signal = 3;
+  uint32 shard = 4;
+  uint32 ingest_hour_bucket = 5;
+  // The exact L0/L1 input set this rewrite supersedes, sorted canonically by
+  // (writer_id, writer_epoch, writer_seq) exactly as CompactionRecord.inputs.
+  // Set only when the bucket's live record set is raw L0/L1 objects; use
+  // `superseded_record_key` below instead when superseding a whole live
+  // CompactionRecord or RewriteRecord. Exactly one of the two is ever set.
+  repeated CompactionInputIdentity inputs = 6;
+  // blake3 over: a case discriminant byte, then exactly one of the sorted
+  // `inputs` above or `superseded_record_key` below (whichever is set), then
+  // the sorted set of erasure request ids this rewrite applied (drops[].
+  // request_id below). Binding the applied request set is what lets two
+  // erasure batches over the same otherwise-unchanged bucket produce two
+  // different keys, while an identical-batch retry still hashes the same and
+  // stays idempotent under CreateIfAbsent (ADR-0064 decision 3, amended; see
+  // ravel-commit::erasure::compute_rewrite_input_set_hash for the exact
+  // byte-level preimage).
+  bytes input_set_hash = 7;    // 32 bytes
+  repeated CompactionPart parts = 8;   // surviving-record output parts (may be empty)
+  // Which erasure requests this rewrite applied, each with the count it
+  // dropped for that request (0 is valid: a request whose predicate matched
+  // nothing in this bucket is still recorded as applied).
+  repeated RewriteDrop drops = 9;
+  sfixed64 created_unix_ns = 10;
+  // The key of the live CompactionRecord or RewriteRecord this rewrite
+  // supersedes as a whole, when the bucket's live record set is already a
+  // compaction or rewrite output rather than raw L0 objects (e.g. a second
+  // erasure pass over a bucket already rewritten once). Exactly one of
+  // `inputs` (non-empty) or `superseded_record_key` (non-empty) is set;
+  // never both, never neither.
+  string superseded_record_key = 11;
+}

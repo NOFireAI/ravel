@@ -1,0 +1,20 @@
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ravel
+      MINIO_ROOT_PASSWORD: ravel-dev-secret
+    volumes:
+      - ../../minio-data:/data
+  createbucket:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      sleep 2 &&
+      mc alias set local http://minio:9000 ravel ravel-dev-secret &&
+      mc mb -p local/ravel-dev || true"

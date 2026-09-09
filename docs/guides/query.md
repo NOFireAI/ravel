@@ -1,0 +1,749 @@
+# Query
+
+![query path](../diagrams/query-path.svg)
+
+Eleven routes are registered under `/api/v1` on `--listen-http`. All but two
+require the same tenant authentication as ingest (`Authorization: Bearer
+<token>`, or the dev header if `--dev-insecure-tenant-header` is set):
+`/api/v1/status/buildinfo` takes no credential, and `/api/v1/metadata` answers
+an empty object to a request it cannot resolve. The Prometheus-shaped
+endpoints below return the Prometheus-compatible JSON envelope; `POST
+/api/v1/sql` and `POST /api/v1/analytics` return a described-schema JSON
+envelope instead, documented with each. This guide covers the query-facing
+routes; the maintenance route `POST /api/v1/admin/fold` is triggered by
+operators, not queried, and the exemplar and analytics routes have their own
+guides linked below.
+
+```json
+{"status": "success", "data": {...}}
+{"status": "error", "errorType": "bad_data", "error": "..."}
+```
+
+## Endpoints
+
+### `GET/POST /api/v1/query`
+
+Instant query. Params: `query` (required), `time` (optional, Prometheus
+timestamp format, defaults to now), `min_commit_token` (repeatable),
+`timeout` (optional).
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/query \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode 'query=demo_requests_total{job="checkout"}' \
+  --data-urlencode 'time=1732400000'
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {"metric": {"__name__": "demo_requests_total", "job": "checkout"}, "value": [1732400000, "42"]}
+    ]
+  }
+}
+```
+
+### `GET/POST /api/v1/query_range`
+
+Range query. Params: `query`, `start`, `end`, `step` (all required),
+`min_commit_token` (repeatable), `timeout` (optional).
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/query_range \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode 'query=demo_requests_total' \
+  --data-urlencode 'start=1732400000' \
+  --data-urlencode 'end=1732400300' \
+  --data-urlencode 'step=30s'
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "matrix",
+    "result": [
+      {"metric": {"__name__": "demo_requests_total"}, "values": [[1732400000, "40"], [1732400030, "41"]]}
+    ]
+  }
+}
+```
+
+### `GET /api/v1/labels`
+
+Label names across matched series. Params: `match[]` (optional, repeatable;
+omit it to match every series in the window), `start`, `end`,
+`min_commit_token` (repeatable).
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/labels \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode 'match[]=demo_requests_total'
+```
+
+```json
+{"status": "success", "data": ["__name__", "instance", "job"]}
+```
+
+### `GET /api/v1/label/{name}/values`
+
+Values seen for one label name, same params as `/labels`.
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/label/job/values \
+  -H "Authorization: Bearer devtoken"
+```
+
+```json
+{"status": "success", "data": ["checkout", "payments"]}
+```
+
+### `GET/POST /api/v1/series`
+
+Series (as label sets, no values) matching one or more selectors. Params:
+`match[]` (required, repeatable, at least one), `start`, `end`,
+`min_commit_token` (repeatable).
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/series \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode 'match[]=demo_requests_total{job="checkout"}'
+```
+
+```json
+{"status": "success", "data": [{"__name__": "demo_requests_total", "job": "checkout"}]}
+```
+
+If you omit `match[]` on `/series`, you get a `400 bad_data` error
+(`missing required parameter "match[]"`). `/labels` and `/label/{name}/values`
+allow it and match every series in the window instead.
+
+`/labels`, `/label/{name}/values`, and `/series` default their window to the
+hour before now (`start`/`end` unset). If you give more than one `match[]`
+selector, each one resolves its own catalog snapshot independently, and Ravel
+unions the results by series identity. The selectors do not share one snapshot
+for the request.
+
+### `GET /api/v1/status/buildinfo` and `GET /api/v1/metadata`
+
+Two routes Grafana's built-in Prometheus datasource probes on every datasource
+save. They take no parameters.
+
+```json
+{"status": "success", "data": {"version": "0.15.0", "revision": "", "branch": "", "buildUser": "", "buildDate": "", "goVersion": ""}}
+```
+
+`version` is Ravel's own version, not a Prometheus one. `revision` is the
+build's git SHA when the build exported `RAVEL_GIT_SHA`, empty otherwise.
+
+`/api/v1/metadata` returns real per-metric type, help, and unit for any metric
+whose ingest carried them, in Prometheus' documented shape (`data` maps
+each family name to a length-1 array of `{type, help, unit}`). It resolves the
+requesting tenant from the same bearer credential the other query routes use and
+serves that tenant's metadata from a per-process, per-tenant cache (one object
+read per tenant per refresh horizon, never a read per request). The optional
+`metric` and `limit` query parameters filter to one family and cap the number of
+names, matching Prometheus. Metadata is best-effort: a metric ingested over a
+path that sent no type, help, or unit has no entry, and a request
+that carries no resolvable tenant still gets `{"status": "success", "data": {}}`
+(this endpoint never returns `401`). See
+[the ingest guide](ingest.md#metric-metadata-and-otlp-name-suffixing) for the
+OTLP name suffixing that decides the family names.
+
+### `GET/POST /api/v1/query_exemplars`
+
+Prometheus exemplar lookup: the trace references a metric sample carried, for a
+metric selector over a `start`/`end` window. It takes the Prometheus `query`,
+`start`, and `end` parameters and returns the Prometheus exemplar shape. Ravel
+stores exemplars only from OTLP ingest. The full walkthrough, including the
+Grafana metric-to-trace link, is in [correlation.md](correlation.md).
+
+### `POST /api/v1/analytics`
+
+A JSON-body endpoint that runs a range evaluation and applies one analytic to
+each series of the result. It accepts exactly two operations: change point
+detection and summary statistics. It shares the query listener and needs no
+cargo feature. The request and response schema, the operations, and the status
+table are in [analytics.md](../analytics.md#endpoint).
+
+## PromQL support
+
+Ravel's PromQL evaluator is differentially tested against real Prometheus.
+Function calls, aggregations, binary operators, subqueries, unary and paren
+expressions, the `@` modifier, and vector matching are all supported. The
+generated conformance table in
+[docs/query-engine.md](../query-engine.md#promql-conformance-adr-0035) is
+authoritative: it classifies every construct as supported, intentionally
+rejected, or an accepted divergence, and its counts are regenerated from the
+differential test rather than written by hand.
+
+A handful of constructs are intentionally rejected. Each answers with a
+typed `422 unprocessable_entity` error naming the construct, never a panic and
+never silently wrong data. The current set is:
+
+| Rejected | Error names it as |
+|---|---|
+| `histogram_stddev(x)` over native histograms | `histogram_stddev` |
+| `histogram_stdvar(x)` over native histograms | `histogram_stdvar` |
+| `x{job="a" or job="b"}`, an or-grouped matcher | `label matcher or-group` |
+| `a + fill(0) b`, vector-matching fill values | `fill-in values` |
+| `avg_over_time(x[5m:1m])` over native histograms, a subquery over native histograms | `subquery over native histograms` |
+
+The experimental aggregation operators `limitk` and `limit_ratio` parse but are
+also rejected with a typed error naming the operator: they are outside the
+stable language and out of the scored surface, and not implemented (see
+[the query engine spec](../query-engine.md)). Subqueries themselves are
+supported; only a subquery
+whose inner expression matches native-histogram data is refused.
+
+Selector details that hold for a bare vector selector:
+
+- All four matcher operators: `=`, `!=`, `=~`, `!~`.
+- Absent-label semantics match Prometheus: an absent label reads as an
+  empty string for every operator. `{foo=""}` matches series without
+  `foo`. `{foo=~".*"}` matches everything, including series without `foo`.
+  `{foo!=""}` matches only series where `foo` is present and non-empty.
+  `{foo=~""}` matches only series where `foo` is absent (the regex is
+  anchored, so this is `^(?:)$`, which only an empty string satisfies).
+  Regex matchers are always fully anchored (`^(?:pattern)$`), the same as
+  Prometheus, so `job=~"api"` does not match `job="api-server"`.
+- `offset`, both the standard positive form (look backward) and the
+  negative form (look forward, experimental in upstream PromQL too).
+- A fixed 5-minute lookback: at evaluation instant `T` (shifted by
+  `offset` if present), a series' value is its most recent sample with a
+  timestamp in `(T - 5m, T]`. The window's start is exclusive. A sample
+  exactly 5 minutes old is not used. A series with no sample in that window
+  is omitted from the result entirely, not reported as absent or zero.
+
+## PromQL over logs
+
+The `logs` signal is also reachable through the PromQL HTTP API, via two
+reserved metric names (see Background below):
+
+- `ravel_log_lines` -- one sample per log line, value `1`. `count_over_time`
+  counts lines.
+- `ravel_log_bytes` -- one sample per log line, value the line's `body`
+  length in bytes. `sum_over_time` sums bytes.
+
+No new endpoint and no new query language. `/api/v1/query`,
+`/api/v1/query_range` and `/api/v1/metadata` serve these two names exactly
+as they serve any other metric name, and the discovery endpoints treat a
+log selector in `match[]` exactly as they treat a metrics one:
+`/api/v1/series` returns its matching label sets, `/api/v1/labels` returns
+the label names those sets carry, and `/api/v1/label/{name}/values` returns
+that label's values, which for `__name__` includes the two reserved names.
+
+### Routing: a selector is a log selector only on exact `__name__` equality
+
+A vector selector is answered from the logs signal only when its `__name__`
+matcher is an exact `=` equality on `ravel_log_lines` or `ravel_log_bytes`
+(`ravel_log_lines{job="api"}`, never `{__name__=~"ravel_log_.*"}` and never
+`!=`). Every other selector, including one that merely resembles a reserved
+name, resolves against the metrics signal as it always has.
+
+### Label mapping
+
+A log record becomes one sample whose label set is built in this precedence
+order, first writer wins on a key collision:
+
+1. `__name__` -- `ravel_log_lines` or `ravel_log_bytes`, from the selector.
+2. `job` and `instance` -- the same derivation ingest already uses for
+   metrics (see [the ingest guide](ingest.md)).
+3. `otel_scope_name` and `otel_scope_version` when non-empty, and
+   `otel_scope_<attr>` for each scope attribute.
+4. Every remaining resource attribute, sanitized to a label name. Unlike
+   metrics ingest, there is **no allowlist**: every resource attribute the
+   record's stream carries becomes a label, not just a fixed set.
+5. `severity_text` when non-empty -- the one per-record (not per-stream)
+   field promoted to a label.
+
+Only scalar attributes become labels. A string is used as it stands, and an
+integer, double or boolean is rendered the way the SQL `attrs` map renders
+it; a byte string, list or map is skipped, since none has a faithful single
+label value. An attribute whose value is empty is skipped as well, so an
+empty attribute never differs from an absent one.
+
+Sanitizing a name for use as a label rewrites the first character to
+`[A-Za-z_]` and every later character to `[A-Za-z0-9_]` in place (so
+`k8s.pod.name` becomes `k8s_pod_name`), the same rule
+`ravel_otlp::normalize::sanitize_label_name` already applies to metrics.
+The `__`-prefixed namespace is reserved: an attribute whose sanitized name
+lands there is dropped rather than becoming a label. The only `__` label on a
+log-derived series is the `__name__` the mapping itself sets to the reserved
+metric name.
+
+A **stream** is a resource-and-scope attribute set; it is not the same thing
+as a query-time series. Two streams whose resource, scope, and per-record
+`severity_text` map to the identical label set merge into one series: their
+samples interleave and none are dropped. Conversely, one stream's records
+with different `severity_text` values (say, `ERROR` and `INFO` from the same
+pod) split into distinct series, since `severity_text` is part of the label
+set.
+
+Two records at the exact same timestamp in the same series are never
+deduplicated or merged; both remain distinct samples, ordered by ascending
+`value.to_bits()` (so `ravel_log_lines`, always `1`, has no defined order
+between same-timestamp lines beyond that bit-pattern tie-break).
+
+### `__body__`: a matcher-only pseudo-label
+
+`__body__` matches a log record's body, either by whole-body equality
+(`__body__="exact text"`) or a fully-anchored regex
+(`__body__=~".*timeout.*"`). It is a matcher, not a label: it never appears
+in a returned label set, and it plays no part in series identity or the
+merge/split rules above. Multiple `__body__` matchers in one selector AND
+together.
+
+### `rate()` is not redefined for log series
+
+There is no log-specific meaning for `rate()`. The PromQL spelling of "lines
+per second" over a log selector is division by the window's seconds, exactly
+as it would be for any counter-shaped `count_over_time`:
+
+```promql
+count_over_time(ravel_log_lines{job="api"}[5m]) / 300
+```
+
+### Budgets, `series`/`labels`/`label-values`, and `metadata`
+
+A log selector draws on the same [query budgets](#query-budgets) as a
+metrics selector, in the same query: `max_samples`, `max_series`,
+`max_segments`, `max_bytes_scanned`, and `max_s3_requests` are shared totals
+across every selector a query contains, metrics and log alike. Exceeding any
+of them is the same typed `422` a metrics-only query gets.
+
+`/api/v1/series` with a log selector in `match[]` resolves that selector's
+matching log streams into label sets, same as for metrics. `/api/v1/labels`
+and `/api/v1/label/{name}/values` behave the same way when a log selector is
+present in `match[]`.
+
+`/api/v1/label/__name__/values` includes both `ravel_log_lines` and
+`ravel_log_bytes` when the request carries no `match[]`, and when at least
+one `match[]` selector is a log selector; a request whose selectors name only
+metrics gets metrics names only. The names are listed even on a tenant that
+has never ingested a log, since they exist independently of the data. A
+`match[]` naming one reserved name currently returns both of them.
+`/api/v1/metadata` always includes both reserved names too, each with a
+fixed `type`, `help`, and `unit`, subject to the same `metric` and `limit`
+filters a metrics request uses; neither entry depends on any log data having
+been ingested.
+
+### Local evaluation only in this release
+
+A log selector is answered by the query coordinator directly against
+object storage; it does not fan out over `--distributed-query` federation
+the way a metrics selector does (see Background below). A federated deployment
+still answers a log selector, just from the coordinator's own local view, not
+a cluster-wide merge; wiring log selectors into federation is unscheduled
+follow-up work.
+
+### Examples
+
+Error lines per job over the last 5 minutes:
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/query \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode 'query=sum by (job) (count_over_time(ravel_log_lines{severity_text="ERROR"}[5m]))'
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {"metric": {"job": "api"}, "value": [1732400000, "128"]}
+    ]
+  }
+}
+```
+
+Log volume in bytes for lines whose body mentions a timeout:
+
+```sh
+curl -G http://127.0.0.1:4318/api/v1/query \
+  -H "Authorization: Bearer devtoken" \
+  --data-urlencode 'query=sum(sum_over_time(ravel_log_bytes{job="api", __body__=~".*timeout.*"}[1h]))'
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {"metric": {}, "value": [1732400000, "5312"]}
+    ]
+  }
+}
+```
+
+## `min_commit_token`
+
+Pass a commit token from an ingest response's `x-ravel-commit-token`
+header as `min_commit_token` to guarantee that the query sees that write. It
+is repeatable if you have more than one, for example from a request that
+flushed to multiple shards. The catalog resolves each token to its exact commit
+record directly, rather than depend on a listing that might race the write. If
+the catalog cannot resolve a token, the query fails outright
+(`503 unavailable`). It does not silently return a snapshot older than what you
+asked for. See [docs/guides/ingest.md](ingest.md#commit-tokens-and-read-your-write).
+
+## Query budgets
+
+Every query is bounded, and every bound is a typed error, never a silent
+truncation:
+
+| Budget | Default | Error when exceeded |
+|---|---|---|
+| Segments touched | fixed: 1,000,000 (`--max-segments`) | `query matched {count} segments, exceeding the limit of {max}` |
+| Distinct series | 10,000 | `query matched {count} series, exceeding the limit of {max}` |
+| Samples materialized | 10,000,000 | `query matched {count} samples, exceeding the limit of {max}` |
+| Concurrent segment fetches | derived: `max(8, 2 x cores)` (`--promql-fetch-fanout`, or `--store-get-concurrency` for the shared object-store GET ceiling) | (not user-visible; throughput knob only) |
+| Wall-clock deadline | fixed: 11m (`--gc-max-query-duration`) | `query exceeded its deadline of {deadline}` |
+| Catalog list requests | 100,000 | `query window too wide: it would issue an estimated {estimate} catalog list requests, over the limit of {limit}; narrow the query time range and retry` |
+| Bytes scanned | unlimited (opt in via `query_defaults.max_bytes_scanned`) | `query scanned {scanned} bytes, exceeding the budget of {max}` |
+| Object-store requests | derived from the deployment's shard count and flush cadence | `query issued {requests} S3 requests, exceeding the budget of {max}` |
+
+`timeout` (Prometheus duration syntax like `30s`/`5m`, or bare float
+seconds) lowers the deadline per request. It cannot raise it above the
+server's configured default.
+
+SQL queries carry one more bound, a per-query byte ceiling on the DataFusion
+memory pool (by default 25% of the host's memory, ~8 GiB on a 30 GB host; see
+[Operator-configurable budgets](#operator-configurable-budgets-server-flags)).
+It bounds the memory the query *holds at one instant* -- what a scan currently has decoded, plus the batch it is handing
+downstream, plus whatever aggregate state the operators above it accumulate --
+not the number of bytes the query has produced over its lifetime. A full-table
+scan over `logs` therefore does not exhaust it merely by being large: the logs
+scan streams one block at a time and releases each block before decoding the
+next, so its own contribution tracks block size and partition count.
+An `ORDER BY` or a high-cardinality `GROUP BY` over a large result is what
+genuinely accumulates. Exceeding the ceiling is an HTTP 422 `execution` error
+naming the pool, never a truncated result.
+
+### Operator-configurable budgets (server flags)
+
+Six of these budgets are process-wide server flags. Unset, each resolves at
+startup, but only some resolve **from host resources**: `--store-get-concurrency`,
+`--sql-partition-count`, and `--promql-fetch-fanout` (or the legacy
+`--fetch-concurrency`, which sets all three) follow the core count, and the two
+SQL ceilings follow memory (shares of `MemTotal`, capped by the cgroup memory
+limit in a container), while `--max-segments` is a fixed 1,000,000 on every
+host. Set, a nonzero flag value is used verbatim (`0` in any of the four
+concurrency flags is a startup error, see below), except that the per-query
+SQL pool is clamped to an explicit per-tenant ceiling set below it (see the
+clamp rule below). All are process-wide, not per-tenant. The "reference host" column is
+what a 16-core, 30 GB host resolves to, the settings the published ClickBench
+run used.
+
+| Flag | Reaches | Default (unset) | Reference host |
+|---|---|---|---|
+| `--fetch-concurrency <N>` | legacy: sets all three rows below together (source `legacy-flag`) | derived: `max(8, 2 x cores)` | 32 |
+| `--store-get-concurrency <N>` | `EngineConfig::store_get_concurrency`, the process-wide `GetLimiter` permit count | derived: `max(8, 2 x cores)` | 32 |
+| `--sql-partition-count <N>` | `EngineConfig::sql_partition_count`, DataFusion `target_partitions` | derived: `max(8, 2 x cores)` | 32 |
+| `--promql-fetch-fanout <N>` | `EngineConfig::promql_fetch_fanout`, per-selector fetch stream fan-out | derived: `max(8, 2 x cores)` | 32 |
+| `--max-segments <N>` | `EngineConfig::max_segments` | fixed: 1,000,000 (host-independent) | 1,000,000 |
+| `--sql-max-query-bytes <BYTES>` | `SqlConfig::max_query_bytes` (per-query SQL memory pool) | derived: 25% of MemTotal (256 MiB if unknown) | 8,053,063,680 |
+| `--sql-tenant-max-bytes <BYTES>` | per-tenant SQL memory ceiling | derived: 50% of MemTotal (1 GiB if unknown) | 16,106,127,360 |
+
+Combining `--fetch-concurrency` with any of `--store-get-concurrency`,
+`--sql-partition-count`, or `--promql-fetch-fanout` is a startup error naming
+both flags. A value of `0` in any of these four flags is a startup error
+naming that flag, raised during configuration resolution before any fetcher,
+engine, or SQL session exists.
+
+The per-query SQL pool never exceeds the per-tenant ceiling. Which side moves
+depends on what the operator set. An explicit `--sql-tenant-max-bytes` below
+the per-query pool lowers the pool to it, and a ceiling the operator set is
+never raised. An explicit `--sql-max-query-bytes` above a derived or fallback
+tenant ceiling raises that ceiling to match it, because no operator set it and
+the flag would otherwise be silently inert. When neither is explicit the
+derived values already satisfy the order. Both adjustments are logged at
+startup (`clamped` and `raised` on the resolved lines, plus a WARN).
+
+Every resolved value is logged at startup, one line per setting with its source
+(`derived`, `flag`, `fallback`, or `legacy-flag`):
+
+```
+INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO performance default resolved setting="store_get_concurrency" value=32 source="derived"
+INFO performance default resolved setting="sql_partition_count" value=32 source="derived"
+INFO performance default resolved setting="promql_fetch_fanout" value=32 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=25769803776 source="derived"
+```
+
+`--logs-fetch-policy latency-first` resolves these three concurrency knobs the
+same way every other policy does; it pays off only once an operator raises
+them explicitly, and it carries a memory caveat -- see the fetch-policy table
+in [Operations: configuration](operations/configuration.md#logs-fetch-policy-and-store-cost-profile) before
+turning it on.
+
+`--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout`
+replace the old single `--fetch-concurrency` knob's three coupled effects with
+three independent ones: the process-wide object-store GET ceiling (one shared
+`Arc<GetLimiter>`, built once and handed to every fetcher- and
+engine-construction site in the process), the SQL scan partition count
+(`target_partitions`), and the PromQL/analytics per-query segment fetch
+fan-out. `--fetch-concurrency` still sets all three together for a config that
+predates the split (source `legacy-flag` in the startup log); combining it
+with any of the three is a startup error naming both flags.
+
+`--max-segments` caps how many segments a single query fans out over. Only the
+narrow recent set (`SegmentOrigin::Recent`, roughly the last couple of hours) is
+exempt; everything older, including compacted L0/L1 objects, counts toward the
+cap. A wide scan over a tenant with many sealed objects hits it directly, so
+raise this flag for such a workload.
+
+`--sql-max-query-bytes` bounds a single SQL query's DataFusion memory pool;
+`--sql-tenant-max-bytes` bounds the memory one tenant may hold across its
+concurrent SQL queries (the multi-tenant isolation ceiling, twice the per-query
+pool at the derived defaults). Both apply only in a build with the `sql`
+feature.
+Per-tenant SQL budgets are **not** configurable in the `--limits-file`: its
+per-tenant query overrides are not consulted at query time and are inert, so
+these ceilings are process-wide flags.
+
+`max_bytes_scanned` is **not** a flag. It stays a `--limits-file` entry
+(`query_defaults.max_bytes_scanned`, default Unlimited); see
+[admission-limits.md](admission-limits.md). `--max-s3-requests`
+is a flag; omitted, it is derived from `--shards` and the flush cadence.
+
+`--gc-max-query-duration` sets the engine's enforced wall-clock deadline.
+Unset, it is a fixed **11 minutes** on every host, the deadline the published
+ClickBench run was configured with. It must be **`<=`** the tenant's durable
+`sys/gc.max_query_duration` (default 1h), which the derived value satisfies.
+A value above it is **rejected at startup** (a hard error), not clamped: raise
+`sys/gc.max_query_duration` first (`ravel-cli gc-config set`) if you need a
+longer engine deadline.
+
+The catalog-list budget is checked before any object-store request is made,
+not after. The catalog lists one prefix per (shard, ingest hour) from the
+window's start to the current hour, so a query whose `start` reaches far back
+(a `start` of `0`, epoch, is the usual cause) can ask for hundreds of
+thousands of LIST requests against object storage in a single call. Such a
+query is refused up front, before it can run up an object-store bill or
+saturate the listing path; the error reports both the estimate and the limit,
+so narrow the time range by the reported factor and retry. The ceiling
+permits roughly an 11-year window at one shard and about 8.5 months at
+sixteen; it scales down as shard count rises. Note the
+limit is on the query's *start*: a narrow `start`/`end` pair costs little
+however recent it is, so the fix is always to move `start` forward, never to
+change `end`.
+
+<a id="sql-over-samples-logs-and-spans"></a>
+
+## SQL over `samples`, `logs`, `spans`, `alerts`, and `audit`
+
+`POST /api/v1/sql` serves five tables from one endpoint:
+`samples` (metrics), `logs`, `spans` (traces), `alerts` (alert state
+transitions), and `audit` (audit records). The server parses the query's `FROM`
+clause before it plans, and registers only that one table for the query. A
+single query may reference exactly one of the five; naming two or more of
+them crosses signals and is rejected with an HTTP 400, before any catalog
+listing. The request body, auth, window
+(`start`/`end`), and `min_commit_token` handling are identical to the `samples`
+case.
+
+The `logs` table columns are `ts`, `observed_ts` (both `Timestamp(ns)`),
+`severity_num`, `severity_text`, `body`, `trace_id`, `span_id`, `flags`, and an
+`attrs` `Map(Utf8, Utf8)` that merges each record's resource, scope, and
+per-record attributes (see docs/query-engine.md for the full schema and
+semantics).
+
+The `alerts` table columns are `ts_ns` (`Timestamp(ns)`, the transition's event
+time), `alert_id`, `rule_id`, `state` (all `Utf8`), `generation` (`Int64`),
+`writer_id` (`Utf8`), `writer_epoch` and `writer_seq` (both `UInt64`), and an
+`attrs` `Map(Utf8, Utf8)` carrying the rule's `label.<k>` and `annotation.<k>`
+entries alongside the promoted keys. `state` takes four values: `pending`,
+`firing`, `resolved`, and `suppressed`.
+The table is raw history, one row per state transition, never a folded
+"current state" row. Current state is a query over that history: the row that
+sorts first per `alert_id` under `ts_ns DESC, writer_epoch DESC, writer_seq
+DESC, writer_id DESC`. The three write-identity columns are what make that a
+total order, because two evaluators can overlap briefly at a lease handover and
+write the same `alert_id` at the same `ts_ns`:
+
+```sql
+SELECT alert_id, state FROM
+  (SELECT *, ROW_NUMBER() OVER (PARTITION BY alert_id
+   ORDER BY ts_ns DESC, writer_epoch DESC, writer_seq DESC, writer_id DESC) AS rn
+   FROM alerts) WHERE rn = 1 ORDER BY alert_id
+```
+
+See the [alerting guide](alerting.md) for what writes those transitions.
+
+The `audit` table columns are `ts_ns` (`Timestamp(ns)`), `severity_text`,
+`body` (both `Utf8`), and an `attrs` `Map(Utf8, Utf8)`. It is deliberately
+generic: `attrs['kind']` selects the record kind (`query` for the query-audit
+trail, `legal_hold`, `reshard`), and each kind's own fields ride the same map.
+Resolution is per tenant hash, so a tenant reads only its own records, never
+another tenant's.
+
+Legal-hold and reshard records are written by the maintenance process itself,
+so they are present on any deployment that has taken those actions.
+Query-audit records are not: every query surface submits one per executed
+statement through a sink that no shipped startup path replaces with the real
+pipeline, so on a stock build `attrs['kind'] = 'query'` selects nothing. The
+handler behavior and the record shape are already in place; only the install
+is missing. Once a deployment attaches the pipeline, a query over `audit` is
+itself audited and appears in the trail a later query reads.
+
+Beyond those fixed columns, an operator can declare per-tenant *typed
+attribute columns*: an attribute key promoted to a native `Int64`, `Boolean`,
+`Dictionary(Int32, Utf8)` (for a `str` column), or `Binary` column named
+exactly after the key, so a typed comparison or aggregate over it needs no
+`CAST` over the stringified map. A declared `str` column is dictionary-encoded,
+and stays a dictionary over the Flight SQL wire (it is not hydrated back to
+plain `Utf8`). Over HTTP JSON the row *values* are unchanged (a string per row,
+`null` for an absent or type-mismatched cell), but the response envelope's
+declared `columns[].type` reports `Dictionary(Int32, Utf8)` instead of `Utf8`;
+over Arrow IPC the schema and every batch column carry the dictionary type
+verbatim. Both are client-visible changes from the pre-declaration plain `Utf8`
+column. Declared keys still appear in `attrs`. A declaration comes from the server's
+`--typed-attr-column` flags or from the durable per-tenant override written by
+`ravel-cli typed-attr-column set`, and a query process picks a durable change
+up within 60s. Querying a column that is not a typed attribute column is an
+unknown-column error, and a
+row whose stored value has another type reads NULL rather than being cast.
+
+A predicate on a typed attribute column prunes blocks before decode, so it is
+no slower than the equivalent `attrs['k']` filter. A selective
+`i64`/`bool` comparison, `BETWEEN`, or `i64` `IN (...)` skips blocks through the
+RLOG skip index (`status_code > 500`, `is_active = true`, `status_code IN (200,
+404)`), and a `str`/`bytes` equality prunes through POSTINGS exactly like
+`attrs['k'] = 'v'`. Pruning is always widen-only: the original predicate is
+re-applied above the scan, so the `IN` envelope's coarser range and any
+type-mismatched shape (`!=`, a range on a `str` column, a float compared to an
+`i64` column) never change which rows return, only which blocks the fetch reads.
+Two caveats: the `str`/`bytes` equality half sees no pruning benefit on an
+object whose POSTINGS section predates the current writer, and a name that
+also carries a non-`str` column anywhere declines equality pruning for that
+name. See
+[typed attribute columns](operations/configuration.md#typed-attribute-columns)
+and [the query engine spec](../query-engine.md) for the full contract.
+
+### Declaring typed attribute columns
+
+Loading a dataset and declaring its typed columns are **two separate steps**,
+in order:
+
+1. **Load** the data with `ravel-cli load --parquet ...` (see
+   [ingest.md](ingest.md#bulk-import-ravel-cli-load---parquet)). The
+   loader writes data objects only; it never touches tenant config.
+2. **Declare** the typed columns with `ravel-cli typed-attr-column set`. This is
+   a control-plane write, kept out of the loader on purpose (a durable
+   CAS whole-list replace does not belong in an append-only data-plane command,
+   where it could clobber a hand-declared typed attribute column). You can pass the columns
+   explicitly as `KEY:TYPE` specs, or derive them from the same `--mapping` the
+   load used:
+
+   ```sh
+   ravel-cli typed-attr-column set acme --from-mapping map.toml
+   ```
+
+   `--from-mapping` turns every `[[attribute]]` and `[[resource_attribute]]`
+   entry into a typed attribute column of the same-named type (`str`/`i64`/`bool`/
+   `bytes`). A resource (stream-level) key is legitimately declarable because a
+   typed attribute column reads the merged resource+scope+record attribute view. An
+   `f64`-typed entry is **skipped with a per-key warning** (there is no `f64`
+   typed attribute column type); the rest are still written. A key declared twice,
+   or a key colliding with a fixed logs column name, is rejected and nothing is
+   written.
+
+**A freshly written declaration is not instantly visible to queries.** A
+query-serving process resolves the durable declaration behind a **staleness
+horizon** (60s by default), so a `set` lands durably at once but a query may
+keep using the previous declaration until the server refreshes within that
+horizon. No restart is needed; wait out the horizon before asserting a fresh
+declaration reads as a typed attribute column. An attribute that overflowed the load's
+dynamic-column budget (see [ingest.md](ingest.md#the-dynamic-column-budget-and-its-warnings))
+stays queryable through `attrs['<key>']` regardless of whether it is declared.
+
+A `ts` range scan. `ts` is a timestamp, so the bounds are `TIMESTAMP` literals,
+not bare integers:
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "query": "SELECT ts, severity_text, body FROM logs WHERE ts >= TIMESTAMP '\''2026-07-30 00:00:00'\'' ORDER BY ts LIMIT 100",
+        "start": 1785369600.0,
+        "end": 1785373200.0
+      }'
+```
+
+A word or phrase content search with `has_word(body, 'literal')`. It pushes
+down to the RLOG bloom-accelerated scan and matches whole tokens (so `timeout`
+matches `connection timeout` but not `timed out`):
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT ts, body FROM logs WHERE has_word(body, '\''timeout'\'') ORDER BY ts"}'
+```
+
+A filter by an attribute value, with the `attrs['k']` subscript:
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT ts, body FROM logs WHERE attrs['\''service.name'\''] = '\''api'\'' ORDER BY ts"}'
+```
+
+The `attrs` column merges three sources of attributes into one map. The
+sources are the resource, the scope, and the log record. If more than one
+source sets the same key, the value from the record wins.
+
+A key that no record carries returns zero rows. It is not an error.
+
+Attribute equality does not change which objects Ravel reads: the `ts` range
+selects them. Inside an object, an equality on an indexed field or a typed
+attribute column prunes blocks through the POSTINGS index before decode, and
+`has_word` prunes through the token bloom filter; any other attribute
+predicate is applied to the decoded records.
+
+Log rows are at-least-once, and a `SELECT` (or `COUNT(*)`) reflects that. A
+client retry after a lost ack re-ingests the batch, and unlike metrics there
+is no query-time dedup for logs, so the retried rows are returned as extra
+rows. A `COUNT` over logs is therefore a lower-bounded count, not an exact
+one, for any window a retry may have touched. The `x-ravel-idempotency-key`
+suppresses this for keyed sequential retries; unkeyed ingest gets plain
+at-least-once. See
+[consistency-model.md](../consistency-model.md#duplicates-and-idempotency)
+for the full contract. The same applies to spans, which are queryable through
+the `spans` table on the same endpoint: span rows are at-least-once with no
+query-time dedup either, so a `COUNT` over `spans` is a lower-bounded count on
+the same terms.
+
+## Alerting on these queries
+
+Alert rules run these same PromQL and SQL queries on a schedule and notify a
+sink when a threshold trips or a detection query returns rows. The rules file,
+the modes that evaluate it, and the sinks are in the
+[alerting guide](alerting.md).
+
+## HTTP status codes
+
+| Status | `errorType` | When |
+|---|---|---|
+| 200 | n/a | Success. |
+| 400 | `bad_data` | Bad or missing parameter, PromQL parse error, invalid time range, step <= 0. |
+| 401 | `unauthorized` | Tenant authentication failed or was not provided. |
+| 422 | `execution` | An intentionally rejected PromQL construct (the set listed under PromQL support: `histogram_stddev`/`histogram_stdvar` over native histograms, an or-grouped label matcher, vector-matching fill values, a subquery over native histograms, or the experimental `limitk`/`limit_ratio` operators), or a query budget (segments/series/samples, bytes scanned, object-store requests, the catalog-list window ceiling, or the SQL memory pool) exceeded. |
+| 500 | `internal` | Permanent data corruption: a corrupt catalog record, segment, field, or key, or a non-monotonic sample sequence. The message is a fixed internal-error string; the storage-layer detail is redacted and logged server-side. |
+| 503 | `unavailable` | Transient catalog or segment fetch failure, an unresolvable `min_commit_token`, or a snapshot invalidated by concurrent GC/compaction. |
+| 504 | `timeout` | Query exceeded its deadline. |
+
+## Background
+
+PromQL over logs, the two reserved metric names, the label mapping, and the
+coordinator-local (non-federated) evaluation are
+[ADR-1103](../adrs/1103-promql-over-logs.md).
