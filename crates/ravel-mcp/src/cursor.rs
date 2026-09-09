@@ -4,22 +4,28 @@
 //! tokens in the same pattern as `ravel_sql::flight_ticket`'s Flight-ticket
 //! codec: magic, version byte, payload, trailing keyed BLAKE3-256 MAC,
 //! base64url on the wire. A cursor pins the snapshot a paginated tool call
-//! must keep reading against (the segment set, any pending erasure
-//! predicates, and the tenant's declared columns at mint time) plus the
-//! caller's position in the result order, so page 2 of a query answers
-//! against exactly the same snapshot page 1 planned against, never a
-//! re-resolution. An evidence reference pins a single row for later
-//! recall by a `ravel_get_trace`-style follow-up.
+//! must keep reading against, as the inputs that resolve it rather than as
+//! its result, plus the caller's position in the result order, so page 2 of
+//! a query answers against the same snapshot page 1 planned against. An
+//! evidence reference pins a single row for later recall by a
+//! `ravel_get_trace`-style follow-up.
 //!
-//! # The pinned snapshot is `ravel_sql::SegmentPin`
+//! # The pinned snapshot is a set of resolve inputs
 //!
-//! A cursor's segment set is a `Vec<ravel_sql::SegmentPin>` encoded through
-//! that crate's own per-pin codec (ADR-1374 decision 9), not a local
-//! projection of the fields the pagination path happens to branch on. The two
-//! tokens pin a snapshot for the same reason and must reconstruct the same
-//! `SegmentRef`, so they share the layout and the field list; a narrower
-//! mirror silently drops the pruning bounds, the routing fields, and each
-//! segment's on-object format version.
+//! A cursor carries the signal, the half-open time range, the minimum
+//! commit-token watermark the page was resolved against, the pending erasure
+//! predicates in force, and the declared column set (the 2026-09-09 amendment
+//! to ADR-1374 D5). Redemption re-resolves the snapshot from those inputs
+//! deterministically; when the re-resolve cannot reproduce the pinned
+//! watermark, the cursor is [`CursorError::Expired`] and the caller re-runs
+//! the query.
+//!
+//! Enumerating the pinned segments instead is what the amendment replaced. One
+//! `ravel_sql::SegmentPin` costs about 250 B plus base64, so the 2,000-segment
+//! admission ceiling of D6 mints a token of several hundred KiB: past the
+//! cursor's own 4 KiB bound in the envelope, and past the whole 256 KiB
+//! response floor. Evidence references are unchanged and keep that per-pin
+//! codec, which is why this module still converts a `FlightTicketError`.
 //!
 //! # The D5 wrong-tenant rule
 //!
@@ -106,8 +112,8 @@
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ravel_query::erasure::ErasurePredicate;
-use ravel_sql::{DeclaredColumn, DeclaredType, FlightTicketError, SegmentPin};
-use ravel_types::TenantHash;
+use ravel_sql::{DeclaredColumn, DeclaredType, FlightTicketError};
+use ravel_types::{CommitToken, Signal, TenantHash};
 
 /// Length in bytes of the trailing keyed-MAC tag.
 const MAC_LEN: usize = 32;
@@ -158,12 +164,15 @@ impl std::fmt::Debug for CursorKey {
 const CURSOR_MAGIC: [u8; 4] = *b"RMC1";
 /// Version 2 pinned each segment as a whole `ravel_sql::SegmentPin` (all 15
 /// fields, through that crate's own codec) instead of the five-field local
-/// projection version 1 carried; version 3 adds the plaintext process nonce
-/// after the version byte. A token of any earlier version decodes as
-/// [`CursorError::Invalid`] like any other unsupported version, which is
-/// correct and costs nothing: these tokens are process-local and
-/// deadline-bounded, so none survives the deploy that changes the number.
-const CURSOR_VERSION: u8 = 3;
+/// projection version 1 carried; version 3 added the plaintext process nonce
+/// after the version byte; version 4 drops the segment enumeration for the
+/// resolve inputs of the 2026-09-09 amendment (signal, time range, commit-token
+/// watermark, pending erasure, declared columns, keyset position). A token of
+/// any earlier version decodes as [`CursorError::Invalid`] like any other
+/// unsupported version, which is correct and costs nothing: these tokens are
+/// process-local and deadline-bounded, so none survives the deploy that
+/// changes the number.
+const CURSOR_VERSION: u8 = 4;
 const EVIDENCE_MAGIC: [u8; 4] = *b"RME1";
 /// Version 2 adds the same plaintext process nonce [`CURSOR_VERSION`] 3 does;
 /// version 3 adds the argument hash, which an unpinned redemption needs to
@@ -183,10 +192,11 @@ const HEADER_LEN: usize = 4 + 1 + NONCE_LEN;
 const NONCE_CONTEXT: &[u8] = b"ravel-mcp cursor process nonce v1";
 
 /// Largest wire token, in base64url characters, either codec will look at.
-/// 1 MiB of base64url decodes to at most 786,432 payload bytes, which at the
-/// ~250 B one segment pin costs is roughly 3,000 pinned segments: far above
-/// any real snapshot, and a bound on what a caller can make this process
-/// allocate from one token.
+/// 1 MiB of base64url decodes to at most 786,432 payload bytes, far above
+/// what any real cursor or evidence reference carries, and a bound on what a
+/// caller can make this process allocate from one token. It is not the bound
+/// a minted cursor is held to: the envelope bounds `presentation.cursor` at
+/// 4 KiB and reports a larger one as an `internal` failure.
 pub const MAX_TOKEN_BYTES: usize = 1024 * 1024;
 
 /// The `grace` component of a deployment's GC protection horizon, 24 h
@@ -237,16 +247,33 @@ pub enum CursorError {
     FieldTooLong { len: usize, max: usize },
 }
 
-/// Where a paginated result left off. A keyset position is an opaque,
-/// tool-defined ordering key (e.g. the last row's sort tuple, encoded by the
-/// tool); a row range is used by tools that page by row index.
+/// Where a paginated result left off.
+///
+/// A keyset position is the last tuple of the page (opaque here, encoded by
+/// the tool that ordered the rows) together with the `ORDER BY` it was taken
+/// under, which the amendment names as part of the position: the same tuple
+/// under a different ordering resumes somewhere else entirely, so the two
+/// travel as one value rather than as a tuple the redeeming call is trusted
+/// to pair correctly. A row range is used by tools that page by row index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CursorPosition {
-    Keyset(Vec<u8>),
-    RowRange { start: u64, end: u64 },
+    Keyset {
+        /// The last tuple of the page, in the tool's own encoding.
+        tuple: Vec<u8>,
+        /// The `ORDER BY` terms the tuple was taken under, in order.
+        order_by: Vec<String>,
+    },
+    RowRange {
+        start: u64,
+        end: u64,
+    },
 }
 
 /// The D5 cursor: an opaque, snapshot-pinning pagination token.
+///
+/// The pin is the resolve inputs below, not an enumeration of what they
+/// resolved to (the 2026-09-09 amendment to ADR-1374 D5). See this module's
+/// "The pinned snapshot is a set of resolve inputs" docs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cursor {
     pub tenant: TenantHash,
@@ -255,16 +282,21 @@ pub struct Cursor {
     /// so a cursor cannot be redeemed against a call with different
     /// arguments than the one that minted it.
     pub argument_hash: [u8; 32],
-    /// The pinned snapshot, one entry per resolved segment.
+    /// The signal the page was resolved over.
+    pub signal: Signal,
+    /// Start of the half-open time range the page was resolved over,
+    /// inclusive.
+    pub range_start_ns: i64,
+    /// End of that range, exclusive.
+    pub range_end_ns: i64,
+    /// The minimum commit-token watermark the page was resolved against, one
+    /// token per shard the read-your-write lower bound covers.
     ///
-    /// This is `ravel_sql::SegmentPin` itself, not a narrower local mirror
-    /// (ADR-1374 decision 9): a cursor pins a snapshot for exactly the reason
-    /// a Flight ticket does, so it carries the same 15 fields through the
-    /// same codec. A projection of "the fields pagination branches on" drops
-    /// the pruning bounds, the routing fields, and the on-object format
-    /// version, and page 2 then cannot rebuild the `SegmentRef` page 1
-    /// planned against.
-    pub segments: Vec<SegmentPin>,
+    /// This is what makes the re-resolve deterministic rather than a fresh
+    /// resolution: page 2 resolves against this same watermark, and a
+    /// re-resolve that cannot reproduce it is [`CursorError::Expired`]
+    /// (see [`Cursor::redeem`]).
+    pub min_commit_watermark: Vec<CommitToken>,
     pub pending_erasure: Vec<ErasurePredicate>,
     pub declared_columns: Vec<DeclaredColumn>,
     pub position: CursorPosition,
@@ -336,9 +368,16 @@ impl Cursor {
         write_len_prefixed(&mut buf, self.tool.as_bytes())?;
         buf.extend_from_slice(&self.argument_hash);
 
-        write_count(&mut buf, self.segments.len())?;
-        for seg in &self.segments {
-            seg.encode_into(&mut buf)?;
+        buf.push(signal_tag(self.signal));
+        buf.extend_from_slice(&self.range_start_ns.to_le_bytes());
+        buf.extend_from_slice(&self.range_end_ns.to_le_bytes());
+
+        write_count(&mut buf, self.min_commit_watermark.len())?;
+        for token in &self.min_commit_watermark {
+            // The token's own codec, not a local field-by-field mirror: a
+            // commit token is a frozen contract (ADR-0010) and a cursor is
+            // not a second place to define its layout.
+            write_len_prefixed(&mut buf, token.encode().as_bytes())?;
         }
 
         write_count(&mut buf, self.pending_erasure.len())?;
@@ -359,9 +398,13 @@ impl Cursor {
         }
 
         match &self.position {
-            CursorPosition::Keyset(bytes) => {
+            CursorPosition::Keyset { tuple, order_by } => {
                 buf.push(0);
-                write_len_prefixed(&mut buf, bytes)?;
+                write_len_prefixed(&mut buf, tuple)?;
+                write_count(&mut buf, order_by.len())?;
+                for term in order_by {
+                    write_len_prefixed(&mut buf, term.as_bytes())?;
+                }
             }
             CursorPosition::RowRange { start, end } => {
                 buf.push(1);
@@ -397,11 +440,17 @@ impl Cursor {
         let tool = read_string(&mut cur)?;
         let argument_hash = cur.read_array::<32>()?;
 
-        let seg_count = cur.read_u32()?;
+        let signal = signal_from_tag(cur.read_u8()?)?;
+        let range_start_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+        let range_end_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+
+        let watermark_count = cur.read_u32()?;
         // Never pre-allocate from the untrusted count; push and grow.
-        let mut segments = Vec::new();
-        for _ in 0..seg_count {
-            segments.push(cur.read_segment_pin()?);
+        let mut min_commit_watermark = Vec::new();
+        for _ in 0..watermark_count {
+            let encoded = read_string(&mut cur)?;
+            min_commit_watermark
+                .push(CommitToken::decode(&encoded).map_err(|_| CursorError::Invalid)?);
         }
 
         let erasure_count = cur.read_u32()?;
@@ -432,7 +481,15 @@ impl Cursor {
         }
 
         let position = match cur.read_u8()? {
-            0 => CursorPosition::Keyset(read_bytes_vec(&mut cur)?),
+            0 => {
+                let tuple = read_bytes_vec(&mut cur)?;
+                let term_count = cur.read_u32()?;
+                let mut order_by = Vec::new();
+                for _ in 0..term_count {
+                    order_by.push(read_string(&mut cur)?);
+                }
+                CursorPosition::Keyset { tuple, order_by }
+            }
             1 => {
                 let start = u64::from_le_bytes(cur.read_array::<8>()?);
                 let end = u64::from_le_bytes(cur.read_array::<8>()?);
@@ -452,7 +509,10 @@ impl Cursor {
             tenant,
             tool,
             argument_hash,
-            segments,
+            signal,
+            range_start_ns,
+            range_end_ns,
+            min_commit_watermark,
             pending_erasure,
             declared_columns,
             position,
@@ -705,6 +765,33 @@ fn process_nonce(key: &CursorKey) -> [u8; NONCE_LEN] {
     nonce
 }
 
+/// The wire tag for a signal. Written out here rather than taken from the
+/// enum's discriminant: this is a token layout under [`CURSOR_VERSION`], so a
+/// reordering of `ravel_types::Signal` must not silently change what a minted
+/// token means.
+fn signal_tag(signal: Signal) -> u8 {
+    match signal {
+        Signal::Metrics => 1,
+        Signal::Logs => 2,
+        Signal::Spans => 3,
+        Signal::Profiles => 4,
+        Signal::Alerts => 5,
+        Signal::Audit => 6,
+    }
+}
+
+fn signal_from_tag(tag: u8) -> Result<Signal, CursorError> {
+    match tag {
+        1 => Ok(Signal::Metrics),
+        2 => Ok(Signal::Logs),
+        3 => Ok(Signal::Spans),
+        4 => Ok(Signal::Profiles),
+        5 => Ok(Signal::Alerts),
+        6 => Ok(Signal::Audit),
+        _ => Err(CursorError::Invalid),
+    }
+}
+
 fn declared_type_tag(ty: DeclaredType) -> u8 {
     match ty {
         DeclaredType::Str => 1,
@@ -813,19 +900,6 @@ impl<'a> ByteReader<'a> {
     fn read_u32(&mut self) -> Result<u32, CursorError> {
         Ok(u32::from_le_bytes(self.read_array::<4>()?))
     }
-
-    /// Reads one segment pin through `ravel_sql`'s own codec, which owns the
-    /// layout, and advances by however many bytes it consumed. A typed
-    /// `FlightTicketError` from there (truncation, bad UTF-8, an invalid
-    /// level tag) becomes [`CursorError::Invalid`] like any other malformed
-    /// input: a cursor exposes exactly the two D5 decode outcomes and never
-    /// reports which field of which pin was wrong.
-    fn read_segment_pin(&mut self) -> Result<SegmentPin, CursorError> {
-        let rest = self.buf.get(self.pos..).ok_or(CursorError::Invalid)?;
-        let (pin, consumed) = SegmentPin::decode_from(rest).map_err(|_| CursorError::Invalid)?;
-        self.pos = self.pos.checked_add(consumed).ok_or(CursorError::Invalid)?;
-        Ok(pin)
-    }
 }
 
 impl From<FlightTicketError> for CursorError {
@@ -845,7 +919,6 @@ impl From<FlightTicketError> for CursorError {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use ravel_sql::SegmentLevel;
     use uuid::Uuid;
 
     use super::*;
@@ -882,32 +955,6 @@ mod tests {
         URL_SAFE_NO_PAD.decode(token).expect("decode base64")
     }
 
-    /// A pin with every one of its 15 fields set to a distinct non-default
-    /// value, so a field dropped anywhere in the cursor's codec changes the
-    /// decoded struct rather than round-tripping a zero through a zero.
-    fn every_field_pin() -> SegmentPin {
-        SegmentPin {
-            data_object_key: "t/aa/logs/l1/2026090812/w.7.9.deadbeef.rseg".to_owned(),
-            object_size: 4_194_304,
-            min_event_ts_ns: 1_700_000_000_111_111_111,
-            max_event_ts_ns: 1_700_000_003_222_222_222,
-            ingest_hour_bucket: 472_222,
-            sample_count: 123_456,
-            series_count: 789,
-            shard: 5,
-            content_hash: [0xC3u8; 32],
-            writer_id: Uuid::from_bytes([0xD7u8; 16]),
-            writer_epoch: 11,
-            writer_seq: 22,
-            created_unix_ns: 1_700_000_004_333_333_333,
-            level: SegmentLevel::L1 {
-                input_set_hash: [0xE5u8; 32],
-                part_index: 3,
-            },
-            segment_format_version: 4,
-        }
-    }
-
     fn sample_evidence(tenant: TenantHash) -> EvidenceRef {
         EvidenceRef {
             tenant,
@@ -924,31 +971,31 @@ mod tests {
             tenant,
             tool: SAMPLE_TOOL.to_owned(),
             argument_hash: SAMPLE_ARGS,
-            segments: vec![SegmentPin {
-                data_object_key: "t/aa/logs/l0/0000/w.1.2.abc.rseg".to_owned(),
-                object_size: 65_536,
-                min_event_ts_ns: 1_700_000_000_000_000_000,
-                max_event_ts_ns: 1_700_000_001_000_000_000,
-                ingest_hour_bucket: 472_222,
-                sample_count: 10,
-                series_count: 4,
-                shard: 0,
-                content_hash: [3u8; 32],
-                writer_id: Uuid::from_bytes([4u8; 16]),
-                writer_epoch: 1,
-                writer_seq: 2,
-                created_unix_ns: 1_700_000_000_000_000_000,
-                level: SegmentLevel::L0,
-                segment_format_version: 3,
-            }],
+            signal: Signal::Logs,
+            range_start_ns: 1_699_999_000_000_000_000,
+            range_end_ns: 1_700_000_000_000_000_000,
+            min_commit_watermark: vec![sample_token(0)],
             pending_erasure: vec![ErasurePredicate::windowless(vec![(
                 "region".to_owned(),
                 "us-east".to_owned(),
             )])],
             declared_columns: vec![DeclaredColumn::new("http.status_code", DeclaredType::I64)],
-            position: CursorPosition::Keyset(vec![1, 2, 3]),
+            position: CursorPosition::Keyset {
+                tuple: vec![1, 2, 3],
+                order_by: vec!["timestamp desc".to_owned()],
+            },
             mint_ns: 1_700_000_000_000_000_000,
             deadline_ns: 1_700_000_030_000_000_000,
+        }
+    }
+
+    fn sample_token(shard: u32) -> CommitToken {
+        CommitToken {
+            shard,
+            writer_id: Uuid::from_bytes([4u8; 16]),
+            epoch: 1,
+            seq: 2,
+            ingest_hour_bucket: 472_222,
         }
     }
 
@@ -1008,11 +1055,11 @@ mod tests {
     /// MAC'd region is `Invalid` too. Flipping only the tag would pass on a
     /// codec that MAC'd nothing but itself.
     ///
-    /// The byte edited belongs to a pinned segment's object key, which is the
-    /// one thing a forger would actually want to change and which nothing
-    /// downstream re-checks: editing the tenant, tool, or argument hash would
-    /// be refused a second time by the bindings in `redeem`, and the assertion
-    /// would hold even with no MAC at all.
+    /// The byte edited belongs to a pending erasure predicate's matcher value,
+    /// which is the kind of thing a forger would actually want to change and
+    /// which nothing downstream re-checks: editing the tenant, tool, or
+    /// argument hash would be refused a second time by the bindings in
+    /// `redeem`, and the assertion would hold even with no MAC at all.
     #[test]
     fn tampered_payload_byte_is_cursor_invalid() {
         let tenant = TenantHash([0x42u8; 16]);
@@ -1020,11 +1067,11 @@ mod tests {
         let token = sample_cursor(tenant).encode(&key).expect("encodes");
 
         let mut bytes = token_bytes(&token);
-        let needle = b"t/aa/logs/l0/0000/w.1.2.abc.rseg";
+        let needle = b"us-east";
         let at = bytes
             .windows(needle.len())
             .position(|window| window == needle)
-            .expect("the pinned object key is in the payload");
+            .expect("the pending erasure matcher value is in the payload");
         assert!(
             at > HEADER_LEN && at < bytes.len() - MAC_LEN,
             "must edit inside the MAC'd payload"
@@ -1068,17 +1115,62 @@ mod tests {
         assert_eq!(err, CursorError::Expired);
     }
 
-    /// The whole point of pinning `ravel_sql::SegmentPin` itself: every one
-    /// of its 15 fields survives the cursor round trip. Asserted on the whole
-    /// struct, so a field the codec forgets to write fails here whether or
-    /// not this test is updated to name it.
+    /// Every resolve input the amendment names survives the round trip, each
+    /// set to a distinct non-default value so a field the codec forgets to
+    /// write changes the decoded struct rather than round-tripping a zero
+    /// through a zero. Asserted on the whole struct, so a new field fails
+    /// here whether or not this test is updated to name it.
     #[test]
-    fn cursor_round_trips_every_segment_pin_field() {
+    fn cursor_round_trips_every_resolve_input() {
         let tenant = TenantHash([0x5Eu8; 16]);
         let key = test_key();
-        let pin = every_field_pin();
-        let mut cursor = sample_cursor(tenant);
-        cursor.segments = vec![pin.clone(), every_field_pin()];
+        let cursor = Cursor {
+            tenant,
+            tool: SAMPLE_TOOL.to_owned(),
+            argument_hash: SAMPLE_ARGS,
+            signal: Signal::Audit,
+            range_start_ns: 1_700_000_000_111_111_111,
+            range_end_ns: 1_700_000_003_222_222_222,
+            min_commit_watermark: vec![
+                CommitToken {
+                    shard: 5,
+                    writer_id: Uuid::from_bytes([0xD7u8; 16]),
+                    epoch: 11,
+                    seq: 22,
+                    ingest_hour_bucket: 472_222,
+                },
+                CommitToken {
+                    shard: 6,
+                    writer_id: Uuid::from_bytes([0xE5u8; 16]),
+                    epoch: 33,
+                    seq: 44,
+                    ingest_hour_bucket: 472_223,
+                },
+            ],
+            pending_erasure: vec![
+                ErasurePredicate::new(
+                    vec![("region".to_owned(), "us-east".to_owned())],
+                    1_699_000_000_000_000_000,
+                    1_699_500_000_000_000_000,
+                ),
+                ErasurePredicate::windowless(vec![
+                    ("service.name".to_owned(), "checkout".to_owned()),
+                    ("user.id".to_owned(), "u-42".to_owned()),
+                ]),
+            ],
+            declared_columns: vec![
+                DeclaredColumn::new("http.status_code", DeclaredType::I64),
+                DeclaredColumn::new("http.route", DeclaredType::Str),
+                DeclaredColumn::new("error", DeclaredType::Bool),
+                DeclaredColumn::new("trace_id", DeclaredType::Bytes),
+            ],
+            position: CursorPosition::Keyset {
+                tuple: vec![7, 8, 9, 10],
+                order_by: vec!["timestamp desc".to_owned(), "trace_id asc".to_owned()],
+            },
+            mint_ns: 1_700_000_000_000_000_000,
+            deadline_ns: 1_700_000_030_000_000_000,
+        };
 
         let token = cursor.encode(&key).expect("encodes");
         let decoded = Cursor::redeem(
@@ -1091,11 +1183,46 @@ mod tests {
             FAR_HORIZON_NS,
         )
         .expect("round-trips through its own codec");
-
-        assert_eq!(decoded.segments.len(), 2);
-        assert_eq!(decoded.segments[0], pin);
-        assert_eq!(decoded.segments[1], pin);
         assert_eq!(decoded, cursor);
+
+        // The other position arm, through the same codec.
+        let mut ranged = cursor.clone();
+        ranged.position = CursorPosition::RowRange {
+            start: 4_000,
+            end: 4_500,
+        };
+        let token = ranged.encode(&key).expect("encodes");
+        let decoded = Cursor::redeem(
+            &token,
+            &key,
+            tenant,
+            SAMPLE_TOOL,
+            &SAMPLE_ARGS,
+            NOW_NS,
+            FAR_HORIZON_NS,
+        )
+        .expect("round-trips through its own codec");
+        assert_eq!(decoded, ranged);
+    }
+
+    /// The amendment changed what a cursor pins, so a token minted by the
+    /// previous version is not readable under the new layout: its version byte
+    /// is refused at the header, before any field is parsed. Reminted under
+    /// this process's key so the refusal is attributable to the version byte
+    /// rather than to the MAC.
+    #[test]
+    fn a_version_3_token_is_invalid() {
+        let tenant = TenantHash([0x5Fu8; 16]);
+        let key = test_key();
+        let token = sample_cursor(tenant).encode(&key).expect("encodes");
+
+        let mut bytes = token_bytes(&token);
+        assert_eq!(bytes[CURSOR_MAGIC.len()], CURSOR_VERSION);
+        bytes[CURSOR_MAGIC.len()] = 3;
+        let stale = remint(bytes, &key);
+
+        let err = Cursor::decode(&stale, &key).expect_err("must be refused");
+        assert_eq!(err, CursorError::Invalid);
     }
 
     /// A cursor is bound to the tool that minted it: handing a
@@ -1299,10 +1426,11 @@ mod tests {
         assert_eq!(err, CursorError::Invalid);
     }
 
-    /// The version byte is checked, so a token in the version 2 layout (a
-    /// whole-`SegmentPin` cursor without the process nonce) is `Invalid`
-    /// rather than parsed as if the nonce were tenant bytes. Re-MAC'd, so the
-    /// failure is the version check and not the MAC.
+    /// The version byte is checked against this build's own version, not for
+    /// being no newer than it: a token claiming a future layout is `Invalid`
+    /// rather than parsed with the fields this build happens to know.
+    /// Re-MAC'd, so the failure is the version check and not the MAC.
+    /// [`a_version_3_token_is_invalid`] covers the previous layout.
     #[test]
     fn wrong_version_token_is_cursor_invalid() {
         let tenant = TenantHash([0x4Du8; 16]);
@@ -1310,7 +1438,7 @@ mod tests {
         let token = sample_cursor(tenant).encode(&key).expect("encodes");
 
         let mut bytes = token_bytes(&token);
-        bytes[4] = CURSOR_VERSION - 1;
+        bytes[4] = CURSOR_VERSION + 1;
         let reminted = remint(bytes, &key);
 
         let err = Cursor::redeem(
@@ -1543,7 +1671,8 @@ mod tests {
     /// deadline 10 days out, redeemed against a 25h05m protection horizon,
     /// stops being redeemable 1h05m in: the horizon minus the 24 h grace a
     /// redemption may not spend. Without the re-clamp the cursor would still
-    /// be live 10 days later, pinning segments the sweeper is free to delete.
+    /// be live 10 days later, resolving against a watermark whose objects the
+    /// sweeper is free to delete.
     #[test]
     fn redeem_reclamps_the_deadline_to_the_protection_horizon() {
         let tenant = TenantHash([0xB7u8; 16]);
