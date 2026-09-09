@@ -153,6 +153,25 @@ pub struct IngestMetrics {
     /// separately. Intended for Prometheus export under the name
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     clock_regressions_refused: AtomicU64,
+    /// Tenants still buffered after a TEARDOWN `flush_all` exhausted its
+    /// bounded retry passes (ADR-1307 finding F1). A graceful drain re-buffers
+    /// a clock-refused flush and retries it in the same call; this counts the
+    /// residue that survived every pass on a drain the actor does not outlive
+    /// (`Shutdown`, channel close), which is a lost acknowledged buffered-mode
+    /// write (a pathological clock that steps back on every reading). Nonzero
+    /// is a durability defect, logged at ERROR beside this bump so the residue
+    /// is never silent.
+    ///
+    /// Residue on a `FlushNow` drain is deliberately NOT counted here: that
+    /// arm leaves the actor running with the tenants still buffered and their
+    /// `oldest_arrival_ns` intact, so the age tick retries them and nothing is
+    /// lost. It is logged at WARN instead. `FlushNow` is reachable from the
+    /// router's `flush_all`, which the `ravel-cli` load path calls on a
+    /// repeating ticker, so counting it here would grow a durability-defect
+    /// counter without bound over a run where every row survives. The refusals
+    /// behind such a residue are still counted per attempt
+    /// (`clock_regressions_refused`).
+    flush_all_residue_tenants: AtomicU64,
     /// Multi-shard Strict writes that returned `WriteError::PartialWrite`
     /// (issue #1130): at least one shard committed durably and at least one
     /// sibling then failed in the same `write()` call. A nonzero value means
@@ -533,6 +552,12 @@ pub struct IngestMetricsSnapshot {
     /// bound (ADR-1307). Intended for export as
     /// `ravel_ingest_clock_regressions_refused_total` (#1473).
     pub clock_regressions_refused: u64,
+    /// Tenants left buffered after a teardown `flush_all` (`Shutdown`, channel
+    /// close) exhausted its retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect. A `FlushNow` drain does not bump it (the actor keeps
+    /// running and retries the residue).
+    pub flush_all_residue_tenants: u64,
     /// Multi-shard Strict writes returned as `WriteError::PartialWrite`
     /// (issue #1130): a partial multi-shard commit. Exported as
     /// `ravel_ingest_partial_writes_total`.
@@ -738,6 +763,15 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// `count` tenants still buffered after a teardown `flush_all` drained
+    /// (ADR-1307 finding F1). Called once per teardown drain that leaves a
+    /// residue, with the residual tenant count; never from the `FlushNow`
+    /// drain, which retries its residue on the next trigger.
+    pub(crate) fn record_flush_all_residue(&self, count: u64) {
+        self.flush_all_residue_tenants
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
     /// One multi-shard Strict write returned as `WriteError::PartialWrite`
     /// (issue #1130): at least one shard committed durably before a sibling
     /// failed. Recorded once per such write, at the router's error
@@ -815,6 +849,7 @@ impl IngestMetrics {
             series_id_collisions: self.series_id_collisions.load(Ordering::Relaxed),
             clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
             clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
@@ -854,6 +889,7 @@ mod tests {
         metrics.record_series_id_collision();
         metrics.record_clock_regression();
         metrics.record_clock_regression_refused();
+        metrics.record_flush_all_residue(2);
         metrics.record_partial_write();
         metrics.record_shard_death();
         metrics.record_exemplars(2, 5);
@@ -874,6 +910,7 @@ mod tests {
         assert_eq!(snap.series_id_collisions, 1);
         assert_eq!(snap.clock_regressions, 1);
         assert_eq!(snap.clock_regressions_refused, 1);
+        assert_eq!(snap.flush_all_residue_tenants, 2);
         assert_eq!(snap.partial_writes, 1);
         assert_eq!(snap.shard_deaths, 1);
     }

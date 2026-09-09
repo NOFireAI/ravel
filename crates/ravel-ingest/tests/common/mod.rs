@@ -97,6 +97,90 @@ impl Clock for TestClock {
     }
 }
 
+/// Clock that steps backwards on every reading once armed, modelling the one
+/// pathological host clock the graceful drain's pass cap exists for (ADR-1307).
+///
+/// [`TestClock`] holds a value a test sets, so a drain that reads it repeatedly
+/// sees the same reading: the first refusal re-anchors the monotonic floor to
+/// it and the next pass proceeds. A clock that recedes on *every* reading never
+/// lets a pass proceed, which is the only way `flush_all` reaches its pass cap
+/// and leaves residue.
+///
+/// Frozen until armed (`recede_from`), so the setup writes that arm the floor
+/// are as deterministic as they are on `TestClock`. Once armed, each
+/// `now_ns()` returns the current reading and leaves the next one `step_ns`
+/// lower. `freeze_at` disarms it again, so a test can show the residue
+/// flushing once the clock stops misbehaving.
+pub struct RecedingClock {
+    now_ns: AtomicI64,
+    /// Nanoseconds each reading drops below the one before it. Zero while
+    /// frozen, which makes this a plain fixed clock.
+    step_ns: AtomicI64,
+    wake_tx: watch::Sender<()>,
+}
+
+impl RecedingClock {
+    pub fn new(start_ns: i64) -> Arc<Self> {
+        let (wake_tx, _rx) = watch::channel(());
+        Arc::new(RecedingClock {
+            now_ns: AtomicI64::new(start_ns),
+            step_ns: AtomicI64::new(0),
+            wake_tx,
+        })
+    }
+
+    /// Reads `start_ns` next, then `step_ns` lower on every reading after it.
+    pub fn recede_from(&self, start_ns: i64, step_ns: i64) {
+        self.now_ns.store(start_ns, Ordering::SeqCst);
+        self.step_ns.store(step_ns, Ordering::SeqCst);
+        let _ = self.wake_tx.send(());
+    }
+
+    /// Stops the recession and holds every later reading at `ns`.
+    pub fn freeze_at(&self, ns: i64) {
+        self.step_ns.store(0, Ordering::SeqCst);
+        self.now_ns.store(ns, Ordering::SeqCst);
+        let _ = self.wake_tx.send(());
+    }
+}
+
+impl Clock for RecedingClock {
+    fn now_ns(&self) -> i64 {
+        let step = self.step_ns.load(Ordering::SeqCst);
+        if step == 0 {
+            self.now_ns.load(Ordering::SeqCst)
+        } else {
+            // Returns the pre-subtraction value, so this reading is the one the
+            // caller asked for and the *next* one is `step` lower.
+            self.now_ns.fetch_sub(step, Ordering::SeqCst)
+        }
+    }
+
+    fn sleep(&self, dur: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        // Same watch-driven wait as `TestClock::sleep`, and the same reason for
+        // a watch rather than a `Notify`: an advance that lands before the
+        // sleeper registers must not be lost. Sleeping observes the reading
+        // without consuming a step, so the number of backwards steps a test
+        // sees is decided by the flush path alone, not by how many times the
+        // actor happened to re-arm its tick.
+        let deadline = self
+            .now_ns
+            .load(Ordering::SeqCst)
+            .saturating_add(i64::try_from(dur.as_nanos()).unwrap_or(i64::MAX));
+        let mut rx = self.wake_tx.subscribe();
+        Box::pin(async move {
+            loop {
+                if self.now_ns.load(Ordering::SeqCst) >= deadline {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+}
+
 /// Wraps a `MemoryStore` and makes every `put` whose key contains
 /// `key_contains` sleep for `delay` on the injected `Clock` before
 /// delegating to the inner store. Models a backend call that is merely slow

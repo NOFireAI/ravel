@@ -162,6 +162,49 @@ pub(crate) fn checked_ingest_hour_bucket(flush_open_ns: i64) -> Result<u32, Stri
 /// follow-up (reported, not fixed here).
 pub const MAX_FLUSH_CLOCK_HOLD_NS: i64 = ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS;
 
+/// Bound on the number of drain passes a graceful `flush_all` makes before it
+/// gives up and records the residue (ADR-1307 finding F1).
+///
+/// `flush_all` re-buffers a clock-refused flush and must retry it in the same
+/// call, because on a graceful teardown there is no later actor tick to retry
+/// it (the map is snapshotted per pass, and a refusal re-inserts a key the
+/// snapshot already consumed). A refusal re-anchors the monotonic floor to the
+/// raw reading, so with any clock that does not keep stepping backwards the
+/// very next pass stamps that reading and proceeds: a normal drain finishes in
+/// one pass, and a single absorbed regression in two. The bound exists only so
+/// a pathological clock that steps back on *every* reading cannot spin the
+/// drain forever; `4` leaves generous headroom above the two passes the
+/// ADR-guaranteed "at most one flush refused per backwards step" needs while
+/// still terminating such a clock in a handful of iterations. Residue that
+/// survives all passes is never dropped silently: how it is reported depends on
+/// whether the caller can still retry it, which is what [`DrainIntent`]
+/// carries.
+pub const MAX_FLUSH_ALL_PASSES: usize = 4;
+
+/// What the caller of a shard actor's `flush_all` does after the drain returns,
+/// which decides how residue left by the pass cap is reported.
+///
+/// Residue is the same state either way: the tenants are still in the actor's
+/// buffer map with their arrival bookkeeping intact. Whether that state is a
+/// durability defect depends entirely on whether anything will flush them
+/// later, and only the caller knows that.
+pub(crate) enum DrainIntent {
+    /// The actor stops when the drain returns (`Shutdown`, or the channel-close
+    /// arm): nothing will retry residue, so acknowledged buffered-mode rows are
+    /// lost on a graceful path. Logged at ERROR and counted
+    /// (`flush_all_residue_tenants`).
+    Teardown,
+    /// The actor keeps running (`FlushNow`, reachable from the router's
+    /// `flush_all`, which benches, tests, and the `ravel-cli` load path call on
+    /// a repeating ticker): residue stays buffered with its
+    /// `oldest_arrival_ns`, so the age tick and the next explicit flush both
+    /// retry it and nothing is lost. Logged at WARN and not counted, so a stuck
+    /// tenant under a bad clock cannot grow a durability-defect counter without
+    /// bound, or page on a ticker. The refusals behind it are still counted
+    /// per flush attempt (`clock_regressions_refused`).
+    Retryable,
+}
+
 /// Why [`monotonic_flush_open_ns`] declined to produce a flush-open stamp. The
 /// two arms surface different write errors because they are different failures.
 ///
