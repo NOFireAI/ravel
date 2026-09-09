@@ -452,9 +452,11 @@ pub struct Presentation {
     /// dropped entry is gone, a cut one is still there and still says so
     /// through its truncation marker.
     pub entries_truncated: u64,
-    /// Scalar fields cut, replaced by the truncation marker, or (for the
-    /// cursor, which is a MAC'd token a cut would corrupt) dropped, because
-    /// the scalars together were over the D4 4 KiB allowance. Counted apart
+    /// Scalar fields cut or replaced by the truncation marker because the
+    /// scalars together were over the D4 4 KiB allowance. The cursor is not
+    /// among them: it holds its own [`CURSOR_BOUND`] outside that allowance,
+    /// and a token over that bound is an internal failure rather than
+    /// something to cut, since a cut would corrupt its MAC. Counted apart
     /// from `entries_truncated` because a scalar is not a list entry: one
     /// oversized `plan` says something different about a result than sixteen
     /// cut warnings do.
@@ -1284,9 +1286,7 @@ impl Envelope {
     /// has already applied the D4 count bound to `warnings`, and re-applies
     /// that same bound afterward (see `finish`'s own doc comment). Putting
     /// the identity warnings first means they are what survives that second
-    /// pass when a caller's own warnings already filled the list, the same
-    /// kept-first reasoning [`Envelope::cap_scalars`] uses for the
-    /// dropped-cursor announcement.
+    /// pass when a caller's own warnings already filled the list.
     fn warn_unreported_identity(&mut self) {
         let reported = [
             !self.visibility.snapshot_id.is_empty(),
@@ -1576,13 +1576,21 @@ mod tests {
     /// Serialized size of a zero-row envelope with every metadata field at
     /// both its D4 bounds, every scalar filling the D4 scalar allowance, and
     /// the cursor at the [`CURSOR_BOUND`] it now holds on its own: the largest
-    /// fixed part the bounds permit. It must stay under 110,592 B, the earlier
-    /// 106,496 B plus the cursor's own 4 KiB, which is what leaves a retained
-    /// row its 148 KiB under the 256 KiB floor.
+    /// fixed part the bounds permit.
+    ///
+    /// The 110,592 B tripwire below is this test's own, not a figure D4
+    /// states: it is 108 KiB, the round number just above what the bounds
+    /// measure to, so a bound that grows shows up as a failure here rather
+    /// than as a quiet climb toward the floor. What D4 constrains is the
+    /// per-list and per-entry bounds and the 4 KiB scalar allowance, whose
+    /// sum with the cursor bound is 106 KiB. What actually guards the 256 KiB
+    /// floor is the [`MAXIMAL_FIXED_PART`] assertion beside that constant,
+    /// which adds the skeleton, its slack, and the identity-warning
+    /// allowance on top of the documented bounds.
     const MAXIMAL_METADATA_ENVELOPE_LEN: usize = 109_902;
     const _: () = assert!(
         MAXIMAL_METADATA_ENVELOPE_LEN < 110_592,
-        "ADR-1374 D4 requires the maximal fixed part under 110,592 B"
+        "the maximal fixed part must stay under this test's 108 KiB tripwire"
     );
 
     fn cell_len(envelope: &Envelope) -> usize {
