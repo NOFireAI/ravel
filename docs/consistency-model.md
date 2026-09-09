@@ -247,7 +247,10 @@ and no stronger; it does not promise a single stored copy per record.
   a bounded hold (the catalog clock-skew allowance, `DEFAULT_CLOCK_SKEW_ALLOWANCE_NS`,
   5 min) is refused with a typed, retryable error (`Abandoned`, 503) rather than
   absorbed, so a spurious forward glitch cannot ratchet the floor into a future
-  ingest hour and strand every later flush. The floor is in-process state,
+  ingest hour and strand every later flush. The refused flush re-anchors the
+  floor to the raw reading and re-buffers its rows rather than dropping them, so
+  the next trigger flushes them once and the refusal costs availability, not
+  durability. The floor is in-process state,
   reset to 0 on restart by construction; the guarantee is per-process, and a
   backwards step spanning a restart can still invert resolution. `writer_id`
   does not close this: it is not part of the duplicate-resolution comparator,
