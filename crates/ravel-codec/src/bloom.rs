@@ -124,15 +124,41 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// `(block, g1, g2)` triple set the old insert-time hashing produced (it even
 /// re-deduplicates by triple, so a BLAKE3 collision between two distinct raw
 /// keys still collapses to one, matching the old distinct-triple count that
-/// sizes the filter). `finish` takes `self` by value and drains `staged`,
-/// freeing each raw entry's `Box<[u8]>` as soon as it is hashed, so the staged
-/// set and the triple set are never both fully live at once; this roughly
-/// halves the peak versus keeping both fully materialized, which would run
-/// roughly 113 to 141 bytes per distinct key (the ~84-byte raw
-/// `column_id_le || token` entry plus a `HashSet<(u64, u64, u64)>` slot --
-/// not the bare 24-byte tuple width, since hashbrown adds a control byte per
-/// slot at a load factor of at most 0.875 with power-of-two capacity, putting
-/// the real per-slot cost at roughly 29 to 57 bytes).
+/// sizes the filter).
+///
+/// `finish` takes `self` by value and drains `staged`, freeing each raw
+/// entry's `Box<[u8]>` as it is hashed. That drain does not halve peak
+/// memory: `triples` below is built with
+/// `HashSet::with_capacity(self.staged.len())` before the drain loop runs,
+/// and `with_capacity` reserves the full bucket array up front to satisfy
+/// its no-reallocation guarantee, so the whole `triples` table exists
+/// before a single `staged` entry is freed -- `staged` and `triples` are
+/// both fully live at that point, and draining only lets `staged` shrink
+/// back down while `triples` fills in alongside it. Measured on this host
+/// (process RSS around one `BloomBuilder` loaded with a large distinct-key
+/// corpus): 38460 KB immediately before the drain loop starts, 37380 KB
+/// immediately after `finish` returns -- about 3%, not "roughly halved".
+///
+/// Per-key cost at that peak, on the same basis for both tables (hashbrown
+/// adds one control byte per slot and keeps the load factor between about
+/// 0.4375 just after a resize and 0.875 just before the next one, so a
+/// slot's real cost is `(value_width + 1) / load_factor`, not the bare
+/// value width):
+/// - `staged: HashSet<Box<[u8]>>` -- each slot holds a `Box<[u8]>` fat
+///   pointer (16 bytes: data pointer + length), so the slot itself costs
+///   `(16 + 1) / 0.875` to `(16 + 1) / 0.4375`, roughly 19 to 39 bytes. That
+///   pointer addresses a separate heap allocation for the raw
+///   `column_id_le || token` bytes: up to 4 + 64 = 68 bytes of data (the
+///   64-byte token bound `insert` documents below) plus a typical ~16-byte
+///   allocator header, roughly 84 bytes. Staged cost: roughly 103 to 123
+///   bytes per distinct key.
+/// - `triples: HashSet<(u64, u64, u64)>` -- the 24-byte tuple lives inline
+///   in the slot, no separate heap allocation, so the slot costs
+///   `(24 + 1) / 0.875` to `(24 + 1) / 0.4375`, roughly 29 to 57 bytes per
+///   distinct key.
+///
+/// Both tables are live at peak (above), so the combined peak cost is their
+/// sum: roughly 132 to 180 bytes per distinct key.
 pub struct BloomBuilder {
     seed: u64,
     /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
@@ -153,15 +179,21 @@ impl BloomBuilder {
         }
     }
 
-    /// Stages one field-scoped token. Duplicates collapse; the staged
-    /// distinct count sizes the filter. No BLAKE3 here: only distinct keys
-    /// reach `key_hash`, in `finish`.
+    /// Stages one field-scoped token. Duplicates collapse; the filter is
+    /// sized by the distinct-*triple* count `finish` computes after hashing
+    /// and re-deduping the staged keys, not by the staged distinct-key
+    /// count itself. No BLAKE3 here: only distinct keys reach `key_hash`,
+    /// in `finish`.
     ///
     /// `token` is not length-checked or truncated here. The crate's
     /// per-key memory bound holds only because every current caller keeps
-    /// `token` at or under 64 bytes: `ravel_logseg::writer::EXACT_BLOOM_MAX`
-    /// bounds whole-value inserts and `tokenizer::TOKEN_MAX_BYTES` bounds
-    /// word tokens. A caller outside those two paths can pass an
+    /// `token` at or under 64 bytes: `ravel-logseg`'s writer module bounds
+    /// whole-value inserts with a private 64-byte const (`EXACT_BLOOM_MAX`,
+    /// crates/ravel-logseg/src/writer.rs), and the tokenizer bounds word
+    /// tokens with a private 64-byte const scoped to its own function body
+    /// (`TOKEN_MAX_BYTES` inside `tokenizer::tokens`,
+    /// crates/ravel-codec/src/tokenizer.rs) -- neither const is importable
+    /// from here. A caller outside those two paths can pass an
     /// arbitrary-length slice, and this function will stage it as-is.
     pub fn insert(&mut self, column_id: u32, token: &[u8]) {
         self.scratch.clear();
@@ -180,8 +212,10 @@ impl BloomBuilder {
         // Hash each distinct raw key once, then dedup by triple exactly as the
         // old insert-time path did (idempotent for bit-setting, but the
         // distinct-triple count is what sizes the filter). Draining (instead
-        // of borrowing) frees each key's `Box<[u8]>` as soon as it is hashed,
-        // so `staged` and `triples` are never both fully live at once.
+        // of borrowing) frees each key's `Box<[u8]>` as it is hashed, but
+        // `with_capacity` below reserves the full table up front, so `staged`
+        // and `triples` are both fully live once the loop starts -- see the
+        // struct doc for the measured peak and per-key arithmetic.
         let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(self.staged.len());
         for key in self.staged.drain() {
             let mut col = [0u8; 4];
