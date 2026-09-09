@@ -246,12 +246,16 @@ Two carriers feed it, unioned per segment and per column (ADR-0873 decision
   snapshot entry (field 15) that resolution already reads. Because it rides
   those records, it covers the live tail above the fold watermark and
   token-resolved segments, which no fold-built sibling object can;
-- the ADR-0850/0942 `.cstat` entry, joined by the entry identity (ingest hour
-  bucket, shard, writer id, writer epoch, writer sequence), which is the
-  carrier for pre-stamp sealed history and the only carrier for `Bytes`
-  extrema. A declared `Str` column is declined before either carrier is read,
-  since it is projected as a dictionary-encoded string with no scalar form on
-  this path, so `MIN`/`MAX` over one is always answered by the scan.
+- the ADR-0850/0942/1413 `.cstat` entry, joined by the segment's content hash
+  first (`SegmentRef::content_hash`, the ADR-0942/1413 keying scheme for v2
+  whole-tenant and v3 per-part records) and falling back to the entry
+  identity (ingest hour bucket, shard, writer id, writer epoch, writer
+  sequence, the ADR-0850 v1 keying scheme) when no content-hash entry
+  matches, which is the carrier for pre-stamp sealed history and the only
+  carrier for `Bytes` extrema. A declared `Str` column is declined before
+  either carrier is read, since it is projected as a dictionary-encoded
+  string with no scalar form on this path, so `MIN`/`MAX` over one is always
+  answered by the scan.
 
 **The write side of the stamp carrier does not exist.** Nothing in the
 flush or compaction path calls the stamp writers in
