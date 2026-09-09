@@ -365,13 +365,17 @@ impl SpanErasureMatcher {
 /// correctly hide the matching samples while this prefilter skipped the
 /// bucket that should have erased them (a GDPR gap, ADR-0064).
 ///
-/// A windowless request (`has_window() == false`) can match a series
-/// regardless of when its samples were recorded, so it overlaps every
-/// bucket that has any live record at all. A bucket whose live record set
-/// carries no samples (`min_event_ts_ns > max_event_ts_ns`, the empty-parts
-/// sentinel [`live_input_event_bounds`] returns) has nothing left to
-/// physically erase, so this always returns `false` for a windowed
-/// request in that case regardless of the window.
+/// A windowless request (`window_start_ns == 0 && window_end_ns == 0`) can
+/// match a series regardless of when its samples were recorded, so it returns
+/// `true` unconditionally, BEFORE the empty-range sentinel below: it overlaps
+/// every bucket, including one whose live record set carries no samples at all.
+/// That is why the empty-RawL0 case needs the separate caller-side
+/// [`is_empty_raw_l0`] guard rather than relying on this prefilter to skip it.
+/// The sentinel applies to windowed requests only: a bucket whose live record
+/// set carries no samples (`min_event_ts_ns > max_event_ts_ns`, the
+/// empty-parts sentinel [`live_input_event_bounds`] returns) has nothing left
+/// to physically erase, so a windowed request always returns `false` in that
+/// case regardless of the window.
 pub fn bucket_may_overlap(
     min_event_ts_ns: i64,
     max_event_ts_ns: i64,
@@ -1569,6 +1573,25 @@ pub async fn publish_rewrite_record(
         RewriteSupersession::Existing(key) => (Vec::new(), key.clone()),
     };
 
+    // An empty input set with no superseded record key names nothing at all:
+    // `erasure::compute_rewrite_input_set_hash` treats that as a caller
+    // contract violation and panics, and `erasure::validate_rewrite` would
+    // reject the record anyway. The in-crate driver cannot reach this
+    // (`is_empty_raw_l0` skips the bucket before any part is built), but this
+    // function is public, so an external caller passing
+    // `RewriteSupersession::RawL0(vec![])` gets a typed error instead of a
+    // panic in a library.
+    if inputs.is_empty() && superseded_record_key.is_empty() {
+        return Err(MaintainError::Invariant(format!(
+            "erasure rewrite supersession names nothing: empty RawL0 input set with no \
+             superseded record key for tenant {} signal {} shard {} hour {}",
+            hex::encode(bucket.tenant_hash.0),
+            bucket.signal.key_prefix(),
+            bucket.shard,
+            bucket.ingest_hour_bucket
+        )));
+    }
+
     let mut applied_request_ids: Vec<String> =
         build.drops.iter().map(|d| d.request_id.clone()).collect();
     applied_request_ids.sort();
@@ -2740,6 +2763,59 @@ mod tests {
         );
     }
 
+    /// A conserving build whose supersession names nothing -- an empty
+    /// `RawL0` input set with no superseded record key -- must return a typed
+    /// invariant error, not panic inside
+    /// `erasure::compute_rewrite_input_set_hash`. The in-crate driver cannot
+    /// reach this shape (`is_empty_raw_l0` skips the bucket first), so this
+    /// pins the public function's own contract for an external caller.
+    /// Flip-line proof: disabling the `if inputs.is_empty() &&
+    /// superseded_record_key.is_empty()` guard in `publish_rewrite_record`
+    /// makes this panic with `compute_rewrite_input_set_hash: exactly one of
+    /// `inputs` (non-empty) or `superseded_record_key` (non-empty) must be set
+    /// (inputs_present=false, superseded_present=false)`.
+    #[tokio::test]
+    async fn empty_supersession_returns_invariant_error_not_panic() {
+        let store = MemoryStore::new();
+        let clock = FixedClock::new(0);
+        let config = CompactorConfig::default();
+        // Conserving on purpose: 0 + 0 == 0, so the conservation and encode
+        // reconciliation gates both pass and the supersession guard is the
+        // only thing that can reject this build.
+        let build = RewriteBuild {
+            parts: Vec::new(),
+            input_sample_count: 0,
+            output_sample_count: 0,
+            drops: Vec::new(),
+        };
+
+        let err = publish_rewrite_record(
+            &store,
+            &config,
+            &clock,
+            &bucket(),
+            RewriteSupersession::RawL0(Vec::new()),
+            build,
+            0,
+        )
+        .await
+        .expect_err("a supersession that names nothing must abort");
+
+        match err {
+            MaintainError::Invariant(message) => {
+                assert!(
+                    message.contains("erasure rewrite supersession names nothing"),
+                    "unexpected invariant message: {message}"
+                );
+            }
+            other => panic!("expected MaintainError::Invariant, got {other:?}"),
+        }
+        assert!(
+            list_all(&store, "").await.expect("list").is_empty(),
+            "the rejected publish must write nothing"
+        );
+    }
+
     /// A `LeaseCheck` that protects any key under one prefix -- `NoLeases`
     /// alone can never produce a `Held` outcome, so this local double
     /// simulates a legal hold on the fixture bucket.
@@ -3274,8 +3350,14 @@ mod tests {
     }
 
     /// A metrics bucket on a tenant distinct from [`bucket`]'s `acme`, for the
-    /// empty-bucket tests (which never seed, so they must not collide with any
-    /// other test's tenant).
+    /// tests that need a bucket holding no objects at all.
+    ///
+    /// The distinct tenant is not about cross-test isolation: every test here
+    /// builds its own `MemoryStore`, so two tests could share a tenant safely.
+    /// It is about the seeding helpers in this module, which all write into
+    /// [`bucket`]'s tenant. A bucket on any other tenant cannot be reached by
+    /// them, so an empty-bucket test cannot be seeded by accident, and the
+    /// tenant name says which test the bucket belongs to.
     fn empty_bucket(tenant: &str) -> Bucket {
         Bucket::new(TenantId::new(tenant).hash(), Signal::Metrics, SHARD, HOUR)
     }
