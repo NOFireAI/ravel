@@ -116,7 +116,11 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// same `(block, g1, g2)` triple set the old insert-time hashing produced (it
 /// even re-deduplicates by triple, so a BLAKE3 collision between two distinct
 /// raw keys still collapses to one, matching the old distinct-triple count that
-/// sizes the filter).
+/// sizes the filter). Peak memory is higher than staging alone suggests:
+/// `finish` builds the hashed triple set while `staged` is still borrowed, so
+/// both are live together, roughly 110 bytes per distinct key (the raw
+/// `column_id_le || token` entry plus its 24-byte triple), not the ~84 bytes
+/// `staged` alone would cost.
 pub struct BloomBuilder {
     seed: u64,
     /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
@@ -416,13 +420,16 @@ mod proptests {
         // Byte-for-byte identical to the pre-#1518 output, over random column
         // ids, token lengths (including empty and >64 bytes), seeds, insert
         // orders, and high duplicate densities (a small key pool picked many
-        // times). Insert order must not change the bytes.
+        // times). Insert order must not change the bytes. The pool goes up to
+        // 600 distinct keys so a case routinely lands above the 512-bit floor
+        // (n > 53) and exercises `block_count > 1`, not just the single-block
+        // geometry every case sat at when the pool topped out at 24.
         #[test]
         fn byte_identical_to_reference(
             pool in proptest::collection::vec(
                 (0u32..8u32, proptest::collection::vec(any::<u8>(), 0..80usize)),
-                1..24usize),
-            picks in proptest::collection::vec(any::<usize>(), 0..800usize),
+                1..600usize),
+            picks in proptest::collection::vec(any::<usize>(), 0..1600usize),
             seed in any::<u64>(),
         ) {
             let inserts: Vec<(u32, Vec<u8>)> = picks
