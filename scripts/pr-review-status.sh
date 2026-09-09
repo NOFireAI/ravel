@@ -24,6 +24,21 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Runs the merge-base guard and keeps both halves of its answer. It is a
+# function so the exit code survives: `$?` read after an `if`/`elif` reports the
+# test, not the command. The guard asks git about whatever repository the cwd
+# belongs to while every other check here is pinned to ${repo} by `gh --repo`,
+# so it runs with the cwd pinned to this script's own checkout; otherwise the
+# two halves of the verdict can be about different repositories.
+guard_rc=0
+guard_out=""
+merge_base_guard() {
+  guard_rc=0
+  guard_out="$(cd "${script_dir}/.." && \
+    "${script_dir}/guards/assert-fresh-merge-base.sh" "${pr}" 2>&1)" || guard_rc=$?
+  return "${guard_rc}"
+}
+
 pr="${1:?usage: pr-review-status.sh <pr-number> [--confirm-addressed]}"
 repo="NOFireAI/ravel"
 confirm_addressed=0
@@ -222,9 +237,13 @@ elif [[ "${cr_outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
 # no CI of its own, so a PR that passed against an older base can still break
 # it, and a gate added to `main` after the PR went green has never run against
 # the PR at all. Costs one fetch.
-elif ! stale_base="$("${script_dir}/guards/assert-fresh-merge-base.sh" "${pr}" 2>&1)"; then
-  echo "  -> merge base is behind origin/main; rebase and let CI re-run before merging"
-  echo "${stale_base//guard: /     }"
+elif ! merge_base_guard; then
+  if [[ "${guard_rc}" == "1" ]]; then
+    echo "  -> merge base is behind origin/main; rebase and let CI re-run before merging"
+  else
+    echo "  -> could not check merge-base freshness (guard exit ${guard_rc}); check by hand before merging"
+  fi
+  echo "${guard_out//guard: /     }"
 elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
   echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
 else

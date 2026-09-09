@@ -292,7 +292,10 @@ check_risk "null body is tolerated" "|active" \
 # --- end-to-end verdict, pr-review-status.sh ------------------------------
 #
 # The count above only matters if it flips the verdict. These run the real
-# script against fixtures with a stand-in `gh` on PATH: no network, no token.
+# script against fixtures with stand-in `gh` and `git` on PATH: no network, no
+# token. The `git` stand-in exists because the script now calls the merge-base
+# guard, which fetches; without it these cases would reach the network and
+# their verdict would depend on the state of whatever repository they ran in.
 
 E2E_DIR="$(mktemp -d)"
 trap 'rm -rf "${E2E_DIR}"' EXIT
@@ -310,6 +313,43 @@ case "$*" in
 esac
 SHIM
 chmod +x "${E2E_DIR}/bin/gh"
+
+# Stand-in for git, so the merge-base guard the script calls runs offline and
+# deterministically. Fresh by default; E2E_GIT_STALE=1 puts the pull request's
+# base three commits behind main. The unseen-commit subjects carry an escape
+# sequence and a carriage return on purpose: the guard is supposed to strip
+# both before the text reaches a terminal, and a test below checks that it did.
+cat >"${E2E_DIR}/bin/git" <<'SHIM'
+#!/usr/bin/env bash
+tip=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+old=cccccccccccccccccccccccccccccccccccccccc
+resolve() {
+  case "$1" in
+    *freshness-check*) printf '%s' "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ;;
+    [0-9a-f][0-9a-f]*) printf '%s' "$1" ;;
+    *) printf '%s' "${tip}" ;;
+  esac
+}
+case "$1" in
+  fetch|update-ref|ls-remote) exit 0 ;;
+  rev-parse)
+    if [[ "$2" == "--short" ]]; then
+      resolve "$3" | cut -c1-8
+    else
+      resolve "$2"
+      printf '\n'
+    fi
+    ;;
+  merge-base)
+    if [[ "${E2E_GIT_STALE:-0}" == "1" ]]; then printf '%s\n' "${old}"
+    else printf '%s\n' "${tip}"; fi
+    ;;
+  rev-list) printf '3\n' ;;
+  log) printf 'ccccccc1 innocent\033[31mSPOOFED\033[0m\rsubject\ncccccc2 second\ncccccc3 third\n' ;;
+  *) echo "unexpected git call: $*" >&2; exit 91 ;;
+esac
+SHIM
+chmod +x "${E2E_DIR}/bin/git"
 
 # Everything except the review body is held constant and clean: CI green,
 # mergeState CLEAN, one COMMENTED review at head, zero inline comments, and a
@@ -372,7 +412,7 @@ check_eq "walkthrough-only body: verdict is unchanged clean" \
   "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
   "$(printf '%s\n' "${clean_out}" | sed -n 2p)"
 check_eq "walkthrough-only body: merge command still printed" \
-  "  -> gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${clean_out}" | sed -n 3p)"
 
 # The #908 regression: same PR, same green CI, same zero inline comments, one
@@ -392,7 +432,7 @@ check_eq "outside-diff body finding: --confirm-addressed clears it" \
   "  -> clean (operator confirmed all 1 outside-diff body finding(s) addressed): CI green, CodeRabbit's risk line names the current head" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 2p)"
 check_eq "outside-diff body finding: --confirm-addressed prints the merge command" \
-  "  -> gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 3p)"
 
 # --- risk-line freshness end-to-end (issue #950) --------------------------
@@ -428,6 +468,10 @@ check_eq "stale risk line: no merge command offered" \
 FLIP_DIR="${E2E_DIR}/flip"
 mkdir -p "${FLIP_DIR}"
 ln -s "$(cd "$(dirname "$0")" && pwd)/lib" "${FLIP_DIR}/lib"
+# The copy resolves its own script_dir, so the guard has to be reachable from
+# there too; without this the flipped script cannot run the guard, reads that
+# as a refusal, and the case proves nothing.
+ln -s "$(cd "$(dirname "$0")" && pwd)/guards" "${FLIP_DIR}/guards"
 sed 's/^elif .*# PROVE-FLIP$/elif false; then/' \
   "$(dirname "$0")/pr-review-status.sh" >"${FLIP_DIR}/pr-review-status.sh"
 if grep -q '^elif false; then$' "${FLIP_DIR}/pr-review-status.sh"; then
@@ -446,7 +490,7 @@ check_eq "prove: the pre-#950 rule calls the stale fixture clean" \
   "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
   "$(printf '%s\n' "${flipped_out}" | sed -n 2p)"
 check_eq "prove: the pre-#950 rule even offers the merge command" \
-  "  -> gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
+  "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${flipped_out}" | sed -n 3p)"
 
 # Degraded mode 1: no CodeRabbit comment at all. Nothing to parse, and the
@@ -508,6 +552,48 @@ unset E2E_ISSUE_COMMENTS
 check_eq "multiple walkthroughs: the newest one decides, fresh clears" \
   "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
   "$(printf '%s\n' "${multi_fresh_out}" | sed -n 2p)"
+
+# --- merge-base freshness end-to-end --------------------------------------
+#
+# Same clean fixture throughout; the only thing that moves is what git says
+# about the base. The fresh direction is already covered by the very first e2e
+# case, which comes back clean with a merge command, so these two cover the
+# ways the check can refuse, and the third covers not being able to check.
+
+# Exported, not just assigned: unlike E2E_ISSUE_COMMENTS, which e2e() reads
+# itself, this one is read by the stand-in git two processes down.
+export E2E_GIT_STALE=1
+stale_base_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_GIT_STALE
+
+check_eq "stale merge base: blocks a verdict that is otherwise clean" \
+  "  -> merge base is behind origin/main; rebase and let CI re-run before merging" \
+  "$(printf '%s\n' "${stale_base_out}" | sed -n 2p)"
+check_eq "stale merge base: no merge command offered" \
+  "0" \
+  "$(printf '%s\n' "${stale_base_out}" | grep -c 'gh pr merge')"
+# The stand-in git puts an escape sequence and a carriage return in the first
+# unseen subject. Both must be gone by the time the text is printed: a subject
+# is attacker-controlled and this output is what the operator reads before
+# deciding to merge.
+check_eq "stale merge base: printed commit subjects carry no control bytes" \
+  "0" \
+  "$(printf '%s' "${stale_base_out}" | LC_ALL=C tr -cd '\000-\010\013-\037\177' | wc -c | tr -d ' ')"
+
+# A guard that cannot run at all must not be reported as a stale base: one is
+# fixed by rebasing and the other by fixing the checkout, and the headline is
+# the line the operator acts on.
+NOGUARD_DIR="${E2E_DIR}/noguard"
+mkdir -p "${NOGUARD_DIR}"
+ln -s "$(cd "$(dirname "$0")" && pwd)/lib" "${NOGUARD_DIR}/lib"
+cp "$(dirname "$0")/pr-review-status.sh" "${NOGUARD_DIR}/pr-review-status.sh"
+E2E_SCRIPT="${NOGUARD_DIR}/pr-review-status.sh"
+noguard_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_SCRIPT
+
+check_eq "a guard that cannot run is not reported as a stale base" \
+  "  -> could not check merge-base freshness (guard exit 127); check by hand before merging" \
+  "$(printf '%s\n' "${noguard_out}" | sed -n 2p)"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]

@@ -17,6 +17,12 @@
 # ALLOW_STALE_MERGE_BASE=1 to proceed anyway (a docs-only branch whose CI you
 # have reason to trust across the gap).
 #
+# Exit codes: 0 the base is current (or the override is set), 1 the base is
+# behind, 2 the question could not be answered (bad argument, no such pull
+# request, git failed). A caller that only needs "may I merge" can treat any
+# non-zero as no; one that reports to a human should say which of the two it
+# got, since "behind" and "could not tell" have different fixes.
+#
 # Fetches with an explicit destination refspec rather than reading FETCH_HEAD.
 # `git fetch origin main <other-ref>` leaves FETCH_HEAD naming main, so a check
 # written that way compares main with itself and reports success for any branch.
@@ -28,13 +34,13 @@ branch=${3:-main}
 
 if [ -z "$pr" ]; then
   echo "guard: usage: assert-fresh-merge-base.sh <pr-number> [remote] [branch]" >&2
-  exit 1
+  exit 2
 fi
 
 case "$pr" in
   *[!0-9]* | '')
     echo "guard: pr-number must be numeric, got '$pr'" >&2
-    exit 1
+    exit 2
     ;;
 esac
 
@@ -66,19 +72,19 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 # One fetch for both refs: two round trips to the same remote buy nothing, and
 # callers document this guard as costing one.
-git fetch "$remote" "+${branch}:${tip_ref}" "+refs/pull/${pr}/head:${local_ref}" \
+git fetch -- "$remote" "+${branch}:${tip_ref}" "+refs/pull/${pr}/head:${local_ref}" \
   >/dev/null 2>&1 || {
-  if ! git ls-remote --exit-code "$remote" "refs/pull/${pr}/head" >/dev/null 2>&1; then
+  if ! git ls-remote --exit-code -- "$remote" "refs/pull/${pr}/head" >/dev/null 2>&1; then
     echo "guard: $remote has no refs/pull/${pr}/head (is $pr a pull request on $remote?)" >&2
   else
     echo "guard: git fetch $remote ($branch, refs/pull/${pr}/head) failed" >&2
   fi
-  exit 1
+  exit 2
 }
 
-tip=$(git rev-parse "$tip_ref") || exit 1
-head=$(git rev-parse "$local_ref") || exit 1
-base=$(git merge-base "$tip" "$head") || exit 1
+tip=$(git rev-parse "$tip_ref") || exit 2
+head=$(git rev-parse "$local_ref") || exit 2
+base=$(git merge-base "$tip" "$head") || exit 2
 
 if [ "$tip" = "$base" ]; then
   echo "guard: PR #$pr merge base is the current $remote/$branch ($(git rev-parse --short "$tip"))"
@@ -87,7 +93,7 @@ fi
 
 behind=$(git rev-list --count "$base".."$tip") || {
   echo "guard: git rev-list --count $base..$tip failed" >&2
-  exit 1
+  exit 2
 }
 echo "guard: PR #$pr is $behind commit(s) behind $remote/$branch." >&2
 echo "guard: its CI ran against $(git rev-parse --short "$base"), not $(git rev-parse --short "$tip")." >&2
@@ -96,7 +102,7 @@ echo "guard: most recent unseen commits:" >&2
 # log from here, so strip the control bytes that could rewrite what the reader
 # sees. Tab and newline stay.
 git log --oneline --max-count=10 "$base".."$tip" 2>/dev/null |
-  LC_ALL=C tr -d '\001-\010\013\014\016-\037\177' |
+  LC_ALL=C tr -d '\000-\010\013-\037\177' |
   sed 's/^/guard:   /' >&2
 if [ "$behind" -gt 10 ]; then
   echo "guard:   ... and $((behind - 10)) more" >&2
