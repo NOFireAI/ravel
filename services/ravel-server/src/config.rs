@@ -3890,6 +3890,22 @@ impl Cli {
             );
         }
 
+        // `POST /mcp` is mounted only from inside the block `start` (lib.rs)
+        // guards with `config.mode.installs_query_audit_pipeline()`, the same
+        // predicate that gates the SQL, PromQL, and analytics query surfaces:
+        // under `--mode gateway` or `--mode maintain` that block never runs,
+        // so the route never mounts and `--mcp` is silently inert. Refuse it
+        // at startup so an operator cannot believe MCP is being served when
+        // nothing serves it.
+        if self.mcp && !self.mode.installs_query_audit_pipeline() {
+            anyhow::bail!(
+                "--mcp is only supported under --mode all or --mode query: POST /mcp is mounted \
+                 only by a query-serving process, so under --mode {:?} this flag would be \
+                 silently inert. Drop --mcp, or run --mode all or --mode query.",
+                self.mode
+            );
+        }
+
         // A listener with no resolver installed on it is a dead flag: it binds
         // a socket that answers every request as unauthenticated, giving a
         // reader (or a future refactor) no signal that mTLS was ever intended
@@ -8373,6 +8389,40 @@ mod tests {
         ])
         .validate()
         .expect("a non-empty allowlist admits public listeners");
+    }
+
+    #[test]
+    fn mcp_in_a_non_query_mode_is_refused() {
+        // POST /mcp is mounted only from inside lib.rs's
+        // `installs_query_audit_pipeline` block (Mode::All | Mode::Query), so
+        // under gateway or maintain mode --mcp would be silently inert.
+        let err = cli(&["--mode", "gateway", "--mcp"])
+            .validate()
+            .expect_err("--mcp under gateway mode must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--mcp"), "error names the flag: {msg}");
+        assert!(
+            msg.contains("--mode all") && msg.contains("--mode query"),
+            "error names the supported modes: {msg}"
+        );
+
+        let err = cli(&["--mode", "maintain", "--mcp"])
+            .validate()
+            .expect_err("--mcp under maintain mode must refuse startup");
+        let msg = err.to_string();
+        assert!(msg.contains("--mcp"), "error names the flag: {msg}");
+    }
+
+    #[test]
+    fn mcp_in_query_and_all_modes_is_accepted() {
+        // Positive control so the mode check above cannot be vacuous: the two
+        // query-serving modes still start with --mcp.
+        cli(&["--mode", "all", "--mcp"])
+            .validate()
+            .expect("--mcp under --mode all is accepted");
+        cli(&["--mode", "query", "--mcp"])
+            .validate()
+            .expect("--mcp under --mode query is accepted");
     }
 
     #[test]
