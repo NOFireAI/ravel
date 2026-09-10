@@ -205,8 +205,14 @@ undeletable even by Maintain.
 shard (`t/*/u/*/0000/*`) is deny-delete for every role including Maintain, so a
 legal hold cannot be destroyed. The query-audit shard (`t/*/u/*/0001/*`) is
 compacted and age-swept on a 90-day window by the Maintain process, so Maintain
-alone grants delete on it. The two are disjoint key paths, so neither grant
-reaches the other shard.
+alone grants delete on it. The two shard paths are disjoint, but Maintain's
+level-based delete grants are not confined to them: an audit object is keyed
+`t/<hash>/u/<level>/<shard>/...`, so `t/*/*/l0/*`, `t/*/*/c/*` and
+`t/*/*/l1/*` match legal-hold keys too. What keeps a legal hold safe is the
+explicit `Deny`, which names both `s3:DeleteObject` and
+`s3:DeleteObjectVersion` on that shard, and a `Deny` overrides an `Allow` only
+for the actions it names. If you edit these policies, keep the deny's action
+list at least as wide as every delete action an `Allow` grants on those keys.
 
 **Tenant discovery needs a bare prefix entry.** Discovery lists the bare,
 delimited `t/` prefix rather than a per-tenant subpath, and under AWS
