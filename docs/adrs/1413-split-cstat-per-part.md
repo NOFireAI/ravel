@@ -87,9 +87,8 @@ message SnapshotPartRef {
   // ... existing fields 1-6 unchanged ...
   // Additive, ADR-1413. The per-part column-statistics object covering
   // exactly this part's segments. Absent (proto3 default) means this part
-  // has no per-part statistics; the reader falls back to the whole-object
-  // ref at SnapshotHead field 13 (ADR-0942), then field 11 (ADR-0850), then
-  // to scan. Absence is never an error.
+  // has no per-part statistics and is scanned: under decision 6 there is no
+  // whole-object fallback. Absence is never an error.
   SnapshotColumnStatsPartRef column_stats = 7;
 }
 ```
@@ -116,10 +115,15 @@ keeps the `LoadedColumnStats` shape (a map keyed by content hash), assembled
 from the covered parts, so `unique_column_stat` and every caller in
 `ravel-sql` are unchanged.
 
-Fallback order per part: v3 per-part object, else the whole-object v2 (field
-13), else v1 (field 11), else scan, each under ADR-0942's reader rule that a
-version mismatch, a `blake3` mismatch or a decode failure subtracts that
-object's coverage and scans, never errors. This ADR adds one thing to that
+Per-part resolution, **as amended by decision 6**: a covered part's v3 object
+under field 7 decodes, or that part is scanned. There is no whole-object
+fallback and the accepted version set is `{3}`. ADR-0942's reader rule still
+governs the failure path, so a version mismatch, a `blake3` mismatch or a
+decode failure subtracts that part's coverage and scans, never errors.
+
+~~Fallback order per part: v3 per-part object, else the whole-object v2 (field
+13), else v1 (field 11), else scan.~~ Superseded by decision 6; kept as the
+record of what this ADR originally specified. This ADR adds one thing to that
 rule: a decode failure of an object HEAD references is logged once per
 (tenant, signal, key) at WARN with the declared size and the ceiling
 (landed separately as the observability half of #1400). Absence stays
@@ -137,9 +141,18 @@ being well inside what the reader can safely inflate. One fixed ceiling,
 shared by the v1/v2 whole-object path and the v3 per-part path, is simpler
 and cannot itself be the reason a legal part is refused.
 
-The whole-object v1/v2 ceiling stays at 256 MiB, the same value. Objects
-over it remain unreadable, which is the state today; the per-part path is
-how they become readable, by being re-folded.
+**Amended by decision 6.** ~~The whole-object v1/v2 ceiling stays at 256 MiB,
+the same value. Objects over it remain unreadable, which is the state today;
+the per-part path is how they become readable, by being re-folded.~~ There is
+no whole-object path to hold a ceiling: the fold writes only v3, so 256 MiB is
+now simply the per-part ceiling. Whole-object artifacts already on the store
+stay unread and are swept once nothing references them. The re-fold is still
+how a tenant's statistics become readable, which is the sentence above that
+survives.
+
+The paragraph before this one keeps its reference to the v1/v2 path because it
+explains where the constant CAME FROM, which is a fact about the ADR's
+reasoning rather than a claim about current behaviour.
 
 ### 4. The writer degrades before it refuses
 
@@ -191,7 +204,10 @@ eviction; per-part entries return it to ordinary LRU granularity.
 
 ### 6. v3 is the only published version: fields 11 and 13 are retired now
 
-Amends decision 3 and the dual-publish item of the migration plan below.
+Amends decision 2's per-part resolution order, decision 3, decision 1's
+illustrative proto comment, the data-flow diagram, the verification
+obligations, and the dual-publish item of the migration plan below. Every one
+of those described the dual-publish/dual-read behaviour this decision retires.
 
 The fold publishes **only** the v3 per-part object under
 `SnapshotPartRef.column_stats` (field 7). It no longer writes the v1
@@ -230,9 +246,12 @@ per run, and removes the only consumer of the dropped-reference defect: a
 field-13 reference that is never recorded costs nothing when field 13 is never
 written.
 
-**Field numbers stay frozen.** 11 and 13 are marked `reserved` in
-`proto/ravel/catalog.proto` and are never reused. Freezing field numbers is
-independent of backward compatibility and still binds: a reused number
+**Field numbers stay frozen.** The implementing change (#1600) marks 11 and 13
+`reserved` in `proto/ravel/catalog.proto`; today they are still declared as
+`SnapshotColumnStatsRef column_stats = 11` and
+`SnapshotColumnStatsPartRef column_stats_part = 13`, and this ADR does not
+change the schema. Once reserved they are never reused. Freezing field numbers
+is independent of backward compatibility and still binds: a reused number
 misdecodes silently rather than failing, which no release boundary makes safe.
 
 ## Rejected alternatives
@@ -344,7 +363,7 @@ flowchart LR
   subgraph query["query"]
     R[resolve window] --> C{covered parts}
     C -->|per part| L[load v3 object<br/>under per-part ceiling]
-    C -->|no field 7| F["fallback: field 13 v2, then field 11 v1, then scan"]
+    C -->|no field 7, or decode fails| F["scan that part<br/>(no whole-object fallback, decision 6)"]
     L --> M[LoadedColumnStats<br/>content-hash keyed]
     F --> M
     M --> U[unique_column_stat per segment]
@@ -367,9 +386,15 @@ flowchart LR
   a reader's ceiling is rejected.
 - A query over a window covering k of n parts issues exactly k per-part
   GETs and zero whole-object GETs; pinned to the count, not `< n`.
-- An old reader (v2-only) against a dual-published snapshot reads field 13
-  and gets the current behaviour; a new reader against an old snapshot
-  (no field 7) falls back to field 13. Both pinned.
+- A fold writes exactly one `.cstat` per part and NO whole-object object:
+  the resulting HEAD has field 7 set on every part and neither field 11 nor
+  field 13 set. Pinned to the object count, not just the fields (decision 6).
+- A HEAD carrying only field 11 or only field 13, i.e. a snapshot folded
+  before decision 6, yields no statistics and the query scans, without error
+  and without a GET of those objects. This is the behaviour change and needs
+  its own test in both directions.
+- Sweep reclaims a now-unreferenced former whole-object artifact and spares a
+  referenced v3 per-part object, in one test so the contrast is visible.
 - Resident bytes after loading k parts equal the sum of those k decoded
   sizes exactly, and eviction under the carve removes whole parts in LRU
   order.
