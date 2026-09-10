@@ -511,8 +511,11 @@ pub struct ServerConfig {
 /// issue #1291 configures.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
-/// Upper bound accepted for `--shutdown-timeout`. A value beyond this is
-/// rejected at startup rather than carried into shutdown, where
+/// Upper bound accepted for `--shutdown-timeout`. The CLI rejects a larger
+/// value at flag parse (`Cli::parse_shutdown_timeout`); `start` copies the
+/// public [`ServerConfig::shutdown_timeout`] field verbatim with no further
+/// check, so a library embedder that sets that field directly is the only
+/// caller who can carry a larger value into shutdown, where
 /// [`listener_join_budget`] multiplies it by four and `Duration`'s checked
 /// arithmetic would panic on an absurd value (a duration whose seconds exceed a
 /// quarter of `u64::MAX`), turning a fat-fingered flag into a crash at the
@@ -3305,13 +3308,42 @@ mod shutdown_drain_tests {
             "the readiness settle interval must be smaller than the drain timeout"
         );
         // The heartbeat stop runs AHEAD of the bounded drain, so what has to
-        // stay below the grace period is the sum of the two bounds, not
-        // `--shutdown-timeout` alone.
-        let worst_case = DEFAULT_SHUTDOWN_TIMEOUT + heartbeat_stop_budget(DEFAULT_SHUTDOWN_TIMEOUT);
+        // stay below the grace period is that pre-drain segment plus
+        // `--shutdown-timeout`, not `--shutdown-timeout` alone. `Running::shutdown`
+        // runs the heartbeat stop and the readiness settle together under
+        // `tokio::join!`, so that segment costs the MAX of the two bounds, not
+        // their sum; the `None` (non-distributed) arm pays the settle alone,
+        // which is the smaller of the two, so the max is the true worst case.
+        let pre_drain =
+            heartbeat_stop_budget(DEFAULT_SHUTDOWN_TIMEOUT).max(DEFAULT_DRAIN_SETTLE_INTERVAL);
+        let worst_case = DEFAULT_SHUTDOWN_TIMEOUT + pre_drain;
+        // Pin the exact figure, not merely that it stays under the grace period:
+        // an operator sizes `terminationGracePeriodSeconds` against this number,
+        // so the test must fail if any input moves it even while it stays below
+        // 30s. 25s drain + max(2.5s heartbeat stop, 0.5s settle) = 27.5s.
+        assert_eq!(
+            worst_case,
+            Duration::from_millis(27_500),
+            "the in-shutdown worst case (drain budget plus the pre-drain heartbeat-stop/settle \
+             segment) must be exactly 27.5s at the shipped defaults, got {worst_case:?}",
+        );
         assert!(
             worst_case < K8S_DEFAULT_GRACE_PERIOD,
-            "the heartbeat stop bound plus --shutdown-timeout ({worst_case:?}) must stay below \
+            "the pre-drain segment plus --shutdown-timeout ({worst_case:?}) must stay below \
              the Kubernetes default terminationGracePeriodSeconds ({K8S_DEFAULT_GRACE_PERIOD:?})",
+        );
+        // After `shutdown` returns, `main` flushes the OTLP trace exporter, whose
+        // provider shutdown the pinned OpenTelemetry SDK hard-caps at 5s. The full
+        // SIGTERM-to-exit worst case is therefore 32.5s, the figure
+        // docs/architecture.md tells the operator to size the pod grace period
+        // above. Pinned here so that doc figure cannot drift from the code.
+        const TRACE_EXPORTER_FLUSH_CAP: Duration = Duration::from_secs(5);
+        assert_eq!(
+            worst_case + TRACE_EXPORTER_FLUSH_CAP,
+            Duration::from_millis(32_500),
+            "the documented SIGTERM-to-exit worst case (docs/architecture.md) must be 32.5s, \
+             got {:?}",
+            worst_case + TRACE_EXPORTER_FLUSH_CAP,
         );
     }
 }

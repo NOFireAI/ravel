@@ -429,17 +429,21 @@ async fn heartbeat_worker_record_is_deleted_on_shutdown() {
     );
 }
 
-/// The durable flush must run BEFORE the listener join, so a connection held
-/// open past `--shutdown-timeout` cannot cost buffered records: a query can run
-/// to its own wall deadline, which the shipped defaults put ABOVE
-/// `--shutdown-timeout`. A record is buffered, then a second request is left
-/// in-flight on a raw socket so the HTTP listener cannot close; with a short
-/// shutdown timeout the listener join is abandoned at its sub-budget, yet the
-/// record is already durable and shutdown still returns.
+/// The listener join is bounded by its own sub-budget, so a connection held
+/// open past that sub-budget cannot cost buffered records: the join is
+/// abandoned, the drain proceeds, and the record is durable when shutdown
+/// returns. A record is buffered, then a second request is left in-flight on a
+/// raw socket so the HTTP listener cannot close; with a short shutdown timeout
+/// the listener join is abandoned at its sub-budget, yet the record is durable
+/// and shutdown still returns.
 ///
-/// Reverting the ordering (flush after the join, as before this change) fails
-/// this test: the stuck connection consumes the whole budget, the drain times
-/// out before the flush, and the buffered record is lost.
+/// This pins the SUB-BUDGET half of the drain's ordering guarantee, not the
+/// flush-before-join half. On a `MemoryStore` the flush is instant, so it fits
+/// in the one-fifth reserve whether it runs before the join or after it: moving
+/// the bounded join ahead of the three `flush_all` calls leaves this test green.
+/// Only removing the join's sub-budget (an unbounded join ahead of the flush)
+/// loses the record here. The ordering itself is discriminated by
+/// [`ingest_flush_is_attempted_before_the_listener_join`].
 #[tokio::test]
 async fn buffered_record_is_flushed_before_a_stuck_listener_join() {
     use tokio::io::AsyncWriteExt;
@@ -517,6 +521,111 @@ async fn buffered_record_is_flushed_before_a_stuck_listener_join() {
 
     // Hold the stuck socket open until after the assertions.
     drop(stuck);
+}
+
+/// The three `flush_all` calls run BEFORE the listener join, not merely within
+/// the same overall `--shutdown-timeout`. Moving the bounded join ahead of the
+/// flush (keeping its four-fifths sub-budget) is caught by nothing else in this
+/// suite, because on a `MemoryStore` the post-join flush still fits in the
+/// one-fifth reserve; a real multi-shard flush against S3 need not, so a future
+/// refactor that reorders them would silently give the flush only the reserve
+/// and lose records under load while the suite stayed green.
+///
+/// This pins the order directly. A `FaultStore` hold on the metrics l0 PUT
+/// makes the flush's arrival observable through `wait_until_held`, and a stuck
+/// in-flight request makes the listener join block for its whole sub-budget.
+/// With the flush first (shipped), its PUT is issued and held at once, so the
+/// wait below returns promptly. With the join moved ahead of the flush, the PUT
+/// is not issued until the join abandons at four-fifths of a deliberately large
+/// `--shutdown-timeout` (80s), far past the small ceiling below, so the wait
+/// expires and the test fails. The margin is 80s against the sub-second cost of
+/// issuing one PUT, so the outcome does not depend on which future a loaded
+/// machine polls first.
+#[tokio::test]
+async fn ingest_flush_is_attempted_before_the_listener_join() {
+    use tokio::io::AsyncWriteExt;
+
+    /// Large, so the listener-join sub-budget (four-fifths, 80s) dwarfs the
+    /// sub-second cost of issuing one PUT: "the PUT was held promptly"
+    /// discriminates the order by an enormous margin, not a fine one.
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(100);
+    /// A generous ceiling on issuing one held PUT, far below the 80s the
+    /// reordered code would make this wait on, so no machine load closes the gap.
+    const FLUSH_OBSERVE_BUDGET: Duration = Duration::from_secs(10);
+
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+    let running = start_server_configured(store.clone(), Mode::Gateway, None, |config| {
+        config.shutdown_timeout = SHUTDOWN_TIMEOUT;
+    })
+    .await;
+    let http_addr = running.http_addr;
+    let base = format!("http://{http_addr}");
+    let client = reqwest::Client::new();
+
+    // Buffer a record (acked at enqueue, nothing durable yet).
+    let request = export_request("drained_metric", "demo", 7.0, now_ns());
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(request.encode_to_vec())
+        .send()
+        .await
+        .expect("buffered export request succeeds");
+    assert_eq!(response.status(), 200, "buffered export should be accepted");
+
+    // A raw request whose body never completes, so the HTTP listener has an
+    // in-flight request and its join blocks for the whole sub-budget.
+    let mut stuck = tokio::net::TcpStream::connect(http_addr)
+        .await
+        .expect("connect a raw socket to the http listener");
+    let partial = format!(
+        "POST /v1/metrics HTTP/1.1\r\nHost: {http_addr}\r\nauthorization: Bearer {TOKEN}\r\n\
+         content-type: application/x-protobuf\r\nx-ravel-ingest-mode: buffered\r\n\
+         content-length: 100000\r\n\r\n"
+    );
+    stuck
+        .write_all(partial.as_bytes())
+        .await
+        .expect("send request headers");
+    stuck
+        .write_all(&[0u8; 8])
+        .await
+        .expect("send a partial body");
+    stuck.flush().await.expect("flush the partial request");
+
+    // Armed only now: no l0 metrics object is written before shutdown, so this
+    // gate holds exactly the drain's first flush PUT and no earlier call.
+    let gate = faults.hold(Op::Put, Some(metrics_l0_prefix()), Occurrence::Always);
+
+    let shutdown = tokio::spawn(async move { running.shutdown().await });
+
+    // The flush is the FIRST drain step, so its metrics PUT is issued and held
+    // at once. Reordered behind the stuck-listener join, it would not be issued
+    // until the join abandons at four-fifths of SHUTDOWN_TIMEOUT (80s), far past
+    // this ceiling, and this wait would expire.
+    tokio::time::timeout(FLUSH_OBSERVE_BUDGET, gate.wait_until_held(1))
+        .await
+        .expect(
+            "the ingest flush PUT must be issued before the listener join; a wait that expires \
+             here means the join was moved ahead of the flush and consumed the budget first",
+        );
+    assert_eq!(
+        gate.held_count(),
+        1,
+        "exactly the drain's metrics flush PUT must be held"
+    );
+
+    // Release the held PUT so the detached flush can unwind, then abandon the
+    // shutdown task rather than wait out the 80s stuck-listener join for a
+    // result already asserted.
+    for id in gate.held() {
+        assert!(gate.release(id), "releasing a held call must succeed");
+    }
+    drop(stuck);
+    shutdown.abort();
 }
 
 /// The ADR-0071 heartbeat record must be deleted BEFORE the listeners close, so
