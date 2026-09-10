@@ -309,7 +309,7 @@ each degraded path resolves) is in docs/catalog-and-mvcc.md.
 
 ## Recent-hours read path
 
-`max_segments` (default 1024) caps only the sealed, below-watermark set a
+`max_segments` (default 1,000,000) caps only the sealed, below-watermark set a
 resolve extracts from snapshot parts. Recent segments listed live above the
 fold watermark and token-resolved segments from an explicit
 `min_commit_token` are exempt from that cap, so a hot tenant's open hour and a
@@ -406,12 +406,16 @@ tiers) is predicate-granular deletion built on the same durable-transaction,
 logical-exclusion, physical-removal shape as every other deletion. Query
 exclusion is immediate and cache-tight: no query whose snapshot resolves after
 the request ack returns matching records, from store or any cache tier, and
-in-flight queries drain within the query deadline, which is at most
-`max_query_duration`. The erasure stage bounds are a guarantee, not a target:
+in-flight queries drain within the query deadline, the engine's enforced query
+timeout, 11 min by default. That deadline is a distinct quantity from
+`max_query_duration`, the GC protection budget it fits under, 1 h by default:
+the first is what the engine cancels a query at, the second is how long the
+sweeps keep an input readable for a query that pinned it. Sizing a drain
+window uses the first. The erasure stage bounds are a guarantee, not a target:
 
 | Stage | Guarantee | Worst-case bound (defaults) |
 |---|---|---|
-| Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within the query deadline (30 s by default, never more than `max_query_duration`, 1 h) |
+| Query exclusion | No query whose snapshot resolves after the request ack returns matching records, from store or any cache tier | immediate; all in-flight queries drain within the query deadline, the engine's enforced query timeout, 11 min by default, validated at startup against `max_query_duration`, the GC protection budget it fits under, 1 h by default |
 | Rewrite complete (`.done`) | Every record that existed when the request was acknowledged is gone from every live commit-record segment a snapshot resolves, verified through the catalog resolver. A bucket still open at the ack is covered once it seals: completion waits for that seal and the rewrite that follows it rather than excluding the bucket. Records ingested after the ack are outside the request's scope. Index entries and derived datasets carry no subject values, so they are free of matching records by construction | `erasure_rewrite_deadline`, default 72 h; a pending request older than this raises an alarm metric. The wait for a bucket open at the ack is bounded by `max_ingest_lag` + one bucket span + `max_flush_lifetime` + `clock_skew_allowance` (4 h 5 min with defaults), well inside that deadline |
 | Physical bytes gone from the bucket | Superseded inputs swept | `.done` + `protection_horizon` (default `max_query_duration` + `grace` + `clock_skew_allowance` = 1 h + 24 h + 5 min) + one sweep interval (default 5 min); with defaults, about four days end to end (72 h + 25 h 5 min + 5 min) |
 | Physical bytes gone from query-node disk caches | Non-durable local copies aged out | sweep + disk-tier entry max-age (24 h); or immediately, by deleting cache directories (ADR-0046: a node with its cache directory deleted mid-flight answers every query correctly) |
