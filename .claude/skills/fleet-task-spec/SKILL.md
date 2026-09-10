@@ -371,16 +371,17 @@ cannot be made. Healthy live task: `http=200 bytes=784005`. Dead box:
 and cancel-and-redispatch on an authorized zero rather than waiting for
 the ceiling.
 
-The size alone is NOT the signal, and reading it that way is how this
-was first written down here. With the operator token the endpoint answers
-`200` with the body `unauthorized`, which is exactly 13 bytes: through
-`wc -c` that reads as a plausible small measurement rather than as an
-error, and a probe built on it alarms on its first sample against any
-task, healthy or dead. It was caught only because a task that had
-finished SUCCESSFULLY also read 13 bytes. Two tasks in opposite states
-with identical readings is not a measurement. The MCP `fleet_transcript`
-returning nothing has the same ambiguity and reads as a broken tool, so
-use the HTTP form with the code and the per-task token.
+Read the status code, and do not use the size alone. Fetched with the
+operator token rather than the task's own JWT, the endpoint refuses, and
+the refusal body is the 13-byte string `unauthorized`. Through `wc -c`
+that is a plausible small measurement rather than an error, so a probe
+built on the size alarms on its first sample against every task, healthy
+or dead. It was caught only because a task that had finished SUCCESSFULLY
+also read 13 bytes; two tasks in opposite states with identical readings
+is not a measurement. The status code is what separates a refusal from an
+authorized empty transcript, which is why the command above prints it
+first. The MCP `fleet_transcript` returning nothing carries the same
+ambiguity with no code to inspect, so prefer the HTTP form.
 
 A start-only ref after hours is suggestive, not conclusive: an executor
 commits locally and pushes once at the end, so it can mean a lost final
