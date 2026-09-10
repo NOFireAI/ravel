@@ -99,6 +99,17 @@ Ravel ingests OTLP natively and answers PromQL and SQL. Everything below is
 either in the published container image or behind a named cargo feature, and the
 matrix says which.
 
+The matrix describes `main`, not a release. Its "In published image" column
+means the surface is compiled into the image built from `main`, so a surface
+that lands after the tag the quickstart pins is not yet in the image you get by
+following the quickstart. Every entry below is in the pinned `0.15.0` image;
+`git log v0.15.0..main` is what tells you whether that is still true after the
+next feature lands, and `CHANGELOG.md` records which release each surface first
+shipped in. Two entries missed the previous pinned tag this way: the `alerts`
+and `audit` SQL tables were registered, and PromQL over logs was answered, only
+after `0.13.0` was cut, so a reader following the README against that image got
+a missing table and an empty vector.
+
 <!-- BEGIN SUPPORT MATRIX -->
 
 | Surface | Signals | Feature gate | In published image |
