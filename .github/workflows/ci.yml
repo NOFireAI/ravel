@@ -635,22 +635,61 @@ jobs:
         # the crate that declares the feature.
       - name: Test ravel-bench --features stage-timing
         run: cargo test --locked -p ravel-bench --features stage-timing
+
+  # The stage-timing feature lane (ADR-0104, issue #1516). ravel-logseg and
+  # ravel-ingest each declare a `stage-timing` feature guarding cfg-gated tests
+  # that no other lane reaches: the `Check`/`Test ravel-bench --features
+  # stage-timing` steps in the `features` job enable both crates' feature
+  # transitively, so they type-check the production seam, but `-p ravel-bench`
+  # builds ravel-logseg and ravel-ingest as library dependencies and cargo
+  # never compiles a dependency's `#[cfg(test)]` module. The four feature-gated
+  # tests -- the logs and metrics pipeline stage-set assertions and the two
+  # per-block bloom sample-count assertions -- run in no lane but this one.
+  #
+  # Its own job rather than two more steps in `features` (issue #1590):
+  # `features` carries a 30-minute budget it already spends ~26 minutes of on
+  # main, and folding this lane in pushed it over the cap on slower runners
+  # (a 30m04s timeout that GitHub reports as `cancelled`). Raising the
+  # `features` cap would leave every future addition to that job in the same
+  # trap; a separate job parallelises the work instead of serialising more of
+  # it onto a job with no headroom.
+  #
+  # services/ravel-cli also declares stage-timing and is deliberately NOT in
+  # this selection: its stage-timing test is broken on main under issue #1522,
+  # so including it would make this lane red for a reason unrelated to the seam.
+  stage-timing:
+    needs: changes
+    # object_store_area (ADR-0053 D4) is true for ravel-ingest and ravel-bench
+    # directly and for ravel-logseg via the catch-all (ravel-logseg is in no
+    # named area list, so any change to it forces every area true). That is
+    # exactly the crate set scripts/gates.sh scopes this lane to (ravel-bench,
+    # ravel-ingest, ravel-logseg). docs_only skips it entirely.
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
+    runs-on: ubuntu-latest
+    # Sized to this lane's own work with headroom, not inherited from
+    # `features`. A local scoped run of the clippy + test pair took about 8
+    # minutes warm; 20 leaves room for a cold compile of both crates and their
+    # test binaries plus an sccache-install flake that clears RUSTC_WRAPPER and
+    # rebuilds unwrapped.
+    timeout-minutes: 20
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Clippy ravel-logseg + ravel-ingest --features stage-timing
         run: cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings
-        # The step above enables ravel-logseg/stage-timing and
-        # ravel-ingest/stage-timing transitively, so it does type-check their
-        # production code. It cannot reach their TESTS: `-p ravel-bench` builds
-        # both crates as library dependencies, and cargo never compiles a
-        # dependency's `#[cfg(test)]` module. Every
-        # `#[cfg(feature = "stage-timing")]` test in those two crates was
-        # unreachable from any lane -- including the ones that pin the logs
-        # stage set and the per-block bloom sample count (issue #1516). This
-        # pair of steps is the lane that compiles and runs them.
-        #
-        # services/ravel-cli also declares stage-timing and is deliberately NOT
-        # in this selection: its stage-timing test is broken on main under
-        # issue #1522, so including it would make this lane red for a reason
-        # unrelated to the seam.
       - name: Test ravel-logseg + ravel-ingest --features stage-timing
         run: cargo test --locked -p ravel-logseg -p ravel-ingest --features stage-timing
 
