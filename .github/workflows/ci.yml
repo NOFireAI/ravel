@@ -234,6 +234,11 @@ jobs:
       # CLAUDE.md tells sessions to arm the guard and it would be inert.
       - name: Disk-watchdog guard cases
         run: bash scripts/guards/disk-watchdog.test.sh
+      # Same reason as the two above: a guard suite that runs in no job is
+      # decorative from the day it lands. Bash and coreutils only, and it
+      # sets FLEET_DISK_REAP=0 itself so it cannot reap a runner workspace.
+      - name: Disk-headroom guard cases
+        run: bash scripts/guards/check-disk-headroom.test.sh
       - name: Python script unit tests
         run: make test-python
 

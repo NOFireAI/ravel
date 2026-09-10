@@ -22,6 +22,15 @@ if [ "$#" -ge 1 ] && [ -z "$1" ]; then
   exit 2
 fi
 dir=${1:-.}
+# The same hole, on the other argument. `${2:-20}` cannot tell an absent floor
+# from a caller whose floor variable did not survive, and it fails in both
+# directions: a caller that meant 40 passes at 25 GB, and one that meant 5
+# aborts a task that had room. The block above fixed this for the directory
+# and left it here, which is half a defect class.
+if [ "$#" -ge 2 ] && [ -z "$2" ]; then
+  echo "guard: empty min_gb argument; pass a number or none at all" >&2
+  exit 2
+fi
 min_gb=${2:-20}
 
 if [ ! -e "$dir" ]; then
