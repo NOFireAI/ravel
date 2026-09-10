@@ -756,7 +756,8 @@ against the 256 KiB `max_response_bytes` floor.
    envelope frame. It still holds for the `data` block, which the adapter
    keeps building.
 
-**Amendment (2026-09-13).** Five contract decisions and one correction.
+**Amendment (2026-09-13).** Seven contract decisions and one correction. The
+correction is item 6.
 
 1. `FindLabelsInput.filter` is a case-sensitive substring match over the
    strings the tool is about to return. It applies after the list is
@@ -775,7 +776,8 @@ against the 256 KiB `max_response_bytes` floor.
    removed from the tool rather than accepted and ignored, and the tool emits
    no `evidence` block. Nothing defines what a label list attests to, and the
    port between the tool layer and the engine does not carry what minting a
-   reference would need.
+   reference would need. `FindLabelsInput` still declares the field today;
+   issue #1605 is the follow-up that removes it.
 3. A paged `ravel_describe_data` pins page one's freshness watermark into the
    cursor, and every later page reports that same value. A page sequence that
    re-measures per page describes a moving state, with nothing telling the
@@ -790,12 +792,16 @@ against the 256 KiB `max_response_bytes` floor.
      cover, and docs/consistency-model.md states that the fold never changes
      which commits a query sees.
    - Its lag is large. An hour seals only once `now >= end(hour) +
-     max_flush_lifetime + clock_skew_allowance + fold_safety_margin`, which
-     at the defaults of 1 h, 5 m and 15 m puts the worst case between an
-     acknowledged write and a covering watermark at about 2 h 25 m, once the
-     fold's 5 m interval and the 30 s HEAD cache are counted. Reporting that
-     as freshness would tell an agent its data may be hours stale while it
-     holds an answer resolved a minute ago.
+     max_flush_lifetime + clock_skew_allowance + fold_safety_margin`. Six
+     terms separate an acknowledged write from a watermark that covers it:
+     up to 1 h from the write itself to `end(hour)`, which the seal
+     condition's own `end(hour)` implies; then `max_flush_lifetime` 1 h,
+     `clock_skew_allowance` 5 m and `fold_safety_margin` 15 m at their
+     defaults; then the fold's 5 m interval and the 30 s HEAD cache. The
+     worst case is their sum, 2 h 25 m 30 s, which this ADR and
+     docs/reference/mcp.md both quote as about 2 h 25 m. Reporting that as
+     freshness would tell an agent its data may be hours stale while it holds
+     an answer resolved a minute ago.
    - It is the costlier of the two. The value is not on the returned
      `Snapshot`; it lives in a crate-private struct, so a query-path caller
      needs a ravel-catalog signature change or an extra HEAD GET outside the
@@ -816,19 +822,78 @@ against the 256 KiB `max_response_bytes` floor.
 
    The pinned watermark is a new cursor field, so `CURSOR_VERSION` goes from
    4 to 5, with a test that a version 4 token decodes as invalid, matching
-   the three that already exist for earlier versions.
+   the one that already exists for version 3. That is the only earlier-layout
+   test in `crates/ravel-mcp/src/cursor.rs` today: the other two tests that
+   manipulate a version byte cover a future cursor version and an evidence
+   token, neither of which is an earlier cursor layout.
 5. A redeeming resolve runs at the cursor's `mint_ns`, not at the redeeming
-   call's clock. A page sequence that re-lists at the current instant walks a
-   moving snapshot, and pinning a watermark while resolving against a later
-   one makes the pin decorative. Nothing in the code states this today and
-   there is no production caller, so this ADR is where it is settled.
+   call's clock. This restates and explains the rule the 2026-09-12
+   amendment's item 4 already settled. It is not a refinement of that rule
+   and does not override it; what is new here is the reason. A page sequence
+   that re-lists at the current instant walks a moving snapshot, and pinning
+   a watermark while resolving against a later one makes the pin decorative.
+   Nothing in the code states the rule today and there is no production
+   caller, so this is where the reasoning is recorded.
 6. Correction. D5 defines `visibility.snapshot_id` as a hash of the pinned
    segment set. The amendment that replaced the segment-enumeration cursor
    with the resolve-input cursor deleted that set, and the code followed it
    at `CURSOR_VERSION` 4, so the set exists nowhere in the system. No later
-   amendment respecifies the derivation. `snapshot_id` is a hash over the
-   same resolve inputs the cursor pins: the signal, the half-open time range,
-   the minimum commit-token watermark, the pending erasure predicates, and
-   the declared column set. Two calls resolving the same inputs report the
-   same `snapshot_id`. It identifies those inputs, not the segments they
-   resolved to.
+   amendment respecifies the derivation. `snapshot_id` is a hash over seven
+   inputs: the tenant hash, the signal, the half-open time range, the
+   minimum commit-token watermark, the pending erasure predicates, the
+   declared column set, and the resolve instant. Two calls resolving the same
+   seven report the same `snapshot_id`. It identifies those inputs, not the
+   segments they resolved to.
+
+   The first five of those are the resolve inputs the cursor pins. The
+   remaining two are in the preimage because leaving either out makes the id
+   collide across resolves that are not the same resolve. Without the tenant
+   hash, two tenants asking for the same signal and window with no declared
+   columns and no pending erasure predicates report a byte-identical
+   `snapshot_id` over disjoint data, which is a cross-tenant collision in a
+   field agents are told to compare. Without the resolve instant, two calls a
+   day apart over the same historical window report the same id while
+   resolving different segment sets, because the live listing above the fold
+   watermark picks up whatever committed in between. A redemption is not an
+   exception: the 2026-09-12 amendment's item 4 makes a redeeming resolve run
+   at the cursor's own `mint_ns`, so every page of one sequence resolves at
+   one instant and reports one id.
+
+Two further decisions follow from item 4. Both are settled here rather than
+left to the implementation.
+
+7. The envelope field is `visibility.ingest_watermark_hour`, not
+   `visibility.watermark_hour`, and it carries the decimal unix hour as a
+   JSON string. Two separate points.
+
+   The name. `watermark_hour` is already the fold watermark's name
+   system-wide: docs/catalog-and-mvcc.md makes HEAD's `watermark_hour`
+   authoritative, and ravel-catalog and ravel-maintain carry that field
+   through `SnapshotPartRef` and `PartHeader`. Item 4 defines the envelope's
+   quantity as explicitly not that one, so keeping the shared name would
+   leave a reader to conclude from the name that a cost boundary is a
+   freshness claim. Nothing populates the field today, which makes the rename
+   free now and impossible once an agent reads it.
+
+   The rendering, previously unstated anywhere. The value is the decimal unix
+   hour -- the count of whole hours since the epoch -- as a JSON string, per
+   D4's precision rule that integers travel as JSON strings. It is not
+   `YYYYMMDDHH`, and it is not the catalog's `YYYYMMDDTHH` object-key text.
+   The field keeps its 32 B scalar sub-bound: that bound measures the value,
+   which the rename does not touch.
+8. An empty resolve reports the field absent, in its own words. The watermark
+   is the greatest ingest hour among the segments the resolve returned, so a
+   resolve that returned none has no value to report even though it measured.
+   That is exactly the state `ravel_describe_data` exists to answer, and D8
+   requires the agent corpus to cover it.
+
+   D4 types the field as a string, so an empty resolve serializes `""`, the
+   same as an operation that never reports freshness at all. The `warnings`
+   entry is what separates them, and the two entries say different things:
+   `visibility.ingest_watermark_hour is not reported by this operation` for
+   the operation that does not measure, and
+   `visibility.ingest_watermark_hour is absent: this operation resolved no
+   segments` for the resolve that measured and found nothing. A caller that
+   reads the first wording on an empty tenant concludes its own freshness is
+   unknowable through this tool rather than that the window it asked about is
+   empty, which is the opposite of what the call established.

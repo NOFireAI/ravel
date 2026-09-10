@@ -23,7 +23,7 @@ the envelope, and the empty-result checklist.
 | --- | --- | --- | --- | --- | --- |
 | `ravel_capabilities` | Protocol and server version, served tools (`tools.enabled`) and declared-but-unserved ones (`tools.catalogued`), effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `unauthorized`, `invalid_argument`, `internal` |
 | `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal`, an optional `cursor` | `data`, `scope`, `visibility`, `coverage`, `presentation` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage`, `presentation` | 2,000 segments admitted for resolution; `max_response_bytes` 512 KiB default, 256 KiB floor. No `max_rows`: a page is bounded by bytes, and a page cut short reports through `presentation.bytes_cap_hit` and `presentation.rows_omitted` | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range`, `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
 | `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `coverage`, `accuracy`, `budget`, `evidence` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
@@ -45,6 +45,15 @@ match over the strings the call is about to return. It is applied after the
 list is produced and before the page cap, so a returned page is complete
 for that filter, and a truncation report means more matches exist. The
 filter is reported in `scope.predicates_applied`.
+
+The page cap that follows the filter is the byte cap. This tool advertises
+no `max_rows`; what bounds a page is `max_response_bytes`, 512 KiB by
+default with a 256 KiB floor. So the guarantee reads exactly: every string
+matching the filter that fits inside the byte cap is on the page. If the cap
+stopped the page short, `presentation.bytes_cap_hit` is set and
+`presentation.rows_omitted` counts what did not fit, and the status is
+`ok_bounded` rather than `ok`. A page with `bytes_cap_hit` false is the
+complete match set for that filter over the requested window.
 
 The match is case-sensitive because label names and values are exact byte
 strings. An empty `filter` string is `invalid_argument`, not a request to
@@ -69,7 +78,7 @@ field means and how to read it.
   "plan": null,
   "scope": {"signal": "", "table": "", "time_range": {}, "predicates_applied": [], "order_by": []},
   "ids": {"query_id": "", "audit_ref": ""},
-  "visibility": {"snapshot_id": "", "watermark_hour": "", "pinned": false, "min_commit_tokens_applied": []},
+  "visibility": {"snapshot_id": "", "ingest_watermark_hour": "", "pinned": false, "min_commit_tokens_applied": []},
   "coverage": {"complete": true, "partial": false, "fragments": [], "unindexed_predicates": []},
   "accuracy": {"exact": true, "approximation": null, "lower_bound_count": false},
   "presentation": {"max_rows": 200, "row_cap_hit": false, "bytes_cap_hit": false, "rows_omitted": 0, "cells_truncated": 0, "metadata_elided": 0, "entries_truncated": 0, "scalars_truncated": 0, "effective_max_response_bytes": 524288, "floor_applied": false, "cursor": null},
@@ -123,23 +132,48 @@ server minted no cursor. A genuinely empty result is `ok` with
 
 ## Snapshot identity and freshness
 
-`visibility.snapshot_id` is a hash over the resolve inputs a cursor pins:
-the signal, the half-open time range, the minimum commit-token watermark,
-the erasure predicates pending at resolve time, and the typed attribute
-columns declared. Two calls that resolve the same inputs report the same
-`snapshot_id`. It identifies those inputs, not the set of segments they
-resolved to, so a later call reporting the same value is not a promise
-that it read the same objects.
+`visibility.snapshot_id` is a hash over seven inputs: the tenant hash, the
+signal, the half-open time range, the minimum commit-token watermark, the
+erasure predicates pending at resolve time, the typed attribute columns
+declared, and the instant the resolve ran at. Two calls that resolve the
+same seven report the same `snapshot_id`. It identifies those inputs, not
+the set of segments they resolved to, so a later call reporting the same
+value is not a promise that it read the same objects.
 
-`visibility.watermark_hour` is the greatest ingest hour bucket among the
-segments the call's snapshot resolved to. It is an ingest-time bound, so
-no client clock moves it, and it is not the catalog's fold watermark. The
-fold watermark is a cost boundary: a resolve serves hours at or below it
-from snapshot parts and lists everything above it live, so a query
-routinely reads data the fold has not reached. It also lags an
-acknowledged write by around 2 h 25 m under the default flush lifetime,
-skew allowance, and fold margins, which would read as hours of staleness
-beside an answer resolved a minute ago.
+The first five of those are the resolve inputs a cursor pins. The tenant
+hash and the resolve instant are in the hash because without them the value
+collides across calls that are not the same resolve: two tenants asking the
+same question of disjoint data would report one id, and two calls a day
+apart over the same historical window would report one id while reading
+different segments. Every page of one cursor sequence still reports one id,
+because a redemption resolves at the instant the cursor was minted rather
+than at the redeeming call's clock.
+
+`visibility.ingest_watermark_hour` is the greatest ingest hour bucket among
+the segments the call's snapshot resolved to. It travels as the decimal unix
+hour -- whole hours since the epoch -- in a JSON string, like every other
+integer in the envelope. It is not `YYYYMMDDHH`, and it is not the
+`YYYYMMDDTHH` text that appears in object keys.
+
+It is an ingest-time bound, so no client clock moves it, and it is not the
+catalog's fold watermark. The name says so: `watermark_hour` unqualified is
+the fold watermark everywhere else in Ravel, and this is a different
+quantity. The fold watermark is a cost boundary: a resolve serves hours at
+or below it from snapshot parts and lists everything above it live, so a
+query routinely reads data the fold has not reached. It also lags an
+acknowledged write by around 2 h 25 m: up to 1 h from the write to the end
+of its ingest hour, then the 1 h flush lifetime, the 5 m skew allowance and
+the 15 m fold margin, then the fold's 5 m interval and the 30 s HEAD cache,
+2 h 25 m 30 s in all. Reported as freshness that would read as hours of
+staleness beside an answer resolved a minute ago.
+
+A resolve that returned no segments has no greatest ingest hour to report.
+It reports the field empty and says which of the two reasons applies in
+`warnings`: `visibility.ingest_watermark_hour is absent: this operation
+resolved no segments` for an empty resolve, against
+`visibility.ingest_watermark_hour is not reported by this operation` for a
+tool that never measures freshness at all. An empty resolve is a result, not
+a gap in the tool.
 
 Event-time bounds are a different quantity. What the data covers in event
 time is reported under `coverage`, not here.
@@ -245,10 +279,10 @@ with the same signal and that cursor. The cursor follows the same codec,
 tenant binding, and lifetime as every other cursor.
 
 Page one's freshness watermark is pinned into that cursor, and every later
-page reports the same value in `visibility.watermark_hour`. A sequence that
-re-measured the watermark per page would describe a moving state, with
-nothing to say whether two pages differ because time passed or because the
-data differs. The pinned value is page one's measurement: a later page may
+page reports the same value in `visibility.ingest_watermark_hour`. A
+sequence that re-measured the watermark per page would describe a moving
+state, with nothing to say whether two pages differ because time passed or
+because the data differs. The pinned value is page one's measurement: a later page may
 resolve over a superset of page one's segments, because the live listing
 above the fold watermark picks up whatever has committed since.
 

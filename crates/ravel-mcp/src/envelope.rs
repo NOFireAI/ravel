@@ -113,7 +113,7 @@ const TIME_RANGE_BOUND: usize = 32;
 const QUERY_ID_BOUND: usize = 128;
 const AUDIT_REF_BOUND: usize = 128;
 const SNAPSHOT_ID_BOUND: usize = 128;
-const WATERMARK_HOUR_BOUND: usize = 32;
+const INGEST_WATERMARK_HOUR_BOUND: usize = 32;
 const APPROXIMATION_BOUND: usize = 256;
 const FAILURE_COUNTER_BOUND: usize = 128;
 
@@ -126,7 +126,7 @@ const FIXED_SCALAR_BOUNDS: usize = SIGNAL_BOUND
     + QUERY_ID_BOUND
     + AUDIT_REF_BOUND
     + SNAPSHOT_ID_BOUND
-    + WATERMARK_HOUR_BOUND
+    + INGEST_WATERMARK_HOUR_BOUND
     + APPROXIMATION_BOUND
     + FAILURE_COUNTER_BOUND;
 
@@ -160,7 +160,7 @@ const MAX_SHORTEN_PASSES: usize = 16;
 /// `zero_row_envelope_with_maximal_metadata_fits_under_the_floor`, which
 /// fails if a field is added or renamed without revisiting the arithmetic
 /// below.
-const EMPTY_ENVELOPE_SERIALIZED_LEN: usize = 852;
+const EMPTY_ENVELOPE_SERIALIZED_LEN: usize = 859;
 
 /// Room for the skeleton parts that grow without being payload: the counters
 /// widening from `0` to their full decimal form, `status` from `ok` to
@@ -420,9 +420,32 @@ pub struct Ids {
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct Visibility {
     pub snapshot_id: String,
-    pub watermark_hour: String,
+    /// Freshness: the greatest ingest hour among the segments this operation
+    /// resolved, as the decimal unix hour in a JSON string (D4's precision
+    /// rule carries integers as strings). It is not `YYYYMMDDHH`, and it is
+    /// not the catalog's `YYYYMMDDTHH` key text.
+    ///
+    /// Deliberately not spelled `watermark_hour`: that name is the FOLD
+    /// watermark everywhere else in this system (docs/catalog-and-mvcc.md
+    /// makes HEAD's `watermark_hour` authoritative, and ravel-catalog and
+    /// ravel-maintain carry it through `SnapshotPartRef` and `PartHeader`).
+    /// This is a different quantity, and a reader who conflates the two reads
+    /// a cost boundary as a freshness claim.
+    pub ingest_watermark_hour: String,
     pub pinned: bool,
     pub min_commit_tokens_applied: Vec<String>,
+    /// Set by an operation that resolved a snapshot and got no segments back,
+    /// which is the one case where [`Self::ingest_watermark_hour`] has no
+    /// value to report: it is the greatest ingest hour among the resolved
+    /// segments, and there are none.
+    ///
+    /// Not a wire field. It selects which warning
+    /// [`Envelope::warn_unreported_identity`] emits for the empty watermark,
+    /// so a caller can tell an empty resolve from an operation that never
+    /// measures the field at all. Both leave the string empty, and the
+    /// distinction is not recoverable from the envelope without it.
+    #[serde(skip)]
+    pub resolved_no_segments: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, JsonSchema)]
@@ -734,7 +757,7 @@ const MARKER_SERIALIZED_LEN: usize = TRUNCATION_MARKER.len() + 2;
 /// [`Envelope::warn_unreported_identity`] warns about them.
 const IDENTITY_FIELDS: [&str; 4] = [
     "visibility.snapshot_id",
-    "visibility.watermark_hour",
+    "visibility.ingest_watermark_hour",
     "ids.query_id",
     "ids.audit_ref",
 ];
@@ -743,12 +766,60 @@ const IDENTITY_FIELDS: [&str; 4] = [
 /// field name in [`IDENTITY_FIELDS`].
 const IDENTITY_WARNING_SUFFIX: &str = " is not reported by this operation";
 
+/// What [`Envelope::warn_unreported_identity`] appends instead, for the one
+/// field and the one case where the operation did measure and the quantity
+/// has no value: a resolve that returned no segments has no greatest ingest
+/// hour among them.
+///
+/// Different words from [`IDENTITY_WARNING_SUFFIX`] on purpose. That one is a
+/// statement about the operation ("this tool never reports the field"), and a
+/// caller reading it on an empty resolve would conclude the freshness of its
+/// own tenant is unknowable through this tool rather than that the window it
+/// asked about is empty. `ravel_describe_data` exists to answer exactly that
+/// question, so the two cases have to be told apart in the text.
+const EMPTY_RESOLVE_WARNING_SUFFIX: &str = " is absent: this operation resolved no segments";
+
+/// Index in [`IDENTITY_FIELDS`] of the one field
+/// [`EMPTY_RESOLVE_WARNING_SUFFIX`] can apply to.
+const INGEST_WATERMARK_HOUR_IDENTITY_INDEX: usize = 1;
+
+const _: () = assert!(
+    ascii_eq(
+        IDENTITY_FIELDS[INGEST_WATERMARK_HOUR_IDENTITY_INDEX],
+        "visibility.ingest_watermark_hour"
+    ),
+    "the empty-resolve warning must point at the ingest watermark field"
+);
+
 /// Serialized JSON string length of one byte inside a string, mirroring
 /// [`escaped_char_len`] for the ASCII range: every byte
 /// [`IDENTITY_FIELDS`] and [`IDENTITY_WARNING_SUFFIX`] can contain today.
 /// Kept separate from `escaped_char_len` because a `const fn` cannot decode
 /// UTF-8 through `str::chars` on stable Rust, and these two string sources
 /// are ASCII by construction (field names and fixed English prose).
+/// Whether two ASCII strings are equal, for the const assertions above:
+/// `str` has no `const` equality on stable Rust.
+const fn ascii_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The larger of two lengths, for the const arithmetic below: `usize::max` is
+/// not `const` on stable Rust.
+const fn max_len(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
+}
+
 const fn ascii_escaped_byte_len(b: u8) -> usize {
     match b {
         b'"' | b'\\' => 2,
@@ -786,11 +857,22 @@ const fn ascii_pair_serialized_len(a: &str, b: &str) -> usize {
 /// Derived from the strings themselves so a changed field name or a changed
 /// wording cannot drift silently from what [`Envelope::fit`] reserves room
 /// for.
+///
+/// The ingest watermark field takes whichever of its two messages is longer:
+/// one envelope carries either the not-reported wording or the
+/// [`EMPTY_RESOLVE_WARNING_SUFFIX`] one for that field, never both.
 const fn identity_warnings_allowance() -> usize {
     let mut total = 0usize;
     let mut i = 0usize;
     while i < IDENTITY_FIELDS.len() {
-        total += ascii_pair_serialized_len(IDENTITY_FIELDS[i], IDENTITY_WARNING_SUFFIX) + 1;
+        let mut entry = ascii_pair_serialized_len(IDENTITY_FIELDS[i], IDENTITY_WARNING_SUFFIX);
+        if i == INGEST_WATERMARK_HOUR_IDENTITY_INDEX {
+            entry = max_len(
+                entry,
+                ascii_pair_serialized_len(IDENTITY_FIELDS[i], EMPTY_RESOLVE_WARNING_SUFFIX),
+            );
+        }
+        total += entry + 1;
         i += 1;
     }
     total
@@ -989,7 +1071,7 @@ impl Envelope {
             + serialized_str_len(&self.ids.query_id)
             + serialized_str_len(&self.ids.audit_ref)
             + serialized_str_len(&self.visibility.snapshot_id)
-            + serialized_str_len(&self.visibility.watermark_hour)
+            + serialized_str_len(&self.visibility.ingest_watermark_hour)
             + entry_serialized_len(&self.budget.effective)
             + entry_serialized_len(&self.budget.actual)
             + entry_serialized_len(&self.budget.estimate);
@@ -1055,8 +1137,8 @@ impl Envelope {
             SNAPSHOT_ID_BOUND,
         ));
         cut += u64::from(bound_scalar(
-            &mut self.visibility.watermark_hour,
-            WATERMARK_HOUR_BOUND,
+            &mut self.visibility.ingest_watermark_hour,
+            INGEST_WATERMARK_HOUR_BOUND,
         ));
         if let Some(approximation) = &mut self.accuracy.approximation {
             cut += u64::from(bound_scalar(approximation, APPROXIMATION_BOUND));
@@ -1301,13 +1383,23 @@ impl Envelope {
 
     /// Names every D4 identity field this envelope did not measure.
     ///
-    /// D4 types `visibility.snapshot_id`, `visibility.watermark_hour`,
+    /// D4 types `visibility.snapshot_id`, `visibility.ingest_watermark_hour`,
     /// `ids.query_id`, and `ids.audit_ref` as strings, so an operation that
     /// never resolved one serializes `""`. An empty string is a value: a
     /// caller cannot tell it apart from an id that really is empty, and a
     /// reader collecting snapshot ids across calls would collect blanks as if
     /// they were measurements. Saying in `warnings` that the field is not
     /// reported by this operation is the honest form.
+    ///
+    /// One empty field has a second reason, and it gets its own wording. The
+    /// ingest watermark is the greatest ingest hour among the segments the
+    /// operation resolved, so a resolve that returned none has nothing to
+    /// report even though it measured. `visibility.resolved_no_segments` is
+    /// how the operation says so, and it swaps
+    /// [`IDENTITY_WARNING_SUFFIX`] for [`EMPTY_RESOLVE_WARNING_SUFFIX`] on
+    /// that field alone. The two never both appear for it: the operation
+    /// either reports the field or does not, and if it does not, exactly one
+    /// of the two reasons holds.
     ///
     /// Every envelope that reaches a caller goes through [`finish`](Self::finish),
     /// which is what calls this: a crate that built its own envelope and
@@ -1323,15 +1415,24 @@ impl Envelope {
     fn warn_unreported_identity(&mut self) {
         let reported = [
             !self.visibility.snapshot_id.is_empty(),
-            !self.visibility.watermark_hour.is_empty(),
+            !self.visibility.ingest_watermark_hour.is_empty(),
             !self.ids.query_id.is_empty(),
             !self.ids.audit_ref.is_empty(),
         ];
+        let empty_resolve = self.visibility.resolved_no_segments;
         let mut identity_warnings: Vec<String> = IDENTITY_FIELDS
             .iter()
+            .enumerate()
             .zip(reported)
             .filter(|(_, reported)| !reported)
-            .map(|(field, _)| format!("{field}{IDENTITY_WARNING_SUFFIX}"))
+            .map(|((index, field), _)| {
+                let suffix = if index == INGEST_WATERMARK_HOUR_IDENTITY_INDEX && empty_resolve {
+                    EMPTY_RESOLVE_WARNING_SUFFIX
+                } else {
+                    IDENTITY_WARNING_SUFFIX
+                };
+                format!("{field}{suffix}")
+            })
             .collect();
         if !identity_warnings.is_empty() {
             identity_warnings.append(&mut self.warnings);
@@ -1458,18 +1559,18 @@ mod tests {
 
     /// Four rows of known serialized size (150,004 B each: a `Cell::Str` of
     /// 150,000 plain ASCII bytes is two bytes of array brackets plus two of
-    /// quotes wider than its body). The fixed part here is 856 B, not the
-    /// 852 B of a bare default envelope: `presentation.effective_max_response_bytes`
+    /// quotes wider than its body). The fixed part here is 863 B, not the
+    /// 859 B of a bare default envelope: `presentation.effective_max_response_bytes`
     /// and `presentation.bytes_cap_hit` are both set (to the requested cap
     /// and to `true`) before the row scan runs, and a 6-digit cap widens the
     /// first from 1 digit to 6 while `bytes_cap_hit` narrows from `false` to
-    /// `true`, a net +4 B. From that fixed part the running total is 150,860
-    /// after the first row and 300,865 after the second (one more byte for
+    /// `true`, a net +4 B. From that fixed part the running total is 150,867
+    /// after the first row and 300,872 after the second (one more byte for
     /// the comma between them). `fit` packs rows against its cap minus
     /// [`IDENTITY_WARNINGS_ALLOWANCE`] (the room it reserves for
     /// [`Envelope::finish`]'s identity warnings), so the requested cap here
     /// is that total plus the allowance: internally `fit` targets exactly
-    /// 300,865 again, keeps exactly those two rows and omits the other two,
+    /// 300,872 again, keeps exactly those two rows and omits the other two,
     /// and the fitted envelope's real serialized size lands on that same
     /// total, unaffected by the reservation because `finish` is never called
     /// in this test.
@@ -1482,20 +1583,20 @@ mod tests {
             .map(|&n| vec![Cell::Str("a".repeat(n))])
             .collect();
 
-        let fitted = envelope.fit(300_865 + IDENTITY_WARNINGS_ALLOWANCE as u64);
+        let fitted = envelope.fit(300_872 + IDENTITY_WARNINGS_ALLOWANCE as u64);
 
         assert_eq!(fitted.presentation.rows_omitted, 2);
         assert_eq!(fitted.data.rows.len(), 2);
         assert_eq!(fitted.presentation.cells_truncated, 0);
-        assert_eq!(serialized_len(&fitted), 300_865);
+        assert_eq!(serialized_len(&fitted), 300_872);
     }
 
     /// 5,000 one-cell rows (the D4 `MAX_ROWS_CEILING`), each a small fixed
     /// size, under a cap that admits a precomputed count: with the same
-    /// 856 B fixed part as above (the 256 KiB floor is a 6-digit cap too)
+    /// 863 B fixed part as above (the 256 KiB floor is a 6-digit cap too)
     /// and 204 B rows (a 200-byte `Cell::Str` plus its two bytes of
     /// brackets and two of quotes), the running total after `k` rows is
-    /// `855 + 205*k`. `fit` packs rows against the floor minus
+    /// `862 + 205*k`. `fit` packs rows against the floor minus
     /// [`IDENTITY_WARNINGS_ALLOWANCE`], not the floor itself, so the
     /// crossing point is one row earlier than it would be without that
     /// reservation: between the 1,273rd and 1,274th row -- except
@@ -1520,7 +1621,7 @@ mod tests {
         assert_eq!(fitted.data.rows.len(), 1_273);
         assert_eq!(fitted.presentation.rows_omitted, 5_000 - 1_273);
         assert_eq!(fitted.presentation.cells_truncated, 0);
-        assert_eq!(serialized_len(&fitted), 855 + 205 * 1_273 + 3);
+        assert_eq!(serialized_len(&fitted), 862 + 205 * 1_273 + 3);
         assert!(serialized_len(&fitted) <= MAX_RESPONSE_BYTES_FLOOR as usize);
     }
 
@@ -1584,27 +1685,27 @@ mod tests {
     /// three tests detect a cut measured in source bytes: such a cut either
     /// overruns the cap or, once the re-measure loop has clamped it, lands on
     /// the 256 B floor instead of this figure.
-    const KEPT_CELL_SERIALIZED_LEN: usize = 261_028;
+    const KEPT_CELL_SERIALIZED_LEN: usize = 261_000;
     /// The whole envelope's exact serialized size for those same cases.
-    const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 261_918;
+    const FITTED_ENVELOPE_SERIALIZED_LEN: usize = 261_897;
 
     /// `\n ` alternates a character that serializes to two bytes with one
-    /// that serializes to one. At this cap the shrink loop's convergence
-    /// lands the kept cell on the same exact serialized length as the pure
-    /// quote body above: both bodies have more than enough source characters
-    /// to hit the budget precisely regardless of their escape ratio, so the
-    /// two constants below are not required to differ, and today they do
-    /// not.
-    const KEPT_CONTROL_CELL_SERIALIZED_LEN: usize = 261_028;
-    const FITTED_CONTROL_ENVELOPE_SERIALIZED_LEN: usize = 261_918;
+    /// that serializes to one, and that is what makes the kept cell one byte
+    /// wider here than for the pure quote body above. A cut lands on a source
+    /// character boundary, so a body of nothing but two-byte escapes can only
+    /// reach an even serialized length; a mixed body can also reach the odd
+    /// one just below the budget. The two constants below are not required to
+    /// agree, and today they do not.
+    const KEPT_CONTROL_CELL_SERIALIZED_LEN: usize = 261_001;
+    const FITTED_CONTROL_ENVELOPE_SERIALIZED_LEN: usize = 261_898;
 
     /// Serialized size of a 200-row page of one hex id column, every id at
     /// the 64-character bound: 13,801 B of rows (200 cells of 68 B, their
-    /// commas, and the array brackets) plus 889 B of envelope fields, far
+    /// commas, and the array brackets) plus 896 B of envelope fields, far
     /// under the 256 KiB floor. Pinned so a hex id that grew past its bound
     /// shows up here as a size change rather than as a cell `fit` silently
     /// skipped.
-    const HEX_ID_PAGE_SERIALIZED_LEN: usize = 14_690;
+    const HEX_ID_PAGE_SERIALIZED_LEN: usize = 14_697;
 
     /// Serialized size of a zero-row envelope with every metadata field at
     /// both its D4 bounds, every scalar filling the D4 scalar allowance, and
@@ -1620,7 +1721,7 @@ mod tests {
     /// floor is the [`MAXIMAL_FIXED_PART`] assertion beside that constant,
     /// which adds the skeleton, its slack, and the identity-warning
     /// allowance on top of the documented bounds.
-    const MAXIMAL_METADATA_ENVELOPE_LEN: usize = 109_902;
+    const MAXIMAL_METADATA_ENVELOPE_LEN: usize = 109_909;
     const _: () = assert!(
         MAXIMAL_METADATA_ENVELOPE_LEN < 110_592,
         "the maximal fixed part must stay under this test's 108 KiB tripwire"
@@ -1904,7 +2005,10 @@ mod tests {
         envelope.ids.query_id = "q".repeat(4096);
         envelope.ids.audit_ref = "a".repeat(4096);
         envelope.visibility.snapshot_id = "v".repeat(4096);
-        envelope.visibility.watermark_hour = "2026090800".to_string();
+        // The decimal unix hour, which is what this field carries: 496896 is
+        // 2026-09-08T00:00:00Z. Not YYYYMMDDHH, and not the catalog's
+        // YYYYMMDDTHH key text.
+        envelope.visibility.ingest_watermark_hour = "496896".to_string();
         envelope.accuracy.approximation = Some("x".repeat(4096));
         envelope.presentation.cursor = Some("k".repeat(3 * 1024));
         envelope.budget.effective = AnyJson(Value::String("b".repeat(1000)));
@@ -1930,7 +2034,7 @@ mod tests {
         // against the allowance there is room left for the message's own
         // text once the plan is at its floor.
         assert!(failure.message.ends_with(TRUNCATION_MARKER));
-        assert_eq!(serialized_str_len(&failure.message), 2_037);
+        assert_eq!(serialized_str_len(&failure.message), 2_041);
         assert_eq!(
             serialized_str_len(failure.counter.as_deref().expect("a counter")),
             FAILURE_COUNTER_BOUND
@@ -1957,7 +2061,7 @@ mod tests {
             APPROXIMATION_BOUND
         );
         // Already inside their bounds, so untouched by the cut.
-        assert_eq!(fitted.visibility.watermark_hour, "2026090800");
+        assert_eq!(fitted.visibility.ingest_watermark_hour, "496896");
         // The stage before it brought the scalars inside the allowance, so
         // the budget values are never reached.
         assert_eq!(
@@ -2189,7 +2293,7 @@ mod tests {
         envelope.ids.query_id = "q".repeat(QUERY_ID_BOUND - 2);
         envelope.ids.audit_ref = "a".repeat(AUDIT_REF_BOUND - 2);
         envelope.visibility.snapshot_id = "v".repeat(SNAPSHOT_ID_BOUND - 2);
-        envelope.visibility.watermark_hour = "h".repeat(WATERMARK_HOUR_BOUND - 2);
+        envelope.visibility.ingest_watermark_hour = "h".repeat(INGEST_WATERMARK_HOUR_BOUND - 2);
         envelope.visibility.pinned = true;
         envelope.visibility.min_commit_tokens_applied = (0..MAX_MIN_COMMIT_TOKENS)
             .map(|i| format!("{i:0>2}_{}", "m".repeat(123)))
@@ -2666,7 +2770,7 @@ mod tests {
             finished.warnings,
             vec![
                 "visibility.snapshot_id is not reported by this operation".to_string(),
-                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "visibility.ingest_watermark_hour is not reported by this operation".to_string(),
                 "ids.query_id is not reported by this operation".to_string(),
                 "ids.audit_ref is not reported by this operation".to_string(),
             ]
@@ -2680,11 +2784,59 @@ mod tests {
         assert_eq!(
             finished.warnings,
             vec![
-                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "visibility.ingest_watermark_hour is not reported by this operation".to_string(),
                 "ids.query_id is not reported by this operation".to_string(),
                 "ids.audit_ref is not reported by this operation".to_string(),
             ]
         );
+    }
+
+    /// An operation that resolved and got no segments back is not an
+    /// operation that does not report freshness. The ingest watermark is the
+    /// greatest ingest hour among the segments resolved, so an empty resolve
+    /// leaves it with no value while having measured perfectly well, and that
+    /// is precisely the state `ravel_describe_data` exists to report. A
+    /// caller that reads the not-reported wording there concludes its
+    /// tenant's freshness is unknowable through this tool rather than that
+    /// the window it asked about is empty.
+    ///
+    /// Both strings are pinned whole, and asserted to differ: the agent
+    /// corpus D8 requires keys on telling these two apart, so the wording is
+    /// a contract rather than incidental prose.
+    #[test]
+    fn an_empty_resolve_warns_in_different_words_than_an_unmeasured_watermark() {
+        const NOT_REPORTED: &str =
+            "visibility.ingest_watermark_hour is not reported by this operation";
+        const EMPTY_RESOLVE: &str =
+            "visibility.ingest_watermark_hour is absent: this operation resolved no segments";
+        assert_ne!(NOT_REPORTED, EMPTY_RESOLVE);
+
+        let unmeasured = envelope_with_rows(1, |i| vec![Cell::Int(i as i128)]).finish(false);
+        assert!(unmeasured.warnings.contains(&NOT_REPORTED.to_string()));
+        assert!(!unmeasured.warnings.contains(&EMPTY_RESOLVE.to_string()));
+
+        let mut empty = envelope_with_rows(0, |i| vec![Cell::Int(i as i128)]);
+        empty.visibility.resolved_no_segments = true;
+        let empty = empty.finish(false);
+        assert_eq!(
+            empty.warnings,
+            vec![
+                "visibility.snapshot_id is not reported by this operation".to_string(),
+                EMPTY_RESOLVE.to_string(),
+                "ids.query_id is not reported by this operation".to_string(),
+                "ids.audit_ref is not reported by this operation".to_string(),
+            ]
+        );
+
+        // A resolve that found segments reports the hour, and neither wording
+        // applies: the flag only ever selects between the two reasons a field
+        // is absent, and never suppresses one that is present.
+        let mut measured = envelope_with_rows(1, |i| vec![Cell::Int(i as i128)]);
+        measured.visibility.ingest_watermark_hour = "496896".to_string();
+        measured.visibility.resolved_no_segments = true;
+        let measured = measured.finish(false);
+        assert!(!measured.warnings.contains(&NOT_REPORTED.to_string()));
+        assert!(!measured.warnings.contains(&EMPTY_RESOLVE.to_string()));
     }
 
     /// An envelope that already carries `MAX_WARNINGS` warnings, each at the
@@ -2722,6 +2874,29 @@ mod tests {
                 finished.warnings
             );
         }
+        assert!(serialized_len(&finished) <= MAX_RESPONSE_BYTES_FLOOR as usize);
+
+        // The empty-resolve wording is the longer of the two messages the
+        // watermark field can carry, so it is the one the allowance has to
+        // cover. Same envelope, same cap, that message instead.
+        let mut envelope = envelope_with_rows(1, |i| vec![Cell::Int(i as i128)]);
+        envelope.warnings = (0..MAX_WARNINGS)
+            .map(|i| format!("{i:0>2}_{}", "w".repeat(507)))
+            .collect();
+        envelope.visibility.resolved_no_segments = true;
+
+        let finished = envelope.fit(MAX_RESPONSE_BYTES_FLOOR).finish(false);
+
+        assert_eq!(finished.warnings.len(), MAX_WARNINGS);
+        let expected = format!(
+            "{}{EMPTY_RESOLVE_WARNING_SUFFIX}",
+            IDENTITY_FIELDS[INGEST_WATERMARK_HOUR_IDENTITY_INDEX]
+        );
+        assert!(
+            finished.warnings.contains(&expected),
+            "{expected:?} is missing from {:?}",
+            finished.warnings
+        );
         assert!(serialized_len(&finished) <= MAX_RESPONSE_BYTES_FLOOR as usize);
     }
 

@@ -279,7 +279,7 @@ mod tests {
             envelope.warnings,
             vec![
                 "visibility.snapshot_id is not reported by this operation".to_string(),
-                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "visibility.ingest_watermark_hour is not reported by this operation".to_string(),
                 "ids.query_id is not reported by this operation".to_string(),
                 "ids.audit_ref is not reported by this operation".to_string(),
             ]

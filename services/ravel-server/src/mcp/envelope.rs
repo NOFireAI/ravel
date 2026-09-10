@@ -805,7 +805,7 @@ mod tests {
             fitted.warnings,
             vec![
                 "visibility.snapshot_id is not reported by this operation".to_string(),
-                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "visibility.ingest_watermark_hour is not reported by this operation".to_string(),
                 "ids.query_id is not reported by this operation".to_string(),
                 "ids.audit_ref is not reported by this operation".to_string(),
             ]
@@ -813,7 +813,7 @@ mod tests {
         // The fields themselves are still the empty strings D4's typing
         // forces; the warnings are what makes them readable as absent.
         assert!(fitted.visibility.snapshot_id.is_empty());
-        assert!(fitted.visibility.watermark_hour.is_empty());
+        assert!(fitted.visibility.ingest_watermark_hour.is_empty());
         assert!(fitted.ids.query_id.is_empty());
         assert!(fitted.ids.audit_ref.is_empty());
     }
@@ -833,7 +833,7 @@ mod tests {
         assert_eq!(
             fitted.warnings,
             vec![
-                "visibility.watermark_hour is not reported by this operation".to_string(),
+                "visibility.ingest_watermark_hour is not reported by this operation".to_string(),
                 "ids.query_id is not reported by this operation".to_string(),
                 "ids.audit_ref is not reported by this operation".to_string(),
             ]
