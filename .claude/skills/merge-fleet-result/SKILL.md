@@ -165,7 +165,12 @@ until CI is green, `mergeStateStatus` is `CLEAN` or `UNSTABLE` (`DIRTY`/
 -- resolve those first), and it reports a review against the PR's current
 head commit in state `COMMENTED` or `APPROVED` (`PENDING`, `DISMISSED`, and
 `CHANGES_REQUESTED` are all not clean; the bot itself only ever posts
-`COMMENTED`, so do not read "not approved" as "not clean"). When it reports
+`COMMENTED`, so do not read "not approved" as "not clean"). That state, and
+the inline-comment count beside it, cover reviews from ANY author, so a
+maintainer's `CHANGES_REQUESTED` at head blocks even though `protect-main`
+requires no approvals; the presence check that says a review happened at all
+stays scoped to the bot, since a human review is not the agent review the
+gate asks for. When it reports
 no review at head, read WHICH of the five states it names: nobody asked, a
 malformed trigger, a task queued or running, a task that went terminal with
 no review (nothing retries it -- post the trigger again), or a review at an

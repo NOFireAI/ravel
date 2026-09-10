@@ -278,9 +278,11 @@ connection, a pushed-but-broken main).
   CI check rollup (pass/pending/fail counts, a skipped count when it is
   nonzero, and failing check names), and the state of the fleet review:
   the `claude-fleet[bot]` review at the head commit, its inline-comment
-  count, and the bot's task comment classified as none/running/done/dead
-  so a missing review says whether to wait, to re-trigger, or that nobody
-  asked. Freshness is `review.commit_id` against `headRefOid`, and the
+  count, and the bot's task comment classified as
+  none/running/done/dead/unknown so a missing review says whether to wait,
+  to re-trigger, that nobody asked, or that the state needs reading by
+  hand. A push never starts a review, so a head that moved after the last
+  request needs a fresh `@claude-fleet review` comment. Freshness is `review.commit_id` against `headRefOid`, and the
   bot never approves, so COMMENTED is the success state. The REST
   comments endpoint carries no resolved/unresolved field (that's a
   GraphQL review-thread concept), so a nonzero comment count needs a

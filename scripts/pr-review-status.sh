@@ -123,8 +123,15 @@ reviews_json="$(gh api "repos/${repo}/pulls/${pr}/reviews" --paginate | jq -s 'a
 # test rather than the count-the-objects guess it replaces.
 reviews_at_head=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" --arg bot "${bot}" \
   '[.[] | select(.user.login==$bot and .commit_id==$sha)] | length')
-review_last_state=$(echo "${reviews_json}" | jq -r --arg sha "${head_sha}" --arg bot "${bot}" \
-  '[.[] | select(.user.login==$bot and .commit_id==$sha)] | last | .state // "none"')
+# The last review state at head from ANY author, not just the bot: a human's
+# CHANGES_REQUESTED at head has to block, and `protect-main` requires zero
+# approvals, so mergeStateStatus stays CLEAN and nothing else here would catch
+# it. The bot's own presence gate above stays bot-scoped, because a human
+# review is not the agent review the gate asks for.
+reviews_at_head_any=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" \
+  '[.[] | select(.commit_id==$sha)] | length')
+review_last_state=$(echo "${reviews_json}" | jq -r --arg sha "${head_sha}" \
+  '[.[] | select(.commit_id==$sha)] | last | .state // "none"')
 # Reviews the bot posted for some OTHER commit. Reported, never gating: it is
 # the difference between "nobody has reviewed this branch" and "the head moved
 # after the last review", and the operator's next action differs.
@@ -139,13 +146,27 @@ issue_comments_json="$(gh api "repos/${repo}/issues/${pr}/comments" --paginate |
 # otherwise never arrive.
 task_state=$(echo "${issue_comments_json}" | jq -r --arg sha "${head_sha}" --arg bot "${bot}" \
   -f "${script_dir}/lib/fleet-review-task-state.jq")
-# Did anyone ask? A trigger with no task comment is its own diagnosis: the
-# mention was malformed (the bot answers an unrecognized argument with a
-# confused reaction and nothing else), or the app is not installed here.
-# Counted from non-bot comments so the bot quoting the trigger cannot pass
-# for someone asking for a review.
+# Did anyone ask? Counted from non-bot comments so the bot quoting the trigger
+# cannot pass for someone asking for a review. The word boundary after `review`
+# matters: without it "@claude-fleet reviews are useful here" counts as a
+# request.
+#
+# A review is NEVER started by a push or by opening a PR -- only by this
+# comment -- so a trigger posted before the current head exists cannot have
+# started a task for it. That is why the count alone cannot diagnose anything:
+# see task_comments_anywhere below.
 triggers=$(echo "${issue_comments_json}" | jq --arg bot "${bot}" \
-  '[.[] | select(.user.login!=$bot) | select((.body // "") | test("@claude-fleet[[:space:]]+review"))] | length')
+  '[.[] | select(.user.login!=$bot) | select((.body // "") | test("@claude-fleet[[:space:]]+review($|[^[:alnum:]])"))] | length')
+# Task comments for ANY commit. This is the discriminator the diagnosis needs:
+# one bot task comment anywhere proves the app is installed here, that its
+# deliveries arrive, and that the trigger parses. So a head with no task
+# comment beside a task comment at an older commit is "the head moved after the
+# last request, ask again", never "the mention did not take" -- which is what
+# this said before, on the single most common state the script runs in, since
+# fleet-result-merge.sh posts a trigger at open and every later push then
+# lands here.
+task_comments_anywhere=$(echo "${issue_comments_json}" | jq --arg bot "${bot}" \
+  '[.[] | select(.user.login==$bot) | select((.body // "") | test("^Review task queued\\."))] | length')
 
 # The REST review-comments endpoint carries no resolved/unresolved field
 # (resolution is a review-THREAD concept, GraphQL-only) -- this reports the
@@ -155,9 +176,11 @@ triggers=$(echo "${issue_comments_json}" | jq --arg bot "${bot}" \
 # comment's own count never drops to zero just because the code it flagged
 # changed, so "clean" below means CI green plus a current-head review, not
 # zero comments -- see the merge-fleet-result skill and issue #1579.
+# Every author's inline comments, for the same reason as the review state: a
+# human reviewer's findings sit on this endpoint too, and counting only the
+# bot's left them invisible to both the summary line and the blocking branch.
 comments_json="$(gh api "repos/${repo}/pulls/${pr}/comments" --paginate | jq -s 'add')"
-inline_comments=$(echo "${comments_json}" | jq --arg bot "${bot}" \
-  '[.[] | select(.user.login==$bot)] | length')
+inline_comments=$(echo "${comments_json}" | jq 'length')
 
 # A finding whose line GitHub will not accept an inline comment on goes into
 # the review BODY instead, under a "Findings outside the diff:" heading. It
@@ -194,6 +217,9 @@ if [[ "${failing}" != "0" ]]; then
   summary="${summary} (${failing_names})"
 fi
 summary="${summary} | review: task@head=${task_state} reviews@head=${reviews_at_head} last=${review_last_state} inline_comments=${inline_comments}"
+if [[ "${reviews_at_head_any}" != "${reviews_at_head}" ]]; then
+  summary="${summary} reviews@head_all_authors=${reviews_at_head_any}"
+fi
 if [[ "${reviews_stale}" != "0" ]]; then
   summary="${summary} reviews_at_older_commits=${reviews_stale}"
 fi
@@ -223,10 +249,12 @@ elif [[ "${reviews_at_head}" == "0" ]]; then # PROVE-FLIP
   # with nothing reviewed.
   case "${task_state}" in
     none)
-      if [[ "${triggers}" == "0" ]]; then
+      if [[ "${task_comments_anywhere}" != "0" ]]; then
+        echo "  -> the head moved after the last review request (${task_comments_anywhere} task comment(s) at earlier commits, none for ${head_sha}): comment \`@claude-fleet review\` again, since a push never starts a review"
+      elif [[ "${triggers}" == "0" ]]; then
         echo "  -> no review at head and nobody asked for one: comment \`@claude-fleet review\` on the PR (that exact body, arguments after \`review\` are parsed and an unrecognized word gets a confused reaction and no review)"
       else
-        echo "  -> ${triggers} \`@claude-fleet review\` comment(s) but no task comment for ${head_sha}: if the last one is seconds old, the task comment lands within seconds, so re-run this; otherwise the mention was malformed (check for a confused reaction on it), the app is not installed here, or the bot is not receiving deliveries"
+        echo "  -> ${triggers} \`@claude-fleet review\` comment(s) and no task comment anywhere on this PR: if the last one is seconds old, the task comment lands within seconds, so re-run this; otherwise the mention was malformed (check for a confused reaction on it), the app is not installed here, or the bot is not receiving deliveries"
       fi
       ;;
     running)
@@ -245,7 +273,7 @@ elif [[ "${reviews_at_head}" == "0" ]]; then # PROVE-FLIP
   if [[ "${reviews_stale}" != "0" ]]; then
     echo "     (${reviews_stale} review(s) exist at older commits; the head moved after them, so they do not cover it)"
   fi
-# Block-only, and the `reviews_at_head` conjunct is what keeps it that way: the
+# Block-only, and the `reviews_at_head_any` conjunct is what keeps it that way: the
 # branch above owns "no review at head" and prints which of the five states the
 # PR is in, so this one refuses only a review that EXISTS and carries a state
 # neither APPROVED nor COMMENTED. Without the conjunct it also fires on
@@ -256,7 +284,7 @@ elif [[ "${reviews_at_head}" == "0" ]]; then # PROVE-FLIP
 # COMMENTED is the bot's own success state -- it never approves and never
 # requests changes -- so this catches a DISMISSED review or a human's
 # CHANGES_REQUESTED, whoever left it.
-elif [[ "${reviews_at_head}" != "0" && "${review_last_state}" != "APPROVED" && "${review_last_state}" != "COMMENTED" ]]; then
+elif [[ "${reviews_at_head_any}" != "0" && "${review_last_state}" != "APPROVED" && "${review_last_state}" != "COMMENTED" ]]; then
   echo "  -> the current-head review state is ${review_last_state} (need APPROVED or COMMENTED); not clean"
 elif [[ "${failing}" != "0" ]]; then
   echo "  -> CI has failing/cancelled checks; not clean to merge"

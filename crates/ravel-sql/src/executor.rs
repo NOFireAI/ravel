@@ -3417,10 +3417,10 @@ mod tests {
         )))
     }
 
-    /// SQL side of the resolve-time request-budget gap: a
-    /// statement whose snapshot resolves to zero segments never reaches the
-    /// segment-fetch loop in scan.rs, so the incremental `max_s3_requests`
-    /// check there never runs. A caller-lowered budget of zero (ADR-1374
+    /// SQL side of the resolve-time request-budget gap: a statement whose
+    /// snapshot resolves to zero segments never reaches the segment-fetch
+    /// loop in scan.rs, so the incremental `max_s3_requests` check there
+    /// never runs. A caller-lowered budget of zero (ADR-1374
     /// decision 3) must still be enforced right after resolve, on the
     /// `execute`, `explain`, and Flight SQL `resolve_snapshot` paths alike --
     /// round 2 moved the check into `resolve_admitted`, the one resolve path
