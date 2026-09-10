@@ -163,6 +163,57 @@ ${gate_pipe}")"
 check deny  "herestring whose word recurs"     "$(bash_payload "cat <<<EOF
 ${gate_pipe}
 EOF")"
+# Longer runs of `<` are not valid shell, but the guard must answer the same
+# way for all of them. Skipping a fixed two characters made `<<<<` fail closed
+# and `<<<<<` fail open; consuming the whole run makes every length behave
+# like the herestring above. Both lengths, since one alone cannot see the
+# alternation.
+check deny  "four angles is not an opener"     "$(bash_payload "cat <<<<EOF
+${gate_pipe}
+EOF")"
+check deny  "five angles is not an opener"     "$(bash_payload "cat <<<<<EOF
+${gate_pipe}
+EOF")"
+
+# `<<` inside a QUOTED STRING is ordinary text, and a later line that happens
+# to equal the word parsed out of it is not a terminator. Fail-closed does not
+# save these, because a terminator is found; only tracking quote state does.
+# Every one was refused on main and allowed here until the opener scan stopped
+# being a regex. Note each needs THREE lines: the two-line versions above take
+# the fail-closed path instead and passed throughout, which is why hand-written
+# cases missed the whole class.
+check deny  "single-quoted << , tag recurs"    "$(bash_payload "git commit -m 'use << EOF here'
+${gate_pipe}
+EOF")"
+check deny  "single-quoted << , short tag"     "$(bash_payload "echo 'a << B'
+${gate_pipe}
+B")"
+check deny  "double-quoted << , tag recurs"    "$(bash_payload "echo \"shift << N\"
+${gate_pipe}
+N")"
+check deny  "quoted << , tab-indented body"    "$(bash_payload "git commit -m 'use << EOF here'
+	${gate_pipe}
+EOF")"
+check deny  "quoted << , reserved name after"  "$(bash_payload "echo 'a << B'
+status=0
+B")"
+# The delimiter's own quotes must not leak into the walk's quote state: if
+# `<<'EOF'` left the scanner inside a string, everything after it on the line
+# would be misread.
+check allow "quoted delimiter closes cleanly"  "$(bash_payload "cat > /tmp/c.md <<'EOF' && echo queued
+${gate_pipe}
+EOF")"
+# Two heredocs, the first with a QUOTED delimiter and the gate in the second
+# body. This is what pins consuming the delimiter's own closing quote: leave
+# it unconsumed and the walk thinks it is inside a string for the rest of the
+# line, never sees `<<B`, and judges B's body as live shell. The single-
+# heredoc case above cannot detect that, because nothing follows the
+# delimiter that the walk needs to read.
+check allow "a second heredoc after a quoted one" "$(bash_payload "cat <<'A' <<B
+first body
+A
+${gate_pipe}
+B")"
 
 # A terminator that IS found still ends the body, and the body's later lines
 # stay data. With terminator matching broken to stop at the first body line,
