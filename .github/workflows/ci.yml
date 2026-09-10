@@ -662,7 +662,16 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 20 rather than 15 as headroom for a cold compile of ravel-logseg and
+    # ravel-rspan plus their test binaries, which this job did not build
+    # before. Observed 4m21s on a cache hit (sccache plus rust-cache) for the
+    # run on 4045c1e978865d313329d93b4af230f63fa85396, so 20 is roughly four
+    # times that rather than a measured ceiling. It is sized for the misses:
+    # a Cargo.lock change, a toolchain bump, an evicted cache, or the sccache
+    # install taking its continue-on-error path, which clears RUSTC_WRAPPER
+    # and compiles the job unwrapped. Nothing declares `needs: fuzz`, so a
+    # generous ceiling blocks no other job.
+    timeout-minutes: 20
     env:
       # Bounded case count keeps wall-clock in check while exploring far more
       # of the corrupt-input space than the 256-case default.
@@ -691,6 +700,16 @@ jobs:
         run: cargo nextest run --locked -p ravel-segment --test fuzz_mutation
       - name: Fuzz OTAP Arrow IPC decode
         run: cargo nextest run --locked -p ravel-otap --test fuzz_mutation
+      # RLOG has a real hostile-input suite but it otherwise runs only in the
+      # ordinary test job at the 256-case default; RLOG is the largest format in
+      # the tree, so run it here at the elevated PROPTEST_CASES for the deeper
+      # exploration the other decoders already get.
+      - name: Fuzz RLOG decode (corrupt-input suite)
+        run: cargo nextest run --locked -p ravel-logseg --test corrupt
+      # RSPAN had no corrupt-input coverage in CI at all. Same never-panic,
+      # never-return-wrong-records property as the RLOG suite above.
+      - name: Fuzz RSPAN decode (corrupt-input suite)
+        run: cargo nextest run --locked -p ravel-rspan --test corrupt
 
   # Runs the object-store contract suite (docs/object-store-contract.md)
   # against real S3-compatible endpoints: MinIO, and floci. Without this job
