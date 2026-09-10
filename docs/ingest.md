@@ -202,11 +202,11 @@ Loop over `select!`:
   keeps running and the residue stays buffered with its arrival timestamp, so
   the age tick retries it; that case is logged at WARN and not counted.
 
-Shard-actor death is observable and recoverable (issue #1299). A shard
+Shard-actor death is observable and recoverable. A shard
 actor dies when its flush task panics (a split-brain commit is one such
 case): the task ends, its channel closes, and the next write to that
 shard sees the closed channel or a failed ack receiver. The router
-observes that death exactly once, using the incarnation the write
+counts that death a single time, using the incarnation the write
 captured, so concurrent writers racing on the same dead channel do not
 double-count it, and:
 
@@ -968,7 +968,7 @@ Counters recorded today:
 - `series_id_collisions`: batches rejected fail-loud on an ADR-0005 series-id
   collision.
 - `shard_deaths`: shard-actor deaths observed by the router, counted once per
-  death including each respawned incarnation (issue #1299), so it can exceed
+  death including each respawned incarnation, so it can exceed
   `shard_count`.
 - `shards_condemned`: shards that exhausted their respawn budget and were
   condemned, counted at most once per shard and never exceeding `shard_count`.
