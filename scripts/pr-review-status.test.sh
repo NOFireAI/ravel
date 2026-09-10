@@ -441,7 +441,7 @@ malformed_out="$(e2e "${CLEAN_BODY_JSON}")"
 unset E2E_ISSUE_COMMENTS
 
 check_eq "asked but no task: verdict says the mention did not take" \
-  "  -> 1 \`@claude-fleet review\` comment(s) but no task comment for ${SHA}: the mention was malformed (check for a confused reaction on it) or the app is not installed on this repository; post the bare trigger again" \
+  "  -> 1 \`@claude-fleet review\` comment(s) but no task comment for ${SHA}: if the last one is seconds old, the task comment lands within seconds, so re-run this; otherwise the mention was malformed (check for a confused reaction on it), the app is not installed here, or the bot is not receiving deliveries" \
   "$(printf '%s\n' "${malformed_out}" | sed -n 2p)"
 
 # The bot quoting the trigger in its own comment is not somebody asking.
