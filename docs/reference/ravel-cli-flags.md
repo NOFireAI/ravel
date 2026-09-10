@@ -123,6 +123,7 @@ One-shot catalog fold for one (tenant, signal)
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
+| `--json` |  |  | Print the full `FoldReport` as JSON instead of the human-readable text report. Either form carries every counter on the report |
 | `--max-flush-lifetime` |  |  | Override the fold's `max_flush_lifetime` (humantime duration, e.g. `30m`, `0s`; the same grammar and unit as the `maintain compact-bucket` / `compact-tenant` flag and ravel-server's `--gc-max-flush-lifetime`). An hour seals only at its end plus this plus the clock-skew allowance plus the fold safety margin, so a freshly finished load waits over an hour before its last hours can be folded; lowering this seals them sooner. The flag asserts that no writer is still flushing, not that this host's clock is exact: the clock-skew allowance and the fold safety margin keep their defaults. UNSAFE under a live writer: a commit record published into a bucket this fold already sealed is never picked up by a later incremental fold, which re-lists only hours after the watermark. The default is the safe 1h; use this only for a tenant known quiescent, such as one whose bulk load has finished and whose writer process has exited |
 | `--shards` |  | `4` |  |
 | `--signal` |  | `metrics` | Which signal's snapshot to fold. Defaults to metrics, so an existing invocation keeps its meaning |
@@ -145,6 +146,20 @@ Re-list sealed commit records for one (tenant, signal) and diff against that sig
 | --- | --- | --- | --- |
 | `--signal` |  | `metrics` | Which signal's snapshot to verify. Defaults to metrics |
 | `--tenant` |  |  |  |
+
+## inspect
+
+Inspect a standalone object by key or local path, outside the segment/rlog/rspan/commit/catalog families above
+
+_No flags._
+
+### inspect cstat
+
+Decode a column-statistics (`.cstat`) object's envelope and header (ADR-0850/ADR-0942/ADR-1413), and report whether its declared `body_uncompressed_len` exceeds the decode ceiling, without ever decompressing the body
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `<KEY>` |  |  | Local file path or object store key |
 
 ## maintain
 

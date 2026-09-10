@@ -201,6 +201,7 @@ async fn fold_signal_logs_folds_the_logs_snapshot_and_a_logs_resolve_reads_no_co
         FOLD_SIGNAL,
         None,
         now_ns(),
+        false,
     )
     .await
     .expect("cli fold succeeds");
@@ -296,6 +297,7 @@ async fn inspect_signal_logs_prints_the_signal_word() {
         SignalArg::Logs,
         None,
         now_ns(),
+        false,
     )
     .await
     .expect("cli fold succeeds");
@@ -339,6 +341,7 @@ async fn verify_signal_logs_checks_the_logs_snapshot() {
         SignalArg::Logs,
         None,
         now_ns(),
+        false,
     )
     .await
     .expect("cli fold succeeds");
