@@ -221,8 +221,8 @@ processors:
     # Forget a series after this long without a point, so a churning series
     # set cannot grow memory without bound.
     max_stale: 5m
-    # Ceiling on tracked series. Points past it pass through unconverted, and
-    # Ravel then rejects them, rather than being buffered.
+    # Ceiling on tracked series. Points for an untracked series past it are
+    # dropped by the processor, not buffered and not forwarded.
     max_streams: 1000000
   batch:
 
@@ -237,11 +237,17 @@ service:
 
 Two consequences to plan for. The processor's memory is proportional to the
 number of live series, so `max_streams` is a real ceiling and not a formality;
-size it above the tenant's active series count. And the first point of each
-series after a collector restart re-bases that series' accumulator, which
-appears downstream as a counter reset. PromQL's `rate` and `increase` handle
-resets, so query results stay correct, but a dashboard reading a raw counter
-value shows the drop.
+size it above the tenant's active series count. Reaching it costs data rather
+than memory: once the processor is tracking `max_streams` series, a point for
+a series it is not already tracking is dropped inside the collector. It is not
+buffered and it is not forwarded unconverted, so nothing about it reaches
+Ravel and no Ravel rejection counter moves. The only signal is the collector's
+own `otelcol_deltatocumulative_datapoints_total{error="limit"}`; alert on it,
+because from the database's side this loss is invisible. And the first point
+of each series after a collector restart re-bases that series' accumulator,
+which appears downstream as a counter reset. PromQL's `rate` and `increase`
+handle resets, so query results stay correct, but a dashboard reading a raw
+counter value shows the drop.
 
 The alternative is to configure the sender for cumulative temporality
 directly, which most OpenTelemetry SDKs support through the
@@ -450,15 +456,29 @@ stored text:
   body, so the record is reported that way rather than as an attribute
   problem.
 - A bytes value inside the body renders as a lowercase hex string. A
-  non-finite double renders as the JSON string `"NaN"`, `"Infinity"`, or
-  `"-Infinity"`, since JSON has no literal for them.
+  non-finite double renders as the JSON string `"NaN"`, `"+Inf"`, or `"-Inf"`,
+  since JSON has no literal for them. Those are the exact three strings a
+  query predicate has to match; they are the same forms a top-level double
+  body of the same value takes.
 
-The converted text counts against `max_body_len` like any other body, so a
-large structured body can still be rejected as `BodyTooLong`. Conversions are
-counted per tenant and signal in `ravel_ingest_body_conversions_total`. That
-counter is not a rejection counter: every record it counts was stored. It
-exists so that a query returning JSON text where a reader expected a plain
-message has a place to check.
+The converted text is bounded by `max_body_len` like any other body, so a
+large structured body can still be rejected as `BodyTooLong`. The bound is
+applied while the text is produced rather than to a finished string: the
+sender chooses how much text its value renders to, so conversion stops at the
+first byte that would carry the text past `max_body_len` and rejects there,
+without rendering the rest. The `len` such a rejection reports is that
+stopping point, one byte past the limit, not the length the full text would
+have had.
+
+Conversions are counted per tenant and signal in
+`ravel_ingest_body_conversions_total`. That counter is not a rejection
+counter, and it is not a count of stored records either: it is incremented at
+normalization, before the active-stream cap and before the write, so a
+counted record can still be dropped by the cap or lost with a failed write.
+It exists so that a query returning JSON text where a reader expected a plain
+message has a place to check. The
+[observability guide](observability.md#reading-the-reason-label) holds the
+normative description.
 
 Malformed `trace_id`/`span_id` byte lengths normalize to absent; Ravel does
 not pad or truncate them. Padding would fabricate an id that never existed.

@@ -2893,16 +2893,17 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
     }
 
     // Structured log bodies converted rather than rejected. Deliberately its
-    // own family and not a `reason` on the counter above: these records were
-    // stored, so an operator alerting on rejection reasons must see nothing
-    // from them.
+    // own family and not a `reason` on the counter above: a conversion is not
+    // a rejection, so an operator alerting on rejection reasons must see
+    // nothing from them.
     write_header(
         out,
         "ravel_ingest_body_conversions_total",
-        "Log records admitted after converting a structured (array or kvlist) body to its \
-         canonical JSON form, by tenant and signal. Not a rejection: every record counted here \
-         was stored. A sustained rate means a sender is emitting structured bodies, which query \
-         paths see as JSON text.",
+        "Log records whose structured (array or kvlist) body was converted to its canonical JSON \
+         form at normalization, by tenant and signal. Not a rejection, and not a count of stored \
+         records: it is counted before the active-stream cap and before the write. Read it as a \
+         conversion rate. A sustained rate means a sender is emitting structured bodies, which \
+         query paths see as JSON text.",
         "counter",
     );
     for ((hash, signal), acc) in &ordered {

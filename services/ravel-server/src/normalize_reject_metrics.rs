@@ -59,8 +59,12 @@ pub struct TenantNormalizeRejects {
     /// unsupported type or temporality, a name or attribute over its limit, a
     /// malformed identifier.
     pub structural_total: u64,
-    /// Log records admitted after converting a structured body to its
-    /// canonical JSON form. Never a rejection: every one of these was stored.
+    /// Log records whose structured body was converted to its canonical JSON
+    /// form at normalization. Never a rejection, and not a count of stored
+    /// records: the handler adds these as soon as normalization returns, which
+    /// is before the active-stream cap and before the shard write, so a
+    /// counted record can still be dropped or lost. Read it as a conversion
+    /// rate. Normative description: docs/guides/observability.md.
     pub body_conversions_total: u64,
 }
 
