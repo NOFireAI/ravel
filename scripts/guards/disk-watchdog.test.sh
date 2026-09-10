@@ -376,5 +376,58 @@ check_contains "giving up says what is still running" "gave up" "${giveup_out}"
 check_eq "giving up does not print the success line" "absent" \
   "$([[ "${giveup_out}" == *"killed; marker at"* ]] && echo present || echo absent)"
 
+# --- the dry-run flag must not fail open on a near-miss spelling ----------
+#
+# `WATCHDOG_DRY_RUN=true` took the ARMING path, deleted the marker, and then
+# looped above the floor printing nothing. One character from the documented
+# spelling, and it lands on the one property the dry run exists to protect:
+# the record that a red gate was invalid rather than genuinely failing. The
+# earlier case above only ever passed `1`, so it could not see this.
+SPELL="${TMP}/spelling"
+mkdir -p "${SPELL}"
+for word in true yes TRUE 1; do
+  echo "fired_at=1999-01-01T00:00:00Z" > "${SPELL}/.disk-watchdog-fired"
+  WATCHDOG_DRY_RUN="${word}" timeout 10 "${WATCHDOG}" "${SPELL}" 999999 1000000 1 >/dev/null 2>&1
+  check_eq "a dry run spelled '${word}' keeps the marker" "present" \
+    "$([[ -e "${SPELL}/.disk-watchdog-fired" ]] && echo present || echo absent)"
+done
+# An unrecognised value is refused rather than silently meaning "not a dry
+# run", which is what let `=true` through as a real arming run.
+echo "fired_at=1999-01-01T00:00:00Z" > "${SPELL}/.disk-watchdog-fired"
+out="$(WATCHDOG_DRY_RUN=bogus timeout 10 "${WATCHDOG}" "${SPELL}" 999999 1000000 1 2>&1)"; rc=$?
+check_eq "an unrecognised dry-run value is refused" "2" "${rc}"
+check_contains "it names the value it could not use" "bogus" "${out}"
+check_eq "a refused value touches no marker" "present" \
+  "$([[ -e "${SPELL}/.disk-watchdog-fired" ]] && echo present || echo absent)"
+rm -f "${SPELL}/.disk-watchdog-fired"
+
+# --- without lsof the scoping cannot work, so refuse rather than no-op ----
+#
+# lsof is what reads a process's cwd, and the cwd is the entire safety
+# property. Absent, every candidate is skipped: the watchdog runs forever,
+# matches nothing and never fires while the volume drains. That is the same
+# silent no-fire the header rejects for `df -g`, one function later.
+# A PATH carrying everything the script needs EXCEPT lsof. Blanking PATH
+# entirely does not test this: `timeout` is then not found either and the
+# run dies at 127 before the script starts, which reads as a refusal and is
+# not one.
+NOLSOF="${TMP}/nolsof-bin"
+mkdir -p "${NOLSOF}"
+for tool in df awk ps sed head kill sleep printf date rm timeout; do
+  src="$(command -v "${tool}" 2>/dev/null)" || continue
+  ln -sf "${src}" "${NOLSOF}/${tool}"
+done
+check_eq "fixture PATH really has no lsof" "absent" \
+  "$(PATH="${NOLSOF}" command -v lsof >/dev/null 2>&1 && echo present || echo absent)"
+check_eq "fixture PATH really does have df" "present" \
+  "$(PATH="${NOLSOF}" command -v df >/dev/null 2>&1 && echo present || echo absent)"
+# Wrapped in `timeout` on purpose. Without the availability check the script
+# does not fail, it LOOPS FOREVER matching nothing, which is the defect. An
+# unwrapped call turns that mutant into a hung suite rather than a red one,
+# and a test that hangs instead of failing reports nothing to anybody.
+out="$(PATH="${NOLSOF}" timeout 10 "${WATCHDOG}" "${SPELL}" 999999 1000000 1 2>&1)"; rc=$?
+check_eq "no lsof on PATH is refused, not ignored" "2" "${rc}"
+check_contains "it says lsof is what is missing" "lsof" "${out}"
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
