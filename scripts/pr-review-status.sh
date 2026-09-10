@@ -261,10 +261,12 @@ elif [[ "${cr_outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
   echo "  -> ${cr_outside_diff} CodeRabbit outside-diff finding(s) in the review BODY at head, not inline; read the body with \`gh api repos/${repo}/pulls/${pr}/reviews --jq '.[] | select(.commit_id==\"${head_sha}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered"
 # Ahead of the mergeState check on purpose. A stale base is always actionable
 # and the fix is always the same; mergeState UNKNOWN is often just GitHub still
-# computing. Green CI on a stale base says nothing about the merge: `main` runs
-# no CI of its own, so a PR that passed against an older base can still break
-# it, and a gate added to `main` after the PR went green has never run against
-# the PR at all. Costs one fetch.
+# computing. Green CI on a stale base says nothing about the merge: a PR that
+# passed against an older base can still break `main`, and a gate added to
+# `main` after the PR went green has never run against the PR at all. Main's
+# own push CI catches the first of those after the merge has landed, which is
+# detection rather than prevention, and it never catches a landing loop that
+# silently reverts a concurrent change. Costs one fetch.
 elif ! merge_base_guard; then
   if [[ "${guard_rc}" == "1" ]]; then
     echo "  -> merge base is behind origin/main; rebase and let CI re-run before merging"
