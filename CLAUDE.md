@@ -321,8 +321,11 @@ merged, local last, so nothing is lost by splitting them.
 
 Four of these no longer depend on being remembered.
 `.claude/guards/pretooluse.mjs` runs as a PreToolUse hook and refuses the
-tool call outright: a gate piped into `tail`/`head`/`grep`/`rg`/`sed` or
-followed by `&& echo`, an assignment to zsh's reserved `status`/`path`/
+tool call outright: a gate or guard piped into `tail`/`head`/`grep`/`rg`/
+`sed` or followed by `&& echo`, in the command itself or inside any
+command substitution (`out="$(guard | tail -1)"` and its backtick
+spelling run the same gate and read the same pipe's status), an
+assignment to zsh's reserved `status`/`path`/
 `argv`/`PWD`, a `ScheduleWakeup` under 900 s, and an `Edit`/`Write`
 inside the primary checkout. It fails open on any internal error, and it
 exempts a dispatched fleet clone (which is itself the isolated
