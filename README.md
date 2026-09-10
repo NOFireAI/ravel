@@ -154,6 +154,20 @@ written: the PromQL table from a differential test against a real Prometheus
 binary, and the SQL table from the conformance suite's recorded verdict for
 each construct. The gaps are measured rather than claimed.
 
+Two ingest limits are worth knowing before you point a sender at Ravel:
+
+- Metrics must be cumulative. A delta-temporality `Sum` or `Histogram` is
+  rejected, and the OTLP response says so. Converting delta to cumulative
+  needs per-series state held between requests, and Ravel's compute processes
+  hold no durable local state, so the conversion belongs in the collector: the
+  `deltatocumulative` processor does it, and the
+  [ingest guide](docs/guides/ingest.md#delta-temporality-metrics) has the
+  configuration. Senders you control can usually be set to export cumulative
+  directly instead.
+- A structured log body (an array or a map) is stored as canonical JSON text,
+  not as a nested value. It reads back as a JSON string, so a query that wants
+  a field inside it parses that string.
+
 ## Quickstart
 
 One command starts the whole stack from published images: MinIO for object

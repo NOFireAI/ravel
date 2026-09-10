@@ -952,6 +952,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::ingest_byte_metrics::IngestByteMetrics;
     use crate::ingest_concurrency::{IngestConcurrencyController, IngestConcurrencyLimit};
+    use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
     const TENANT: &str = "acme";
 
@@ -1001,6 +1002,9 @@ pub(crate) mod tests {
             .with_budget(budget.clone()),
         );
         let admission = Arc::new(AdmissionController::new(Arc::new(SystemClock), limits));
+        // One instance across all three signals, as in `gateway_state`: a test
+        // that reads it sees what a scrape would.
+        let normalize_metrics = Arc::new(NormalizeRejectMetrics::new());
         Arc::new(GatewayState {
             tenant_resolver: Arc::new(FixedTenantResolver(TenantId::new(TENANT))),
             ingest: crate::ingest::IngestState {
@@ -1011,6 +1015,7 @@ pub(crate) mod tests {
                 recovery: None,
                 provisioning: None,
                 metadata_sink: None,
+                normalize_metrics: normalize_metrics.clone(),
             },
             logs_ingest: crate::logs_ingest::LogIngestState {
                 router: log_router,
@@ -1020,6 +1025,7 @@ pub(crate) mod tests {
                 store: store.clone(),
                 recovery: None,
                 provisioning: None,
+                normalize_metrics: normalize_metrics.clone(),
             },
             traces_ingest: crate::traces_ingest::SpanIngestState {
                 router: span_router,
@@ -1029,6 +1035,7 @@ pub(crate) mod tests {
                 store: store.clone(),
                 recovery: None,
                 provisioning: None,
+                normalize_metrics: normalize_metrics.clone(),
             },
             admission,
             budget,

@@ -71,6 +71,11 @@ pub struct NormalizedLogRecord {
 pub struct LogNormalizeOutput {
     pub records: Vec<NormalizedLogRecord>,
     pub rejected: Vec<LogRejection>,
+    /// How many admitted records carried a structured (array or kvlist) body
+    /// that was converted to its canonical JSON form. Every one of these
+    /// records is in `records`: the count is a conversion, never a rejection,
+    /// so an operator alerting on rejection reasons sees nothing from it.
+    pub body_conversions: usize,
 }
 
 /// Decode and normalize log records from `req`.
@@ -94,16 +99,29 @@ pub fn normalize_logs(
                 count: total_records,
                 max: limits.max_records_per_request,
             }],
+            body_conversions: 0,
         };
     }
 
     let mut records = Vec::new();
     let mut rejected = Vec::new();
+    let mut body_conversions = 0;
     for rl in &req.resource_logs {
-        normalize_resource(rl, limits, ingest_ts_ns, &mut records, &mut rejected);
+        normalize_resource(
+            rl,
+            limits,
+            ingest_ts_ns,
+            &mut records,
+            &mut rejected,
+            &mut body_conversions,
+        );
     }
 
-    LogNormalizeOutput { records, rejected }
+    LogNormalizeOutput {
+        records,
+        rejected,
+        body_conversions,
+    }
 }
 
 fn resource_record_count(rl: &ResourceLogs) -> usize {
@@ -116,6 +134,7 @@ fn normalize_resource(
     ingest_ts_ns: i64,
     records: &mut Vec<NormalizedLogRecord>,
     rejected: &mut Vec<LogRejection>,
+    body_conversions: &mut usize,
 ) {
     let resource_record_count = resource_record_count(rl);
     if resource_record_count == 0 {
@@ -154,7 +173,15 @@ fn normalize_resource(
     };
 
     for sl in &rl.scope_logs {
-        normalize_scope(sl, &resource_attrs, limits, ingest_ts_ns, records, rejected);
+        normalize_scope(
+            sl,
+            &resource_attrs,
+            limits,
+            ingest_ts_ns,
+            records,
+            rejected,
+            body_conversions,
+        );
     }
 }
 
@@ -165,6 +192,7 @@ fn normalize_scope(
     ingest_ts_ns: i64,
     records: &mut Vec<NormalizedLogRecord>,
     rejected: &mut Vec<LogRejection>,
+    body_conversions: &mut usize,
 ) {
     let scope_record_count = sl.log_records.len();
     if scope_record_count == 0 {
@@ -205,9 +233,12 @@ fn normalize_scope(
 
     for record in &sl.log_records {
         match normalize_record(record, stream_id, &stream_attrs, limits, ingest_ts_ns) {
-            Ok((normalized, dropped_attrs)) => {
+            Ok((normalized, dropped_attrs, converted_body)) => {
                 records.push(normalized);
                 rejected.extend(dropped_attrs);
+                if converted_body {
+                    *body_conversions += 1;
+                }
             }
             Err(reason) => rejected.push(reason),
         }
@@ -216,14 +247,15 @@ fn normalize_scope(
 
 /// Normalize one record. `Err` drops the whole record; `Ok`'s second element
 /// carries per-attribute rejections for attributes dropped from an otherwise
-/// admitted record.
+/// admitted record, and its third says whether a structured body was
+/// converted to canonical JSON to admit it.
 fn normalize_record(
     record: &LogRecord,
     stream_id: LogStreamId,
     stream_attrs: &[u8],
     limits: &LogIngestLimits,
     ingest_ts_ns: i64,
-) -> Result<(NormalizedLogRecord, Vec<LogRejection>), LogRejection> {
+) -> Result<(NormalizedLogRecord, Vec<LogRejection>, bool), LogRejection> {
     if record.attributes.len() > limits.max_attributes_per_record {
         return Err(LogRejection::TooManyAttributes {
             count: record.attributes.len(),
@@ -231,7 +263,10 @@ fn normalize_record(
         });
     }
 
-    let body = normalize_body(record.body.as_ref())?;
+    let NormalizedBody {
+        text: body,
+        converted: converted_body,
+    } = normalize_body(record.body.as_ref())?;
     if body.len() > limits.max_body_len {
         return Err(LogRejection::BodyTooLong {
             len: body.len(),
@@ -285,6 +320,7 @@ fn normalize_record(
             attrs,
         },
         dropped,
+        converted_body,
     ))
 }
 
@@ -334,25 +370,171 @@ fn checked_record_ts(
     Ok(ts_ns)
 }
 
+/// A normalized record body plus whether producing it converted a structured
+/// value. The flag is what the ingest surface counts as a body conversion,
+/// separately from every rejection reason: the record was stored, so an
+/// operator alerting on rejections must not see this traffic.
+struct NormalizedBody {
+    text: String,
+    converted: bool,
+}
+
+/// The key [`convert_value`] is given for a structured body. It never reaches
+/// a stored attribute name; it appears only in the rejection message for a
+/// body that could not be converted, which this function replaces with
+/// [`LogRejection::UnsupportedBodyKind`] anyway.
+const BODY_KEY: &str = "body";
+
 /// Normalize a record body to the string RLOG stores. A string body maps
 /// directly; scalar bodies take their canonical string form; a bytes body
-/// becomes lowercase hex. Array and kvlist bodies are rejected rather than
-/// stringified: a structured body needs a real storage decision, and a
-/// rejection makes the gap visible instead of inventing lossy semantics.
+/// becomes lowercase hex. An array or kvlist body is converted to its
+/// canonical JSON form (see [`canonical_json`]) and the record is stored:
+/// its attributes, trace id, span id, and timestamp all have lossless
+/// representations, and rejecting the record discarded those too.
 /// An absent body (or an `AnyValue` with no variant set) is the empty string,
 /// which is what `ravel_logseg::LogRecord` uses for an absent field.
-fn normalize_body(body: Option<&AnyValue>) -> Result<String, LogRejection> {
+///
+/// `StringValueStrindex` stays rejected. It is an index into the sender's
+/// shared string table, and no table travels with an
+/// `ExportLogsServiceRequest`: the value it names is not reachable here, so
+/// storing anything at all would fabricate content the sender never sent.
+///
+/// A structured body that [`convert_value`] refuses (nested past
+/// [`MAX_ATTRIBUTE_NESTING_DEPTH`], carrying an unset value, or carrying a
+/// nested string-table reference) is reported as
+/// [`LogRejection::UnsupportedBodyKind`] rather than as the attribute-shaped
+/// rejection the converter returns, because the thing the sender lost is the
+/// body, not an attribute.
+fn normalize_body(body: Option<&AnyValue>) -> Result<NormalizedBody, LogRejection> {
+    let plain = |text: String| {
+        Ok(NormalizedBody {
+            text,
+            converted: false,
+        })
+    };
     match body.and_then(|v| v.value.as_ref()) {
-        None => Ok(String::new()),
-        Some(AnyValueVariant::StringValue(s)) => Ok(s.clone()),
-        Some(AnyValueVariant::BoolValue(b)) => Ok(b.to_string()),
-        Some(AnyValueVariant::IntValue(i)) => Ok(i.to_string()),
-        Some(AnyValueVariant::DoubleValue(d)) => Ok(format_float(*d)),
-        Some(AnyValueVariant::BytesValue(b)) => Ok(hex::encode(b)),
-        Some(AnyValueVariant::ArrayValue(_))
-        | Some(AnyValueVariant::KvlistValue(_))
-        | Some(AnyValueVariant::StringValueStrindex(_)) => Err(LogRejection::UnsupportedBodyKind),
+        None => plain(String::new()),
+        Some(AnyValueVariant::StringValue(s)) => plain(s.clone()),
+        Some(AnyValueVariant::BoolValue(b)) => plain(b.to_string()),
+        Some(AnyValueVariant::IntValue(i)) => plain(i.to_string()),
+        Some(AnyValueVariant::DoubleValue(d)) => plain(format_float(*d)),
+        Some(AnyValueVariant::BytesValue(b)) => plain(hex::encode(b)),
+        Some(AnyValueVariant::ArrayValue(_)) | Some(AnyValueVariant::KvlistValue(_)) => {
+            let value =
+                convert_value(BODY_KEY, body, 1).map_err(|_| LogRejection::UnsupportedBodyKind)?;
+            Ok(NormalizedBody {
+                text: canonical_json(&value),
+                converted: true,
+            })
+        }
+        Some(AnyValueVariant::StringValueStrindex(_)) => Err(LogRejection::UnsupportedBodyKind),
     }
+}
+
+/// The canonical JSON text for a structured body value.
+///
+/// The value model is [`AttrValue`], the same one
+/// [`ravel_types::logstream`] canonicalizes for stream identity, so a body and
+/// an attribute holding the identical OTLP value convert through one mapping.
+/// The rendering rules:
+///
+/// * a map is a JSON object whose entries are ordered exactly as
+///   `ravel_types::logstream` orders an attribute set: by key bytes, ties
+///   broken by the canonical encoding of the value. Two senders that emit the
+///   same kvlist in different orders therefore store byte-identical bodies.
+///   Duplicate keys are kept, not merged: OTLP permits them and dropping one
+///   would lose data.
+/// * a list is a JSON array in input order (list order is significant).
+/// * bytes are lowercase hex in a JSON string, the same rendering a top-level
+///   bytes body gets.
+/// * a non-finite double has no JSON number form, so it renders as the string
+///   `"NaN"`, `"+Inf"`, or `"-Inf"`, matching how a top-level double body of
+///   the same value renders.
+fn canonical_json(value: &AttrValue) -> String {
+    let mut out = String::new();
+    write_canonical_json(&mut out, value);
+    out
+}
+
+fn write_canonical_json(out: &mut String, value: &AttrValue) {
+    match value {
+        AttrValue::Str(s) => write_json_string(out, s),
+        AttrValue::I64(i) => out.push_str(&i.to_string()),
+        AttrValue::F64(f) => {
+            if f.is_finite() {
+                out.push_str(&format_float(*f));
+            } else {
+                write_json_string(out, &format_float(*f));
+            }
+        }
+        AttrValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        AttrValue::Bytes(b) => write_json_string(out, &hex::encode(b)),
+        AttrValue::List(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(out, item);
+            }
+            out.push(']');
+        }
+        AttrValue::Map(entries) => {
+            let mut ordered: Vec<&(String, AttrValue)> = entries.iter().collect();
+            ordered.sort_by(|a, b| {
+                a.0.as_bytes()
+                    .cmp(b.0.as_bytes())
+                    .then_with(|| canonical_value_bytes(&a.1).cmp(&canonical_value_bytes(&b.1)))
+            });
+            out.push('{');
+            for (i, (key, value)) in ordered.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(out, key);
+                out.push(':');
+                write_canonical_json(out, value);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// The canonical encoding of one value, used only as the duplicate-key
+/// tiebreaker in [`write_canonical_json`].
+///
+/// [`ravel_types::logstream`] owns that encoding and exposes it for a whole
+/// attribute set, not for a bare value, so this asks it for a one-entry set
+/// under an empty key. Every such encoding carries the same two-byte prefix
+/// (entry count 1, key length 0), so comparing two of them compares exactly
+/// the two encoded values, which is the tiebreak `encode_attrs` applies. This
+/// crate does not re-implement the encoding.
+fn canonical_value_bytes(value: &AttrValue) -> Vec<u8> {
+    ravel_types::logstream::canonical_attr_bytes(std::slice::from_ref(&(
+        String::new(),
+        value.clone(),
+    )))
+}
+
+/// Write `s` as a JSON string literal (RFC 8259 section 7): the two mandatory
+/// escapes, the five short escapes, and `\u00XX` for the remaining control
+/// characters. Rust strings are UTF-8, so nothing else needs escaping.
+fn write_json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// Convert an attribute set whole: the first failure rejects the set. Used
@@ -748,7 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn array_body_rejects_the_record() {
+    fn array_body_is_stored_as_canonical_json() {
         let out = normalize(request(vec![resource_logs(
             vec![],
             vec![scope_logs(
@@ -757,7 +939,11 @@ mod tests {
                 vec![
                     record(
                         Some(any(AnyValueVariant::ArrayValue(ArrayValue {
-                            values: vec![any(AnyValueVariant::IntValue(1))],
+                            values: vec![
+                                any(AnyValueVariant::IntValue(1)),
+                                any(AnyValueVariant::StringValue("two".into())),
+                                any(AnyValueVariant::BoolValue(true)),
+                            ],
                         }))),
                         vec![],
                         1,
@@ -770,10 +956,191 @@ mod tests {
                 ],
             )],
         )]));
-        assert_eq!(out.records.len(), 1);
-        assert_eq!(out.records[0].body, "ok");
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records.len(), 2);
+        assert_eq!(out.records[0].body, r#"[1,"two",true]"#);
+        assert_eq!(out.records[1].body, "ok");
+        assert_eq!(out.body_conversions, 1);
+    }
+
+    #[test]
+    fn kvlist_body_is_stored_in_canonical_key_order() {
+        // Two records carrying the same entries in opposite input order must
+        // store byte-identical bodies: the object is ordered the way
+        // ravel_types::logstream orders an attribute set, not the way the
+        // sender happened to serialize it.
+        let entries = vec![
+            string_kv("zeta", "z"),
+            kv("alpha", AnyValueVariant::IntValue(7)),
+        ];
+        let reversed: Vec<KeyValue> = entries.iter().rev().cloned().collect();
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![
+                    record(
+                        Some(any(AnyValueVariant::KvlistValue(KeyValueList {
+                            values: entries,
+                        }))),
+                        vec![],
+                        1,
+                    ),
+                    record(
+                        Some(any(AnyValueVariant::KvlistValue(KeyValueList {
+                            values: reversed,
+                        }))),
+                        vec![],
+                        2,
+                    ),
+                ],
+            )],
+        )]));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records.len(), 2);
+        assert_eq!(out.records[0].body, r#"{"alpha":7,"zeta":"z"}"#);
+        assert_eq!(out.records[1].body, out.records[0].body);
+        assert_eq!(out.body_conversions, 2);
+    }
+
+    #[test]
+    fn duplicate_kvlist_body_keys_are_kept_and_ordered_by_value() {
+        // OTLP permits a repeated key. Both entries survive, tie-broken by
+        // the canonical encoding of the value, so the rendering is stable.
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::KvlistValue(KeyValueList {
+                        values: vec![
+                            kv("k", AnyValueVariant::IntValue(2)),
+                            kv("k", AnyValueVariant::IntValue(1)),
+                        ],
+                    }))),
+                    vec![],
+                    1,
+                )],
+            )],
+        )]));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records[0].body, r#"{"k":1,"k":2}"#);
+        assert_eq!(out.body_conversions, 1);
+    }
+
+    #[test]
+    fn structured_body_renders_nested_scalars_and_escapes() {
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::KvlistValue(KeyValueList {
+                        values: vec![
+                            kv("bytes", AnyValueVariant::BytesValue(vec![0xde, 0xad])),
+                            kv("nan", AnyValueVariant::DoubleValue(f64::NAN)),
+                            kv("real", AnyValueVariant::DoubleValue(1.5)),
+                            string_kv("quote\"and\\slash", "line\nbreak\u{1}"),
+                            kv(
+                                "nested",
+                                AnyValueVariant::ArrayValue(ArrayValue {
+                                    values: vec![any(AnyValueVariant::KvlistValue(KeyValueList {
+                                        values: vec![],
+                                    }))],
+                                }),
+                            ),
+                        ],
+                    }))),
+                    vec![],
+                    1,
+                )],
+            )],
+        )]));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(
+            out.records[0].body,
+            format!(
+                r#"{{"bytes":"dead","nan":"{}","nested":[{{}}],"quote\"and\\slash":"line\nbreak\u0001","real":{}}}"#,
+                format_float(f64::NAN),
+                format_float(1.5),
+            )
+        );
+        assert_eq!(out.body_conversions, 1);
+    }
+
+    #[test]
+    fn structured_body_past_the_nesting_bound_is_still_rejected() {
+        let mut value = any(AnyValueVariant::IntValue(1));
+        for _ in 0..MAX_ATTRIBUTE_NESTING_DEPTH {
+            value = any(AnyValueVariant::ArrayValue(ArrayValue {
+                values: vec![value],
+            }));
+        }
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs("lib", "1", vec![record(Some(value), vec![], 1)])],
+        )]));
+        assert!(out.records.is_empty());
         assert_eq!(out.rejected, vec![LogRejection::UnsupportedBodyKind]);
         assert_eq!(out.rejected[0].rejected_count(), 1);
+        assert_eq!(out.body_conversions, 0);
+    }
+
+    #[test]
+    fn string_table_reference_body_is_still_rejected() {
+        // No string table travels with an ExportLogsServiceRequest, so the
+        // referenced text is not reachable here.
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValueStrindex(3))),
+                    vec![],
+                    1,
+                )],
+            )],
+        )]));
+        assert!(out.records.is_empty());
+        assert_eq!(out.rejected, vec![LogRejection::UnsupportedBodyKind]);
+        assert_eq!(out.body_conversions, 0);
+    }
+
+    #[test]
+    fn oversized_converted_body_is_rejected_as_too_long() {
+        let limits = LogIngestLimits::default();
+        let out = normalize_logs(
+            request(vec![resource_logs(
+                vec![],
+                vec![scope_logs(
+                    "lib",
+                    "1",
+                    vec![record(
+                        Some(any(AnyValueVariant::ArrayValue(ArrayValue {
+                            values: vec![any(AnyValueVariant::StringValue(
+                                "x".repeat(limits.max_body_len),
+                            ))],
+                        }))),
+                        vec![],
+                        1,
+                    )],
+                )],
+            )]),
+            &limits,
+            5_000,
+        );
+        assert!(out.records.is_empty());
+        assert!(
+            matches!(out.rejected.as_slice(), [LogRejection::BodyTooLong { .. }]),
+            "{:?}",
+            out.rejected
+        );
+        // The record was rejected, so no conversion is counted for it.
+        assert_eq!(out.body_conversions, 0);
     }
 
     #[test]
@@ -1012,7 +1379,9 @@ mod tests {
                 max: MAX_ATTRIBUTE_NESTING_DEPTH,
             }]
         );
-        assert_eq!(out.rejected[0].rejected_count(), 1);
+        // The over-nested attribute dropped, but its record was stored, so it
+        // costs the sender no record and its rejected_count is 0.
+        assert_eq!(out.rejected[0].rejected_count(), 0);
     }
 
     // --- convert_value key identity (#808): both recursive arms must report
@@ -1599,6 +1968,79 @@ mod tests {
                 proptest::prop_assert!(is_skew_rejection, "{:?}", out.rejected);
             }
         }
+    }
+
+    /// A stored record whose attributes were dropped must move neither the
+    /// skew nor the structural rejected counter: the record landed, so its
+    /// dropped attributes cost the sender no record. This is the blocker the
+    /// per-context fix closes.
+    #[test]
+    fn stored_record_dropped_attrs_move_no_rejected_counter() {
+        use crate::limits::NormalizeRejectCounts;
+        let limits = LogIngestLimits::default();
+        let big = "x".repeat(limits.max_attribute_value_len + 1);
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![
+                        string_kv("a", &big),
+                        string_kv("b", &big),
+                        string_kv("c", &big),
+                    ],
+                    1,
+                )],
+            )],
+        )]));
+        // records_stored=1, records_lost=0, structural=0 (was 3 before the fix).
+        assert_eq!(out.records.len(), 1);
+        assert!(out.records[0].attrs.is_empty());
+        assert_eq!(out.rejected.len(), 3);
+        let counts = NormalizeRejectCounts::from_log_rejections(&out.rejected);
+        assert_eq!(counts.structural, 0, "{:?}", out.rejected);
+        assert_eq!(counts.skew, 0);
+        // Partial-success rejected_log_records for the record is 0: it landed.
+        let rejected_records: usize = out.rejected.iter().map(|r| r.rejected_count()).sum();
+        assert_eq!(rejected_records, 0);
+    }
+
+    /// A whole resource lost to an attribute that cannot be converted still
+    /// counts `structural` for its full record count. The `Grouped` carries
+    /// the loss even though its inner reason costs nothing on its own; this
+    /// pins the case the naive enum-level fix breaks.
+    #[test]
+    fn whole_resource_conversion_failure_counts_every_record_structural() {
+        use crate::limits::NormalizeRejectCounts;
+        let out = normalize(request(vec![resource_logs(
+            vec![KeyValue {
+                key: "service.name".to_string(),
+                value: None,
+                ..Default::default()
+            }],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![
+                    record(
+                        Some(any(AnyValueVariant::StringValue("a".into()))),
+                        vec![],
+                        1,
+                    ),
+                    record(
+                        Some(any(AnyValueVariant::StringValue("b".into()))),
+                        vec![],
+                        2,
+                    ),
+                ],
+            )],
+        )]));
+        assert!(out.records.is_empty());
+        let counts = NormalizeRejectCounts::from_log_rejections(&out.rejected);
+        assert_eq!(counts.structural, 2, "{:?}", out.rejected);
+        assert_eq!(counts.skew, 0);
     }
 
     #[test]

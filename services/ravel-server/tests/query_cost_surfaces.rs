@@ -211,6 +211,9 @@ fn surfaces(store: Arc<dyn ObjectStoreBackend>, tenant: &TenantId) -> Surfaces {
         ingest_byte_metrics: std::sync::Arc::new(
             ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
         ),
+        normalize_reject_metrics: std::sync::Arc::new(
+            ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
         metadata_cache: None,
         cache: None,
         cache_max_bytes: 0,
@@ -618,6 +621,9 @@ mod flight {
             durable_auth: None,
             ingest_byte_metrics: std::sync::Arc::new(
                 ravel_server::ingest_byte_metrics::IngestByteMetrics::new(),
+            ),
+            normalize_reject_metrics: std::sync::Arc::new(
+                ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
             ),
             metadata_cache: None,
             cache: None,

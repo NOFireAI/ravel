@@ -123,15 +123,18 @@ impl Level {
 /// 6, extended by the 2026-08-13 amendment). ADR-0051 named a closed set of
 /// six reasons `{body_size, byte_rate, series_rate, series_cap, skew,
 /// structural}`; the amendment adds a seventh, `clock`, for the receiver-clock
-/// floor. The four here are exactly the ones
-/// `AdmissionController::usage_snapshot` counts today
-/// (`ravel_ingest::TenantUsage`). The remaining three (body_size, skew,
-/// structural) are enforced at layers that keep no per-tenant counter in that
-/// snapshot yet (body size at the transport, skew and structural in
-/// normalization, surfaced there through OTLP partial success), so a variant
-/// for them would render samples no data source can fill. They join this enum
-/// when their counters do, additively, the same way a new `Signal` variant
-/// joins `signal_name`.
+/// floor. Six of the seven are here. Four come from
+/// `AdmissionController::usage_snapshot` (`ravel_ingest::TenantUsage`), which
+/// covers the byte-rate and active-cap layers plus the receiver-clock floor.
+/// The other two, `skew` and `structural`, come from
+/// [`crate::normalize_reject_metrics::NormalizeRejectMetrics`]: the
+/// normalization layer keeps no row in that snapshot, so the ingest surfaces
+/// count its decisions where they observe them.
+///
+/// The seventh, `body_size`, is enforced at the transport and still keeps no
+/// per-tenant counter, so a variant for it would render samples no data source
+/// can fill. It joins this enum when its counter does, additively, the same
+/// way a new `Signal` variant joins `signal_name`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     ByteRate,
@@ -141,17 +144,29 @@ pub enum RejectReason {
     /// non-representable), so the whole request was rejected 503 / `UNAVAILABLE`
     /// (ADR-0051 amendment). The fault is the replica's, not the data's.
     Clock,
+    /// A point, record, or span whose event timestamp fell outside the
+    /// admissible window (too far in the future, or older than the maximum
+    /// ingest lag). Counted per rejected datum, matching the count the same
+    /// request reports back to the sender through OTLP partial success.
+    Skew,
+    /// A point, record, or span rejected by a structural bound in
+    /// normalization: an unsupported metric type or aggregation temporality, a
+    /// name or attribute over its limit, a malformed identifier, an
+    /// inconsistent histogram. Counted per rejected datum, like `skew`.
+    Structural,
 }
 
 impl RejectReason {
-    /// Every reason with a counter, so the rejected family renders all four
+    /// Every reason with a counter, so the rejected family renders all six
     /// series per (tenant, signal) even when some are zero (the same
     /// zero-is-not-absence discipline the other families keep).
-    const ALL: [RejectReason; 4] = [
+    const ALL: [RejectReason; 6] = [
         RejectReason::ByteRate,
         RejectReason::SeriesRate,
         RejectReason::SeriesCap,
         RejectReason::Clock,
+        RejectReason::Skew,
+        RejectReason::Structural,
     ];
 
     fn name(self) -> &'static str {
@@ -160,6 +175,8 @@ impl RejectReason {
             RejectReason::SeriesRate => "series_rate",
             RejectReason::SeriesCap => "series_cap",
             RejectReason::Clock => "clock",
+            RejectReason::Skew => "skew",
+            RejectReason::Structural => "structural",
         }
     }
 }
@@ -2634,6 +2651,14 @@ pub struct AdmissionCountersSnapshot {
     /// a compressed request, so the wire quantity has no home in that snapshot.
     /// Folded by the same `tenant_labels` gate as `usage`.
     pub wire_bytes: Vec<crate::ingest_byte_metrics::TenantWireBytes>,
+    /// Per-tenant normalization-layer decisions (ADR-0051 section 3, layer 3),
+    /// rendered as the `skew` and `structural` reasons of this family's
+    /// rejection counter plus the separate body-conversion counter. Sourced
+    /// from [`crate::normalize_reject_metrics::NormalizeRejectMetrics`], not
+    /// the admission `usage_snapshot`: the controller enforces layers 2 and 4
+    /// and keeps no row for a decision normalization made. Folded by the same
+    /// `tenant_labels` gate as `usage`.
+    pub normalize_rejects: Vec<crate::normalize_reject_metrics::TenantNormalizeRejects>,
 }
 
 /// The counters this family sums per rendered series. Split out so the fold
@@ -2649,6 +2674,9 @@ struct AdmissionAcc {
     rejected_series_rate: u64,
     rejected_series_cap: u64,
     rejected_clock: u64,
+    rejected_skew: u64,
+    rejected_structural: u64,
+    body_conversions: u64,
     reconciliation_failures: u64,
 }
 
@@ -2659,6 +2687,8 @@ impl AdmissionAcc {
             RejectReason::SeriesRate => self.rejected_series_rate,
             RejectReason::SeriesCap => self.rejected_series_cap,
             RejectReason::Clock => self.rejected_clock,
+            RejectReason::Skew => self.rejected_skew,
+            RejectReason::Structural => self.rejected_structural,
         }
     }
 }
@@ -2705,6 +2735,24 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
         acc.reconciliation_failures = acc
             .reconciliation_failures
             .saturating_add(row.reconciliation_failures_total);
+    }
+
+    // Normalization-layer decisions fold into the same rows, under the same
+    // tenant-label gate. A (tenant, signal) that has only these and no
+    // admission-controller usage still gets a full row: every other counter
+    // renders zero, which is what it is, and the rejection reasons the sender
+    // was told about are visible rather than absent.
+    for row in &snapshot.normalize_rejects {
+        let key = (
+            snapshot.tenant_labels.then_some(row.tenant_hash),
+            row.signal,
+        );
+        let acc = rows.entry(key).or_default();
+        acc.rejected_skew = acc.rejected_skew.saturating_add(row.skew_total);
+        acc.rejected_structural = acc.rejected_structural.saturating_add(row.structural_total);
+        acc.body_conversions = acc
+            .body_conversions
+            .saturating_add(row.body_conversions_total);
     }
 
     // A HashMap iterates in an unspecified order; Prometheus does not require
@@ -2824,7 +2872,11 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
     write_header(
         out,
         "ravel_admission_rejected_total",
-        "Admission rejections by tenant, signal, and reason (byte_rate, series_rate, series_cap, clock).",
+        "Admission rejections by tenant, signal, and reason (byte_rate, series_rate, series_cap, \
+         clock, skew, structural). byte_rate and clock count whole requests; series_rate and \
+         series_cap count series; skew and structural count individual data points, log records, \
+         or spans rejected in normalization, matching what the sender is told through OTLP \
+         partial success.",
         "counter",
     );
     for ((hash, signal), acc) in &ordered {
@@ -2838,6 +2890,28 @@ fn render_admission_family(out: &mut String, mode: Mode, snapshot: &AdmissionCou
                 acc.rejected(reason),
             );
         }
+    }
+
+    // Structured log bodies converted rather than rejected. Deliberately its
+    // own family and not a `reason` on the counter above: these records were
+    // stored, so an operator alerting on rejection reasons must see nothing
+    // from them.
+    write_header(
+        out,
+        "ravel_ingest_body_conversions_total",
+        "Log records admitted after converting a structured (array or kvlist) body to its \
+         canonical JSON form, by tenant and signal. Not a rejection: every record counted here \
+         was stored. A sustained rate means a sender is emitting structured bodies, which query \
+         paths see as JSON text.",
+        "counter",
+    );
+    for ((hash, signal), acc) in &ordered {
+        write_sample(
+            out,
+            "ravel_ingest_body_conversions_total",
+            &labels(mode, *hash, *signal),
+            acc.body_conversions,
+        );
     }
 
     // Fleet-global reconciliation read failures (ADR-0057 section 3). Same
@@ -3865,6 +3939,12 @@ pub struct MetricsState {
     /// that turned compression off. Always present; empty until an OTLP request
     /// is admitted. Folded by the same `--metrics-tenant-labels` gate.
     pub ingest_byte_metrics: Arc<crate::ingest_byte_metrics::IngestByteMetrics>,
+    /// Per-tenant normalization-layer decisions (ADR-0051 section 3, layer 3),
+    /// rendered as the admission family's `skew` and `structural` reasons and
+    /// its body-conversion counter. The same `Arc` every ingest surface holds.
+    /// Always present; empty until a request is normalized. Folded by the same
+    /// `--metrics-tenant-labels` gate.
+    pub normalize_reject_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
     /// The per-process metric-metadata cache (ADR-0085 decision 1), read at
     /// scrape time for its four `query_metadata_cache_*` counters. `Some` only
     /// in a request-serving mode that built one (`Mode::All`/`Mode::Query`);
@@ -4013,6 +4093,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         usage: state.admission.usage_snapshot(),
         tenant_labels: state.metrics_tenant_labels,
         wire_bytes: state.ingest_byte_metrics.snapshot(),
+        normalize_rejects: state.normalize_reject_metrics.snapshot(),
     };
 
     // Per-query cost rows, read at scrape time like every other family (a
@@ -6466,6 +6547,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             usage,
             tenant_labels: false,
             wire_bytes: Vec::new(),
+            normalize_rejects: Vec::new(),
         };
         let body = render(
             Mode::Gateway,
@@ -6549,6 +6631,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             usage: vec![byte_rate, series_rate, series_cap],
             tenant_labels: true,
             wire_bytes: Vec::new(),
+            normalize_rejects: Vec::new(),
         };
         let body = render(
             Mode::Gateway,
@@ -6630,6 +6713,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             usage: vec![row],
             tenant_labels: true,
             wire_bytes: Vec::new(),
+            normalize_rejects: Vec::new(),
         };
         let hash = ravel_types::TenantId::new("skewed").hash().to_hex();
         let body = render(
@@ -6667,6 +6751,79 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                  signal=\"metrics\",reason=\"clock\"}} 7"
             )),
             "clock rejection must render distinctly:\n{body}"
+        );
+    }
+
+    /// Normalization's own rejections render under the reserved `skew` and
+    /// `structural` reasons of the same family, and converted structured
+    /// bodies render as their own family rather than as a reason. The tenant
+    /// here has no admission usage row at all, so this also pins that a
+    /// normalize-only (tenant, signal) still renders a full row.
+    #[test]
+    fn admission_family_renders_the_skew_and_structural_reasons() {
+        let hash = ravel_types::TenantId::new("noisy").hash();
+        let snapshot = AdmissionCountersSnapshot {
+            usage: Vec::new(),
+            tenant_labels: true,
+            wire_bytes: Vec::new(),
+            normalize_rejects: vec![crate::normalize_reject_metrics::TenantNormalizeRejects {
+                tenant_hash: hash,
+                signal: Signal::Logs,
+                skew_total: 2,
+                structural_total: 3,
+                body_conversions_total: 4,
+            }],
+        };
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &snapshot,
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let hash = hash.to_hex();
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"logs\",reason=\"skew\"}} 2"
+            )),
+            "event-time rejections must render under reason=skew:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_admission_rejected_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"logs\",reason=\"structural\"}} 3"
+            )),
+            "structural rejections must render under reason=structural:\n{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "ravel_ingest_body_conversions_total{{mode=\"gateway\",tenant_hash=\"{hash}\",\
+                 signal=\"logs\"}} 4"
+            )),
+            "converted bodies are their own family, not a rejection reason:\n{body}"
         );
     }
 
