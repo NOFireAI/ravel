@@ -153,7 +153,7 @@ const NON_TENANT_WITNESS_KEYS: [&str; 7] = [
 /// and the live `t/*/*/idem/*` MaintainDelete grant, then matched zero keys and
 /// the measurement reported an empty overlap having examined nothing there. The
 /// anti-vacuity guard was an ANY over the whole protected set that `sys/tenancy`
-/// alone satisfied, so the two zero-witness keyspaces went unnoticed (#1346).
+/// alone satisfied, so the two zero-witness keyspaces went unnoticed.
 ///
 /// These are kept out of `representative_keys` because no constructor produces
 /// them, for the same reason the non-tenant witnesses are: they are not evidence
@@ -235,13 +235,14 @@ const BUCKET_ARN: &str = "arn:aws:s3:::my-ravel-bucket";
 const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
 
 /// Translate an IAM policy glob into an anchored regex. IAM resolves two
-/// wildcard characters inside both `Action` and `Resource` strings: `*` matches
-/// any sequence and `?` matches exactly one character; every other character is
-/// literal. This once handled only `*`; the shipped templates carry no `?`
-/// (asserted by `every_shipped_template_passes_the_choke_point`, not assumed),
-/// so widening it changes no existing match, but a `?` smuggled into an action or
-/// resource pattern is now resolved as the wildcard IAM treats it as instead of
-/// being escaped to a literal `\?` that quietly matches nothing.
+/// wildcard characters inside `Action`, `Resource`, and `s3:prefix` Condition
+/// strings: `*` matches any sequence and `?` matches exactly one character;
+/// every other character is literal. This handles both, so a `?` smuggled into
+/// any of those fields is resolved as the wildcard IAM treats it as instead of
+/// being escaped to a literal `\?` that quietly matches nothing. The shipped
+/// templates carry no `?` in any of the three fields, asserted (not assumed) by
+/// `every_shipped_template_passes_the_choke_point`, which scans Action, Resource,
+/// and the `s3:prefix` values it reads through `list_prefix_patterns`.
 fn glob_to_regex(pattern: &str) -> regex::Regex {
     let mut regex_src = String::from("^");
     for ch in pattern.chars() {
@@ -282,7 +283,7 @@ fn glob_matches(pattern: &str, candidate: &str) -> bool {
 /// `*?*` and `*/*` do not, while each of those matches all 67 representative
 /// keys; `*/*` is the plausible operator spelling of "any tenant, any signal"
 /// and, put in a shipped template's delete `Resource`, left the whole suite
-/// green (issue #1346, hole ten).
+/// green.
 ///
 /// The empty-string test is kept as a disjunct, so the new definition is a
 /// SUPERSET of the old one rather than a trade of one blind spot for another:
@@ -351,7 +352,7 @@ const KMS_OTHER_OPERATIONS: [&str; 2] = ["kms:Decrypt", "kms:Encrypt"];
 /// existed each axis carried its own matcher and only the delete axis resolved
 /// wildcards, so `"Action": "s3:*"` granted PutObject and ListBucket while being
 /// selected by neither -- and the Condition-presence rule, which keys on the
-/// list grant, never fired either (issue #1346, H3). There is now one place that
+/// list grant, never fired either. There is now one place that
 /// decides, so no axis can be wildcard-aware while another is not.
 ///
 /// The asymmetry is deliberate and asserted: the wildcard lives on the policy
@@ -415,7 +416,7 @@ enum ResourceShape<'a> {
     Bucket,
     /// A KMS key ARN.
     KmsKey,
-    /// Anything else, including every shape issue #1346 H1 lists: an S3
+    /// Anything else, including every shape outside the three above: an S3
     /// access-point ARN (`arn:aws:s3:<region>:<account>:accesspoint/...`), an
     /// Object Lambda ARN (`arn:aws:s3-object-lambda:...`), a multi-region access
     /// point (`arn:aws:s3::<account>:accesspoint/...`), the everything-grant
@@ -460,7 +461,7 @@ struct Policy {
 ///
 /// This list is the guard's contract: a statement carrying any key outside it
 /// is one no guard reasons about, so it must fail closed at `load_policy`
-/// rather than be silently skipped (issue #1346).
+/// rather than be silently skipped.
 const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource", "Condition"];
 
 /// The complete set of `Condition` operators any guard in this file reads.
@@ -469,7 +470,7 @@ const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource",
 /// a different comparison such as `StringNotLike`, or a set-qualified form such
 /// as `ForAnyValue:StringLike` -- carries a constraint no guard reasons about,
 /// so it must fail closed at `validate_statement` rather than pass with its
-/// Condition unexamined (issue #1346).
+/// Condition unexamined.
 const HANDLED_CONDITION_OPERATORS: &[&str] = &["StringLike"];
 
 /// The complete set of `Condition` keys any guard in this file reads, under a
@@ -494,13 +495,10 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 /// unhandled shape is rejected once here instead of slipping past a guard that
 /// only reads the fields it happens to know.
 ///
-/// # The closure argument
+/// # The contract
 ///
-/// Every earlier round of this guard fixed one hole and left another, because
-/// each helper decided for itself which shapes it understood and answered "no
-/// resources to check" for the rest. The fix is structural: ALL shape decisions
-/// happen here, and the helpers are total functions over the shapes that got
-/// through. Concretely, a statement reaching any guard has:
+/// ALL shape decisions happen here, so the helpers are total functions over the
+/// shapes that get through. A statement reaching any guard has:
 ///
 /// - a present string `Sid`, so every message can name it;
 /// - only keys in `HANDLED_STATEMENT_KEYS`, so no permission lives in a field no
@@ -523,8 +521,8 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 ///   sub-shape is the one `StringLike`/`s3:prefix` block
 ///   `list_prefix_patterns` reads.
 ///
-/// A helper downstream can therefore no longer meet a shape it does not
-/// understand. `object_key_patterns` matches all four `ResourceShape` variants:
+/// A helper downstream therefore cannot meet a shape it does not understand.
+/// `object_key_patterns` matches all four `ResourceShape` variants:
 /// it strips `ObjectKey`, skips `Bucket` and `KmsKey` because this function
 /// proved the same statement grants the list or KMS operation whose own guard
 /// reads that exact string, and panics on `Unclassified` because this function
@@ -562,83 +560,71 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 /// reads the result as neither a grant nor a prohibition (the pattern-vs-key
 /// coverage guard) passes `None` and sees both effects on purpose.
 ///
-/// The `Allow` filter closes ONE direction, and the claim is narrowed to it: it
-/// stops a `Deny` being READ AS a grant -- a Deny-derived output read as an
-/// Allow-derived permission, asserting the inverse of the fact (issue #1346,
-/// F1/F2). It does NOT stop a `Deny` WITHDRAWING a grant that a positive guard
-/// then asserts is held: a Deny added alongside a retained Allow, withdrawing
-/// (say) `kms:GenerateDataKey`/`kms:Encrypt` from the only key, leaves
+/// The `Allow` filter closes ONE direction: it stops a `Deny`-derived output
+/// being read as an `Allow`-derived permission, asserting the inverse of the
+/// fact. It does NOT stop a `Deny` WITHDRAWING a grant that a positive guard then
+/// asserts is held: a Deny added alongside a retained Allow, withdrawing (say)
+/// `kms:GenerateDataKey`/`kms:Encrypt` from the only key, leaves
 /// `write_roles_have_kms_generate_data_key` and
 /// `roles_writing_routed_objects_have_kms_grant` green, because those guards read
 /// the retained `Allow` and never subtract the `Deny`. That case is knowingly
-/// left unhandled here. It is availability drift, not permissiveness: the
+/// left unhandled: it is availability drift, not permissiveness, since the
 /// templates would fail CLOSED in production (the write is denied) while the
-/// guard stayed green, so it is strictly safer than the direction the filter
-/// closes. Its precondition is that no shipped template carries a `Deny` that
-/// withdraws a granted KMS/Put capability, which is a property of the four JSON
-/// files rather than of this code and is therefore asserted rather than assumed:
-/// `every_shipped_deny_is_a_delete_only_prohibition` pins that the only shipped
-/// `Deny` is `DenyDeleteProtected` and that every action it names grants a delete
-/// operation and nothing else. Round six stated that premise with a second
-/// clause, "disjoint from every Allow", which is FALSE and was never asserted:
-/// maintain's level-based delete grants and the legal-hold audit-shard
-/// protection cover the same keys (`t/<hash>/u/{l0,c,l1}/0000/...`), so the
-/// delete `Allow` set overstates the capability by exactly the three pattern
-/// pairs `delete_deny_and_allow_overlap_exactly_where_expected` now pins.
-/// Closing the drift would require each positive-capability guard to subtract
-/// the matching `Deny` before asserting; that is a deliberate non-goal. This is
-/// the axis the next reviewer checks the next finding against.
+/// guard stayed green, strictly safer than the direction the filter closes. Its
+/// precondition -- that no shipped template carries a `Deny` withdrawing a
+/// granted KMS/Put capability -- is a property of the four JSON files, so it is
+/// asserted rather than assumed by `every_shipped_deny_is_a_delete_only_prohibition`.
+/// A delete `Deny` can still overlap a delete `Allow`; that overlap is measured
+/// and pinned by `EXPECTED_DELETE_OVERLAPS`, the one home for the Deny-override
+/// fact.
 ///
 /// Rejects, naming the `Sid` (and the statement index) and the offending key or
 /// field:
 /// - a statement that is not a JSON object;
-/// - a missing or non-string `Sid` (`"Sid": 123`): Sid is in the handled set,
-///   but its type went unchecked pre-fix and the `<no Sid>` fallback then named
-///   nothing (issue #1346, F3);
+/// - a missing or non-string `Sid` (`"Sid": 123`), so every other rejection can
+///   name the statement;
 /// - `NotAction`/`NotResource`/`NotPrincipal`/`Principal` (negated or
 ///   principal-scoped: the guard cannot reason about them);
 /// - any other key outside `HANDLED_STATEMENT_KEYS` (e.g. a `Resources` typo);
 /// - an `Effect` that is neither `Allow` nor `Deny`;
 /// - an `Action` or `Resource` that is neither a string nor a non-empty array
-///   of strings (an empty array is vacuously "all strings", so it slipped past
-///   as a valid set the guards then derived nothing from);
-/// - a missing `Resource` key (the exact shape #1346 records being skipped:
-///   the resource guards read `stmt["Resource"]`, find `Null`, and drop the
-///   statement as having nothing to check);
+///   of strings (an empty array is vacuously "all strings", so it would pass as
+///   a valid set the guards then derive nothing from);
+/// - a missing `Resource` key (the resource guards would read `Null` and treat
+///   the statement as having nothing to check);
 /// - an `Action` element that grants no operation in the vocabulary, so no axis
-///   would select the statement (H3);
+///   would select the statement;
 /// - a `Resource` element `classify_resource` cannot place, quoting the value:
 ///   an S3 access-point or Object Lambda or multi-region-access-point ARN, the
 ///   everything-grant `arn:*`, the bare `"*"`, another bucket's ARN, or a
-///   malformed non-ARN such as `my-ravel-bucket/*` (H1);
+///   malformed non-ARN such as `my-ravel-bucket/*`;
 /// - a `Resource` whose shape belongs to an operation class the statement does
 ///   not grant (an `s3:ListBucket` on an object ARN, an `s3:GetObject` on the
 ///   bare bucket ARN, a KMS ARN on a statement granting no KMS operation), and
-///   conversely a granted class with no resource of its shape (an
-///   `s3:ListBucket` that names no bucket ARN -- the H2 hole, where round
-///   three's list-only exemption left a list statement's Resource read by
-///   nothing at all);
-/// - a `Resource` object-key pattern that admits every key in `key_domain()` (a
-///   bucket-relative `arn:aws:s3:::my-ravel-bucket/*`, which strips to `"*"`, or
-///   any other spelling that excludes nothing, such as `"*/*"`): shape-valid but
-///   vacuous, scoping the object grant no more than naming no key would, the
-///   resource-axis sibling of F1's `"*"` s3:prefix (issue #1346, F1 sweep and
-///   hole ten);
+///   conversely a granted class with no resource of its shape (an `s3:ListBucket`
+///   that names no bucket ARN);
+/// - on an `Allow` only, a `Resource` object-key pattern that admits every key in
+///   `key_domain()` (a bucket-relative `arn:aws:s3:::my-ravel-bucket/*`, which
+///   strips to `"*"`, or any other spelling that excludes nothing, such as
+///   `"*/*"`): shape-valid but vacuous, scoping the grant no more than naming no
+///   key would. On a `Deny` such a pattern is maximally constraining, so it is
+///   accepted;
 /// - a Condition whose presence does not track the ListBucket action: a
 ///   ListBucket statement with no Condition (an unconstrained bucket-wide list),
-///   or a Condition on any non-ListBucket statement (read by no guard) (F2);
+///   or a Condition on any non-ListBucket statement (read by no guard);
 /// - a `Condition` whose sub-shape is anything other than the one block a guard
 ///   reads: it must be a non-empty JSON object of handled operators
 ///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike`), each a non-empty map of
 ///   handled condition keys (`HANDLED_CONDITION_KEYS`, today `s3:prefix`) to a
 ///   string or non-empty array of strings. A different operator, a set-qualified
-///   operator, an unhandled key, or an empty `{}`/`{"StringLike":{}}` (which
-///   constrains nothing) is a shape `list_prefix_patterns` cannot read, so it
-///   fails closed here rather than contributing nothing silently;
-/// - an `s3:prefix` VALUE that admits every key in `key_domain()` (a bare `"*"`,
-///   any all-`"*"` run, `"?*"`, `"*/*"`): shape-valid but vacuous, letting a
-///   caller list the whole bucket exactly as an absent Condition would (issue
-///   #1346, F1 and hole ten).
+///   operator, an unhandled key, or an empty `{}`/`{"StringLike":{}}` is a shape
+///   `list_prefix_patterns` cannot read, so it fails closed here rather than
+///   contributing nothing silently;
+/// - on an `Allow` only, an `s3:prefix` VALUE that admits every key in
+///   `key_domain()` (a bare `"*"`, any all-`"*"` run, `"?*"`, `"*/*"`):
+///   shape-valid but vacuous, letting a caller list the whole bucket exactly as
+///   an absent Condition would. On a `Deny` it is a maximal prohibition and is
+///   accepted.
 fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Result<(), String> {
     let obj = stmt
         .as_object()
@@ -648,7 +634,7 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     // guard's own failure message names it; a missing Sid, or a non-string
     // `"Sid": 123`, was accepted pre-fix through the `<no Sid>` fallback (Sid is
     // in the handled set but its type was never checked), leaving a statement
-    // whose rejections could name nothing (issue #1346, F3).
+    // whose rejections could name nothing.
     let sid = match obj.get("Sid") {
         Some(serde_json::Value::String(s)) => s.as_str(),
         Some(other) => {
@@ -683,15 +669,15 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
         }
     }
 
-    match obj.get("Effect").and_then(|v| v.as_str()) {
-        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => {}
+    let effect = match obj.get("Effect").and_then(|v| v.as_str()) {
+        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => e,
         other => {
             return Err(format!(
                 "{role}/{sid} (statement #{index}): Effect is neither \"Allow\" nor \
                  \"Deny\": {other:?}"
             ));
         }
-    }
+    };
 
     if !is_string_or_string_array(obj.get("Action")) {
         return Err(format!(
@@ -723,7 +709,7 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     // `statement_resources` now return exactly what the policy declares.
     let actions = statement_actions(stmt);
     let resources = statement_resources(stmt);
-    validate_actions_and_resources(role, sid, index, &actions, &resources)?;
+    validate_actions_and_resources(role, sid, index, effect, &actions, &resources)?;
 
     // Condition presence must track the list action. `list_prefix_patterns`
     // is the only Condition reader and only reads one when the Action grants
@@ -734,13 +720,10 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     //    guard: a StringLike/s3:prefix on the protected-delete Deny would pass
     //    validation while, in AWS, a DeleteObject request carries no s3:prefix
     //    context key, so the Deny never fires and protects nothing).
-    // (issue #1346, F2)
     //
     // The list grant is decided by `action_grants`, the same predicate every
     // other axis uses, so `"Action": "s3:*"` -- which grants ListBucket -- is
-    // required to carry a Condition here too. Under round three's exact-name
-    // detection it was not, and `list_prefix_patterns` then read nothing from it
-    // (issue #1346, H3).
+    // required to carry a Condition here too.
     let grants_list = any_action_grants_any(&actions, &S3_BUCKET_OPERATIONS);
     match obj.get("Condition") {
         Some(condition) => {
@@ -752,7 +735,7 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
                      statement sits unexamined and must fail closed"
                 ));
             }
-            validate_condition(role, sid, index, condition)?;
+            validate_condition(role, sid, index, effect, condition)?;
         }
         None => {
             if grants_list {
@@ -773,15 +756,13 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
 /// operation in the vocabulary, and every resource must have a shape that some
 /// granted operation class asks for, with no granted class left without one.
 ///
-/// This is what makes the resource helpers total. Round three put the same
-/// question inside `bucket_relative_s3_pattern`, which meant each helper decided
-/// on its own which resources it understood, and everything else came back as
-/// "nothing to check": an access-point ARN, an Object Lambda ARN, `arn:*` and a
-/// malformed `my-ravel-bucket/*` were all real S3 object grants reaching outside
-/// the bucket and all silently dropped (H1), and the list-only exemption added to
-/// keep the bare bucket ARN from tripping the strip left list statements'
-/// Resource examined by nothing at all (H2). Asking it here instead answers it
-/// once, for every axis, before any helper runs.
+/// This is what makes the resource helpers total. Deciding it here, once, for
+/// every axis before any helper runs, is what keeps a helper from deciding on its
+/// own which resources it understands and answering "nothing to check" for the
+/// rest: an access-point ARN, an Object Lambda ARN, `arn:*`, or a malformed
+/// `my-ravel-bucket/*` is a real S3 object grant reaching outside the bucket and
+/// must fail here, not be silently dropped, and a list grant's bare bucket ARN
+/// must be examined rather than exempted.
 ///
 /// The three classes are independent, so a statement granting several carries the
 /// resources of each. That is what makes the normal IAM idiom -- one statement
@@ -791,6 +772,7 @@ fn validate_actions_and_resources(
     role: &str,
     sid: &str,
     index: usize,
+    effect: &str,
     actions: &[String],
     resources: &[&str],
 ) -> Result<(), String> {
@@ -829,22 +811,25 @@ fn validate_actions_and_resources(
                     ));
                 }
                 // The object-key VALUE must constrain, not merely have the object
-                // shape: `arn:aws:s3:::my-ravel-bucket/*` strips to `*`, which
-                // matches every key in the bucket, so it scopes the object grant
-                // no more than naming no key prefix at all -- the same vacuity F1
-                // closes for an s3:prefix, on the resource axis (issue #1346, F1
-                // sweep). Vacuity is decided against `key_domain()`, so the
-                // spellings that dodge the empty-string reading (`*/*`, `?*`) are
-                // caught too (issue #1346, hole ten). A bounded prefix (`t/*`,
-                // `sys/*`) excludes keys outside it and is unaffected.
-                if glob_admits_everything(key) {
+                // shape -- but only on an `Allow`. On an `Allow`, a pattern that
+                // matches every key in `key_domain()` scopes the grant no more
+                // than naming no key prefix would, so it is refused. On a `Deny`
+                // the same pattern is MAXIMALLY constraining -- it prohibits every
+                // object in the bucket, the safest hardening an operator can make
+                // -- so it must not be refused with a grant-worded reason. The
+                // justification below is written in terms of a grant and does not
+                // transfer to a prohibition, so the check is gated on the Effect.
+                // Vacuity is decided against `key_domain()`, so `*/*` and `?*`,
+                // which match every key without matching the empty string, are
+                // refused alongside the bare `*`. A bounded prefix (`t/*`,
+                // `sys/*`) excludes some key and is accepted on either Effect.
+                if effect.eq_ignore_ascii_case("Allow") && glob_admits_everything(key) {
                     return Err(format!(
-                        "{role}/{sid} (statement #{index}): Resource {resource:?} strips to the \
-                         object-key pattern {key:?}, which matches every key shape this file \
+                        "{role}/{sid} (statement #{index}): Allow Resource {resource:?} strips to \
+                         the object-key pattern {key:?}, which matches every key shape this file \
                          knows about under {BUCKET_ARN:?} -- a full-bucket object grant constrains \
                          no more than naming no key scope at all; it must name a bounded key \
-                         prefix that excludes some key the system can produce (issue #1346, F1 \
-                         sweep and hole ten)"
+                         prefix that excludes some key the system can produce"
                     ));
                 }
                 saw_object = true;
@@ -922,7 +907,7 @@ fn validate_actions_and_resources(
 /// such as `s3:delimiter`, a non-object Condition, or an empty `{}` /
 /// `{"StringLike": {}}` (a `for` over an empty map iterates zero times, so it used
 /// to return Ok and constrain nothing) -- is a shape no guard reasons about and is
-/// rejected by name (issue #1346, F2). Without this, a ListBucket statement
+/// rejected by name. Without this, a ListBucket statement
 /// carrying such a Condition passes validation and `list_prefix_patterns` then
 /// finds no `["StringLike"]["s3:prefix"]` array and silently contributes nothing.
 ///
@@ -936,11 +921,12 @@ fn validate_actions_and_resources(
 /// `key_domain()` such as `"?*"` or `"*/*"` -- passes every shape check yet lets
 /// a caller list the whole bucket, constraining no more than an absent
 /// Condition. It is rejected for the same reason the empty block is, one level
-/// down in the value (issue #1346, F1 and hole ten).
+/// down in the value.
 fn validate_condition(
     role: &str,
     sid: &str,
     index: usize,
+    effect: &str,
     condition: &serde_json::Value,
 ) -> Result<(), String> {
     let cond_obj = condition.as_object().ok_or_else(|| {
@@ -992,23 +978,24 @@ fn validate_condition(
                      neither a string nor a non-empty array of strings: {value:?}"
                 ));
             }
-            // Shape is not enough: the VALUE must constrain. A shape-valid
-            // s3:prefix that admits everything (a bare "*", any all-"*" run) lets
-            // a caller pass the empty prefix and list the whole bucket, exactly as
-            // an absent Condition would -- the same emptiness the empty-map arms
-            // above reject, one level down in the value (issue #1346, F1). The
-            // empty-block rejection says an empty block "constrains nothing"; that
-            // is equally true of a "*" value, so it fails here too. Gated on
-            // s3:prefix because "admits everything" is a glob-prefix reading; a
-            // future handled key with different value semantics would need its own.
-            if cond_key == "s3:prefix" {
+            // Shape is not enough: the VALUE must constrain -- but only on an
+            // `Allow`, for the same reason the object-key vacuity check is gated
+            // (see `validate_actions_and_resources`). On an `Allow`, a shape-valid
+            // s3:prefix that admits everything lets a caller list the whole bucket
+            // exactly as an absent Condition would. On a `Deny`, an s3:prefix that
+            // matches every request prohibits every list, which is maximally
+            // constraining; refusing it with a grant-worded reason inverts the
+            // fact. Gated on s3:prefix because "admits everything" is a glob-prefix
+            // reading; a future handled key with different value semantics would
+            // need its own.
+            if effect.eq_ignore_ascii_case("Allow") && cond_key == "s3:prefix" {
                 for prefix in condition_value_strings(value) {
                     if glob_admits_everything(prefix) {
                         return Err(format!(
-                            "{role}/{sid} (statement #{index}): Condition {operator:?}.{cond_key:?} \
-                             value {prefix:?} admits every key shape this file knows about, so it \
-                             constrains no more than an absent Condition -- an s3:prefix must \
-                             exclude some key the system can produce (issue #1346, F1 and hole ten)"
+                            "{role}/{sid} (statement #{index}): Allow Condition \
+                             {operator:?}.{cond_key:?} value {prefix:?} admits every key shape this \
+                             file knows about, so it constrains no more than an absent Condition -- \
+                             an s3:prefix must exclude some key the system can produce"
                         ));
                     }
                 }
@@ -1031,7 +1018,7 @@ fn condition_value_strings(value: &serde_json::Value) -> Vec<&str> {
 /// True only for a JSON string or a non-empty array whose every element is a
 /// string. An empty array is rejected: `iter().all(..)` is vacuously true on it,
 /// so `"Action": []` / `"Resource": []` used to pass and every downstream guard
-/// then derived an empty set and skipped the statement (issue #1346).
+/// then derived an empty set and skipped the statement.
 fn is_string_or_string_array(value: Option<&serde_json::Value>) -> bool {
     match value {
         Some(serde_json::Value::String(_)) => true,
@@ -1088,7 +1075,7 @@ fn load_policy(role: &'static str) -> Policy {
 /// is exactly this against the fixed `deploy/iam/{role}.json` paths; a
 /// regression test drives it with a synthetic invalid file so the validation is
 /// exercised through the entry point production uses, not only through
-/// `build_policy` (issue #1346, F4).
+/// `build_policy`.
 fn load_policy_from(role: &'static str, path: &str) -> Policy {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let json: serde_json::Value =
@@ -1151,7 +1138,7 @@ fn statement_sid(stmt: &serde_json::Value) -> &str {
 /// result as the prefixes a role is ALLOWED to list, so it must pass
 /// `Some("Allow")`: pooling a `Deny` block's `s3:prefix` into that vector would
 /// assert the inverse of the fact, admitting a discovery prefix that an explicit
-/// Deny withdraws (issue #1346, F1). A caller that only checks each prefix names a
+/// Deny withdraws. A caller that only checks each prefix names a
 /// real key shape (`every_in_scope_policy_pattern_matches_a_real_key_shape`) is
 /// effect-agnostic and passes `None`.
 ///
@@ -1216,30 +1203,27 @@ fn policy_statements(policy: &Policy) -> &Vec<serde_json::Value> {
 /// - `ObjectKey` is the pattern to check, returned.
 /// - `Bucket` contributes nothing to strip. Skipping it is safe because
 ///   `validate_actions_and_resources` proved the same statement grants a list
-///   operation, and a list grant is checked on both counts: its Resource must be
-///   exactly this ARN, and its Condition must be the `s3:prefix` block
-///   `list_prefix_patterns` reads. This is the arm that makes the normal mixed
-///   ListBucket+GetObject idiom work without a misleading rejection, and round
-///   three's alternative -- exempting whole list statements at the caller --
-///   is what left list Resources read by nothing (H2).
+///   operation, whose Resource must be exactly this ARN and whose Condition must
+///   be the `s3:prefix` block `list_prefix_patterns` reads. This arm makes the
+///   normal mixed ListBucket+GetObject idiom work without a misleading rejection;
+///   exempting whole list statements at the caller instead would leave their
+///   Resources read by nothing.
 /// - `KmsKey` likewise: the choke point proved the statement grants a KMS
 ///   operation, so `kms_statement_resources` selects it and both KMS resource
 ///   guards run over this exact string.
 /// - `Unclassified` panics. The choke point rejects it, so reaching here means a
 ///   guard ran on a statement that never passed validation (a synthetic fixture
 ///   built straight from `Policy`), and the loud failure is the belt-and-braces
-///   half of the H1 fix.
+///   half of the unclassified-resource fix.
 ///
-/// A bucket-relative FULL-bucket object grant `arn:aws:s3:::my-ravel-bucket/*`
-/// (which strips to `"*"` and matches every key) is now rejected at the choke
-/// point by `validate_actions_and_resources`: it is the vacuous-value sibling of
-/// F1's `"*"` s3:prefix, on the resource axis, so a shape-valid object ARN that
-/// constrains nothing fails there rather than reaching
-/// `every_in_scope_policy_pattern_matches_a_real_key_shape` -- which asserts a
-/// pattern matches AT LEAST ONE real key and so, being a coverage check, cannot
-/// reject an over-broad pattern (issue #1346, F1 sweep). Rejecting an in-bucket
-/// grant that is merely too wide but still bounded (`t/*`) remains a separate
-/// guard, out of scope here.
+/// An `Allow` full-bucket object grant `arn:aws:s3:::my-ravel-bucket/*` (which
+/// strips to `"*"` and matches every key) is rejected earlier, at the choke point
+/// by `validate_actions_and_resources`, so a shape-valid object ARN that
+/// constrains nothing never reaches `every_in_scope_policy_pattern_matches_a_real_key_shape`
+/// -- a coverage check, which asserts a pattern matches AT LEAST ONE real key and
+/// so cannot reject an over-broad pattern. Rejecting an in-bucket grant that is
+/// merely too wide but still bounded (`t/*`) remains a separate guard, out of
+/// scope here.
 fn object_key_patterns(role: &str, sid: &str, resources: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     for resource in resources {
@@ -1262,13 +1246,10 @@ fn object_key_patterns(role: &str, sid: &str, resources: &[&str]) -> Vec<String>
 /// `effect` (`None` matches any) and whose `Action` grants at least one of
 /// `operations`.
 ///
-/// The single resource-collection loop every S3 axis uses. Round three had four
-/// near-copies of it (read, put, delete-Allow, delete-Deny) that differed in
-/// which actions they selected, whether the selection resolved wildcards, and
-/// what they did with a resource they could not strip; the read copy and the
-/// delete copy then disagreed about the bare bucket ARN, which is how the
-/// list-only exemption got added to one of them. There is now one loop, one
-/// action predicate, and one resource classifier.
+/// The single resource-collection loop every S3 axis uses: one loop, one action
+/// predicate, one resource classifier. Per-axis near-copies would let two of them
+/// disagree about a shape such as the bare bucket ARN, which is what an
+/// exemption added to one copy but not another once did.
 ///
 /// The `continue`s are axis selection, not shape skips: "this statement grants
 /// no operation on my axis" and "this statement is the other Effect". The choke
@@ -1356,7 +1337,7 @@ fn resource_key_patterns(policy: &Policy) -> Vec<String> {
 /// writes a role performs and then demands a KMS grant for them, so a `Deny`
 /// PutObject read as a routed write would demand a KMS grant for a write the role
 /// cannot perform --- the inverse of the fact, since an explicit Deny withdraws
-/// the write (issue #1346, F1/F2). Passing `None` here left `Deny` matching, so
+/// the write. Passing `None` here left `Deny` matching, so
 /// the sentence above was true of Delete/Get and false of Deny; `Some("Allow")`
 /// makes it true.
 ///
@@ -1419,7 +1400,7 @@ const WRITE_ROLES: [&str; 3] = ["gateway", "maintain", "query"];
 /// vector would report a role able to mint ciphertext when the Deny withdraws
 /// exactly that, and would make the negative admin assertion fail on a policy that
 /// safely denies the operation --- the inverse of the fact in both directions
-/// (issue #1346, F1 sweep). A `Deny` KMS statement passes the choke point, so this
+///. A `Deny` KMS statement passes the choke point, so this
 /// case is reachable, not hypothetical.
 ///
 /// Selection goes through `action_selects_kms`, so `KMS:GenerateDataKey*` is
@@ -1458,7 +1439,7 @@ fn kms_actions(policy: &Policy) -> Vec<String> {
 /// `Deny` naming `key/*` is a broad prohibition (safe), yet these guards would
 /// flag it as an account-wide grant --- the inverse of the fact. A `Deny` KMS
 /// statement passes the choke point, so this is reachable; scoping is asked only
-/// of the grants (issue #1346, F1 sweep).
+/// of the grants.
 ///
 /// The returned resources are filtered to `ResourceShape::KmsKey`, so a mixed
 /// statement's S3 object ARNs are not handed to the KMS ARN-shape assertions
@@ -1543,14 +1524,13 @@ fn roles_writing_routed_objects_have_kms_grant() {
 /// assertions on a synthetic policy rather than a re-typed copy of them (the
 /// same pattern `assert_admin_delete_grant_is_scratch_only` uses).
 ///
-/// An EMPTY routed set is a failure here, not a skip. Pre-fix the body read
-/// `if routed.is_empty() { continue; }`, so widening a non-exempt write role's
-/// PutObject `Resource` to a pattern the routing predicate does not recognize
-/// emptied the set and silently retired the KMS requirement for that role: the
-/// guard reported nothing while the role kept its PUT grant (issue #1346, hole
-/// twelve). Every shipped role PUTs at least one `t/<hash>/...` object, so the
-/// only way to reach an empty set is a widening or a deletion, and both must be
-/// loud. The exemption-honesty check reads off the same assertion.
+/// An EMPTY routed set is a failure here, not a skip. A body that read
+/// `if routed.is_empty() { continue; }` let a non-exempt write role widen its
+/// PutObject `Resource` to a pattern the routing predicate does not recognize,
+/// empty the set, and silently retire the KMS requirement for that role while
+/// keeping its PUT grant. Every shipped role PUTs at least one `t/<hash>/...`
+/// object, so the only way to reach an empty set is a widening or a deletion, and
+/// both must be loud. The exemption-honesty check reads off the same assertion.
 fn assert_role_routed_writes_have_kms_grant(policy: &Policy) {
     let role = policy.role;
     let puts = put_resource_key_patterns(policy);
@@ -1637,7 +1617,7 @@ fn assert_role_routed_writes_have_kms_grant(policy: &Policy) {
 // `assert_admin_delete_grant_is_scratch_only` happens to assert exact equality
 // on admin's delete grant. Every other guard asks a one-sided question ("does
 // SOME pattern do X?"), which a Deny turning into an Allow, or vanishing,
-// cannot make false (issue #1346, hole eleven). Generalising that exact-equality
+// cannot make false. Generalising that exact-equality
 // shape to every role and every axis is what makes the Effect load-bearing.
 //
 // The form is deliberate: an Allow set and a Deny set per axis, each by exact
@@ -2118,17 +2098,16 @@ fn every_shipped_deny_is_a_delete_only_prohibition() {
 /// key, exactly. `(Deny pattern, Allow pattern)` pairs, per role, sorted and
 /// deduplicated, witnessed by at least one key in `key_domain()`.
 ///
-/// Round six asserted nothing here and claimed "the only shipped `Deny` is
-/// `DenyDeleteProtected`, a delete-only prohibition DISJOINT FROM EVERY ALLOW".
-/// The delete-only half is true (`every_shipped_deny_is_a_delete_only_prohibition`
-/// pins it); the disjointness half is FALSE, and measuring it is what found that
-/// out. Maintain's level-based delete grants cover the legal-hold audit shard:
-/// an `Signal::Audit` shard-0 key is spelled `t/<hash>/u/{l0,c,l1}/0000/...`, so
-/// `t/*/*/l0/*` and `t/*/u/*/0000/*` both match it. That is the protection
-/// working as ADR-0055 section 3 designs it, not a template bug: an explicit IAM
-/// `Deny` overrides the `Allow`, so the effective capability is correct. What is
-/// wrong is reading the `Allow` set alone as the delete capability the role
-/// HOLDS -- for these three pattern pairs it overstates.
+/// This is the ONE normative home in this file for the Deny-override fact; other
+/// helpers point here rather than restate it. An explicit IAM `Deny` overrides an
+/// `Allow` only for the operations it NAMES, so a delete `Deny` and a delete
+/// `Allow` can cover the same key and the effective capability is still correct.
+/// The shipped overlap is maintain's: its level-based delete grants reach the
+/// legal-hold audit shard, because an `Signal::Audit` shard-0 key is spelled
+/// `t/<hash>/u/{l0,c,l1}/0000/...`, so `t/*/*/l0/*` and `t/*/u/*/0000/*` both
+/// match it. That is ADR-0055 section 3 protection working, not a template bug.
+/// What is wrong is reading the `Allow` set alone as the delete capability the
+/// role HOLDS -- for these three pattern pairs it overstates.
 ///
 /// Pinning the overlap rather than asserting it away fails in both directions: a
 /// new overlap (a widened delete grant reaching a protected keyspace) and a
@@ -2204,7 +2183,7 @@ fn delete_deny_and_allow_overlap_exactly_where_expected() {
         // the overlap below examined nothing for those keyspaces and still
         // reported the pinned overlap set as complete. Refusing each pattern by
         // name fails closed on any protected or granted keyspace the domain does
-        // not model (#1346).
+        // not model.
         for pattern in &protected {
             assert_pattern_is_witnessed(role, "delete Deny (protected)", pattern);
         }
@@ -2330,11 +2309,10 @@ fn all_signals_is_exhaustive_and_witnessed() {
 /// "hold for a different reason than" the legal-hold shard: they are disjoint
 /// from every delete grant, so their `Deny` is belt-and-suspenders, while the
 /// legal-hold shard `t/*/u/*/0000/*` IS reached by maintain's level-based delete
-/// grants and holds only because the explicit `Deny` overrides them. Round eight
-/// added that sentence by inspection; this backs it now that the domain carries
-/// catalog and prov witnesses (`constructor_free_tenant_witness_keys`): no delete
-/// `Allow` pattern in any template matches a witness key of those three
-/// keyspaces.
+/// grants and holds only because the explicit `Deny` overrides them. This backs
+/// that ADR sentence now that the domain carries catalog and prov witnesses
+/// (`constructor_free_tenant_witness_keys`): no delete `Allow` pattern in any
+/// template matches a witness key of those three keyspaces.
 ///
 /// Scoped to DELETE on purpose. The ADR sentence is about delete capability;
 /// get and put legitimately reach catalog and prov (fold reads and writes catalog
@@ -2367,7 +2345,7 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
     // entry here (or this fails loudly and names it), emptying this list fails,
     // and dropping an entry fails. Nothing else asserts this relationship, so a
     // new protected keyspace could otherwise be added with every other assertion
-    // green and its disjointness from delete grants never checked (#1346).
+    // green and its disjointness from delete grants never checked.
     const LEGAL_HOLD_SHARD: &str = "t/*/u/*/0000/*";
     assert!(
         PROTECTED_DELETE_KEYS.contains(&LEGAL_HOLD_SHARD),
@@ -2815,27 +2793,21 @@ fn admin_delete_grant_is_qualify_scratch_only() {
     assert_admin_delete_grant_is_scratch_only(&policy);
 }
 
-/// The pre-fix Allow side of `delete_key_patterns`, kept verbatim so the fixture below
-/// pins the two holes existed independent of the fixed code: delete capability
+/// The historical Allow side of `delete_key_patterns`, kept verbatim so the
+/// fixture below pins two holes independent of the fixed code: delete capability
 /// recognized only by an exact `s3:DeleteObject` match, and any resource not
 /// under the bucket prefix silently dropped (`if let Some(..)` with no `else`).
+/// It spells out exactly the two comparisons whose holes it pins
+/// (`eq_ignore_ascii_case` on the action, `strip_prefix` against a literal ARN);
+/// reusing today's live predicate would make the fixture a tautology the moment
+/// that predicate changed.
 ///
-/// A pre-fix body spells out the comparison whose HOLE it pins, and only that
-/// one: here `eq_ignore_ascii_case` on the action and `strip_prefix` against a
-/// literal ARN on the resource, because those two are the holes. A pre-fix copy
-/// that reused today's predicate for the axis it is proving would stop proving
-/// the hole the moment that predicate changed, which is how a fixture becomes a
-/// tautology.
-///
-/// Everything that is NOT the hole still goes through live code, and that is
-/// deliberate: this body reads `statement_actions`, and
-/// `pre_fix_validate_condition` calls the live `is_string_or_string_array` and
-/// the live handled-operator and handled-key constants. So an assertion whose
-/// whole content is "a pre-fix body came back empty" can be satisfied by a
-/// regression in that live code instead of by the historical hole, and it has
-/// to pin WHY the result was empty from the raw JSON alongside. The fixture
-/// below is the pattern: it asserts the pre-fix delete set exactly, then
-/// asserts separately which of the two holes swallowed the statement.
+/// Everything that is NOT the hole still goes through live code, so an assertion
+/// whose whole content is "this body came back empty" could be satisfied by a
+/// regression in that live code instead of by the hole. The fixture pins WHY the
+/// result was empty from the raw JSON alongside: it asserts the delete set
+/// exactly, then asserts separately which of the two holes swallowed the
+/// statement.
 fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy_statements(policy) {
@@ -2866,39 +2838,31 @@ fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
     out
 }
 
-/// Regression fixture for the delete-capability holes (issue #1372, the seventh
-/// in the skip-what-you-don't-recognize sequence #1346 tracks). The pre-fix
-/// guard recognized a delete grant only by an exact `s3:DeleteObject` match and
-/// silently dropped any resource not under the bucket prefix. So a statement
-/// granting `s3:*`/`s3:Delete*`/`*` on any resource, or `s3:DeleteObject` on
-/// `"*"` or a different bucket, was invisible to it: the delete-pattern helper
-/// returned an empty set and the assertion "Admin's only delete Allow is
-/// sys/qualify/*" passed while a delete-everywhere grant sat unexamined.
-///
-/// Two independent holes, both closed: the Action is matched as an IAM wildcard
-/// pattern (ASCII-folded, `*`/`?` resolved), and a delete-capable statement
-/// whose Resource is not bucket-relative is a test failure naming the Sid, never
-/// a dropped entry.
+/// Regression fixture for the two delete-capability holes: a delete grant
+/// recognized only by an exact `s3:DeleteObject` match, and a resource not under
+/// the bucket prefix silently dropped. So a statement granting
+/// `s3:*`/`s3:Delete*`/`*` on any resource, or `s3:DeleteObject` on `"*"` or a
+/// different bucket, was invisible: the delete-pattern helper returned an empty
+/// set and "Admin's only delete Allow is sys/qualify/*" passed while a
+/// delete-everywhere grant sat unexamined. Both closed: the Action is matched as
+/// an IAM wildcard pattern (ASCII-folded, `*`/`?` resolved), and a delete-capable
+/// statement whose Resource is not bucket-relative is a test failure naming the
+/// Sid, never a dropped entry.
 ///
 /// Synthetic statements, not `deploy/iam/*.json`: a fixture over the shipped
-/// (correct) admin policy passes whichever way the matcher behaves and proves
-/// nothing about the matcher.
+/// (correct) admin policy passes whichever way the matcher behaves.
 ///
 /// Each fixture carries the WHOLE bypass shape, not just the permissive
-/// statement: admin's shipped `s3:DeleteObject` Allow on `sys/qualify/*`, which
-/// the pre-fix exact match does see; the permissive statement, which it does
-/// not; and a `DenyDeleteProtected` block. That combination is what makes the
-/// fixture reach the same PASSING state under the pre-fix derivation that
-/// admin's real policy reaches, so only the post-fix derivation rejects. A
-/// fixture holding the permissive statement alone panics on the scratch-only
-/// `assert_eq` either way (its delete set can never be `["sys/qualify/*"]`),
-/// which makes a bare `is_err()` unfalsifiable: measured, the suite stayed
-/// 50/0 with both historical holes reintroduced.
-///
-/// So each case asserts in both directions, and names WHICH direction: the
-/// pre-fix derivation returns exactly the scratch prefix (hiding the grant, so
-/// the scratch-only assertion passes over it) and the post-fix guard rejects
-/// with that case's expected message.
+/// statement: admin's shipped `s3:DeleteObject` Allow on `sys/qualify/*` (which
+/// the exact match sees), the permissive statement (which it does not), and a
+/// `DenyDeleteProtected` block. That combination makes the fixture reach the same
+/// PASSING state under the historical derivation that admin's real policy
+/// reaches, so only the post-fix derivation rejects. A fixture holding the
+/// permissive statement alone panics on the scratch-only `assert_eq` either way,
+/// which makes a bare `is_err()` unfalsifiable. So each case asserts in both
+/// directions and names WHICH: the historical derivation returns exactly the
+/// scratch prefix (hiding the grant), and the post-fix guard rejects with that
+/// case's expected message.
 #[test]
 fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
     // The two post-fix rejection paths, as a substring of the panic each
@@ -3476,12 +3440,12 @@ fn single_character_wildcard_in_kms_resource_is_not_a_bypass() {
     }
 }
 
-/// Regression fixtures for the fail-closed choke point (issue #1346, the fourth
-/// instance of the skip-what-you-do-not-understand class this guard keeps
-/// repeating: could not read `Resource`; matched the action prefix
-/// case-sensitively; accepted `?` in ARN segments; and now ignores
-/// `NotResource`/`NotAction`). Before this fix, `load_policy` performed no
-/// per-statement validation, so a statement whose permission lived in a field
+/// Regression fixtures for the fail-closed choke point, closing the
+/// skip-what-you-do-not-understand class this guard exists for: a statement that
+/// could not read `Resource`, a case-sensitive action-prefix match, a `?`
+/// accepted in ARN segments, and `NotResource`/`NotAction` ignored. Before this,
+/// `load_policy` performed no per-statement validation, so a statement whose
+/// permission lived in a field
 /// no guard reads -- `NotResource`, `NotAction`, an unrecognized key such as a
 /// `Resources` typo, or a statement with no `Resource` at all -- was loaded and
 /// then silently skipped by whichever guard went looking for a field it did not
@@ -3703,13 +3667,13 @@ fn malformed_effect_action_or_resource_fails_closed() {
     }
 }
 
-/// F2 regression: an empty `Action`/`Resource` array must fail closed. Pre-fix,
+/// An empty `Action`/`Resource` array must fail closed. Before the fix,
 /// `is_string_or_string_array` returned true for `[]` (`iter().all(..)` is
 /// vacuously true on an empty array), so `"Action": []` / `"Resource": []`
-/// passed validation and every downstream guard derived an empty set and
-/// skipped the statement -- the skip class #1346 tracks, one level inside a
-/// handled key. Synthetic, not `deploy/iam/*.json`: the shipped templates carry
-/// no empty arrays.
+/// passed validation and every downstream guard derived an empty set and skipped
+/// the statement -- the same skip class, one level inside a handled key.
+/// Synthetic, not `deploy/iam/*.json`: the shipped templates carry no empty
+/// arrays.
 #[test]
 fn empty_action_or_resource_array_fails_closed() {
     let cases = [
@@ -3949,7 +3913,7 @@ fn discovery_prefix_admitted_for_every_discovering_role() {
         let policy = load_policy(role);
         // Allow-only: an explicit Deny ListBucket withdraws listing, so its
         // s3:prefix is not a prefix the role is ALLOWED to discover. Reading it
-        // here would assert the inverse of the fact (issue #1346, F1).
+        // here would assert the inverse of the fact.
         let patterns = list_prefix_patterns(&policy, Some("Allow"));
         assert!(
             patterns.iter().any(|p| glob_matches(p, "t/")),
@@ -4433,6 +4397,93 @@ fn full_bucket_object_resource_fails_closed() {
         validate_statement("fixture", 0, &bounded).is_ok(),
         "a bounded object prefix must pass: {:?}",
         validate_statement("fixture", 0, &bounded)
+    );
+}
+
+/// The other direction of the resource-vacuity rule: on a `Deny`, an object-key
+/// pattern that matches every key is MAXIMALLY constraining -- it prohibits
+/// every object in the bucket -- so it must LOAD, not be refused with the
+/// grant-worded reason. Widening `DenyDeleteProtected`'s Resource to the whole
+/// bucket is the safest hardening an operator can make (it denies both delete
+/// operations on every object), and before the Effect gate it took the suite red.
+/// Synthetic: no shipped template names a whole-bucket Deny resource.
+#[test]
+fn whole_bucket_deny_resource_is_maximally_constraining_and_loads() {
+    let deny_whole_bucket = serde_json::json!({
+        "Sid": "DenyDeleteProtected",
+        "Effect": "Deny",
+        "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+        "Resource": "arn:aws:s3:::my-ravel-bucket/*",
+    });
+    // The specific thing: the guard that used to panic on the vacuous key now
+    // returns Ok, so the statement passes the choke point.
+    assert!(
+        validate_statement("fixture", 0, &deny_whole_bucket).is_ok(),
+        "a Deny whose Resource matches every key must pass the choke point: {:?}",
+        validate_statement("fixture", 0, &deny_whole_bucket)
+    );
+    // And a whole policy carrying it loads through build_policy (load_policy's body).
+    let policy = build_policy(
+        "fixture",
+        "<synthetic>",
+        &serde_json::json!({ "Statement": [deny_whole_bucket] }),
+    );
+    assert_eq!(
+        policy_statements(&policy).len(),
+        1,
+        "the synthetic Deny policy must load with its one statement"
+    );
+
+    // The `Allow` side is unchanged. A synthetic `Allow` with the same
+    // whole-bucket object pattern is still refused, with the grant-worded
+    // message. `full_bucket_object_resource_fails_closed` pins this for the
+    // object axis; restated here so both directions sit together.
+    let allow_whole_bucket = serde_json::json!({
+        "Sid": "FullBucketObject",
+        "Effect": "Allow",
+        "Action": "s3:DeleteObject",
+        "Resource": "arn:aws:s3:::my-ravel-bucket/*",
+    });
+    let err = validate_statement("fixture", 0, &allow_whole_bucket)
+        .expect_err("an Allow whose Resource matches every key must still be refused");
+    assert!(
+        err.contains("matches every key"),
+        "the Allow rejection must keep the grant-worded message; got {err:?}"
+    );
+}
+
+/// The list-prefix half of the same rule. On a `Deny` ListBucket, an s3:prefix
+/// that admits every request prohibits every list, which is maximally
+/// constraining, so it must LOAD. On an `Allow` an admits-everything s3:prefix is
+/// still refused (`vacuous_s3_prefix_value_fails_closed` pins that). Synthetic:
+/// no shipped template carries a Deny ListBucket.
+#[test]
+fn whole_bucket_deny_list_prefix_is_maximally_constraining_and_loads() {
+    let deny_star = serde_json::json!({
+        "Sid": "DenyListEverything",
+        "Effect": "Deny",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": ["*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &deny_star).is_ok(),
+        "a Deny s3:prefix `*` denies every list request and must load: {:?}",
+        validate_statement("fixture", 0, &deny_star)
+    );
+
+    // The `Allow` side is unchanged: an admits-everything s3:prefix on an Allow
+    // still fails closed.
+    let allow_star = serde_json::json!({
+        "Sid": "ListEverything",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": ["*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &allow_star).is_err(),
+        "an Allow s3:prefix `*` must still fail closed"
     );
 }
 
@@ -5199,11 +5250,10 @@ fn load_policy_from_rejects_a_synthetic_invalid_file() {
 }
 
 // ---------------------------------------------------------------------------
-// Round four (issue #1346, holes H1/H2/H3): the redesign's own fixtures.
-//
-// Round three's `bucket_relative_s3_pattern` and the list-only exemption its
-// callers carried, kept verbatim, so each fixture below pins the hole it closes
-// instead of restating today's rule.
+// Fixtures for the total-shape redesign. The earlier
+// `bucket_relative_s3_pattern` and the list-only exemption its callers carried
+// are kept verbatim as `round_three_*` below, so each fixture pins the hole it
+// closes instead of restating today's rule.
 // ---------------------------------------------------------------------------
 
 /// Round three's resource classifier, verbatim: it panicked for exactly two
@@ -5845,6 +5895,21 @@ fn every_shipped_template_passes_the_choke_point() {
                      consequence as for Action above"
                 );
             }
+        }
+
+        // `s3:prefix` Condition values are the third field fed through
+        // `glob_to_regex` (via `glob_admits_everything` in `validate_condition`
+        // and `glob_matches` in `discovery_prefix_admitted_for_every_discovering_role`),
+        // so the no-`?` property must be asserted over them too or the
+        // glob_to_regex doc's citation of this test would overstate its scope.
+        for prefix in list_prefix_patterns(&policy, None) {
+            assert!(
+                !prefix.contains('?'),
+                "{role}: s3:prefix {prefix:?} carries a `?`. glob_to_regex resolves \
+                 it as IAM's single-character wildcard; the doc claim that no \
+                 shipped pattern uses one is now false and every prefix axis in \
+                 this file must be re-read"
+            );
         }
     }
 }
