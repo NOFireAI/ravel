@@ -345,5 +345,36 @@ check_eq "the orphaned linker child is dead" "dead" \
 check_eq "the watchdog still succeeds once the set is empty" "0" "${rescan_rc}"
 kill -KILL "${pid_rescan}" "${child_pid}" 2>/dev/null || true
 
+# --- giving up is reported, not reported as success ------------------------
+#
+# After five rounds the watchdog stops and exits 1 rather than claiming a
+# volume it did not free. CLAUDE.md states that; nothing reached it, so
+# deleting the give-up branch and letting the loop fall through to the success
+# message left every case green. A keeper OUTSIDE the scope respawns a `cc`
+# inside it whenever one dies, so the scoped set is never empty. The keeper is
+# named `sh`, which the matcher ignores, and it is bounded to 20 spawns so a
+# failing test cannot leave a respawn loop running on a shared box.
+GIVEUP="${TMP}/giveup"
+mkdir -p "${GIVEUP}/bin"
+ln -s /bin/sh "${GIVEUP}/bin/cc"
+cat > "${TMP}/keeper.sh" <<'EOF'
+n=0
+while [ "${n}" -lt 20 ]; do
+  ( cd "${KEEP_DIR}" && exec "${KEEP_DIR}/bin/cc" -c 'while :; do sleep 1; done' ) \
+    >/dev/null 2>&1
+  n=$((n + 1))
+done
+EOF
+KEEP_DIR="${GIVEUP}" sh "${TMP}/keeper.sh" >/dev/null 2>&1 &
+keeper_pid=$!
+sleep 1
+giveup_out="$(timeout 90 "${WATCHDOG}" "${GIVEUP}" 999999 1000000 1 2>&1)"; giveup_rc=$?
+kill -KILL "${keeper_pid}" 2>/dev/null || true
+pkill -KILL -f "${GIVEUP}/bin/cc" 2>/dev/null || true
+check_eq "giving up exits non-zero" "1" "${giveup_rc}"
+check_contains "giving up says what is still running" "gave up" "${giveup_out}"
+check_eq "giving up does not print the success line" "absent" \
+  "$([[ "${giveup_out}" == *"killed; marker at"* ]] && echo present || echo absent)"
+
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
