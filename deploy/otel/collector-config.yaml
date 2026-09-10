@@ -46,6 +46,25 @@ receivers:
       network:
 
 processors:
+  # Ravel stores cumulative metrics only: a delta-temporality Sum or Histogram
+  # is rejected whole at normalization (counted under
+  # `ravel_admission_rejected_total{reason="structural"}`), because converting
+  # delta to cumulative needs per-series state across requests and every Ravel
+  # compute process is disposable. This processor holds that state in the
+  # collector, which is the right place for it, and emits cumulative points.
+  # It runs before `batch` so batching sees the converted points.
+  #
+  # `hostmetrics` emits cumulative sums already, so this is a no-op for the
+  # quickstart's own pipeline. It is here because it is the piece any real
+  # deployment needs the moment an exporter that defaults to delta (the
+  # OpenTelemetry SDKs for .NET, Go, and Python among them) points at Ravel.
+  deltatocumulative:
+    # Drop a series' accumulated state after this long without a new point, so
+    # a churning series set cannot grow memory without bound.
+    max_stale: 5m
+    # Ceiling on tracked series. Points for series past it pass through
+    # unconverted, and are then rejected by Ravel, rather than being buffered.
+    max_streams: 1000000
   batch:
 
 exporters:
@@ -63,7 +82,7 @@ service:
   pipelines:
     metrics:
       receivers: [hostmetrics]
-      processors: [batch]
+      processors: [deltatocumulative, batch]
       exporters: [otlphttp]
   telemetry:
     logs:

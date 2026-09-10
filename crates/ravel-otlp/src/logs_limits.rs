@@ -178,15 +178,87 @@ pub enum LogRejection {
 }
 
 impl LogRejection {
+    /// The admission `reason` this rejection is counted under (ADR-0051
+    /// section 3 layer 3), or `None` when it costs the sender no log record.
+    /// Mirrors [`crate::limits::Rejection::admission_class`], and is
+    /// exhaustive for the same reason: a new variant does not compile until it
+    /// has been classified.
+    ///
+    /// The five per-attribute variants class as `None`, not `structural`,
+    /// when they stand on their own: they drop one attribute of a record that
+    /// is still stored (their [`LogRejection::rejected_count`] is 0), so they
+    /// cost the sender no record and must not move a rejected counter. This
+    /// mirrors the traces path, where a stored span's dropped attributes are
+    /// classed `None` for the same reason.
+    ///
+    /// Those same five variants also appear inside a [`LogRejection::Grouped`]
+    /// when a resource- or scope-level attribute set cannot be converted,
+    /// where they do cost whole records (the attributes carry stream identity,
+    /// so nothing under the resource or scope can be admitted). That context
+    /// lives on `Grouped`, which classes `structural` for the group rather
+    /// than delegating to the reason: at record scope the same reason costs
+    /// nothing, so delegating would let a real whole-resource loss go
+    /// uncounted.
+    pub fn admission_class(&self) -> Option<crate::limits::AdmissionClass> {
+        use crate::limits::AdmissionClass;
+        match self {
+            LogRejection::FutureSkew { .. } | LogRejection::TooOld { .. } => {
+                Some(AdmissionClass::Skew)
+            }
+            LogRejection::TooManyRecords { .. }
+            | LogRejection::TooManyAttributes { .. }
+            | LogRejection::BodyTooLong { .. }
+            | LogRejection::TooManyResourceAttributes { .. }
+            | LogRejection::TooManyScopeAttributes { .. }
+            | LogRejection::UnsupportedBodyKind => Some(AdmissionClass::Structural),
+            // Per-attribute drops on an otherwise-stored record: the record
+            // still lands, so these cost the sender nothing and must not move
+            // a rejected counter (their `rejected_count` is 0 for the same
+            // reason). When one of these instead rejects a whole resource or
+            // scope it is wrapped in `Grouped`, whose arm below classes the
+            // group, not the reason.
+            LogRejection::AttributeKeyTooLong { .. }
+            | LogRejection::AttributeValueTooLong { .. }
+            | LogRejection::MissingAttributeValue { .. }
+            | LogRejection::UnsupportedAttributeValue { .. }
+            | LogRejection::AttributeTooDeeplyNested { .. } => None,
+            // A grouped rejection is always a whole-group structural loss: its
+            // reason is either a too-many-attributes breach or an attribute
+            // that could not be converted at resource or scope scope, and skew
+            // is resolved per record after the group check, so it never
+            // groups. Classify by the group rather than by the reason, since
+            // the attribute-conversion reasons class `None` on their own.
+            LogRejection::Grouped { .. } => Some(AdmissionClass::Structural),
+        }
+    }
+
     /// Number of underlying OTLP log records this rejection accounts for.
     /// Summing this over [`crate::logs_normalize::LogNormalizeOutput::rejected`]
     /// gives the count to report in an OTLP `rejected_log_records` field.
     /// Mirrors [`crate::limits::Rejection::rejected_count`].
+    ///
+    /// The five per-attribute variants return 0: they drop one attribute of a
+    /// record that is still stored, so counting them as a rejected record
+    /// over-reports how many records a sender's export lost. They remain
+    /// visible to the sender through the partial-success `error_message`; only
+    /// their contribution to `rejected_log_records` is zero. When one of them
+    /// rejects a whole resource or scope it is carried in
+    /// [`LogRejection::Grouped`], whose own `count` (not the reason's) is read
+    /// here, so a real whole-group loss still counts. This mirrors the traces
+    /// path's [`crate::traces_limits::SpanRejection::rejected_count`].
     pub fn rejected_count(&self) -> usize {
         match self {
             LogRejection::TooManyRecords { count, .. } | LogRejection::Grouped { count, .. } => {
                 *count
             }
+            // The record still lands; only one attribute was dropped. These
+            // must never inflate `rejected_log_records`.
+            LogRejection::AttributeKeyTooLong { .. }
+            | LogRejection::AttributeValueTooLong { .. }
+            | LogRejection::MissingAttributeValue { .. }
+            | LogRejection::UnsupportedAttributeValue { .. }
+            | LogRejection::AttributeTooDeeplyNested { .. } => 0,
+            // Whole-record rejections: the record never reached storage.
             _ => 1,
         }
     }
@@ -255,18 +327,6 @@ mod tests {
             1
         );
         assert_eq!(
-            LogRejection::AttributeKeyTooLong { len: 300, max: 256 }.rejected_count(),
-            1
-        );
-        assert_eq!(
-            LogRejection::AttributeValueTooLong {
-                len: 9000,
-                max: 8192
-            }
-            .rejected_count(),
-            1
-        );
-        assert_eq!(
             LogRejection::BodyTooLong {
                 len: 70_000,
                 max: 65_536
@@ -291,22 +351,6 @@ mod tests {
             1
         );
         assert_eq!(
-            LogRejection::MissingAttributeValue { key: "k".into() }.rejected_count(),
-            1
-        );
-        assert_eq!(
-            LogRejection::UnsupportedAttributeValue { key: "k".into() }.rejected_count(),
-            1
-        );
-        assert_eq!(
-            LogRejection::AttributeTooDeeplyNested {
-                key: "k".into(),
-                max: 100,
-            }
-            .rejected_count(),
-            1
-        );
-        assert_eq!(
             LogRejection::FutureSkew {
                 skew_ns: 700_000_000_000,
                 max_ns: 600_000_000_000,
@@ -322,6 +366,49 @@ mod tests {
             .rejected_count(),
             1
         );
+    }
+
+    /// The five per-attribute variants drop one attribute of a record that is
+    /// still stored, so on their own they cost the sender no record: their
+    /// `rejected_count` is 0 and they carry no admission class. Mirrors the
+    /// traces path's attribute-level rejections.
+    #[test]
+    fn per_attribute_variants_cost_no_record_on_their_own() {
+        let variants = [
+            LogRejection::AttributeKeyTooLong { len: 300, max: 256 },
+            LogRejection::AttributeValueTooLong {
+                len: 9000,
+                max: 8192,
+            },
+            LogRejection::MissingAttributeValue { key: "k".into() },
+            LogRejection::UnsupportedAttributeValue { key: "k".into() },
+            LogRejection::AttributeTooDeeplyNested {
+                key: "k".into(),
+                max: 100,
+            },
+        ];
+        for v in &variants {
+            assert_eq!(v.rejected_count(), 0, "{v:?}");
+            assert_eq!(v.admission_class(), None, "{v:?}");
+        }
+    }
+
+    /// A whole resource or scope lost to an attribute that could not be
+    /// converted is carried as a `Grouped`, and must still count as
+    /// `structural` for its full record count. The reason inside classes
+    /// `None` on its own (previous test), so this pins that the group context
+    /// on `Grouped`, not delegation to the reason, is what counts.
+    #[test]
+    fn grouped_attribute_conversion_failure_counts_as_structural() {
+        let r = LogRejection::Grouped {
+            reason: Box::new(LogRejection::MissingAttributeValue { key: "svc".into() }),
+            count: 7,
+        };
+        assert_eq!(
+            r.admission_class(),
+            Some(crate::limits::AdmissionClass::Structural)
+        );
+        assert_eq!(r.rejected_count(), 7);
     }
 
     #[test]

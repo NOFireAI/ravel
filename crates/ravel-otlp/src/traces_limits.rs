@@ -240,6 +240,42 @@ pub enum SpanRejection {
 }
 
 impl SpanRejection {
+    /// The admission `reason` this rejection is counted under (ADR-0051
+    /// section 3 layer 3), or `None` when it costs the sender no span. Mirrors
+    /// [`crate::limits::Rejection::admission_class`], and is exhaustive for
+    /// the same reason: a new variant does not compile until it has been
+    /// classified.
+    pub fn admission_class(&self) -> Option<crate::limits::AdmissionClass> {
+        use crate::limits::AdmissionClass;
+        match self {
+            SpanRejection::FutureSkew { .. } | SpanRejection::TooOld { .. } => {
+                Some(AdmissionClass::Skew)
+            }
+            SpanRejection::TooManySpans { .. }
+            | SpanRejection::TooManyAttributes { .. }
+            | SpanRejection::NameTooLong { .. }
+            | SpanRejection::StatusMessageTooLong { .. }
+            | SpanRejection::TooManyResourceAttributes { .. }
+            | SpanRejection::TooManyScopeAttributes { .. }
+            | SpanRejection::InvalidTraceId { .. }
+            | SpanRejection::InvalidSpanId { .. }
+            | SpanRejection::InvalidTimeRange { .. } => Some(AdmissionClass::Structural),
+            // Attribute-, blob-, and parent-edge-level: the span is still
+            // stored, so these cost the sender nothing and must not move a
+            // rejected counter (their `rejected_count` is 0 for the same
+            // reason).
+            SpanRejection::AttributeKeyTooLong { .. }
+            | SpanRejection::AttributeValueTooLong { .. }
+            | SpanRejection::InvalidParentSpanId { .. }
+            | SpanRejection::EventsBlobTooLong { .. }
+            | SpanRejection::LinksBlobTooLong { .. }
+            | SpanRejection::MissingAttributeValue { .. }
+            | SpanRejection::UnsupportedAttributeValue { .. }
+            | SpanRejection::UnsupportedAttributeKind { .. } => None,
+            SpanRejection::Grouped { reason, .. } => reason.admission_class(),
+        }
+    }
+
     /// Number of underlying OTLP spans this rejection accounts for. Summing
     /// this over [`crate::traces_normalize::SpanNormalizeOutput::rejected`]
     /// gives the count to report in an OTLP `rejected_spans` field. Mirrors
@@ -426,5 +462,62 @@ mod tests {
         let msg = r.to_string();
         assert!(msg.contains("5000"), "{msg}");
         assert!(msg.contains("resource has 200 attributes"), "{msg}");
+    }
+
+    /// The eight attribute-, blob-, and parent-edge-level reasons drop part of
+    /// a span that is still stored, so they carry no admission class and must
+    /// never move a rejected counter. Pinned alongside the `rejected_count`
+    /// zeros above so both halves of "the span landed" fail an arm swap.
+    #[test]
+    fn attribute_level_reasons_carry_no_admission_class() {
+        for r in [
+            SpanRejection::AttributeKeyTooLong { len: 300, max: 256 },
+            SpanRejection::AttributeValueTooLong {
+                len: 9000,
+                max: 8192,
+            },
+            SpanRejection::InvalidParentSpanId { len: 5 },
+            SpanRejection::EventsBlobTooLong {
+                len: 70_000,
+                max: 65_536,
+            },
+            SpanRejection::LinksBlobTooLong {
+                len: 70_000,
+                max: 65_536,
+            },
+            SpanRejection::MissingAttributeValue { key: "k".into() },
+            SpanRejection::UnsupportedAttributeValue { key: "k".into() },
+            SpanRejection::UnsupportedAttributeKind { key: "k".into() },
+        ] {
+            assert_eq!(r.admission_class(), None, "{r}");
+        }
+    }
+
+    /// The span counters: `from_span_rejections` totals a stored span's
+    /// dropped attributes to zero and a whole-span event-time breach to one
+    /// skew. This is the record-call side the per-signal counting feeds.
+    #[test]
+    fn from_span_rejections_totals_by_class() {
+        use crate::limits::NormalizeRejectCounts;
+
+        let stored_span_drops = [
+            SpanRejection::AttributeValueTooLong {
+                len: 9000,
+                max: 8192,
+            },
+            SpanRejection::MissingAttributeValue { key: "k".into() },
+        ];
+        let counts = NormalizeRejectCounts::from_span_rejections(&stored_span_drops);
+        assert_eq!(counts.structural, 0);
+        assert_eq!(counts.skew, 0);
+        assert!(counts.is_empty());
+
+        let too_old = [SpanRejection::TooOld {
+            lag_ns: 8_000_000_000_000,
+            max_ns: 7_200_000_000_000,
+        }];
+        let counts = NormalizeRejectCounts::from_span_rejections(&too_old);
+        assert_eq!(counts.skew, 1);
+        assert_eq!(counts.structural, 0);
     }
 }

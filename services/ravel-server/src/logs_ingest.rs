@@ -14,7 +14,7 @@ use ravel_ingest::{
 };
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_otlp::{LogIngestLimits, LogRejection, normalize_logs};
+use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize_logs};
 use ravel_types::logstream::LogStreamId;
 use ravel_types::{CommitToken, Signal, TenantId};
 
@@ -40,6 +40,11 @@ pub struct LogIngestState {
     /// Durable shard_count provisioning-record writer (ADR-0050 section 5),
     /// pins the (tenant, Logs) record on the tenant's first log write.
     pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
+    /// Normalization's own admission decisions for this signal, the log
+    /// counterpart of [`crate::ingest::IngestState::normalize_metrics`]. Also
+    /// counts structured bodies converted rather than rejected, which is not a
+    /// rejection and gets its own family.
+    pub normalize_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
 }
 
 #[derive(Debug)]
@@ -226,6 +231,19 @@ pub async fn handle_export_logs(
 
     let normalized = normalize_logs(request, &state.limits, ingest_ts_ns);
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    // Layer 3's rejections, counted where they are observed. The body
+    // conversions alongside them are not rejections: those records are in
+    // `normalized.records` and are about to be written.
+    state.normalize_metrics.record(
+        &tenant,
+        ravel_types::Signal::Logs,
+        NormalizeRejectCounts::from_log_rejections(&normalized.rejected),
+    );
+    state.normalize_metrics.record_body_conversions(
+        &tenant,
+        ravel_types::Signal::Logs,
+        normalized.body_conversions,
+    );
     let mut records = normalized.records;
 
     // Layer 4 (ADR-0051 section 1): stream-creation-rate is a whole-request
@@ -412,6 +430,8 @@ mod tests {
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
+    use crate::normalize_reject_metrics::NormalizeRejectMetrics;
+
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
     /// (ADR-0051 amendment): the fixture ingest clock and every log
     /// record timestamp anchor to it so the receiver-clock plausibility floor
@@ -440,6 +460,7 @@ mod tests {
             store,
             recovery: None,
             provisioning: None,
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         }
     }
 
@@ -451,6 +472,64 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    fn int_kv(key: &str, value: i64) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyValueVariant::IntValue(value)),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// `(skew, structural, body_conversions)` summed over the logs rows of the
+    /// normalize-reject counters, so a test can read the same figures before
+    /// and after an export and assert the delta rather than the total.
+    fn logs_normalize_totals(state: &LogIngestState) -> (u64, u64, u64) {
+        state
+            .normalize_metrics
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.signal == Signal::Logs)
+            .fold((0, 0, 0), |acc, row| {
+                (
+                    acc.0 + row.skew_total,
+                    acc.1 + row.structural_total,
+                    acc.2 + row.body_conversions_total,
+                )
+            })
+    }
+
+    /// Reads back every log record the tenant's L0 data objects hold, so a
+    /// test can assert on what was actually stored rather than on what the
+    /// normalize layer returned.
+    async fn stored_log_records(
+        store: &dyn ObjectStoreBackend,
+        tenant: &str,
+    ) -> Vec<ravel_logseg::LogRecord> {
+        use ravel_logseg::{Predicate, RlogConfig, RlogReader};
+        use ravel_object_store::{GetRange, list_all};
+
+        let prefix = format!("t/{}/l/l0/", TenantId::new(tenant).hash().to_hex());
+        let objects = list_all(store, &prefix)
+            .await
+            .expect("list log data objects");
+        let mut out = Vec::new();
+        for object in objects {
+            let bytes = store
+                .get(&object.key, GetRange::Full)
+                .await
+                .expect("get log data object")
+                .data;
+            let reader = RlogReader::new(&bytes, &RlogConfig::default()).expect("open RLOG object");
+            let (records, _stats) = reader
+                .scan(&Predicate::And(Vec::new()))
+                .expect("unfiltered scan");
+            out.extend(records);
+        }
+        out
     }
 
     fn request(records: Vec<LogRecord>) -> ExportLogsServiceRequest {
@@ -525,13 +604,14 @@ mod tests {
     #[tokio::test]
     async fn all_records_rejected_yields_no_tokens_and_a_partial_success() {
         let state = state();
-        // An ArrayValue body is LogRejection::UnsupportedBodyKind, which drops
-        // the whole record.
+        // A string-table reference body is LogRejection::UnsupportedBodyKind,
+        // which drops the whole record: the table it indexes lives on the OTLP
+        // request, not on the record, so nothing here can resolve it. Array and
+        // kvlist bodies used to reach this same rejection and no longer do;
+        // they convert to canonical JSON and are stored.
         let mut rec = record("unused", Vec::new());
         rec.body = Some(AnyValue {
-            value: Some(AnyValueVariant::ArrayValue(
-                opentelemetry_proto::tonic::common::v1::ArrayValue { values: vec![] },
-            )),
+            value: Some(AnyValueVariant::StringValueStrindex(3)),
         });
 
         let outcome = handle_export_logs(
@@ -551,6 +631,185 @@ mod tests {
             .partial_success
             .expect("the record was rejected");
         assert_eq!(partial_success.rejected_log_records, 1);
+    }
+
+    /// A kvlist body is stored as canonical JSON, and everything else on the
+    /// record survives the conversion. The counters see a conversion, not a
+    /// rejection.
+    #[tokio::test]
+    async fn kvlist_body_is_stored_as_canonical_json_with_the_record_intact() {
+        const TRACE_ID: [u8; 16] = [0x11; 16];
+        const SPAN_ID: [u8; 8] = [0x22; 8];
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let state = state_with_store(1, store.clone());
+
+        let mut rec = record("unused", vec![string_kv("http.route", "/v1/logs")]);
+        rec.body = Some(AnyValue {
+            value: Some(AnyValueVariant::KvlistValue(
+                opentelemetry_proto::tonic::common::v1::KeyValueList {
+                    // Reverse key order on the wire: the stored form must be
+                    // the canonical order, not the sender's.
+                    values: vec![string_kv("zeta", "z"), int_kv("alpha", 7)],
+                },
+            )),
+        });
+        rec.trace_id = TRACE_ID.to_vec();
+        rec.span_id = SPAN_ID.to_vec();
+
+        let before = logs_normalize_totals(&state);
+        let outcome = handle_export_logs(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![rec]),
+            BASE_TS_NS,
+            None,
+        )
+        .await
+        .expect("strict write publishes");
+        assert!(
+            outcome.response.partial_success.is_none(),
+            "a converted body is not a rejection, got {:?}",
+            outcome.response.partial_success
+        );
+        let after = logs_normalize_totals(&state);
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            (0, 0, 1),
+            "exactly one conversion, no skew or structural rejection"
+        );
+
+        let stored = stored_log_records(store.as_ref(), "acme").await;
+        assert_eq!(stored.len(), 1, "the record was stored, not dropped");
+        let stored = &stored[0];
+        assert_eq!(stored.body, r#"{"alpha":7,"zeta":"z"}"#);
+        assert_eq!(stored.ts_ns, BASE_TS_NS);
+        assert_eq!(stored.trace_id, Some(TRACE_ID));
+        assert_eq!(stored.span_id, Some(SPAN_ID));
+        assert_eq!(
+            stored.attrs,
+            vec![(
+                "http.route".to_string(),
+                ravel_types::logstream::AttrValue::Str("/v1/logs".to_string())
+            )],
+            "record attributes survive the body conversion"
+        );
+    }
+
+    /// The array-body counterpart of
+    /// `kvlist_body_is_stored_as_canonical_json_with_the_record_intact`:
+    /// element order is the sender's, not sorted.
+    #[tokio::test]
+    async fn array_body_is_stored_as_canonical_json_with_the_record_intact() {
+        const TRACE_ID: [u8; 16] = [0x33; 16];
+        const SPAN_ID: [u8; 8] = [0x44; 8];
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let state = state_with_store(1, store.clone());
+
+        let mut rec = record("unused", vec![string_kv("http.route", "/v1/logs")]);
+        rec.body = Some(AnyValue {
+            value: Some(AnyValueVariant::ArrayValue(
+                opentelemetry_proto::tonic::common::v1::ArrayValue {
+                    values: vec![
+                        AnyValue {
+                            value: Some(AnyValueVariant::IntValue(1)),
+                        },
+                        AnyValue {
+                            value: Some(AnyValueVariant::StringValue("two".to_string())),
+                        },
+                        AnyValue {
+                            value: Some(AnyValueVariant::BoolValue(true)),
+                        },
+                    ],
+                },
+            )),
+        });
+        rec.trace_id = TRACE_ID.to_vec();
+        rec.span_id = SPAN_ID.to_vec();
+
+        let before = logs_normalize_totals(&state);
+        let outcome = handle_export_logs(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![rec]),
+            BASE_TS_NS,
+            None,
+        )
+        .await
+        .expect("strict write publishes");
+        assert!(
+            outcome.response.partial_success.is_none(),
+            "a converted body is not a rejection, got {:?}",
+            outcome.response.partial_success
+        );
+        let after = logs_normalize_totals(&state);
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            (0, 0, 1),
+            "exactly one conversion, no skew or structural rejection"
+        );
+
+        let stored = stored_log_records(store.as_ref(), "acme").await;
+        assert_eq!(stored.len(), 1, "the record was stored, not dropped");
+        let stored = &stored[0];
+        assert_eq!(stored.body, r#"[1,"two",true]"#);
+        assert_eq!(stored.ts_ns, BASE_TS_NS);
+        assert_eq!(stored.trace_id, Some(TRACE_ID));
+        assert_eq!(stored.span_id, Some(SPAN_ID));
+        assert_eq!(
+            stored.attrs,
+            vec![(
+                "http.route".to_string(),
+                ravel_types::logstream::AttrValue::Str("/v1/logs".to_string())
+            )],
+            "record attributes survive the body conversion"
+        );
+    }
+
+    /// Event-time rejections land under the skew reason, one per rejected
+    /// record, and move nothing else.
+    #[tokio::test]
+    async fn event_time_rejections_count_as_skew() {
+        let state = state();
+        let too_old = BASE_TS_NS - state.limits.max_ingest_lag_ns - 1;
+        let records: Vec<LogRecord> = (0..3)
+            .map(|i| {
+                let mut rec = record("hello", vec![string_kv("k", "v")]);
+                rec.time_unix_nano = (too_old - i) as u64;
+                rec.observed_time_unix_nano = (too_old - i) as u64;
+                rec
+            })
+            .collect();
+
+        let before = logs_normalize_totals(&state);
+        let outcome = handle_export_logs(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(records),
+            BASE_TS_NS,
+            None,
+        )
+        .await
+        .expect("a write with zero admitted records never fails");
+        let after = logs_normalize_totals(&state);
+
+        assert_eq!(
+            outcome
+                .response
+                .partial_success
+                .expect("all three records were rejected")
+                .rejected_log_records,
+            3
+        );
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            (3, 0, 0),
+            "three skew rejections, nothing structural, no conversion"
+        );
     }
 
     #[tokio::test]
@@ -794,6 +1053,7 @@ mod tests {
             store,
             recovery: None,
             provisioning: None,
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         }
     }
 

@@ -96,6 +96,9 @@ fn log_state(
         store,
         recovery: None,
         provisioning: None,
+        normalize_metrics: Arc::new(
+            ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
     }
 }
 

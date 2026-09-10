@@ -13,7 +13,7 @@ use ravel_ingest::{
     WriteError, WriteMode, plausible_ingest_clock,
 };
 use ravel_otlp::normalize::normalize_metrics_with_metadata;
-use ravel_otlp::{IngestLimits, Rejection};
+use ravel_otlp::{IngestLimits, NormalizeRejectCounts, Rejection};
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
 
 pub struct IngestState {
@@ -39,6 +39,12 @@ pub struct IngestState {
     /// normalization decoded, synchronously and off the acknowledgement path.
     /// `None` in a unit test or a mode that captures no metadata.
     pub metadata_sink: Option<Arc<MetadataSink>>,
+    /// Per-tenant counter for normalization's own admission decisions
+    /// (ADR-0051 section 3, layer 3), rendered as the `skew` and `structural`
+    /// reasons of `ravel_admission_rejected_total`. Every ingest surface shares
+    /// this one `Arc`, so the counter does not move when a fleet switches
+    /// transport.
+    pub normalize_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
 }
 
 pub struct IngestOutcome {
@@ -175,6 +181,15 @@ pub async fn handle_export(
         .collect();
     let normalized = result.output;
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    // Layer 3's rejections, counted where they are observed rather than inside
+    // the normalizer, which knows no tenant. Classified per point, so the
+    // counter moves by exactly what the sender is told in `rejected_data_points`
+    // below.
+    state.normalize_metrics.record(
+        &tenant,
+        ravel_types::Signal::Metrics,
+        NormalizeRejectCounts::from_metric_rejections(&normalized.rejected),
+    );
 
     // Scalar and native-histogram points arrive in separate vectors; both
     // feed one ingest write so a request's points share a single receipt.
@@ -326,6 +341,8 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::Signal;
 
+    use crate::normalize_reject_metrics::NormalizeRejectMetrics;
+
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
     /// (ADR-0051 amendment): the fixture ingest clock anchors to it so
     /// the receiver-clock plausibility floor admits the request. Never
@@ -351,6 +368,7 @@ mod tests {
             recovery: None,
             provisioning: None,
             metadata_sink: None,
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         }
     }
 
@@ -381,6 +399,7 @@ mod tests {
             recovery: None,
             provisioning: None,
             metadata_sink: Some(sink.clone()),
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         };
         (state, store, sink)
     }
@@ -389,6 +408,151 @@ mod tests {
         ExportMetricsServiceRequest {
             resource_metrics: vec![],
         }
+    }
+
+    /// `(skew, structural)` summed over the metrics rows of the
+    /// normalize-reject counters, so a test can read the same figures before
+    /// and after an export and assert the delta rather than the total.
+    fn metrics_normalize_totals(state: &IngestState) -> (u64, u64) {
+        state
+            .normalize_metrics
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.signal == Signal::Metrics)
+            .fold((0, 0), |acc, row| {
+                (acc.0 + row.skew_total, acc.1 + row.structural_total)
+            })
+    }
+
+    /// A delta-temporality Sum with `point_count` points, which the normalize
+    /// layer rejects whole (`aggregation_temporality` is a field of the Sum
+    /// message, not of a data point, so every point under it shares one
+    /// temporality).
+    pub(crate) fn delta_sum_request(point_count: usize) -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, metric::Data as MetricData,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests".to_string(),
+                        data: Some(MetricData::Sum(Sum {
+                            data_points: (0..point_count)
+                                .map(|i| NumberDataPoint {
+                                    time_unix_nano: BASE_TS_NS as u64,
+                                    value: Some(NumberValue::AsDouble(i as f64)),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            // AGGREGATION_TEMPORALITY_DELTA.
+                            aggregation_temporality: 1,
+                            is_monotonic: true,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// Delta temporality is a structural rejection, and the operator-visible
+    /// counter must move by exactly the number of points the response reports
+    /// rejected.
+    #[tokio::test]
+    async fn delta_sum_export_counts_every_point_as_structural() {
+        const POINT_COUNT: usize = 3;
+
+        let state = state();
+        let before = metrics_normalize_totals(&state);
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            delta_sum_request(POINT_COUNT),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("buffered write with zero admitted points never fails");
+        let after = metrics_normalize_totals(&state);
+
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the whole delta metric was rejected");
+        assert_eq!(partial_success.rejected_data_points, POINT_COUNT as i64);
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (0, POINT_COUNT as u64),
+            "every rejected point counts once under structural, none under skew"
+        );
+    }
+
+    /// Event-time rejections land under the skew reason, one per rejected
+    /// point, and move nothing else.
+    #[tokio::test]
+    async fn stale_points_count_as_skew() {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+            metric::Data as MetricData,
+        };
+
+        const POINT_COUNT: usize = 4;
+
+        let state = state();
+        let too_old = BASE_TS_NS - state.limits.max_ingest_lag_ns - 1;
+        let request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests".to_string(),
+                        data: Some(MetricData::Gauge(Gauge {
+                            data_points: (0..POINT_COUNT)
+                                .map(|i| NumberDataPoint {
+                                    time_unix_nano: (too_old - i as i64) as u64,
+                                    value: Some(NumberValue::AsDouble(i as f64)),
+                                    ..Default::default()
+                                })
+                                .collect(),
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        let before = metrics_normalize_totals(&state);
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Buffered,
+            request,
+            BASE_TS_NS,
+        )
+        .await
+        .expect("buffered write with zero admitted points never fails");
+        let after = metrics_normalize_totals(&state);
+
+        assert_eq!(
+            outcome
+                .response
+                .partial_success
+                .expect("every point was too old")
+                .rejected_data_points,
+            POINT_COUNT as i64
+        );
+        assert_eq!(
+            (after.0 - before.0, after.1 - before.1),
+            (POINT_COUNT as u64, 0),
+            "every rejected point counts once under skew, none under structural"
+        );
     }
 
     #[test]
@@ -611,6 +775,7 @@ mod tests {
             recovery: Some(writer),
             provisioning: None,
             metadata_sink: None,
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         };
 
         let tenant = TenantId::new("acme");

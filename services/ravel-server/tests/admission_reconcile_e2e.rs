@@ -151,6 +151,9 @@ fn build_process(store: Arc<dyn ObjectStoreBackend>) -> (Arc<AdmissionController
         recovery: None,
         provisioning: None,
         metadata_sink: None,
+        normalize_metrics: Arc::new(
+            ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
     };
     (admission, state)
 }

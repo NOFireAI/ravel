@@ -13,7 +13,7 @@ use ravel_ingest::{
 };
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_otlp::{SpanIngestLimits, SpanRejection, normalize_traces};
+use ravel_otlp::{NormalizeRejectCounts, SpanIngestLimits, SpanRejection, normalize_traces};
 use ravel_types::{CommitToken, Signal, TenantId};
 
 use crate::otlp_http::{
@@ -38,6 +38,9 @@ pub struct SpanIngestState {
     /// Durable shard_count provisioning-record writer (ADR-0050 section 5),
     /// pins the (tenant, Spans) record on the tenant's first span write.
     pub provisioning: Option<Arc<crate::provisioning::ProvisioningRecordWriter>>,
+    /// Normalization's own admission decisions for this signal, the span
+    /// counterpart of [`crate::ingest::IngestState::normalize_metrics`].
+    pub normalize_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
 }
 
 pub struct SpanIngestOutcome {
@@ -212,6 +215,14 @@ pub async fn handle_export_traces(
     // of a span that still lands, and `SpanRejection::rejected_count` returns 0
     // for it, so it does not inflate this total.
     let rejected_spans: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
+    // Layer 3's rejections, counted where they are observed. Attribute-level
+    // rejections classify as neither reason for the same reason they do not
+    // reach `rejected_spans`: the span landed.
+    state.normalize_metrics.record(
+        &tenant,
+        ravel_types::Signal::Spans,
+        NormalizeRejectCounts::from_span_rejections(&normalized.rejected),
+    );
 
     // Spans this request actually writes, captured before `spans` is moved.
     let written_count = normalized.spans.len() as u64;
@@ -362,6 +373,8 @@ mod tests {
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
+    use crate::normalize_reject_metrics::NormalizeRejectMetrics;
+
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
     /// (ADR-0051 amendment): every fixture clock and span timestamp is
     /// anchored to it so the receiver-clock plausibility floor admits the
@@ -389,6 +402,7 @@ mod tests {
             store,
             recovery: None,
             provisioning: None,
+            normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         }
     }
 

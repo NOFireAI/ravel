@@ -193,6 +193,66 @@ Two behaviors are worth knowing about, both intentional:
   one named `_foo` both sanitize to `_foo` and become the same series. This
   is a documented consequence of the sanitization rule, not a bug.
 
+## Delta temporality metrics
+
+Ravel stores cumulative metrics only. A `Sum`, `Histogram`, or
+`ExponentialHistogram` whose `aggregation_temporality` is delta (or
+unspecified) is rejected as `UnsupportedTemporality`, and the response reports
+every point under that metric as rejected. This is not a temporary
+restriction: converting delta to cumulative means holding the running total
+for every series between requests, and a Ravel compute process keeps no
+durable local state, so it has nowhere correct to hold it. A process restart
+mid-stream would silently reset the totals.
+
+Temporality is a property of the metric, not of the individual point: the
+`aggregation_temporality` field sits on the `Sum` and `Histogram` messages,
+above the data points, so a metric cannot carry a mix. Rejecting the whole
+metric rejects exactly the points that share the delta temporality, and no
+others.
+
+Convert in the collector instead, which is a stateful process that owns local
+memory. The `deltatocumulative` processor
+(`otel/opentelemetry-collector-contrib`) holds the per-series accumulators and
+emits cumulative points:
+
+```yaml
+processors:
+  deltatocumulative:
+    # Forget a series after this long without a point, so a churning series
+    # set cannot grow memory without bound.
+    max_stale: 5m
+    # Ceiling on tracked series. Points past it pass through unconverted, and
+    # Ravel then rejects them, rather than being buffered.
+    max_streams: 1000000
+  batch:
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      # Convert before batching, so batches carry converted points.
+      processors: [deltatocumulative, batch]
+      exporters: [otlphttp]
+```
+
+Two consequences to plan for. The processor's memory is proportional to the
+number of live series, so `max_streams` is a real ceiling and not a formality;
+size it above the tenant's active series count. And the first point of each
+series after a collector restart re-bases that series' accumulator, which
+appears downstream as a counter reset. PromQL's `rate` and `increase` handle
+resets, so query results stay correct, but a dashboard reading a raw counter
+value shows the drop.
+
+The alternative is to configure the sender for cumulative temporality
+directly, which most OpenTelemetry SDKs support through the
+`OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=cumulative` environment
+variable. That avoids the conversion and its memory entirely, and is the
+better fix where the sender is yours to configure.
+
+Watch `ravel_admission_rejected_total{reason="structural"}`
+([observability guide](observability.md#reading-the-reason-label)) to confirm
+the rejections stopped.
+
 ## Metric metadata and OTLP name suffixing
 
 Ravel captures each metric's type, help, and unit at ingest time and serves it
@@ -363,7 +423,7 @@ Every rejection reason:
 | `AttributeKeyTooLong` | An attribute key exceeds `max_attribute_key_len`. Ravel drops that one attribute, not the record. |
 | `AttributeValueTooLong` | An attribute value's payload exceeds `max_attribute_value_len` (nested list and map entries count toward it). Ravel drops that one attribute, not the record. |
 | `BodyTooLong` | The record body, after normalization to a string, exceeds `max_body_len`. Ravel rejects that record. |
-| `UnsupportedBodyKind` | The body is an OTLP `ArrayValue`, `KvlistValue`, or string-table reference. A structured body has no lossless string form, so Ravel rejects the record rather than stringify it by guess. |
+| `UnsupportedBodyKind` | The body is a string-table reference, which indexes a table the record does not carry, so there is nothing to store. Array and map bodies are converted, not rejected; see below. |
 | `MissingAttributeValue` | An attribute arrived with its `value` field unset. Ravel drops and reports that one attribute; it never silently discards it. |
 | `UnsupportedAttributeValue` | An attribute value is a string-table reference (`strindex`), which carries no value of its own. Ravel drops that one attribute. |
 | `Grouped` | Not a reason of its own. It carries one of the reasons above plus the number of records it applies to, for a rejection that covers a whole resource or scope. Ravel reports it as that inner reason with a count. |
@@ -373,6 +433,32 @@ and `IntValue` become their plain string form. `DoubleValue` uses the same
 float formatting that the metrics path uses. `BytesValue` becomes a hex
 string. A record with no body at all normalizes to an empty body, which is
 legal OTLP, not a rejection.
+
+An `ArrayValue` or `KvlistValue` body is stored as JSON text. The rendering is
+canonical, so two exports of the same body always produce byte-identical
+stored text:
+
+- Map keys are ordered by the same rule that orders attributes in stream
+  identity, which is a byte ordering on the key and then on the encoded value,
+  not the sender's order and not lexicographic ordering of the JSON text. Two
+  entries with the same key are both kept, ordered by their values.
+- Array elements keep the sender's order, which is part of the value.
+- Nested arrays and maps render recursively under the same rules. Nesting is
+  bounded by the same depth limit that applies to attribute values. A body
+  past that depth, or one holding an unset value or a nested string-table
+  reference, is rejected as `UnsupportedBodyKind`: what the sender lost is the
+  body, so the record is reported that way rather than as an attribute
+  problem.
+- A bytes value inside the body renders as a lowercase hex string. A
+  non-finite double renders as the JSON string `"NaN"`, `"Infinity"`, or
+  `"-Infinity"`, since JSON has no literal for them.
+
+The converted text counts against `max_body_len` like any other body, so a
+large structured body can still be rejected as `BodyTooLong`. Conversions are
+counted per tenant and signal in `ravel_ingest_body_conversions_total`. That
+counter is not a rejection counter: every record it counts was stored. It
+exists so that a query returning JSON text where a reader expected a plain
+message has a place to check.
 
 Malformed `trace_id`/`span_id` byte lengths normalize to absent; Ravel does
 not pad or truncate them. Padding would fabricate an id that never existed.

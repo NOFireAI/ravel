@@ -151,15 +151,13 @@ pub enum Rejection {
     #[error("data point has neither an int nor a double value set")]
     MissingValue,
 
-    #[error("metric type {metric_type} is not supported in phase 1; rejecting {count} data points")]
+    #[error("metric type {metric_type} is not supported; rejecting {count} data points")]
     UnsupportedMetricType {
         metric_type: &'static str,
         count: usize,
     },
 
-    #[error(
-        "only cumulative-temporality sums are supported in phase 1; rejecting {count} data points"
-    )]
+    #[error("only cumulative-temporality sums are supported; rejecting {count} data points")]
     UnsupportedTemporality { count: usize },
 
     #[error("event timestamp is zero")]
@@ -261,7 +259,138 @@ pub enum Rejection {
     },
 }
 
+/// Which admission `reason` a normalization-layer rejection is counted under
+/// (ADR-0051 section 3 layer 3, section 6).
+///
+/// Layer 3 is "structural and event-time bounds, in normalization, per point /
+/// record / span". Those are the only two reasons the layer can produce, so
+/// the classification is total over every rejection that costs the sender a
+/// point, record, or span:
+///
+/// * [`AdmissionClass::Skew`] is the event-time arm: the sender's timestamp
+///   could not be placed in the admission window around ingest time.
+/// * [`AdmissionClass::Structural`] is everything else the layer refuses:
+///   a shape, a type, a limit, or a value the storage format cannot represent.
+///
+/// A rejection that costs the sender nothing (an informational drop of a
+/// histogram `min`/`max`, an exemplar, or a single attribute of an otherwise
+/// admitted record) has no class: it is not an admission rejection and must
+/// never move a rejected counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionClass {
+    Skew,
+    Structural,
+}
+
+/// Rejected points, records, or spans totalled per [`AdmissionClass`] over one
+/// normalization pass, ready to be recorded against the `reason` label on
+/// `ravel_admission_rejected_total`.
+///
+/// Each unit is counted once, with the same `rejected_count()` multiplier the
+/// OTLP partial-success response reports, so the counter and the response
+/// cannot disagree about how many units a request lost.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NormalizeRejectCounts {
+    pub skew: usize,
+    pub structural: usize,
+}
+
+impl NormalizeRejectCounts {
+    /// Whether anything at all was rejected, so a caller can skip taking a
+    /// counter lock on the (overwhelmingly common) clean request.
+    pub fn is_empty(&self) -> bool {
+        self.skew == 0 && self.structural == 0
+    }
+
+    pub fn add(&mut self, class: Option<AdmissionClass>, count: usize) {
+        match class {
+            Some(AdmissionClass::Skew) => self.skew += count,
+            Some(AdmissionClass::Structural) => self.structural += count,
+            None => {}
+        }
+    }
+
+    /// Total the metric path's rejections by class.
+    pub fn from_metric_rejections(rejected: &[Rejection]) -> Self {
+        let mut counts = Self::default();
+        for rejection in rejected {
+            counts.add(rejection.admission_class(), rejection.rejected_count());
+        }
+        counts
+    }
+
+    /// Total the log path's rejections by class.
+    pub fn from_log_rejections(rejected: &[crate::logs_limits::LogRejection]) -> Self {
+        let mut counts = Self::default();
+        for rejection in rejected {
+            counts.add(rejection.admission_class(), rejection.rejected_count());
+        }
+        counts
+    }
+
+    /// Total the trace path's rejections by class.
+    pub fn from_span_rejections(rejected: &[crate::traces_limits::SpanRejection]) -> Self {
+        let mut counts = Self::default();
+        for rejection in rejected {
+            counts.add(rejection.admission_class(), rejection.rejected_count());
+        }
+        counts
+    }
+}
+
 impl Rejection {
+    /// The admission `reason` this rejection is counted under, or `None` when
+    /// it costs the sender no data point (the informational variants, whose
+    /// [`Rejection::rejected_count`] is 0).
+    ///
+    /// Exhaustive on purpose: a new variant does not compile until it has been
+    /// classified, so a normalize-layer rejection cannot be added and then
+    /// silently go uncounted.
+    pub fn admission_class(&self) -> Option<AdmissionClass> {
+        match self {
+            // Event-time arm. `ZeroTimestamp` belongs here with the two bound
+            // breaches: all three come out of the event-time check, and a zero
+            // event time is unbounded lag against any plausible ingest clock.
+            Rejection::ZeroTimestamp | Rejection::FutureSkew { .. } | Rejection::TooOld { .. } => {
+                Some(AdmissionClass::Skew)
+            }
+
+            // Structural arm: a shape, type, limit, or value the storage
+            // format cannot represent.
+            Rejection::TooManyDataPoints { .. }
+            | Rejection::TooManyResourceAttributes { .. }
+            | Rejection::MetricNameTooLong { .. }
+            | Rejection::EmptyMetricName { .. }
+            | Rejection::TooManyAttributes { .. }
+            | Rejection::LabelNameTooLong { .. }
+            | Rejection::LabelValueTooLong { .. }
+            | Rejection::DuplicateLabelName(_)
+            | Rejection::ComplexAttributeValue
+            | Rejection::MissingValue
+            | Rejection::UnsupportedMetricType { .. }
+            | Rejection::UnsupportedTemporality { .. }
+            | Rejection::OversizedSeriesComponent
+            | Rejection::HistogramBucketCountMismatch { .. }
+            | Rejection::NonFiniteHistogramBound
+            | Rejection::HistogramBoundsNotIncreasing
+            | Rejection::HistogramCountOverflow
+            | Rejection::NativeHistogramScaleUnsupported { .. }
+            | Rejection::NativeHistogramCountInconsistent
+            | Rejection::NativeHistogramCountOverflow
+            | Rejection::NonFiniteQuantile
+            | Rejection::DuplicateQuantile => Some(AdmissionClass::Structural),
+
+            // Informational: the point was admitted and stored.
+            Rejection::HistogramMinMaxDropped { .. }
+            | Rejection::HistogramExemplarsDropped { .. }
+            | Rejection::IntegerValuePrecisionLoss { .. } => None,
+
+            // A grouped rejection carries its own point count; the class is
+            // the shared reason's.
+            Rejection::Grouped { reason, .. } => reason.admission_class(),
+        }
+    }
+
     /// Number of underlying OTLP data points this rejection accounts for.
     /// Summing this over [`crate::normalize::NormalizeOutput::rejected`]
     /// gives the count to report in an OTLP `rejected_data_points` field.
@@ -339,5 +468,26 @@ mod tests {
         };
         assert_eq!(r.rejected_count(), 100_000);
         assert!(r.to_string().contains("100000"));
+    }
+
+    /// `add` routes each class to its own field and leaves the other
+    /// untouched, and `None` moves neither. Pinned in this crate because a
+    /// crate-scoped gate here otherwise cannot catch an arm swap: only the
+    /// server crate exercised this arithmetic before.
+    #[test]
+    fn add_routes_each_class_to_its_own_field() {
+        let mut counts = NormalizeRejectCounts::default();
+        counts.add(Some(AdmissionClass::Skew), 3);
+        assert_eq!(counts.skew, 3);
+        assert_eq!(counts.structural, 0);
+
+        counts.add(Some(AdmissionClass::Structural), 5);
+        assert_eq!(counts.skew, 3);
+        assert_eq!(counts.structural, 5);
+
+        counts.add(None, 100);
+        assert_eq!(counts.skew, 3);
+        assert_eq!(counts.structural, 5);
+        assert!(!counts.is_empty());
     }
 }

@@ -37,6 +37,7 @@ pub mod mcp;
 pub mod mem_stats;
 pub mod metadata_sink_task;
 pub mod metrics;
+pub mod normalize_reject_metrics;
 #[cfg(feature = "otap")]
 pub mod otap_grpc;
 pub mod otlp_grpc;
@@ -1168,6 +1169,7 @@ fn gateway_state(
     provisioning: &Option<Arc<provisioning::ProvisioningRecordWriter>>,
     ingest_concurrency: &Arc<ingest_concurrency::IngestConcurrencyController>,
     ingest_byte_metrics: &Arc<ingest_byte_metrics::IngestByteMetrics>,
+    normalize_reject_metrics: &Arc<normalize_reject_metrics::NormalizeRejectMetrics>,
     ingest_buffer_budget: &Arc<ravel_ingest::IngestByteBudget>,
     metadata_sink: &Option<Arc<ravel_ingest::MetadataSink>>,
 ) -> Arc<otlp_http::GatewayState> {
@@ -1181,6 +1183,7 @@ fn gateway_state(
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
             metadata_sink: metadata_sink.clone(),
+            normalize_metrics: normalize_reject_metrics.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
@@ -1190,6 +1193,7 @@ fn gateway_state(
             store: store.clone(),
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
+            normalize_metrics: normalize_reject_metrics.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
@@ -1199,6 +1203,7 @@ fn gateway_state(
             store: store.clone(),
             recovery: recovery.clone(),
             provisioning: provisioning.clone(),
+            normalize_metrics: normalize_reject_metrics.clone(),
         },
         admission: admission.clone(),
         budget: ingest_buffer_budget.clone(),
@@ -1542,6 +1547,14 @@ pub async fn start(
     // wire-bytes family sums the same tenants the admission family does.
     let ingest_byte_metrics = Arc::new(ingest_byte_metrics::IngestByteMetrics::new());
 
+    // Normalization-layer admission counters (ADR-0051 section 3, layer 3), on
+    // the same terms: one shared instance per process, threaded into every
+    // ingest surface (OTLP HTTP and gRPC, OTAP, both listeners) and read at
+    // scrape time. Sharing the instance is what makes the `skew` and
+    // `structural` reasons transport-independent.
+    let normalize_reject_metrics =
+        Arc::new(normalize_reject_metrics::NormalizeRejectMetrics::new());
+
     // Per-query cost aggregator (ADR-0044 section 4): one per
     // process, shared with every query handler below and read at scrape time by
     // the `/metrics` route. Its per-tenant allowlist is the tenants an operator
@@ -1606,6 +1619,7 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &ingest_byte_metrics,
+            &normalize_reject_metrics,
             &ingest_buffer_budget,
             &metadata_sink,
         );
@@ -1633,6 +1647,7 @@ pub async fn start(
                 &provisioning_writer,
                 &ingest_concurrency,
                 &ingest_byte_metrics,
+                &normalize_reject_metrics,
                 &ingest_buffer_budget,
                 &metadata_sink,
             );
@@ -1821,6 +1836,7 @@ pub async fn start(
         distrib: distrib_metrics.clone(),
         durable_auth: durable_auth.clone(),
         ingest_byte_metrics: ingest_byte_metrics.clone(),
+        normalize_reject_metrics: normalize_reject_metrics.clone(),
         metadata_cache: metadata_cache.clone(),
         // Filled in below, once the query-serving block has spawned the
         // pipeline; the metrics router is merged after that block for the
@@ -2426,6 +2442,7 @@ pub async fn start(
             &provisioning_writer,
             &ingest_concurrency,
             &ingest_byte_metrics,
+            &normalize_reject_metrics,
             &ingest_buffer_budget,
             &metadata_sink,
         )),

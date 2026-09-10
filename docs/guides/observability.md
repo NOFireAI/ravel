@@ -388,8 +388,7 @@ ratios for PromQL to compute, per `cache` and per `tier`.
 Labels: `mode`, `tenant_hash`, `signal`, plus `reason` on the rejection
 counter. This family folds tenants per the rule above. The
 [admission limits guide](admission-limits.md) covers this family in
-operational depth. No alert rule for it is written yet; alert on a rejection
-rate against the workload's expected admission behavior until one is.
+operational depth.
 
 | Metric | Meaning |
 |---|---|
@@ -398,16 +397,105 @@ rate against the workload's expected admission behavior until one is.
 | `ravel_admission_admitted_bytes_total` | Charged (decompressed) bytes admitted past the ingest byte-rate layer, by tenant and signal. For a gzip OTLP request this is the decompressed size; for an uncompressed request it equals the wire size. |
 | `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal. |
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
+| `ravel_ingest_body_conversions_total` | Log records stored after their structured (array or map) body was converted to canonical JSON text, by tenant and signal. Not a rejection. |
 | `ravel_admission_reconciliation_failures_total` | Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, by tenant and signal; the last-known soft threshold stays in force. |
 
-The `reason` label carries `byte_rate`, `series_rate`, `series_cap`, or
-`clock`. The active-streams count for logs renders under
+The `reason` label carries `byte_rate`, `series_rate`, `series_cap`, `clock`,
+`skew`, or `structural`. The active-streams count for logs renders under
 `ravel_admission_active_series` with `signal="logs"`, not under a separate
 metric name. A sustained nonzero
 `ravel_admission_reconciliation_failures_total` rate means a process cannot
 read its siblings' snapshots and is falling back to its last-computed soft
 threshold; admission never fails closed on it, so it signals degrading
 fleet-wide accuracy, not that ingest is down.
+
+#### Reading the `reason` label
+
+Each reason answers a different operator question, and the unit each one
+counts differs, so a rate summed across reasons means nothing. Read them
+separately.
+
+| `reason` | Counts | What it means |
+|---|---|---|
+| `byte_rate` | Requests | The tenant sent more charged bytes per second than its ingest byte-rate limit allows. |
+| `clock` | Requests | The receiving replica's own clock was implausible, so the request was refused before any data was read. The fault is the replica's. |
+| `series_rate` | Series | New series or log streams appeared faster than the creation-rate limit allows. |
+| `series_cap` | Series | The tenant is at its active series or stream cap, so points for series past the cap were dropped. |
+| `skew` | Points, records, or spans | The event timestamp sat too far ahead of, or behind, ingest time. A sender clock problem, or a backfill wider than the accepted lag. |
+| `structural` | Points, records, or spans | The data itself cannot be represented: a delta-temporality metric, an over-long label, a body kind with no stored form. Retrying the same payload always fails the same way. |
+
+`skew` and `structural` count individual points, log records, or spans, and
+they match what the sender is told in the OTLP partial-success response, so a
+client that reads `rejected_data_points` and an operator reading this counter
+see the same number. The OTLP Arrow (OTAP) surface has no partial-success
+field, so on that surface this counter is the only place the drop appears.
+
+The two reasons want different alerts. `skew` is usually a fleet-wide clock or
+backfill problem and clears on its own once the sender is fixed; `structural`
+never clears without a change to what the sender emits, so any sustained rate
+is worth paging a human who can go and read
+[the ingest guide's temporality recipe](ingest.md#delta-temporality-metrics).
+
+```yaml
+groups:
+  - name: ravel-ingest-rejections
+    rules:
+      - alert: RavelStructuralRejections
+        expr: |
+          sum by (tenant_hash, signal) (
+            rate(ravel_admission_rejected_total{reason="structural"}[5m])
+          ) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Tenant {{ $labels.tenant_hash }} is sending {{ $labels.signal }}
+            data Ravel cannot represent
+          description: >-
+            Structural rejections do not clear on retry. Check the OTLP
+            partial-success message the sender receives for the reason, then
+            fix the exporter or add a collector processor for it.
+      - alert: RavelEventTimeSkew
+        expr: |
+          sum by (tenant_hash, signal) (
+            rate(ravel_admission_rejected_total{reason="skew"}[5m])
+          ) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Tenant {{ $labels.tenant_hash }} is dropping {{ $labels.signal }}
+            data outside the accepted event-time window
+          description: >-
+            This is an absolute rate of rejected points, records, or spans per
+            second, not a fraction of the tenant's traffic. Check sender clock
+            sync first, then whether a backfill is running outside the tenant's
+            accepted ingest lag. Raise the threshold for a tenant that runs a
+            steady expected backfill.
+```
+
+Both rules are absolute rates of rejected units per second, broken out by
+tenant and signal, because there is no per-tenant admitted-points series to
+divide by. `ravel_admission_rejected_total{reason="skew"}` counts individual
+points, records, or spans, while `ravel_admission_admitted_total` counts
+requests; dividing one by the other inflates the result by the mean points per
+request, which is three orders of magnitude at typical batching, so that ratio
+means nothing. An absolute rate tells you how much data a tenant is losing to
+the event-time window. It does not tell you what fraction of that tenant's
+traffic that is, so a large tenant with a steady backfill and a small tenant
+with a broken clock can trip the same threshold; tune the threshold per tenant
+and treat the alert as a prompt to check clock sync and backfill status, not as
+a percentage. The skew rule uses a nonzero threshold because a few late points
+are normal. The structural rule keeps `> 0` because one sender emitting a
+metric type Ravel cannot store drops every point of that metric forever, and
+that is worth seeing even at a low rate.
+
+Neither rule alerts on `ravel_ingest_body_conversions_total`. Every record it
+counts was stored; it exists so a query that returns JSON text where a reader
+expected a plain message has an explanation. A sustained rate means a sender
+is emitting structured log bodies, which is supported, not a fault.
 
 `ravel_ingest_wire_bytes_total` is emitted from the ingest byte-metrics tracker
 rather than the admission snapshot, so its name carries the `ravel_ingest_`
