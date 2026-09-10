@@ -14,8 +14,10 @@ use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
-use ravel_types::{Signal, TenantId};
+use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantId};
 use uuid::Uuid;
 
 /// Same margin as `tests/catalog.rs`: clears the default 1h20m seal margin
@@ -61,6 +63,69 @@ async fn publish_segment(
     .expect("valid record");
     let data_key = keys::reconstruct_data_key(&rec).expect("data key");
     publish::put_data_object(store, &data_key, Bytes::from(payload))
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+/// Unlike `publish_segment` above (whose payload is the literal bytes
+/// `seg-{shard}-{seq}`), this writes a real, decodable RSEG v1 segment with
+/// one named series. The fold's postings build needs a segment it can
+/// actually decode before it issues a postings PUT at all, which the
+/// deliverable-2 fault-injection test below needs in order to have a
+/// postings PUT to fault.
+async fn publish_real_segment(store: &MemoryStore, tenant: &str, shard: u32, created_unix_ns: i64) {
+    let tenant_hash = TenantId::new(tenant).hash();
+    let ingest_hour_bucket = u32::try_from(created_unix_ns / 3_600_000_000_000).expect("fits u32");
+    let writer_id = Uuid::new_v4();
+    let series = vec![SeriesInput {
+        series_id: SeriesId([1u8; 16]),
+        labels: LabelSet::new(vec![Label {
+            name: METRIC_NAME_LABEL.to_string(),
+            value: "up".to_string(),
+        }])
+        .expect("valid labels"),
+        samples: vec![Sample {
+            ts_ns: created_unix_ns,
+            value: 1.0,
+        }],
+    }];
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let bounds = IngestBounds {
+        min_ingest_ts_ns: created_unix_ns - 1_000,
+        max_ingest_ts_ns: created_unix_ns,
+    };
+    let written = SegmentWriter::write(series, identity, bounds).expect("write RSEG");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: created_unix_ns - 1_000,
+        max_ingest_ts_ns: created_unix_ns,
+        segment_format_version: 1,
+        created_unix_ns,
+        ingest_hour_bucket,
+    })
+    .expect("valid record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    publish::put_data_object(store, &data_key, written.bytes)
         .await
         .expect("put data object");
     publish::publish(store, &rec, &RetryPolicy::default())
@@ -187,10 +252,18 @@ async fn fold_json_report_serializes_the_whole_fold_report() {
 /// leaves exactly two PUTs: the fresh tail part (`.csnap`) and the HEAD CAS
 /// write.
 ///
-/// Prove-the-test: in `render_fold_report`
-/// (`services/ravel-cli/src/catalog.rs`), or by reverting the `fold.rs` fix
-/// that counts a PUT before matching its outcome, `put_requests` would read
-/// something other than `2` and this assertion fails.
+/// This pins the success-path count only: on this fixture every PUT the
+/// fold issues also succeeds, so it guards against double-counting (e.g. a
+/// stray increment inside *and* outside a `match` arm) rather than against
+/// the issued-but-failed case. It cannot distinguish "count before the
+/// match" from "count inside `Ok(_) | Err(AlreadyExists)`" the fix changed,
+/// because every PUT here lands in `Ok`. That distinction is
+/// `fold_put_requests_counts_an_issued_postings_put_that_failed` below,
+/// which injects a real (non-`AlreadyExists`) PUT failure.
+///
+/// Prove-the-test: delete either `counters.put_requests += 1;` this fixture
+/// reaches (the part PUT at `fold.rs:1757`, or the HEAD PUT at
+/// `fold.rs:2361`) and `put_requests` reads `1` instead of `2` below.
 #[tokio::test]
 async fn fold_put_requests_counts_exactly_the_objects_this_fold_writes() {
     let store = Arc::new(MemoryStore::new());
@@ -229,5 +302,65 @@ async fn fold_put_requests_counts_exactly_the_objects_this_fold_writes() {
     assert_eq!(
         report.put_requests, 2,
         "put_requests must count exactly the part PUT and the HEAD PUT this fold issues:\n{printed}"
+    );
+}
+
+/// Deliverable 2 (#1598): a PUT that was actually issued and came back a
+/// real (non-`AlreadyExists`) error must still count, because the postings
+/// PUT's own failure path degrades rather than failing the fold: it warns,
+/// omits the postings ref, and lets the fold return a normal report
+/// (`crates/ravel-catalog/src/fold.rs`, the postings `match put_result`
+/// block around line 1869). `publish_real_segment` writes a real, decodable
+/// RSEG segment (unlike `publish_segment` above) specifically so
+/// `build_postings` has something to encode and a postings PUT is actually
+/// issued for `FaultStore` to fail.
+///
+/// Prove-the-test: in `fold.rs`, move `counters.put_requests += 1;`
+/// (currently at line 1868, issued unconditionally before the postings
+/// PUT's `match put_result`) down into the `Ok(_) | Err(StoreError::AlreadyExists)`
+/// arm below it. This test's fault fires a real `Transient` error, not
+/// `AlreadyExists`, so the moved increment is skipped and `put_requests`
+/// reads `2` instead of `3`.
+#[tokio::test]
+async fn fold_put_requests_counts_an_issued_postings_put_that_failed() {
+    let store = MemoryStore::new();
+    let tenant = "cli-fold-put-degrade";
+    let created = now_ns() - SEALED_AGE_NS;
+    publish_real_segment(&store, tenant, 0, created).await;
+
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::Put,
+            ScriptedFault::Transient("simulated store outage".to_string()),
+        )
+        .with_key_contains(".npost"),
+    );
+    let fault_store = Arc::new(FaultStore::new(store, plan));
+
+    let (report, printed) = catalog::fold(
+        fault_store.clone() as Arc<dyn ObjectStoreBackend>,
+        MEMORY,
+        tenant,
+        1,
+        SignalArg::Metrics,
+        None,
+        now_ns(),
+        false,
+    )
+    .await
+    .expect("an issued-but-failed postings PUT must degrade the fold, not fail it");
+
+    assert_eq!(
+        fault_store.fault_count(Op::Put, FaultKind::Transient),
+        1,
+        "the postings PUT fault must actually fire exactly once"
+    );
+    assert!(
+        !report.postings_built,
+        "the faulted postings PUT must degrade: no postings ref is published: {report:?}"
+    );
+    assert_eq!(
+        report.put_requests, 3,
+        "put_requests must count the part PUT, the failed-but-issued postings PUT, and the HEAD PUT:\n{printed}"
     );
 }
