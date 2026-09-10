@@ -500,6 +500,38 @@ into a false green. When you write or edit any such script:
   after an `if`/`fi` block reports the `if` construct, not the command
   (this exact bug made a draft of `verify-dispatch-gates.sh` report PASS
   on everything).
+- `set -e` at the top of a Bash tool call does NOTHING. The block is
+  `eval`'d (zsh's own `(eval):N:` error prefix gives it away), and
+  ERREXIT does not apply to the enclosing eval'd context, so it is inert
+  at every depth: top level, inside `( ... )`, and inside a function. A
+  partial rebase was pushed under one, and the fix that re-pushed under
+  another was equally ungated and merely had nothing left to catch.
+  SCRIPT FILES ARE UNAFFECTED: everything under `scripts/` runs as its
+  own shell and its `set -e` behaves normally. This is about inline shell
+  only. What works inline is one explicit refusal per dangerous step,
+  `cmd || { echo "refused: ..." >&2; exit 1; }` or
+  `if ! cmd; then ... exit 1; fi`. `echo "EXIT=$?"` reports and
+  continues; printing a number beside a dangerous action is not a gate,
+  and it relies on your attention at the moment you are most hurried.
+  Verifying this rule is itself the trap, and four attempts across two
+  sessions all failed the same way, by measuring a neighbouring shell:
+  `bash -c 'set -e; ...'` and `zsh -c '...'` spawn a clean shell where it
+  works, running the probe from inside a `.sh` file does the same, and
+  appending `|| echo aborted` to see whether something aborts puts it in
+  a condition context, which suppresses ERREXIT and disables the very
+  behaviour being measured. Probe it inline, unconditioned, and read `$?`
+  on the following line.
+- Never pass `--body` inline to `gh issue comment` or `gh pr comment`
+  when the text contains backticks. The shell command-substitutes them,
+  the identifier runs as a command, its empty output is substituted, and
+  `gh` exits 0 and returns a URL: the published text is missing exactly
+  the names the argument rested on. Two sessions hit this within an hour.
+  Use `--body-file` or `-F body=@file` with text written by the Write
+  tool or a quoted heredoc, then verify the artifact rather than the exit
+  code: `gh api repos/<o>/<r>/issues/comments/<id> --jq .body` piped to
+  `grep -cF` for an identifier you expect, plus a second grep for a
+  string you know is absent so that a zero means something. Repair in
+  place with `gh api -X PATCH .../issues/comments/<id> -F body=@file`.
 - Never name a variable `status`, `path`, `argv`, or `PWD`: zsh reserves
   them, and assignment kills the loop with `read-only variable`.
 - Never pipe a gate OR A GUARD through `grep`, `head`, or `tail`, and never

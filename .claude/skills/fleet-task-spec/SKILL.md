@@ -50,13 +50,27 @@ DEGRADED-BOX TRIPWIRE, your very first command, before reading anything:
     time git config user.name "Ravel Fleet Executor"
 
 You need both of these before your first commit anyway. Read the elapsed
-time. If either took more than 30 seconds, STOP: do not read a file, do
-not start the work. Report `DEGRADED EXECUTOR: git config took <N>s` and
-end the task. The pool contains at least one box where trivial commands
-take 90 to 120 seconds, and on it the four-hour ceiling arrives before a
-first commit does, so COMMIT EARLY below cannot save you. Ending in two
-minutes with a report costs a redispatch; carrying on costs the whole
-task, and 2h50m and 3h29m have each been lost that way.
+time on the FIRST one before running the second: if it took more than 30
+seconds, stop there. Waiting for both doubles the worst case, since the
+box this exists for takes 90 to 120 seconds per command, and two of them
+is three to four minutes rather than the two this paragraph used to
+claim.
+
+On a breach, STOP: do not read a file, do not start the work. Report
+
+    DEGRADED EXECUTOR: git config took <N>s
+    <the output of `uname -a`>
+    <the output of `nproc`>
+
+and end the task. The two extra lines are what make the report
+actionable: one lost task tells the orchestrator the pool has a bad box,
+and the box's identity is what lets it be quarantined instead of
+rediscovered next week by a different task.
+
+The four-hour ceiling arrives on that box before a first commit does, so
+COMMIT EARLY below cannot save you. Ending in two minutes with a report
+costs a redispatch; carrying on costs the whole task, and 2h50m and
+3h29m have each been lost that way.
 
 COMMIT EARLY: `git commit -s` the first state that compiles, before you
 go on to the rest. Never put any command in the background and never end
