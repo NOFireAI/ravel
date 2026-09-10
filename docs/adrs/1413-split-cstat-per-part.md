@@ -241,10 +241,12 @@ Each fold wrote three column-statistics objects: the v3 per-part object at
 Both whole-object forms declared ~6.5 GB uncompressed, 24.3x over the 256 MiB
 ceiling, so **neither was decodable by any reader** while both were being
 written on every fold. One of the two was not even referenced from HEAD.
-Retiring them saves roughly 3.4 GiB of PUT and five minutes of fold wall time
-per run, and removes the only consumer of the dropped-reference defect: a
-field-13 reference that is never recorded costs nothing when field 13 is never
-written.
+Retiring them saves 3.32 GiB of PUT and five minutes of fold wall time per
+run. That is 1,775,911,103 + 1,784,045,649 = 3,559,956,752 **wire** bytes, the
+bytes actually transferred, not the ~13 GB the two objects declare
+uncompressed. It also removes the only consumer of the dropped-reference
+defect: a field-13 reference that is never recorded costs nothing when field
+13 is never written.
 
 **Field numbers stay frozen.** The implementing change (#1600) marks 11 and 13
 `reserved` in `proto/ravel/catalog.proto`; today they are still declared as
@@ -345,7 +347,7 @@ and shorter by a release:
   simpler than before this ADR rather than more complex. Fields 11 and 13 are
   `reserved`.
 - The fold stops writing two whole-object artifacts per run. On the reference
-  tenant that is 3.4 GiB of PUT and about five minutes of wall time per fold,
+  tenant that is 3.32 GiB of PUT and about five minutes of wall time per fold,
   for objects that were 24.3x over the decode ceiling and therefore unreadable
   by anything.
 - The per-part ceiling is the existing `DEFAULT_MAX_COLUMN_STATS_BYTES`
