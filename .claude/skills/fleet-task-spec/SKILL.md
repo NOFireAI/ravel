@@ -44,6 +44,20 @@ UNATTENDED TASK: never ask for confirmation or approval; when your work
 passes the gates, commit it and end with a report. Committing
 (git commit -s) is part of the deliverable.
 
+DEGRADED-BOX TRIPWIRE, your very first command, before reading anything:
+
+    time git config user.email "fleet-executor@nofire.ai"
+    time git config user.name "Ravel Fleet Executor"
+
+You need both of these before your first commit anyway. Read the elapsed
+time. If either took more than 30 seconds, STOP: do not read a file, do
+not start the work. Report `DEGRADED EXECUTOR: git config took <N>s` and
+end the task. The pool contains at least one box where trivial commands
+take 90 to 120 seconds, and on it the four-hour ceiling arrives before a
+first commit does, so COMMIT EARLY below cannot save you. Ending in two
+minutes with a report costs a redispatch; carrying on costs the whole
+task, and 2h50m and 3h29m have each been lost that way.
+
 COMMIT EARLY: `git commit -s` the first state that compiles, before you
 go on to the rest. Never put any command in the background and never end
 your turn waiting for one. Nothing will wake you -- your turn ending ends
@@ -340,7 +354,27 @@ the same turn as the `fleet_dispatch` call, every time.
 
 Record the returned task_id, arm the watch command from the dispatch
 response as a persistent Monitor, and merge with the merge-fleet-result
-skill when it lands. `fleet_status` needs the full task UUID; an 8-char
+skill when it lands.
+
+**Watch the transcript byte count, not just the status.** A task on a
+degraded box reports `running` for its whole life and then dies at the
+ceiling with an empty `result_ref` and only a start ref. The signal that
+separates it from a hard task is available in minutes:
+
+    curl -s "$FLEET_CP/v1/tasks/<id>/transcript" | wc -c
+
+A healthy executor emits lines continuously; 13 bytes after three and a
+half hours is a dead box, and that exact figure cost 2h50m on 2026-09-10
+(#1308/#1309 on `pimox5`). Sample it every few minutes for the first
+quarter hour of any dispatch and cancel-and-redispatch on a near-zero
+count rather than waiting for the ceiling. Use the HTTP endpoint and the
+byte count, not the MCP `fleet_transcript`, which returns no output at
+all in this state and so reads as a broken tool rather than as evidence.
+
+Placement cannot be pre-checked: `GET /v1/tasks/<id>` carries no executor
+field while a task runs, and the executor name appears only in the
+terminal event's `results.executor`. That is why the tripwire in the spec
+and this probe both exist, rather than a label selector. `fleet_status` needs the full task UUID; an 8-char
 short form returns "not found". Result branches appear at
 refs/heads/task/<task-id>/result.
 
