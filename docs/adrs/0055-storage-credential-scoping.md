@@ -255,7 +255,27 @@ compromised Maintain credential retains delete capability over durable data,
 and only over
 `l0/`, `l1/`, `c/`, `idem/`, and the query-audit shard `u/0001/**`
 (amendment below) — never `sys/`, `prov`, `catalog/`, or the legal-hold
-shard `u/0000/**` of the audit prefix, which brings us to §3. Admin's
+shard `u/0000/**` of the audit prefix. The last of those holds for a
+different reason than the other three: the three protected `sys/` control
+objects (`sys/tenancy`, `sys/qualification`, `sys/gc`), together with `prov`
+and `catalog/`, are disjoint from every delete grant in every template, so
+their `Deny` is belt-and-suspenders.
+`no_delete_allow_reaches_the_disjoint_protected_keyspaces` in
+`crates/ravel-commit/tests/iam_templates.rs` enforces this: it asserts that
+no delete `Allow` pattern in any template matches a witness key of those
+five protected patterns. The set is those three named `sys/` control
+objects, not the whole `sys/` prefix, because Admin's `sys/qualify/*`
+scratch-delete grant does reach a key under `sys/` (a
+`sys/qualify/<run-id>/…` object) and is deliberately excluded. An audit
+object is keyed
+`t/<hash>/u/<l0|c|l1>/<shard>/…`, so Maintain's level-based delete grants
+(`t/*/*/l0/*` and its `c`/`l1` siblings) do match legal-hold keys, and the
+`Allow` set alone overstates the capability by exactly that much. What
+withholds it is the explicit `Deny` of §3 over the same keys, which names
+the same two delete actions: a `Deny` overrides an `Allow` only for the
+actions it names, so the deny's action coverage — not a gap in the `Allow`
+patterns — is what makes the shard undeletable. Which brings us to §3.
+Admin's
 `sys/qualify/*` delete (amendment below) reaches only the qualification scratch
 prefix, which is neither tenant data nor a durability anchor.
 
