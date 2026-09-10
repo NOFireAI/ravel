@@ -470,6 +470,168 @@ mod tests {
         assert!(r.to_string().contains("100000"));
     }
 
+    /// Every [`Rejection`] variant's admission class, one case per variant.
+    ///
+    /// The `match` is exhaustive so a variant added to the enum does not
+    /// compile until it has been given an expected class here, which is what
+    /// stops a new metric-path rejection from going silently unclassified.
+    /// Before this test, `Rejection::admission_class` was covered only by two
+    /// ravel-server integration tests pinning `UnsupportedTemporality` and
+    /// `TooOld`, so every other variant could change arm unnoticed.
+    ///
+    /// `ZeroTimestamp` is the judgement call and is named explicitly below: a
+    /// zero event time is classified as skew, not structural, because it
+    /// comes out of the event-time check and is unbounded lag against any
+    /// plausible ingest clock. Moving it to the structural arm is a change to
+    /// what `ravel_admission_rejected_total{reason=...}` reports, and it
+    /// fails here.
+    #[test]
+    fn every_rejection_variant_has_its_expected_admission_class() {
+        fn expected(rejection: &Rejection) -> Option<AdmissionClass> {
+            let skew = Some(AdmissionClass::Skew);
+            let structural = Some(AdmissionClass::Structural);
+            match rejection {
+                Rejection::ZeroTimestamp => skew,
+                Rejection::FutureSkew { .. } => skew,
+                Rejection::TooOld { .. } => skew,
+
+                Rejection::TooManyDataPoints { .. } => structural,
+                Rejection::TooManyResourceAttributes { .. } => structural,
+                Rejection::MetricNameTooLong { .. } => structural,
+                Rejection::EmptyMetricName { .. } => structural,
+                Rejection::TooManyAttributes { .. } => structural,
+                Rejection::LabelNameTooLong { .. } => structural,
+                Rejection::LabelValueTooLong { .. } => structural,
+                Rejection::DuplicateLabelName(_) => structural,
+                Rejection::ComplexAttributeValue => structural,
+                Rejection::MissingValue => structural,
+                Rejection::UnsupportedMetricType { .. } => structural,
+                Rejection::UnsupportedTemporality { .. } => structural,
+                Rejection::OversizedSeriesComponent => structural,
+                Rejection::HistogramBucketCountMismatch { .. } => structural,
+                Rejection::NonFiniteHistogramBound => structural,
+                Rejection::HistogramBoundsNotIncreasing => structural,
+                Rejection::HistogramCountOverflow => structural,
+                Rejection::NativeHistogramScaleUnsupported { .. } => structural,
+                Rejection::NativeHistogramCountInconsistent => structural,
+                Rejection::NativeHistogramCountOverflow => structural,
+                Rejection::NonFiniteQuantile => structural,
+                Rejection::DuplicateQuantile => structural,
+
+                // Informational: the point was admitted and stored, so it
+                // costs the sender nothing and must move no counter.
+                Rejection::HistogramMinMaxDropped { .. } => None,
+                Rejection::HistogramExemplarsDropped { .. } => None,
+                Rejection::IntegerValuePrecisionLoss { .. } => None,
+
+                // Carries its reason's class, whatever that reason is.
+                Rejection::Grouped { reason, .. } => expected(reason),
+            }
+        }
+
+        // One value per variant. The `match` above does not compile with a
+        // variant missing; this list is what makes each case run.
+        let variants = [
+            Rejection::TooManyDataPoints {
+                count: 1,
+                max: 100_000,
+            },
+            Rejection::TooManyResourceAttributes { count: 1, max: 128 },
+            Rejection::MetricNameTooLong {
+                len: 600,
+                max: 512,
+                count: 1,
+            },
+            Rejection::EmptyMetricName { count: 1 },
+            Rejection::TooManyAttributes {
+                attribute_count: 65,
+                max: 64,
+            },
+            Rejection::LabelNameTooLong { len: 300, max: 256 },
+            Rejection::LabelValueTooLong {
+                len: 5000,
+                max: 4096,
+            },
+            Rejection::DuplicateLabelName("x".to_string()),
+            Rejection::ComplexAttributeValue,
+            Rejection::MissingValue,
+            Rejection::UnsupportedMetricType {
+                metric_type: "histogram",
+                count: 1,
+            },
+            Rejection::UnsupportedTemporality { count: 1 },
+            Rejection::ZeroTimestamp,
+            Rejection::FutureSkew {
+                skew_ns: 1,
+                max_ns: 0,
+            },
+            Rejection::TooOld {
+                lag_ns: 1,
+                max_ns: 0,
+            },
+            Rejection::OversizedSeriesComponent,
+            Rejection::HistogramBucketCountMismatch {
+                bounds: 1,
+                buckets: 1,
+                expected: 2,
+            },
+            Rejection::NonFiniteHistogramBound,
+            Rejection::HistogramBoundsNotIncreasing,
+            Rejection::HistogramCountOverflow,
+            Rejection::NativeHistogramScaleUnsupported { scale: -54 },
+            Rejection::NativeHistogramCountInconsistent,
+            Rejection::NativeHistogramCountOverflow,
+            Rejection::NonFiniteQuantile,
+            Rejection::DuplicateQuantile,
+            Rejection::HistogramMinMaxDropped { count: 1 },
+            Rejection::HistogramExemplarsDropped { count: 1 },
+            Rejection::IntegerValuePrecisionLoss { value: i64::MAX },
+            Rejection::Grouped {
+                reason: Box::new(Rejection::ComplexAttributeValue),
+                count: 3,
+            },
+        ];
+
+        // One entry per variant, each a distinct one, so no variant is
+        // covered twice while another is missing.
+        assert_eq!(variants.len(), 29);
+        for (i, a) in variants.iter().enumerate() {
+            for b in &variants[i + 1..] {
+                assert_ne!(
+                    std::mem::discriminant(a),
+                    std::mem::discriminant(b),
+                    "{a} and {b} are the same variant"
+                );
+            }
+        }
+
+        for rejection in &variants {
+            assert_eq!(
+                rejection.admission_class(),
+                expected(rejection),
+                "{rejection}"
+            );
+        }
+
+        // `ZeroTimestamp` by name, so the judgement call is pinned where a
+        // reader looking for it will find it and not only inside the loop.
+        assert_eq!(
+            Rejection::ZeroTimestamp.admission_class(),
+            Some(AdmissionClass::Skew)
+        );
+
+        // A grouped rejection takes its inner reason's class, including the
+        // skew arm, so the wrapper cannot silently reclassify.
+        assert_eq!(
+            Rejection::Grouped {
+                reason: Box::new(Rejection::ZeroTimestamp),
+                count: 4,
+            }
+            .admission_class(),
+            Some(AdmissionClass::Skew)
+        );
+    }
+
     /// `add` routes each class to its own field and leaves the other
     /// untouched, and `None` moves neither. Pinned in this crate because a
     /// crate-scoped gate here otherwise cannot catch an arm swap: only the

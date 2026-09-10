@@ -547,12 +547,16 @@ jobs:
   # features are off by default and no other job builds them, so a break in
   # any of them -- an unreachable e2e test path, four bench binaries that
   # never link -- ships undetected. This lane proves each combination still
-  # compiles (`cargo check`), and for one of them also runs its tests:
+  # compiles (`cargo check`), and for three of them also runs their tests:
   #   - ravel-server --features otap            (links ravel-otap + arrow tree;
   #                                              the image lanes build it in
   #                                              release together with sql and
-  #                                              flight-sql, this is the fast
-  #                                              probe of the feature alone)
+  #                                              flight-sql, this is the debug
+  #                                              lane for the feature alone.
+  #                                              LINTED with --all-targets and
+  #                                              RUNS its tests: a compile
+  #                                              probe left the feature's own
+  #                                              tests unexecuted)
   #   - ravel-bench --features parquet-baseline (arrow/parquet/object_store)
   #   - ravel-bench --features flight-egress    (ravel-sql/datafusion/flight)
   #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
@@ -579,10 +583,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    # 30m, not 20m: four separate, mutually non-sharing compile
+    # 40m, not 30m: the probes are separate, mutually non-sharing compile
     # configurations (arrow, parquet, object_store, datafusion, arrow-flight
-    # all appear across the four probes) with no shared incremental state.
-    timeout-minutes: 30
+    # all appear across them) with no shared incremental state, and the otap
+    # lane now also builds ravel-server's test targets and runs them.
+    timeout-minutes: 40
     env:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
@@ -599,8 +604,23 @@ jobs:
         if: steps.sccache.outcome == 'failure'
         run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Check ravel-server --features otap
-        run: cargo check --locked -p ravel-server --features otap
+        # LINTED and RUN, not compile-probed. `cargo check -p ravel-server
+        # --features otap` never built the crate's test targets, so every test
+        # behind the feature shipped unexecuted and a clippy finding in
+        # feature-gated code could not fail anything. That is the same failure
+        # the `flight-sql` note above describes. `--all-targets` on clippy
+        # builds the test targets the `check` step skipped, so the `cargo test`
+        # below adds the run and little compile.
+      - name: Clippy ravel-server --features otap
+        run: cargo clippy --locked -p ravel-server --features otap --all-targets -- -D warnings
+        # `--lib`, not the whole test set: `tests/cli_reference.rs` asserts
+        # `docs/reference/ravel-server-flags.md` matches the flags of a build
+        # with NO optional features, and that page says in its own header that
+        # `--otap` is absent for that reason. Under `--features otap` the
+        # binary grows `--otap` and that test fails by construction, on any
+        # tree. `--all-targets` on the clippy step above still compiles it.
+      - name: Test ravel-server --features otap
+        run: cargo test --locked -p ravel-server --features otap --lib
       - name: Check ravel-bench --features parquet-baseline
         run: cargo check --locked -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress

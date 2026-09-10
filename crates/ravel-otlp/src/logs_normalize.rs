@@ -266,7 +266,7 @@ fn normalize_record(
     let NormalizedBody {
         text: body,
         converted: converted_body,
-    } = normalize_body(record.body.as_ref())?;
+    } = normalize_body(record.body.as_ref(), limits.max_body_len)?;
     if body.len() > limits.max_body_len {
         return Err(LogRejection::BodyTooLong {
             len: body.len(),
@@ -405,7 +405,17 @@ const BODY_KEY: &str = "body";
 /// [`LogRejection::UnsupportedBodyKind`] rather than as the attribute-shaped
 /// rejection the converter returns, because the thing the sender lost is the
 /// body, not an attribute.
-fn normalize_body(body: Option<&AnyValue>) -> Result<NormalizedBody, LogRejection> {
+///
+/// `max_body_len` is passed down rather than checked only on the result: a
+/// structured body's canonical text is built under that budget (see
+/// [`canonical_json`]), so a body far larger than any storable record is
+/// refused without being materialized first. The caller still checks the
+/// returned text against the same limit, which is what bounds the
+/// pass-through arms above.
+fn normalize_body(
+    body: Option<&AnyValue>,
+    max_body_len: usize,
+) -> Result<NormalizedBody, LogRejection> {
     let plain = |text: String| {
         Ok(NormalizedBody {
             text,
@@ -423,7 +433,7 @@ fn normalize_body(body: Option<&AnyValue>) -> Result<NormalizedBody, LogRejectio
             let value =
                 convert_value(BODY_KEY, body, 1).map_err(|_| LogRejection::UnsupportedBodyKind)?;
             Ok(NormalizedBody {
-                text: canonical_json(&value),
+                text: canonical_json(&value, max_body_len)?,
                 converted: true,
             })
         }
@@ -450,91 +460,224 @@ fn normalize_body(body: Option<&AnyValue>) -> Result<NormalizedBody, LogRejectio
 /// * a non-finite double has no JSON number form, so it renders as the string
 ///   `"NaN"`, `"+Inf"`, or `"-Inf"`, matching how a top-level double body of
 ///   the same value renders.
-fn canonical_json(value: &AttrValue) -> String {
-    let mut out = String::new();
-    write_canonical_json(&mut out, value);
-    out
+///
+/// The text is built under a hard byte budget. `max_body_len` is the length
+/// the finished text may not exceed, and construction stops with
+/// [`LogRejection::BodyTooLong`] at the first byte that would carry it past
+/// that. The sender controls how much text its value produces (a kvlist tree
+/// nests up to [`MAX_ATTRIBUTE_NESTING_DEPTH`] and fans out freely), so the
+/// bound is enforced while the text is produced rather than on a finished
+/// string: a body that cannot be stored is refused without ever being
+/// materialized. Every byte of the finished text is counted exactly once, so
+/// a value whose text fits within the budget is rendered byte for byte as it
+/// would be with no budget at all.
+fn canonical_json(value: &AttrValue, max_body_len: usize) -> Result<String, LogRejection> {
+    let mut budget = JsonBudget {
+        produced: 0,
+        max: max_body_len,
+    };
+    Ok(build_canonical(value, &mut budget)?.json)
 }
 
-fn write_canonical_json(out: &mut String, value: &AttrValue) {
-    match value {
-        AttrValue::Str(s) => write_json_string(out, s),
-        AttrValue::I64(i) => out.push_str(&i.to_string()),
-        AttrValue::F64(f) => {
-            if f.is_finite() {
-                out.push_str(&format_float(*f));
-            } else {
-                write_json_string(out, &format_float(*f));
+/// Running byte budget for the canonical JSON under construction.
+///
+/// `produced` is the number of bytes of the finished text emitted so far,
+/// each counted exactly once: a nested value's text is counted when it is
+/// written, not again when it is moved into the text of the value enclosing
+/// it. So `produced` never exceeds `max`, and the `String`s alive at any
+/// point during the build hold disjoint pieces of the finished text; the peak
+/// is `max` bytes, not the size of whatever the sender sent.
+struct JsonBudget {
+    produced: usize,
+    max: usize,
+}
+
+impl JsonBudget {
+    /// Append `piece`, or reject when it would carry the text past the
+    /// budget. The rejection's `len` is the length the text would have
+    /// reached at that point, which is the smallest length that is known to
+    /// be over the limit; it is not the length of the sender's value rendered
+    /// in full, because that text is deliberately never built.
+    fn emit(&mut self, out: &mut String, piece: &str) -> Result<(), LogRejection> {
+        let len = self.produced + piece.len();
+        if len > self.max {
+            return Err(LogRejection::BodyTooLong { len, max: self.max });
+        }
+        out.push_str(piece);
+        self.produced = len;
+        Ok(())
+    }
+
+    /// Append `s` as a JSON string literal (RFC 8259 section 7): the two
+    /// mandatory escapes, the five short escapes, and `\u00XX` for the
+    /// remaining control characters. Rust strings are UTF-8, so nothing else
+    /// needs escaping. Emitted one escape at a time so that an oversized
+    /// string is cut off at the budget instead of being escaped in full
+    /// first.
+    fn emit_json_string(&mut self, out: &mut String, s: &str) -> Result<(), LogRejection> {
+        self.emit(out, "\"")?;
+        let mut utf8 = [0u8; 4];
+        for ch in s.chars() {
+            match ch {
+                '"' => self.emit(out, "\\\"")?,
+                '\\' => self.emit(out, "\\\\")?,
+                '\n' => self.emit(out, "\\n")?,
+                '\r' => self.emit(out, "\\r")?,
+                '\t' => self.emit(out, "\\t")?,
+                '\u{08}' => self.emit(out, "\\b")?,
+                '\u{0c}' => self.emit(out, "\\f")?,
+                c if (c as u32) < 0x20 => self.emit(out, &format!("\\u{:04x}", c as u32))?,
+                c => self.emit(out, c.encode_utf8(&mut utf8))?,
             }
         }
-        AttrValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        AttrValue::Bytes(b) => write_json_string(out, &hex::encode(b)),
+        self.emit(out, "\"")
+    }
+}
+
+/// One value's canonical JSON text together with its canonical byte
+/// encoding, produced by the same bottom-up pass.
+///
+/// The encoding is what orders a map's entries, and it is carried up rather
+/// than recomputed because a map's entry order depends on its children's
+/// encodings and a child map's encoding depends on its own children's: asking
+/// for a whole subtree's encoding from inside a comparator re-encodes that
+/// subtree once per enclosing level.
+#[derive(Debug)]
+struct CanonicalNode {
+    json: String,
+    encoded: Vec<u8>,
+}
+
+/// Type tags and framing of the frozen `ravel-logstream-v1` value encoding,
+/// mirrored from `ravel_types::logstream`'s `encode_value` and
+/// `encode_attrs`.
+///
+/// `ravel_types::logstream` exposes that encoding only for a whole attribute
+/// set, which encodes every nested value under it, so it cannot be used to
+/// build one value's encoding from its children's already-built ones. The
+/// framing is therefore assembled here, and
+/// `bottom_up_encoding_matches_ravel_types` pins it against
+/// [`ravel_types::logstream::canonical_attr_bytes`], which stays the only
+/// definition of the contract.
+const TAG_STR: u8 = 1;
+const TAG_I64: u8 = 2;
+const TAG_F64: u8 = 3;
+const TAG_BOOL: u8 = 4;
+const TAG_BYTES: u8 = 5;
+const TAG_LIST: u8 = 6;
+const TAG_MAP: u8 = 7;
+
+/// Unsigned LEB128, the length and count prefix of the encoding above.
+fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Zigzag maps a signed value to an unsigned one (protobuf convention).
+fn zigzag(value: i64) -> u64 {
+    ((value as u64) << 1) ^ ((value >> 63) as u64)
+}
+
+/// Render one value's canonical JSON and canonical encoding in a single
+/// bottom-up pass, under `budget`.
+///
+/// A map's entries are ordered by key bytes, ties broken by the canonical
+/// encoding of the value, which is exactly how
+/// `ravel_types::logstream::encode_attrs` orders an attribute set. The
+/// tiebreak matters only for duplicate keys, which OTLP permits and which are
+/// kept rather than merged.
+///
+/// Recursion is bounded by [`MAX_ATTRIBUTE_NESTING_DEPTH`]: every value
+/// reaching here came through [`convert_value`], which rejects anything
+/// nested deeper.
+fn build_canonical(
+    value: &AttrValue,
+    budget: &mut JsonBudget,
+) -> Result<CanonicalNode, LogRejection> {
+    let mut json = String::new();
+    let mut encoded = Vec::new();
+    match value {
+        AttrValue::Str(s) => {
+            budget.emit_json_string(&mut json, s)?;
+            encoded.push(TAG_STR);
+            put_uvarint(&mut encoded, s.len() as u64);
+            encoded.extend_from_slice(s.as_bytes());
+        }
+        AttrValue::I64(i) => {
+            budget.emit(&mut json, &i.to_string())?;
+            encoded.push(TAG_I64);
+            put_uvarint(&mut encoded, zigzag(*i));
+        }
+        AttrValue::F64(f) => {
+            let text = format_float(*f);
+            if f.is_finite() {
+                budget.emit(&mut json, &text)?;
+            } else {
+                budget.emit_json_string(&mut json, &text)?;
+            }
+            encoded.push(TAG_F64);
+            encoded.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        AttrValue::Bool(b) => {
+            budget.emit(&mut json, if *b { "true" } else { "false" })?;
+            encoded.push(TAG_BOOL);
+            encoded.push(u8::from(*b));
+        }
+        AttrValue::Bytes(b) => {
+            budget.emit_json_string(&mut json, &hex::encode(b))?;
+            encoded.push(TAG_BYTES);
+            put_uvarint(&mut encoded, b.len() as u64);
+            encoded.extend_from_slice(b);
+        }
         AttrValue::List(items) => {
-            out.push('[');
+            encoded.push(TAG_LIST);
+            put_uvarint(&mut encoded, items.len() as u64);
+            budget.emit(&mut json, "[")?;
             for (i, item) in items.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    budget.emit(&mut json, ",")?;
                 }
-                write_canonical_json(out, item);
+                let node = build_canonical(item, budget)?;
+                json.push_str(&node.json);
+                encoded.extend_from_slice(&node.encoded);
             }
-            out.push(']');
+            budget.emit(&mut json, "]")?;
         }
         AttrValue::Map(entries) => {
-            let mut ordered: Vec<&(String, AttrValue)> = entries.iter().collect();
-            ordered.sort_by(|a, b| {
+            let mut built: Vec<(&str, CanonicalNode)> = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                built.push((key.as_str(), build_canonical(value, budget)?));
+            }
+            built.sort_by(|a, b| {
                 a.0.as_bytes()
                     .cmp(b.0.as_bytes())
-                    .then_with(|| canonical_value_bytes(&a.1).cmp(&canonical_value_bytes(&b.1)))
+                    .then_with(|| a.1.encoded.cmp(&b.1.encoded))
             });
-            out.push('{');
-            for (i, (key, value)) in ordered.into_iter().enumerate() {
+            encoded.push(TAG_MAP);
+            put_uvarint(&mut encoded, built.len() as u64);
+            budget.emit(&mut json, "{")?;
+            for (i, (key, node)) in built.into_iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
+                    budget.emit(&mut json, ",")?;
                 }
-                write_json_string(out, key);
-                out.push(':');
-                write_canonical_json(out, value);
+                budget.emit_json_string(&mut json, key)?;
+                budget.emit(&mut json, ":")?;
+                json.push_str(&node.json);
+                put_uvarint(&mut encoded, key.len() as u64);
+                encoded.extend_from_slice(key.as_bytes());
+                encoded.extend_from_slice(&node.encoded);
             }
-            out.push('}');
+            budget.emit(&mut json, "}")?;
         }
     }
-}
-
-/// The canonical encoding of one value, used only as the duplicate-key
-/// tiebreaker in [`write_canonical_json`].
-///
-/// [`ravel_types::logstream`] owns that encoding and exposes it for a whole
-/// attribute set, not for a bare value, so this asks it for a one-entry set
-/// under an empty key. Every such encoding carries the same two-byte prefix
-/// (entry count 1, key length 0), so comparing two of them compares exactly
-/// the two encoded values, which is the tiebreak `encode_attrs` applies. This
-/// crate does not re-implement the encoding.
-fn canonical_value_bytes(value: &AttrValue) -> Vec<u8> {
-    ravel_types::logstream::canonical_attr_bytes(std::slice::from_ref(&(
-        String::new(),
-        value.clone(),
-    )))
-}
-
-/// Write `s` as a JSON string literal (RFC 8259 section 7): the two mandatory
-/// escapes, the five short escapes, and `\u00XX` for the remaining control
-/// characters. Rust strings are UTF-8, so nothing else needs escaping.
-fn write_json_string(out: &mut String, s: &str) {
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
+    Ok(CanonicalNode { json, encoded })
 }
 
 /// Convert an attribute set whole: the first failure rejects the set. Used
@@ -1028,6 +1171,232 @@ mod tests {
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records[0].body, r#"{"k":1,"k":2}"#);
         assert_eq!(out.body_conversions, 1);
+    }
+
+    /// A kvlist tree whose every level is a pair of entries under one
+    /// repeated key: the duplicate-key tiebreak in [`build_canonical`]
+    /// applies at every node, which is the only shape in which the tiebreak
+    /// runs at all (a map with distinct keys never compares two values).
+    /// Leaves are 8-byte strings. `depth` levels give `2 ^ depth` leaves and
+    /// a canonical text of `21 * 2 ^ depth - 11` bytes: 10 per leaf
+    /// (`"abcdefgh"`) plus 11 of framing per internal node
+    /// (`{"k":`, `,"k":`, `}`).
+    fn duplicate_key_kvlist_tree(depth: usize) -> AnyValue {
+        if depth == 0 {
+            return any(AnyValueVariant::StringValue("abcdefgh".to_string()));
+        }
+        let child = duplicate_key_kvlist_tree(depth - 1);
+        any(AnyValueVariant::KvlistValue(KeyValueList {
+            values: vec![kv_with_value("k", child.clone()), kv_with_value("k", child)],
+        }))
+    }
+
+    fn kv_with_value(key: &str, value: AnyValue) -> KeyValue {
+        KeyValue {
+            key: key.to_string(),
+            value: Some(value),
+            ..Default::default()
+        }
+    }
+
+    /// The canonical text of a body the sender sized is bounded while it is
+    /// produced, not after: a nested duplicate-key body whose text would run
+    /// to megabytes is refused at `max_body_len`, and the `String` under
+    /// construction never grows past `max_body_len` at all.
+    ///
+    /// Depth 16 gives 65 536 leaves and a full text of
+    /// `21 * 2 ^ 16 - 11 = 1_376_245` bytes, so the 65 536-byte budget is
+    /// reached inside the leftmost 4.8% of it. Depth 12 (`21 * 2 ^ 12 - 11 =
+    /// 86_005`) is the shallowest tree of this shape whose text exceeds the
+    /// default budget, so every depth from 12 up aborts; 16 is used for
+    /// margin while staying cheap to build.
+    ///
+    /// The two assertions are the mechanical form of "the work was bounded
+    /// before it was done". Without the budget the text is built in full and
+    /// the record is still rejected, by the length check on the finished
+    /// string, so the rejection alone proves nothing: the reported length
+    /// and `JsonBudget::produced` are what distinguish the two.
+    #[test]
+    fn nested_duplicate_key_body_stops_at_the_budget() {
+        let limits = LogIngestLimits::default();
+        let body = duplicate_key_kvlist_tree(16);
+
+        let out = normalize_logs(
+            request(vec![resource_logs(
+                vec![],
+                vec![scope_logs(
+                    "lib",
+                    "1",
+                    vec![record(Some(body.clone()), vec![], 1)],
+                )],
+            )]),
+            &limits,
+            5_000,
+        );
+        assert!(out.records.is_empty());
+        // Every piece this body emits is one byte wide (`{`, `"`, `k`, `:`,
+        // `,`, `}`, and each leaf character), so the text reached exactly
+        // `max_body_len` and the length the next byte would have taken it to
+        // is one past that. Not a generous upper bound: this is the whole
+        // slack the budget allows on this input.
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::BodyTooLong {
+                len: limits.max_body_len + 1,
+                max: limits.max_body_len,
+            }]
+        );
+        assert_eq!(out.body_conversions, 0);
+
+        // Same body, straight at the builder, so the bound is asserted on the
+        // text that was actually built rather than inferred from the
+        // rejection.
+        let value = convert_value(BODY_KEY, Some(&body), 1).expect("body converts");
+        let mut budget = JsonBudget {
+            produced: 0,
+            max: limits.max_body_len,
+        };
+        let rejection = build_canonical(&value, &mut budget).expect_err("over budget");
+        assert_eq!(
+            rejection,
+            LogRejection::BodyTooLong {
+                len: limits.max_body_len + 1,
+                max: limits.max_body_len,
+            }
+        );
+        assert_eq!(budget.produced, limits.max_body_len);
+    }
+
+    /// The renderer this file carried before the budget and the bottom-up
+    /// encoding: the duplicate-key tiebreak asks `ravel_types` for a whole
+    /// subtree's encoding from inside the comparator, and clones the subtree
+    /// to ask. Kept as the differential oracle for
+    /// `canonical_json_matches_the_reference_renderer`, so the rewrite is
+    /// pinned to produce the same stored bytes rather than to look
+    /// equivalent.
+    fn reference_canonical_json(value: &AttrValue) -> String {
+        fn reference_value_bytes(value: &AttrValue) -> Vec<u8> {
+            ravel_types::logstream::canonical_attr_bytes(std::slice::from_ref(&(
+                String::new(),
+                value.clone(),
+            )))
+        }
+        fn write_json_string(out: &mut String, s: &str) {
+            out.push('"');
+            for ch in s.chars() {
+                match ch {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\u{08}' => out.push_str("\\b"),
+                    '\u{0c}' => out.push_str("\\f"),
+                    c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+        }
+        fn write(out: &mut String, value: &AttrValue) {
+            match value {
+                AttrValue::Str(s) => write_json_string(out, s),
+                AttrValue::I64(i) => out.push_str(&i.to_string()),
+                AttrValue::F64(f) => {
+                    if f.is_finite() {
+                        out.push_str(&format_float(*f));
+                    } else {
+                        write_json_string(out, &format_float(*f));
+                    }
+                }
+                AttrValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                AttrValue::Bytes(b) => write_json_string(out, &hex::encode(b)),
+                AttrValue::List(items) => {
+                    out.push('[');
+                    for (i, item) in items.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        write(out, item);
+                    }
+                    out.push(']');
+                }
+                AttrValue::Map(entries) => {
+                    let mut ordered: Vec<&(String, AttrValue)> = entries.iter().collect();
+                    ordered.sort_by(|a, b| {
+                        a.0.as_bytes().cmp(b.0.as_bytes()).then_with(|| {
+                            reference_value_bytes(&a.1).cmp(&reference_value_bytes(&b.1))
+                        })
+                    });
+                    out.push('{');
+                    for (i, (key, value)) in ordered.into_iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        write_json_string(out, key);
+                        out.push(':');
+                        write(out, value);
+                    }
+                    out.push('}');
+                }
+            }
+        }
+        let mut out = String::new();
+        write(&mut out, value);
+        out
+    }
+
+    /// Arbitrary nested attribute values, with keys drawn from a two-symbol
+    /// alphabet so duplicate sibling keys (the only input that exercises the
+    /// tiebreak) are common rather than vanishingly rare.
+    fn arbitrary_attr_value() -> impl proptest::strategy::Strategy<Value = AttrValue> {
+        use proptest::prelude::*;
+        let leaf = prop_oneof![
+            proptest::collection::vec(any::<char>(), 0..4)
+                .prop_map(|cs| AttrValue::Str(cs.into_iter().collect())),
+            any::<i64>().prop_map(AttrValue::I64),
+            any::<f64>().prop_map(AttrValue::F64),
+            any::<bool>().prop_map(AttrValue::Bool),
+            proptest::collection::vec(any::<u8>(), 0..4).prop_map(AttrValue::Bytes),
+        ];
+        leaf.prop_recursive(4, 48, 3, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(AttrValue::List),
+                proptest::collection::vec(("[ab]", inner), 0..4).prop_map(AttrValue::Map),
+            ]
+        })
+    }
+
+    proptest::proptest! {
+        /// The rewrite is byte-identical to the renderer it replaces, for
+        /// every value whose text fits the budget. A stored body is a
+        /// contract query predicates are written against, so "same order,
+        /// same escapes, same duplicate keys kept" is asserted as byte
+        /// equality against the old code, not re-derived from the rules.
+        #[test]
+        fn canonical_json_matches_the_reference_renderer(value in arbitrary_attr_value()) {
+            let rendered = canonical_json(&value, 1 << 20).expect("fits the budget");
+            proptest::prop_assert_eq!(rendered, reference_canonical_json(&value));
+        }
+
+        /// The bottom-up encoding assembled in [`build_canonical`] is the
+        /// same frozen `ravel-logstream-v1` encoding
+        /// [`ravel_types::logstream`] defines. That crate exposes it only for
+        /// a whole attribute set, whose every encoding carries the same
+        /// two-byte prefix (entry count 1, key length 0) for a one-entry set
+        /// under an empty key, so the comparison strips those two bytes. This
+        /// is what keeps the framing mirrored here from drifting from its
+        /// definition.
+        #[test]
+        fn bottom_up_encoding_matches_ravel_types(value in arbitrary_attr_value()) {
+            let mut budget = JsonBudget { produced: 0, max: 1 << 20 };
+            let node = build_canonical(&value, &mut budget).expect("fits the budget");
+            let whole_set = ravel_types::logstream::canonical_attr_bytes(
+                std::slice::from_ref(&(String::new(), value)),
+            );
+            proptest::prop_assert_eq!(&whole_set[..2], &[1u8, 0u8][..]);
+            proptest::prop_assert_eq!(node.encoded, whole_set[2..].to_vec());
+        }
     }
 
     #[test]

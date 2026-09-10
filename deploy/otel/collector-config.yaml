@@ -62,8 +62,13 @@ processors:
     # Drop a series' accumulated state after this long without a new point, so
     # a churning series set cannot grow memory without bound.
     max_stale: 5m
-    # Ceiling on tracked series. Points for series past it pass through
-    # unconverted, and are then rejected by Ravel, rather than being buffered.
+    # Ceiling on tracked series. Once it is reached, points for a series that
+    # is not already tracked are DROPPED by the processor, not buffered and not
+    # forwarded: nothing about them reaches Ravel, so no Ravel rejection
+    # counter moves and the loss is silent from the database's side. The
+    # collector counts them as
+    # `otelcol_deltatocumulative_datapoints_total{error="limit"}`; alert on
+    # that, and size this above the tenant's active series count.
     max_streams: 1000000
   batch:
 

@@ -108,6 +108,12 @@ pub enum LogRejection {
     #[error("attribute value is {len} bytes, more than the limit of {max}")]
     AttributeValueTooLong { len: usize, max: usize },
 
+    /// `len` is the body's own length for a body that arrives as text. For a
+    /// structured body, whose text Ravel renders itself, it is instead the
+    /// point at which rendering stopped, one byte past `max`: the renderer
+    /// works under a byte budget and refuses at the first byte over it, so the
+    /// length the whole text would have reached is never produced and cannot
+    /// be reported. Either way `len > max` and the record is rejected.
     #[error("body is {len} bytes, more than the limit of {max}")]
     BodyTooLong { len: usize, max: usize },
 

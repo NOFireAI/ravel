@@ -397,7 +397,7 @@ operational depth.
 | `ravel_admission_admitted_bytes_total` | Charged (decompressed) bytes admitted past the ingest byte-rate layer, by tenant and signal. For a gzip OTLP request this is the decompressed size; for an uncompressed request it equals the wire size. |
 | `ravel_ingest_wire_bytes_total` | Wire (on-the-wire, compressed when the client compressed) OTLP request-body bytes admitted, by tenant and signal. |
 | `ravel_admission_rejected_total` | Admission rejections, by tenant, signal, and reason. |
-| `ravel_ingest_body_conversions_total` | Log records stored after their structured (array or map) body was converted to canonical JSON text, by tenant and signal. Not a rejection. |
+| `ravel_ingest_body_conversions_total` | Log records whose structured (array or map) body was converted to canonical JSON text at normalization, by tenant and signal. Not a rejection, and not a count of stored records: see "Neither rule alerts on" below. |
 | `ravel_admission_reconciliation_failures_total` | Fleet-admission reconciliation cycles whose sibling-snapshot read (LIST or GET) failed, by tenant and signal; the last-known soft threshold stays in force. |
 
 The `reason` label carries `byte_rate`, `series_rate`, `series_cap`, `clock`,
@@ -492,10 +492,25 @@ are normal. The structural rule keeps `> 0` because one sender emitting a
 metric type Ravel cannot store drops every point of that metric forever, and
 that is worth seeing even at a low rate.
 
-Neither rule alerts on `ravel_ingest_body_conversions_total`. Every record it
-counts was stored; it exists so a query that returns JSON text where a reader
-expected a plain message has an explanation. A sustained rate means a sender
-is emitting structured log bodies, which is supported, not a fault.
+Neither rule alerts on `ravel_ingest_body_conversions_total`. It exists so a
+query that returns JSON text where a reader expected a plain message has an
+explanation. A sustained rate means a sender is emitting structured log bodies,
+which is supported, not a fault.
+
+This paragraph is the normative description of that counter; the ingest guide,
+the admission-limits reference, and the counter's own `HELP` text point here.
+It counts conversions at normalization, not stored records. The logs ingest
+handler increments it as soon as `normalize_logs` returns, which is before the
+layer-4 active-stream cap drops the records whose stream is over the cap, and
+before the shard write runs at all. So a converted record can be counted and
+then not stored: dropped by the stream cap, or lost with every other record in
+a request whose write fails. Read it as a conversion rate, in the sense of "how
+much of this tenant's log traffic arrives with a structured body", and never as
+a count of rows in storage. It is still not a rejection counter, which is why
+it is its own family rather than a `reason` on
+`ravel_admission_rejected_total`: a record it counts was admitted by
+normalization, and an operator alerting on rejection reasons must see nothing
+from it.
 
 `ravel_ingest_wire_bytes_total` is emitted from the ingest byte-metrics tracker
 rather than the admission snapshot, so its name carries the `ravel_ingest_`
