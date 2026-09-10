@@ -84,18 +84,25 @@ actually failed. If the output is long, redirect it to a file and grep or
 read the file separately; the exit code check and the output-size problem
 are independent, solve them independently.
 Where that file goes is itself a rule, because both wrong answers have
-already cost a task. Run exactly these four commands first, substituting
+already cost a task. Run this first, as ONE command, substituting
 nothing:
 
-    LOGDIR="$HOME/gate-logs/$(basename "$PWD")"
-    mkdir -p "$LOGDIR"
-    scripts/guards/check-disk-headroom.sh "$LOGDIR" 5
-    df -h /tmp "$LOGDIR"
+    LOGDIR="$HOME/gate-logs/$(basename "$PWD")" && mkdir -p "$LOGDIR" &&
+      scripts/guards/check-disk-headroom.sh "$LOGDIR" 5 && df -h /tmp "$LOGDIR"
+
+One command because each tool call is its own shell: `LOGDIR` set in one
+call is empty in the next, and the guard was reached with an empty first
+argument, which it read as "no argument" and answered about the current
+directory instead. It now refuses an empty argument, so the split
+version fails loudly rather than passing about the wrong volume, but the
+single command is what you run.
 
 If the guard exits non-zero, say so in your report and stop rather than
 picking another directory: a host without 5 GB for a log has no room for
 the gate either, and the run would die mid-link with a fake compiler
-error. Then redirect every long gate to `"$LOGDIR/<step>.log"`.
+error. Then redirect every long gate to
+`"$HOME/gate-logs/$(basename "$PWD")/<step>.log"`, spelled out in full
+each time for the same reason: nothing carries over between calls.
 The two constraints that path satisfies, both of which have cost a task:
 it is outside the git checkout, and it is not under `/tmp`. Inside the
 checkout, the harness's commit-on-death runs `git add -A`, so a killed
