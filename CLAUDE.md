@@ -356,20 +356,32 @@ there before changing a rule.
   every Bash command in every session on the host, including the ones
   that would clean up.
 - `scripts/guards/disk-watchdog.sh <scope-dir> [floor_gb] [warn_gb]
-  [sample_s]`: samples free space and kills the `cargo`/`rustc`
-  processes whose cwd is inside `scope-dir` once it drops below the floor
+  [sample_s]`: samples free space and kills the build processes whose cwd
+  is inside `scope-dir` once it drops below the floor
   (default 9 GB, warning at 15). The scope is REQUIRED and it is what
   makes the thing safe here: a watchdog that matches by command name
   kills every session's build on this box and reports it as killing
   yours. Two sessions wrote that version independently within one hour on
   2026-09-09 and one killed the other's compile with it, which is why
   this exists as a script rather than as the paragraph above.
+  The matched set is `cargo` and `rustc` plus the linker children they
+  spawn (`cc`, `ld`, `collect2`, `rust-lld`, `clang`, `clang++`): SIGKILL
+  to rustc leaves its linker running, and linking is the phase writing
+  the largest artifacts, so a matcher of the first two reports success
+  while the volume keeps draining. After the kill it re-scans and kills
+  again until the scoped set is empty, since a child can outlive the
+  parent that was matched, and gives up with exit 1 after five rounds
+  rather than claiming a volume it did not free.
   `WATCHDOG_DRY_RUN=1` names the pids and kills nothing; use it rather
   than testing the kill path against live processes. On firing it writes
   `<scope-dir>/.disk-watchdog-fired` BEFORE killing anything: a gate whose
   run overlaps that marker is INVALID rather than red, because a runner
   reports a SIGTERM'd test as a failure and the next reader cannot tell
-  the two apart. It never touches the gate's own exit code. Cases in
+  the two apart. Arming clears a marker from an earlier run so its
+  presence always refers to the current one; a dry run arms nothing and
+  leaves it alone, because the reason to run one is usually a gate that
+  just came back red and the marker is the answer. It never touches the
+  gate's own exit code. Cases in
   `scripts/guards/disk-watchdog.test.sh`.
 - This host is itself a fleet executor. `~/.fleet/executor` holds the
   cargo target of whatever task it has claimed from the queue, which no

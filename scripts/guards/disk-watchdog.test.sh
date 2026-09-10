@@ -120,10 +120,29 @@ check_eq "dry run: writes no marker" "absent" \
 #
 # A marker left by an earlier firing would label a later, valid gate as
 # invalid. Ignored markers are worse than no markers, so arming truncates.
+# Armed for real, with a floor of 0 so it watches without ever firing: an
+# earlier version of this proved the clearing with a DRY RUN, which asserted
+# the behaviour the dry run must not have.
 echo "fired_at=1999-01-01T00:00:00Z" > "${SCOPE}/.disk-watchdog-fired"
-WATCHDOG_DRY_RUN=1 "${WATCHDOG}" "${SCOPE}" 999999 1000000 1 >/dev/null 2>&1
+"${WATCHDOG}" "${SCOPE}" 0 0 1 >/dev/null 2>&1 &
+arm_pid=$!
+sleep 1
 check_eq "arming clears a marker from an earlier firing" "absent" \
   "$([[ -e "${SCOPE}/.disk-watchdog-fired" ]] && echo present || echo absent)"
+kill "${arm_pid}" 2>/dev/null || true
+wait "${arm_pid}" 2>/dev/null || true
+
+# --- a DRY RUN preserves a marker it did not write ------------------------
+#
+# The dry run is the documented way to check the matcher, and the situation
+# that prompts it is a gate that has just come back red. Clearing the marker
+# there answers the question by destroying the evidence: the run that fired is
+# gone, and the gate reads as a genuine failure.
+echo "fired_at=1999-01-01T00:00:00Z" > "${SCOPE}/.disk-watchdog-fired"
+WATCHDOG_DRY_RUN=1 "${WATCHDOG}" "${SCOPE}" 999999 1000000 1 >/dev/null 2>&1
+check_eq "a dry run leaves an existing marker in place" "present" \
+  "$([[ -e "${SCOPE}/.disk-watchdog-fired" ]] && echo present || echo absent)"
+rm -f "${SCOPE}/.disk-watchdog-fired"
 
 # --- firing kills the scoped build and leaves the marker ------------------
 out="$("${WATCHDOG}" "${SCOPE}" 999999 1000000 1 2>&1)"
@@ -264,6 +283,67 @@ sleep 1
 check_eq "the marker exists while the build is still alive" "yes" \
   "$(head -1 "${ORD_SEEN}" 2>/dev/null)"
 kill -KILL "${pid_ord}" 2>/dev/null || true
+
+# --- the linker children are really in the match set -----------------------
+#
+# The matcher names cc, ld, collect2, rust-lld, clang and clang++ alongside
+# cargo and rustc, because SIGKILL to rustc leaves the linker it spawned
+# running and the link is the phase writing the largest artifacts. Every case
+# above builds its fixture as `cargo`, so deleting all six linker names from
+# the matcher left the whole suite green and the shipped watchdog reporting
+# success while the volume kept draining. One fixture per name.
+LINKERS="${TMP}/linkers"
+mkdir -p "${LINKERS}/bin"
+for tool in cc ld collect2 rust-lld clang clang++; do
+  ln -s /bin/sh "${LINKERS}/bin/${tool}"
+  ( cd "${LINKERS}" && exec "${LINKERS}/bin/${tool}" -c 'while :; do sleep 1; done' ) \
+    >/dev/null 2>&1 &
+  eval "pid_${tool//[!a-z0-9]/_}=$!"
+done
+sleep 1
+link_out="$(WATCHDOG_DRY_RUN=1 timeout 10 "${WATCHDOG}" "${LINKERS}" 2>&1)"
+for tool in cc ld collect2 rust-lld clang clang++; do
+  eval "tool_pid=\${pid_${tool//[!a-z0-9]/_}}"
+  check_contains "a ${tool} under the scope is in the match set" "${tool_pid}" "${link_out}"
+  kill -KILL "${tool_pid}" 2>/dev/null || true
+done
+
+# --- the post-kill re-scan catches a child the kill left behind ------------
+#
+# A process can be spawned between the scan and the kill, and a linker child
+# outlives the rustc that was matched, so the watchdog re-scans and kills
+# again until the scoped set is empty. Nothing asserted that: deleting the
+# whole re-scan loop left every case green, because in all of them the single
+# fixture dies to the first SIGKILL. Here the victim spawns a cc child from
+# its TERM handler and then exits, so the child exists only AFTER the first
+# scan and only the re-scan can find it.
+RESCAN="${TMP}/rescan"
+mkdir -p "${RESCAN}/bin"
+ln -s /bin/sh "${RESCAN}/bin/cargo"
+ln -s /bin/sh "${RESCAN}/bin/cc"
+cat > "${RESCAN}/spawn-on-term.sh" <<'EOF'
+on_term() {
+  "${RESCAN_BIN}/cc" -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+  echo "$!" > "${RESCAN_CHILD}"
+  exit 0
+}
+trap on_term TERM
+while :; do sleep 1; done
+EOF
+RESCAN_CHILD="${RESCAN}/child.pid"
+: > "${RESCAN_CHILD}"
+( cd "${RESCAN}" && RESCAN_BIN="${RESCAN}/bin" RESCAN_CHILD="${RESCAN_CHILD}" \
+    exec "${RESCAN}/bin/cargo" "${RESCAN}/spawn-on-term.sh" ) >/dev/null 2>&1 &
+pid_rescan=$!
+sleep 1
+rescan_out="$(timeout 60 "${WATCHDOG}" "${RESCAN}" 999999 1000000 1 2>&1)"; rescan_rc=$?
+child_pid="$(cat "${RESCAN_CHILD}" 2>/dev/null)"
+check_contains "the re-scan reports the child left behind" "still running under" "${rescan_out}"
+check_contains "the re-scan names the child's pid" "${child_pid}" "${rescan_out}"
+check_eq "the orphaned linker child is dead" "dead" \
+  "$(kill -0 "${child_pid}" 2>/dev/null && echo alive || echo dead)"
+check_eq "the watchdog still succeeds once the set is empty" "0" "${rescan_rc}"
+kill -KILL "${pid_rescan}" "${child_pid}" 2>/dev/null || true
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"
 [[ "${fails}" -eq 0 ]]
