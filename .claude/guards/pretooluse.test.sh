@@ -124,6 +124,58 @@ harmless text
 EOF
 status=0")"
 
+# --- a substitution VALUE must not hide the gate after it ----------------
+#
+# Found by review, and not by the 24-case battery written to look for it:
+# every case there put the gate INSIDE the substitution. This shape is an
+# assignment whose value is a NON-gate substitution, with the gate after the
+# closing paren. A `NAME=$(` prefix alternative consumed `FOO=$(` and left
+# `date) cargo test`, which is not a gate, so the guard ALLOWED a masked gate
+# that `main` denied. The second case has a space inside the substitution and
+# was a hole on `main` too.
+check deny  "substitution value, then a gate"  "$(bash_payload 'FOO=$(date) cargo test -p ravel-sql | tail -1')"
+check deny  "substitution value, then a guard" "$(bash_payload 'FOO=$(date) scripts/gates.sh | tail -1')"
+check deny  "substitution value, then && echo" "$(bash_payload 'FOO=$(date) cargo test -p ravel-sql && echo DONE')"
+check deny  "a space inside the substitution"  "$(bash_payload 'TS=$(date +%s) cargo test -p ravel-sql | tail -1')"
+check deny  "backtick value, then a gate"      "$(bash_payload 'FOO=`date` cargo test -p ravel-sql | tail -1')"
+
+# --- the heredoc strip must fail closed ----------------------------------
+#
+# Dropping a body to end-of-input when no terminator exists deletes every
+# remaining line from every rule. A herestring and a bare `<<` inside a
+# quoted string both matched as openers, so the rule's own motivating case,
+# quoting shell in a commit message, disabled the guard for the rest of the
+# command.
+check deny  "herestring is not a heredoc"      "$(bash_payload "cat <<<WORD
+${gate_pipe}")"
+check deny  "quoted herestring is not one"     "$(bash_payload "python3 - <<<'print(1)'
+${gate_pipe}")"
+check deny  "<< inside a commit message"       "$(bash_payload "git commit -m \"use << HEAD trick\"
+${gate_pipe}")"
+check deny  "<< inside single quotes"          "$(bash_payload "echo 'a << B'
+${gate_pipe}")"
+check deny  "unterminated heredoc keeps lines" "$(bash_payload "cat > /tmp/c.md <<EOF
+${gate_pipe}")"
+# A herestring whose word happens to match a later line. The terminator check
+# alone does not save this one, because a terminator IS found: only refusing
+# to read `<<<` as an opener does. Without that, the gate on line two is
+# stripped as a heredoc body and the command is allowed.
+check deny  "herestring whose word recurs"     "$(bash_payload "cat <<<EOF
+${gate_pipe}
+EOF")"
+
+# A terminator that IS found still ends the body, and the body's later lines
+# stay data. With terminator matching broken to stop at the first body line,
+# line two leaks out and is judged, so this flips to deny.
+check allow "second body line stays data"      "$(bash_payload "cat > /tmp/c.md <<'EOF'
+harmless first line
+${gate_pipe}
+EOF")"
+# `<<-` strips leading TABS from the terminator. Nothing pinned that branch.
+check allow "<<- with a tab-indented end"      "$(bash_payload "cat > /tmp/c.md <<-EOF
+${gate_pipe}
+	EOF")"
+
 # --- zsh reserved names -------------------------------------------------
 check deny  "bare status="                    "$(bash_payload 'status=0')"
 check deny  "local status="                   "$(bash_payload 'run_it || local status=$?')"
