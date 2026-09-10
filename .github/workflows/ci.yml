@@ -662,7 +662,14 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 20m, not 15m: the two corrupt-input suites added below (RLOG, RSPAN) add
+    # ~57s of proptest execution at 4096 cases locally (RLOG ~37s, RSPAN ~19s)
+    # plus a from-scratch compile of ravel-logseg and ravel-rspan and their
+    # test binaries, neither of which this job built before. On a CI runner
+    # with a cold-ish sccache that compile is the larger cost, so the extra
+    # 5 minutes is headroom over the previous 15m budget rather than a measured
+    # ceiling.
+    timeout-minutes: 20
     env:
       # Bounded case count keeps wall-clock in check while exploring far more
       # of the corrupt-input space than the 256-case default.
@@ -691,6 +698,16 @@ jobs:
         run: cargo nextest run --locked -p ravel-segment --test fuzz_mutation
       - name: Fuzz OTAP Arrow IPC decode
         run: cargo nextest run --locked -p ravel-otap --test fuzz_mutation
+      # RLOG has a real hostile-input suite but it otherwise runs only in the
+      # ordinary test job at the 256-case default; RLOG is the largest format in
+      # the tree, so run it here at the elevated PROPTEST_CASES for the deeper
+      # exploration the other decoders already get.
+      - name: Fuzz RLOG decode (corrupt-input suite)
+        run: cargo nextest run --locked -p ravel-logseg --test corrupt
+      # RSPAN had no corrupt-input coverage in CI at all. Same never-panic,
+      # never-return-wrong-records property as the RLOG suite above.
+      - name: Fuzz RSPAN decode (corrupt-input suite)
+        run: cargo nextest run --locked -p ravel-rspan --test corrupt
 
   # Runs the object-store contract suite (docs/object-store-contract.md)
   # against real S3-compatible endpoints: MinIO, and floci. Without this job
