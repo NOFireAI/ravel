@@ -2,7 +2,9 @@
 
 One decision per document. Status: Proposed | Accepted | Superseded.
 
-Numbering: ADR 0001 through 0109 are sequential, with no 0014. From ADR 0110 onward the
+Numbering: ADR 0001 through 0109 are sequential, with no 0014 and no 0091
+(0091 recorded the authorization boundary for a review integration that was
+removed outright; ADR-1586 replaces it). From ADR 0110 onward the
 number is the GitHub issue number of the issue that produced it (the epic
 when the decision spans the epic, the ticket when an epic has several
 decisions in flight at once, as ADR-0774 under epic #680 does), so the
@@ -101,7 +103,6 @@ the reservation commit that used to work around it.
 | [0088](0088-operator-configurable-query-budgets.md) | Operator-configurable query budgets | Accepted |
 | [0089](0089-bulk-import-logs-signal.md) | Bulk import of structured event data into the logs signal | Accepted |
 | [0090](0090-typed-attribute-columns-logs-sql.md) | Typed attribute columns for the logs SQL table | Accepted |
-| [0091](0091-maintainer-gated-coderabbit-reviews.md) | Maintainer-gated CodeRabbit reviews: a workflow started by hand or by a `/coderabbit review` comment, which verifies `role_name` is maintain or admin, keeps the credential behind a main-only protected environment, loads policy from main by absolute path, and never executes pull-request code; amendment 2 (2026-08-26) turns the App's automatic review back on for every pull request, with every write-capable surface still off | Proposed |
 | [0092](0092-run-merged-l1-and-rseg-v7.md) | Run-merged L1 compaction and RSEG v7: per-sample dedup provenance columns, first timestamp as a delta from the run minimum, no alignment pad on single-sample raw value pages, and three measured page encodings, landed as one version bump | Accepted |
 | [0093](0093-typed-column-pushdown-logs.md) | Skip-index and postings pushdown for declared typed logs columns: one resolver dispatching to two existing prune primitives (NumRange for I64/Bool, POSTINGS Equals for Str/Bytes), envelope-range IN, allowlist-only extraction | Proposed |
 | [0094](0094-parallel-final-aggregation-exact-typed.md) | Parallel final aggregation for exact-typed inputs | Amended by 0825 |
@@ -151,3 +152,4 @@ the reservation commit that used to work around it.
 | [1307](1307-per-writer-monotonic-flush-clock.md) | Per-writer monotonic flush clock: each shard actor raises the flush-open `created_unix_ns` stamp to a per-writer in-process monotonic floor so a backwards wall-clock step cannot invert query-time duplicate resolution, counting each absorbed step; the floor is per-process only and does not order a restarted writer against its predecessor (`writer_id` is not part of the dedup comparator, so it does not close this), no format change | Proposed |
 | [1374](1374-agent-mcp-server.md) | A first-party MCP server behind a shared query service layer, with a bounded, evidence-bearing agent result contract | Proposed |
 | [1413](1413-split-cstat-per-part.md) | Split `.cstat` column statistics per snapshot part, so a wide table's statistics fit the reader's guard and the process memory budget, with a per-part ceiling the writer also enforces | Accepted (2026-09-08) |
+| [1586](1586-fleet-review-bot-as-the-review-path.md) | The fleet review bot is Ravel's agent review path: `@claude-fleet review` as the trigger, the previous third-party integration and its repository-side control plane deleted outright, a `write`-level trigger accepted on the record with the role gate filed on the bot, and a missing review classified into five states rather than one | Accepted |

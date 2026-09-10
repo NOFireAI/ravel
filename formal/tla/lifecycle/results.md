@@ -848,7 +848,7 @@ after this fix against the updated `bands.tsv`: smoke PASS
 band, 62s across two runs), all seven negative controls VIOLATED as
 expected, all seventeen traceability rows resolve, `check_docs.py` clean.
 
-No new CodeRabbit findings on pull request 1206 were folded in: the `gh`
+No new review findings on pull request 1206 were folded in: the `gh`
 CLI is unavailable in this executor's environment, so the pull request
 could not be checked. This should be verified separately before merge.
 

@@ -31,12 +31,15 @@ rebase-merge keeps each commit's own message, so per-commit `Fixes:`/
 `Refs:` trailers still close their issues when they land.
 
 **The PR opens WITHOUT auto-merge by default (standing rule, 2026-08-26).**
-CodeRabbit's GitHub App reviews every PR but posts as a review comment, not
-a required status check, so `--auto` merges before that review lands --
-\#749/\#750 landed with 6 real CodeRabbit findings unaddressed this way. Wait
-for the `coderabbitai[bot]` review, fix or explicitly answer every
-actionable finding (a walkthrough-only comment with zero findings counts
-as clean), then merge by hand once CI is green:
+A bot review posts as a review comment, not a required status check, so
+`--auto` merges before that review lands -- \#749/\#750 landed with 6 real
+findings unaddressed this way. The script asks for the review itself: after
+opening the PR it posts one comment whose whole body is
+`@claude-fleet review`, which is the trigger (ADR-1586; anything after
+`review` is parsed as arguments, and an unrecognized word gets a confused
+reaction and no review). Wait for the `claude-fleet[bot]` review, fix or
+explicitly answer every actionable finding (a review with zero findings
+counts as clean), then merge by hand once CI is green:
 
 ```sh
 scripts/pr-review-status.sh <pr-number>   # one-line status; on clean, prints
@@ -44,8 +47,9 @@ scripts/pr-review-status.sh <pr-number>   # one-line status; on clean, prints
 ```
 
 `FLEET_MERGE_AUTO=1` restores the old `gh pr merge --auto --rebase`
-behavior for the rare case that genuinely does not need a CodeRabbit wait;
-do not set it out of impatience.
+behavior for the rare case that genuinely does not need to wait for a
+review; do not set it out of impatience. The review still arrives, after
+the merge, so sweep it rather than skipping it.
 
 ## Result-branch history is cleaned before the PR is opened
 
@@ -138,7 +142,7 @@ scripts/fleet-result-merge.sh $TASK message.txt   # add -p CRATE to scope local 
   needs `-F` (`-F strict=false`), or the API answers with
   `"false" is not a boolean`.
 - `gh pr merge --auto --rebase` (only under `FLEET_MERGE_AUTO=1`, or the
-  final by-hand merge once CodeRabbit is clean) can fail once with a
+  final by-hand merge once the review is clean) can fail once with a
   GraphQL error naming a merge method you never requested ("squash merging
   is not allowed"). That is API flakiness around enabling auto-merge:
   retry once before investigating repo settings.
@@ -158,19 +162,25 @@ against a PR GitHub is already landing for you.
 **Otherwise** (the default): poll `scripts/pr-review-status.sh <number>`
 until CI is green, `mergeStateStatus` is `CLEAN` or `UNSTABLE` (`DIRTY`/
 `DRAFT`/`BEHIND` mean it isn't mergeable regardless of CI or review state
--- resolve those first), and it reports a CodeRabbit review against the
-PR's current head commit in state `APPROVED` or `COMMENTED` (`PENDING`,
-`DISMISSED`, and `CHANGES_REQUESTED` are all not clean). The review's
-inline-comment count does not drop to zero once you fix something --
-the REST API never removes a comment just because the code it flagged
-changed -- so "clean" here means every comment has been individually
-read and its finding fixed or explicitly answered (a reply on the
-thread, or a commit message noting why it doesn't apply), never that
-the count reaches zero. A walkthrough-only review with zero comments
-from the start is the one case that is actually clean by count. Once
-every finding is accounted for, `pr-review-status.sh` prints the exact
-merge command, pinned to the head SHA it just checked via
-`--match-head-commit` so the merge refuses if the branch moved since:
+-- resolve those first), and it reports a review against the PR's current
+head commit in state `COMMENTED` or `APPROVED` (`PENDING`, `DISMISSED`, and
+`CHANGES_REQUESTED` are all not clean; the bot itself only ever posts
+`COMMENTED`, so do not read "not approved" as "not clean"). When it reports
+no review at head, read WHICH of the five states it names: nobody asked, a
+malformed trigger, a task queued or running, a task that went terminal with
+no review (nothing retries it -- post the trigger again), or a review at an
+older commit. The review's inline-comment count does not drop to zero once
+you fix something -- the REST API never removes a comment just because the
+code it flagged changed -- so "clean" here means every comment has been
+individually read and its finding fixed or explicitly answered (a reply on
+the thread, or a commit message noting why it doesn't apply), never that the
+count reaches zero. A review with zero comments from the start is the one
+case that is actually clean by count. Findings the bot could not place
+inline sit in the review BODY under "Findings outside the diff:" and are
+counted separately on the status line; read those too. Once every finding is
+accounted for, `pr-review-status.sh` prints the exact merge command, pinned
+to the head SHA it just checked via `--match-head-commit` so the merge
+refuses if the branch moved since:
 
 ```sh
 gh pr merge <number> --rebase --delete-branch --match-head-commit <sha>
@@ -179,7 +189,7 @@ gh pr merge <number> --rebase --delete-branch --match-head-commit <sha>
 This removes the `task/$TASK/merge` head once it merges. The script
 deliberately leaves `task/$TASK/result` and `task/$TASK/start` in place
 regardless of merge mode: opening a PR is not landing, and deleting them
-before the checks (and the CodeRabbit wait) finish would mean a failed
+before the checks (and the review wait) finish would mean a failed
 check or an unresolved finding leaves the PR open with no way to recover
 the original result branch.
 

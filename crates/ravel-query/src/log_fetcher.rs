@@ -7870,7 +7870,7 @@ mod fetch_stream_dir_tests {
             .with_block_range(BlockRangeFetcher::new(store).with_whole_object_threshold(0))
     }
 
-    /// Finding 1 (#1106 CodeRabbit review on PR #1158): the above-threshold
+    /// Finding 1 (#1106): the above-threshold
     /// branch of `fetch_stream_dir` must open the `page_fetch` span and call
     /// `record_probe_misses`, exactly like `plan_segment_fast`,
     /// `plan_segment`'s skip-decidable branch, and `plan_segment_block_stats`
@@ -7928,7 +7928,7 @@ mod fetch_stream_dir_tests {
         );
     }
 
-    /// Finding 2 (#1106 CodeRabbit review on PR #1158): the doc comment on
+    /// Finding 2 (#1106): the doc comment on
     /// `fetch_stream_dir` says an absent STREAM_DIR section returns `None`
     /// regardless of which branch answers the read. `RlogWriter::build_object`
     /// always writes a STREAM_DIR section unconditionally (see the

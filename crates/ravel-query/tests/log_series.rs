@@ -1150,7 +1150,7 @@ async fn log_series_window_covering_only_object_a_fetches_one_segment() {
     assert_eq!(out.segments_fetched, 1, "only object A overlaps [0, 200]");
 }
 
-/// Finding 3 (CodeRabbit review on PR #1158, #1106, log_series.rs:370): two
+/// Finding 3 (#1106, log_series.rs:370): two
 /// `severity_text` equality matchers must conjoin like every other pair of
 /// matchers in a PromQL selector -- `severity_text="ERROR"` AND
 /// `severity_text="INFO"` can never both hold for one record, so the

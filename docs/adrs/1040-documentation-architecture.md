@@ -142,8 +142,7 @@ Files move only where the move buys comprehension:
 - `docs/query-engine.md` keeps the engine contract. The endpoint
   descriptions inside it move to the HTTP API reference.
 - `docs/guides/development.md`, `docs/guides/clickbench.md`,
-  `docs/guides/clickbench-aws-runbook.md`,
-  `docs/guides/coderabbit-runbook.md`, `docs/diagrams/README.md`, and
+  `docs/guides/clickbench-aws-runbook.md`, `docs/diagrams/README.md`, and
   `docs/reviews/` move to `docs/internal/`.
 
 New pages, each of which answers a question the tree cannot answer today:

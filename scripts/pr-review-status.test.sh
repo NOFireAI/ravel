@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
-# Cases for the three filters behind scripts/pr-review-status.sh:
-# lib/coderabbit-risk.jq, which extracts the walkthrough's Merge Risk sha and
-# so decides whether CodeRabbit's assessment covers the current head;
-# lib/coderabbit-verdict.jq, the older review-presence count; and
-# lib/coderabbit-outside-diff.jq, which counts the findings the bot reports in
-# a review BODY instead of inline.
+# Cases for the two filters behind scripts/pr-review-status.sh:
+# lib/fleet-review-task-state.jq, which classifies the review bot's task
+# comment for the head commit into one word and so decides whether a missing
+# review means "wait", "re-trigger" or "nobody asked"; and
+# lib/fleet-review-outside-diff.jq, which counts the findings the bot reports
+# in a review BODY instead of inline.
 #
-# Fixtures only: no network, no gh. Each case is a comment or review shape
-# observed on a real PR, named with the PR it came from.
+# Fixtures only: no network, no gh. Each case is a comment or review shape the
+# bot actually emits (reviewbot/format.go, reviewbot/result.go) or one observed
+# on a real PR, named with the PR it came from.
 #
 # Exit 0 all pass, 1 on a failure.
 set -uo pipefail
 
-FILTER="$(dirname "$0")/lib/coderabbit-verdict.jq"
-[[ -r "${FILTER}" ]] || { echo "missing ${FILTER}" >&2; exit 64; }
-OUTSIDE_FILTER="$(dirname "$0")/lib/coderabbit-outside-diff.jq"
+TASK_FILTER="$(dirname "$0")/lib/fleet-review-task-state.jq"
+[[ -r "${TASK_FILTER}" ]] || { echo "missing ${TASK_FILTER}" >&2; exit 64; }
+OUTSIDE_FILTER="$(dirname "$0")/lib/fleet-review-outside-diff.jq"
 [[ -r "${OUTSIDE_FILTER}" ]] || { echo "missing ${OUTSIDE_FILTER}" >&2; exit 64; }
-RISK_FILTER="$(dirname "$0")/lib/coderabbit-risk.jq"
-[[ -r "${RISK_FILTER}" ]] || { echo "missing ${RISK_FILTER}" >&2; exit 64; }
 
 SHA="0c65a3d3983384d663189257a25cc2d40ca95d32"
 OTHER="1111111111111111111111111111111111111111"
+BOT="claude-fleet[bot]"
 passes=0
 fails=0
 
 run_case() {
   local filter="$1" name="$2" want="$3" json="$4" got
-  got="$(printf '%s' "${json}" | jq --arg sha "${SHA}" -f "${filter}")" || got="ERROR"
+  got="$(printf '%s' "${json}" | jq -r --arg sha "${SHA}" --arg bot "${BOT}" -f "${filter}")" || got="ERROR"
   if [[ "${got}" == "${want}" ]]; then
     printf 'ok    %s\n' "${name}"
     passes=$((passes + 1))
@@ -36,266 +36,213 @@ run_case() {
   fi
 }
 
-check() { run_case "${FILTER}" "$@"; }
+check_task() { run_case "${TASK_FILTER}" "$@"; }
 check_outside() { run_case "${OUTSIDE_FILTER}" "$@"; }
-# The risk filter emits a two-field TSV line, so its expectations are written
-# as "<sha>|<paused>" and the tab is translated before comparison.
-check_risk() {
-  local name="$1" want="$2" json="$3" got
-  got="$(printf '%s' "${json}" | jq -r -f "${RISK_FILTER}" | tr '\t' '|')" || got="ERROR"
-  if [[ "${got}" == "${want}" ]]; then
-    printf 'ok    %s\n' "${name}"
-    passes=$((passes + 1))
-  else
-    printf 'FAIL  %s: want %s, got %s\n' "${name}" "${want}" "${got}"
-    fails=$((fails + 1))
-  fi
-}
 
-# The clean case (#893): zero findings, reported as an issue comment, no formal
-# review filed at all. This is what used to be missed, holding a reviewed PR
-# forever.
-check "zero-finding walkthrough at head counts" 1 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},
-  "body":"Reviewing files that changed between abc and ${SHA}.\n\nNo actionable comments were generated in the recent review."}]
+# --- lib/fleet-review-task-state.jq --------------------------------------
+#
+# The five words this filter emits are five different next actions, and two of
+# them are opposites: `running` means wait, `dead` means the review will never
+# arrive and the trigger has to be posted again. A filter that collapsed them
+# would either hang the gate forever or clear a PR nothing reviewed.
+
+QUEUED_HEAD="Review task queued.\n\nTask: 3d030033-05ed-48d5-98f1-b086b1684655\nCommit: ${SHA}\nModel: executor default (effort high)\nExecutor: pending"
+RUNNING_HEAD="Review task queued.\n\nTask: 3d030033-05ed-48d5-98f1-b086b1684655\nCommit: ${SHA}\nModel: executor default (effort high)\nExecutor: pimox5"
+
+check_task "no comments at all is none" none '[]'
+
+check_task "a task comment at a DIFFERENT commit is none" none "$(cat <<EOF
+[{"user":{"login":"${BOT}"},
+  "body":"Review task queued.\n\nTask: t1\nCommit: ${OTHER}\nModel: opus (effort high)\nExecutor: rp2\nStatus: done. Review posted."}]
 EOF
 )"
 
-# A review that DID find things still counts as a review; its findings are
-# gated separately by the inline-comment check.
-check "walkthrough reporting findings counts" 1 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},
-  "body":"Actionable comments posted: 6\n\nReviewed up to ${SHA}."}]
+check_task "queued, executor still pending, is running" running "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${QUEUED_HEAD}"}]
 EOF
 )"
 
-# The regression this file exists for (#788): a rate-limit notice quotes the
-# commit but is not a review. Keying on the sha alone counted it and cleared
-# the review gate for a PR the bot never reviewed -- the false-CLEAR direction.
-check "rate-limit notice quoting the sha does NOT count" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},
-  "body":"⚠️ Rate limit exceeded\n\n@user has exceeded the limit. Please wait before requesting another review.\n\nCommits: reviewed up to ${SHA}."}]
+check_task "claimed by an executor, no status line, is running" running "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}"}]
 EOF
 )"
 
-# A verdict for a DIFFERENT commit is a stale review of code that is no longer
-# the head, exactly as a stale formal review would be.
-check "verdict naming another commit does NOT count" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},
-  "body":"Reviewed up to ${OTHER}.\n\nNo actionable comments were generated in the recent review."}]
+check_task "done with the review posted is done" "done" "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}\nStatus: done. Review posted."}]
 EOF
 )"
 
-# Only the bot's own verdicts count; a human quoting the marker does not.
-check "human comment quoting the marker does NOT count" 0 "$(cat <<EOF
+# The bot posts the agent's raw text as the review when it cannot parse a
+# structured result, so a review DOES exist and the gate must read it.
+check_task "done (unstructured) is done, because a review was still posted" "done" "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}\nStatus: done (unstructured)."}]
+EOF
+)"
+
+# Every terminal-without-a-review path the bot writes, one case each. These are
+# the cases that must never read as `running`: nothing retries them.
+check_task "failed with a class is dead" dead "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}\nStatus: failed (setup). No review posted.\nTranscript: fleet-cp task 3d030033."}]
+EOF
+)"
+
+check_task "the sidecar losing the task status is dead" dead "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}\nStatus: failed (sidecar could not read the task status). No review posted."}]
+EOF
+)"
+
+check_task "a timeout is dead" dead "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}\nStatus: timeout. The sidecar stopped waiting after 3h0m0s. No review posted."}]
+EOF
+)"
+
+check_task "abandoned before enqueue is dead" dead "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${QUEUED_HEAD}\nStatus: abandoned (sidecar restarted before enqueue)."}]
+EOF
+)"
+
+# The nastiest of the set: the task finished and the agent wrote a review, but
+# GitHub refused it. The word "done" is in the line, so a filter that matched
+# on it loosely would report a review that does not exist.
+check_task "done but the review post failed is dead, not done" dead "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}\nStatus: done, but posting the review failed (422 Unprocessable Entity)."}]
+EOF
+)"
+
+# A status string this filter has never seen must surface as "read it by hand"
+# rather than being folded into whichever branch is checked last.
+check_task "an unrecognized status line is unknown" unknown "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}\nStatus: something new upstream."}]
+EOF
+)"
+
+# Only the bot's own task comment counts. A human pasting the shape (quoting a
+# failure while asking about it, say) must not decide the gate.
+check_task "a human comment in the task-comment shape is none" none "$(cat <<EOF
 [{"user":{"login":"pmoust"},
-  "body":"CodeRabbit said: No actionable comments were generated, at ${SHA}."}]
+  "body":"Review task queued.\n\nTask: t1\nCommit: ${SHA}\nStatus: done. Review posted."}]
 EOF
 )"
 
-# A body-less comment must not blow up the filter.
-check "null body is tolerated" 0 '[{"user":{"login":"coderabbitai[bot]"},"body":null}]'
+# The bot's OTHER comments carry a Commit: line too. Only the comment that
+# opens with the task-comment first line is a task comment.
+check_task "a bot comment that is not the task comment is none" none "$(cat <<EOF
+[{"user":{"login":"${BOT}"},
+  "body":"A review task already runs for this commit.\n\nCommit: ${SHA}"}]
+EOF
+)"
 
-check "no comments at all" 0 '[]'
+# A Commit: line has to name the whole sha. A prefix match would let a task
+# comment for one commit answer for any commit sharing its first hex digits.
+check_task "a Commit line naming a prefix of the head is none" none "$(cat <<EOF
+[{"user":{"login":"${BOT}"},
+  "body":"Review task queued.\n\nTask: t1\nCommit: ${SHA:0:12}\nStatus: done. Review posted."}]
+EOF
+)"
 
-# --- lib/coderabbit-outside-diff.jq --------------------------------------
+# Two tasks for one commit: the first went terminal, a re-trigger made another.
+# The last one is the live one, so it decides.
+check_task "with two task comments for the head, the last decides" running "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":"${RUNNING_HEAD}\nStatus: failed (setup). No review posted."},
+ {"user":{"login":"${BOT}"},"body":"${QUEUED_HEAD}"}]
+EOF
+)"
+
+check_task "null body is tolerated" none "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"body":null}]
+EOF
+)"
+
+# --- lib/fleet-review-outside-diff.jq ------------------------------------
 #
-# Input is the pulls/<pr>/reviews array, so head discipline is the review's own
-# commit_id, not a sha quoted in the body.
-#
-# Counting rule (asserted below): the heading carries the number of findings in
-# the block in parentheses, so a heading WITH a count contributes that count and
-# a heading WITHOUT one contributes 1; headings sum across a body and across
-# reviews at the same head.
-
-# The #908 shape: an unaddressed finding the bot could not post inline, folded
-# into the review body at the current head. Nothing else in the script sees it.
-check_outside "outside-diff block at head is counted" 1 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
-  "body":"> [!CAUTION]\n> Some comments are outside the diff and can't be posted inline due to platform limitations.\n>\n> <details>\n> <summary>⚠️ Outside diff range comments (1)</summary>\n>\n> scripts/foo.sh line 12: the guard is inverted.\n"}]
-EOF
-)"
-
-# Summary/walkthrough prose is not a finding. Counting a non-empty body would
-# make every reviewed PR look like it carried findings, which trains the
-# operator to pass --confirm-addressed without reading anything.
-check_outside "walkthrough-only body at head is NOT counted" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
-  "body":"Actionable comments posted: 0\n\n<details>\n<summary>Walkthrough</summary>\n\nThe change adds a guard to the merge script.\n</details>"}]
-EOF
-)"
-
-# A body on a superseded commit describes code that no longer exists on the
-# branch, exactly as a stale formal review does.
-check_outside "outside-diff block on a superseded commit is NOT counted" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${OTHER}",
-  "body":"> <summary>⚠️ Outside diff range comments (2)</summary>"}]
-EOF
-)"
-
-# 3 from the counted heading plus 1 for the heading with no count: 4.
-check_outside "multiple findings sum per heading count" 4 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
-  "body":"> <summary>⚠️ Outside diff range comments (3)</summary>\n\nprose\n\n> <summary>⚠️ Outside diff range and nitpick comments</summary>"}]
-EOF
-)"
-
-check_outside "null review body is tolerated" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}","body":null}]
-EOF
-)"
-
-check_outside "absent body key is tolerated" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}"}]
-EOF
-)"
+# A finding GitHub will not accept inline goes into the review body. Nothing on
+# the review-comments endpoint sees it, which is how #908 shipped an
+# unaddressed finding while `inline_comments` read as stale-and-fixed.
 
 check_outside "no reviews at all" 0 '[]'
 
-# The false-CLEAR direction, the same one that forced the verdict filter to be
-# tightened on #788: a bot comment that quotes the sha but reports no findings
-# must not be counted as one.
-check_outside "rate-limit notice quoting the sha is NOT counted" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
-  "body":"⚠️ Rate limit exceeded\n\n@user has exceeded the limit. Please wait before requesting another review.\n\nCommits: reviewed up to ${SHA}."}]
+check_outside "a body with no findings block" 0 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Verdict: comment.\n\nI verified the bloom counter against page.rs:43.\n\nTask t1 on rp2, model opus, effort high."}]
 EOF
 )"
 
-# Only the bot's own reviews count.
-check_outside "human review quoting the marker is NOT counted" 0 "$(cat <<EOF
+check_outside "one finding in the body block" 1 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Verdict: comment.\n\nFindings outside the diff:\n- scripts/foo.sh:12 (major): the guard is inverted.\n\nTask t1 on rp2, model opus, effort high."}]
+EOF
+)"
+
+check_outside "three findings in the body block" 3 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Findings outside the diff:\n- a.rs:1: one\n- b.rs:2: two\n- c.rs: three\n\nTask t1 on rp2, model opus, effort high."}]
+EOF
+)"
+
+# The bot appends a SECOND block when GitHub answers 422 to an inline line it
+# will not take (MoveCommentsToBody), so both blocks in one body must count.
+check_outside "two blocks in one body both count" 3 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Findings outside the diff:\n- a.rs:1: one\n- b.rs:2: two\n\nTask t1 on rp2.\n\nFindings outside the diff:\n- c.rs:3: moved out of the diff by a 422\n"}]
+EOF
+)"
+
+# The "Not checked:" list uses the same bullet syntax EARLIER in the same body.
+# Counting bullets only inside an open block is what keeps it out; a regex over
+# the whole body would report the gaps a review names as findings, which is a
+# false block on every honest review.
+check_outside "the Not checked list is not counted as findings" 1 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Verdict: comment.\n\nNot checked:\n- the k8s manifests\n- the bench lane\n\nFindings outside the diff:\n- a.rs:1: one\n\nTask t1 on rp2."}]
+EOF
+)"
+
+# Head discipline, the same rule the review count uses: a body on a superseded
+# commit describes code that is no longer on the branch.
+check_outside "a block on another commit does not count" 0 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${OTHER}",
+  "body":"Findings outside the diff:\n- a.rs:1: one\n"}]
+EOF
+)"
+
+check_outside "a human review with the same block does not count" 0 "$(cat <<EOF
 [{"user":{"login":"pmoust"},"commit_id":"${SHA}",
-  "body":"CodeRabbit reported ⚠️ Outside diff range comments (1) earlier, already fixed."}]
+  "body":"Findings outside the diff:\n- a.rs:1: one\n"}]
 EOF
 )"
 
-# The bot itself quotes the heading when it discusses this mechanism, and a
-# quote is not a finding. This is the case the user filter above does NOT
-# cover: same phrase, same line, bot author, current head -- and no <summary>
-# element, because nothing was actually reported. Matching the phrase rather
-# than the emitted element counted this and blocked a clean PR.
-check_outside "bot review quoting the marker in prose is NOT counted" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
-  "body":"Line 40 counts any same-line prose containing Outside diff range comments (1), which is a false positive."}]
+check_outside "two reviews at the head sum" 2 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Findings outside the diff:\n- a.rs:1: one\n"},
+ {"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Findings outside the diff:\n- b.rs:2: two\n"}]
 EOF
 )"
 
-# Two qualifying elements on ONE line must count as two headings, not one. A
-# greedy [^\n]* between the tags let the first match swallow both, and the
-# count capture then read only the first number: 1 + 2 reported as 1.
-check_outside "two summaries on one line count separately" 3 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
-  "body":"> <summary>⚠️ Outside diff range comments (1)</summary><summary>⚠️ Outside diff range comments (2)</summary>"}]
+check_outside "null body is tolerated" 0 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}","body":null}]
 EOF
 )"
 
-# The emitted form puts <blockquote> immediately after </summary> on the same
-# line. Bounding the match with [^<\n]* must not break that.
-check_outside "emitted form with a trailing blockquote still counts" 1 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
-  "body":"> <summary>⚠️ Outside diff range comments (1)</summary><blockquote>\n>\n> <details>\n> <summary>scripts/foo.sh (1)</summary><blockquote>"}]
+# The heading has to be the whole line. Prose that mentions the phrase mid-line
+# does not open a block, so a review discussing this mechanism does not block
+# itself.
+check_outside "the phrase inside a prose line does not open a block" 0 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"I checked that the Findings outside the diff: list is parsed correctly.\n- this bullet is prose, not a finding\n"}]
 EOF
 )"
 
-# Backticked inline code is the same shape and must not count either.
-check_outside "bot review with the marker in inline code is NOT counted" 0 "$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"commit_id":"${SHA}",
-  "body":"Match the emitted \`⚠️ Outside diff range comments (1)\` summary marker instead of the phrase."}]
+# The accepted limit, pinned so it is a decision rather than a surprise: a body
+# that reproduces a whole block verbatim counts those bullets. Over-counting
+# costs one read of the body; under-counting ships unfixed findings.
+check_outside "a verbatim quoted block still counts (accepted over-count)" 1 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"The bot writes this shape:\n\nFindings outside the diff:\n- a.rs:1: an example finding\n"}]
 EOF
 )"
 
-# --- lib/coderabbit-risk.jq ----------------------------------------------
-#
-# Input is the issues/<pr>/comments array. Expectations are "<sha>|<paused>".
-#
-# The signal exists because CodeRabbit re-reviews by EDITING one walkthrough
-# comment in place: a review object at head can be absent after a real
-# re-review and present after a stale one, so the sha on the risk line is the
-# only thing that tracks what was actually assessed (issue #950).
-
-check_risk "risk line yields its short sha" "6f458|active" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-01T00:00:00Z",
-  "body":"<details>\n<summary>Walkthrough</summary>\n</details>\n\nMerge Risk: Moderate . up to `6f458`"}]
-EOF
-)"
-
-# The emitted form bolds the label; the substring is unchanged.
-check_risk "bolded risk label still parses" "6f458|active" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"body":"**Merge Risk: Low** . up to `6f458`"}]
-EOF
-)"
-
-# A risk line that backticks something before the sha (a file name, a label)
-# must still yield the trailing "up to" sha, not the first backticked token.
-check_risk "the last backticked token on the line wins" "6f458|active" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"body":"Merge Risk: Moderate for `scripts/foo.sh` . up to `6f458`"}]
-EOF
-)"
-
-# A backticked token on a LATER line is not part of the risk line. Without the
-# [^\n]* bound the greedy match would cross the newline and report the wrong
-# commit, which is a false freshness signal in either direction.
-check_risk "a backticked token on a later line is not the risk sha" "6f458|active" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"body":"Merge Risk: Moderate . up to `6f458`\n\nFiles reviewed: `deadbeef`"}]
-EOF
-)"
-
-# Newest wins. Two walkthroughs, the older one fresh and the newer one stale:
-# reading the older would clear a PR whose latest assessment is behind.
-check_risk "newest walkthrough wins when the older one is fresher" "aaaaa|active" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
-  "body":"Merge Risk: Low . up to `bbbbb`"},
- {"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-03T00:00:00Z",
-  "body":"Merge Risk: Low . up to `aaaaa`"}]
-EOF
-)"
-
-# Array order is not trusted: created_at decides.
-check_risk "out-of-order comments are ordered by created_at" "aaaaa|active" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-03T00:00:00Z",
-  "body":"Merge Risk: Low . up to `aaaaa`"},
- {"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
-  "body":"Merge Risk: Low . up to `bbbbb`"}]
-EOF
-)"
-
-# A newer bot comment with no risk line (a chat reply, a rate-limit notice)
-# does not erase the newest ASSESSMENT; only risk-carrying comments are ranked.
-check_risk "a newer non-walkthrough comment does not hide the risk line" "6f458|active" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
-  "body":"Merge Risk: Low . up to `6f458`"},
- {"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-04T00:00:00Z",
-  "body":"@user I have resolved that thread."}]
-EOF
-)"
-
-check_risk "paused reviews are reported alongside the sha" "6f458|paused" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
-  "body":"Merge Risk: Low . up to `6f458`\n\n> Reviews paused"}]
-EOF
-)"
-
-check_risk "paused with no risk line yields an empty sha" "|paused" "$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"body":"⏸️ Reviews paused\n\nUse @coderabbitai resume to restart."}]
-EOF
-)"
-
-# A human quoting a risk line is not an assessment.
-check_risk "a human risk line does not count" "|active" "$(cat <<'EOF'
-[{"user":{"login":"pmoust"},"body":"CodeRabbit said Merge Risk: Low . up to `6f458`, merging."}]
-EOF
-)"
-
-check_risk "no comments at all" "|active" '[]'
-check_risk "null body is tolerated" "|active" \
-  '[{"user":{"login":"coderabbitai[bot]"},"body":null}]'
-
-# --- end-to-end verdict, pr-review-status.sh ------------------------------
-#
-# The count above only matters if it flips the verdict. These run the real
-# script against fixtures with stand-in `gh` and `git` on PATH: no network, no
-# token. The `git` stand-in exists because the script now calls the merge-base
-# guard, which fetches; without it these cases would reach the network and
-# their verdict would depend on the state of whatever repository they ran in.
+# --- end-to-end, with gh and git stood in for ----------------------------
 
 E2E_DIR="$(mktemp -d)"
 trap 'rm -rf "${E2E_DIR}"' EXIT
@@ -373,16 +320,12 @@ chmod +x "${E2E_DIR}/bin/git"
 
 # Everything except the review body is held constant and clean: CI green,
 # mergeState CLEAN, one COMMENTED review at head, zero inline comments, and a
-# walkthrough whose risk line names the head. So the only thing that can move
-# the verdict is the body -- or, in the risk cases below, E2E_ISSUE_COMMENTS.
-#
-# The default walkthrough deliberately carries neither the full head sha nor a
-# verdict marker, so walkthroughs@head stays 0 and these cases keep exercising
-# the outside-diff path rather than accidentally depending on the verdict
-# filter as well.
-FRESH_WALKTHROUGH="$(cat <<EOF
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
-  "body":"<details>\n<summary>Walkthrough</summary>\nAdds a guard.\n</details>\n\n**Merge Risk: Low** . up to \`${SHA:0:5}\`"}]
+# task comment saying the review for the head was posted. So the only thing
+# that can move the verdict is the body -- or, in the cases below, one of the
+# E2E_* overrides.
+DONE_TASK_COMMENT="$(cat <<EOF
+[{"user":{"login":"${BOT}"},"created_at":"2026-01-02T00:00:00Z",
+  "body":"Review task queued.\n\nTask: t1\nCommit: ${SHA}\nModel: opus (effort high)\nExecutor: rp2\nStatus: done. Review posted."}]
 EOF
 )"
 
@@ -398,10 +341,10 @@ e2e() {
   fi
   printf '{"state":"OPEN","mergeStateStatus":"CLEAN","statusCheckRollup":%s,"headRefOid":"%s"}\n' \
     "${rollup}" "${SHA}" >"${fx}/pr-view.json"
-  printf '[{"user":{"login":"coderabbitai[bot]"},"state":"COMMENTED","commit_id":"%s","body":%s}]\n' \
-    "${SHA}" "${review_body}" >"${fx}/reviews.json"
-  printf '%s\n' "${E2E_ISSUE_COMMENTS:-${FRESH_WALKTHROUGH}}" >"${fx}/issue-comments.json"
-  printf '[]\n' >"${fx}/review-comments.json"
+  printf '%s\n' "${E2E_REVIEWS:-$(printf '[{"user":{"login":"%s"},"state":"%s","commit_id":"%s","body":%s}]' \
+    "${BOT}" "${E2E_REVIEW_STATE:-COMMENTED}" "${SHA}" "${review_body}")}" >"${fx}/reviews.json"
+  printf '%s\n' "${E2E_ISSUE_COMMENTS:-${DONE_TASK_COMMENT}}" >"${fx}/issue-comments.json"
+  printf '%s\n' "${E2E_REVIEW_COMMENTS:-[]}" >"${fx}/review-comments.json"
   FIXTURES="${fx}" PATH="${E2E_DIR}/bin:${PATH}" \
     bash "${E2E_SCRIPT:-$(dirname "$0")/pr-review-status.sh}" 908 "$@"
 }
@@ -417,35 +360,31 @@ check_eq() {
   fi
 }
 
-CLEAN_BODY_JSON='"Actionable comments posted: 0\n\n<details>\n<summary>Walkthrough</summary>\n\nAdds a guard.\n</details>"'
-FINDING_BODY_JSON="$(cat <<'EOF'
-"**Actionable comments posted: 2**\n\n> [!CAUTION]\n> Some comments are outside the diff and can't be posted inline due to platform limitations.\n>\n> <details>\n> <summary>⚠️ Outside diff range comments (1)</summary>\n>\n> `scripts/foo.sh` line 12: the guard is inverted.\n>\n> </details>"
-EOF
-)"
+CLEAN_BODY_JSON='"Verdict: comment.\n\nI read the diff and the code around it.\n\nTask t1 on rp2, model opus, effort high."'
+FINDING_BODY_JSON='"Verdict: comment.\n\nFindings outside the diff:\n- scripts/foo.sh:12 (major): the guard is inverted.\n\nTask t1 on rp2, model opus, effort high."'
 
 clean_out="$(e2e "${CLEAN_BODY_JSON}")"
 finding_out="$(e2e "${FINDING_BODY_JSON}")"
 confirmed_out="$(e2e "${FINDING_BODY_JSON}" --confirm-addressed)"
 
-# A body with no findings prints exactly what it printed before this field
-# existed: no extra summary field, and the unchanged clean verdict.
-check_eq "walkthrough-only body: summary line carries no outside-diff field" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=head reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
+# A body with no findings: no extra summary field, and the clean verdict.
+check_eq "no findings: summary line carries no outside-diff field" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
   "$(printf '%s\n' "${clean_out}" | sed -n 1p)"
-check_eq "walkthrough-only body: verdict is unchanged clean" \
-  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
+check_eq "no findings: verdict is clean" \
+  "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${clean_out}" | sed -n 2p)"
-check_eq "walkthrough-only body: merge command still printed" \
+check_eq "no findings: merge command printed" \
   "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${clean_out}" | sed -n 3p)"
 
 # The #908 regression: same PR, same green CI, same zero inline comments, one
 # outside-diff finding in the body. It must be visible and it must block.
 check_eq "outside-diff body finding: counted on the summary line" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=head reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0 outside_diff_body_findings@head=1" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0 outside_diff_body_findings@head=1" \
   "$(printf '%s\n' "${finding_out}" | sed -n 1p)"
 check_eq "outside-diff body finding: verdict is not clean" \
-  "  -> 1 CodeRabbit outside-diff finding(s) in the review BODY at head, not inline; read the body with \`gh api repos/NOFireAI/ravel/pulls/908/reviews --jq '.[] | select(.commit_id==\"${SHA}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered" \
+  "  -> 1 outside-diff finding(s) in the review BODY at head, not inline; read the body with \`gh api repos/NOFireAI/ravel/pulls/908/reviews --jq '.[] | select(.commit_id==\"${SHA}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered" \
   "$(printf '%s\n' "${finding_out}" | sed -n 2p)"
 check_eq "outside-diff body finding: no merge command offered" \
   "" \
@@ -453,42 +392,125 @@ check_eq "outside-diff body finding: no merge command offered" \
 
 # --confirm-addressed overrides it, in the same shape as the inline branch.
 check_eq "outside-diff body finding: --confirm-addressed clears it" \
-  "  -> clean (operator confirmed all 1 outside-diff body finding(s) addressed): CI green, CodeRabbit's risk line names the current head" \
+  "  -> clean (operator confirmed all 1 outside-diff body finding(s) addressed): CI green, review at the current head" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 2p)"
 check_eq "outside-diff body finding: --confirm-addressed prints the merge command" \
   "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${confirmed_out}" | sed -n 3p)"
 
-# --- risk-line freshness end-to-end (issue #950) --------------------------
+# An inline comment blocks the same way, and names the other flag path.
+E2E_REVIEW_COMMENTS="$(printf '[{"user":{"login":"%s"},"body":"the retry drops the error"}]' "${BOT}")"
+inline_out="$(e2e "${CLEAN_BODY_JSON}")"
+inline_confirmed_out="$(e2e "${CLEAN_BODY_JSON}" --confirm-addressed)"
+unset E2E_REVIEW_COMMENTS
+
+check_eq "inline comment: blocks until confirmed" \
+  "  -> 1 inline review comment(s); read them, then re-run with --confirm-addressed once each is fixed or answered (the API cannot tell; see the header comment)" \
+  "$(printf '%s\n' "${inline_out}" | sed -n 2p)"
+check_eq "inline comment: --confirm-addressed clears it" \
+  "  -> clean (operator confirmed all 1 inline comment(s) addressed): CI green, review at the current head" \
+  "$(printf '%s\n' "${inline_confirmed_out}" | sed -n 2p)"
+
+# --- no review at head: five states, five different next actions ---------
 #
-# Everything else in these fixtures is clean and constant -- CI green,
-# mergeState CLEAN, one COMMENTED review at head, no findings anywhere -- so
-# the ONLY thing that moves the verdict is the walkthrough's risk line. That is
-# the point: under the old rule this exact fixture read as reviewed and clean.
+# Everything else in these fixtures stays clean, so the ONLY thing that moves
+# the verdict is what the review and the task comment say. Under a check that
+# only asked "is there a review object", four of these five read identically.
 
-STALE_WALKTHROUGH="$(cat <<'EOF'
-[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z",
-  "body":"<details>\n<summary>Walkthrough</summary>\nAdds a guard.\n</details>\n\n**Merge Risk: Moderate** . up to `6f458`"}]
-EOF
-)"
+E2E_REVIEWS='[]'
 
-E2E_ISSUE_COMMENTS="${STALE_WALKTHROUGH}"
-stale_out="$(e2e "${CLEAN_BODY_JSON}")"
+E2E_ISSUE_COMMENTS='[]'
+noask_out="$(e2e "${CLEAN_BODY_JSON}")"
 unset E2E_ISSUE_COMMENTS
 
-check_eq "stale risk line: reported on the summary line" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=stale:6f458 reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
-  "$(printf '%s\n' "${stale_out}" | sed -n 1p)"
-check_eq "stale risk line: verdict blocks the merge" \
-  "  -> CodeRabbit's risk line is at STALE sha 6f458 vs head ${SHA} (do not merge yet)" \
-  "$(printf '%s\n' "${stale_out}" | sed -n 2p)"
-check_eq "stale risk line: no merge command offered" \
-  "" \
-  "$(printf '%s\n' "${stale_out}" | sed -n 3p)"
+check_eq "nobody asked: summary says no task at head" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | review: task@head=none reviews@head=0 last=none inline_comments=0" \
+  "$(printf '%s\n' "${noask_out}" | sed -n 1p)"
+check_eq "nobody asked: verdict says to post the trigger" \
+  "  -> no review at head and nobody asked for one: comment \`@claude-fleet review\` on the PR (that exact body, arguments after \`review\` are parsed and an unrecognized word gets a confused reaction and no review)" \
+  "$(printf '%s\n' "${noask_out}" | sed -n 2p)"
+check_eq "nobody asked: no merge command offered" \
+  "0" \
+  "$(printf '%s\n' "${noask_out}" | grep -c 'gh pr merge')"
 
-# Proof this pins the fix rather than passing anyway: flip the single marked
-# condition off, which leaves the pre-#950 behaviour (a review object at head
-# decides), and the SAME fixture must come back clean with a merge command.
+# Asked, but no task comment came back: the mention was malformed (a confused
+# reaction and nothing else) or the app is not installed. Distinguishing this
+# from "nobody asked" is the whole point -- the operator's next move differs.
+E2E_ISSUE_COMMENTS='[{"user":{"login":"pmoust"},"body":"@claude-fleet review this PR carefully"}]'
+malformed_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "asked but no task: verdict says the mention did not take" \
+  "  -> 1 \`@claude-fleet review\` comment(s) but no task comment for ${SHA}: the mention was malformed (check for a confused reaction on it) or the app is not installed on this repository; post the bare trigger again" \
+  "$(printf '%s\n' "${malformed_out}" | sed -n 2p)"
+
+# The bot quoting the trigger in its own comment is not somebody asking.
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"%s"},"body":"Write @claude-fleet review to start a review."}]' "${BOT}")"
+botquote_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "the bot quoting the trigger does not count as asking" \
+  "  -> no review at head and nobody asked for one: comment \`@claude-fleet review\` on the PR (that exact body, arguments after \`review\` are parsed and an unrecognized word gets a confused reaction and no review)" \
+  "$(printf '%s\n' "${botquote_out}" | sed -n 2p)"
+
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"%s"},"body":"Review task queued.\\n\\nTask: t1\\nCommit: %s\\nModel: opus (effort high)\\nExecutor: pending"}]' "${BOT}" "${SHA}")"
+running_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "task running: verdict says wait" \
+  "  -> review task for ${SHA} is queued or running; wait (the bot edits its task comment in place, and posts the review when the task finishes)" \
+  "$(printf '%s\n' "${running_out}" | sed -n 2p)"
+
+# The state that must never read as "wait": nothing retries a failed task, so a
+# check that folded this into `running` waits forever.
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"%s"},"body":"Review task queued.\\n\\nTask: t1\\nCommit: %s\\nModel: opus (effort high)\\nExecutor: rp2\\nStatus: failed (setup). No review posted."}]' "${BOT}" "${SHA}")"
+dead_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "task dead: verdict says re-trigger, not wait" \
+  "  -> review task for ${SHA} went terminal with NO review posted; nothing will arrive, so re-trigger with \`@claude-fleet review\` (read the task comment for the failure class: \`gh api repos/NOFireAI/ravel/issues/908/comments --jq '.[] | select(.user.login==\"${BOT}\") | .body'\`)" \
+  "$(printf '%s\n' "${dead_out}" | sed -n 2p)"
+check_eq "task dead: no merge command offered" \
+  "0" \
+  "$(printf '%s\n' "${dead_out}" | grep -c 'gh pr merge')"
+
+# The task says it posted a review and no review object is there. Whatever that
+# is, it is not a merge: say so instead of clearing on the task comment alone.
+donenoreview_out="$(e2e "${CLEAN_BODY_JSON}")"
+
+check_eq "task done but no review object: verdict says check by hand" \
+  "  -> the task comment for ${SHA} says the review was posted, but no review object at that commit is visible; check by hand before merging" \
+  "$(printf '%s\n' "${donenoreview_out}" | sed -n 2p)"
+
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"%s"},"body":"Review task queued.\\n\\nTask: t1\\nCommit: %s\\nModel: opus (effort high)\\nExecutor: rp2\\nStatus: something new upstream."}]' "${BOT}" "${SHA}")"
+unknown_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "task in an unrecognized state: verdict says read it by hand" \
+  "  -> review task for ${SHA} is in an unrecognized state (unknown); read its task comment by hand before merging" \
+  "$(printf '%s\n' "${unknown_out}" | sed -n 2p)"
+
+# A review for an EARLIER commit is the case where the head moved after a
+# review. It must not clear the head, and the count belongs on the line so the
+# operator can tell it from "never reviewed".
+E2E_REVIEWS="$(printf '[{"user":{"login":"%s"},"state":"COMMENTED","commit_id":"%s","body":"Verdict: comment."}]' "${BOT}" "${OTHER}")"
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"%s"},"body":"Review task queued.\\n\\nTask: t1\\nCommit: %s\\nModel: opus (effort high)\\nExecutor: rp2\\nStatus: done. Review posted."}]' "${BOT}" "${OTHER}")"
+stalereview_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_REVIEWS E2E_ISSUE_COMMENTS
+
+check_eq "review at an older commit: reported on the summary line" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | review: task@head=none reviews@head=0 last=none inline_comments=0 reviews_at_older_commits=1" \
+  "$(printf '%s\n' "${stalereview_out}" | sed -n 1p)"
+check_eq "review at an older commit: does not clear the head" \
+  "  -> no review at head and nobody asked for one: comment \`@claude-fleet review\` on the PR (that exact body, arguments after \`review\` are parsed and an unrecognized word gets a confused reaction and no review)" \
+  "$(printf '%s\n' "${stalereview_out}" | sed -n 2p)"
+check_eq "review at an older commit: the head-moved note is printed" \
+  "     (1 review(s) exist at older commits; the head moved after them, so they do not cover it)" \
+  "$(printf '%s\n' "${stalereview_out}" | sed -n 3p)"
+
+# Proof this pins the rule rather than passing anyway: flip the single marked
+# condition off, which leaves a check that clears on green CI alone, and the
+# SAME unreviewed fixture must come back clean with a merge command.
 FLIP_DIR="${E2E_DIR}/flip"
 mkdir -p "${FLIP_DIR}"
 ln -s "$(cd "$(dirname "$0")" && pwd)/lib" "${FLIP_DIR}/lib"
@@ -506,76 +528,40 @@ else
   fails=$((fails + 1))
 fi
 
-E2E_ISSUE_COMMENTS="${STALE_WALKTHROUGH}" E2E_SCRIPT="${FLIP_DIR}/pr-review-status.sh"
+E2E_REVIEWS='[]' E2E_ISSUE_COMMENTS='[]' E2E_SCRIPT="${FLIP_DIR}/pr-review-status.sh"
 flipped_out="$(e2e "${CLEAN_BODY_JSON}")"
-unset E2E_ISSUE_COMMENTS E2E_SCRIPT
+unset E2E_REVIEWS E2E_ISSUE_COMMENTS E2E_SCRIPT
 
-check_eq "prove: the pre-#950 rule calls the stale fixture clean" \
-  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
+check_eq "prove: without the review conjunct, an unreviewed PR reads clean" \
+  "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${flipped_out}" | sed -n 2p)"
-check_eq "prove: the pre-#950 rule even offers the merge command" \
+check_eq "prove: without it, the merge command is even offered" \
   "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
   "$(printf '%s\n' "${flipped_out}" | sed -n 3p)"
 
-# Degraded mode 1: no CodeRabbit comment at all. Nothing to parse, and the
-# script must say so explicitly rather than fall through to clean.
-E2E_ISSUE_COMMENTS='[]'
-none_out="$(e2e "${CLEAN_BODY_JSON}")"
-unset E2E_ISSUE_COMMENTS
+unset E2E_REVIEWS
 
-check_eq "no CodeRabbit comment: risk_line=none on the summary line" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=none reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
-  "$(printf '%s\n' "${none_out}" | sed -n 1p)"
-check_eq "no CodeRabbit comment: verdict says not assessed" \
-  "  -> no CodeRabbit Merge Risk line found: CodeRabbit has not assessed this PR; do not merge until a risk line naming the head commit appears" \
-  "$(printf '%s\n' "${none_out}" | sed -n 2p)"
+# A review state that is neither APPROVED nor COMMENTED blocks. The bot never
+# approves and never requests changes, so this catches a dismissed review or a
+# human's CHANGES_REQUESTED, and it can only ever block, never clear.
+E2E_REVIEW_STATE=DISMISSED
+dismissed_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_REVIEW_STATE
 
-# Degraded mode 2: reviews paused, no assessment. The pause is the reason the
-# risk line will never arrive, so it is named in the same line.
-E2E_ISSUE_COMMENTS='[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z","body":"⏸️ Reviews paused\n\nUse `@coderabbitai resume` to restart."}]'
-paused_out="$(e2e "${CLEAN_BODY_JSON}")"
-unset E2E_ISSUE_COMMENTS
+check_eq "a DISMISSED review at head blocks" \
+  "  -> the current-head review state is DISMISSED (need APPROVED or COMMENTED); not clean" \
+  "$(printf '%s\n' "${dismissed_out}" | sed -n 2p)"
 
-check_eq "paused reviews: flagged on the summary line" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | CodeRabbit: risk_line=none reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0 reviews_paused=yes" \
-  "$(printf '%s\n' "${paused_out}" | sed -n 1p)"
-check_eq "paused reviews: verdict names the pause as the reason" \
-  "  -> no CodeRabbit Merge Risk line found: CodeRabbit has not assessed this PR; CodeRabbit reviews are PAUSED on this PR, so the assessment will not refresh until they resume; do not merge until a risk line naming the head commit appears" \
-  "$(printf '%s\n' "${paused_out}" | sed -n 2p)"
+# COMMENTED is the bot's success state, so it must NOT be treated as "not
+# approved, therefore not clean" -- the first e2e case above already proves
+# that. APPROVED is accepted too, for a human review on the same head.
+E2E_REVIEW_STATE=APPROVED
+approved_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_REVIEW_STATE
 
-# A pause AFTER a head-fresh assessment is not a blocker: the assessment that
-# exists already covers the head. Blocking here would be a false block that
-# only an unrelated bot state caused.
-E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-02T00:00:00Z","body":"**Merge Risk: Low** . up to `%s`\\n\\n⏸️ Reviews paused"}]' "${SHA:0:5}")"
-paused_fresh_out="$(e2e "${CLEAN_BODY_JSON}")"
-unset E2E_ISSUE_COMMENTS
-
-check_eq "paused after a head-fresh assessment still merges" \
-  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
-  "$(printf '%s\n' "${paused_fresh_out}" | sed -n 2p)"
-
-# Degraded mode 3: several walkthrough comments. The bot posts a fresh one
-# after a force-push or a re-summon, and the older one still carries its own
-# risk line. Newest by created_at decides; here the newest is stale, so a
-# reader that took the first (or the freshest-looking) one would clear a PR
-# whose latest assessment is behind the head.
-E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-01T00:00:00Z","body":"**Merge Risk: Low** . up to `%s`"},{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-05T00:00:00Z","body":"**Merge Risk: High** . up to `6f458`"}]' "${SHA:0:5}")"
-multi_out="$(e2e "${CLEAN_BODY_JSON}")"
-unset E2E_ISSUE_COMMENTS
-
-check_eq "multiple walkthroughs: the newest one decides, stale blocks" \
-  "  -> CodeRabbit's risk line is at STALE sha 6f458 vs head ${SHA} (do not merge yet)" \
-  "$(printf '%s\n' "${multi_out}" | sed -n 2p)"
-
-# The mirror: newest fresh, older stale. Newest wins in both directions, so the
-# case above cannot be passing merely because something always blocks.
-E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-01T00:00:00Z","body":"**Merge Risk: Low** . up to `6f458`"},{"user":{"login":"coderabbitai[bot]"},"created_at":"2026-01-05T00:00:00Z","body":"**Merge Risk: High** . up to `%s`"}]' "${SHA:0:5}")"
-multi_fresh_out="$(e2e "${CLEAN_BODY_JSON}")"
-unset E2E_ISSUE_COMMENTS
-
-check_eq "multiple walkthroughs: the newest one decides, fresh clears" \
-  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
-  "$(printf '%s\n' "${multi_fresh_out}" | sed -n 2p)"
+check_eq "an APPROVED review at head is also clean" \
+  "  -> clean: CI green, review at the current head with zero findings" \
+  "$(printf '%s\n' "${approved_out}" | sed -n 2p)"
 
 # --- merge-base freshness end-to-end --------------------------------------
 #
@@ -694,7 +680,7 @@ cat >"${VANISH_DIR}/bin/jq" <<SHIM
 "${REAL_JQ}" "\$@"
 rc=\$?
 case "\$*" in
-  *coderabbit-outside-diff.jq*) rm -rf "${VANISH_DIR}/scripts" ;;
+  *fleet-review-outside-diff.jq*) rm -rf "${VANISH_DIR}/scripts" ;;
 esac
 exit \$rc
 SHIM
@@ -729,10 +715,10 @@ all_skipped_out="$(e2e "${CLEAN_BODY_JSON}")"
 unset E2E_ROLLUP
 
 check_eq "all checks skipped: counted as skipped, not as passes" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=0 pass/0 pending/0 fail/2 skipped | CodeRabbit: risk_line=head reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=0 pass/0 pending/0 fail/2 skipped | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
   "$(printf '%s\n' "${all_skipped_out}" | sed -n 1p)"
 check_eq "all checks skipped: the verdict does not claim CI green" \
-  "  -> clean: every check skipped, nothing ran, CodeRabbit's risk line names the current head with zero inline comments" \
+  "  -> clean: every check skipped, nothing ran, review at the current head with zero findings" \
   "$(printf '%s\n' "${all_skipped_out}" | sed -n 2p)"
 check_eq "all checks skipped: the merge command is still offered" \
   "  -> scripts/guards/assert-fresh-merge-base.sh 908 && gh pr merge 908 --rebase --delete-branch --match-head-commit ${SHA}" \
@@ -745,10 +731,10 @@ mixed_out="$(e2e "${CLEAN_BODY_JSON}")"
 unset E2E_ROLLUP
 
 check_eq "one pass beside one skip: both counted, separately" \
-  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail/1 skipped | CodeRabbit: risk_line=head reviews@head=1 walkthroughs@head=0 last=COMMENTED inline_comments=0" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail/1 skipped | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
   "$(printf '%s\n' "${mixed_out}" | sed -n 1p)"
 check_eq "one pass beside one skip: the verdict still says CI green" \
-  "  -> clean: CI green, CodeRabbit's risk line names the current head with zero inline comments" \
+  "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${mixed_out}" | sed -n 2p)"
 
 printf '\n%d passed, %d failed\n' "${passes}" "${fails}"

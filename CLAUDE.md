@@ -243,12 +243,13 @@ connection, a pushed-but-broken main).
   cleans `wip:`/fixup commits out of the reviewed result branch, runs
   `gates.sh`, and opens a PR against `main` (`main` is protected; the
   script never pushes or merges it directly). The PR opens WITHOUT
-  auto-merge by default (standing rule, 2026-08-26): CodeRabbit's GitHub
-  App reviews every PR as a comment, not a required status check, so
-  `--auto` used to merge before that review landed (#749/#750 shipped
-  with 6 real findings unaddressed this way). Wait for the
-  `coderabbitai[bot]` review, fix or answer every actionable finding (a
-  walkthrough-only comment with zero findings counts as clean; check with
+  auto-merge by default (standing rule, 2026-08-26): a bot review posts as
+  a comment, not a required status check, so `--auto` used to merge before
+  that review landed (#749/#750 shipped with 6 real findings unaddressed
+  this way). After opening the PR it posts `@claude-fleet review` on it,
+  which is the trigger for the fleet review (ADR-1586). Wait for the
+  `claude-fleet[bot]` review, fix or answer every actionable finding (a
+  review with zero findings counts as clean; check with
   `scripts/pr-review-status.sh <pr-number>`), then run the exact merge
   command it prints once clean (it pins `--match-head-commit` to the SHA
   it just checked, so a stale check can't land unreviewed code).
@@ -273,11 +274,15 @@ connection, a pushed-but-broken main).
   satisfies this same check: the authorship rewrite and wip-fold change
   commit ids, not the tree, so the tree-hash-keyed receipt still matches.
 - `scripts/pr-review-status.sh <pr-number>`: one-line status for the
-  wait-for-CodeRabbit-then-merge-by-hand flow -- `mergeStateStatus`, the
+  wait-for-the-review-then-merge-by-hand flow -- `mergeStateStatus`, the
   CI check rollup (pass/pending/fail counts, a skipped count when it is
-  nonzero, and failing check names), and
-  the `coderabbitai[bot]` review count plus its inline-comment count. The
-  REST comments endpoint carries no resolved/unresolved field (that's a
+  nonzero, and failing check names), and the state of the fleet review:
+  the `claude-fleet[bot]` review at the head commit, its inline-comment
+  count, and the bot's task comment classified as none/running/done/dead
+  so a missing review says whether to wait, to re-trigger, or that nobody
+  asked. Freshness is `review.commit_id` against `headRefOid`, and the
+  bot never approves, so COMMENTED is the success state. The REST
+  comments endpoint carries no resolved/unresolved field (that's a
   GraphQL review-thread concept), so a nonzero comment count needs a
   human/session read of `gh api repos/.../pulls/<n>/comments` to judge
   whether each was already fixed or answered; the script only tells you

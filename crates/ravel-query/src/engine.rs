@@ -4973,7 +4973,7 @@ mod tests {
 
     use super::*;
 
-    /// CodeRabbit finding on PR #1424 (comment 3952989200): a query whose
+    /// A query whose
     /// snapshot resolves to zero segments never enters the segment-fetch
     /// loop, so the incremental `max_s3_requests` check there never runs. A
     /// caller-lowered budget of zero (ADR-1374 decision 3) must still be
@@ -5045,7 +5045,7 @@ mod tests {
         );
     }
 
-    /// Round 2, CodeRabbit finding on PR #1424: the log lane's post-resolve
+    /// The log lane's post-resolve
     /// budget check added in `prefetch` (see
     /// `lowered_request_budget_is_enforced_after_resolve` above) compared
     /// only the log lane's OWN resolve cost against the ceiling, ignoring

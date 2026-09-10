@@ -7,16 +7,23 @@
 # to a PR head branch, and opens a PR.
 #
 # The PR is opened WITHOUT auto-merge by default (standing rule, 2026-08-26):
-# CodeRabbit's GitHub App reviews every PR but posts as a review comment, not
-# a required status check, so `--auto` merges before that review lands.
-# #749/#750 landed with 6 real CodeRabbit findings unaddressed this way. Wait
-# for the coderabbitai[bot] review, fix or explicitly answer every actionable
-# finding it raises (a walkthrough-only comment with zero findings counts as
-# clean), then merge by hand once CI is green:
+# a bot review posts as a review comment, not a required status check, so
+# `--auto` merges before that review lands. #749/#750 landed with 6 real
+# findings unaddressed this way. The reason did not change when the reviewer
+# did (ADR-1586): the fleet review bot posts a comment review too, and it
+# never approves, so branch protection has nothing to wait on.
+#
+# So this script also asks for the review: after opening the PR it posts one
+# comment whose whole body is `@claude-fleet review`. That is the trigger, and
+# it has to be the whole body -- the bot parses whatever follows `review` as
+# arguments and answers an unrecognized word with a confused reaction and no
+# review. Then wait for the `claude-fleet[bot]` review, fix or explicitly
+# answer every actionable finding (a review with zero findings counts as
+# clean), and merge by hand once CI is green:
 #   gh pr merge <n> --rebase
-# `scripts/pr-review-status.sh <n>` prints CI + CodeRabbit status in one line.
+# `scripts/pr-review-status.sh <n>` prints CI + review status in one line.
 # FLEET_MERGE_AUTO=1 restores the old behavior (`gh pr merge --auto --rebase`)
-# for a case that genuinely does not need a CodeRabbit wait; do not set this
+# for a case that genuinely does not need to wait for a review; do not set this
 # out of impatience, only when you have already confirmed no review applies.
 #
 # Run fleet-result-inspect.sh first and review its output; this script
@@ -572,17 +579,31 @@ pr_url="$(gh pr create --base main --head "${pr_branch}" \
 rm -f "${body_file}"
 pr_number="${pr_url##*/}"
 
+# Ask for the review. The body is exactly the trigger and nothing else: the bot
+# reads the words after `review` as arguments and answers one it does not
+# recognize with a confused reaction and no review, so a friendly sentence
+# appended here would silently cost the review. A failure to post is a warning
+# rather than an error: the PR is already open and the trigger can be posted by
+# hand, while exiting here would strand a pushed branch.
+review_trigger="@claude-fleet review"
+if gh pr comment "${pr_number}" --body "${review_trigger}" >/dev/null; then
+  echo "==> Requested a review: posted \`${review_trigger}\` on the PR"
+else
+  echo "==> WARNING: could not post the review trigger; comment \`${review_trigger}\` on ${pr_url} by hand" >&2
+fi
+
 if [[ "${FLEET_MERGE_AUTO:-0}" == "1" ]]; then
   echo "==> FLEET_MERGE_AUTO=1: enabling auto-merge (--rebase)"
   gh pr merge --auto --rebase --delete-branch "${pr_number}"
   echo "Opened PR for task ${task_id}; auto-merge (--rebase) will land it once required checks pass."
+  echo "The review will land after the merge, so sweep it afterwards rather than skipping it."
 else
-  echo "==> Opened without auto-merge (standing rule): wait for coderabbitai[bot], then merge by hand"
+  echo "==> Opened without auto-merge (standing rule): wait for the claude-fleet[bot] review, then merge by hand"
   echo "  ${pr_url}"
   echo "  Check status:   ${script_dir}/pr-review-status.sh ${pr_number}"
   echo "  Or by hand:     gh pr checks ${pr_number}"
   echo "                  gh api repos/NOFireAI/ravel/pulls/${pr_number}/reviews"
-  echo "                  gh api repos/NOFireAI/ravel/pulls/${pr_number}/comments"
+  echo "                  gh api repos/NOFireAI/ravel/issues/${pr_number}/comments"
   echo "  Once ${script_dir}/pr-review-status.sh ${pr_number} reports clean, run the"
   echo "  exact merge command it prints (it pins --match-head-commit to the SHA it"
   echo "  just checked, so the merge refuses if the branch moved since):"
@@ -592,7 +613,7 @@ fi
 # Do NOT delete the task/<id>/result and task/<id>/start refs here, with or
 # without auto-merge: this script reporting success does not mean the PR has
 # landed. Deleting them now reintroduces the exact silent-loss shape this
-# script exists to prevent: if a required check (or an unresolved CodeRabbit
+# script exists to prevent: if a required check (or an unresolved review
 # finding) later blocks the merge, the PR sits open with no way to recover
 # the original result branch. The task refs are cleaned up by the
 # merge-fleet-result skill's "after the PR is open" step, once it has
