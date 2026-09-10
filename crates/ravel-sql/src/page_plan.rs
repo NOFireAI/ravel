@@ -80,19 +80,36 @@
 //! Only a term the text proves NON NULL is admitted, and a term reaches that
 //! proof by one of two routes.
 //!
-//! A bare column reference goes through the target table's public schema, and
-//! that lookup holds end to end only when the output name is a bare reference
-//! to a column of the `FROM` relation AND that relation is the target base
-//! table itself. [`SchemaBasis`] is what settles the second half: a derived
-//! table, a CTE, a join, or a `ROLLUP`/`CUBE`/`GROUPING SETS` grouping each
-//! leave the schema answering about a column the ordered value did not come
-//! from.
+//! A [`Provenance::BaseColumn`] goes through the target table's public
+//! schema. That lookup holds end to end by construction of the variant: it
+//! exists only where the output name is a bare reference to a column of the
+//! `FROM` relation AND that relation is the target base table itself, under
+//! its own column names. A derived table, a CTE, a join, a positional
+//! column-rename list on the relation, or a `ROLLUP`/`CUBE`/`GROUPING SETS`
+//! grouping each leave the schema answering about a column the ordered value
+//! did not come from, so none of them yields that variant.
 //!
-//! An alias over an expression is answered by the expression itself
+//! A [`Provenance::Expression`] is answered by the expression itself
 //! ([`expression_is_non_null`]), with no schema involved: a literal and a
 //! `count(...)` are NON NULL wherever they are selected from. `SUM`, `MIN`,
 //! `MAX` and `AVG` are not, and keep refusing, because each is NULL over
 //! empty and over all-NULL input.
+//!
+//! # One resolution from an output name
+//!
+//! Both of those routes, the row-identity claim behind `not_total`, and the
+//! projected-output-column check are all the same question -- what does this
+//! statement's text prove the output name `x` is built from? -- and they are
+//! all asked through [`OutputResolution::resolve`], which is the only way to
+//! ask it. Its [`Provenance`] answer distinguishes a genuine column of the
+//! target base table (the only answer that carries row identity) from an
+//! expression, from a name whose source the text does not settle, and from a
+//! name the statement does not project.
+//!
+//! That the raw output name is unreachable from those consumers is the point
+//! rather than a tidiness. Three rounds of fixes to this defect class each
+//! converted one consumer and left another matching the name itself, so the
+//! same wrong answer came back through a different door.
 //!
 //! The refusal says which of two things went wrong.
 //! [`PagePlanError::OrderTermNullable`] means the term CAN be NULL: the
@@ -124,13 +141,12 @@
 //! support for comparing tuples, and each conjunct is a plain binary
 //! comparison the providers can push down.
 
-use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
     Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
+    SetExpr, Statement, TableFactor, UnaryOperator, Value, Visit, Visitor,
 };
 
 use crate::alerts_schema::alerts_schema;
@@ -210,10 +226,13 @@ pub enum NotTotalOrder {
     )]
     ShapeNotIdentityPreserving { shape: &'static str },
 
-    /// The tiebreak columns exist but are not in the projection, so a page's
-    /// own rows would not carry the values the next cursor position needs.
+    /// The tiebreak columns exist on the target, and the statement does not
+    /// project each of them AS ITSELF: either it does not project the name at
+    /// all, so a page's own rows would not carry the values the next cursor
+    /// position needs, or it projects that name off something else, so
+    /// ordering on it would not order on the identity column.
     #[error(
-        "the tiebreak columns ({}) are not in the projection",
+        "the tiebreak columns ({}) are not projected as themselves",
         missing.join(", ")
     )]
     TiebreakNotProjected { missing: Vec<String> },
@@ -469,18 +488,21 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     reject_nested_pipes_and_row_limits(&query)?;
 
     let target = page_target(sql)?;
-    let projection = projection_of(&query);
+    // The one resolution from an output name to what the text proves it holds.
+    // Every check below goes through it; none of them looks a name up for
+    // itself.
+    let names = OutputResolution::of(&query, target);
 
     let mut terms = statement_order_terms(&query)?;
     for term in &terms {
-        if !projection.projects(&term.column) {
+        if matches!(names.resolve(&term.column), Provenance::NotProjected) {
             return Err(PagePlanError::OrderTermNotProjected {
                 column: term.column.clone(),
             });
         }
     }
 
-    let (tiebreak_appended, not_total) = tiebreak(&query, target, &projection, &terms);
+    let (tiebreak_appended, not_total) = tiebreak(&query, target, &names, &terms);
     for column in &tiebreak_appended {
         terms.push(OrderTerm::ascending(column.clone()));
     }
@@ -491,9 +513,8 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     }
     // Every effective term, the appended tiebreak included: a NULL anywhere in
     // the ordering drops the rows it covers from every page.
-    let basis = schema_basis(&query, target);
     for term in &terms {
-        match term_nullability(&basis, &projection, &term.column) {
+        match term_nullability(&names, &term.column) {
             NullProof::NonNull => {}
             NullProof::Nullable => {
                 return Err(PagePlanError::OrderTermNullable {
@@ -651,143 +672,452 @@ fn page_target(sql: &str) -> Result<PageTarget, PagePlanError> {
     }
 }
 
-/// What one output column of a `SELECT` list is built from, as far as the
-/// text says. The distinction exists for nullability: a schema lookup answers
-/// for a bare column reference and for nothing else, and an expression
-/// answers for itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OutputSource {
-    /// A bare reference to this column of the `FROM` relation, under its own
-    /// name or an alias.
-    Column(String),
-    /// A computed expression, carried rather than discarded: no schema
-    /// describes it, but the expression itself settles some cases outright.
-    /// A literal is NON NULL whatever it is selected from. Boxed: a
-    /// sqlparser `Expr` is an order of magnitude larger than the other
-    /// variants, and one is held per projected output name.
-    Expression(Box<SqlExpr>),
-    /// An output name the projection gives twice from different sources.
-    /// Which of them an order term means is not readable from the text.
-    Ambiguous,
-}
+/// The one resolution from an output name of the statement to what the text
+/// PROVES that name is built from, and the only way to ask the question.
+///
+/// The internals are private to this module for a structural reason rather
+/// than a stylistic one. Three rounds of fixes to one defect class each
+/// converted ONE consumer to a provenance check and left another matching the
+/// raw output name itself, so the same wrong answer came back through a
+/// different door: the nullability prover was gated on whether the `FROM`
+/// relation is the target base table, while the tiebreak went on proving row
+/// identity by looking the string `"series_id"` up among the output names,
+/// which any alias may take (`SELECT ts, value AS series_id FROM samples`
+/// reported a total order over `(ts, value)`, which is not a key, and a walk
+/// over it left a row on no page).
+///
+/// So nothing in here hands a consumer a name to look up for itself:
+/// [`OutputResolution::resolve`] is the only entry point, a [`Provenance`] is
+/// the only thing it returns, and a consumer that wants a base column has to
+/// name the one variant that carries one. Adopting the resolution in some
+/// consumers and not others does not compile.
+mod resolution {
+    use std::collections::{BTreeMap, BTreeSet};
 
-/// What the statement projects, as far as its text says.
-enum Projection {
-    /// A wildcard projects every column of the target, so any column of it is
-    /// available to order by.
-    Wildcard,
-    /// The named output columns (an alias where the item has one, the column
-    /// itself otherwise), each with what it is built from. An item that is
-    /// neither -- a bare expression with no alias -- contributes no name.
-    Columns(BTreeMap<String, OutputSource>),
-    /// The projection is not readable from the text (a set-operation body).
-    Unknown,
-}
-
-impl Projection {
-    /// Whether `column` is available to order by. `Wildcard` and `Unknown`
-    /// both answer yes: neither carries a name list to check against, and
-    /// refusing would reject a `SELECT *` and a `UNION` whose orderings are
-    /// perfectly resolvable. A column that exists in neither surfaces as the
-    /// executor's own plan error, which is the same answer the caller would
-    /// have got for the statement it handed in.
-    fn projects(&self, column: &str) -> bool {
-        match self {
-            Projection::Wildcard | Projection::Unknown => true,
-            Projection::Columns(names) => names.contains_key(column),
-        }
-    }
-
-    /// What the output column `column` is built from, as far as the text
-    /// says.
-    ///
-    /// A wildcard answers with the name itself: every output column of a
-    /// `SELECT *` is a column of the `FROM` relation under its own name. A
-    /// set-operation body answers `Unreadable` rather than guessing, which is
-    /// what makes it fail the nullability check instead of passing it
-    /// unexamined.
-    ///
-    /// A [`TermSource::Column`] name is a name in the `FROM` relation, which
-    /// is the target table's own column only when that relation IS the target
-    /// table. [`SchemaBasis`] is what settles that, and every caller has to
-    /// consult it before turning this name into a schema lookup.
-    fn term_source<'a>(&'a self, column: &'a str) -> TermSource<'a> {
-        match self {
-            Projection::Wildcard => TermSource::Column(column),
-            Projection::Unknown => TermSource::Unreadable(unproven::SET_OPERATION),
-            Projection::Columns(items) => match items.get(column) {
-                Some(OutputSource::Column(name)) => TermSource::Column(name.as_str()),
-                Some(OutputSource::Expression(expr)) => TermSource::Expression(expr),
-                Some(OutputSource::Ambiguous) => TermSource::Unreadable(unproven::AMBIGUOUS_NAME),
-                None => TermSource::Unreadable(unproven::NOT_A_BARE_COLUMN),
-            },
-        }
-    }
-}
-
-/// What an `ORDER BY` term resolves to in the projection that produced it.
-enum TermSource<'a> {
-    /// A bare reference to this column of the `FROM` relation.
-    Column(&'a str),
-    /// A computed expression, which the text carries in full.
-    Expression(&'a SqlExpr),
-    /// Neither, for this reason.
-    Unreadable(&'static str),
-}
-
-fn projection_of(query: &Query) -> Projection {
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return Projection::Unknown;
+    use datafusion::sql::sqlparser::ast::{
+        Expr as SqlExpr, Query, SelectItem, SetExpr, WildcardAdditionalOptions,
     };
-    let mut names: BTreeMap<String, OutputSource> = BTreeMap::new();
-    let mut record = |name: String, source: OutputSource| {
-        // A name the projection gives twice is ambiguous here even when both
-        // sources are columns, so it degrades rather than resolving to
-        // whichever item came last.
-        let entry = names.entry(name).or_insert_with(|| source.clone());
+
+    use super::{
+        PageTarget, Relation, bare_name, column_of, grouping_can_null_a_grouping_column,
+        ident_name, relation_of, unproven,
+    };
+
+    /// What the statement's text proves one of its output names is built
+    /// from.
+    pub(super) enum Provenance<'a> {
+        /// A genuine column of the target base table: the value under this
+        /// output name IS the value of `column` in `table`'s public schema.
+        ///
+        /// The only variant that carries row identity. A uniqueness claim
+        /// about a set of the scan's columns carries to the output only for
+        /// names that resolve to those columns themselves, so
+        /// [`super::tiebreak`] may claim identity here and nowhere else.
+        BaseColumn {
+            table: &'static str,
+            column: &'a str,
+        },
+        /// A computed expression, carried in full. No schema describes it and
+        /// no row identity attaches to it, but the expression alone settles
+        /// some nullability cases outright: a literal and a `count(...)` are
+        /// NON NULL wherever they are selected from.
+        Expression(&'a SqlExpr),
+        /// The statement projects this name and the text does not say what it
+        /// is built from, for this reason.
+        Opaque(&'static str),
+        /// The statement does not project this name at all.
+        NotProjected,
+    }
+
+    /// What one output column of a `SELECT` list is built from, as far as the
+    /// text says.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum OutputSource {
+        /// A bare reference to this column of the `FROM` relation, under its
+        /// own name or an alias.
+        Column(String),
+        /// A computed expression, carried rather than discarded. Boxed: a
+        /// sqlparser `Expr` is an order of magnitude larger than the other
+        /// variants, and one is held per projected output name.
+        Expression(Box<SqlExpr>),
+        /// An output name the projection gives twice from different sources.
+        /// Which of them an order term means is not readable from the text.
+        Ambiguous,
+        /// A name a projection item declares while what it holds is not
+        /// readable from the text (a multi-alias item's expansion).
+        Unmodelled(&'static str),
+    }
+
+    /// How a name the projection does not declare explicitly is answered.
+    enum Rest {
+        /// Nothing else projects a name, so an undeclared one is not
+        /// projected.
+        Nothing,
+        /// A wildcard projects every column of the `FROM` relation under its
+        /// own name, except the ones `removed` names (an `EXCEPT`, an
+        /// `EXCLUDE`, or a `REPLACE` that supplies its own value instead).
+        Wildcard { removed: BTreeSet<String> },
+        /// The projected names are not readable from the text, for this
+        /// reason.
+        Unreadable(&'static str),
+    }
+
+    /// What the statement projects, as far as its text says.
+    struct Projection {
+        /// The names the projection declares, with what each is built from.
+        /// An item that declares none -- a bare expression with no alias --
+        /// contributes nothing.
+        declared: BTreeMap<String, OutputSource>,
+        /// How a name absent from `declared` is answered.
+        rest: Rest,
+    }
+
+    /// Whether an output name that is a bare column reference may be resolved
+    /// against the target table's public schema at all.
+    ///
+    /// Sound only when the `FROM` relation IS that base table under its own
+    /// column names: otherwise the schema answers about a column the ordered
+    /// value did not come from, and a NOT NULL declaration there says nothing
+    /// about the value.
+    enum Basis {
+        /// Bare column references resolve against this table's public schema.
+        Table(&'static str),
+        /// They do not, for this reason, which the refusal quotes.
+        Unresolvable(&'static str),
+    }
+
+    pub(super) struct OutputResolution {
+        projection: Projection,
+        basis: Basis,
+    }
+
+    impl OutputResolution {
+        /// Read `query`'s projection and `FROM` relation once.
+        pub(super) fn of(query: &Query, target: PageTarget) -> Self {
+            OutputResolution {
+                projection: projection_of(query),
+                basis: basis_of(query, target),
+            }
+        }
+
+        /// What the text proves the output name `name` is built from.
+        pub(super) fn resolve<'r>(&'r self, name: &'r str) -> Provenance<'r> {
+            match self.projection.source_of(name) {
+                Source::Column(column) => match self.basis {
+                    Basis::Table(table) => Provenance::BaseColumn { table, column },
+                    Basis::Unresolvable(reason) => Provenance::Opaque(reason),
+                },
+                Source::Expression(expr) => Provenance::Expression(expr),
+                Source::Opaque(reason) => Provenance::Opaque(reason),
+                Source::Absent => Provenance::NotProjected,
+            }
+        }
+    }
+
+    /// What the projection alone says, before the `FROM` relation is
+    /// consulted. Private: a `Column` here is a name in the `FROM` relation,
+    /// which is the target table's own column only once [`Basis`] says so,
+    /// and that pairing is what [`OutputResolution::resolve`] exists to make
+    /// unskippable.
+    enum Source<'a> {
+        Column(&'a str),
+        Expression(&'a SqlExpr),
+        Opaque(&'static str),
+        Absent,
+    }
+
+    impl Projection {
+        fn source_of<'p>(&'p self, name: &'p str) -> Source<'p> {
+            if let Some(source) = self.declared.get(name) {
+                // A wildcard that still projects a declared name gives the
+                // statement two output columns of it.
+                if let Rest::Wildcard { removed } = &self.rest
+                    && !removed.contains(name)
+                {
+                    return Source::Opaque(unproven::AMBIGUOUS_NAME);
+                }
+                return match source {
+                    OutputSource::Column(column) => Source::Column(column.as_str()),
+                    OutputSource::Expression(expr) => Source::Expression(expr),
+                    OutputSource::Ambiguous => Source::Opaque(unproven::AMBIGUOUS_NAME),
+                    OutputSource::Unmodelled(reason) => Source::Opaque(reason),
+                };
+            }
+            match &self.rest {
+                Rest::Nothing => Source::Absent,
+                Rest::Wildcard { removed } if removed.contains(name) => Source::Absent,
+                Rest::Wildcard { .. } => Source::Column(name),
+                Rest::Unreadable(reason) => Source::Opaque(reason),
+            }
+        }
+    }
+
+    /// Read the whole `SELECT` list, wildcard included.
+    ///
+    /// The wildcard is not a stopping point. It used to return outright, so a
+    /// projection item AFTER one was never read and a name the wildcard
+    /// removed and a later item redefined resolved to the base column of that
+    /// name: `SELECT * EXCEPT (ts), nullif(value, 0) AS ts FROM samples
+    /// ORDER BY ts` proved `ts` NON NULL off `samples.ts` while the ordered
+    /// value was `nullif(value, 0)`, and delivered one of three rows.
+    fn projection_of(query: &Query) -> Projection {
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Projection {
+                declared: BTreeMap::new(),
+                rest: Rest::Unreadable(unproven::SET_OPERATION),
+            };
+        };
+        let mut declared: BTreeMap<String, OutputSource> = BTreeMap::new();
+        let mut rest = Rest::Nothing;
+        let mut wildcards = 0usize;
+        for item in &select.projection {
+            match item {
+                SelectItem::Wildcard(options) | SelectItem::QualifiedWildcard(_, options) => {
+                    wildcards += 1;
+                    rest = if wildcards > 1 {
+                        // Two wildcards project one relation's columns twice
+                        // over, so which output column a name means is not
+                        // readable from the text.
+                        Rest::Unreadable(unproven::SEVERAL_WILDCARDS)
+                    } else {
+                        wildcard_rest(options)
+                    };
+                    for (name, source) in wildcard_replacements(options) {
+                        record(&mut declared, name, source);
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let source = match column_of(expr) {
+                        Some(name) => OutputSource::Column(name),
+                        None => OutputSource::Expression(Box::new(expr.clone())),
+                    };
+                    record(&mut declared, ident_name(alias), source);
+                }
+                SelectItem::UnnamedExpr(expr) => {
+                    if let Some(column) = column_of(expr) {
+                        record(&mut declared, column.clone(), OutputSource::Column(column));
+                    }
+                }
+                // A multi-alias item declares these names over an expansion
+                // this planner does not model, so each is recorded as a name
+                // it holds nothing readable for rather than left out: left
+                // out, a wildcard beside it would answer for the name with
+                // the base column of that name.
+                SelectItem::ExprWithAliases { aliases, .. } => {
+                    for alias in aliases {
+                        record(
+                            &mut declared,
+                            ident_name(alias),
+                            OutputSource::Unmodelled(unproven::MULTI_ALIAS),
+                        );
+                    }
+                }
+            }
+        }
+        Projection { declared, rest }
+    }
+
+    /// A name the projection gives twice is ambiguous even when both sources
+    /// are columns, so it degrades rather than resolving to whichever item
+    /// came last.
+    fn record(declared: &mut BTreeMap<String, OutputSource>, name: String, source: OutputSource) {
+        let entry = declared.entry(name).or_insert_with(|| source.clone());
         if *entry != source {
             *entry = OutputSource::Ambiguous;
         }
-    };
-    for item in &select.projection {
-        match item {
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                return Projection::Wildcard;
+    }
+
+    /// What a wildcard leaves for the names no projection item declares.
+    ///
+    /// `EXCEPT`, `EXCLUDE` and `REPLACE` each remove a name from the
+    /// expansion, the last because it supplies its own value for it. `ILIKE`,
+    /// `RENAME` and a trailing `AS` alias select or rename the expanded
+    /// columns by a rule this planner does not model, so a name under one is
+    /// answered with a reason rather than with the base column of that name.
+    /// (DataFusion 54 refuses to plan the last two outright, which makes the
+    /// refusal here the same answer the caller would have got for the
+    /// statement it handed in.)
+    fn wildcard_rest(options: &WildcardAdditionalOptions) -> Rest {
+        if options.opt_ilike.is_some()
+            || options.opt_rename.is_some()
+            || options.opt_alias.is_some()
+        {
+            return Rest::Unreadable(unproven::WILDCARD_OPTION);
+        }
+        let mut removed: BTreeSet<String> = BTreeSet::new();
+        if let Some(except) = &options.opt_except {
+            for ident in std::iter::once(&except.first_element).chain(&except.additional_elements) {
+                removed.insert(ident_name(ident));
             }
-            SelectItem::ExprWithAlias { expr, alias } => {
-                let source = match column_of(expr) {
-                    Some(name) => OutputSource::Column(name),
-                    None => OutputSource::Expression(Box::new(expr.clone())),
-                };
-                record(ident_name(alias), source);
-            }
-            SelectItem::UnnamedExpr(expr) => {
-                if let Some(column) = column_of(expr) {
-                    record(column.clone(), OutputSource::Column(column));
+        }
+        if let Some(exclude) = &options.opt_exclude {
+            let names = match exclude {
+                datafusion::sql::sqlparser::ast::ExcludeSelectItem::Single(name) => {
+                    std::slice::from_ref(name)
+                }
+                datafusion::sql::sqlparser::ast::ExcludeSelectItem::Multiple(names) => {
+                    names.as_slice()
+                }
+            };
+            for name in names {
+                match bare_name(name) {
+                    Some(name) => {
+                        removed.insert(name);
+                    }
+                    // A qualified EXCLUDE name is not a plain output column,
+                    // so which name it removes is not readable here.
+                    None => return Rest::Unreadable(unproven::WILDCARD_OPTION),
                 }
             }
-            // A multi-alias item names columns this planner does not model, so
-            // it contributes no name: an ordering over one is refused rather
-            // than admitted on a guess.
-            SelectItem::ExprWithAliases { .. } => {}
         }
+        if let Some(replace) = &options.opt_replace {
+            for item in &replace.items {
+                removed.insert(ident_name(&item.column_name));
+            }
+        }
+        Rest::Wildcard { removed }
     }
-    Projection::Columns(names)
+
+    /// The output names a wildcard's `REPLACE` declares, with the expressions
+    /// they are built from. `* REPLACE (nullif(value, 0) AS ts)` projects `ts`
+    /// from that expression, not from `samples.ts`.
+    fn wildcard_replacements(options: &WildcardAdditionalOptions) -> Vec<(String, OutputSource)> {
+        let Some(replace) = &options.opt_replace else {
+            return Vec::new();
+        };
+        replace
+            .items
+            .iter()
+            .map(|item| {
+                let source = match column_of(&item.expr) {
+                    Some(name) => OutputSource::Column(name),
+                    None => OutputSource::Expression(Box::new(item.expr.clone())),
+                };
+                (ident_name(&item.column_name), source)
+            })
+            .collect()
+    }
+
+    /// Whether the statement's own `FROM` relation is the target base table
+    /// under its own column names, so that the table's public schema
+    /// describes the values it projects.
+    ///
+    /// The shapes this refuses each produced a plan whose keyset predicate
+    /// silently dropped rows from every page with no error:
+    ///
+    /// - a derived table or a CTE, where the output name is the inner query's
+    ///   own (`SELECT * FROM (SELECT nullif(value, 0) AS ts, series_id FROM
+    ///   samples) x ORDER BY ts` proved `ts` off `samples.ts` while the value
+    ///   was `nullif(value, 0)`);
+    /// - a positional column-rename list on the relation itself
+    ///   (`FROM samples AS x (ts, series_id, a, b)`), where the schema is
+    ///   asked about `series_id` and the value is `value`;
+    /// - the nullable side of an outer join, where the base column really is
+    ///   NOT NULL and is still NULL for every unmatched row;
+    /// - `ROLLUP`, `CUBE` and `GROUPING SETS`, where the schema lookup is
+    ///   correct and the grouping construct introduces the NULL in the
+    ///   super-aggregate row.
+    ///
+    /// Two of the refusals are wider than those shapes strictly need, and
+    /// both are deliberate. An inner or cross join is refused alongside the
+    /// outer ones, because an output name under a join is resolvable against
+    /// more than one relation and a single-table lookup cannot say which. A
+    /// `WITH` clause is refused even when the `FROM` names the base table,
+    /// because a CTE can declare that same name and shadow it.
+    fn basis_of(query: &Query, target: PageTarget) -> Basis {
+        let Some(table) = target.table_name() else {
+            return Basis::Unresolvable(unproven::NO_BASE_TABLE);
+        };
+        if query.with.is_some() {
+            return Basis::Unresolvable(unproven::WITH_CLAUSE);
+        }
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            return Basis::Unresolvable(unproven::SET_OPERATION);
+        };
+        let [only] = select.from.as_slice() else {
+            return Basis::Unresolvable(unproven::NOT_ONE_RELATION);
+        };
+        if !only.joins.is_empty() {
+            return Basis::Unresolvable(unproven::JOINED);
+        }
+        let name = match relation_of(&only.relation) {
+            Relation::BareTable(name) => name,
+            Relation::Other(reason) => return Basis::Unresolvable(reason),
+        };
+        if bare_name(name).as_deref() != Some(table) {
+            return Basis::Unresolvable(unproven::OTHER_RELATION);
+        }
+        if grouping_can_null_a_grouping_column(&select.group_by) {
+            return Basis::Unresolvable(unproven::GROUPING_NULLS);
+        }
+        Basis::Table(table)
+    }
 }
 
-/// Whether an output name may be resolved against the target table's public
-/// schema at all.
+use resolution::{OutputResolution, Provenance};
+
+/// The `FROM` relation of a single `SELECT` body, for the two questions this
+/// module asks of it: whether the target table's public schema describes the
+/// names it projects, and whether it emits the target's rows one-for-one.
 ///
-/// [`Projection::source_column`] maps an output name to a name in the `FROM`
-/// relation. Asking the target table's schema about that name is sound only
-/// when the `FROM` relation IS that base table: otherwise the schema answers
-/// about a column the value did not come from, and a NOT NULL declaration
-/// there says nothing about the value being ordered on.
-enum SchemaBasis {
-    /// Output names resolve against this table's public schema.
-    Resolvable(&'static str),
-    /// They do not, for this reason, which the refusal quotes.
-    Unresolvable(&'static str),
+/// Both answers used to be read off a `TableFactor::Table { name, args: None,
+/// .. }` pattern, in two independent places. The `..` swallowed `alias`, whose
+/// `columns` field is a POSITIONAL rename list: `FROM samples AS x (ts,
+/// series_id, a, b)` was judged to be `samples` while every column was renamed
+/// underneath it, so `series_id` named `value` and both the row-identity claim
+/// and the schema lookup answered about a different column. It swallowed
+/// `sample` too, so a `TABLESAMPLE` was planned as a total order over rows
+/// that a later DataFusion will re-draw per page.
+///
+/// So the pattern below names every field, with no `..`: a field a later
+/// sqlparser adds is a compile error here rather than a third instance of the
+/// same defect.
+enum Relation<'a> {
+    /// A bare reference to this table: nothing renames its columns, selects a
+    /// subset of its rows, or adds a column to it.
+    BareTable(&'a ObjectName),
+    /// Anything else, with the reason it is not that.
+    Other(&'static str),
+}
+
+fn relation_of(factor: &TableFactor) -> Relation<'_> {
+    let TableFactor::Table {
+        name,
+        alias,
+        args,
+        with_hints,
+        version,
+        with_ordinality,
+        partitions,
+        json_path,
+        sample,
+        index_hints,
+    } = factor
+    else {
+        return Relation::Other(unproven::DERIVED_RELATION);
+    };
+    if args.is_some() {
+        return Relation::Other(unproven::DERIVED_RELATION);
+    }
+    if alias
+        .as_ref()
+        .is_some_and(|alias| !alias.columns.is_empty())
+    {
+        return Relation::Other(unproven::RENAMED_COLUMNS);
+    }
+    if sample.is_some() {
+        return Relation::Other(unproven::SAMPLED_RELATION);
+    }
+    if *with_ordinality
+        || version.is_some()
+        || json_path.is_some()
+        || !with_hints.is_empty()
+        || !partitions.is_empty()
+        || !index_hints.is_empty()
+    {
+        return Relation::Other(unproven::RELATION_MODIFIER);
+    }
+    Relation::BareTable(name)
 }
 
 /// The reasons a [`PagePlanError::OrderTermNullabilityUnknown`] can carry,
@@ -816,60 +1146,18 @@ mod unproven {
         "the projection gives that output name twice, from different sources";
     pub(super) const EXPRESSION_NOT_PROVABLE: &str = "the expression it is defined by is not one this planner proves NON NULL, and \
          SUM, MIN, MAX and AVG are NULL over empty or all-NULL input";
-}
-
-/// Whether the statement's own `FROM` relation is the target base table, so
-/// that the table's public schema describes the values it projects.
-///
-/// The three shapes this refuses each produced a plan whose keyset predicate
-/// silently dropped every row with a NULL order term, from every page, with
-/// no error:
-///
-/// - a derived table or a CTE, where the output name is the inner query's
-///   own (`SELECT * FROM (SELECT nullif(value, 0) AS ts, series_id FROM
-///   samples) x ORDER BY ts` proved `ts` off `samples.ts` while the value was
-///   `nullif(value, 0)`);
-/// - the nullable side of an outer join, where the base column really is NOT
-///   NULL and is still NULL for every unmatched row;
-/// - `ROLLUP`, `CUBE` and `GROUPING SETS`, where the schema lookup is correct
-///   and the grouping construct introduces the NULL in the super-aggregate
-///   row.
-///
-/// Two of the refusals are wider than those shapes strictly need, and both
-/// are deliberate. An inner or cross join is refused alongside the outer
-/// ones, because an output name under a join is resolvable against more than
-/// one relation and a single-table lookup cannot say which. A `WITH` clause
-/// is refused even when the `FROM` names the base table, because a CTE can
-/// declare that same name and shadow it.
-fn schema_basis(query: &Query, target: PageTarget) -> SchemaBasis {
-    let Some(table) = target.table_name() else {
-        return SchemaBasis::Unresolvable(unproven::NO_BASE_TABLE);
-    };
-    if query.with.is_some() {
-        return SchemaBasis::Unresolvable(unproven::WITH_CLAUSE);
-    }
-    let SetExpr::Select(select) = query.body.as_ref() else {
-        return SchemaBasis::Unresolvable(unproven::SET_OPERATION);
-    };
-    let [only] = select.from.as_slice() else {
-        return SchemaBasis::Unresolvable(unproven::NOT_ONE_RELATION);
-    };
-    if !only.joins.is_empty() {
-        return SchemaBasis::Unresolvable(unproven::JOINED);
-    }
-    let TableFactor::Table {
-        name, args: None, ..
-    } = &only.relation
-    else {
-        return SchemaBasis::Unresolvable(unproven::DERIVED_RELATION);
-    };
-    if bare_name(name).as_deref() != Some(table) {
-        return SchemaBasis::Unresolvable(unproven::OTHER_RELATION);
-    }
-    if grouping_can_null_a_grouping_column(&select.group_by) {
-        return SchemaBasis::Unresolvable(unproven::GROUPING_NULLS);
-    }
-    SchemaBasis::Resolvable(table)
+    pub(super) const RENAMED_COLUMNS: &str = "its FROM relation carries a positional column-rename list, so an output name \
+         is not the base column of that name";
+    pub(super) const SAMPLED_RELATION: &str =
+        "its FROM relation is sampled, so it does not emit the target's rows";
+    pub(super) const RELATION_MODIFIER: &str = "its FROM relation carries a modifier that can change the columns or the rows \
+         it emits";
+    pub(super) const SEVERAL_WILDCARDS: &str =
+        "the projection has more than one wildcard, so an output name is given twice";
+    pub(super) const WILDCARD_OPTION: &str = "the wildcard carries an ILIKE, RENAME or AS option, which selects or renames \
+         the expanded columns by a rule this planner does not model";
+    pub(super) const MULTI_ALIAS: &str = "the projection item that names it carries a multi-alias list, whose expansion \
+         this planner does not model";
 }
 
 /// Whether the `GROUP BY` can emit a row where a grouping column is NULL even
@@ -877,12 +1165,19 @@ fn schema_basis(query: &Query, target: PageTarget) -> SchemaBasis {
 ///
 /// `ROLLUP`, `CUBE`, `GROUPING SETS` and ClickHouse's `WITH TOTALS` each add
 /// a super-aggregate row whose unaggregated grouping columns are NULL. Both
-/// spellings count: the modifier form (`GROUP BY a WITH ROLLUP`) and the
-/// expression form (`GROUP BY ROLLUP(a)`). A plain `GROUP BY` and
+/// spellings count, and so does either grouping form carrying them: the
+/// modifier form (`GROUP BY a WITH ROLLUP`, `GROUP BY ALL WITH ROLLUP`) and
+/// the expression form (`GROUP BY ROLLUP(a)`). A plain `GROUP BY` and a bare
 /// `GROUP BY ALL` add no such row, so neither is refused here.
+///
+/// The modifier list has to be read off BOTH grouping forms. Reading it off
+/// the expression form alone refused `GROUP BY a WITH ROLLUP` and admitted
+/// `GROUP BY ALL WITH ROLLUP`, which is the same construct over a column list
+/// the parser did not have to spell out.
 fn grouping_can_null_a_grouping_column(group_by: &GroupByExpr) -> bool {
-    let GroupByExpr::Expressions(exprs, modifiers) = group_by else {
-        return false;
+    let (exprs, modifiers) = match group_by {
+        GroupByExpr::All(modifiers) => ([].as_slice(), modifiers),
+        GroupByExpr::Expressions(exprs, modifiers) => (exprs.as_slice(), modifiers),
     };
     !modifiers.is_empty()
         || exprs.iter().any(|expr| {
@@ -914,35 +1209,36 @@ enum NullProof {
 /// There are two routes to a proof and the term takes whichever one its
 /// projection offers.
 ///
-/// A bare column reference goes through the schema, and that proof has to hold
-/// end to end: the name has to be a column of the `FROM` relation, that
-/// relation has to be the target base table itself (see [`schema_basis`]), and
-/// the column has to be declared non-nullable in the table's public schema. A
-/// declared column is absent from the static schema, and whether it exists at
-/// all depends on the tenant's declarations rather than on the text, so it is
-/// `Unproven` rather than either answer.
+/// A [`Provenance::BaseColumn`] goes through the schema, and that proof holds
+/// end to end by construction of the variant: it exists only where the name is
+/// a column of the `FROM` relation AND that relation is the target base table
+/// itself under its own column names. What is left for this function is the
+/// declaration. A declared column is absent from the static schema, and
+/// whether it exists at all depends on the tenant's declarations rather than
+/// on the text, so it is `Unproven` rather than either answer.
 ///
-/// An alias over an expression is answered by
-/// [`expression_is_non_null`] reading the expression itself, with no schema
-/// consulted and no basis required: a literal and a `count(...)` are NON NULL
-/// whatever relation they are selected from, including under an outer join or
-/// a `ROLLUP`, because neither is a grouping column that a super-aggregate row
-/// can null.
-fn term_nullability(basis: &SchemaBasis, projection: &Projection, column: &str) -> NullProof {
-    let source = match projection.term_source(column) {
-        TermSource::Column(source) => source,
-        TermSource::Expression(expr) => {
+/// A [`Provenance::Expression`] is answered by [`expression_is_non_null`]
+/// reading the expression itself, with no schema consulted and no basis
+/// required: a literal and a `count(...)` are NON NULL whatever relation they
+/// are selected from, including under an outer join or a `ROLLUP`, because
+/// neither is a grouping column that a super-aggregate row can null.
+fn term_nullability(names: &OutputResolution, column: &str) -> NullProof {
+    let (table, source) = match names.resolve(column) {
+        Provenance::BaseColumn { table, column } => (table, column),
+        Provenance::Expression(expr) => {
             return if expression_is_non_null(expr) {
                 NullProof::NonNull
             } else {
                 NullProof::Unproven(unproven::EXPRESSION_NOT_PROVABLE)
             };
         }
-        TermSource::Unreadable(reason) => return NullProof::Unproven(reason),
-    };
-    let table = match basis {
-        SchemaBasis::Resolvable(table) => *table,
-        SchemaBasis::Unresolvable(reason) => return NullProof::Unproven(reason),
+        Provenance::Opaque(reason) => return NullProof::Unproven(reason),
+        // `plan_page` refuses an order term the statement does not project
+        // before it asks about nullability, and `tiebreak` reports a tiebreak
+        // column it cannot find as not-a-total-order rather than appending it.
+        // Answering rather than asserting keeps that ordering a property of
+        // the code above instead of a panic on a production path.
+        Provenance::NotProjected => return NullProof::Unproven(unproven::NOT_A_BARE_COLUMN),
     };
     let schema = match table {
         SAMPLES_TABLE => public_schema(),
@@ -1022,11 +1318,9 @@ fn shape_of<'a>(query: &'a Query) -> Option<SelectShape<'a>> {
     };
     let (from_table, joined) = match select.from.as_slice() {
         [only] => (
-            match &only.relation {
-                TableFactor::Table {
-                    name, args: None, ..
-                } => Some(name),
-                _ => None,
+            match relation_of(&only.relation) {
+                Relation::BareTable(name) => Some(name),
+                Relation::Other(_) => None,
             },
             !only.joins.is_empty(),
         ),
@@ -1102,7 +1396,7 @@ fn statement_order_terms(query: &Query) -> Result<Vec<OrderTerm>, PagePlanError>
 fn tiebreak(
     query: &Query,
     target: PageTarget,
-    projection: &Projection,
+    names: &OutputResolution,
     terms: &[OrderTerm],
 ) -> (Vec<String>, Option<NotTotalOrder>) {
     let identity: &[&str] = match target {
@@ -1130,7 +1424,15 @@ fn tiebreak(
     let mut missing = Vec::new();
     let mut append = Vec::new();
     for column in identity {
-        if !projection.projects(column) {
+        // The output name has to BE the identity column, not merely carry its
+        // name. `SELECT ts, value AS series_id FROM samples` projects the name
+        // `series_id` off `value`, and `(ts, value)` is not a key: the ordering
+        // ties on it and the keyset predicate leaves a tied row on no page.
+        let identical = matches!(
+            names.resolve(column),
+            Provenance::BaseColumn { column: source, .. } if source == *column
+        );
+        if !identical {
             missing.push((*column).to_string());
             continue;
         }
@@ -1305,6 +1607,7 @@ fn quote_ident(column: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use datafusion::datasource::MemTable;
@@ -2033,7 +2336,7 @@ mod tests {
         }
 
         // An inner join is refused by the same rule, for the narrower reason
-        // stated in `schema_basis`: nothing nulls a column, but an output
+        // stated on `unproven::JOINED`: nothing nulls a column, but an output
         // name under a join resolves against more than one relation.
         let inner = plan_page(
             "SELECT a.ts AS ts, b.body AS b_body FROM logs AS a \
@@ -2433,6 +2736,19 @@ mod tests {
     /// the ordering itself, not about NULLs -- no `ORDER BY` at all, a term
     /// that is not a column, a term the statement does not project -- and
     /// each is a separate piece of work.
+    ///
+    /// What this does NOT cover: the total-order path. The corpus is
+    /// logs-only, `logs` has no row identity, and every statement in it is
+    /// therefore `NotTotalOrder::NoRowIdentity` before the tiebreak, the
+    /// row-identity claim, or the keyset predicate is exercised at all. Zero
+    /// of the 43 statements produce a total-order plan, so no regression in
+    /// that path can move a number here. The coverage for it is the executed
+    /// page walk in `crates/ravel-sql/tests/page_walk.rs`, which pages a
+    /// `samples` fixture with deliberate ties one row at a time and asserts
+    /// multiset equality against the same statement run unpaged. A
+    /// total-order claim is proven there and nowhere else: a plan assertion
+    /// cannot tell a correct claim from one that drops a tied row from every
+    /// page.
     #[test]
     fn the_clickbench_corpus_page_plan_outcomes_are_pinned() {
         let corpus: serde_json::Value =
@@ -2534,5 +2850,211 @@ mod tests {
             ],
         );
         assert!(plan.total_order());
+    }
+
+    /// An output name is not a column. A projection may give an identity
+    /// column's NAME to any expression, and the row-identity claim has to be
+    /// about the column itself: `(ts, value)` is not a key of `samples`, and
+    /// `crates/ravel-sql/tests/page_walk.rs` shows the tied row landing on no
+    /// page when the claim is made on the name alone.
+    #[test]
+    fn an_alias_cannot_take_an_identity_columns_name() {
+        for sql in [
+            "SELECT ts, value AS series_id FROM samples ORDER BY ts",
+            "SELECT ts, labels AS series_id FROM samples ORDER BY ts",
+            "SELECT ts, nullif(value, 0) AS series_id FROM samples ORDER BY ts",
+        ] {
+            let plan = plan_page(sql, None).expect("planned");
+            assert_eq!(
+                plan.not_total,
+                Some(NotTotalOrder::TiebreakNotProjected {
+                    missing: vec!["series_id".to_string()],
+                }),
+                "unexpected total-order claim for {sql:?}"
+            );
+            assert!(!plan.total_order());
+            assert_eq!(plan.tiebreak_appended, Vec::<String>::new());
+        }
+
+        // The same name from the column itself, qualified or aliased to
+        // itself, still IS that column and still carries the identity.
+        for sql in [
+            "SELECT ts, series_id FROM samples ORDER BY ts",
+            "SELECT ts, samples.series_id FROM samples ORDER BY ts",
+            "SELECT ts, series_id AS series_id FROM samples ORDER BY ts",
+        ] {
+            let plan = plan_page(sql, None).expect("planned");
+            assert_eq!(plan.not_total, None, "unexpected refusal for {sql:?}");
+            assert_eq!(plan.tiebreak_appended, vec!["series_id".to_string()]);
+        }
+    }
+
+    /// A `TableAlias`'s `columns` field is a POSITIONAL rename list, so
+    /// `FROM samples AS x (ts, series_id, a, b)` projects `value` under the
+    /// name `series_id`. Both questions asked of the `FROM` relation have to
+    /// see it: the row-identity claim and the schema lookup.
+    #[test]
+    fn a_positional_column_rename_list_is_not_the_target_relation() {
+        // The nullability route is gated by the reading: `ts` and `series_id`
+        // are NOT NULL in the public schema, and the values under those names
+        // here are the first two columns of whatever `x` renames, so the
+        // schema must not be consulted for either.
+        for sql in [
+            "SELECT ts, series_id FROM samples AS x (ts, series_id, a, b) \
+             ORDER BY ts, series_id",
+            "SELECT ts, a FROM samples AS x (ts, series_id, a, b) ORDER BY ts",
+        ] {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullabilityUnknown {
+                    column: "ts".to_string(),
+                    reason: unproven::RENAMED_COLUMNS,
+                },
+                "unexpected outcome for {sql:?}"
+            );
+        }
+
+        // The row-identity claim is gated by the same reading, which the
+        // shape check reaches first: the relation is not the target table.
+        let (_, not_total) = {
+            let query = parse_query(
+                "SELECT ts, series_id FROM samples AS x (ts, series_id, a, b) \
+                 ORDER BY ts, series_id",
+            )
+            .expect("parsed");
+            let names = OutputResolution::of(&query, PageTarget::Samples);
+            let terms = statement_order_terms(&query).expect("terms");
+            tiebreak(&query, PageTarget::Samples, &names, &terms)
+        };
+        assert_eq!(
+            not_total,
+            Some(NotTotalOrder::ShapeNotIdentityPreserving {
+                shape: "a FROM clause that is not the target table",
+            }),
+        );
+
+        // An alias with NO column list renames the relation only, and both
+        // questions still resolve.
+        let aliased = plan_page("SELECT * FROM samples AS x ORDER BY ts", None).expect("planned");
+        assert!(aliased.total_order());
+    }
+
+    /// A wildcard is not the end of the projection. `EXCEPT`, `EXCLUDE` and
+    /// `REPLACE` each remove a name from the expansion, and an item that
+    /// redefines that name supplies what the ordering actually sorts on.
+    #[test]
+    fn a_wildcard_does_not_answer_for_a_name_a_later_item_redefines() {
+        for sql in [
+            "SELECT * EXCEPT (ts), nullif(value, 0) AS ts FROM samples ORDER BY ts",
+            "SELECT * EXCLUDE (ts), nullif(value, 0) AS ts FROM samples ORDER BY ts",
+            "SELECT * REPLACE (nullif(value, 0) AS ts) FROM samples ORDER BY ts",
+        ] {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullabilityUnknown {
+                    column: "ts".to_string(),
+                    reason: unproven::EXPRESSION_NOT_PROVABLE,
+                },
+                "unexpected outcome for {sql:?}"
+            );
+        }
+
+        // A removed identity column is not projected at all, so the row
+        // identity does not carry either.
+        let removed =
+            plan_page("SELECT * EXCEPT (series_id) FROM samples", None).expect_err("refused");
+        assert_eq!(removed, PagePlanError::NoOrdering { target: "samples" });
+
+        // A wildcard that does NOT remove the name still expands it, so the
+        // statement gives that output name twice.
+        let twice =
+            plan_page("SELECT *, 1 AS ts FROM samples ORDER BY ts", None).expect_err("refused");
+        assert_eq!(
+            twice,
+            PagePlanError::OrderTermNullabilityUnknown {
+                column: "ts".to_string(),
+                reason: unproven::AMBIGUOUS_NAME,
+            },
+        );
+
+        // Two wildcards expand one relation twice over.
+        let both = plan_page("SELECT *, * FROM samples ORDER BY ts", None).expect_err("refused");
+        assert_eq!(
+            both,
+            PagePlanError::OrderTermNullabilityUnknown {
+                column: "ts".to_string(),
+                reason: unproven::SEVERAL_WILDCARDS,
+            },
+        );
+
+        // A plain wildcard, and one whose removals do not touch the term,
+        // both still resolve through to the base column.
+        for sql in [
+            "SELECT * FROM samples ORDER BY ts",
+            "SELECT * EXCEPT (labels) FROM samples ORDER BY ts",
+            "SELECT * REPLACE (value + 1 AS value) FROM samples ORDER BY ts",
+        ] {
+            let plan = plan_page(sql, None).expect("planned");
+            assert!(plan.total_order(), "unexpected refusal for {sql:?}");
+        }
+    }
+
+    /// `WITH ROLLUP`, `WITH CUBE` and `WITH TOTALS` are modifiers on the
+    /// grouping, and either grouping form can carry them. `GROUP BY ALL WITH
+    /// ROLLUP` is the same super-aggregate row as `GROUP BY a WITH ROLLUP`
+    /// over a column list the parser did not have to spell out.
+    #[test]
+    fn a_grouping_modifier_counts_on_both_grouping_forms() {
+        for sql in [
+            "SELECT ts, count(*) AS hits FROM samples GROUP BY ts WITH ROLLUP ORDER BY ts",
+            "SELECT ts, count(*) AS hits FROM samples GROUP BY ALL WITH ROLLUP ORDER BY ts",
+            "SELECT ts, count(*) AS hits FROM samples GROUP BY ALL WITH CUBE ORDER BY ts",
+            "SELECT ts, count(*) AS hits FROM samples GROUP BY ALL WITH TOTALS ORDER BY ts",
+        ] {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullabilityUnknown {
+                    column: "ts".to_string(),
+                    reason: unproven::GROUPING_NULLS,
+                },
+                "unexpected outcome for {sql:?}"
+            );
+        }
+
+        // A bare `GROUP BY ALL` adds no super-aggregate row, so the schema
+        // still describes the grouping column. It is not a total order (the
+        // grouping does not preserve rows one-for-one), but it plans.
+        let plain = plan_page(
+            "SELECT ts, count(*) AS hits FROM samples GROUP BY ALL ORDER BY ts",
+            None,
+        )
+        .expect("planned");
+        assert_eq!(
+            plain.not_total,
+            Some(NotTotalOrder::ShapeNotIdentityPreserving { shape: "GROUP BY" }),
+        );
+    }
+
+    /// A sampled relation does not emit the target's rows: the sample is
+    /// re-drawn per execution, so every page would be a fresh draw.
+    #[test]
+    fn a_sampled_relation_is_not_the_targets_rows() {
+        for sql in [
+            "SELECT * FROM samples TABLESAMPLE BERNOULLI (50) ORDER BY ts",
+            "SELECT * FROM samples TABLESAMPLE SYSTEM (50) ORDER BY ts",
+        ] {
+            let plan = plan_page(sql, None);
+            assert_eq!(
+                plan,
+                Err(PagePlanError::OrderTermNullabilityUnknown {
+                    column: "ts".to_string(),
+                    reason: unproven::SAMPLED_RELATION,
+                }),
+                "unexpected outcome for {sql:?}"
+            );
+        }
     }
 }
