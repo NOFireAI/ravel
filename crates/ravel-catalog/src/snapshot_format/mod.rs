@@ -11,8 +11,9 @@ mod part;
 mod postings;
 
 pub use column_stats::{
-    DecodedColumnStats, column_stats_segments_concat, decode_column_stats, encode_column_stats,
-    encode_column_stats_v2, encode_column_stats_v3, validate_min_max_presence,
+    ColumnStatsHeaderPeek, DecodedColumnStats, column_stats_segments_concat, decode_column_stats,
+    decode_column_stats_header, encode_column_stats, encode_column_stats_v2,
+    encode_column_stats_v3, validate_min_max_presence,
 };
 pub use error::SnapshotFormatError;
 pub use head::{HEAD_FORMAT_VERSION, decode_head, encode_head};

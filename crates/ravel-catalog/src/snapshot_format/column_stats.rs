@@ -248,12 +248,34 @@ fn frame_column_stats_body(
     Ok(out)
 }
 
-/// Decodes and fully validates a column-statistics object. Every byte is
-/// untrusted; every failure is a typed error, never a panic.
-pub fn decode_column_stats(
+/// A header-only envelope peek: everything [`decode_column_stats`] validates
+/// up to and including the header decode and its self-consistency checks
+/// (format-version/envelope agreement, tenant-hash width, the v3
+/// exactly-one-part rule), but stopping before the `body_uncompressed_len`
+/// ceiling check and never decompressing the body. `body_uncompressed_len`
+/// is on `header`, so a caller can compare it against any ceiling it likes
+/// (or none) without this function needing to know one.
+///
+/// Exists for `ravel-cli inspect cstat`: an object whose declared
+/// `body_uncompressed_len` exceeds the decode ceiling cannot be decoded by
+/// [`decode_column_stats`] at all (that is the point of the ceiling), so a
+/// reader wanting to report "this object is over ceiling" needs a path that
+/// answers the question without decompressing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnStatsHeaderPeek {
+    pub envelope_version: u8,
+    pub header_len: u32,
+    pub header: ColumnStatsHeader,
+}
+
+/// The envelope-parsing and header-validation prefix shared by
+/// [`decode_column_stats_header`] and [`decode_column_stats`], returning the
+/// validated peek alongside the still-compressed body slice so the full
+/// decoder does not re-parse the envelope. Every check performed here never
+/// requires decompressing `body`.
+fn decode_column_stats_prefix(
     bytes: &[u8],
-    limits: &ColumnStatsLimits,
-) -> Result<DecodedColumnStats, SnapshotFormatError> {
+) -> Result<(ColumnStatsHeaderPeek, &[u8]), SnapshotFormatError> {
     if bytes.len() < MIN_COLUMN_STATS_ENVELOPE_LEN {
         return Err(SnapshotFormatError::ColumnStatsTooSmall { size: bytes.len() });
     }
@@ -320,6 +342,35 @@ pub fn decode_column_stats(
             header.part_blake3.len(),
         ));
     }
+
+    Ok((
+        ColumnStatsHeaderPeek {
+            envelope_version: version,
+            header_len,
+            header,
+        },
+        body,
+    ))
+}
+
+/// Parses and validates a column-statistics object's envelope and header
+/// WITHOUT touching any ceiling and WITHOUT decompressing the body, so an
+/// object whose declared `body_uncompressed_len` is over any ceiling a
+/// caller might check still yields its header rather than an error.
+pub fn decode_column_stats_header(
+    bytes: &[u8],
+) -> Result<ColumnStatsHeaderPeek, SnapshotFormatError> {
+    decode_column_stats_prefix(bytes).map(|(peek, _body)| peek)
+}
+
+/// Decodes and fully validates a column-statistics object. Every byte is
+/// untrusted; every failure is a typed error, never a panic.
+pub fn decode_column_stats(
+    bytes: &[u8],
+    limits: &ColumnStatsLimits,
+) -> Result<DecodedColumnStats, SnapshotFormatError> {
+    let (peek, body) = decode_column_stats_prefix(bytes)?;
+    let header = peek.header;
     if header.body_uncompressed_len > limits.max_column_stats_bytes {
         return Err(SnapshotFormatError::ColumnStatsDecompressedTooLarge {
             declared: header.body_uncompressed_len,
@@ -349,7 +400,7 @@ pub fn decode_column_stats(
             actual: segments.len() as u64,
         });
     }
-    validate_segments(&segments, version)?;
+    validate_segments(&segments, peek.envelope_version)?;
 
     Ok(DecodedColumnStats { header, segments })
 }

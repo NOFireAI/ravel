@@ -490,9 +490,11 @@ pub struct Catalog {
     /// (ADR-1413 decision 3, normally
     /// [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]), so a fold
     /// test can exercise the degrade loop at a few kilobytes instead of 256
-    /// MiB. `None` in every non-test build path; read through
+    /// MiB. Not `#[cfg(test)]`: `ravel-cli`'s own `catalog fold` test sets
+    /// this through a normal (non-dev) dependency edge on `ravel-catalog`,
+    /// which never compiles with this crate's own `cfg(test)` active.
+    /// `None` in every real production run; read through
     /// [`Catalog::column_stats_part_ceiling`].
-    #[cfg(test)]
     column_stats_part_ceiling_override: Option<u64>,
 }
 
@@ -580,7 +582,6 @@ impl Catalog {
             column_stats_cache,
             warned_decode_failures: Mutex::new(HashSet::new()),
             column_stats_decode_refusals: AtomicU64::new(0),
-            #[cfg(test)]
             column_stats_part_ceiling_override: None,
         })
     }
@@ -1550,19 +1551,23 @@ impl Catalog {
     /// build may override it via [`Catalog::set_column_stats_part_ceiling_for_test`]
     /// to exercise the degrade loop at a few kilobytes.
     pub(crate) fn column_stats_part_ceiling(&self) -> u64 {
-        #[cfg(test)]
         if let Some(ceiling) = self.column_stats_part_ceiling_override {
             return ceiling;
         }
         crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES
     }
 
-    /// `#[cfg(test)]`: override the per-part column-statistics ceiling this
+    /// Test-only seam: override the per-part column-statistics ceiling this
     /// catalog's fold enforces, so a test can force the degrade loop (or the
     /// no-dictionary-left refusal) at a size far below the real 256 MiB
-    /// constant without a multi-hundred-megabyte fixture.
-    #[cfg(test)]
-    pub(crate) fn set_column_stats_part_ceiling_for_test(&mut self, ceiling: u64) {
+    /// constant without a multi-hundred-megabyte fixture. `pub`, not
+    /// `#[cfg(test)]`, because `ravel-cli`'s own `catalog fold` test needs it
+    /// through a normal (non-dev) dependency edge, the same way `fold`
+    /// threads `now_ns` as a plain parameter rather than reaching for
+    /// `SystemTime::now()` internally: production code never calls this, and
+    /// every real caller goes through [`Catalog::column_stats_part_ceiling`],
+    /// which returns the real constant whenever no override is set (#1598).
+    pub fn set_column_stats_part_ceiling_for_test(&mut self, ceiling: u64) {
         self.column_stats_part_ceiling_override = Some(ceiling);
     }
 

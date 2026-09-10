@@ -84,11 +84,12 @@ pub use seal_divergence::{
 };
 pub use snapshot::{SegmentLevel, SegmentOrigin, SegmentOrigins, SegmentRef, Snapshot};
 pub use snapshot_format::{
-    ColumnStatsLimits, DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES, DEFAULT_MAX_COLUMN_STATS_BYTES,
-    DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES, DecodedColumnStats, DecodedPart,
-    DecodedPostings, HEAD_FORMAT_VERSION, MAGIC, NamePostings, PartLimits, PostingsLimits,
-    SnapshotFormatError, VERSION, decode_column_stats, decode_head, decode_part, decode_postings,
-    encode_column_stats, encode_head, encode_part, encode_postings, validate_min_max_presence,
+    ColumnStatsHeaderPeek, ColumnStatsLimits, DEFAULT_MAX_COLUMN_DICTIONARY_ENTRIES,
+    DEFAULT_MAX_COLUMN_STATS_BYTES, DEFAULT_MAX_POSTINGS_BYTES, DEFAULT_MAX_SNAPSHOT_PART_BYTES,
+    DecodedColumnStats, DecodedPart, DecodedPostings, HEAD_FORMAT_VERSION, MAGIC, NamePostings,
+    PartLimits, PostingsLimits, SnapshotFormatError, VERSION, decode_column_stats,
+    decode_column_stats_header, decode_head, decode_part, decode_postings, encode_column_stats,
+    encode_head, encode_part, encode_postings, validate_min_max_presence,
 };
 pub use tenant_config::{
     DeclaredColumnType, DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS,

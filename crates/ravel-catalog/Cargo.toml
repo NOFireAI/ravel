@@ -25,6 +25,7 @@ crc32c = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
