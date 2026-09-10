@@ -55,8 +55,14 @@ warned=0
 starved=0
 
 # Arm: clear any marker from a previous firing, so its presence always refers
-# to this run.
-rm -f "${marker}" 2>/dev/null || true
+# to this run. A dry run arms nothing and must not clear it. The marker is the
+# only record that a gate's result is invalid rather than red, and the dry run
+# is what a session is told to reach for instead of testing the kill path,
+# including while working out why a gate just came back red: the check for
+# whether the watchdog fired would have destroyed the answer.
+if [ "${WATCHDOG_DRY_RUN:-0}" != "1" ]; then
+    rm -f "${marker}" 2>/dev/null || true
+fi
 
 free_gb() {
     # The volume backing the SCOPE, not a hardcoded one: what fills is the
