@@ -791,12 +791,6 @@ const _: () = assert!(
     "the empty-resolve warning must point at the ingest watermark field"
 );
 
-/// Serialized JSON string length of one byte inside a string, mirroring
-/// [`escaped_char_len`] for the ASCII range: every byte
-/// [`IDENTITY_FIELDS`] and [`IDENTITY_WARNING_SUFFIX`] can contain today.
-/// Kept separate from `escaped_char_len` because a `const fn` cannot decode
-/// UTF-8 through `str::chars` on stable Rust, and these two string sources
-/// are ASCII by construction (field names and fixed English prose).
 /// Whether two ASCII strings are equal, for the const assertions above:
 /// `str` has no `const` equality on stable Rust.
 const fn ascii_eq(a: &str, b: &str) -> bool {
@@ -820,6 +814,12 @@ const fn max_len(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
 
+/// Serialized JSON string length of one byte inside a string, mirroring
+/// [`escaped_char_len`] for the ASCII range: every byte
+/// [`IDENTITY_FIELDS`] and [`IDENTITY_WARNING_SUFFIX`] can contain today.
+/// Kept separate from `escaped_char_len` because a `const fn` cannot decode
+/// UTF-8 through `str::chars` on stable Rust, and these two string sources
+/// are ASCII by construction (field names and fixed English prose).
 const fn ascii_escaped_byte_len(b: u8) -> usize {
     match b {
         b'"' | b'\\' => 2,
