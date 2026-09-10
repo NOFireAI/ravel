@@ -224,6 +224,31 @@ check_outside "null body is tolerated" 0 "$(cat <<EOF
 EOF
 )"
 
+# A finding body can carry newlines, so a wrapped finding's continuation lines
+# sit under its bullet. Closing the block on those under-counted -- the
+# false-clear direction this filter refuses -- and the second finding then
+# neither showed on the summary line nor blocked the merge.
+check_outside "a wrapped finding does not end the block" 2 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Findings outside the diff:\n- a.rs:1 (major): the retry drops the error and\n  the caller cannot tell\n- b.rs:2: second finding\n\nTask t1 on rp2."}]
+EOF
+)"
+
+check_outside "a blank line between bullets does not end the block" 2 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Findings outside the diff:\n- a.rs:1: one\n\n- b.rs:2: two\n\nTask t1 on rp2."}]
+EOF
+)"
+
+# What DOES end a block: a non-empty line at column 0 that is not a bullet, in
+# practice the footer. Without this the walk would run to the end of the body
+# and count bullets from unrelated prose after the footer.
+check_outside "the footer ends the block, so later prose bullets do not count" 1 "$(cat <<EOF
+[{"user":{"login":"${BOT}"},"commit_id":"${SHA}",
+  "body":"Findings outside the diff:\n- a.rs:1: one\n\nTask t1 on rp2, model opus, effort high.\n\n- this bullet is after the footer\n"}]
+EOF
+)"
+
 # The heading has to be the whole line. Prose that mentions the phrase mid-line
 # does not open a block, so a review discussing this mechanism does not block
 # itself.
@@ -441,8 +466,37 @@ malformed_out="$(e2e "${CLEAN_BODY_JSON}")"
 unset E2E_ISSUE_COMMENTS
 
 check_eq "asked but no task: verdict says the mention did not take" \
-  "  -> 1 \`@claude-fleet review\` comment(s) but no task comment for ${SHA}: if the last one is seconds old, the task comment lands within seconds, so re-run this; otherwise the mention was malformed (check for a confused reaction on it), the app is not installed here, or the bot is not receiving deliveries" \
+  "  -> 1 \`@claude-fleet review\` comment(s) and no task comment anywhere on this PR: if the last one is seconds old, the task comment lands within seconds, so re-run this; otherwise the mention was malformed (check for a confused reaction on it), the app is not installed here, or the bot is not receiving deliveries" \
   "$(printf '%s\n' "${malformed_out}" | sed -n 2p)"
+
+# The most common state this script runs in, and the one it used to misdiagnose:
+# the bot reviewed commit A, the author pushed B, so there is a trigger and a
+# task comment but neither is for the head. One task comment anywhere proves the
+# app is installed, the deliveries arrive and the trigger parses, so the answer
+# is "ask again", not "the mention did not take".
+E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"pmoust"},"body":"@claude-fleet review"},{"user":{"login":"%s"},"body":"Review task queued.\\n\\nTask: t1\\nCommit: %s\\nModel: opus (effort high)\\nExecutor: rp2\\nStatus: done. Review posted."}]' "${BOT}" "${OTHER}")"
+E2E_REVIEWS="$(printf '[{"user":{"login":"%s"},"state":"COMMENTED","commit_id":"%s","body":"Verdict: comment."}]' "${BOT}" "${OTHER}")"
+headmoved_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+# Back to the section-wide "no review anywhere" fixture this block borrowed.
+E2E_REVIEWS='[]'
+
+check_eq "head moved after the last request: says ask again, not malformed" \
+  "  -> the head moved after the last review request (1 task comment(s) at earlier commits, none for ${SHA}): comment \`@claude-fleet review\` again, since a push never starts a review" \
+  "$(printf '%s\n' "${headmoved_out}" | sed -n 2p)"
+check_eq "head moved after the last request: no merge command offered" \
+  "0" \
+  "$(printf '%s\n' "${headmoved_out}" | grep -c 'gh pr merge')"
+
+# A mention that is not the trigger. Without the word boundary after `review`,
+# "@claude-fleet reviews are useful here" counted as somebody asking.
+E2E_ISSUE_COMMENTS='[{"user":{"login":"pmoust"},"body":"@claude-fleet reviews are useful here"}]'
+notatrigger_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ISSUE_COMMENTS
+
+check_eq "\"@claude-fleet reviews are useful\" is not a trigger" \
+  "  -> no review at head and nobody asked for one: comment \`@claude-fleet review\` on the PR (that exact body, arguments after \`review\` are parsed and an unrecognized word gets a confused reaction and no review)" \
+  "$(printf '%s\n' "${notatrigger_out}" | sed -n 2p)"
 
 # The bot quoting the trigger in its own comment is not somebody asking.
 E2E_ISSUE_COMMENTS="$(printf '[{"user":{"login":"%s"},"body":"Write @claude-fleet review to start a review."}]' "${BOT}")"
@@ -502,7 +556,7 @@ check_eq "review at an older commit: reported on the summary line" \
   "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/0 fail | review: task@head=none reviews@head=0 last=none inline_comments=0 reviews_at_older_commits=1" \
   "$(printf '%s\n' "${stalereview_out}" | sed -n 1p)"
 check_eq "review at an older commit: does not clear the head" \
-  "  -> no review at head and nobody asked for one: comment \`@claude-fleet review\` on the PR (that exact body, arguments after \`review\` are parsed and an unrecognized word gets a confused reaction and no review)" \
+  "  -> the head moved after the last review request (1 task comment(s) at earlier commits, none for ${SHA}): comment \`@claude-fleet review\` again, since a push never starts a review" \
   "$(printf '%s\n' "${stalereview_out}" | sed -n 2p)"
 check_eq "review at an older commit: the head-moved note is printed" \
   "     (1 review(s) exist at older commits; the head moved after them, so they do not cover it)" \
@@ -554,7 +608,7 @@ check_eq "a DISMISSED review at head blocks" \
 
 # COMMENTED is the bot's success state, so it must NOT be treated as "not
 # approved, therefore not clean" -- the first e2e case above already proves
-# that. APPROVED is accepted too, for a human review on the same head.
+# that. APPROVED is accepted too.
 E2E_REVIEW_STATE=APPROVED
 approved_out="$(e2e "${CLEAN_BODY_JSON}")"
 unset E2E_REVIEW_STATE
@@ -562,6 +616,43 @@ unset E2E_REVIEW_STATE
 check_eq "an APPROVED review at head is also clean" \
   "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${approved_out}" | sed -n 2p)"
+
+# A HUMAN review at head, which is the half the state branch used to miss: both
+# counts filtered on the bot login, so a maintainer's CHANGES_REQUESTED was
+# invisible, and `protect-main` requires zero approvals, so mergeStateStatus
+# stays CLEAN and nothing else caught it either. The bot's own COMMENTED review
+# sits at the same head here, so only the human review can move the verdict.
+E2E_REVIEWS="$(printf '[{"user":{"login":"%s"},"state":"COMMENTED","commit_id":"%s","body":"Verdict: comment."},{"user":{"login":"pmoust"},"state":"CHANGES_REQUESTED","commit_id":"%s","body":"not yet"}]' "${BOT}" "${SHA}" "${SHA}")"
+human_cr_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_REVIEWS
+
+check_eq "a human CHANGES_REQUESTED at head blocks" \
+  "  -> the current-head review state is CHANGES_REQUESTED (need APPROVED or COMMENTED); not clean" \
+  "$(printf '%s\n' "${human_cr_out}" | sed -n 2p)"
+check_eq "a human review at head is counted on the summary line" \
+  "1" \
+  "$(printf '%s\n' "${human_cr_out}" | sed -n 1p | grep -c 'reviews@head_all_authors=2')"
+
+# The mirror: a human COMMENTED after the bot leaves the PR clean, so the case
+# above is not passing because any second review blocks.
+E2E_REVIEWS="$(printf '[{"user":{"login":"%s"},"state":"COMMENTED","commit_id":"%s","body":"Verdict: comment."},{"user":{"login":"pmoust"},"state":"COMMENTED","commit_id":"%s","body":"agreed"}]' "${BOT}" "${SHA}" "${SHA}")"
+human_comment_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_REVIEWS
+
+check_eq "a human COMMENTED review at head does not block" \
+  "  -> clean: CI green, review at the current head with zero findings" \
+  "$(printf '%s\n' "${human_comment_out}" | sed -n 2p)"
+
+# A human's INLINE findings live on the same endpoint as the bot's and are now
+# counted with them; counting only the bot's hid them from the status line and
+# from the blocking branch.
+E2E_REVIEW_COMMENTS='[{"user":{"login":"pmoust"},"body":"this drops the error"}]'
+human_inline_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_REVIEW_COMMENTS
+
+check_eq "a human inline comment blocks until confirmed" \
+  "  -> 1 inline review comment(s); read them, then re-run with --confirm-addressed once each is fixed or answered (the API cannot tell; see the header comment)" \
+  "$(printf '%s\n' "${human_inline_out}" | sed -n 2p)"
 
 # --- merge-base freshness end-to-end --------------------------------------
 #

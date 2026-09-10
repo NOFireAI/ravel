@@ -28,17 +28,32 @@
 # KNOWN LIMIT, accepted deliberately: a body that quotes a complete block
 # verbatim (a review discussing this very mechanism, say) counts those bullets.
 # That is a false BLOCK, which costs one read of the body, rather than a false
-# CLEAR, which ships unfixed findings. The asymmetry decides it.
+# CLEAR, which ships unfixed findings. The asymmetry decides it, and it decides
+# what closes a block below too.
 def outside_diff_count:
   # Line-state walk rather than a regex over the whole body: the heading opens
-  # a block, any non-bullet line closes it. A regex spanning lines would have
-  # to guess where the block ends, and the bullet syntax is not unique to it.
+  # a block and only a line that ENDS it closes it. A regex spanning lines
+  # would have to guess where the block ends, and the bullet syntax is not
+  # unique to it.
+  #
+  # What ends a block is a non-empty line at column 0 that is not a bullet --
+  # in practice the footer the bot writes after a blank line. A blank line and
+  # an indented line both keep it open, because a finding body can carry
+  # newlines: `result.go` prints `- <where>: <body>` with the body verbatim, so
+  # a wrapped finding's continuation lines sit under its bullet. Closing on
+  # those was an UNDER-count, the false-clear direction this filter refuses:
+  # a two-finding block whose first finding wrapped counted 1, and the second
+  # finding then neither showed on the summary line nor blocked the merge.
   ( split("\n")
   | reduce .[] as $line ({inblock: false, n: 0};
       if ($line | sub("[[:space:]]+$"; "")) == "Findings outside the diff:" then
         .inblock = true
       elif .inblock and ($line | test("^- ")) then
         .n += 1
+      elif .inblock and ($line | test("^[[:space:]]*$")) then
+        .                      # blank line between bullets: block stays open
+      elif .inblock and ($line | test("^[[:space:]]")) then
+        .                      # indented continuation of the bullet above
       else
         .inblock = false
       end)
