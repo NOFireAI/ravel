@@ -56,10 +56,13 @@ maintenance.
 ### Find labels
 
 - `ravel_find_labels`: metric names for a selector, label names, or the
-  values of one label under a selector. The result states whether the list
-  is declared through configuration, observed from data, or exact. Ask for a
-  tenant-wide list with no filter and the tool refuses, naming the bounded
-  form to ask for instead.
+  values of one label under a selector. The list is observed from the data
+  over the window you asked for, and the result states whether it is
+  complete for that window. A call bounded by neither a selector nor a label
+  name is refused, naming the bounded form to ask for instead. An optional
+  `filter` does not satisfy that bound: a selector or a label name narrows
+  what the call resolves, a filter narrows only what it returns, so a call
+  carrying a filter and neither of the other two is still refused.
 
 ### Check a query before you run it
 
@@ -105,8 +108,10 @@ One of four values, each a different fact about the result:
 
 - `ok`: the query completed. A query with zero matching rows is `ok`. A
   `LIMIT` the data did not fill is still `ok`.
-- `ok_bounded`: a row cap stopped the result and more rows exist, but the
-  statement has no total order, so no cursor exists for the rest.
+- `ok_bounded`: a cap stopped the result and more rows exist, but no cursor
+  exists for the rest, because the statement has no total order or the tool
+  mints no cursor. `presentation` states which cap stopped it. A
+  `ravel_find_labels` page cut short by the byte cap reports this way.
 - `ok_page`: a cap stopped the result and a cursor exists. `presentation`
   states whether the row cap, the byte cap, or both caused it.
 - `error`: the call failed. `failure` names why.
@@ -136,9 +141,17 @@ the deployment writes one.
 
 ### `visibility`
 
-The snapshot this call read: `snapshot_id`, the `watermark_hour` the catalog
-has folded up to, which `min_commit_tokens_applied` the call honored, and
-`pinned`, whether this call's snapshot stays held for a later paged call.
+The snapshot this call read: `snapshot_id`, `ingest_watermark_hour`, which
+`min_commit_tokens_applied` the call honored, and `pinned`, whether this
+call's snapshot stays held for a later paged call.
+
+`ingest_watermark_hour` is the greatest ingest hour among the segments this
+call resolved, as a decimal unix hour in a string. It is a freshness bound,
+not the catalog's fold watermark: the fold is a cost boundary that a query
+reads past routinely, and it lags an acknowledged write by around 2 h 25 m,
+which would read as staleness that is not there. A call that resolved no
+segments has no such hour to report, so it leaves the field empty and says
+so in `warnings`.
 
 ### `coverage`
 
@@ -172,9 +185,9 @@ an upper envelope, never a prediction, and the field says so.
 
 ### `evidence`
 
-A list of references, each an opaque `ref` token plus a `sha256` of the
+A list of references, each an opaque `ref` token plus a `blake3_256` of the
 canonical row bytes it covers. Redeem a reference later to prove a row has
-not changed.
+not changed. `ravel_find_labels` emits no `evidence` block.
 
 ### `warnings` and `next_steps`
 
@@ -226,7 +239,11 @@ Defaults and floors:
   `presentation.cursor` when more families exist. Request the next page
   with the same signal and that cursor. The cursor follows the same
   codec, tenant binding, and lifetime as every other cursor.
-- `ravel_find_labels`: 2,000 segments admitted for label resolution.
+- `ravel_find_labels`: 2,000 segments admitted for label resolution. It
+  takes no `max_rows`: a page is bounded by bytes alone, and a page cut
+  short reports through `presentation.bytes_cap_hit` and
+  `presentation.rows_omitted`. A page with `bytes_cap_hit` false is the
+  complete match set for the window and filter you asked for.
 
 `ravel_explain_query` compares its cost estimate to the effective budget
 before you run anything. When the estimate exceeds the budget, the call
@@ -266,10 +283,12 @@ When no complete group fits in the row cap, the server returns the
 rows it has, up to the row cap, with status `ok_bounded` and no cursor.
 `next_steps` names narrowing `time_range`.
 
-Every data tool accepts an optional `evidence_ref` input. Redeeming a
-reference re-executes the tool with the reference's own arguments. The
-re-execution runs against the reference's pinned snapshot while the pin is
-valid. The server then compares the sha256 of the canonical row bytes.
+Every data tool but `ravel_find_labels` accepts an optional `evidence_ref`
+input. That tool takes none and emits no `evidence` block: nothing defines
+what a label list attests to. Redeeming a reference re-executes the tool
+with the reference's own arguments. The re-execution runs against the
+reference's pinned snapshot while the pin is valid. The server then compares
+the BLAKE3-256 digest of the canonical row bytes.
 After the pin expires, redemption re-executes fresh instead of using the
 pin. It reports `pinned: false` and states whether the hash matched.
 `cursor_invalid` and `cursor_expired` do not apply to an evidence reference
@@ -313,9 +332,12 @@ empty case in order:
    Compare `scope.time_range` to what you meant to ask, and check the
    signal with a wider window.
 3. **The data exists but has not become visible yet.** Compare
-   `visibility.watermark_hour` to your window's end. A window that reaches
-   past the watermark can be honestly empty for now and non-empty once the
-   catalog catches up.
+   `visibility.ingest_watermark_hour` to your window's end. A window that
+   reaches past that hour can be honestly empty for now and non-empty once
+   the newer data is ingested. If the field is empty, read `warnings`: an
+   absent value means either that this operation does not report it or that
+   the call resolved no segments at all, and the two say so in different
+   words.
 4. **A predicate matched nothing.** Read `scope.predicates_applied` to see
    the predicate the server actually ran, which can differ from what you
    typed, for example when a typed-attribute-column name did not match and
