@@ -211,11 +211,7 @@ async fn handle_label_values(
     let tenant_hash = authenticate(state, &headers)?;
     let params = read_params(req).await?;
     let request = metadata_request(state, &params)?;
-    // ADR-1103: the two reserved log metric names never appear in any stored
-    // postings, so they only surface here explicitly. A request whose match[]
-    // selectors name metrics only asks about the metrics signal specifically
-    // and gets metrics names only.
-    let include_log_metrics = name == METRIC_NAME_LABEL && include_log_metric_names(&params)?;
+    let include_log_metrics = include_log_metric_names(&name, &request.selectors)?;
     let outcome = service::label_values(
         &state.controls(),
         &state.engine,
@@ -233,11 +229,30 @@ async fn handle_label_values(
     ))
 }
 
-/// Whether `label/__name__/values` should include the two reserved log
-/// metric names (ADR-1103): true when the request carries no `match[]` at
-/// all, or when at least one `match[]` selector is a log selector.
-fn include_log_metric_names(params: &Params) -> Result<bool, ApiError> {
-    let selectors = params.all("match[]");
+/// Whether a `label/{label_name}/values` answer should include the two
+/// reserved log metric names (ADR-1103 decision 4). The two names never
+/// appear in any stored postings, so `label/__name__/values` must add them
+/// explicitly rather than discover them by scanning series; every other
+/// label name returns `false` without inspecting `selectors` at all, since
+/// the reserved names are metric names, not values of some other label.
+///
+/// For `label_name == __name__`, the rule is: include both names when
+/// `selectors` is empty, or when at least one selector is a log selector
+/// (a `__name__` matcher naming one of the two reserved metrics); a
+/// selector set that names only metrics gets metrics names only. An entry
+/// in `selectors` that fails to parse as a `match[]` selector returns the
+/// same [`ApiError`] the label-values handler surfaces today.
+///
+/// This is the one implementation of that rule, extracted (issue #1571) so
+/// the MCP `ravel_find_labels` tool can call it before reaching the
+/// metadata path instead of re-deriving the condition on its own: a second,
+/// independently written copy of "empty or log selector" would silently
+/// drift from the HTTP answer for the same selector the moment either side
+/// changed, with nothing to catch it.
+pub fn include_log_metric_names(label_name: &str, selectors: &[String]) -> Result<bool, ApiError> {
+    if label_name != METRIC_NAME_LABEL {
+        return Ok(false);
+    }
     if selectors.is_empty() {
         return Ok(true);
     }
@@ -315,4 +330,87 @@ fn resolve_window(params: &Params, now: i64) -> Result<TimeRange, ApiError> {
         None => now,
     };
     Ok(TimeRange { start_ns, end_ns })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod include_log_metric_names_tests {
+    //! Issue #1571 T2: this is a MOVE, not a copy, of the derivation the
+    //! label-values handler used to keep inline. These tests pin the exact
+    //! documented result for every selector shape ADR-1103 decision 4 names,
+    //! plus the one it does not apply to, and the parse-error passthrough, so
+    //! a later change to the rule (here or in a re-derivation) is caught
+    //! rather than silently drifting between the HTTP and MCP callers.
+    use super::include_log_metric_names;
+    use crate::engine::parse_match_selector;
+    use crate::http::error::ApiError;
+    use ravel_types::METRIC_NAME_LABEL;
+
+    const LOG_SELECTOR: &str = r#"{__name__="ravel_log_lines"}"#;
+    const METRICS_SELECTOR: &str = r#"{__name__="cpu_usage"}"#;
+    const UNPARSEABLE_SELECTOR: &str = "{";
+
+    #[test]
+    fn no_selectors_includes_log_metric_names() {
+        let got = include_log_metric_names(METRIC_NAME_LABEL, &[]).expect("no parse to fail");
+        assert!(
+            got,
+            "no match[] selectors must include both reserved log metric names"
+        );
+    }
+
+    #[test]
+    fn log_selector_includes_log_metric_names() {
+        let selectors = vec![LOG_SELECTOR.to_string()];
+        let got = include_log_metric_names(METRIC_NAME_LABEL, &selectors).expect("selector parses");
+        assert!(
+            got,
+            "a log selector among match[] must include both reserved log metric names"
+        );
+    }
+
+    #[test]
+    fn metrics_only_selector_excludes_log_metric_names() {
+        let selectors = vec![METRICS_SELECTOR.to_string()];
+        let got = include_log_metric_names(METRIC_NAME_LABEL, &selectors).expect("selector parses");
+        assert!(
+            !got,
+            "match[] selectors that name only metrics must exclude both reserved log metric names"
+        );
+    }
+
+    #[test]
+    fn other_label_name_never_includes_log_metric_names() {
+        let shapes: Vec<Vec<String>> = vec![
+            Vec::new(),
+            vec![LOG_SELECTOR.to_string()],
+            vec![METRICS_SELECTOR.to_string()],
+        ];
+        for selectors in shapes {
+            let got = include_log_metric_names("job", &selectors)
+                .expect("the job label short-circuits before parsing any selector");
+            assert!(
+                !got,
+                "a label other than __name__ must never include the reserved log metric \
+                 names, selectors: {selectors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unparseable_selector_is_rejected_with_the_handler_error() {
+        let selectors = vec![UNPARSEABLE_SELECTOR.to_string()];
+        let got = include_log_metric_names(METRIC_NAME_LABEL, &selectors)
+            .expect_err("an unparseable match[] selector must be rejected");
+        let want = parse_match_selector(UNPARSEABLE_SELECTOR)
+            .expect_err("fixture selector must itself be unparseable");
+        match got {
+            ApiError::BadData(msg) => assert_eq!(
+                msg,
+                want.to_string(),
+                "must surface the same message the handler's own parse produces"
+            ),
+            other => panic!("expected ApiError::BadData, got {other:?}"),
+        }
+    }
 }
