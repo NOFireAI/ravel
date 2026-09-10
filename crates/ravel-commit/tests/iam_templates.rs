@@ -1231,6 +1231,43 @@ fn key_patterns_for(policy: &Policy, operations: &[&str], effect: Option<&str>) 
     out
 }
 
+/// The action strings, in template order, that select `policy` on the axis
+/// `operations` under `effect`. The action-side mirror of `key_patterns_for`,
+/// and the S3 counterpart of `kms_actions`.
+///
+/// Only the actions that grant an axis operation are returned, for the reason
+/// `kms_actions` filters the same way: a mixed ListBucket+GetObject statement
+/// must contribute `s3:ListBucket` to the list axis and `s3:GetObject` to the
+/// get axis rather than both to each, or an axis would report an action it does
+/// not select on. A wildcard action that grants an axis operation without naming
+/// it (`"s3:*"`) is returned, because `action_grants` decides membership.
+///
+/// The strings keep the template's own capitalization and spelling, so an
+/// expectation over them pins WHAT THE POLICY SAYS, not what it resolves to.
+/// That is the point: an action edit that leaves the resolved capability
+/// unchanged for the operations this file has a vocabulary for (`s3:Delete*` for
+/// the two delete operations) still widens the real grant, and must be read by a
+/// human rather than absorbed.
+fn actions_for(policy: &Policy, operations: &[&str], effect: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        if let Some(effect) = effect {
+            let has_effect = stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case(effect));
+            if !has_effect {
+                continue;
+            }
+        }
+        out.extend(
+            statement_actions(stmt)
+                .into_iter()
+                .filter(|a| action_grants_any(a, operations)),
+        );
+    }
+    out
+}
+
 /// Bucket-relative key patterns from every statement granting an S3 object
 /// operation (`GetObject`, `PutObject`, `DeleteObject`, ...), either Effect.
 ///
@@ -1538,8 +1575,10 @@ fn assert_role_routed_writes_have_kms_grant(policy: &Policy) {
 // shape to every role and every axis is what makes the Effect load-bearing.
 //
 // The form is deliberate: an Allow set and a Deny set per axis, each by exact
-// equality, plus the disjointness property asserted separately over real keys
-// (`deny_delete_is_disjoint_from_allow_delete_over_real_keys`). The alternative
+// equality, plus the overlap properties asserted separately over real keys
+// (`delete_deny_and_allow_overlap_exactly_where_expected` measures where the two
+// sides cover the same key, and `every_allow_deny_key_overlap_is_named_by_the_deny`
+// asserts the Deny's actions cover the Allow's wherever they do). The alternative
 // -- one "effective" set per axis, with the Deny globs subtracted from the Allow
 // globs -- is not exactly computable: glob difference is not a glob, so any
 // single-set form would have to approximate, and an approximation asserted by
@@ -1565,18 +1604,42 @@ const PROTECTED_DELETE_KEYS: &[&str] = &[
     "t/*/u/*/0000/*",
 ];
 
+/// The `DenyDeleteProtected` action set, identical in all four templates: both
+/// delete operations S3 distinguishes.
+///
+/// This is the axis the protection actually turns on. A `Deny` overrides an
+/// `Allow` only for the operations it NAMES, and three of maintain's delete
+/// grants cover the legal-hold shard (`EXPECTED_DELETE_OVERLAPS`), so dropping
+/// `s3:DeleteObjectVersion` from here would leave Maintain able to destroy
+/// versions of legal-hold audit objects while every pattern-set expectation and
+/// the overlap measurement stayed green. `every_allow_deny_key_overlap_is_named_by_the_deny`
+/// asserts the property directly; this row makes the edit itself visible.
+const PROTECTED_DELETE_ACTIONS: &[&str] = &["s3:DeleteObject", "s3:DeleteObjectVersion"];
+
 /// One role's complete grant surface, as the guards in this file derive it.
 /// Written as intent: each field is the exact list, in template order, that the
 /// axis returns. The Deny side of every axis except delete is empty, which is
 /// the claim `every_shipped_deny_is_a_delete_only_prohibition` restates
 /// structurally.
+///
+/// Every S3 axis carries a pattern list AND an action list, because a statement
+/// is two independent halves and the pattern half alone leaves one of them
+/// unpinned. Resources decide WHICH keys a statement reaches; actions decide
+/// WHAT it may do to them and, on a `Deny`, exactly how much of an overlapping
+/// `Allow` it overrides. Before the action rows, a resource edit reddened this
+/// table and an action edit prompted nobody.
 struct ExpectedRolePatterns {
     role: &'static str,
     list_prefixes: &'static [&'static str],
+    list_actions: &'static [&'static str],
     gets: &'static [&'static str],
+    get_actions: &'static [&'static str],
     puts: &'static [&'static str],
+    put_actions: &'static [&'static str],
     deletes: &'static [&'static str],
+    delete_actions: &'static [&'static str],
     protected_deletes: &'static [&'static str],
+    protected_delete_actions: &'static [&'static str],
     kms_actions: &'static [&'static str],
     /// `(Sid, KMS key ARNs)` per `Allow` statement granting a KMS operation.
     kms_resources: &'static [(&'static str, &'static [&'static str])],
@@ -1595,6 +1658,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/admission/*",
             "t/*/catalog/*/*",
         ],
+        list_actions: &["s3:ListBucket"],
         gets: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -1606,6 +1670,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualification",
             "sys/gc",
         ],
+        get_actions: &["s3:GetObject"],
         puts: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -1617,8 +1682,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/idx/*",
             "sys/tenancy",
         ],
+        put_actions: &["s3:PutObject"],
         deletes: &[],
+        delete_actions: &[],
         protected_deletes: PROTECTED_DELETE_KEYS,
+        protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
         kms_resources: &[("GatewayTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
@@ -1633,6 +1701,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "admission/query/*",
             "sys/query/workers/*",
         ],
+        list_actions: &["s3:ListBucket"],
         gets: &[
             "t/*/*/c/*",
             "t/*/*/l0/*",
@@ -1645,6 +1714,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/gc",
             "sys/query/workers/*",
         ],
+        get_actions: &["s3:GetObject"],
         puts: &[
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/HEAD",
@@ -1654,8 +1724,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/query/workers/*",
         ],
+        put_actions: &["s3:PutObject"],
         deletes: &[],
+        delete_actions: &[],
         protected_deletes: PROTECTED_DELETE_KEYS,
+        protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
         kms_resources: &[("QueryTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
@@ -1672,6 +1745,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/idem/*",
             "sys/maintain/workers/*",
         ],
+        list_actions: &["s3:ListBucket"],
         gets: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -1684,6 +1758,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/gc",
             "sys/maintain/*",
         ],
+        get_actions: &["s3:GetObject"],
         puts: &[
             "t/*/*/l1/*",
             "t/*/*/c/*",
@@ -1692,6 +1767,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/maintain/*",
         ],
+        put_actions: &["s3:PutObject"],
         deletes: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -1699,7 +1775,14 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/idem/*",
             "t/*/u/*/0001/*",
         ],
+        // Both delete operations, and the same two the Deny names. Maintain is
+        // the only role where that identity is load-bearing rather than
+        // incidental: its level-based grants cover the legal-hold shard, so the
+        // shard is protected only as far as this list is covered by
+        // PROTECTED_DELETE_ACTIONS.
+        delete_actions: &["s3:DeleteObject", "s3:DeleteObjectVersion"],
         protected_deletes: PROTECTED_DELETE_KEYS,
+        protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
         kms_resources: &[("MaintainTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
@@ -1708,7 +1791,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     ExpectedRolePatterns {
         role: "admin",
         list_prefixes: &["t/*", "sys/*"],
+        list_actions: &["s3:ListBucket"],
         gets: &["t/*", "sys/*"],
+        get_actions: &["s3:GetObject"],
         puts: &[
             "sys/tenancy",
             "sys/qualification",
@@ -1718,21 +1803,28 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/u/*",
         ],
+        put_actions: &["s3:PutObject"],
         deletes: &["sys/qualify/*"],
+        // Narrower than the Deny, which names both operations. Legitimate, and
+        // the reason the overlap property is asserted as containment rather than
+        // equality: admin's delete grant and its Deny cover no key in common, and
+        // where they did, a Deny naming MORE than the Allow grants is safe.
+        delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
+        protected_delete_actions: PROTECTED_DELETE_ACTIONS,
         kms_actions: &["kms:Decrypt"],
         kms_resources: &[("AdminTenantKms", &[TENANT_KMS_KEY_ARN])],
     },
 ];
 
-/// Compare one axis's derived pattern set against the expected set, by exact
-/// equality and in order.
+/// Compare one axis's derived set (key patterns, `s3:prefix` values or action
+/// strings) against the expected set, by exact equality and in order.
 fn assert_axis_eq(role: &str, axis: &str, actual: &[String], expected: &[&str]) {
     let expected: Vec<String> = expected.iter().map(|p| (*p).to_string()).collect();
     assert_eq!(
         actual,
         expected.as_slice(),
-        "{role}: the effective {axis} pattern set is not the set this test \
+        "{role}: the effective {axis} set is not the set this test \
          expects. Every axis is pinned by exact equality, so a widened, dropped, \
          reordered or Effect-flipped statement fails here rather than passing a \
          one-sided \"does some pattern do X?\" check. If the template change is \
@@ -1742,10 +1834,11 @@ fn assert_axis_eq(role: &str, axis: &str, actual: &[String], expected: &[&str]) 
 }
 
 /// Every role's grant surface, per axis, by exact equality against
-/// `EXPECTED_PATTERNS`. The Allow and Deny sides are asserted separately: glob
+/// `EXPECTED_PATTERNS`: the key patterns and the action strings, both sides of
+/// every statement. The Allow and Deny sides are asserted separately: glob
 /// difference is not a glob, so a single "effective" set would have to
-/// approximate the subtraction, and the disjointness that makes the two sides
-/// safe to read separately is asserted as its own property below.
+/// approximate the subtraction, and the overlap that makes the two sides unsafe
+/// to read as independent is measured and covered by its own properties below.
 #[test]
 fn every_role_grants_exactly_the_expected_pattern_set() {
     let mut covered: Vec<&str> = EXPECTED_PATTERNS.iter().map(|e| e.role).collect();
@@ -1776,6 +1869,18 @@ fn every_role_grants_exactly_the_expected_pattern_set() {
         );
         assert_axis_eq(
             role,
+            "list action Allow",
+            &actions_for(&policy, &S3_BUCKET_OPERATIONS, Some("Allow")),
+            expected.list_actions,
+        );
+        assert_axis_eq(
+            role,
+            "list action Deny",
+            &actions_for(&policy, &S3_BUCKET_OPERATIONS, Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
             "s3:GetObject Allow",
             &key_patterns_for(&policy, &["s3:GetObject"], Some("Allow")),
             expected.gets,
@@ -1784,6 +1889,18 @@ fn every_role_grants_exactly_the_expected_pattern_set() {
             role,
             "s3:GetObject Deny",
             &key_patterns_for(&policy, &["s3:GetObject"], Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
+            "get action Allow",
+            &actions_for(&policy, &["s3:GetObject"], Some("Allow")),
+            expected.get_actions,
+        );
+        assert_axis_eq(
+            role,
+            "get action Deny",
+            &actions_for(&policy, &["s3:GetObject"], Some("Deny")),
             &[],
         );
         assert_axis_eq(
@@ -1800,6 +1917,18 @@ fn every_role_grants_exactly_the_expected_pattern_set() {
         );
         assert_axis_eq(
             role,
+            "put action Allow",
+            &actions_for(&policy, &["s3:PutObject"], Some("Allow")),
+            expected.put_actions,
+        );
+        assert_axis_eq(
+            role,
+            "put action Deny",
+            &actions_for(&policy, &["s3:PutObject"], Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
             "delete Allow",
             &delete_key_patterns(&policy, "Allow"),
             expected.deletes,
@@ -1809,6 +1938,18 @@ fn every_role_grants_exactly_the_expected_pattern_set() {
             "delete Deny",
             &delete_key_patterns(&policy, "Deny"),
             expected.protected_deletes,
+        );
+        assert_axis_eq(
+            role,
+            "delete action Allow",
+            &actions_for(&policy, &S3_DELETE_OPERATIONS, Some("Allow")),
+            expected.delete_actions,
+        );
+        assert_axis_eq(
+            role,
+            "delete action Deny",
+            &actions_for(&policy, &S3_DELETE_OPERATIONS, Some("Deny")),
+            expected.protected_delete_actions,
         );
         assert_axis_eq(
             role,
@@ -2025,6 +2166,289 @@ fn delete_deny_and_allow_overlap_exactly_where_expected() {
              missing pair means a protection or a grant was narrowed"
         );
     }
+}
+
+/// One statement reduced to what an Allow/Deny overlap check needs: which
+/// operations ON ONE AXIS it names, and which object keys it names them over.
+///
+/// The operations are the resolved literal names, not the policy's action
+/// strings, so `"s3:Delete*"` on one side and
+/// `["s3:DeleteObject", "s3:DeleteObjectVersion"]` on the other compare as the
+/// same coverage. Pinning the spellings is the separate job of
+/// `EXPECTED_PATTERNS`.
+struct AxisStatement {
+    sid: String,
+    operations: Vec<&'static str>,
+    patterns: Vec<String>,
+}
+
+/// Every statement of `effect` that names at least one operation in
+/// `operations`, reduced to an `AxisStatement`.
+fn axis_statements(
+    policy: &Policy,
+    operations: &[&'static str],
+    effect: &str,
+) -> Vec<AxisStatement> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let has_effect = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case(effect));
+        if !has_effect {
+            continue;
+        }
+        let actions = statement_actions(stmt);
+        let named: Vec<&'static str> = operations
+            .iter()
+            .copied()
+            .filter(|operation| actions.iter().any(|a| action_grants(a, operation)))
+            .collect();
+        if named.is_empty() {
+            continue;
+        }
+        let sid = statement_sid(stmt).to_string();
+        let patterns = object_key_patterns(policy.role, &sid, &statement_resources(stmt));
+        out.push(AxisStatement {
+            sid,
+            operations: named,
+            patterns,
+        });
+    }
+    out
+}
+
+/// The operation classes on which an `Allow` and a `Deny` in the same policy can
+/// select the same OBJECT KEY, so the containment property below is asked of
+/// each. Swept as a set rather than written for delete alone: nothing about the
+/// property is specific to deletion, and an axis that cannot overlap today
+/// answers the question by measuring empty rather than by being left out.
+///
+/// The two axes NOT here have a domain that is not an object key, and the test
+/// fails closed on them instead: the list axis compares `s3:prefix` values
+/// (request parameters, not stored keys) and the KMS axis compares key ARNs.
+/// Neither can overlap today because no shipped `Deny` selects either -- the
+/// test asserts that emptiness directly, so a `Deny` added to one of them fails
+/// here rather than passing an axis this file does not model.
+const OBJECT_OVERLAP_AXES: [(&str, &[&str]); 3] = [
+    ("get", &["s3:GetObject"]),
+    ("put", &["s3:PutObject"]),
+    ("delete", &S3_DELETE_OPERATIONS),
+];
+
+/// The `(role, axis)` pairs where an `Allow` and a `Deny` statement cover a
+/// common key today. Exactly one: maintain's delete axis, over the legal-hold
+/// shard (`EXPECTED_DELETE_OVERLAPS` records the pattern pairs).
+///
+/// This is the anti-vacuity half of the containment test. Containment over an
+/// empty overlap set is vacuously true, so a test that only asserted the
+/// property would go green if the measurement stopped finding the overlap it
+/// exists for.
+const EXPECTED_OVERLAP_AXES: &[(&str, &str)] = &[("maintain", "delete")];
+
+/// Sid pairs of every `Deny` statement that selects a KMS operation.
+fn deny_kms_statement_sids(policy: &Policy) -> Vec<String> {
+    policy_statements(policy)
+        .iter()
+        .filter(|stmt| {
+            stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case("Deny"))
+        })
+        .filter(|stmt| {
+            statement_actions(stmt)
+                .iter()
+                .any(|a| action_selects_kms(a))
+        })
+        .map(|stmt| statement_sid(stmt).to_string())
+        .collect()
+}
+
+/// The containment property, for one policy. Returns the `(role, axis)` pairs
+/// where an overlap was found and checked, so a caller can pin that the
+/// measurement examined what it claims to.
+fn assert_allow_deny_overlaps_are_named(policy: &Policy) -> Vec<(&'static str, &'static str)> {
+    let role = policy.role;
+
+    // The two axes whose domain is not an object key. Neither is modelled here,
+    // so neither may carry a Deny: with an empty Deny side no Allow/Deny pair
+    // can select the same value, which is what makes the omission safe.
+    assert!(
+        list_prefix_patterns(policy, Some("Deny")).is_empty(),
+        "{role}: a Deny statement grants s3:ListBucket. The list axis compares \
+         s3:prefix request parameters rather than stored keys, so this file does \
+         not model an Allow/Deny overlap on it: whether the Deny covers every \
+         list the Allow permits is unchecked"
+    );
+    let deny_kms = deny_kms_statement_sids(policy);
+    assert!(
+        deny_kms.is_empty(),
+        "{role}: Deny statement(s) {deny_kms:?} select a KMS operation. The KMS \
+         axis compares key ARNs rather than stored keys, so this file does not \
+         model an Allow/Deny overlap on it: whether the Deny covers every KMS \
+         operation the Allow grants on the same key is unchecked"
+    );
+
+    let mut observed = Vec::new();
+    for (axis, operations) in OBJECT_OVERLAP_AXES {
+        let allows = axis_statements(policy, operations, "Allow");
+        let denies = axis_statements(policy, operations, "Deny");
+        for deny in &denies {
+            for allow in &allows {
+                let witnesses: Vec<&String> = key_domain()
+                    .iter()
+                    .filter(|key| {
+                        deny.patterns
+                            .iter()
+                            .any(|p| glob_matches(p.as_str(), key.as_str()))
+                            && allow
+                                .patterns
+                                .iter()
+                                .any(|p| glob_matches(p.as_str(), key.as_str()))
+                    })
+                    .collect();
+                if witnesses.is_empty() {
+                    continue;
+                }
+                observed.push((role, axis));
+                let uncovered: Vec<&str> = allow
+                    .operations
+                    .iter()
+                    .copied()
+                    .filter(|operation| !deny.operations.contains(operation))
+                    .collect();
+                assert!(
+                    uncovered.is_empty(),
+                    "{role}: on the {axis} axis, Allow statement {} and Deny \
+                     statement {} both cover key(s) {witnesses:?}, and the Allow \
+                     grants {uncovered:?} there, which the Deny does not name. An \
+                     IAM Deny overrides an Allow only for the operations it \
+                     names, so the effective capability on those keys includes \
+                     {uncovered:?}: the overlap is NOT neutralized. Either name \
+                     those operations in the Deny, or narrow the Allow off these \
+                     keys",
+                    allow.sid,
+                    deny.sid
+                );
+            }
+        }
+    }
+    observed.sort_unstable();
+    observed.dedup();
+    observed
+}
+
+/// A Deny overrides only the operations it NAMES.
+///
+/// `delete_deny_and_allow_overlap_exactly_where_expected` measures WHERE the
+/// shipped delete Allow and Deny sets cover the same key, and its
+/// justification for the three recorded maintain pairs is that an explicit IAM
+/// Deny wins, so the effective capability is still correct. That justification
+/// holds only for the actions the Deny names, and nothing asserted it: drop
+/// `s3:DeleteObjectVersion` from `DenyDeleteProtected` and Maintain can
+/// permanently destroy versions of legal-hold audit objects
+/// (`t/<hash>/u/{l0,c,l1}/0000/...`, reached through `t/*/*/l0/*` and its two
+/// siblings) while the overlap measurement reports the same three pairs and
+/// every pattern expectation stays green. ADR-0055 section 2 and its section 3
+/// amendment call that shard deny-delete-forever, so this is a documented
+/// invariant with no check under it.
+///
+/// The assertion is CONTAINMENT, not equality: the Allow's operations on the
+/// overlapping keys must be a subset of the Deny's. A Deny broader than the
+/// Allow is legitimate (admin's Deny names both delete operations while its
+/// `sys/qualify/*` grant names one), and equality would reject it.
+///
+/// Swept over every axis where an Allow and a Deny can select the same key, not
+/// written for delete: see `OBJECT_OVERLAP_AXES` for the two axes whose domain
+/// is not a key and how the sweep fails closed on them instead.
+#[test]
+fn every_allow_deny_key_overlap_is_named_by_the_deny() {
+    let mut observed = Vec::new();
+    for role in ALL_ROLES {
+        observed.extend(assert_allow_deny_overlaps_are_named(&load_policy(role)));
+    }
+    observed.sort_unstable();
+    observed.dedup();
+    assert_eq!(
+        observed.as_slice(),
+        EXPECTED_OVERLAP_AXES,
+        "the set of (role, axis) pairs carrying an Allow/Deny key overlap is not \
+         the one EXPECTED_OVERLAP_AXES records. A missing pair means the \
+         containment above now checks nothing where it used to check the \
+         legal-hold shard; a new pair means an Allow and a Deny began covering a \
+         common key on an axis where they did not"
+    );
+}
+
+/// The containment assertion in both directions, on synthetic policies, so
+/// neither direction rests on the shipped templates happening to be correct.
+///
+/// Case 1 is the shape that must stay accepted: a Deny naming MORE operations
+/// than the overlapping Allow grants. Asserting the two action sets are EQUAL
+/// would reject it, and equality is a stronger condition than the property
+/// needs.
+///
+/// Case 2 is the finding itself, reproduced in miniature: an Allow granting a
+/// delete operation the overlapping Deny does not name.
+#[test]
+fn deny_broader_than_the_allow_is_accepted_and_narrower_is_not() {
+    let hold_shard = format!("{BUCKET_KEY_PREFIX}t/*/u/*/0000/*");
+    let level_zero = format!("{BUCKET_KEY_PREFIX}t/*/*/l0/*");
+
+    let policy = |allow_actions: serde_json::Value, deny_actions: serde_json::Value| {
+        build_policy(
+            "fixture",
+            "<synthetic>",
+            &serde_json::json!({
+                "Statement": [
+                    {
+                        "Sid": "LevelDelete",
+                        "Effect": "Allow",
+                        "Action": allow_actions,
+                        "Resource": [level_zero],
+                    },
+                    {
+                        "Sid": "DenyDeleteProtected",
+                        "Effect": "Deny",
+                        "Action": deny_actions,
+                        "Resource": [hold_shard],
+                    },
+                ]
+            }),
+        )
+    };
+
+    // Case 1: Deny names both operations, the Allow grants one. Accepted, and
+    // the overlap is real -- the returned axis proves the check ran rather than
+    // finding nothing to check.
+    let broader = policy(
+        serde_json::json!("s3:DeleteObject"),
+        serde_json::json!(["s3:DeleteObject", "s3:DeleteObjectVersion"]),
+    );
+    assert_eq!(
+        assert_allow_deny_overlaps_are_named(&broader),
+        vec![("fixture", "delete")],
+        "fixture invalid: the Allow and the Deny were expected to cover a common \
+         legal-hold key, or case 1 proves nothing about a Deny broader than the \
+         Allow"
+    );
+
+    // Case 2: the same overlap with the operations swapped. Rejected, naming the
+    // operation the Deny leaves granted.
+    let narrower = policy(
+        serde_json::json!(["s3:DeleteObject", "s3:DeleteObjectVersion"]),
+        serde_json::json!("s3:DeleteObject"),
+    );
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_allow_deny_overlaps_are_named(&narrower)
+    }));
+    let message = panic_message(
+        failure.expect_err("a Deny that names less than the overlapping Allow must fail"),
+    );
+    assert!(
+        message.contains("s3:DeleteObjectVersion"),
+        "the failure must name the operation the Deny does not cover; got \
+         {message:?}"
+    );
 }
 
 /// Admin is GetObject-only per ADR-0055 (its only tenant-scoped writes are
@@ -3834,6 +4258,129 @@ fn empty_routed_write_set_is_not_a_skip() {
         failure.is_err(),
         "narrowing MaintainWrite to a non-routing resource must fail the routed \
          write guard, not silently skip maintain"
+    );
+}
+
+/// The routed-write guard's first failure branch: no PUT grant at all.
+///
+/// `assert_role_routed_writes_have_kms_grant` has three failure branches, and
+/// each is a distinct claim about a distinct policy shape. Only the empty-routed-set
+/// branch had a fixture; this one and the pattern-admits-routed-keys branch below
+/// existed only at their definition sites, so a rewrite that turned either back
+/// into a skip would have gone unnoticed.
+///
+/// The shape is a role whose PutObject grant was dropped or moved to a field no
+/// axis reads. Pre-empty-set-fix that emptied `routed` too and skipped the role;
+/// the dedicated assertion distinguishes it, so the message says the write grant
+/// is gone rather than that it routes nowhere.
+#[test]
+fn empty_put_set_fails_the_routed_write_guard() {
+    let read_only = build_policy(
+        "fixture",
+        "<synthetic>",
+        &serde_json::json!({
+            "Statement": [{
+                "Sid": "ReadOnly",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": [format!("{BUCKET_KEY_PREFIX}t/*/*/l0/*")],
+            }]
+        }),
+    );
+    assert!(
+        put_resource_key_patterns(&read_only).is_empty(),
+        "fixture invalid: this policy was expected to grant s3:PutObject on \
+         nothing"
+    );
+
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_role_routed_writes_have_kms_grant(&read_only)
+    }));
+    let message =
+        panic_message(failure.expect_err("a policy with no PUT grant must fail, not pass"));
+    assert!(
+        message.contains("grants s3:PutObject on nothing"),
+        "the failure must say the PUT set was empty, not that it routes nowhere; \
+         got {message:?}"
+    );
+}
+
+/// The routed-write guard's third failure branch: a PUT pattern that does not
+/// itself parse as a routed tenant key yet admits routed keys.
+///
+/// This is the hole-ten property on the routing axis. `t/*` is not a routed key
+/// (`routes_through_tenant_key` needs a non-empty hash segment FOLLOWED BY a
+/// slash, and `t/*` has no second slash), but as a glob it matches every tenant
+/// key, so a role holding it can PUT routed objects while the KMS requirement is
+/// decided on the pattern's own text and comes out false.
+///
+/// Reaching the branch takes a two-element resource list: the guard asserts a
+/// non-empty routed set first, so a policy whose only PUT pattern is `t/*` fails
+/// at the branch above instead. The routing element makes the routed set
+/// non-empty, and `t/*` then trips this branch.
+#[test]
+fn non_routing_put_pattern_admitting_routed_keys_fails_the_routed_write_guard() {
+    let kms_statement = serde_json::json!({
+        "Sid": "FixtureTenantKms",
+        "Effect": "Allow",
+        "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
+        "Resource": [TENANT_KMS_KEY_ARN],
+    });
+    let write_statement = |resources: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "FixtureWrite",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": resources,
+        })
+    };
+
+    // The same policy without the `t/*` element passes, so the branch below is
+    // fired by that element and not by anything else in the fixture.
+    let routing_only = build_policy(
+        "fixture",
+        "<synthetic>",
+        &serde_json::json!({
+            "Statement": [
+                write_statement(serde_json::json!([format!("{BUCKET_KEY_PREFIX}t/*/*/l1/*")])),
+                kms_statement.clone(),
+            ]
+        }),
+    );
+    assert_role_routed_writes_have_kms_grant(&routing_only);
+
+    let admits_routed = build_policy(
+        "fixture",
+        "<synthetic>",
+        &serde_json::json!({
+            "Statement": [
+                write_statement(serde_json::json!([
+                    format!("{BUCKET_KEY_PREFIX}t/*/*/l1/*"),
+                    format!("{BUCKET_KEY_PREFIX}t/*"),
+                ])),
+                kms_statement,
+            ]
+        }),
+    );
+    assert!(
+        !ravel_object_store::routes_through_tenant_key("t/*")
+            && key_domain()
+                .iter()
+                .any(|key| glob_matches("t/*", key.as_str())
+                    && ravel_object_store::routes_through_tenant_key(key.as_str())),
+        "fixture invalid: `t/*` must not parse as a routed key while still \
+         admitting one, or this case does not reach the branch it is written for"
+    );
+
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_role_routed_writes_have_kms_grant(&admits_routed)
+    }));
+    let message = panic_message(
+        failure.expect_err("a PUT pattern admitting routed keys it does not parse as must fail"),
+    );
+    assert!(
+        message.contains("yet it admits routed keys"),
+        "the failure must name the pattern-versus-key gap; got {message:?}"
     );
 }
 
