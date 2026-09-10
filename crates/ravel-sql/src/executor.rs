@@ -94,6 +94,7 @@ use futures::{Stream, StreamExt};
 use ravel_catalog::{Catalog, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_promql::{LabelMatcher, MatchOp};
+use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::{
     LogSegmentFetcher, QueryError, RequestBudgets, SegmentAdmission, SegmentFetcher, admit,
     request_budget_exceeded,
@@ -545,6 +546,31 @@ pub struct SqlOutcome {
     /// spilled 4 files" are different findings that a pooled total cannot tell
     /// apart.
     pub spill_by_operator: Vec<OperatorSpill>,
+    /// Which signal this statement read, resolved from its `FROM` clause. The
+    /// same value [`ExplainReport::target`] carries for the same text.
+    ///
+    /// One of the three resolve inputs a paging cursor pins (ADR-1374 D5).
+    /// They are surfaced here, on the outcome, rather than being re-derived by
+    /// the caller: a cursor is only sound if it pins what the query that
+    /// produced the page actually ran against, and a second resolution at mint
+    /// time could see a different snapshot, a different declared set, or a
+    /// newer erasure.
+    pub target: TargetSignal,
+    /// The tenant's declared column set as this query resolved it, in the
+    /// order [`crate::DeclaredColumnSource`] returned. Empty for a tenant with
+    /// no declarations.
+    ///
+    /// A cursor pins this set and D5 expires a cursor whose redemption sees a
+    /// different one, because a declaration changes what the same statement
+    /// projects.
+    pub declared_columns: Vec<DeclaredColumn>,
+    /// The erasure predicates pending in the snapshot this query read, from
+    /// the attempt that succeeded.
+    ///
+    /// A cursor pins these and D5 expires a cursor once a newer intersecting
+    /// erasure is in force, so a later page cannot return rows an erasure
+    /// accepted between pages.
+    pub pending_erasure: Vec<ErasurePredicate>,
 }
 
 /// A shared, cloneable view of the [`QueryAccounting`] for the query currently
@@ -987,6 +1013,12 @@ impl SqlExecutor {
         // one instant together.
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
 
+        // Resolved from the statement text alone, so it is attempt-independent
+        // and identical to what `explain` reports for the same text. Resolved
+        // before the loop so a cross-signal statement fails here rather than
+        // after a snapshot resolve has already been paid for.
+        let target = Self::target_signal(&req.sql)?;
+
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
         // (ADR-0044): a discarded first attempt's counts must never bleed
@@ -1007,6 +1039,10 @@ impl SqlExecutor {
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = snapshot.segments.len();
+            // Read off this attempt's snapshot, before it is moved into
+            // `attempt`, so it describes the snapshot the returned rows were
+            // read from and not one a retry resolved afterwards.
+            let pending_erasure = snapshot_pending_erasure_predicates(&snapshot);
 
             let (result, emitted, blocks, spill, spill_by_operator, caps) = self
                 .attempt(tenant_hash, req, snapshot, &accounting, &declared)
@@ -1034,6 +1070,9 @@ impl SqlExecutor {
                         accounting: accounting.snapshot(),
                         estimate,
                         spill_by_operator,
+                        target,
+                        declared_columns: declared.clone(),
+                        pending_erasure,
                     });
                 }
                 Err(err) => match retry_decision(err.is_segment_not_found(), emitted, attempt) {
@@ -3408,6 +3447,8 @@ mod tests {
     use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
     use uuid::Uuid;
 
+    use crate::declared::{DeclaredType, StaticDeclaredColumns};
+
     use super::*;
 
     fn empty_store() -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
@@ -3755,6 +3796,87 @@ mod tests {
                 matches!(err, SqlError::CrossSignalQuery),
                 "expected CrossSignalQuery for {sql:?}, got {err:?}"
             );
+        }
+    }
+
+    /// ADR-1374 D5: a cursor pins the declared column set the query it paged
+    /// resolved, so [`SqlOutcome::declared_columns`] carries that set and not
+    /// one a later resolution might see. Asserts the exact set for a tenant
+    /// with declarations and the exact empty set for a tenant with none, over
+    /// the same statement and the same store.
+    #[tokio::test]
+    async fn outcome_declared_columns_are_the_tenants_declared_set() {
+        let declared = vec![
+            DeclaredColumn::new("http_status", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+        ];
+        let store = empty_store();
+        let executor = executor_over(store.clone())
+            .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.clone())));
+        let request = sql_request(
+            "SELECT ts FROM logs",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 2_000,
+            },
+        );
+
+        let outcome = executor
+            .execute(TenantHash([7u8; 16]), &request)
+            .await
+            .expect("a logs query over an empty store succeeds");
+        assert_eq!(
+            outcome.declared_columns, declared,
+            "the outcome must carry the tenant's declared set, in source order"
+        );
+
+        // Same statement, same store, no declared source: the default source
+        // declares nothing, so the set is exactly empty.
+        let bare = executor_over(store);
+        let bare_outcome = bare
+            .execute(TenantHash([7u8; 16]), &request)
+            .await
+            .expect("a logs query over an empty store succeeds");
+        assert_eq!(
+            bare_outcome.declared_columns,
+            Vec::<DeclaredColumn>::new(),
+            "a tenant with no declarations must carry an empty set"
+        );
+    }
+
+    /// ADR-1374 D5: a cursor pins the signal the query it paged resolved. The
+    /// outcome's target must therefore be the same value `explain` reports for
+    /// the same text, since the MCP adapter mints cursors from one and operators
+    /// read the other.
+    #[tokio::test]
+    async fn outcome_target_matches_the_explain_report_target() {
+        let store = empty_store();
+        let executor = executor_over(store);
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 2_000,
+        };
+        let tenant_hash = TenantHash([7u8; 16]);
+
+        for (sql, expected) in [
+            ("SELECT ts FROM logs", TargetSignal::Logs),
+            ("SELECT ts FROM samples", TargetSignal::Metrics),
+            ("SELECT trace_id FROM spans", TargetSignal::Spans),
+        ] {
+            let request = sql_request(sql, window);
+            let report = executor
+                .explain(tenant_hash, &request)
+                .await
+                .expect("explain succeeds over an empty store");
+            let outcome = executor
+                .execute(tenant_hash, &request)
+                .await
+                .expect("execute succeeds over an empty store");
+            assert_eq!(
+                outcome.target, report.target,
+                "outcome and explain must agree on the target for {sql:?}"
+            );
+            assert_eq!(outcome.target, expected, "unexpected target for {sql:?}");
         }
     }
 
