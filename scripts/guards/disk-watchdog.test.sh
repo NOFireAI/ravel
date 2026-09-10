@@ -385,12 +385,29 @@ check_eq "giving up does not print the success line" "absent" \
 # earlier case above only ever passed `1`, so it could not see this.
 SPELL="${TMP}/spelling"
 mkdir -p "${SPELL}"
-for word in true yes TRUE 1; do
+# Marker survival alone cannot tell ACCEPTED from REFUSED: a refused value
+# leaves the marker present too, so `bogus` would satisfy it. Assert the run
+# actually performed a dry run as well, or a future edit moving `true` into
+# the refuse arm keeps these green.
+for word in true yes TRUE; do
   echo "fired_at=1999-01-01T00:00:00Z" > "${SPELL}/.disk-watchdog-fired"
-  WATCHDOG_DRY_RUN="${word}" timeout 10 "${WATCHDOG}" "${SPELL}" 999999 1000000 1 >/dev/null 2>&1
+  out="$(WATCHDOG_DRY_RUN="${word}" timeout 10 "${WATCHDOG}" "${SPELL}" 999999 1000000 1 2>&1)"; rc=$?
+  check_eq "a dry run spelled '${word}' is accepted" "0" "${rc}"
+  check_contains "'${word}' really ran as a dry run" "DRY RUN" "${out}"
   check_eq "a dry run spelled '${word}' keeps the marker" "present" \
     "$([[ -e "${SPELL}/.disk-watchdog-fired" ]] && echo present || echo absent)"
 done
+
+# Set but EMPTY is refused, not treated as off. `${VAR:-0}` used to substitute
+# the default here, so the empty arm was unreachable and an empty value armed
+# for real and deleted the marker. Off is the destructive branch, so an
+# ambiguous value must not select it.
+echo "fired_at=1999-01-01T00:00:00Z" > "${SPELL}/.disk-watchdog-fired"
+out="$(WATCHDOG_DRY_RUN= timeout 10 "${WATCHDOG}" "${SPELL}" 999999 1000000 1 2>&1)"; rc=$?
+check_eq "an empty dry-run value is refused" "2" "${rc}"
+check_contains "it says the value was empty" "set but empty" "${out}"
+check_eq "an empty value touches no marker" "present" \
+  "$([[ -e "${SPELL}/.disk-watchdog-fired" ]] && echo present || echo absent)"
 # An unrecognised value is refused rather than silently meaning "not a dry
 # run", which is what let `=true` through as a real arming run.
 echo "fired_at=1999-01-01T00:00:00Z" > "${SPELL}/.disk-watchdog-fired"
@@ -413,8 +430,20 @@ rm -f "${SPELL}/.disk-watchdog-fired"
 # not one.
 NOLSOF="${TMP}/nolsof-bin"
 mkdir -p "${NOLSOF}"
-for tool in df awk ps sed head kill sleep printf date rm timeout; do
-  src="$(command -v "${tool}" 2>/dev/null)" || continue
+for tool in df awk ps sed head sleep date rm timeout; do
+  src="$(command -v "${tool}" 2>/dev/null)"
+  # An external binary that is missing means the fixture cannot pose the
+  # question. `|| continue` degraded silently: without GNU timeout the lsof
+  # case failed at 127 rather than 2, and nothing said the fixture was
+  # incomplete. `kill` and `printf` are deliberately absent from this list:
+  # they are shell builtins, so `command -v` returns the bare name and the
+  # symlink would dangle.
+  if [ -z "${src}" ] || [ ! -x "${src}" ]; then
+    printf 'FAIL  %-52s fixture needs %s and it is not on PATH\n' \
+      "no-lsof fixture" "${tool}"
+    fails=$((fails + 1))
+    continue
+  fi
   ln -sf "${src}" "${NOLSOF}/${tool}"
 done
 check_eq "fixture PATH really has no lsof" "absent" \

@@ -61,11 +61,26 @@ fi
 # took the arming path, DELETED the marker a session had come to read, then
 # looped above the floor printing nothing: one character from the documented
 # spelling, landing on the exact property the dry run exists to protect.
-case "${WATCHDOG_DRY_RUN:-0}" in
-    ''|0|false|no|FALSE|NO) dry_run=0 ;;
+#
+# `${VAR-0}` without the colon, so a variable that is SET AND EMPTY reaches
+# the case as the empty string instead of being substituted to `0`. With the
+# colon the empty arm below was unreachable and an empty value armed for
+# real, deleting the marker. Empty is refused rather than treated as off,
+# because here "off" is the DESTRUCTIVE branch: it clears the marker and
+# kills. The usual "empty means off" idiom is safe only when off is the
+# passive choice, and the realistic way to produce an empty value is a
+# wrapper forwarding `"${DRY:-}"`, which is the same near-miss shape as
+# `=true`.
+case "${WATCHDOG_DRY_RUN-0}" in
+    0|false|no|FALSE|NO) dry_run=0 ;;
     1|true|yes|TRUE|YES) dry_run=1 ;;
+    '')
+        echo "watchdog: WATCHDOG_DRY_RUN is set but empty; use 1 or 0" >&2
+        exit 2
+        ;;
     *)
-        echo "watchdog: unrecognised WATCHDOG_DRY_RUN='${WATCHDOG_DRY_RUN}'; use 1 or 0" >&2
+        printf 'watchdog: unrecognised WATCHDOG_DRY_RUN=%s; use 1 or 0\n' \
+            "${WATCHDOG_DRY_RUN}" >&2
         exit 2
         ;;
 esac
@@ -196,9 +211,21 @@ while :; do
         done
         # The loop kills on its last iteration and then exits without looking
         # again, so `remaining` still holds the pre-kill snapshot: a kill that
-        # worked was reported as "gave up". One more scan. This can only ever
-        # have produced a false alarm, never a false success, but a guard that
-        # cries wolf on its own success stops being read.
+        # worked was reported as "gave up".
+        #
+        # A full re-scan, not `kill -0` on the pids just signalled. `kill -0`
+        # was tried and is wrong here: it answers "did THOSE pids die", and
+        # the thing this loop exists to catch is a build that keeps putting
+        # new processes into the scope, where the old pids are indeed gone
+        # and the volume is still draining. It turned three give-up cases
+        # green by reporting success against a live respawning fixture.
+        #
+        # The cost of re-scanning is one more chance for a spurious empty
+        # answer to override five correct observations of survivors. That is
+        # the dangerous direction, and it is accepted deliberately: missing a
+        # respawn means the watchdog reports success while the volume fills,
+        # which is the failure it exists to prevent, and a spurious empty
+        # needs lsof to fail exactly once at exactly that moment.
         if [ -n "${remaining:-}" ]; then
             sleep 2
             remaining=$(scoped_pids | sed 's/ *$//')
