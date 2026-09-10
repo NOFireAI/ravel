@@ -219,6 +219,10 @@ jobs:
         run: scripts/guards/check-test-hygiene.sh
       - name: Injected-clock helper guard cases (issue #1260)
         run: bash scripts/tests/check-injected-clock-helpers.test.sh
+      # ci-sweep-cancelled.sh's timeout-vs-supersede discrimination (issue
+      # #1590). Stubbed gh, no network. Bash/jq/awk only, no toolchain.
+      - name: ci-sweep timeout-discrimination cases (issue #1590)
+        run: bash scripts/tests/ci-sweep-cancelled.test.sh
       - name: Injected-clock helper guard (issue #1260)
         run: bash scripts/check-injected-clock-helpers.sh
       # The merge-readiness script's own cases: its jq filters, its verdict
@@ -543,11 +547,28 @@ jobs:
       - name: Flight SQL tests
         run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
 
-  # Never-compiled feature combinations (ADR-0053 D6). Five cargo
-  # features are off by default and no other job builds them, so a break in
-  # any of them -- an unreachable e2e test path, four bench binaries that
-  # never link -- ships undetected. This lane proves each combination still
-  # compiles (`cargo check`), and for one of them also runs its tests:
+  # Never-compiled feature combinations (ADR-0053 D6). Cargo features that
+  # are off by default and no other job builds, so a break in any of them --
+  # an unreachable e2e test path, a bench binary that never links -- ships
+  # undetected. These lanes prove each combination still compiles
+  # (`cargo check`), and some also run their tests.
+  #
+  # Split across two jobs for CI headroom (issue #1590). The single
+  # `features` job took ~26m of a 30m cap on main (two consecutive runs:
+  # 26m14s, 26m17s), ~88% of budget before anyone adds a step, and a branch
+  # that added two cargo steps already died at 30m04s. The comment below the
+  # `timeout-minutes` setting recorded that these are "mutually non-sharing
+  # compile configurations ... with no shared incremental state", which is
+  # exactly the property that makes them safe to split: serialising them
+  # shared no cache, so running them as two parallel jobs loses nothing and
+  # halves the wall-clock a single job carries. The SQL-corpus lanes (which
+  # pull the datafusion tree AND run their tests, the heavier half) went to
+  # `features-sql`; the compile probes and the stage-timing test stayed here.
+  # Each job now does a strict subset of the previously-measured 26m, so the
+  # 30m cap carries real headroom on both. A tighter, per-job cap should
+  # follow once the split's own durations are measured on main.
+  #
+  # `features` lanes:
   #   - ravel-server --features otap            (links ravel-otap + arrow tree;
   #                                              the image lanes build it in
   #                                              release together with sql and
@@ -558,30 +579,36 @@ jobs:
   #   - ravel-bench --features profiling        (pprof/inferno flamegraph lane)
   #   - ravel-bench --features flight-lane      (ravel-sql/arrow-flight; the
   #                                              Flight SQL bench lane, PR #724)
-  #   - ravel-bench --features sql-latency      (ravel-sql; the SQL corpus and
-  #                                              its construct gate, ADR-0100)
-  #   - ravel-bench --features sql-latency,profiling,flight-lane (the widest
-  #                                              combination the ClickBench box
-  #                                              builds; RUNS its tests, #714/#732)
   #   - ravel-bench --features stage-timing     (ravel-ingest/stage-timing;
   #                                              per-stage ingest breakdown,
   #                                              ADR-0104. RUNS its test, does
   #                                              not merely compile it)
+  # `features-sql` lanes (defined below, after quickstart):
+  #   - ravel-bench --features sql-latency      (ravel-sql; the SQL corpus and
+  #                                              its construct gate, ADR-0100.
+  #                                              RUNS its tests)
+  #   - ravel-bench --features sql-latency,profiling,flight-lane (the widest
+  #                                              combination the ClickBench box
+  #                                              builds; RUNS its tests, #714/#732)
   #
   # `flight-sql` used to be probed here too. It moved to the `flight-sql` job
   # above, which lints and RUNS it: a compile-only probe let every test behind
   # that feature ship unexecuted.
   #
-  # This job is a required check (main's protect-main ruleset lists it), so a
-  # break here blocks a merge. A feature added to ravel-bench therefore
-  # belongs in the list above in the same change that adds the feature.
+  # Both jobs are required checks: main's protect-main ruleset lists `features`
+  # already, and must be updated to also list `features-sql` or the SQL-corpus
+  # lanes stop blocking a merge (see issue #1590 / this change's report). A
+  # feature added to ravel-bench belongs in whichever job's list above matches
+  # it, in the same change that adds the feature.
   features:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    # 30m, not 20m: four separate, mutually non-sharing compile
-    # configurations (arrow, parquet, object_store, datafusion, arrow-flight
-    # all appear across the four probes) with no shared incremental state.
+    # 30m: these lanes are mutually non-sharing compile configurations
+    # (arrow, parquet, object_store, datafusion, arrow-flight appear across
+    # them) with no shared incremental state. The SQL-corpus lanes moved to
+    # `features-sql` for headroom (issue #1590); what remains is a strict
+    # subset of the ~26m the whole job used to take, so 30m now has margin.
     timeout-minutes: 30
     env:
       RUSTC_WRAPPER: sccache
@@ -609,20 +636,6 @@ jobs:
         run: cargo check --locked -p ravel-bench --features profiling
       - name: Check ravel-bench --features flight-lane
         run: cargo check --locked -p ravel-bench --features flight-lane
-      - name: Check ravel-bench --features sql-latency
-        run: cargo check --locked -p ravel-bench --features sql-latency --all-targets
-        # The one lane here that also RUNS its tests. A compile probe is the
-        # right trade for a bench binary that only has to keep linking. It is
-        # the wrong trade for the SQL corpus, whose deliverable IS a
-        # test-enforced gate: every construct a corpus entry names must exist
-        # in the conformance registry as supported. A compile-only probe would
-        # let that gate rot while this lane stayed green, the same failure the
-        # flight-sql note above describes. The compile cost is already paid by
-        # the step above (same feature set, same target dir).
-      - name: Test ravel-bench --features sql-latency
-        run: cargo test --locked -p ravel-bench --features sql-latency
-      - name: Test ravel-bench --features sql-latency,profiling,flight-lane
-        run: cargo test --locked -p ravel-bench --features sql-latency,profiling,flight-lane
       - name: Check ravel-bench --features stage-timing
         run: cargo check --locked -p ravel-bench --features stage-timing --all-targets
         # RUN the stage-timing acceptance test, not merely compile it (ADR-0104
@@ -1715,3 +1728,52 @@ jobs:
       - name: Tear down the compose stack
         if: always() && steps.filter.outputs.run == 'true'
         run: docker compose -f "$COMPOSE_FILE" down -v || true
+
+  # SQL-corpus feature lanes, split out of `features` for CI headroom
+  # (issue #1590). See the comment block above the `features` job for the
+  # full rationale: the single job ran ~26m of a 30m cap, and these lanes --
+  # which pull the datafusion tree and RUN their tests -- are the heavier,
+  # non-cache-sharing half, so they parallelise cleanly rather than
+  # serialising. Placed here, at the end of the jobs list, deliberately away
+  # from the `features` / `supply-chain` boundary so it stays a disjoint hunk
+  # from PR #1583's `stage-timing` job. This job is NOT yet in main's
+  # protect-main ruleset; it must be added there for these lanes to block a
+  # merge.
+  features-sql:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    # 30m: a strict subset of the ~26m the undivided `features` job took, so
+    # this carries real headroom. Tighten once measured on main (issue #1590).
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Install sccache
+        id: sccache
+        continue-on-error: true
+        uses: ./.github/actions/setup-sccache
+      - name: Disable sccache if its install flaked
+        if: steps.sccache.outcome == 'failure'
+        run: echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check ravel-bench --features sql-latency
+        run: cargo check --locked -p ravel-bench --features sql-latency --all-targets
+        # The one lane here that only needs to keep compiling before its test
+        # runs. A compile probe is the right trade for a bench binary that only
+        # has to keep linking. It is the wrong trade for the SQL corpus, whose
+        # deliverable IS a test-enforced gate: every construct a corpus entry
+        # names must exist in the conformance registry as supported. A
+        # compile-only probe would let that gate rot while this lane stayed
+        # green, the same failure the flight-sql note above describes. The
+        # compile cost is already paid by this step (same feature set, same
+        # target dir) before the test step below.
+      - name: Test ravel-bench --features sql-latency
+        run: cargo test --locked -p ravel-bench --features sql-latency
+      - name: Test ravel-bench --features sql-latency,profiling,flight-lane
+        run: cargo test --locked -p ravel-bench --features sql-latency,profiling,flight-lane
