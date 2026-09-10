@@ -109,6 +109,36 @@ function substitutionBodies(text) {
   return bodies;
 }
 
+// A heredoc body is data, not shell. Statements split on newlines, so a
+// document that QUOTES a piped gate is otherwise refused line by line: the
+// commit message describing this rule could not be written by the tool that
+// writes commit messages. Only the body is dropped, so a real gate elsewhere
+// in the same command is still judged; exempting the whole command whenever
+// it contains `<<` is what the reserved-name rule did, and that let a real
+// `status=` through beside an unrelated heredoc.
+function stripHeredocBodies(text) {
+  const lines = text.split("\n");
+  const kept = [];
+  for (let i = 0; i < lines.length; i++) {
+    kept.push(lines[i]);
+    const opener = /<<(-?)\s*(["'])?([A-Za-z_][A-Za-z0-9_]*)\2?/g;
+    const delims = [];
+    let m;
+    while ((m = opener.exec(lines[i])) !== null) {
+      delims.push({ tag: m[3], dash: m[1] === "-" });
+    }
+    for (const d of delims) {
+      i++;
+      while (i < lines.length) {
+        const line = d.dash ? lines[i].replace(/^\t+/, "") : lines[i];
+        if (line === d.tag) break;
+        i++;
+      }
+    }
+  }
+  return kept.join("\n");
+}
+
 function splitStatements(command) {
   // Rough statement split. Over-splitting only weakens a rule; it never
   // invents a violation, because each rule needs its whole pattern in one
@@ -139,8 +169,9 @@ function scanTexts(command) {
   return texts;
 }
 
-function checkBash(command) {
-  if (typeof command !== "string" || command === "") return;
+function checkBash(rawCommand) {
+  if (typeof rawCommand !== "string" || rawCommand === "") return;
+  const command = stripHeredocBodies(rawCommand);
 
   for (const raw of scanTexts(command).flatMap(splitStatements)) {
     const stmt = raw.trim();
@@ -166,8 +197,10 @@ function checkBash(command) {
       );
     }
 
-    // A heredoc body is not shell, and scratchpad heredocs are allowed.
-    if (!command.includes("<<") && RESERVED_ASSIGN.test(stmt)) {
+    // Heredoc bodies are already gone, so this judges real shell only. The
+    // condition here used to be `!command.includes("<<")`, which exempted a
+    // reserved assignment sitting beside an unrelated heredoc.
+    if (RESERVED_ASSIGN.test(stmt)) {
       deny(
         "zsh reserves status, path, argv and PWD. Assigning to one fails " +
           "with `read-only variable` and silently kills the enclosing " +

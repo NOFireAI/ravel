@@ -89,6 +89,41 @@ check allow "timeout on a non-gate"            "$(bash_payload 'timeout 5 curl -
 check allow "git log into head"               "$(bash_payload 'git log --oneline | head -5')"
 check allow "grepping a saved gate log"       "$(bash_payload 'grep -c FAILED /tmp/gate.log')"
 
+# --- heredoc bodies are data, not shell ----------------------------------
+#
+# Every payload above is a single line, which is why this class was invisible.
+# Statements split on newlines, so a document QUOTING a piped gate was refused
+# line by line: the commit message describing these very rules could not be
+# written by the tool that writes commit messages. The exemption has to drop
+# the BODY rather than the whole command, since `command.includes("<<")` also
+# excuses a real gate that happens to share a call with a heredoc.
+gate_pipe='cargo test -p ravel-sql | tail -5'
+check allow "a heredoc body quoting a piped gate" \
+  "$(bash_payload "cat > /tmp/c.md <<'EOF'
+${gate_pipe} was allowed because timeout was not a prefix.
+EOF")"
+check allow "a heredoc body quoting a piped suite" \
+  "$(bash_payload "cat > /tmp/c.md <<'EOF'
+bash scripts/guards/disk-watchdog.test.sh | tail -25 said nothing.
+EOF")"
+check allow "an unquoted heredoc delimiter" \
+  "$(bash_payload "cat > /tmp/c.md <<EOF
+${gate_pipe}
+EOF")"
+check deny  "a real piped gate on a later line" \
+  "$(bash_payload "echo hi
+${gate_pipe}")"
+check deny  "a heredoc beside a real piped gate" \
+  "$(bash_payload "cat > /tmp/c.md <<'EOF'
+harmless text
+EOF
+${gate_pipe}")"
+check deny  "a reserved name beside a heredoc" \
+  "$(bash_payload "cat > /tmp/c.md <<'EOF'
+harmless text
+EOF
+status=0")"
+
 # --- zsh reserved names -------------------------------------------------
 check deny  "bare status="                    "$(bash_payload 'status=0')"
 check deny  "local status="                   "$(bash_payload 'run_it || local status=$?')"
