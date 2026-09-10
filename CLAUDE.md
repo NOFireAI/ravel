@@ -347,6 +347,12 @@ there before changing a rule.
   `linking with cc failed` (errno 28) that reads as a code bug, and a full
   disk can break the harness's own output capture so nothing runs at all.
   `FLEET_DISK_REAP=1` auto-runs `disk-reap.sh -y` when below the floor.
+  Exit 1 is "below the floor, or the path is unreadable"; exit 2 is an
+  argument it cannot use, which today means a directory argument that was
+  passed and is empty. That is a caller whose variable did not survive,
+  not a caller asking for the default, and `${1:-.}` cannot tell the two
+  apart: it measured the current directory and passed about a volume the
+  caller was never going to write to.
   The check proves headroom at one instant, not for the duration of the
   build. A session that read 82 GB free, started a cold gate, and took
   the volume to 886 MiB still passed this guard: another session was

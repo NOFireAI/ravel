@@ -11,6 +11,16 @@
 # Set FLEET_DISK_REAP=1 to auto-run scripts/disk-reap.sh -y when below floor.
 set -u
 
+# An argument that was passed and is empty is a caller whose variable did not
+# survive, not a caller asking for the default. `${1:-.}` cannot tell the two
+# apart, so the guard checked the current directory, found it healthy and
+# exited 0 about a volume the caller was never going to write to. The shape
+# that produced it: a shell variable set in one tool call and read in the
+# next, where each call is its own shell.
+if [ "$#" -ge 1 ] && [ -z "$1" ]; then
+  echo "guard: empty directory argument; pass a path or none at all" >&2
+  exit 2
+fi
 dir=${1:-.}
 min_gb=${2:-20}
 
