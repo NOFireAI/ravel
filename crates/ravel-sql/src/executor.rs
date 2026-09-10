@@ -3417,7 +3417,7 @@ mod tests {
         )))
     }
 
-    /// CodeRabbit finding on PR #1424 (comment 3952989200), SQL side: a
+    /// SQL side of the resolve-time request-budget gap: a
     /// statement whose snapshot resolves to zero segments never reaches the
     /// segment-fetch loop in scan.rs, so the incremental `max_s3_requests`
     /// check there never runs. A caller-lowered budget of zero (ADR-1374
