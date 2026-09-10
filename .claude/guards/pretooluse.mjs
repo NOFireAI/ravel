@@ -48,15 +48,17 @@ function readStdin() {
 const GATE_HEAD =
   /^(cargo\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
 // Things that may legitimately precede a gate on the same command line.
-// A bare assignment may precede a gate (`FOO=1 cargo test`). A command
-// substitution assignment is stripped too, but as its own alternative, so the
-// command INSIDE it is what gets matched: `out=$(scripts/guards/x.sh | tail
-// -1)` is a masked guard whose exit code the caller then reads, and a single
-// `[^\s]+` value swallowed `out=$(scripts/guards/x.sh` whole, leaving the
-// pipe unseen. Ordered before the bare-assignment alternative, which is
-// guarded against `$(` so it cannot re-swallow it.
+// A bare assignment may precede a gate (`FOO=1 cargo test`). One plain
+// alternative for it: an earlier version added a separate `NAME=$(`
+// alternative so the command inside a substitution would be matched, and
+// that made `FOO=$(date) cargo test | tail -1` ALLOW, because the prefix
+// consumed `FOO=$(` and left `date) cargo test`, which is not a gate. The
+// substitution case does not need an alternative here at all; `scanTexts`
+// scans substitution bodies as commands in their own right, and
+// `blankSubstitutions` below collapses a substitution to one word so the
+// gate AFTER it is still seen.
 const HARMLESS_PREFIX =
-  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=\$\(|[A-Za-z_][A-Za-z0-9_]*=(?!\$\()[^\s]*|timeout(\s+-[A-Za-z-]+)*\s+\d+(\.\d+)?[smhd]?|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh|if|while|until|!)\s*)+/;
+  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=[^\s]*|timeout(\s+-[A-Za-z-]+(=[^\s]+)?)*(\s+\d+[smhd]?)?\s+\d+(\.\d+)?[smhd]?|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh|if|while|until|!)\s*)+/;
 const MASKING_FILTER = /^\s*(tail|head|grep|rg|sed)\b/;
 const MASKING_ECHO = /&&\s*echo\b/;
 
@@ -116,27 +118,86 @@ function substitutionBodies(text) {
 // in the same command is still judged; exempting the whole command whenever
 // it contains `<<` is what the reserved-name rule did, and that let a real
 // `status=` through beside an unrelated heredoc.
+// Fails closed: a body is dropped only once its terminator is actually
+// found. An earlier version consumed to end-of-input when no terminator
+// existed, which silently deleted every remaining line from every rule. A
+// herestring (`<<<WORD`) and a bare `<<` inside a quoted string both matched
+// as openers, so `git commit -m "use << HEAD trick"` followed by a piped gate
+// disabled the guard for the rest of the command. That is this rule's own
+// motivating case, quoting shell in a commit message, turned into a hole.
 function stripHeredocBodies(text) {
   const lines = text.split("\n");
   const kept = [];
   for (let i = 0; i < lines.length; i++) {
     kept.push(lines[i]);
-    const opener = /<<(-?)\s*(["'])?([A-Za-z_][A-Za-z0-9_]*)\2?/g;
+    const opener = /(?<!<)<<(?!<)(-?)\s*(["'])?([A-Za-z_][A-Za-z0-9_]*)\2?/g;
     const delims = [];
     let m;
     while ((m = opener.exec(lines[i])) !== null) {
       delims.push({ tag: m[3], dash: m[1] === "-" });
     }
     for (const d of delims) {
-      i++;
-      while (i < lines.length) {
-        const line = d.dash ? lines[i].replace(/^\t+/, "") : lines[i];
+      let j = i + 1;
+      while (j < lines.length) {
+        const line = d.dash ? lines[j].replace(/^\t+/, "") : lines[j];
         if (line === d.tag) break;
-        i++;
+        j++;
       }
+      // No terminator: this was not a heredoc opener. Keep the lines.
+      if (j >= lines.length) break;
+      i = j;
     }
   }
   return kept.join("\n");
+}
+
+// Collapse a command substitution to a single whitespace-free token, for the
+// prefix decision only. An assignment whose VALUE is a substitution is then
+// one word, so the gate after the closing paren is still seen, and a value
+// containing a space (`TS=$(date +%s) cargo test | tail -1`) no longer hides
+// it either. The bodies themselves are scanned separately by `scanTexts`, so
+// nothing is lost by blanking them here.
+function blankSubstitutions(text) {
+  let out = "";
+  let sq = false;
+  let dq = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\" && !sq) {
+      out += text.slice(i, i + 2);
+      i++;
+      continue;
+    }
+    if (c === "'" && !dq) {
+      sq = !sq;
+      out += c;
+      continue;
+    }
+    if (c === '"' && !sq) {
+      dq = !dq;
+      out += c;
+      continue;
+    }
+    if (!sq && c === "$" && text[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < text.length && depth > 0; j++) {
+        if (text[j] === "(") depth++;
+        else if (text[j] === ")") depth--;
+      }
+      out += "SUB";
+      i = j - 1;
+      continue;
+    }
+    if (!sq && c === "`") {
+      const end = text.indexOf("`", i + 1);
+      out += "SUB";
+      i = end === -1 ? text.length : end;
+      continue;
+    }
+    out += c;
+  }
+  return out;
 }
 
 function splitStatements(command) {
@@ -152,7 +213,9 @@ function splitPipeline(stmt) {
 }
 
 function startsWithGate(fragment) {
-  return GATE_HEAD.test(fragment.replace(HARMLESS_PREFIX, ""));
+  return GATE_HEAD.test(
+    blankSubstitutions(fragment).replace(HARMLESS_PREFIX, ""),
+  );
 }
 
 // The command itself plus every command substitution nested inside it. The
