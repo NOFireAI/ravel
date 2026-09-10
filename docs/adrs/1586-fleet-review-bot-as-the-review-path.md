@@ -137,11 +137,12 @@ enforced in the bot rather than here.
 
 Nothing in this repository authorizes, configures or runs a review any more,
 so there is no repository-side surface to keep correct, and no credential in a
-repository environment. One protected environment created for the old path
-outlives this change: it holds a credential no workflow can reach any more,
-and it should be deleted once that key is revoked at the vendor. That is an
-operator action outside a pull request, and #1586 names the environment and
-tracks it.
+repository environment. The protected environment the old path used was
+deleted on 2026-09-10; it held zero secrets when it went, so this repository
+never stored the reviewing credential by the end, whatever it held while the
+workflow ran. A key minted in the vendor's own dashboard is not visible from
+here and is revoked there, which is the one part of this retirement that no
+change to this repository can carry out.
 
 The trigger is a comment, so a reviewer's absence is silent by construction.
 That is why decision 5 exists: a merge check that only asked "is there a
