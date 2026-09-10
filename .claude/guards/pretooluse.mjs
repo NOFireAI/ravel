@@ -41,8 +41,12 @@ function readStdin() {
 
 // Commands whose exit code is a gate. Matched only in command position, so
 // a gate name quoted inside a grep pattern is not a gate.
+// A guard's own test suite is a gate too: its exit code is the evidence that
+// a change to the guard is safe, and `[a-z0-9-]+\.sh` did not match
+// `disk-watchdog.test.sh`, whose extra dot falls outside the class. Both
+// guard directories are listed; the hook itself lives under `.claude`.
 const GATE_HEAD =
-  /^(cargo\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9-]+\.sh))\b/;
+  /^(cargo\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
 // Things that may legitimately precede a gate on the same command line.
 // A bare assignment may precede a gate (`FOO=1 cargo test`). A command
 // substitution assignment is stripped too, but as its own alternative, so the
@@ -52,7 +56,7 @@ const GATE_HEAD =
 // pipe unseen. Ordered before the bare-assignment alternative, which is
 // guarded against `$(` so it cannot re-swallow it.
 const HARMLESS_PREFIX =
-  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=\$\(|[A-Za-z_][A-Za-z0-9_]*=(?!\$\()[^\s]*|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh|if|while|until|!)\s*)+/;
+  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=\$\(|[A-Za-z_][A-Za-z0-9_]*=(?!\$\()[^\s]*|timeout(\s+-[A-Za-z-]+)*\s+\d+(\.\d+)?[smhd]?|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh|if|while|until|!)\s*)+/;
 const MASKING_FILTER = /^\s*(tail|head|grep|rg|sed)\b/;
 const MASKING_ECHO = /&&\s*echo\b/;
 

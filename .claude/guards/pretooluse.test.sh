@@ -74,6 +74,18 @@ check allow "the text of a gate pipe, quoted"  "$(bash_payload "echo 'cargo test
 check allow "an unpiped guard in a quoted sub" "$(bash_payload 'out="$(scripts/guards/assert-fresh-merge-base.sh 1556)"')"
 check allow "jq inside a quoted substitution"  "$(bash_payload 'n="$(cargo metadata --format-version 1 | jq -r .packages)"')"
 
+# Both of these were run for real by this session on 2026-09-10, minutes after
+# the substitution hole above was closed, and both reported an empty exit code
+# through a `tail`. `timeout` was not a recognised prefix, and a guard's own
+# test suite did not match the guard pattern because `disk-watchdog.test.sh`
+# carries a second dot.
+check deny  "a gate behind timeout"            "$(bash_payload 'timeout 60 scripts/gates.sh | tail -5')"
+check deny  "a guard suite behind timeout+bash" "$(bash_payload 'timeout 300 bash scripts/guards/disk-watchdog.test.sh | tail -25')"
+check deny  "a guard test suite piped"         "$(bash_payload 'bash scripts/guards/disk-watchdog.test.sh | tail -25')"
+check deny  "the hook's own suite piped"       "$(bash_payload 'bash .claude/guards/pretooluse.test.sh | tail -5')"
+check allow "a guard suite redirected"         "$(bash_payload 'bash scripts/guards/disk-watchdog.test.sh > /tmp/w.txt 2>&1')"
+check allow "timeout on a non-gate"            "$(bash_payload 'timeout 5 curl -s https://example.com | head -3')"
+
 check allow "git log into head"               "$(bash_payload 'git log --oneline | head -5')"
 check allow "grepping a saved gate log"       "$(bash_payload 'grep -c FAILED /tmp/gate.log')"
 
