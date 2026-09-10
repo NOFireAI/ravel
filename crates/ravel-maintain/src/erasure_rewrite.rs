@@ -2947,6 +2947,8 @@ mod tests {
             input_sample_count: 0,
             output_sample_count: 0,
             drops: Vec::new(),
+            exemplars_kept: 0,
+            exemplars_dropped: 0,
         };
 
         let err = publish_rewrite_record(
