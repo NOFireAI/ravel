@@ -232,6 +232,11 @@ impl DedupStream {
         // grows with the row count. Compact it back to one entry per distinct
         // series the flushed rows reference; the schema and every decoded
         // label set are unchanged.
+        //
+        // The oversized dictionary is still materialized transiently by the
+        // `concat_batches` call above, before compaction shrinks it: this
+        // fixes the wire cost (the flushed, compacted batch), not the peak
+        // allocation cost of concatenating the uncompacted slices.
         let mut columns = batch.columns().to_vec();
         columns[COL_LABELS] = crate::labels::compact_labels(&columns[COL_LABELS])?;
         let batch = RecordBatch::try_new(Arc::clone(&self.schema), columns)

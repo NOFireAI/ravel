@@ -53,6 +53,13 @@ pub fn build_labels_dict(distinct: &[LabelSet], keys: &[i32]) -> Result<ArrayRef
 /// by content, so the result carries exactly one entry per distinct label set
 /// referenced by a non-null row, bounded by the distinct series in the batch
 /// regardless of how many rows reference them.
+///
+/// `concat_batches`'s own dictionary handling cannot do this instead: Arrow's
+/// dictionary-value merge (`should_merge_dictionary_values`, arrow-select) only
+/// considers byte-array and primitive value types and short-circuits for
+/// anything else. This column's dictionary values are `Map`, so that merge can
+/// never fire here, at any batch size or flush threshold -- it is not a matter
+/// of scale.
 pub fn compact_labels(labels: &ArrayRef) -> Result<ArrayRef, SqlError> {
     let dict = labels
         .as_any()

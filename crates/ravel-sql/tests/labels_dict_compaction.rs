@@ -323,21 +323,32 @@ async fn compaction_preserves_every_rows_label_set() {
     assert_eq!(checked, 24 * 60, "every written sample must appear once");
 }
 
-/// Client-boundary size: at the 25-series / 60,000-row shape the diagnosis
-/// measured a ~5.87 MB single Arrow IPC body, the post-fix largest single
-/// batch body must fit inside the 4 MiB a stock Flight client allows.
+/// Client-boundary size: a `SELECT labels` result whose dedup flush straddles
+/// a scan-batch boundary must still fit inside the 4 MiB a stock Flight
+/// client allows.
+///
+/// The corpus shape is load-bearing: 25 series x 2400 samples (few series,
+/// many samples each) never straddles a scan batch, because the 8192-row
+/// scan batch (`BATCH_ROWS`, crates/ravel-sql/src/scan.rs) holds only a
+/// handful of distinct series and the 1024-row dedup flush (`FLUSH_ROWS`,
+/// dedup.rs) never spans two of them, so that shape passes even against
+/// unfixed code and pins nothing. 500 series x 20 samples each (many series,
+/// few samples) matches the production shape instead: an 8192-row scan batch
+/// spans hundreds of distinct series, so a 1024-row flush straddles two scan
+/// batches and carries over a full source dictionary from the first plus the
+/// second batch's own dictionary, which is exactly the oversized-dictionary
+/// case the fix compacts away.
 #[tokio::test]
 async fn largest_ipc_body_fits_a_stock_flight_client() {
     const FOUR_MIB: usize = 4 * 1024 * 1024;
 
-    // 25 series x 2400 samples = 60,000 rows, the shape the diagnosis measured
-    // a ~5.87 MB single Arrow IPC body at before the fix.
-    let series = varied_corpus(25, 2400);
+    // 500 series x 20 samples = 10,000 winner rows.
+    let series = varied_corpus(500, 20);
     let batches = run(&series).await;
     assert_eq!(
         batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-        60_000,
-        "corpus must produce exactly 60,000 winner rows"
+        10_000,
+        "corpus must produce exactly 10,000 winner rows"
     );
 
     let schema = batches[0].schema();
