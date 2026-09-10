@@ -228,6 +228,12 @@ jobs:
       # without anything noticing.
       - name: pr-review-status.sh cases
         run: bash scripts/pr-review-status.test.sh
+      # Requires lsof, which is what reads a process cwd and is the entire
+      # scoping property; the guard refuses to run without it. If this step
+      # fails on the runner for that reason, that is worth knowing, because
+      # CLAUDE.md tells sessions to arm the guard and it would be inert.
+      - name: Disk-watchdog guard cases
+        run: bash scripts/guards/disk-watchdog.test.sh
       - name: Python script unit tests
         run: make test-python
 
