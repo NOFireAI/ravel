@@ -113,6 +113,9 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Rspan { .. }
         | Command::Store { .. }
         | Command::Idem { .. }
+        // `inspect cstat` takes an explicit object key, exactly like
+        // `segment inspect`/`rlog inspect`: no tenant to hash.
+        | Command::Inspect { .. }
         // `tenancy show` decodes the marker itself and takes no `--tenant`;
         // `tenancy resolve` (issue #1180) resolves the scheme itself inline
         // (mirroring `show`), rather than going through this shared gate, so
@@ -229,7 +232,9 @@ fn command_is_write(command: &Command) -> bool {
         | Command::Rspan { .. }
         | Command::Idem { .. }
         | Command::Tenancy { .. }
-        | Command::Cache { .. } => false,
+        | Command::Cache { .. }
+        // `inspect cstat` only reads the named object.
+        | Command::Inspect { .. } => false,
     }
 }
 
@@ -259,6 +264,12 @@ enum Command {
     Catalog {
         #[command(subcommand)]
         command: CatalogCommand,
+    },
+    /// Inspect a standalone object by key or local path, outside the
+    /// segment/rlog/rspan/commit/catalog families above.
+    Inspect {
+        #[command(subcommand)]
+        command: InspectCommand,
     },
     /// Run and inspect maintenance: compaction, sweep, retention, version audit.
     Maintain {
@@ -866,6 +877,18 @@ enum SegmentCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum InspectCommand {
+    /// Decode a column-statistics (`.cstat`) object's envelope and header
+    /// (ADR-0850/ADR-0942/ADR-1413), and report whether its declared
+    /// `body_uncompressed_len` exceeds the decode ceiling, without ever
+    /// decompressing the body.
+    Cstat {
+        /// Local file path or object store key.
+        key: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum RlogCommand {
     Inspect {
         /// Local file path or object store key.
@@ -1161,6 +1184,10 @@ enum CatalogCommand {
         #[arg(long, value_name = "DURATION",
               value_parser = parse_max_flush_lifetime_ns)]
         max_flush_lifetime: Option<i64>,
+        /// Print the full `FoldReport` as JSON instead of the human-readable
+        /// text report. Either form carries every counter on the report.
+        #[arg(long)]
+        json: bool,
     },
     /// Decode and print HEAD and every referenced snapshot part for one
     /// (tenant, signal).
@@ -1291,6 +1318,7 @@ async fn main() -> anyhow::Result<()> {
                     shards,
                     signal,
                     max_flush_lifetime,
+                    json,
                 },
         } => catalog::fold(
             store::build_store(&cli.store)?,
@@ -1300,9 +1328,16 @@ async fn main() -> anyhow::Result<()> {
             signal,
             max_flush_lifetime,
             now_ns()?,
+            json,
         )
         .await
         .map(|_report| ()),
+        Command::Inspect {
+            command: InspectCommand::Cstat { key },
+        } => {
+            let bytes = store::read_bytes(&cli.store, &key).await?;
+            catalog::inspect_cstat(&bytes)
+        }
         Command::Catalog {
             command: CatalogCommand::Inspect { tenant, signal },
         } => {
