@@ -189,6 +189,52 @@ other two caches already have. Today's whole-tenant entry is what makes
 "cannot shed" bite hardest, since a single 2 GB entry is atomic under
 eviction; per-part entries return it to ordinary LRU granularity.
 
+### 6. v3 is the only published version: fields 11 and 13 are retired now
+
+Amends decision 3 and the dual-publish item of the migration plan below.
+
+The fold publishes **only** the v3 per-part object under
+`SnapshotPartRef.column_stats` (field 7). It no longer writes the v1
+whole-object (`SnapshotHead.column_stats`, field 11) or the v2 whole-object
+(`SnapshotHead.column_stats_part`, field 13), at any size. The decoder's
+accepted set of `.cstat` envelope versions becomes `{3}`, and the reader's
+fallback ladder in decision 2 collapses to: a covered part has its field-7 ref
+and it decodes, or that part is scanned.
+
+**Why now rather than on the format floors.** The dual-publish window exists
+for one reason, stated in the migration plan below: an older reader that
+ignores field 7 must still find field 13, and retiring it earlier would be the
+writers-before-readers change ADR-0066 decision 1 forbids. The owner directed
+on 2026-09-10 that there is no backward-compatibility constraint before v1.0.0.
+With no older reader to protect, the window has no content, and the second and
+third copies are cost with no consumer. This is the "own change" the migration
+plan already anticipated for field 13; only its trigger moves, from recorded
+format floors to the pre-1.0 directive.
+
+**Why it is safe.** `.cstat` is a Class B derived catalog object (ADR-0066
+decision 4). It is rebuildable from commit records, so no object needs
+migrating and nothing is lost: a tenant's statistics are whatever its next fold
+produces. Objects already written under fields 11 and 13 become unreferenced
+once the reader stops resolving them and are reclaimed by the existing
+`sweep_unreferenced_catalog_objects` lifecycle. No new sweep rule, no migration
+tool, no wipe.
+
+**What this measured on the reference tenant** (#1413, the T2 post-fold run).
+Each fold wrote three column-statistics objects: the v3 per-part object at
+83.4 MiB of wire, and the v1 and v2 whole-object forms at 1.65 and 1.66 GiB.
+Both whole-object forms declared ~6.5 GB uncompressed, 24.3x over the 256 MiB
+ceiling, so **neither was decodable by any reader** while both were being
+written on every fold. One of the two was not even referenced from HEAD.
+Retiring them saves roughly 3.4 GiB of PUT and five minutes of fold wall time
+per run, and removes the only consumer of the dropped-reference defect: a
+field-13 reference that is never recorded costs nothing when field 13 is never
+written.
+
+**Field numbers stay frozen.** 11 and 13 are marked `reserved` in
+`proto/ravel/catalog.proto` and are never reused. Freezing field numbers is
+independent of backward compatibility and still binds: a reused number
+misdecodes silently rather than failing, which no release boundary makes safe.
+
 ## Rejected alternatives
 
 - **Raise `DEFAULT_MAX_COLUMN_STATS_BYTES` to fit the largest tenant.**
@@ -224,29 +270,44 @@ ADR-0942's declaration stands): rebuildable from commit records,
 supersession-swept, no migration tool. The convergence plan is ADR-0942's,
 extended by one version:
 
-- **Dual-publish.** The upgraded fold emits v3 per-part objects under
+**Superseded by decision 6.** The three bullets below described a
+dual-publish and dual-read window sized by ADR-0066 decision 1's
+readers-before-writers rule. That rule is what made the window necessary, and
+the owner's 2026-09-10 pre-1.0 directive removes it. They are kept here as the
+record of what was decided and why, not as the current plan; decision 6 states
+what the fold does now.
+
+- ~~**Dual-publish.** The upgraded fold emits v3 per-part objects under
   `SnapshotPartRef.column_stats` and keeps publishing the field-13 v2
   whole-object until every reader understands the per-part field. Retiring
   field 13 at the first v3 publish would be the writers-before-readers
   change ADR-0066 decision 1 forbids: an older reader ignores field 7 on
-  the part, finds field 13, and reads it as today. For a tenant whose v2
-  object is over the ceiling that reader keeps scanning, which is the
-  current state, not a regression.
-- **Field 13 is retired on the format floor, as its own change** citing the
-  recorded floors (ADR-0066 decision 3), after which the old objects become
-  unreferenced and the existing `sweep_unreferenced_catalog_objects`
-  lifecycle GCs them. No new sweep rule.
-- **Dual-read spans the same window**, per decision 2's fallback order.
-  The accepted read set becomes {1, 2, 3} for that window. ADR-0942's
-  pending retirement of v1 (field 11) is independent of this change and
-  its own reviewed change citing the recorded floors, whether it lands
-  before or after this one; the three-version set is what Class B's
-  rolling-upgrade window costs (a reader is cheap to keep, and the objects
-  are rebuilt by the fold), and it shrinks to {2, 3} and then {3} by those
-  two retirements in turn.
-- **This tenant's 2.0 GB object stays unreadable until its next fold**,
-  which is what makes the per-part path reachable for it. The WARN from the
-  observability half names it until then.
+  the part, finds field 13, and reads it as today.~~
+- ~~**Field 13 is retired on the format floor, as its own change** citing the
+  recorded floors (ADR-0066 decision 3).~~ Decision 6 is that change; the
+  trigger is the pre-1.0 directive rather than the recorded floors. The
+  consequence is unchanged: the old objects become unreferenced and the
+  existing `sweep_unreferenced_catalog_objects` lifecycle GCs them. No new
+  sweep rule.
+- ~~**Dual-read spans the same window**, per decision 2's fallback order. The
+  accepted read set becomes {1, 2, 3} for that window.~~ The accepted read
+  set is `{3}`. ADR-0942's pending retirement of v1 (field 11) is subsumed by
+  decision 6 rather than left independent, since the same directive removes
+  the same constraint.
+
+The convergence plan that remains is the Class B one, unchanged in mechanism
+and shorter by a release:
+
+- **A tenant's statistics are whatever its next fold produces.** Nothing is
+  migrated, because nothing needs to be: `.cstat` is rebuilt from commit
+  records. A tenant folded before this change has field-11 and field-13
+  artifacts that no reader resolves; they are unreferenced and swept.
+- **This tenant's over-ceiling objects stay unreadable until its next fold**,
+  which is what makes the per-part path reachable for it. That was already
+  true of the whole-object forms at 24.3x the ceiling; retiring them changes
+  only whether the fold keeps writing new ones.
+- **Field numbers 11 and 13 are `reserved`, never reused.** This outlives the
+  pre-1.0 window: a reused field number misdecodes silently.
 
 ## Consequences
 
@@ -259,9 +320,15 @@ extended by one version:
   set, idle-tenant sweep and the `build_catalog_with_column_stats_budget`
   start path from the two rejected #1400 fixes (their branches are named
   on that issue) are reviewed plumbing this implementation reuses.
-- One more version byte to keep readable (v1, v2, v3) for the dual-read
-  window, and one more field on `SnapshotPartRef`. Additive only; no
-  renumbering.
+- One more field on `SnapshotPartRef`, additive, no renumbering. Under
+  decision 6 there is no dual-read window: the accepted version set is `{3}`
+  and v1 and v2 readers are deleted rather than carried, so the reader gets
+  simpler than before this ADR rather than more complex. Fields 11 and 13 are
+  `reserved`.
+- The fold stops writing two whole-object artifacts per run. On the reference
+  tenant that is 3.4 GiB of PUT and about five minutes of wall time per fold,
+  for objects that were 24.3x over the decode ceiling and therefore unreadable
+  by anything.
 - The per-part ceiling is the existing `DEFAULT_MAX_COLUMN_STATS_BYTES`
   constant, not a new one; the writer now shares the exact bound the reader
   already enforced, instead of deriving its own from the part.
