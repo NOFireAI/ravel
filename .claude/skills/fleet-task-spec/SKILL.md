@@ -356,20 +356,37 @@ Record the returned task_id, arm the watch command from the dispatch
 response as a persistent Monitor, and merge with the merge-fleet-result
 skill when it lands.
 
-**Watch the transcript byte count, not just the status.** A task on a
-degraded box reports `running` for its whole life and then dies at the
-ceiling with an empty `result_ref` and only a start ref. The signal that
-separates it from a hard task is available in minutes:
+**Watch the transcript size, not just the status, and read the HTTP code
+beside it.** A task on a degraded box reports `running` for its whole
+life, then dies at the ceiling with an empty `result_ref` and only a
+start ref. An authorized, empty transcript separates it from a hard task
+within minutes:
 
-    curl -s "$FLEET_CP/v1/tasks/<id>/transcript" | wc -c
+    curl -s -o /dev/null -w "http=%{http_code} bytes=%{size_download}\n" \
+      "$FLEET_CP/v1/tasks/<id>/transcript?token=<per-task-jwt>"
 
-A healthy executor emits lines continuously; 13 bytes after three and a
-half hours is a dead box, and that exact figure cost 2h50m on 2026-09-10
-(#1308/#1309 on `pimox5`). Sample it every few minutes for the first
-quarter hour of any dispatch and cancel-and-redispatch on a near-zero
-count rather than waiting for the ceiling. Use the HTTP endpoint and the
-byte count, not the MCP `fleet_transcript`, which returns no output at
-all in this state and so reads as a broken tool rather than as evidence.
+Save the per-task JWT from the dispatch response; without it this check
+cannot be made. Healthy live task: `http=200 bytes=784005`. Dead box:
+`http=200 bytes=0`. Sample every few minutes for the first quarter hour
+and cancel-and-redispatch on an authorized zero rather than waiting for
+the ceiling.
+
+The size alone is NOT the signal, and reading it that way is how this
+was first written down here. With the operator token the endpoint answers
+`200` with the body `unauthorized`, which is exactly 13 bytes: through
+`wc -c` that reads as a plausible small measurement rather than as an
+error, and a probe built on it alarms on its first sample against any
+task, healthy or dead. It was caught only because a task that had
+finished SUCCESSFULLY also read 13 bytes. Two tasks in opposite states
+with identical readings is not a measurement. The MCP `fleet_transcript`
+returning nothing has the same ambiguity and reads as a broken tool, so
+use the HTTP form with the code and the per-task token.
+
+A start-only ref after hours is suggestive, not conclusive: an executor
+commits locally and pushes once at the end, so it can mean a lost final
+push rather than no work. Confirm with the authorized-empty transcript
+before cancelling, because cancelling on the weaker signal destroys
+committed work.
 
 Placement cannot be pre-checked: `GET /v1/tasks/<id>` carries no executor
 field while a task runs, and the executor name appears only in the
