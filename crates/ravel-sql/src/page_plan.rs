@@ -60,6 +60,15 @@
 //! kinds, so a pipe kind added by a later sqlparser is refused too instead of
 //! being silently admitted.
 //!
+//! Both that refusal and the row-limit one
+//! ([`PagePlanError::RowLimitInStatement`]) are taken over EVERY `Query` in
+//! the statement, not the outermost one alone. The wrap re-emits the caller's
+//! text verbatim, so a `LIMIT` inside a `WHERE` subquery, a scalar subquery,
+//! a derived table, an arm of a set operation, or a CTE is still there on
+//! every page, picking a fresh arbitrary set of rows each time it runs. See
+//! [`reject_nested_pipes_and_row_limits`] for what that walk covers and for
+//! why a nested limit is refused even when its own subquery is deterministic.
+//!
 //! An `ORDER BY` term that can be NULL is refused as well
 //! ([`PagePlanError::OrderTermNullable`]): a keyset comparison against NULL is
 //! NULL, so the rows whose term is NULL match no disjunct and appear on no
@@ -97,11 +106,12 @@
 //! comparison the providers can push down.
 
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 use datafusion::sql::parser::{DFParser, Statement as DFStatement};
 use datafusion::sql::sqlparser::ast::{
-    Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query,
-    SelectItem, SetExpr, Statement, TableFactor,
+    Distinct, Expr as SqlExpr, GroupByExpr, Ident, ObjectName, OrderBy, OrderByKind, Query, Select,
+    SelectItem, SetExpr, Statement, TableFactor, Visit, Visitor,
 };
 
 use crate::alerts_schema::alerts_schema;
@@ -414,17 +424,10 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     let query = parse_query(sql)?;
 
     // Before anything else reads the `SELECT` body: a pipe operator makes that
-    // body an incomplete description of the statement, so every check below it
-    // would be answering about the wrong rows.
-    if !query.pipe_operators.is_empty() {
-        return Err(PagePlanError::PipeOperator);
-    }
-    if query.limit_clause.is_some() || query.fetch.is_some() {
-        return Err(PagePlanError::RowLimitInStatement);
-    }
-    if let Some(SelectShape { top: Some(_), .. }) = shape_of(&query) {
-        return Err(PagePlanError::RowLimitInStatement);
-    }
+    // body an incomplete description of the statement, and a row limit at any
+    // depth re-evaluates per page, so every check below either answers about
+    // the wrong rows or answers about rows that change under it.
+    reject_nested_pipes_and_row_limits(&query)?;
 
     let target = page_target(sql)?;
     let projection = projection_of(&query);
@@ -479,6 +482,66 @@ fn parse_query(sql: &str) -> Result<Query, PagePlanError> {
             })),
         },
         _ => Err(PagePlanError::Invalid(ValidationError::Empty)),
+    }
+}
+
+/// Refuse a pipe operator and a row limit wherever either sits, not only on
+/// the outermost `Query`.
+///
+/// Both used to be read off the top-level `Query` alone, which made a pipe or
+/// a limit on any inner query invisible: a subquery in `WHERE`, a scalar
+/// subquery in the projection, a derived table in `FROM`, an arm of a set
+/// operation, and a CTE all carry their own `Query`, and `Display for Query`
+/// re-emits every one of them verbatim into the derived table the rewrite
+/// wraps. An inner `LIMIT 5` then re-evaluates against a fresh arbitrary five
+/// rows on every page, so consecutive pages of one cursor are pages of
+/// different results, with `not_total: None` reported for the whole thing.
+///
+/// Every nested row limit is refused, including one whose own subquery is
+/// totally ordered and therefore picks the same rows every time. Telling those
+/// apart means reading each inner query's ordering and proving it total, which
+/// is a design change; this is a correctness fix, so the conservative refusal
+/// is the decision.
+///
+/// The pipe check is keyed on a pipe being PRESENT rather than on a list of
+/// pipe kinds, so a kind a later sqlparser adds fails closed.
+fn reject_nested_pipes_and_row_limits(query: &Query) -> Result<(), PagePlanError> {
+    let mut found: Option<PagePlanError> = None;
+    let _ = query.visit(&mut NestedShapeGuard { found: &mut found });
+    match found {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+struct NestedShapeGuard<'a> {
+    found: &'a mut Option<PagePlanError>,
+}
+
+impl Visitor for NestedShapeGuard<'_> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
+        if !query.pipe_operators.is_empty() {
+            *self.found = Some(PagePlanError::PipeOperator);
+            return ControlFlow::Break(());
+        }
+        if query.limit_clause.is_some() || query.fetch.is_some() {
+            *self.found = Some(PagePlanError::RowLimitInStatement);
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// `TOP` hangs off the `SELECT` body rather than the `Query`, and an arm
+    /// of a set operation is a bare `SetExpr::Select` with no `Query` of its
+    /// own, so it needs its own hook to be seen in every position.
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        if select.top.is_some() {
+            *self.found = Some(PagePlanError::RowLimitInStatement);
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -1423,6 +1486,79 @@ mod tests {
                 err.to_string(),
                 "a statement using a pipe operator cannot be paged; a pipe \
                  reshapes the rows after the SELECT body a page is planned from",
+            );
+        }
+    }
+
+    /// A pipe operator is refused wherever it sits, not only on the outermost
+    /// `Query`.
+    ///
+    /// The five positions below each carry their own `Query`, and the guard
+    /// used to read the top-level one alone: every one of these planned, with
+    /// the pipe re-emitted verbatim into the derived table by `Display`. The
+    /// `WHERE`-subquery case is the demonstrated defect -- `SELECT * FROM
+    /// samples WHERE series_id IN (SELECT series_id FROM samples |> LIMIT 5)
+    /// ORDER BY ts` planned with `not_total: None`, so the tool minted a
+    /// cursor over an inner relation that re-picks five arbitrary series on
+    /// every page.
+    #[test]
+    fn refuses_a_pipe_at_every_nesting_depth() {
+        let cases = [
+            // A subquery in WHERE.
+            "SELECT * FROM samples WHERE series_id IN \
+             (SELECT series_id FROM samples |> LIMIT 5) ORDER BY ts",
+            // A scalar subquery in the projection.
+            "SELECT ts, series_id, (SELECT max(value) FROM samples |> LIMIT 1) AS m \
+             FROM samples ORDER BY ts",
+            // A derived table in FROM.
+            "SELECT * FROM (SELECT ts, series_id FROM samples |> WHERE value > 1) AS x \
+             ORDER BY ts",
+            // An arm of a set operation.
+            "SELECT ts FROM samples UNION ALL (SELECT ts FROM samples |> LIMIT 5) ORDER BY ts",
+            // A CTE in a WITH clause.
+            "WITH c AS (SELECT ts, series_id FROM samples |> LIMIT 5) \
+             SELECT * FROM c ORDER BY ts",
+        ];
+        for sql in cases {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(err, PagePlanError::PipeOperator, "unexpected for {sql:?}");
+        }
+    }
+
+    /// A row limit is refused wherever it sits, for the same reason and by the
+    /// same walk.
+    ///
+    /// An inner `LIMIT 5` with no ordering of its own selects five arbitrary
+    /// rows, and it is re-evaluated on every page because the wrap re-emits
+    /// it: page 2 resumes past page 1's last row of a relation that no longer
+    /// contains the same rows. The refusal covers a nested limit that WOULD be
+    /// deterministic too; see [`reject_nested_pipes_and_row_limits`].
+    #[test]
+    fn refuses_a_row_limit_at_every_nesting_depth() {
+        let cases = [
+            // A subquery in WHERE.
+            "SELECT * FROM samples WHERE series_id IN \
+             (SELECT series_id FROM samples LIMIT 5) ORDER BY ts",
+            // A scalar subquery in the projection.
+            "SELECT ts, series_id, (SELECT max(value) FROM samples LIMIT 1) AS m \
+             FROM samples ORDER BY ts",
+            // A derived table in FROM, in all three spellings a row cap has.
+            "SELECT * FROM (SELECT ts, series_id FROM samples LIMIT 5) AS x ORDER BY ts",
+            "SELECT * FROM (SELECT ts, series_id FROM samples OFFSET 5 ROWS) AS x ORDER BY ts",
+            "SELECT * FROM (SELECT TOP 5 ts, series_id FROM samples) AS x ORDER BY ts",
+            // An arm of a set operation, as a Query operand and as a bare
+            // SELECT body carrying a TOP.
+            "SELECT ts FROM samples UNION ALL (SELECT ts FROM samples LIMIT 5) ORDER BY ts",
+            "SELECT ts FROM samples UNION ALL SELECT TOP 5 ts FROM samples ORDER BY ts",
+            // A CTE in a WITH clause.
+            "WITH c AS (SELECT ts, series_id FROM samples LIMIT 5) SELECT * FROM c ORDER BY ts",
+        ];
+        for sql in cases {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::RowLimitInStatement,
+                "unexpected for {sql:?}"
             );
         }
     }
