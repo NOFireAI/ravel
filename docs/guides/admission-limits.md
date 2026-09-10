@@ -122,6 +122,14 @@ points/records/spans and admits the rest through OTLP partial success.
 | Series-creation rate | request | 429 + `Retry-After` | `RESOURCE_EXHAUSTED` | 429 + `Retry-After` |
 | Active-series/stream cap | per series | 200 + partial success | OK + partial success | 204, written-count header excludes rejected samples |
 | Event-time skew | per point | 200 + partial success | OK + partial success | 204, written-count header excludes rejected samples |
+| Informational field drop | per item, costs no item | 200 + partial success, zero count | OTLP: OK + partial success, zero count. OTAP: not reported | not reported (no partial-success message) |
+
+The last row is not an admission limit: it is a field of an admitted item that
+Ravel could not store (a histogram `min`/`max`, an exemplar, an integer past
+2^53, one bad attribute of a log record or span). It appears here because the
+transports answer it differently, and because a zero rejected count with a
+populated `error_message` is easy to mistake for a clean write.
+[ingest.md](ingest.md#zero-count-partial-success) is normative for it.
 
 ### Body size
 

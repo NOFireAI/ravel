@@ -112,6 +112,14 @@ impl IngestRequestError {
 /// HTTP header/body sanity limits.
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 
+/// How many recent rejection groups [`collapse_rejection_variants`] compares a
+/// new rejection against before giving up and starting a new group. Comfortably
+/// above the number of distinct reasons a real request produces (the metrics
+/// [`Rejection`] enum has under thirty variants in total), and small enough that
+/// the scan stays a constant factor rather than turning the collapse quadratic
+/// on a request whose reasons genuinely are all distinct.
+const MAX_PREGROUPED_VARIANTS: usize = 16;
+
 pub async fn handle_export(
     state: &IngestState,
     tenant: TenantId,
@@ -248,14 +256,14 @@ pub async fn handle_export(
             IngestRequestError::Write(err)
         })?;
 
-    // Both rejection sources gate this, because neither alone covers the
-    // request. Gating on `rejected_count` swallows an informational drop: the
-    // point lands, so its count is 0, yet the sender must still learn that its
-    // min/max, its exemplars, or its integer precision is gone, through
-    // `error_message` with `rejected_data_points` reported as 0 (the
-    // OTLP-sanctioned warning channel). Gating on `normalized.rejected` alone
-    // swallows an active-series-cap drop: layer 4 turns away whole points that
-    // normalized cleanly, so they never appear in that list.
+    // Gate on whether anything was rejected at all, never on the unit count: a
+    // zero-count rejection still has to reach the sender. The rule and the
+    // reasoning are in docs/guides/ingest.md, "Zero-count partial success".
+    //
+    // Metrics carry a second term because layer 4's active-series-cap count is
+    // tracked outside `normalized.rejected` and never appears in it, so a gate
+    // reading only that list would report a fully clean write on a request whose
+    // points normalized cleanly and were then turned away by the cap.
     let partial_success = if normalized.rejected.is_empty() && series_cap_rejected == 0 {
         None
     } else {
@@ -272,12 +280,50 @@ pub async fn handle_export(
     })
 }
 
+/// Collapse `rejected` into one entry per distinct rejection value, in
+/// first-appearance order, each carrying the data-point count summed over the
+/// entries it stands for.
+///
+/// This runs before anything is rendered, which is the point of it: normalize
+/// pushes one rejection per data point, so a request of
+/// `max_data_points_per_request` histogram points whose SDK records `min`/`max`
+/// arrives with that many entries, all of them the same variant. Rendering
+/// first would allocate two strings and hash them per point to produce a
+/// message that collapses to a single entry. Collapsing first ties the
+/// rendering work to the number of distinct reasons instead.
+///
+/// The scan is a bounded linear search over the most recent
+/// [`MAX_PREGROUPED_VARIANTS`] groups rather than a hash lookup, because
+/// [`Rejection`] is `Eq` but not `Hash` and the only key available without one
+/// is the rendered text this pass exists to avoid producing. A rejection that
+/// matches nothing in the window simply becomes its own group, which is not a
+/// correctness question: [`build_error_message`] folds groups together by
+/// rendered text afterwards, so an unmatched group costs one extra render and
+/// changes no output.
+fn collapse_rejection_variants(rejected: &[Rejection]) -> Vec<(&Rejection, usize)> {
+    let mut groups: Vec<(&Rejection, usize)> = Vec::new();
+    for rejection in rejected {
+        let n = rejection.rejected_count();
+        let window_start = groups.len().saturating_sub(MAX_PREGROUPED_VARIANTS);
+        let hit = groups[window_start..]
+            .iter()
+            .position(|(seen, _)| *seen == rejection)
+            .map(|offset| window_start + offset);
+        match hit {
+            Some(index) => groups[index].1 += n,
+            None => groups.push((rejection, n)),
+        }
+    }
+    groups
+}
+
 /// Build the OTLP partial-success `error_message` from `rejected`: one entry
 /// per distinct reason with the total point count it covers, rather than
-/// joining one string per rejected point. Distinct reasons are rare relative
-/// to rejected points in the pathological case this guards against (a
-/// whole-resource or whole-metric rejection covering a huge batch collapses
-/// to a single reason), so this stays cheap even when `rejected` is large.
+/// joining one string per rejected point. Identical rejections are collapsed by
+/// [`collapse_rejection_variants`] before any of them is rendered, so the
+/// rendering and hashing cost tracks distinct reasons rather than
+/// `rejected.len()`; two rejection values that differ but render alike are
+/// still folded together here, by their rendered text.
 /// The assembled message is capped at [`MAX_ERROR_MESSAGE_BYTES`]; if more
 /// distinct reasons exist than fit, the message is truncated with a count of
 /// how many were omitted.
@@ -294,26 +340,23 @@ pub async fn handle_export(
 fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for r in rejected {
-        let key = r.to_string();
-        let n = r.rejected_count();
-        counts
-            .entry(key.clone())
-            .and_modify(|count| *count += n)
-            .or_insert_with(|| {
-                order.push(key);
-                n
-            });
+    for (rejection, n) in collapse_rejection_variants(rejected) {
+        let key = rejection.to_string();
+        if let Some(count) = counts.get_mut(&key) {
+            *count += n;
+        } else {
+            counts.insert(key.clone(), n);
+            order.push(key);
+        }
     }
     if series_cap_rejected > 0 {
         let key = "active series cap exceeded".to_string();
-        counts
-            .entry(key.clone())
-            .and_modify(|count| *count += series_cap_rejected)
-            .or_insert_with(|| {
-                order.push(key);
-                series_cap_rejected
-            });
+        if let Some(count) = counts.get_mut(&key) {
+            *count += series_cap_rejected;
+        } else {
+            counts.insert(key.clone(), series_cap_rejected);
+            order.push(key);
+        }
     }
 
     let mut message = String::new();
@@ -603,6 +646,188 @@ mod tests {
             message.contains("more distinct rejection reason(s) omitted"),
             "expected a truncation indicator, got: {message}"
         );
+    }
+
+    /// The pre-collapse implementation: render every entry, then fold by the
+    /// rendered text. Kept as a test-only oracle so the collapse can be shown
+    /// to change cost and nothing else. Any input for which this and
+    /// [`build_error_message`] disagree is a sender-visible change.
+    fn render_first_reference(rejected: &[Rejection], series_cap_rejected: usize) -> String {
+        let mut order: Vec<String> = Vec::new();
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in rejected {
+            let key = r.to_string();
+            let n = r.rejected_count();
+            counts
+                .entry(key.clone())
+                .and_modify(|count| *count += n)
+                .or_insert_with(|| {
+                    order.push(key);
+                    n
+                });
+        }
+        if series_cap_rejected > 0 {
+            let key = "active series cap exceeded".to_string();
+            counts
+                .entry(key.clone())
+                .and_modify(|count| *count += series_cap_rejected)
+                .or_insert_with(|| {
+                    order.push(key);
+                    series_cap_rejected
+                });
+        }
+
+        let mut message = String::new();
+        let mut shown = 0usize;
+        for reason in &order {
+            let count = counts[reason];
+            let entry = if count > 1 {
+                format!("{reason} (x{count})")
+            } else {
+                reason.clone()
+            };
+            let sep_len = if message.is_empty() { 0 } else { 2 };
+            if message.len() + sep_len + entry.len() > MAX_ERROR_MESSAGE_BYTES {
+                break;
+            }
+            if !message.is_empty() {
+                message.push_str("; ");
+            }
+            message.push_str(&entry);
+            shown += 1;
+        }
+        if shown < order.len() {
+            message.push_str(&format!(
+                "; ... {} more distinct rejection reason(s) omitted",
+                order.len() - shown
+            ));
+        }
+        message
+    }
+
+    /// A corpus built to exercise every way the collapse could diverge from
+    /// [`render_first_reference`]: more distinct values than the collapse
+    /// window holds, repeats separated by other reasons, a long run of one
+    /// value, and two values that are unequal yet render identically
+    /// (`HistogramMinMaxDropped` does not print its `count`).
+    fn divergence_corpus() -> Vec<Rejection> {
+        let mut rejected = Vec::new();
+        for i in 0..(MAX_PREGROUPED_VARIANTS * 3) {
+            rejected.push(Rejection::DuplicateLabelName(format!("label_{i}")));
+            rejected.push(Rejection::HistogramMinMaxDropped { count: 1 });
+            rejected.push(Rejection::ZeroTimestamp);
+            rejected.push(Rejection::HistogramMinMaxDropped { count: 7 });
+            rejected.push(Rejection::MissingValue);
+        }
+        rejected.extend(
+            std::iter::repeat_n(Rejection::ComplexAttributeValue, 1_000)
+                .chain(std::iter::once(Rejection::ZeroTimestamp)),
+        );
+        rejected
+    }
+
+    #[test]
+    fn build_error_message_renders_one_entry_for_a_request_full_of_one_informational_drop() {
+        // The reviewer's case: every point in a full request carries a min/max
+        // the SDK recorded, so normalize pushes one rejection per point. The
+        // rendered message is one entry, and it carries no count, because an
+        // informational drop costs the sender no data point
+        // (`Rejection::rejected_count` is 0 for this variant) and the renderer
+        // only appends a count above 1.
+        let points = IngestLimits::default().max_data_points_per_request;
+        assert_eq!(points, 100_000, "the limit this case is sized against");
+        let rejected: Vec<Rejection> =
+            std::iter::repeat_n(Rejection::HistogramMinMaxDropped { count: 1 }, points).collect();
+
+        assert_eq!(
+            build_error_message(&rejected, 0),
+            "histogram min/max field(s) dropped: no Prometheus-convention representation"
+        );
+    }
+
+    #[test]
+    fn build_error_message_renders_the_summed_total_for_a_request_full_of_one_reason() {
+        // The same shape for a reason that does cost the sender points: the
+        // 100_000 entries collapse to one entry whose count is their total.
+        let points = IngestLimits::default().max_data_points_per_request;
+        let rejected: Vec<Rejection> =
+            std::iter::repeat_n(Rejection::ZeroTimestamp, points).collect();
+
+        assert_eq!(
+            build_error_message(&rejected, 0),
+            "event timestamp is zero (x100000)"
+        );
+    }
+
+    #[test]
+    fn collapse_rejection_variants_is_sized_by_distinct_reasons_not_by_entries() {
+        // The shape assertion. One group means one render and one hash for the
+        // whole request; a collapse that reverted to per-entry keying would
+        // return `max_data_points_per_request` groups here.
+        let points = IngestLimits::default().max_data_points_per_request;
+        let one_reason: Vec<Rejection> =
+            std::iter::repeat_n(Rejection::HistogramMinMaxDropped { count: 1 }, points).collect();
+        assert_eq!(collapse_rejection_variants(&one_reason).len(), 1);
+
+        // K distinct reasons, interleaved rather than run-length ordered, so
+        // the collapse cannot be passing by only comparing against the group it
+        // just pushed.
+        let distinct = [
+            Rejection::HistogramMinMaxDropped { count: 1 },
+            Rejection::HistogramExemplarsDropped { count: 1 },
+            Rejection::ZeroTimestamp,
+            Rejection::MissingValue,
+            Rejection::ComplexAttributeValue,
+        ];
+        let mixed: Vec<Rejection> = (0..points)
+            .map(|i| distinct[i % distinct.len()].clone())
+            .collect();
+        assert_eq!(
+            collapse_rejection_variants(&mixed).len(),
+            distinct.len(),
+            "one group per distinct reason, whatever the entry count"
+        );
+    }
+
+    #[test]
+    fn collapse_rejection_variants_sums_the_point_count_of_the_entries_it_folds() {
+        // Grouping is on the whole value, so two `EmptyMetricName`s fold only
+        // when their counts match; they render differently otherwise and are
+        // distinct reasons. The folded group carries their summed point count.
+        let rejected = vec![
+            Rejection::EmptyMetricName { count: 3 },
+            Rejection::ZeroTimestamp,
+            Rejection::EmptyMetricName { count: 3 },
+            Rejection::EmptyMetricName { count: 4 },
+        ];
+        let groups = collapse_rejection_variants(&rejected);
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0], (&Rejection::EmptyMetricName { count: 3 }, 6));
+        assert_eq!(groups[1], (&Rejection::ZeroTimestamp, 1));
+        assert_eq!(groups[2], (&Rejection::EmptyMetricName { count: 4 }, 4));
+    }
+
+    #[test]
+    fn build_error_message_is_byte_identical_to_rendering_every_entry_first() {
+        for series_cap_rejected in [0usize, 1, 4_096] {
+            for rejected in [
+                Vec::new(),
+                vec![Rejection::ZeroTimestamp],
+                std::iter::repeat_n(Rejection::HistogramMinMaxDropped { count: 1 }, 10_000)
+                    .collect(),
+                (0..10_000)
+                    .map(|i| Rejection::DuplicateLabelName(format!("label_{i}")))
+                    .collect(),
+                divergence_corpus(),
+            ] {
+                assert_eq!(
+                    build_error_message(&rejected, series_cap_rejected),
+                    render_first_reference(&rejected, series_cap_rejected),
+                    "collapsing changed the message for {} entries with cap {series_cap_rejected}",
+                    rejected.len()
+                );
+            }
+        }
     }
 
     #[tokio::test]

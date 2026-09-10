@@ -255,11 +255,13 @@ pub async fn handle_export_traces(
             SpanIngestRequestError::Write(err)
         })?;
 
-    // Emit partial-success whenever anything was rejected, not only when a
-    // whole span was lost: an attribute-only drop must still be surfaced to the
-    // sender through `error_message`, with `rejected_spans` reported as 0 (the
-    // OTLP-sanctioned warning channel). Gating on the span count instead would
-    // silently swallow attribute drops on an otherwise clean request.
+    // Gate on whether anything was rejected at all, never on the unit count: a
+    // zero-count rejection still has to reach the sender. The rule and the
+    // reasoning are in docs/guides/ingest.md, "Zero-count partial success".
+    //
+    // Spans need only the one term, unlike metrics and logs: ADR-0051 gives
+    // them no layer-4 series/stream admission, so `normalized.rejected` is the
+    // whole rejection signal here and nothing is tracked beside it.
     let partial_success = if normalized.rejected.is_empty() {
         None
     } else {

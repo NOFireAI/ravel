@@ -301,14 +301,14 @@ pub async fn handle_export_logs(
             LogIngestRequestError::Write(err)
         })?;
 
-    // Both rejection sources gate this, because neither alone covers the
-    // request. Gating on `rejected_count` swallows an attribute-only drop: the
-    // record lands, so its count is 0, yet the sender must still learn the
-    // attribute is gone through `error_message` with `rejected_log_records`
-    // reported as 0 (the OTLP-sanctioned warning channel). Gating on
-    // `normalized.rejected` alone swallows a stream-cap drop: the layer-4 cap
-    // rejects whole records that normalized cleanly, so they never appear in
-    // that list.
+    // Gate on whether anything was rejected at all, never on the unit count: a
+    // zero-count rejection still has to reach the sender. The rule and the
+    // reasoning are in docs/guides/ingest.md, "Zero-count partial success".
+    //
+    // Logs carry a second term because layer 4's active-stream-cap count is
+    // tracked outside `normalized.rejected` and never appears in it, so a gate
+    // reading only that list would report a fully clean write on a request whose
+    // records normalized cleanly and were then turned away by the cap.
     let partial_success = if normalized.rejected.is_empty() && stream_cap_rejected == 0 {
         None
     } else {

@@ -183,6 +183,9 @@ Every rejection reason:
 | `FutureSkew` | The event timestamp is ahead of ingest time by more than `max_future_skew_ns`. |
 | `TooOld` | The event timestamp is behind ingest time by more than `max_ingest_lag_ns`. |
 | `OversizedSeriesComponent` | A series identity component (tenant, metric name, or label set) is too large to encode. |
+| `HistogramMinMaxDropped` | Informational. The point is stored; its `min`/`max` fields are not, because they have no Prometheus-convention representation. Zero rejected points; see [Zero-count partial success](#zero-count-partial-success). |
+| `HistogramExemplarsDropped` | Informational. The point is stored; some of its exemplars were malformed or fell past the per-series admission cap. Applies to any metric type, not only histograms. Zero rejected points. |
+| `IntegerValuePrecisionLoss` | Informational. The point is stored, but its `as_int` value has a magnitude above 2^53 and was stored as the nearest `f64`. Zero rejected points. |
 
 Two behaviors are worth knowing about, both intentional:
 
@@ -192,6 +195,43 @@ Two behaviors are worth knowing about, both intentional:
   with `_` in place. It does not shift or prefix. A metric named `1foo` and
   one named `_foo` both sanitize to `_foo` and become the same series. This
   is a documented consequence of the sanitization rule, not a bug.
+
+### Zero-count partial success
+
+Some rejections cost the sender nothing. A histogram data point whose `min`
+and `max` fields have no Prometheus-convention representation is stored
+without them; exemplars past the per-series admission cap are not carried;
+an OTLP `as_int` value with a magnitude above
+2^53 is stored as the nearest `f64`. The same is true of a log record or a
+span with one bad attribute: the attribute is dropped and the record or span
+is stored. In each case the unit itself was admitted, so it contributes zero
+to the rejected count.
+
+Ravel reports these anyway. **The rule every OTLP surface follows is to emit a
+partial success whenever anything was rejected at all, never when some unit
+count is above zero.** A drop of this kind comes back as
+`rejected_data_points = 0` (or `rejected_log_records = 0`, or
+`rejected_spans = 0`) together with a populated `error_message` naming it.
+The OTLP proto documents `error_message` as a channel for warnings on an
+otherwise successful response, and a zero count with a message is that
+channel. Gating on the count instead would return a response byte-identical
+to a clean write, and a sender losing a field on every export would never
+learn it.
+
+Which transport you use decides whether the report reaches you, and the
+transports do not agree:
+
+- **OTLP over HTTP and gRPC**, for metrics, logs, and spans: reported, as
+  above.
+- **OTAP** (metrics only): not reported. `BatchStatus` carries one
+  `status_message` string, and Ravel spends it on the active-series-cap
+  drop count and the commit tokens; no normalization-layer rejection,
+  informational or not, reaches it. The drop is still visible in the
+  per-tenant rejection counters.
+- **Remote Write**: not reported, and there is no partial-success message on
+  that surface to report it in. Its only per-request feedback is the
+  `x-prometheus-remote-write-samples-written` family of headers, which count
+  what was admitted.
 
 ## Delta temporality metrics
 
@@ -417,6 +457,11 @@ The partial-success contract is the same as metrics, with
 `error_message` aggregates by distinct reason with a per-reason count, and its
 length is capped. A request rejected wholesale therefore does not produce a
 response string proportional to its record count.
+
+A dropped attribute is reported the same way, with `rejected_log_records` at 0:
+the record itself was stored, so it costs the sender no record. See
+[Zero-count partial success](#zero-count-partial-success) for the rule and for
+which transports carry it.
 
 Every rejection reason:
 
