@@ -125,17 +125,86 @@ function substitutionBodies(text) {
 // as openers, so `git commit -m "use << HEAD trick"` followed by a piped gate
 // disabled the guard for the rest of the command. That is this rule's own
 // motivating case, quoting shell in a commit message, turned into a hole.
+// The heredoc openers on one line, found by walking it with quote state
+// rather than by matching a regex over the whole line.
+//
+// A regex cannot do this. `<<` inside a quoted string is ordinary text, but a
+// pattern scanning the line parses a tag out of it anyway, and when a later
+// line coincidentally equals that tag a terminator IS found, so the real
+// commands between them are deleted from every rule. Fail-closed on a missing
+// terminator does not help, because the terminator exists. Six spellings of
+//
+//     git commit -m 'use << EOF here'
+//     cargo test -p x | tail -1
+//     EOF
+//
+// were refused by the guard on main and allowed here until this replaced the
+// pattern. Found by an uncurated corpus, not by cases written from the
+// findings: every case written by hand was two lines long and so exercised
+// the fail-closed path instead of this one.
+function heredocDelims(line) {
+  const delims = [];
+  let sq = false;
+  let dq = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === "\\" && !sq) {
+      i++;
+      continue;
+    }
+    if (c === "'" && !dq) {
+      sq = !sq;
+      continue;
+    }
+    if (c === '"' && !sq) {
+      dq = !dq;
+      continue;
+    }
+    if (sq || dq) continue;
+    if (c !== "<" || line[i + 1] !== "<") continue;
+    // `<<<` is a herestring, not a heredoc: no body follows. Consume the
+    // WHOLE run of `<`, not just three. Skipping a fixed two left the
+    // behaviour alternating with the run length: `<<<< EOF` parsed no tag
+    // (fail closed) while `<<<<< EOF` parsed `EOF` and stripped the lines
+    // after it (fail open). Neither spelling is valid shell, but only one of
+    // those two answers is safe, and a rule that alternates is not a rule.
+    // Found by enumerating 444,440 strings, which reported 30 differences
+    // where the argument said there would be none.
+    if (line[i + 2] === "<") {
+      let k = i + 2;
+      while (line[k] === "<") k++;
+      i = k - 1;
+      continue;
+    }
+    let j = i + 2;
+    let dash = false;
+    if (line[j] === "-") {
+      dash = true;
+      j++;
+    }
+    while (line[j] === " " || line[j] === "\t") j++;
+    const quote = line[j] === "'" || line[j] === '"' ? line[j] : "";
+    if (quote) j++;
+    let tag = "";
+    while (j < line.length && /[A-Za-z0-9_]/.test(line[j])) {
+      tag += line[j];
+      j++;
+    }
+    // Consume the delimiter's own closing quote so the walk does not read it
+    // as opening a string for the rest of the line.
+    if (quote && line[j] === quote) j++;
+    if (tag !== "" && /[A-Za-z_]/.test(tag[0])) delims.push({ tag, dash });
+    i = j - 1;
+  }
+  return delims;
+}
+
 function stripHeredocBodies(text) {
   const lines = text.split("\n");
   const kept = [];
   for (let i = 0; i < lines.length; i++) {
     kept.push(lines[i]);
-    const opener = /(?<!<)<<(?!<)(-?)\s*(["'])?([A-Za-z_][A-Za-z0-9_]*)\2?/g;
-    const delims = [];
-    let m;
-    while ((m = opener.exec(lines[i])) !== null) {
-      delims.push({ tag: m[3], dash: m[1] === "-" });
-    }
+    const delims = heredocDelims(lines[i]);
     for (const d of delims) {
       let j = i + 1;
       while (j < lines.length) {
