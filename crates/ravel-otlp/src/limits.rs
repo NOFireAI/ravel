@@ -386,7 +386,14 @@ impl Rejection {
             | Rejection::IntegerValuePrecisionLoss { .. } => None,
 
             // A grouped rejection carries its own point count; the class is
-            // the shared reason's.
+            // the shared reason's. Delegating is safe only because the metrics
+            // path groups nothing but a `build_resource_labels` failure
+            // (`crate::normalize`), whose reasons are all in the structural arm
+            // above: `LabelNameTooLong`, `LabelValueTooLong`, and
+            // `ComplexAttributeValue`. Grouping a reason that classes `None`
+            // needs this arm to classify the group instead, the way
+            // `crate::logs_limits::LogRejection::admission_class` does, or the
+            // whole-resource loss goes uncounted.
             Rejection::Grouped { reason, .. } => reason.admission_class(),
         }
     }

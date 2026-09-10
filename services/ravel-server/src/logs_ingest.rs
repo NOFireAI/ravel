@@ -232,8 +232,11 @@ pub async fn handle_export_logs(
     let normalized = normalize_logs(request, &state.limits, ingest_ts_ns);
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
     // Layer 3's rejections, counted where they are observed. The body
-    // conversions alongside them are not rejections: those records are in
-    // `normalized.records` and are about to be written.
+    // conversions alongside them are not rejections: those records passed
+    // normalization and are in `normalized.records`, still facing the
+    // active-stream cap below and the router write (see
+    // docs/guides/observability.md, "Reading the `reason` label", for what
+    // each counter does and does not claim).
     state.normalize_metrics.record(
         &tenant,
         ravel_types::Signal::Logs,

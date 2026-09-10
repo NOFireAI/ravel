@@ -272,6 +272,16 @@ impl SpanRejection {
             | SpanRejection::MissingAttributeValue { .. }
             | SpanRejection::UnsupportedAttributeValue { .. }
             | SpanRejection::UnsupportedAttributeKind { .. } => None,
+            // A grouped rejection carries its own span count; the class is the
+            // shared reason's. Delegating is safe only because the traces path
+            // groups nothing but a `TooManyResourceAttributes` or
+            // `TooManyScopeAttributes` breach (`crate::traces_normalize`), both
+            // in the structural arm above; an unconvertible resource or scope
+            // attribute is lossy here rather than group-rejecting. Grouping one
+            // of the `None` variants above needs this arm to classify the group
+            // instead, the way
+            // `crate::logs_limits::LogRejection::admission_class` does, or the
+            // whole-group loss goes uncounted.
             SpanRejection::Grouped { reason, .. } => reason.admission_class(),
         }
     }
