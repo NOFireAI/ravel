@@ -155,19 +155,34 @@ const NON_TENANT_WITNESS_KEYS: [&str; 7] = [
 /// anti-vacuity guard was an ANY over the whole protected set that `sys/tenancy`
 /// alone satisfied, so the two zero-witness keyspaces went unnoticed (#1346).
 ///
-/// These are kept out of `representative_keys` for the same reason the non-tenant
-/// witnesses are: they are hand-written literals, not evidence that a constructor
-/// produces the shape, and the delete-scope/coverage guards that read
-/// `representative_keys` alone must keep seeing only constructor output.
-const CONSTRUCTOR_FREE_TENANT_WITNESS_KEYS: [&str; 7] = [
-    "t/0123456789abcdef/catalog/u/HEAD",
-    "t/0123456789abcdef/catalog/m/HEAD",
-    "t/0123456789abcdef/catalog/u/snap/0000000000000000.csnap",
-    "t/0123456789abcdef/catalog/u/idx/name-postings",
-    "t/0123456789abcdef/m/prov",
-    "t/0123456789abcdef/m/idem/0123456789abcdef",
-    "t/0123456789abcdef/m/admission/writer-0",
-];
+/// These are kept out of `representative_keys` because no constructor produces
+/// them, for the same reason the non-tenant witnesses are: they are not evidence
+/// that a constructor builds the shape, and the delete-scope/coverage guards that
+/// read `representative_keys` alone must keep seeing only constructor output.
+///
+/// The SIGNAL segment is derived from `ALL_SIGNALS` rather than typed, so every
+/// signal gets a witness in each of these keyspaces. Typing two of the six is
+/// what a delete pattern with a literal signal segment escapes: `t/*/*/c/*`
+/// matches `t/<hash>/catalog/c/HEAD`, so today's green rests on no
+/// `Signal::key_prefix()` being `c`, which nothing states. Adding a signal, or
+/// changing a prefix to a letter some delete grant names, now moves this set
+/// instead of leaving the scan silently narrow.
+fn constructor_free_tenant_witness_keys() -> Vec<String> {
+    let hash = hash16();
+    let mut keys = Vec::new();
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        keys.push(format!("t/{hash}/catalog/{prefix}/HEAD"));
+        keys.push(format!(
+            "t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap"
+        ));
+        keys.push(format!("t/{hash}/catalog/{prefix}/idx/name-postings"));
+        keys.push(format!("t/{hash}/{prefix}/prov"));
+        keys.push(format!("t/{hash}/{prefix}/idem/{hash}"));
+        keys.push(format!("t/{hash}/{prefix}/admission/writer-0"));
+    }
+    keys
+}
 
 /// The key domain the value-level checks in this file evaluate a pattern
 /// against: every key `ravel-commit`'s constructors can produce, plus one
@@ -178,11 +193,7 @@ fn key_domain() -> &'static [String] {
     DOMAIN.get_or_init(|| {
         let mut keys = representative_keys();
         keys.extend(NON_TENANT_WITNESS_KEYS.iter().map(|k| (*k).to_string()));
-        keys.extend(
-            CONSTRUCTOR_FREE_TENANT_WITNESS_KEYS
-                .iter()
-                .map(|k| (*k).to_string()),
-        );
+        keys.extend(constructor_free_tenant_witness_keys());
         keys
     })
 }
@@ -200,8 +211,8 @@ fn assert_pattern_is_witnessed(role: &str, class: &str, pattern: &str) {
         "{role}: {class} pattern {pattern:?} matches no key in key_domain(), so \
          the overlap enumeration models no key for its keyspace and would report \
          an empty overlap having examined nothing. Add a witness key for this \
-         keyspace to CONSTRUCTOR_FREE_TENANT_WITNESS_KEYS or NON_TENANT_WITNESS_KEYS \
-         (#1346)"
+         keyspace to constructor_free_tenant_witness_keys() or \
+         NON_TENANT_WITNESS_KEYS (#1346)"
     );
 }
 
@@ -2260,13 +2271,68 @@ fn every_overlap_pattern_has_a_domain_witness() {
     }
 }
 
+/// `ALL_SIGNALS` is every `Signal`, and each one's `key_prefix()` is the letter
+/// this file's key shapes are written against. The `match` is the mechanism: a
+/// new variant makes this fail to compile, so `ALL_SIGNALS` -- and with it
+/// `representative_keys` and the derived constructor-free witness set -- cannot
+/// go silently short one signal.
+///
+/// The letters matter, not only the count. A delete grant can name the signal
+/// segment literally: maintain's `t/*/*/c/*` does. So whether a catalog witness
+/// `t/<hash>/catalog/<prefix>/HEAD` is reached by a delete `Allow` depends on
+/// which letters exist, and `no_delete_allow_reaches_the_disjoint_protected_keyspaces`
+/// is green partly because no prefix is `c`. Pinning the six letters here makes
+/// that a checked fact instead of an unstated one; if a prefix ever becomes `c`,
+/// that test starts reporting a delete grant reaching a protected keyspace,
+/// which is a template and ADR finding, not an assertion to weaken.
+#[test]
+fn all_signals_is_exhaustive_and_witnessed() {
+    for signal in ALL_SIGNALS {
+        let expected_prefix = match signal {
+            Signal::Metrics => "m",
+            Signal::Logs => "l",
+            Signal::Spans => "s",
+            Signal::Profiles => "p",
+            Signal::Alerts => "a",
+            Signal::Audit => "u",
+        };
+        assert_eq!(
+            signal.key_prefix(),
+            expected_prefix,
+            "{signal:?}: key_prefix() changed. The physical key prefixes are part \
+             of the frozen object-layout contract (docs/catalog-and-mvcc.md), and \
+             both the witness keys and the signal-segment delete patterns in this \
+             file are written against these letters"
+        );
+    }
+
+    let witnesses = constructor_free_tenant_witness_keys();
+    let hash = hash16();
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        for shape in [
+            format!("t/{hash}/catalog/{prefix}/HEAD"),
+            format!("t/{hash}/{prefix}/prov"),
+            format!("t/{hash}/{prefix}/idem/{hash}"),
+            format!("t/{hash}/{prefix}/admission/writer-0"),
+        ] {
+            assert!(
+                witnesses.contains(&shape),
+                "{signal:?}: the constructor-free witness set carries no {shape:?}, \
+                 so a delete grant naming the {prefix:?} signal segment literally \
+                 would be measured against no key in that keyspace"
+            );
+        }
+    }
+}
+
 /// ADR-0055 section 2 says the protected keyspaces `sys/`, `prov` and `catalog/`
 /// "hold for a different reason than" the legal-hold shard: they are disjoint
 /// from every delete grant, so their `Deny` is belt-and-suspenders, while the
 /// legal-hold shard `t/*/u/*/0000/*` IS reached by maintain's level-based delete
 /// grants and holds only because the explicit `Deny` overrides them. Round eight
 /// added that sentence by inspection; this backs it now that the domain carries
-/// catalog and prov witnesses (`CONSTRUCTOR_FREE_TENANT_WITNESS_KEYS`): no delete
+/// catalog and prov witnesses (`constructor_free_tenant_witness_keys`): no delete
 /// `Allow` pattern in any template matches a witness key of those three
 /// keyspaces.
 ///
@@ -2681,8 +2747,12 @@ fn admin_has_no_kms_generate_data_key() {
 /// (the same pattern the KMS `assert_kms_resource_*` helpers use). The delete
 /// set is derived first, so a delete-capable Allow that is out-of-bucket or
 /// wildcard-actioned fails inside `delete_key_patterns` before any
-/// protected-block check, and a synthetic fixture need not carry a Deny block
-/// to make the guard fire for the right reason.
+/// protected-block check.
+///
+/// A synthetic fixture still has to carry the whole shape --- the scratch Allow
+/// and a Deny block as well as the statement under test --- or it fails the
+/// first `assert_eq` for an unrelated reason and cannot tell a guard that
+/// rejects from one that does not.
 fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
     let deletes = delete_key_patterns(policy, "Allow");
     assert_eq!(
@@ -2750,11 +2820,22 @@ fn admin_delete_grant_is_qualify_scratch_only() {
 /// recognized only by an exact `s3:DeleteObject` match, and any resource not
 /// under the bucket prefix silently dropped (`if let Some(..)` with no `else`).
 ///
-/// Every pre-fix body in this file spells its own comparisons out (here
-/// `eq_ignore_ascii_case`, below `strip_prefix` against a literal ARN) rather
-/// than calling a live helper: a pre-fix copy that reuses today's predicates
-/// stops proving the hole the moment those predicates change, which is how a
-/// fixture becomes a tautology.
+/// A pre-fix body spells out the comparison whose HOLE it pins, and only that
+/// one: here `eq_ignore_ascii_case` on the action and `strip_prefix` against a
+/// literal ARN on the resource, because those two are the holes. A pre-fix copy
+/// that reused today's predicate for the axis it is proving would stop proving
+/// the hole the moment that predicate changed, which is how a fixture becomes a
+/// tautology.
+///
+/// Everything that is NOT the hole still goes through live code, and that is
+/// deliberate: this body reads `statement_actions`, and
+/// `pre_fix_validate_condition` calls the live `is_string_or_string_array` and
+/// the live handled-operator and handled-key constants. So an assertion whose
+/// whole content is "a pre-fix body came back empty" can be satisfied by a
+/// regression in that live code instead of by the historical hole, and it has
+/// to pin WHY the result was empty from the raw JSON alongside. The fixture
+/// below is the pattern: it asserts the pre-fix delete set exactly, then
+/// asserts separately which of the two holes swallowed the statement.
 fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy_statements(policy) {
@@ -2801,29 +2882,58 @@ fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
 ///
 /// Synthetic statements, not `deploy/iam/*.json`: a fixture over the shipped
 /// (correct) admin policy passes whichever way the matcher behaves and proves
-/// nothing about the matcher. Each case asserts in both directions --- that the
-/// pre-fix helper accepted the input (returned no delete entry, hiding the
-/// grant, with a message flagging the fixture invalid if it ever stops) and
-/// that the post-fix guard rejects it.
+/// nothing about the matcher.
+///
+/// Each fixture carries the WHOLE bypass shape, not just the permissive
+/// statement: admin's shipped `s3:DeleteObject` Allow on `sys/qualify/*`, which
+/// the pre-fix exact match does see; the permissive statement, which it does
+/// not; and a `DenyDeleteProtected` block. That combination is what makes the
+/// fixture reach the same PASSING state under the pre-fix derivation that
+/// admin's real policy reaches, so only the post-fix derivation rejects. A
+/// fixture holding the permissive statement alone panics on the scratch-only
+/// `assert_eq` either way (its delete set can never be `["sys/qualify/*"]`),
+/// which makes a bare `is_err()` unfalsifiable: measured, the suite stayed
+/// 50/0 with both historical holes reintroduced.
+///
+/// So each case asserts in both directions, and names WHICH direction: the
+/// pre-fix derivation returns exactly the scratch prefix (hiding the grant, so
+/// the scratch-only assertion passes over it) and the post-fix guard rejects
+/// with that case's expected message.
 #[test]
 fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
-    // (Sid, Action, Resource, does the pre-fix EXACT action match recognize it)
+    // The two post-fix rejection paths, as a substring of the panic each
+    // produces. Asserting the message rather than `is_err()` is what keeps them
+    // distinguishable: a fixture rejected by some third guard, or by a missing
+    // Deny block, would otherwise read as a pass for the wrong reason.
+    const UNCLASSIFIED_RESOURCE: &str =
+        "reaching here means a guard ran on an unvalidated statement";
+    const NOT_SCRATCH_ONLY: &str =
+        "the only delete-capable Allow must be the qualification scratch";
+
+    // (Sid, Action, Resource, does the pre-fix EXACT action match recognize it,
+    //  which post-fix rejection the case must produce)
     let cases = [
         // Wildcard action the exact match misses, on the bare "*" resource: the
-        // action hole and the resource hole at once.
+        // action hole and the resource hole at once. Post-fix the action is
+        // selected and the resource classifies as nothing, so the rejection
+        // comes from inside delete_key_patterns.
         (
             "StarActionStarResource",
             serde_json::json!("s3:*"),
             "*",
             false,
+            UNCLASSIFIED_RESOURCE,
         ),
         // Wildcard action, bucket-relative resource OUTSIDE sys/qualify: the
-        // action hole alone; post-fix this surfaces as a non-scratch pattern.
+        // action hole ALONE. The resource is classifiable either way, so this
+        // case reddens only if the action predicate resolves wildcards, and it
+        // surfaces as a second, non-scratch pattern in the delete set.
         (
             "DeleteStarOutsidePrefix",
             serde_json::json!("s3:Delete*"),
             "arn:aws:s3:::my-ravel-bucket/t/tenant/data",
             false,
+            NOT_SCRATCH_ONLY,
         ),
         // The all-actions wildcard on a DIFFERENT bucket's ARN: the action hole
         // plus a resource that names another bucket entirely.
@@ -2832,47 +2942,79 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
             serde_json::json!("*"),
             "arn:aws:s3:::other-bucket/t/*",
             false,
+            UNCLASSIFIED_RESOURCE,
         ),
         // Mis-cased literal delete on "*": here the pre-fix EXACT match already
         // recognized the action (it folds case), so this isolates the resource
-        // hole --- the statement was seen as a delete yet its "*" resource was
-        // silently dropped, leaving an empty delete set.
+        // hole ALONE --- the statement was seen as a delete yet its "*" resource
+        // was silently dropped, leaving the scratch prefix as the whole set.
         (
             "WrongCaseDeleteObjectStarResource",
             serde_json::json!("S3:DELETEOBJECT"),
             "*",
             true,
+            UNCLASSIFIED_RESOURCE,
         ),
     ];
 
-    for (sid, action, resource, pre_fix_exact_recognizes) in cases {
+    let protected_resources: Vec<String> = PROTECTED_DELETE_KEYS
+        .iter()
+        .map(|key| format!("{BUCKET_KEY_PREFIX}{key}"))
+        .collect();
+
+    for (sid, action, resource, pre_fix_exact_recognizes, expected_rejection) in cases {
         let policy = Policy {
             role: "fixture",
-            statements: serde_json::json!([{
-                "Sid": sid,
-                "Effect": "Allow",
-                "Action": action,
-                "Resource": resource,
-            }]),
+            statements: serde_json::json!([
+                // The shipped scratch delete. The pre-fix exact action match
+                // sees this one, so the pre-fix delete set is non-empty and
+                // equal to what the guard demands.
+                {
+                    "Sid": "AdminQualifyScratchDelete",
+                    "Effect": "Allow",
+                    "Action": "s3:DeleteObject",
+                    "Resource": format!("{BUCKET_KEY_PREFIX}sys/qualify/*"),
+                },
+                // The permissive statement the pre-fix match misses.
+                {
+                    "Sid": sid,
+                    "Effect": "Allow",
+                    "Action": action,
+                    "Resource": resource,
+                },
+                // ...and the protected block, so the guard's "DenyDeleteProtected
+                // names no keys" check cannot be what rejects and mask which
+                // assertion actually fired.
+                {
+                    "Sid": "DenyDeleteProtected",
+                    "Effect": "Deny",
+                    "Action": PROTECTED_DELETE_ACTIONS,
+                    "Resource": protected_resources,
+                },
+            ]),
         };
-        let stmt = &policy_statements(&policy)[0];
-        let actions = statement_actions(stmt);
+        let permissive = &policy_statements(&policy)[1];
+        let actions = statement_actions(permissive);
 
-        // Observation 1 (load-bearing): the pre-fix helper returned no delete
-        // entry, so the permissive grant was invisible and the scratch-only
-        // assertion passed over it. If this stops being empty, the fixture no
-        // longer proves the hole existed and must be rewritten, not deleted.
+        // Observation 1 (load-bearing): under the pre-fix derivation the delete
+        // set is EXACTLY the shipped scratch prefix --- the permissive statement
+        // contributes nothing --- so the scratch-only assert_eq passes on a
+        // policy that grants delete outside sys/qualify. That is the hole. If
+        // this stops holding, the fixture no longer reaches the state admin's
+        // real policy reaches and must be rewritten, not deleted.
         let pre_fix = pre_fix_allow_delete_key_patterns(&policy);
-        assert!(
-            pre_fix.is_empty(),
-            "fixture {sid} invalid: pre_fix_allow_delete_key_patterns was \
-             expected to return no delete entry (hiding the grant); returned \
-             {pre_fix:?}"
+        assert_eq!(
+            pre_fix,
+            vec!["sys/qualify/*".to_string()],
+            "fixture {sid} invalid: the pre-fix derivation must return exactly \
+             the shipped scratch prefix, hiding the permissive grant so the \
+             scratch-only assertion passes over it; returned {pre_fix:?}"
         );
 
-        // ...pin WHY it was empty so the two holes stay distinguishable: either
-        // the pre-fix exact match did not see a wildcard action, or it saw the
-        // action but the silent drop discarded a non-bucket-relative resource.
+        // ...pin WHY the permissive statement was invisible so the two holes
+        // stay distinguishable: either the pre-fix exact match did not see a
+        // wildcard action, or it saw the action but the silent drop discarded a
+        // non-bucket-relative resource.
         let pre_fix_action_hit = actions
             .iter()
             .any(|a| a.eq_ignore_ascii_case("s3:DeleteObject"));
@@ -2887,18 +3029,24 @@ fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
              {actions:?} as a delete grant"
         );
 
-        // Observation 2: the real guard fires on the synthetic policy --- either
-        // panicking inside delete_key_patterns on an out-of-bucket
-        // resource, or failing the scratch-only assert_eq on a non-scratch key.
+        // Observation 2: the real guard fires on the synthetic policy, and the
+        // message says which path did it --- panicking inside
+        // delete_key_patterns on a resource that classifies as nothing, or
+        // failing the scratch-only assert_eq on a second, non-scratch key.
         // catch_unwind so the panic is reported as a result here.
         let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_admin_delete_grant_is_scratch_only(&policy)
         }));
-        assert!(
-            guard.is_err(),
+        let message = panic_message(guard.expect_err(&format!(
             "the delete guard must reject fixture {sid}: a delete-capable \
              statement on {resource:?} must surface as a permissive grant, not \
-             be silently dropped"
+             sit unexamined beside the scratch prefix"
+        )));
+        assert!(
+            message.contains(expected_rejection),
+            "fixture {sid}: the delete guard rejected, but not for the reason \
+             this case is written for. Expected a message containing \
+             {expected_rejection:?}; got {message:?}"
         );
     }
 }
@@ -3133,13 +3281,6 @@ fn mixed_case_generate_data_key_is_not_missed_by_the_negative_assertion() {
          \"KMS:GenerateDataKey*\" -- if it saw it, this fixture no longer \
          proves the hole existed"
     );
-    assert!(
-        !selected_before_fix
-            .iter()
-            .any(|a| a.starts_with("kms:GenerateDataKey")),
-        "fixture invalid: the pre-fix negative assertion was expected to hold \
-         (reporting the role unprivileged) on a policy that grants the key"
-    );
     // The second half of the hole, independent of the first: even handed the
     // action directly, the pre-fix comparison did not recognize it.
     assert!(
@@ -3355,9 +3496,17 @@ fn single_character_wildcard_in_kms_resource_is_not_a_bypass() {
 /// now rejects it naming both the `Sid` and the offending key (Observation 2).
 #[test]
 fn statement_using_an_unhandled_key_fails_closed() {
-    // (Sid, statement, substring the rejection must name, which field hid the
-    // permission pre-fix: "resource" => resource_key_patterns skipped it,
-    // "action" => statement_actions saw no action).
+    // (Sid, statement, substring the rejection must name, phrase identifying
+    // WHICH rule rejected, which field hid the permission pre-fix:
+    // "resource" => resource_key_patterns skipped it, "action" =>
+    // statement_actions saw no action).
+    //
+    // The name and the rule are separate columns because a Sid can contain the
+    // name (`TypoResources` contains `Resources`), and then "the rejection
+    // names the offending key" is implied by "the rejection names the Sid" and
+    // asserts nothing. The rule phrase is the independent claim: it fires when
+    // the choke point rejects for some other reason than the one this case is
+    // written for.
     let negative_cases = [
         (
             "NegatedResource",
@@ -3368,6 +3517,7 @@ fn statement_using_an_unhandled_key_fails_closed() {
                 "NotResource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov"
             }),
             "NotResource",
+            "cannot reason about negated or principal-scoped",
             "resource",
         ),
         (
@@ -3379,6 +3529,7 @@ fn statement_using_an_unhandled_key_fails_closed() {
                 "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
             }),
             "NotAction",
+            "cannot reason about negated or principal-scoped",
             "action",
         ),
         (
@@ -3390,6 +3541,7 @@ fn statement_using_an_unhandled_key_fails_closed() {
                 "Resources": "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*"
             }),
             "Resources",
+            "which no guard in this file handles",
             "resource",
         ),
         (
@@ -3400,11 +3552,12 @@ fn statement_using_an_unhandled_key_fails_closed() {
                 "Action": "s3:GetObject"
             }),
             "no Resource",
+            "the exact shape the resource guards skip",
             "resource",
         ),
     ];
 
-    for (sid, stmt, must_name, hidden_side) in &negative_cases {
+    for (sid, stmt, must_name, must_explain, hidden_side) in &negative_cases {
         let policy = Policy {
             role: "fixture",
             statements: serde_json::json!([stmt.clone()]),
@@ -3429,7 +3582,8 @@ fn statement_using_an_unhandled_key_fails_closed() {
             other => panic!("fixture {sid}: unknown hidden_side {other:?}"),
         }
 
-        // Observation 2: the choke point rejects it, naming the Sid and the key.
+        // Observation 2: the choke point rejects it, naming the Sid and the key,
+        // and the rejection is the one this case is written for.
         let err = validate_statement("fixture", 0, stmt)
             .expect_err(&format!("validate_statement must reject fixture {sid}"));
         assert!(
@@ -3439,6 +3593,11 @@ fn statement_using_an_unhandled_key_fails_closed() {
         assert!(
             err.contains(sid),
             "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+        assert!(
+            err.contains(must_explain),
+            "fixture {sid}: rejection must come from the rule this case is \
+             written for, whose message contains {must_explain:?}; got {err:?}"
         );
 
         // ...and so does the extracted loop `load_policy` actually runs
@@ -3484,6 +3643,7 @@ fn malformed_effect_action_or_resource_fails_closed() {
                 "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
             }),
             "Effect",
+            "Effect is neither \"Allow\" nor \"Deny\"",
         ),
         (
             "ActionIsNumber",
@@ -3494,6 +3654,7 @@ fn malformed_effect_action_or_resource_fails_closed() {
                 "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
             }),
             "Action",
+            "Action is neither a string nor a non-empty array of strings",
         ),
         (
             "ActionArrayHasNonString",
@@ -3504,6 +3665,7 @@ fn malformed_effect_action_or_resource_fails_closed() {
                 "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
             }),
             "Action",
+            "Action is neither a string nor a non-empty array of strings",
         ),
         (
             "ResourceIsNumber",
@@ -3514,10 +3676,11 @@ fn malformed_effect_action_or_resource_fails_closed() {
                 "Resource": 7
             }),
             "Resource",
+            "Resource is neither a string nor a non-empty array of strings",
         ),
     ];
 
-    for (sid, stmt, must_name) in &cases {
+    for (sid, stmt, must_name, must_explain) in &cases {
         let err = validate_statement("fixture", 0, stmt)
             .expect_err(&format!("validate_statement must reject fixture {sid}"));
         assert!(
@@ -3527,6 +3690,15 @@ fn malformed_effect_action_or_resource_fails_closed() {
         assert!(
             err.contains(sid),
             "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+        // Independent of both above: every Sid here contains its own
+        // `must_name`, so "the rejection names the key" follows from "the
+        // rejection names the Sid" and asserts nothing on its own. This is the
+        // claim that fires when some other rule rejected the statement first.
+        assert!(
+            err.contains(must_explain),
+            "fixture {sid}: rejection must come from the rule this case is \
+             written for, whose message contains {must_explain:?}; got {err:?}"
         );
     }
 }
@@ -3550,6 +3722,7 @@ fn empty_action_or_resource_array_fails_closed() {
                 "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
             }),
             "Action",
+            "Action is neither a string nor a non-empty array of strings",
         ),
         (
             "EmptyResource",
@@ -3560,10 +3733,11 @@ fn empty_action_or_resource_array_fails_closed() {
                 "Resource": []
             }),
             "Resource",
+            "Resource is neither a string nor a non-empty array of strings",
         ),
     ];
 
-    for (sid, stmt, must_name) in &cases {
+    for (sid, stmt, must_name, must_explain) in &cases {
         // The fixed predicate rejects the empty array. (An `iter().all` over the
         // empty array is vacuously true, which is exactly the pre-fix bug.)
         assert!(
@@ -3579,6 +3753,14 @@ fn empty_action_or_resource_array_fails_closed() {
         assert!(
             err.contains(sid),
             "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+        // Both Sids here contain their own `must_name`, so the key-naming
+        // assertion above follows from the Sid-naming one. This is the
+        // independent claim: the empty array is what rejected the statement.
+        assert!(
+            err.contains(must_explain),
+            "fixture {sid}: rejection must come from the string-array shape \
+             rule, whose message contains {must_explain:?}; got {err:?}"
         );
     }
 }
@@ -3605,6 +3787,7 @@ fn unhandled_condition_shape_fails_closed() {
                 "Condition": {"StringNotLike": {"s3:prefix": ["t/*"]}}
             }),
             "StringNotLike",
+            "which no guard in this file reads (handled operators:",
         ),
         (
             "SetQualifiedOperator",
@@ -3616,6 +3799,7 @@ fn unhandled_condition_shape_fails_closed() {
                 "Condition": {"ForAnyValue:StringLike": {"s3:prefix": ["t/*"]}}
             }),
             "ForAnyValue:StringLike",
+            "which no guard in this file reads (handled operators:",
         ),
         (
             "UnhandledConditionKey",
@@ -3627,6 +3811,7 @@ fn unhandled_condition_shape_fails_closed() {
                 "Condition": {"StringLike": {"s3:delimiter": ["/"]}}
             }),
             "s3:delimiter",
+            "which no guard in this file reads (handled keys:",
         ),
         (
             "ConditionNotObject",
@@ -3638,10 +3823,11 @@ fn unhandled_condition_shape_fails_closed() {
                 "Condition": "StringLike"
             }),
             "Condition",
+            "Condition is not a JSON object",
         ),
     ];
 
-    for (sid, stmt, must_name) in &cases {
+    for (sid, stmt, must_name, must_explain) in &cases {
         // Load-bearing: the guard that would read this Condition finds nothing,
         // so the constraint sits unexamined. Prove the pre-fix skip on the two
         // operator cases (both are s3:ListBucket, so list_prefix_patterns is the
@@ -3651,6 +3837,17 @@ fn unhandled_condition_shape_fails_closed() {
                 role: "fixture",
                 statements: serde_json::json!([stmt.clone()]),
             };
+            // The pre-fix body decides list membership through the live
+            // `statement_actions`, so an empty result on its own is also what a
+            // regression there would produce. Pin the raw Action first: the
+            // emptiness has to come from the unread Condition sub-shape.
+            assert_eq!(
+                stmt["Action"],
+                serde_json::json!("s3:ListBucket"),
+                "fixture {sid} invalid: this case is a list statement, and the \
+                 emptiness below must come from the unread Condition rather \
+                 than from action selection returning nothing"
+            );
             assert!(
                 pre_fix_list_prefix_patterns(&policy).is_empty(),
                 "fixture {sid}: the pre-fix list_prefix_patterns was expected to \
@@ -3667,6 +3864,15 @@ fn unhandled_condition_shape_fails_closed() {
         assert!(
             err.contains(sid),
             "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+        // Two of these Sids contain their own `must_name`, so for them the
+        // key-naming assertion follows from the Sid-naming one. This names the
+        // Condition rule that had to be the one to reject.
+        assert!(
+            err.contains(must_explain),
+            "fixture {sid}: rejection must come from the Condition rule this \
+             case is written for, whose message contains {must_explain:?}; got \
+             {err:?}"
         );
     }
 
@@ -4610,6 +4816,22 @@ fn condition_presence_must_track_list_bucket_action() {
             "Resource": "arn:aws:s3:::my-ravel-bucket",
         }]),
     };
+    // The pre-fix body decides list membership through the live
+    // `statement_actions`, so an empty result on its own is also what a
+    // regression there would produce. Pin the raw JSON first: this statement IS
+    // a list statement and it carries no Condition, so the emptiness below can
+    // only be the absent Condition.
+    let no_condition_stmt = &policy_statements(&no_condition)[0];
+    assert_eq!(
+        no_condition_stmt["Action"],
+        serde_json::json!("s3:ListBucket"),
+        "fixture invalid: this statement must be a list statement"
+    );
+    assert_eq!(
+        no_condition_stmt["Condition"],
+        serde_json::Value::Null,
+        "fixture invalid: this statement must carry no Condition at all"
+    );
     assert!(
         pre_fix_list_prefix_patterns(&no_condition).is_empty(),
         "fixture invalid: a ListBucket statement with no Condition must contribute \
@@ -5290,20 +5512,28 @@ fn list_statement_resource_is_examined() {
 /// be wildcard-blind.
 #[test]
 fn wildcard_action_is_selected_by_every_axis() {
-    // (action, does it grant an S3 object op, a bucket op, a KMS op)
+    // (action, does it grant an S3 object op / a bucket op / a KMS op,
+    //  and what did round three's put / list / KMS matcher answer for it)
     let cases = [
-        ("s3:*", true, true, false),
-        ("S3:*", true, true, false),
-        ("*", true, true, true),
-        ("s3:?utObject", true, false, false),
-        ("kms:*", false, false, true),
+        ("s3:*", (true, true, false), (false, false, false)),
+        ("S3:*", (true, true, false), (false, false, false)),
+        ("*", (true, true, true), (false, false, false)),
+        ("s3:?utObject", (true, false, false), (false, false, false)),
+        // The one wildcard round three's KMS prefix matcher did catch: `kms:*`
+        // starts with `kms:`. It is `"*"` that slipped past that axis.
+        ("kms:*", (false, false, true), (false, false, true)),
         // Control: a literal action grants only itself.
-        ("s3:GetObject", true, false, false),
+        ("s3:GetObject", (true, false, false), (false, false, false)),
         // Control: an unrelated literal grants nothing in the vocabulary.
-        ("s3:DeleteObjectTagging", false, false, false),
+        (
+            "s3:DeleteObjectTagging",
+            (false, false, false),
+            (false, false, false),
+        ),
     ];
 
-    for (action, grants_object, grants_list, grants_kms) in cases {
+    for (action, post_fix, pre_fix) in cases {
+        let (grants_object, grants_list, grants_kms) = post_fix;
         assert_eq!(
             action_grants_any(action, &S3_OBJECT_OPERATIONS),
             grants_object,
@@ -5319,25 +5549,24 @@ fn wildcard_action_is_selected_by_every_axis() {
             grants_kms,
             "action_selects_kms: {action:?}"
         );
-    }
 
-    // Observation 1 (load-bearing): round three's per-axis matchers -- exact
-    // case-folded equality for put and list, a case-folded `kms:` prefix for KMS
-    // -- each missed the wildcard action that grants their operation. Written as
-    // those literal expressions, so this pins the hole rather than restating the
-    // fix.
-    assert!(
-        !"s3:*".eq_ignore_ascii_case("s3:PutObject"),
-        "fixture invalid: round three's put selection was expected to miss \"s3:*\""
-    );
-    assert!(
-        !"s3:*".eq_ignore_ascii_case("s3:ListBucket"),
-        "fixture invalid: round three's list selection was expected to miss \"s3:*\""
-    );
-    assert!(
-        !"*".starts_with("kms:"),
-        "fixture invalid: round three's KMS selection was expected to miss \"*\""
-    );
+        // Observation 1 (load-bearing): round three's per-axis matchers --
+        // exact case-folded equality for put and list, a case-folded `kms:`
+        // prefix for KMS -- asked about THIS case's action, so a row added to
+        // the table has to state what they answered for it. Spelled against
+        // two literals instead, the comparison is a compile-time constant that
+        // no edit to this file, to a template, or to the predicate could make
+        // fire, which is decoration rather than an assertion.
+        assert_eq!(
+            (
+                action.eq_ignore_ascii_case("s3:PutObject"),
+                action.eq_ignore_ascii_case("s3:ListBucket"),
+                action.starts_with("kms:"),
+            ),
+            pre_fix,
+            "round three's (put, list, KMS) selection for {action:?}"
+        );
+    }
 
     // ...while the delete axis, the one round three made wildcard-aware, saw it.
     // That asymmetry is what the single predicate removes.
@@ -5397,6 +5626,30 @@ fn shipped_gateway_write_mutated_to_wildcard_action_fails_closed() {
 
     // Observation 1 (load-bearing): under round three's exact-name matchers the
     // mutated policy hid the grant in two independent places.
+    //
+    // The pre-fix put body decides membership through the live
+    // `statement_actions`, so an empty result on its own is also what a
+    // regression there would produce. Pin the raw mutated Action and round
+    // three's own comparison over it, so the emptiness is the exact-name
+    // matcher missing a wildcard and nothing else.
+    let mutated_action = json["Statement"]
+        .as_array()
+        .and_then(|s| {
+            s.iter()
+                .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayWrite"))
+        })
+        .and_then(|stmt| stmt["Action"].as_str())
+        .expect("the mutated GatewayWrite statement carries a string Action")
+        .to_string();
+    assert_eq!(
+        mutated_action, "s3:*",
+        "fixture invalid: the mutation must have taken effect on GatewayWrite"
+    );
+    assert!(
+        !mutated_action.eq_ignore_ascii_case("s3:PutObject"),
+        "fixture invalid: round three selected put statements by exact name, so \
+         the mutated action {mutated_action:?} must not match it"
+    );
     assert!(
         pre_fix_put_resource_key_patterns(&mutated).is_empty(),
         "fixture invalid: round three's PutObject selection was expected to derive \
