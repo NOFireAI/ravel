@@ -29,9 +29,10 @@ pub struct ToolContext<'a> {
     pub tenant_hash: TenantHash,
     /// Wall-clock instant the call must be finished by, as a nanosecond epoch.
     pub deadline_ns: i64,
-    /// The oldest ingest instant the deployment still guarantees is readable,
-    /// as a nanosecond epoch. A cursor or evidence reference pointing before
-    /// it can no longer be honored.
+    /// The instant, as a nanosecond epoch, through which the deployment
+    /// still protects a pinned snapshot from the sweeper. A cursor or
+    /// evidence reference whose effective deadline falls after it can no
+    /// longer be honored.
     pub protection_horizon_ns: i64,
     /// The D6 budgets this call runs under, already clamped.
     pub budgets: McpEffectiveBudgets,
@@ -199,7 +200,7 @@ mod tests {
         ToolContext {
             tenant_hash: TenantId::new("acme").hash(),
             deadline_ns: 4 * 3_600_000_000_000,
-            protection_horizon_ns: 0,
+            protection_horizon_ns: 30 * 3_600_000_000_000,
             budgets: McpRequestBudgets::default()
                 .clamp(&EngineConfig::default(), &McpBudgetConfig::default()),
             cursor_key: key,
