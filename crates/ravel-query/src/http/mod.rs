@@ -22,6 +22,7 @@ pub use error::{
     ApiError, MSG_AUDIT_UNAVAILABLE, MSG_CORRUPT, MSG_UNAVAILABLE, MSG_UNSATISFIABLE,
     QueryErrorResponse,
 };
+pub use handlers::include_log_metric_names;
 pub use metadata_cache::{
     MetadataCache, MetadataCacheConfig, MetadataCacheCounters, MetadataSnapshot,
 };
