@@ -2292,6 +2292,37 @@ fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
         "t/*/*/prov",
         "t/*/catalog/*/*",
     ];
+    // Pin DISJOINT_PROTECTED to its own definition so it cannot drift from the
+    // protected list it is carved out of. It must be exactly
+    // PROTECTED_DELETE_KEYS minus the one entry that does NOT hold by
+    // disjointness: the legal-hold shard, reached by maintain's level-based
+    // delete grants and held only by the Deny. The expected value is derived
+    // from PROTECTED_DELETE_KEYS, so a keyspace added there forces a matching
+    // entry here (or this fails loudly and names it), emptying this list fails,
+    // and dropping an entry fails. Nothing else asserts this relationship, so a
+    // new protected keyspace could otherwise be added with every other assertion
+    // green and its disjointness from delete grants never checked (#1346).
+    const LEGAL_HOLD_SHARD: &str = "t/*/u/*/0000/*";
+    assert!(
+        PROTECTED_DELETE_KEYS.contains(&LEGAL_HOLD_SHARD),
+        "legal-hold shard {LEGAL_HOLD_SHARD:?} is not in PROTECTED_DELETE_KEYS; \
+         the disjoint set is defined as PROTECTED_DELETE_KEYS minus that shard \
+         and must track a rename (#1346)"
+    );
+    let expected_disjoint: Vec<&str> = PROTECTED_DELETE_KEYS
+        .iter()
+        .copied()
+        .filter(|p| *p != LEGAL_HOLD_SHARD)
+        .collect();
+    assert_eq!(
+        DISJOINT_PROTECTED,
+        expected_disjoint.as_slice(),
+        "DISJOINT_PROTECTED must equal PROTECTED_DELETE_KEYS minus the legal-hold \
+         shard {LEGAL_HOLD_SHARD:?}. If a protected keyspace was added to \
+         PROTECTED_DELETE_KEYS, add it here so its disjointness from delete \
+         grants is checked; if one must be excluded for a reason other than the \
+         legal-hold shard, exclude it explicitly and justify it (#1346)"
+    );
     let disjoint_witnesses: Vec<&String> = key_domain()
         .iter()
         .filter(|k| {
