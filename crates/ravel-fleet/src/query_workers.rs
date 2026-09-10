@@ -206,6 +206,19 @@ impl QueryWorkers {
         Ok(())
     }
 
+    /// Delete this process's own heartbeat record. Called on graceful shutdown
+    /// so a draining query worker stops advertising itself to sibling
+    /// coordinators immediately, rather than lingering in their live set until
+    /// its stamp ages past the `3 * H` staleness window. Deletes only the one
+    /// key this process owns (`sys/query/workers/<process_id>`); a single writer
+    /// alone controls that key, so this never races another process. A missing
+    /// key is not an error (`delete` is idempotent).
+    pub async fn delete_heartbeat(&self, store: &dyn ObjectStoreBackend) -> Result<(), StoreError> {
+        store
+            .delete(&query_worker_key(&self.process_id.to_string()))
+            .await
+    }
+
     /// Compute the live query-worker set (ADR-0071): this process plus every
     /// non-stale sibling under `sys/query/workers/`, applying the exact
     /// `worker_set::is_stale` rule (`3 * H`, symmetric) to each record's
@@ -407,6 +420,46 @@ mod tests {
                 .any(|r| r.process_id == body_id.to_string() || r.process_id == key_id.to_string()),
             "neither the key id nor the forged body id may enter the live set"
         );
+    }
+
+    /// After a worker deletes its own heartbeat, a sibling's live set stops
+    /// including it immediately, without waiting for the `3 * H` staleness
+    /// window to age the record out.
+    #[tokio::test]
+    async fn deleted_heartbeat_drops_from_the_live_set_immediately() {
+        let store = MemoryStore::new();
+        let now = 1_000 * H_NS;
+        let a = worker();
+        let b = worker();
+
+        a.write_heartbeat(&store, now).await.expect("a heartbeat");
+        b.write_heartbeat(&store, now).await.expect("b heartbeat");
+
+        // Both fresh: `a` sees both, at the same reader clock.
+        let live = a.live_set(&store, now).await.expect("live set");
+        assert_eq!(live.len(), 2, "both workers live before delete");
+
+        // `b` drains and deletes its record; `a` re-reads at the SAME clock, so
+        // only the deletion (not staleness) can drop `b`.
+        b.delete_heartbeat(&store).await.expect("b delete");
+        let live = a.live_set(&store, now).await.expect("live set");
+        assert_eq!(
+            live.len(),
+            1,
+            "only self survives after the sibling deletes"
+        );
+        assert_eq!(live[0].process_id, a.process_id().to_string());
+        assert!(
+            !live
+                .iter()
+                .any(|r| r.process_id == b.process_id().to_string()),
+            "a deleted worker must not read as live even within its window"
+        );
+
+        // Idempotent: deleting an already-absent key is not an error.
+        b.delete_heartbeat(&store)
+            .await
+            .expect("second delete is a no-op");
     }
 
     /// A far-future-dated record must be excluded exactly like a far-past one,

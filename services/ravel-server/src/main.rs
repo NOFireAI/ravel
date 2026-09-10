@@ -514,6 +514,10 @@ async fn main() -> anyhow::Result<()> {
             .resolve_audit_pipeline_config()
             .context("failed to resolve --audit-mode/--audit-max-batch/--audit-max-age")?,
         audit_text,
+        shutdown_timeout: cli
+            .parse_shutdown_timeout()
+            .context("failed to parse --shutdown-timeout")?,
+        drain_settle_interval: ravel_server::DEFAULT_DRAIN_SETTLE_INTERVAL,
     };
 
     let running =
@@ -522,7 +526,14 @@ async fn main() -> anyhow::Result<()> {
 
     wait_for_shutdown_signal().await;
     tracing::info!("shutdown signal received, draining");
-    running.shutdown().await?;
+    // A drain that overran `--shutdown-timeout`, a listener error, or a failed
+    // query-audit drain each return `Err`: log it at error level and propagate
+    // so the process exits non-zero, rather than falling through to the
+    // "shutdown complete" line and a clean exit it did not earn.
+    if let Err(err) = running.shutdown().await {
+        tracing::error!(error = %err, "graceful shutdown did not complete cleanly");
+        return Err(err);
+    }
     tracing::info!("shutdown complete");
     // Flush the OTLP trace exporter AFTER draining (ADR-0060 decision 7): a
     // span for the last request the server handled closes as that request
