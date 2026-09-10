@@ -247,6 +247,9 @@ Every tool returns one envelope:
 }
 ```
 
+The 2026-09-13 amendment's item 7 renames `watermark_hour` above to
+`ingest_watermark_hour`, and this skeleton keeps the original name.
+
 `plan` carries the plan text that `ravel_explain_query` returns and stays
 `null` on every other tool.
 
@@ -845,19 +848,17 @@ correction is item 6.
    seven report the same `snapshot_id`. It identifies those inputs, not the
    segments they resolved to.
 
-   The first five of those are the resolve inputs the cursor pins. The
-   remaining two are in the preimage because leaving either out makes the id
-   collide across resolves that are not the same resolve. Without the tenant
-   hash, two tenants asking for the same signal and window with no declared
-   columns and no pending erasure predicates report a byte-identical
-   `snapshot_id` over disjoint data, which is a cross-tenant collision in a
-   field agents are told to compare. Without the resolve instant, two calls a
-   day apart over the same historical window report the same id while
-   resolving different segment sets, because the live listing above the fold
-   watermark picks up whatever committed in between. A redemption is not an
-   exception: the 2026-09-12 amendment's item 4 makes a redeeming resolve run
-   at the cursor's own `mint_ns`, so every page of one sequence resolves at
-   one instant and reports one id.
+   Each of the seven avoids a collision across resolves that are not the
+   same resolve. Without the tenant hash, two tenants resolving the same
+   signal over the same window report a byte-identical `snapshot_id` over
+   disjoint data. Without the resolve instant, two calls a day apart over
+   the same historical window report the same id while resolving different
+   segment sets. The live listing above the fold watermark picks up
+   whatever committed in between. A cursor pins the same resolve inputs
+   plus its keyset position, which is why every page of one sequence
+   reports the same id. A redemption is not an exception. The 2026-09-12
+   amendment's item 4 makes a redeeming resolve run at the cursor's own
+   `mint_ns`. So every page of one sequence resolves at one instant.
 
 Two further decisions follow from item 4. Both are settled here rather than
 left to the implementation.

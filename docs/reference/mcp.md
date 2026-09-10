@@ -140,14 +140,14 @@ same seven report the same `snapshot_id`. It identifies those inputs, not
 the set of segments they resolved to, so a later call reporting the same
 value is not a promise that it read the same objects.
 
-The first five of those are the resolve inputs a cursor pins. The tenant
-hash and the resolve instant are in the hash because without them the value
-collides across calls that are not the same resolve: two tenants asking the
-same question of disjoint data would report one id, and two calls a day
-apart over the same historical window would report one id while reading
-different segments. Every page of one cursor sequence still reports one id,
-because a redemption resolves at the instant the cursor was minted rather
-than at the redeeming call's clock.
+Each of the seven avoids a collision across calls that are not the same
+resolve. Without the tenant hash, two tenants asking the same question of
+disjoint data would report one id. Without the resolve instant, two calls
+a day apart over the same historical window would report one id while
+reading different segments. A cursor pins the same resolve inputs plus
+its keyset position, so every page of one cursor sequence reports one id.
+A redemption resolves at the instant the cursor was minted, not at the
+redeeming call's clock.
 
 `visibility.ingest_watermark_hour` is the greatest ingest hour bucket among
 the segments the call's snapshot resolved to. It travels as the decimal unix
