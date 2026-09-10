@@ -2,8 +2,7 @@
 //! (docs/ingest.md "Structure").
 
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ravel_commit::rng::{RngSource, SystemRng};
@@ -39,13 +38,61 @@ pub struct WriteReceipt {
     pub tokens: Vec<CommitToken>,
 }
 
+/// The router's live handle to one shard actor. Interior-mutable because a
+/// handle lives inside a [`GenerationSwitch`] set behind `Arc<Vec<ShardHandle>>`
+/// (shared, never mutated in place), yet the supervisor must swap in a fresh
+/// sender when it respawns the actor after a death (issue #1299).
 struct ShardHandle {
+    inner: Mutex<ShardInner>,
+}
+
+/// Supervisor state guarded together so a death observation, the respawn that
+/// replaces `tx`, and the incarnation a concurrent observer compares against
+/// are one atomic transition.
+struct ShardInner {
+    /// Sender for the current live actor incarnation.
     tx: mpsc::Sender<ShardMsg>,
-    /// Set once the router first observes this shard's channel closed (send
-    /// half or a strict-mode ack failing because the actor task is gone).
-    /// The actor is never restarted, so this only ever flips false to true;
-    /// it dedups the `shard_deaths` counter to one increment per shard.
-    dead: AtomicBool,
+    /// Bumped on every respawn. A write captures it beside the sender it sends
+    /// on; a later death report carrying a stale incarnation is a duplicate of a
+    /// death already counted and already respawned, and is ignored.
+    incarnation: u64,
+    /// Respawns already spent on this shard. Once it reaches
+    /// [`IngestRouter::MAX_SHARD_RESPAWNS`] the next death condemns the shard
+    /// instead of respawning it.
+    respawns: u32,
+    /// Set once the shard has exhausted its respawn budget: the router stops
+    /// respawning it and reports not-ready so the orchestrator replaces this
+    /// replica. One-way.
+    condemned: bool,
+}
+
+impl ShardHandle {
+    fn new(tx: mpsc::Sender<ShardMsg>) -> Self {
+        ShardHandle {
+            inner: Mutex::new(ShardInner {
+                tx,
+                incarnation: 0,
+                respawns: 0,
+                condemned: false,
+            }),
+        }
+    }
+
+    /// Poison-recovering lock: a shard's supervisor state is best-effort
+    /// self-healing, not a durability path, so a prior panicked holder must not
+    /// take this one down (matches `GenerationSwitch::lock`).
+    fn lock(&self) -> std::sync::MutexGuard<'_, ShardInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The current sender and the incarnation it belongs to: a write sends on
+    /// the sender and, if it fails, attributes the death to that incarnation.
+    fn send_target(&self) -> (mpsc::Sender<ShardMsg>, u64) {
+        let inner = self.lock();
+        (inner.tx.clone(), inner.incarnation)
+    }
 }
 
 /// Routes writes to generation-versioned shard-actor sets (ADR-0052).
@@ -61,6 +108,10 @@ pub struct IngestRouter {
     store: Arc<dyn ObjectStoreBackend>,
     signal: Signal,
     clock: Arc<dyn Clock>,
+    /// Randomness source for minting a fresh writer identity when respawning a
+    /// dead shard actor (issue #1299). The same source the initial factory and
+    /// the shard actors' PUT-retry jitter draw from (ADR-0068 decision 2).
+    rng: Arc<dyn RngSource>,
     metrics: Arc<IngestMetrics>,
     config: IngestConfig,
     /// Process-wide ingest buffer byte budget (ADR-0069 decision 1). Shared by `Arc` with the log and span routers so one ceiling
@@ -79,6 +130,22 @@ pub struct IngestRouter {
 }
 
 impl IngestRouter {
+    /// How many times the router respawns a shard actor before condemning it
+    /// (issue #1299). A shard actor dies only by panicking mid-flush, and the
+    /// two causes want opposite responses. A transient cause (a split-brain
+    /// from a racing writer that has since lost, a spurious store failure
+    /// surfaced as a panic) clears under a fresh actor with a new writer
+    /// identity, so some respawns are worth trying. A deterministic cause (a
+    /// poison-pill buffered point, a corrupt object every flush re-reads)
+    /// reproduces on every incarnation, so unbounded respawning is a hot crash
+    /// loop that never makes progress. Three bounds the loop: enough to ride
+    /// out a couple of independent transients, few enough that a deterministic
+    /// killer condemns the shard quickly and hands it to the orchestrator. The
+    /// buffered points the dead actor held are lost on every respawn (a respawn
+    /// restores write capacity for the shard, not its buffer); the strict-mode
+    /// writer already saw `ShardUnavailable` for them.
+    pub const MAX_SHARD_RESPAWNS: u32 = 3;
+
     /// Construct with the production OS-entropy randomness source. Writer ids
     /// and PUT-retry backoff jitter draw from OS entropy, unchanged from
     /// before the [`RngSource`] seam (ADR-0068 decision 2).
@@ -139,10 +206,7 @@ impl IngestRouter {
                             Arc::clone(&stage_timings),
                         );
                         tokio::spawn(actor.run());
-                        ShardHandle {
-                            tx,
-                            dead: AtomicBool::new(false),
-                        }
+                        ShardHandle::new(tx)
                     })
                     .collect()
             }
@@ -155,6 +219,7 @@ impl IngestRouter {
             store,
             signal,
             clock,
+            rng,
             metrics,
             config,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
@@ -392,13 +457,19 @@ impl IngestRouter {
         shard_ids.sort_unstable();
         shard_ids.dedup();
 
-        // Parallel to `ack_rxs`: the shard each receiver belongs to, so a
-        // closed ack channel can be attributed to the right shard and counted
-        // as that shard's death.
-        let mut ack_shards = Vec::with_capacity(shard_ids.len());
+        // Parallel to `ack_rxs`: the (shard, incarnation) each receiver belongs
+        // to, so a closed ack channel is attributed to the right shard and to
+        // the exact actor incarnation this request sent on (issue #1299), and
+        // counted as that incarnation's death rather than a duplicate of one
+        // already respawned.
+        let mut ack_shards: Vec<(u32, u64)> = Vec::with_capacity(shard_ids.len());
         let mut ack_rxs = Vec::with_capacity(shard_ids.len());
         for shard in shard_ids {
             let points = by_shard.remove(&shard).unwrap_or_default();
+            // The current live sender for this shard and the incarnation it
+            // belongs to, captured together so a send failure or a dropped ack
+            // is attributed to exactly the incarnation this request used.
+            let (shard_tx, incarnation) = set[shard as usize].send_target();
             // Strict mode acknowledges the points this request sent. A shard
             // that received only exemplars gets no ack: an exemplar is a
             // decoration on a measurement (ADR-0047 decision 1), its loss is
@@ -410,7 +481,7 @@ impl IngestRouter {
             let ack = match mode {
                 WriteMode::Strict if !points.is_empty() => {
                     let (tx, rx) = oneshot::channel();
-                    ack_shards.push(shard);
+                    ack_shards.push((shard, incarnation));
                     ack_rxs.push(rx);
                     Some(tx)
                 }
@@ -423,12 +494,13 @@ impl IngestRouter {
                 ack,
                 charge: Some(Arc::clone(&charge)),
             };
-            if set[shard as usize].tx.send(msg).await.is_err() {
+            if shard_tx.send(msg).await.is_err() {
                 // The actor task is gone (it never closes its own receiver
-                // while alive), so this shard is dead. Count it once and
-                // surface the typed error rather than acking as if the points
-                // landed.
-                self.mark_shard_dead(&set[shard as usize]);
+                // while alive), so this incarnation is dead. Observe it (which
+                // counts the death once and respawns the shard within its
+                // budget) and surface the typed error rather than acking as if
+                // the points landed.
+                self.observe_shard_death(shard, &set[shard as usize], incarnation);
                 return Err(WriteError::ShardUnavailable);
             }
             // The message is now in the shard's channel (issue #865): count it
@@ -457,14 +529,15 @@ impl IngestRouter {
 
         // Every ack resolved. Scan them all: collect every shard that acked a
         // durable commit (issue #1130), and record the first failure in shard
-        // order so the returned classification and `mark_shard_dead` side effect
-        // are exactly what the pre-fix early-return produced. A shard whose ack
-        // failed to resolve (`RecvError`: the actor panicked mid-flush) is NOT a
-        // durable write and contributes no token.
+        // order so the returned classification and the death side effect match
+        // the pre-fix early-return. A shard whose ack failed to resolve
+        // (`RecvError`: the actor panicked mid-flush) is NOT a durable write and
+        // contributes no token; its (shard, incarnation) is remembered so the
+        // death is observed against the exact incarnation this write sent on.
         let mut durable = Vec::with_capacity(joined.len());
         let mut first_error: Option<WriteError> = None;
-        let mut dead_shard: Option<u32> = None;
-        for (shard, result) in ack_shards.into_iter().zip(joined) {
+        let mut dead_shard: Option<(u32, u64)> = None;
+        for ((shard, incarnation), result) in ack_shards.into_iter().zip(joined) {
             match result {
                 Ok(Ok(token)) => durable.push(token),
                 Ok(Err(shard_error)) => {
@@ -475,18 +548,19 @@ impl IngestRouter {
                 Err(_) => {
                     if first_error.is_none() {
                         first_error = Some(WriteError::ShardUnavailable);
-                        dead_shard = Some(shard);
+                        dead_shard = Some((shard, incarnation));
                     }
                 }
             }
         }
 
         if let Some(inner) = first_error {
-            // Preserve the exact failure semantics: the death is counted once,
-            // only when the first failure in shard order is a dropped ack, and
-            // only then (a resolved shard-level error never marked a death).
-            if let Some(shard) = dead_shard {
-                self.mark_shard_dead(&set[shard as usize]);
+            // Observe the death only when the first failure in shard order is a
+            // dropped ack (a resolved shard-level error is not a death). This
+            // counts the death once for this incarnation and respawns the shard
+            // within its budget, or condemns it past the budget.
+            if let Some((shard, incarnation)) = dead_shard {
+                self.observe_shard_death(shard, &set[shard as usize], incarnation);
             }
             // Carry the durably-acked sibling tokens only when there are any; a
             // failure with no partial success surfaces as the bare variant,
@@ -506,13 +580,70 @@ impl IngestRouter {
         Ok(WriteReceipt { tokens: durable })
     }
 
-    /// Records the first observation of a shard actor's death, deduped so a
-    /// permanently dead shard is counted once no matter how many later writes
-    /// route to it (docs/ingest.md "Metrics (self-observability)").
-    fn mark_shard_dead(&self, handle: &ShardHandle) {
-        if !handle.dead.swap(true, Ordering::Relaxed) {
-            self.metrics.record_shard_death();
+    /// Observe one death report for `shard`'s actor at `observed_incarnation`
+    /// (issue #1299). Deduped by incarnation, so concurrent observers of the
+    /// same death, and later writes that route to an already-replaced actor,
+    /// count the death once. Within the respawn budget it spawns a fresh actor
+    /// and swaps in its sender under the same lock, so the next write to this
+    /// shard reaches a live actor; past the budget the shard is condemned (no
+    /// further respawn) and [`Self::ready`] reports not-ready so the
+    /// orchestrator replaces this replica. The dead actor's buffered points are
+    /// lost either way (docs/ingest.md "Metrics (self-observability)").
+    fn observe_shard_death(&self, shard: u32, handle: &ShardHandle, observed_incarnation: u64) {
+        let mut inner = handle.lock();
+        // A duplicate report of a death already handled: another observer got
+        // here first and respawned (so the live incarnation moved on), or the
+        // shard is already condemned. Count nothing.
+        if inner.incarnation != observed_incarnation || inner.condemned {
+            return;
         }
+        self.metrics.record_shard_death();
+        if inner.respawns >= Self::MAX_SHARD_RESPAWNS {
+            inner.condemned = true;
+            self.metrics.record_shard_condemned();
+            return;
+        }
+        inner.respawns += 1;
+        inner.incarnation += 1;
+        inner.tx = self.spawn_shard_actor(shard);
+    }
+
+    /// Spawn a replacement actor for `shard` with a fresh writer identity and
+    /// return its sender (issue #1299). A new `writer_id` keeps the
+    /// replacement's object and commit keys disjoint from the dead
+    /// incarnation's, so a late PUT from the old actor cannot collide with the
+    /// new one. This restores write capacity for the shard, not the buffered
+    /// points the dead actor lost.
+    fn spawn_shard_actor(&self, shard: u32) -> mpsc::Sender<ShardMsg> {
+        let writer_id = self.rng.new_uuid();
+        let epoch =
+            u64::try_from(self.clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
+        let (tx, rx) = mpsc::channel(self.config.channel_depth);
+        let actor = ShardActor::new(
+            shard,
+            self.signal,
+            writer_id,
+            epoch,
+            Arc::clone(&self.store),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.rng),
+            self.config,
+            Arc::clone(&self.metrics),
+            rx,
+            #[cfg(feature = "stage-timing")]
+            Arc::clone(&self.stage_timings),
+        );
+        tokio::spawn(actor.run());
+        tx
+    }
+
+    /// Whether every shard actor this router owns is live enough to serve:
+    /// false once any shard has exhausted its respawn budget and been condemned
+    /// (issue #1299). A condemned shard cannot recover in-process, so a false
+    /// here is the router asking the orchestrator to replace this replica;
+    /// `services/ravel-server` ANDs it into `/readyz`.
+    pub fn ready(&self) -> bool {
+        self.metrics.condemned_shards() == 0
     }
 
     /// Forces every shard to flush all buffered tenants now, for tests and
@@ -523,9 +654,14 @@ impl IngestRouter {
         let mut dones = Vec::new();
         for set in &sets {
             for shard in set.iter() {
-                let (tx, rx) = oneshot::channel();
-                if shard.tx.send(ShardMsg::FlushNow { done: tx }).await.is_ok() {
-                    dones.push(rx);
+                let (done_tx, done_rx) = oneshot::channel();
+                let (shard_tx, _) = shard.send_target();
+                if shard_tx
+                    .send(ShardMsg::FlushNow { done: done_tx })
+                    .await
+                    .is_ok()
+                {
+                    dones.push(done_rx);
                 }
             }
         }
@@ -544,9 +680,10 @@ impl IngestRouter {
         let mut dones = Vec::new();
         for set in &sets {
             for shard in set.iter() {
-                let (tx, rx) = oneshot::channel();
-                let _ = shard.tx.send(ShardMsg::Shutdown { done: tx }).await;
-                dones.push(rx);
+                let (done_tx, done_rx) = oneshot::channel();
+                let (shard_tx, _) = shard.send_target();
+                let _ = shard_tx.send(ShardMsg::Shutdown { done: done_tx }).await;
+                dones.push(done_rx);
             }
         }
         for rx in dones {
@@ -560,7 +697,7 @@ impl IngestRouter {
 mod tests {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     use ravel_catalog::ShardGeneration;
     use ravel_object_store::list_all;
