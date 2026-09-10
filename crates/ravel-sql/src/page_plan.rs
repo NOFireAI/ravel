@@ -73,14 +73,24 @@
 //! ([`PagePlanError::OrderTermNullable`]): a keyset comparison against NULL is
 //! NULL, so the rows whose term is NULL match no disjunct and appear on no
 //! page at all. That is a wrong answer on both the total and the not-total
-//! path, because the keyset predicate is what resumes both. Only a term that
-//! the text proves NON NULL is admitted: it has to be a bare reference to a
-//! column the target table's public schema declares non-nullable, either
-//! directly or through an alias over one. Everything else is refused,
-//! including a projected expression (whose nullability no schema lookup
-//! answers), a declared column (all nullable), a set-operation body (whose
-//! projection is not readable from the text), an output name projected twice
-//! under different sources, and a statement with no base table at all.
+//! path, because the keyset predicate is rendered whenever a resume is given
+//! and is therefore what resumes both. `not_total: Some(..)` rescues nothing
+//! here: reporting is not a substitute for refusing.
+//!
+//! Only a term the text proves NON NULL is admitted, and the proof is a
+//! schema lookup that holds end to end only when the output name is a bare
+//! reference to a column of the `FROM` relation AND that relation is the
+//! target base table itself. [`SchemaBasis`] is what settles the second half:
+//! a derived table, a CTE, a join, or a `ROLLUP`/`CUBE`/`GROUPING SETS`
+//! grouping each leave the schema answering about a column the ordered value
+//! did not come from.
+//!
+//! The refusal says which of two things went wrong.
+//! [`PagePlanError::OrderTermNullable`] means the term CAN be NULL: the
+//! schema declares that column nullable, and the caller has to order by
+//! something else. [`PagePlanError::OrderTermNullabilityUnknown`] means the
+//! text does not settle it, and names the missing link, because a caller told
+//! that `count(*)` "is not known to be NON NULL" has no repair to make.
 //!
 //! # The rewrite
 //!
@@ -293,6 +303,26 @@ pub enum PagePlanError {
     )]
     OrderTermNullable { column: String },
 
+    /// An `ORDER BY` term whose nullability the text does not settle either
+    /// way.
+    ///
+    /// Distinct from [`Self::OrderTermNullable`], which says the term CAN be
+    /// NULL, and the distinction is the caller's repair. A caller told that
+    /// `count(*)` "is not known to be NON NULL" has nothing to fix and no way
+    /// to tell a planner gap from a real hazard; a caller told which link of
+    /// the proof is missing can rewrite around it, by ordering on a schema
+    /// column rather than a declared one, or by lifting the term out of a
+    /// derived table.
+    #[error(
+        "the ORDER BY term `{column}` cannot be proved NON NULL from the statement \
+         text ({reason}), and a keyset comparison against NULL selects no rows, so \
+         the rows whose `{column}` is NULL would appear on no page"
+    )]
+    OrderTermNullabilityUnknown {
+        column: String,
+        reason: &'static str,
+    },
+
     /// The resume tuple does not have one value per effective term.
     #[error("the resume position has {found} values for {expected} ORDER BY terms")]
     ResumeArity { expected: usize, found: usize },
@@ -452,11 +482,21 @@ pub fn plan_page(sql: &str, resume: Option<&ResumePosition>) -> Result<PagePlan,
     }
     // Every effective term, the appended tiebreak included: a NULL anywhere in
     // the ordering drops the rows it covers from every page.
+    let basis = schema_basis(&query, target);
     for term in &terms {
-        if !term_is_non_nullable(target, &projection, &term.column) {
-            return Err(PagePlanError::OrderTermNullable {
-                column: term.column.clone(),
-            });
+        match term_nullability(&basis, &projection, &term.column) {
+            NullProof::NonNull => {}
+            NullProof::Nullable => {
+                return Err(PagePlanError::OrderTermNullable {
+                    column: term.column.clone(),
+                });
+            }
+            NullProof::Unproven(reason) => {
+                return Err(PagePlanError::OrderTermNullabilityUnknown {
+                    column: term.column.clone(),
+                    reason,
+                });
+            }
         }
     }
 
@@ -643,14 +683,19 @@ impl Projection {
         }
     }
 
-    /// The target-table column the output column `column` is a bare reference
-    /// to, or `None` when the text does not name one.
+    /// The column of the `FROM` RELATION that the output column `column` is a
+    /// bare reference to, or `None` when the text does not name one.
     ///
     /// A wildcard answers with the name itself: every output column of a
     /// `SELECT *` is a column of the `FROM` relation under its own name.
     /// `Unknown` answers `None` rather than guessing, which is what makes a
     /// set-operation body fail the nullability check instead of passing it
     /// unexamined.
+    ///
+    /// The name this returns is a name in the `FROM` relation, which is the
+    /// target table's own column only when that relation IS the target table.
+    /// [`SchemaBasis`] is what settles that, and every caller has to consult
+    /// it before turning this name into a schema lookup.
     fn source_column<'a>(&'a self, column: &'a str) -> Option<&'a str> {
         match self {
             Projection::Wildcard => Some(column),
@@ -700,20 +745,152 @@ fn projection_of(query: &Query) -> Projection {
     Projection::Columns(names)
 }
 
-/// Whether the text proves the effective term `column` is NON NULL.
+/// Whether an output name may be resolved against the target table's public
+/// schema at all.
 ///
-/// The proof has to hold end to end: the output column has to be a bare
-/// reference to a column of the target table (so a schema lookup is about the
-/// right value at all), and that column has to be declared non-nullable in the
-/// table's public schema. A statement with no base table has no schema to ask,
-/// and a declared column is absent from the static schema and nullable
-/// anyway, so both answer false.
-fn term_is_non_nullable(target: PageTarget, projection: &Projection, column: &str) -> bool {
+/// [`Projection::source_column`] maps an output name to a name in the `FROM`
+/// relation. Asking the target table's schema about that name is sound only
+/// when the `FROM` relation IS that base table: otherwise the schema answers
+/// about a column the value did not come from, and a NOT NULL declaration
+/// there says nothing about the value being ordered on.
+enum SchemaBasis {
+    /// Output names resolve against this table's public schema.
+    Resolvable(&'static str),
+    /// They do not, for this reason, which the refusal quotes.
+    Unresolvable(&'static str),
+}
+
+/// The reasons a [`PagePlanError::OrderTermNullabilityUnknown`] can carry,
+/// named rather than written inline so a test pins which link of the proof
+/// was missing without restating the sentence, and so two paths cannot drift
+/// into two spellings of one reason.
+mod unproven {
+    pub(super) const NOT_A_BARE_COLUMN: &str = "it is not a bare reference to a column of the FROM relation, so no schema \
+         lookup describes it";
+    pub(super) const NO_BASE_TABLE: &str = "the statement has no base table";
+    pub(super) const WITH_CLAUSE: &str =
+        "a WITH clause can declare the target table's own name and shadow it";
+    pub(super) const SET_OPERATION: &str = "a set operation's projection is not readable here";
+    pub(super) const NOT_ONE_RELATION: &str = "its FROM clause is not one relation";
+    pub(super) const JOINED: &str = "a join leaves an output name resolvable against more than one relation, and an \
+         outer join nulls one side of it";
+    pub(super) const DERIVED_RELATION: &str =
+        "its FROM relation is a derived table or a table function, not the target table";
+    pub(super) const OTHER_RELATION: &str = "its FROM relation is not the target table itself";
+    pub(super) const GROUPING_NULLS: &str = "a ROLLUP, CUBE or GROUPING SETS grouping nulls a grouping column in its \
+         super-aggregate rows";
+    pub(super) const NOT_A_SCHEMA_COLUMN: &str = "it is not a column of the target table's public schema, so it is a declared \
+         column whose nullability the text does not carry";
+    pub(super) const NO_PUBLIC_SCHEMA: &str = "the target table has no public schema here";
+}
+
+/// Whether the statement's own `FROM` relation is the target base table, so
+/// that the table's public schema describes the values it projects.
+///
+/// The three shapes this refuses each produced a plan whose keyset predicate
+/// silently dropped every row with a NULL order term, from every page, with
+/// no error:
+///
+/// - a derived table or a CTE, where the output name is the inner query's
+///   own (`SELECT * FROM (SELECT nullif(value, 0) AS ts, series_id FROM
+///   samples) x ORDER BY ts` proved `ts` off `samples.ts` while the value was
+///   `nullif(value, 0)`);
+/// - the nullable side of an outer join, where the base column really is NOT
+///   NULL and is still NULL for every unmatched row;
+/// - `ROLLUP`, `CUBE` and `GROUPING SETS`, where the schema lookup is correct
+///   and the grouping construct introduces the NULL in the super-aggregate
+///   row.
+///
+/// Two of the refusals are wider than those shapes strictly need, and both
+/// are deliberate. An inner or cross join is refused alongside the outer
+/// ones, because an output name under a join is resolvable against more than
+/// one relation and a single-table lookup cannot say which. A `WITH` clause
+/// is refused even when the `FROM` names the base table, because a CTE can
+/// declare that same name and shadow it.
+fn schema_basis(query: &Query, target: PageTarget) -> SchemaBasis {
     let Some(table) = target.table_name() else {
+        return SchemaBasis::Unresolvable(unproven::NO_BASE_TABLE);
+    };
+    if query.with.is_some() {
+        return SchemaBasis::Unresolvable(unproven::WITH_CLAUSE);
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return SchemaBasis::Unresolvable(unproven::SET_OPERATION);
+    };
+    let [only] = select.from.as_slice() else {
+        return SchemaBasis::Unresolvable(unproven::NOT_ONE_RELATION);
+    };
+    if !only.joins.is_empty() {
+        return SchemaBasis::Unresolvable(unproven::JOINED);
+    }
+    let TableFactor::Table {
+        name, args: None, ..
+    } = &only.relation
+    else {
+        return SchemaBasis::Unresolvable(unproven::DERIVED_RELATION);
+    };
+    if bare_name(name).as_deref() != Some(table) {
+        return SchemaBasis::Unresolvable(unproven::OTHER_RELATION);
+    }
+    if grouping_can_null_a_grouping_column(&select.group_by) {
+        return SchemaBasis::Unresolvable(unproven::GROUPING_NULLS);
+    }
+    SchemaBasis::Resolvable(table)
+}
+
+/// Whether the `GROUP BY` can emit a row where a grouping column is NULL even
+/// though that column is declared NOT NULL.
+///
+/// `ROLLUP`, `CUBE`, `GROUPING SETS` and ClickHouse's `WITH TOTALS` each add
+/// a super-aggregate row whose unaggregated grouping columns are NULL. Both
+/// spellings count: the modifier form (`GROUP BY a WITH ROLLUP`) and the
+/// expression form (`GROUP BY ROLLUP(a)`). A plain `GROUP BY` and
+/// `GROUP BY ALL` add no such row, so neither is refused here.
+fn grouping_can_null_a_grouping_column(group_by: &GroupByExpr) -> bool {
+    let GroupByExpr::Expressions(exprs, modifiers) = group_by else {
         return false;
     };
+    !modifiers.is_empty()
+        || exprs.iter().any(|expr| {
+            matches!(
+                expr,
+                SqlExpr::Rollup(_) | SqlExpr::Cube(_) | SqlExpr::GroupingSets(_)
+            )
+        })
+}
+
+/// What the statement's text says about whether an effective term can be
+/// NULL.
+///
+/// The two negative answers are kept apart because they call for different
+/// repairs: `Nullable` says the term CAN be NULL and the caller has to order
+/// by something else, while `Unproven` says the text does not settle it, and
+/// names what would.
+enum NullProof {
+    /// Provably NON NULL from the text alone.
+    NonNull,
+    /// The target table's public schema declares this column nullable.
+    Nullable,
+    /// Neither proved. The string is the reason the refusal quotes.
+    Unproven(&'static str),
+}
+
+/// What the text says about the effective term `column`.
+///
+/// The proof has to hold end to end: the output column has to be a bare
+/// reference to a column of the `FROM` relation, that relation has to be the
+/// target base table itself (see [`schema_basis`]), and the column has to be
+/// declared non-nullable in the table's public schema. A declared column is
+/// absent from the static schema, and whether it exists at all depends on the
+/// tenant's declarations rather than on the text, so it is `Unproven` rather
+/// than either answer.
+fn term_nullability(basis: &SchemaBasis, projection: &Projection, column: &str) -> NullProof {
     let Some(source) = projection.source_column(column) else {
-        return false;
+        return NullProof::Unproven(unproven::NOT_A_BARE_COLUMN);
+    };
+    let table = match basis {
+        SchemaBasis::Resolvable(table) => *table,
+        SchemaBasis::Unresolvable(reason) => return NullProof::Unproven(reason),
     };
     let schema = match table {
         SAMPLES_TABLE => public_schema(),
@@ -721,11 +898,13 @@ fn term_is_non_nullable(target: PageTarget, projection: &Projection, column: &st
         SPANS_TABLE => spans_schema(),
         ALERTS_TABLE => alerts_schema(),
         AUDIT_TABLE => audit_schema(),
-        _ => return false,
+        _ => return NullProof::Unproven(unproven::NO_PUBLIC_SCHEMA),
     };
-    schema
-        .field_with_name(source)
-        .is_ok_and(|field| !field.is_nullable())
+    match schema.field_with_name(source) {
+        Ok(field) if !field.is_nullable() => NullProof::NonNull,
+        Ok(_) => NullProof::Nullable,
+        Err(_) => NullProof::Unproven(unproven::NOT_A_SCHEMA_COLUMN),
+    }
 }
 
 /// The parts of a single `SELECT` body that decide whether it projects the
@@ -1387,11 +1566,13 @@ mod tests {
             ),
             // Nullable ordering terms: a projected expression whose
             // nullability no schema lookup answers, and a column the schema
-            // declares nullable outright.
+            // declares nullable outright. The two carry different refusals,
+            // because the repairs differ.
             (
                 "SELECT nullif(value, 0) AS v, ts, series_id FROM samples ORDER BY v",
-                PagePlanError::OrderTermNullable {
+                PagePlanError::OrderTermNullabilityUnknown {
                     column: "v".to_string(),
+                    reason: unproven::NOT_A_BARE_COLUMN,
                 },
             ),
             (
@@ -1574,32 +1755,20 @@ mod tests {
     /// both. Proof of NON NULL has to come from the statement's own text, and
     /// it does for a bare reference to a column the target's public schema
     /// declares non-nullable and for nothing else.
+    ///
+    /// These are the cases where the schema ANSWERS, and answers nullable.
+    /// The cases where it cannot answer carry
+    /// [`PagePlanError::OrderTermNullabilityUnknown`] instead and are pinned
+    /// by the tests below; the split matters because only these have a repair
+    /// the caller can make from the message alone.
     #[test]
     fn refuses_an_ordering_term_that_can_be_null() {
         let cases: Vec<(&str, &str)> = vec![
-            // A projected expression: the case reachable on the TOTAL path.
-            // This used to report `total_order() == true` while every keyset
-            // disjunct was NULL for the rows `nullif` nulled out.
-            (
-                "SELECT nullif(value, 0) AS v, ts, series_id FROM samples ORDER BY v",
-                "v",
-            ),
             // Columns the schemas declare nullable, one per table that has
             // one.
             ("SELECT * FROM logs ORDER BY span_id, ts", "span_id"),
             ("SELECT * FROM spans ORDER BY service_name", "service_name"),
             ("SELECT * FROM alerts ORDER BY alert_id", "alert_id"),
-            // An output name the projection gives twice from different
-            // columns: both are columns, but which one the term means is not
-            // readable from the text, so the nullable one cannot be ruled out.
-            ("SELECT ts AS a, trace_id AS a FROM logs ORDER BY a", "a"),
-            // A set-operation body carries no readable projection at all.
-            (
-                "SELECT ts FROM logs UNION ALL SELECT ts FROM logs ORDER BY ts",
-                "ts",
-            ),
-            // No base table, so there is no schema to prove anything against.
-            ("SELECT 1 AS a ORDER BY a", "a"),
         ];
         for (sql, column) in cases {
             let err = plan_page(sql, None).expect_err("refused");
@@ -1620,6 +1789,56 @@ mod tests {
             );
         }
 
+        // The cases the schema cannot answer for. Each names the link of the
+        // proof that is missing, so a caller can tell a planner gap from a
+        // column that really can be NULL.
+        let unproven_cases: Vec<(&str, &str, &str)> = vec![
+            // A projected expression: the case reachable on the TOTAL path.
+            // This used to report `total_order() == true` while every keyset
+            // disjunct was NULL for the rows `nullif` nulled out.
+            (
+                "SELECT nullif(value, 0) AS v, ts, series_id FROM samples ORDER BY v",
+                "v",
+                unproven::NOT_A_BARE_COLUMN,
+            ),
+            // An output name the projection gives twice from different
+            // columns: both are columns, but which one the term means is not
+            // readable from the text, so the nullable one cannot be ruled out.
+            (
+                "SELECT ts AS a, trace_id AS a FROM logs ORDER BY a",
+                "a",
+                unproven::NOT_A_BARE_COLUMN,
+            ),
+            // A set-operation body carries no readable projection at all.
+            (
+                "SELECT ts FROM logs UNION ALL SELECT ts FROM logs ORDER BY ts",
+                "ts",
+                unproven::NOT_A_BARE_COLUMN,
+            ),
+            // A literal, which no schema lookup reaches.
+            ("SELECT 1 AS a ORDER BY a", "a", unproven::NOT_A_BARE_COLUMN),
+        ];
+        for (sql, column, reason) in unproven_cases {
+            let err = plan_page(sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullabilityUnknown {
+                    column: column.to_string(),
+                    reason,
+                },
+                "unexpected refusal for {sql:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "the ORDER BY term `{column}` cannot be proved NON NULL from the \
+                     statement text ({reason}), and a keyset comparison against NULL \
+                     selects no rows, so the rows whose `{column}` is NULL would \
+                     appear on no page"
+                ),
+            );
+        }
+
         // The non-nullable columns of those same tables still page, including
         // through an alias over one, so the refusal is about nullability and
         // not about the table or about aliasing.
@@ -1633,6 +1852,157 @@ mod tests {
             let plan = plan_page(sql, None);
             assert!(plan.is_ok(), "{sql:?} should plan, got {plan:?}");
         }
+    }
+
+    /// A wildcard over a derived table or a CTE resolves against the inner
+    /// query's output names, not the base table's schema, so no schema lookup
+    /// proves anything about it.
+    ///
+    /// The demonstrated defect: `SELECT * FROM (SELECT nullif(value, 0) AS
+    /// ts, series_id FROM samples) x ORDER BY ts` planned. `referenced_base_
+    /// tables` still reported `samples` underneath the derived table, the
+    /// wildcard answered `ts` with the name itself, and `samples.ts` is
+    /// declared NOT NULL, so the term was proved non-null while the value
+    /// being ordered on was `nullif(value, 0)`. Every row where `value` is 0
+    /// was dropped from every page by the keyset predicate, with no error.
+    #[test]
+    fn refuses_a_wildcard_over_a_derived_table_or_cte() {
+        let derived = plan_page(
+            "SELECT * FROM (SELECT nullif(value, 0) AS ts, series_id FROM samples) AS x \
+             ORDER BY ts",
+            None,
+        )
+        .expect_err("refused");
+        assert_eq!(
+            derived,
+            PagePlanError::OrderTermNullabilityUnknown {
+                column: "ts".to_string(),
+                reason: unproven::DERIVED_RELATION,
+            },
+        );
+
+        let cte = plan_page(
+            "WITH x AS (SELECT nullif(value, 0) AS ts, series_id FROM samples) \
+             SELECT * FROM x ORDER BY ts",
+            None,
+        )
+        .expect_err("refused");
+        assert_eq!(
+            cte,
+            PagePlanError::OrderTermNullabilityUnknown {
+                column: "ts".to_string(),
+                reason: unproven::WITH_CLAUSE,
+            },
+        );
+
+        // A CTE that shadows the target table's own name is the same hole
+        // spelled so the `FROM` relation reads as the base table. It refuses
+        // one step earlier: `referenced_base_tables` subtracts a CTE-declared
+        // name, so the statement resolves to no base table at all.
+        let shadowing = plan_page(
+            "WITH samples AS (SELECT nullif(value, 0) AS ts, series_id FROM samples) \
+             SELECT * FROM samples ORDER BY ts",
+            None,
+        )
+        .expect_err("refused");
+        assert_eq!(
+            shadowing,
+            PagePlanError::OrderTermNullabilityUnknown {
+                column: "ts".to_string(),
+                reason: unproven::NO_BASE_TABLE,
+            },
+        );
+    }
+
+    /// A term aliased off the nullable side of an outer join is NULL for
+    /// every unmatched row, whatever the base column's schema says.
+    ///
+    /// `logs.body` is declared NOT NULL, and `b.body` under a `LEFT JOIN` is
+    /// still NULL for every left row with no match. The schema lookup was
+    /// correct about `logs.body` and wrong about the value.
+    #[test]
+    fn refuses_a_term_from_the_nullable_side_of_an_outer_join() {
+        for join in ["LEFT JOIN", "RIGHT JOIN", "FULL OUTER JOIN"] {
+            let sql = format!(
+                "SELECT a.ts AS ts, b.body AS b_body FROM logs AS a \
+                 {join} logs AS b ON a.ts = b.ts ORDER BY b_body, ts"
+            );
+            let err = plan_page(&sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullabilityUnknown {
+                    column: "b_body".to_string(),
+                    reason: unproven::JOINED,
+                },
+                "unexpected refusal for {sql:?}"
+            );
+        }
+
+        // An inner join is refused by the same rule, for the narrower reason
+        // stated in `schema_basis`: nothing nulls a column, but an output
+        // name under a join resolves against more than one relation.
+        let inner = plan_page(
+            "SELECT a.ts AS ts, b.body AS b_body FROM logs AS a \
+             INNER JOIN logs AS b ON a.ts = b.ts ORDER BY b_body, ts",
+            None,
+        )
+        .expect_err("refused");
+        assert_eq!(
+            inner,
+            PagePlanError::OrderTermNullabilityUnknown {
+                column: "b_body".to_string(),
+                reason: unproven::JOINED,
+            },
+        );
+    }
+
+    /// `ROLLUP`, `CUBE` and `GROUPING SETS` null a grouping column in their
+    /// super-aggregate rows.
+    ///
+    /// Here the schema lookup is CORRECT -- `logs.severity_text` really is
+    /// NOT NULL -- and the grouping construct introduces the NULL anyway. The
+    /// prover modelled nothing about it, so the super-aggregate row was
+    /// dropped from every page by the keyset predicate.
+    #[test]
+    fn refuses_a_grouping_column_under_rollup_cube_or_grouping_sets() {
+        let groupings = [
+            // The expression spelling.
+            "ROLLUP(severity_text)",
+            "CUBE(severity_text)",
+            "GROUPING SETS ((severity_text), ())",
+            // The modifier spelling of the same thing.
+            "severity_text WITH ROLLUP",
+            "severity_text WITH CUBE",
+        ];
+        for grouping in groupings {
+            let sql = format!(
+                "SELECT severity_text, count(*) AS c FROM logs \
+                 GROUP BY {grouping} ORDER BY severity_text"
+            );
+            let err = plan_page(&sql, None).expect_err("refused");
+            assert_eq!(
+                err,
+                PagePlanError::OrderTermNullabilityUnknown {
+                    column: "severity_text".to_string(),
+                    reason: unproven::GROUPING_NULLS,
+                },
+                "unexpected refusal for {sql:?}"
+            );
+        }
+
+        // A plain GROUP BY adds no super-aggregate row, so it is not refused
+        // by this rule: the narrowing is about the grouping construct, not
+        // about grouping.
+        let plain = plan_page(
+            "SELECT severity_text, count(*) AS c FROM logs GROUP BY severity_text \
+             ORDER BY severity_text",
+            None,
+        )
+        .expect("planned");
+        assert_eq!(
+            plain.not_total,
+            Some(NotTotalOrder::NoRowIdentity { table: "logs" }),
+        );
     }
 
     /// Every order term is quoted, so a column aliased with a quoted keyword
