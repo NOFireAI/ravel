@@ -755,3 +755,80 @@ against the 256 KiB `max_response_bytes` floor.
    port returning finished envelopes. That reason is superseded for the
    envelope frame. It still holds for the `data` block, which the adapter
    keeps building.
+
+**Amendment (2026-09-13).** Five contract decisions and one correction.
+
+1. `FindLabelsInput.filter` is a case-sensitive substring match over the
+   strings the tool is about to return. It applies after the list is
+   produced and before the page cap. So a returned page is complete for that
+   filter, and a truncation report means more matches genuinely exist. The
+   filter is reported in `scope.predicates_applied`. It is case-sensitive
+   because label names and values are exact byte strings and canonical series
+   identity is exact. A case-insensitive match would need a Unicode
+   case-folding rule that nothing else in the system defines. An empty filter
+   string is `invalid_argument`, not a match of everything. A filter does not
+   satisfy the rule that refuses an unfiltered tenant-wide list. That rule
+   keys on a selector or a label name, each of which bounds the resolution. A
+   filter bounds only the output, so a request carrying a filter and neither
+   of the other two is still refused.
+2. `ravel_find_labels` takes no `evidence_ref` in this phase. The input is
+   removed from the tool rather than accepted and ignored, and the tool emits
+   no `evidence` block. Nothing defines what a label list attests to, and the
+   port between the tool layer and the engine does not carry what minting a
+   reference would need.
+3. A paged `ravel_describe_data` pins page one's freshness watermark into the
+   cursor, and every later page reports that same value. A page sequence that
+   re-measures per page describes a moving state, with nothing telling the
+   agent that two pages disagree because time passed rather than because the
+   data differs.
+4. That freshness watermark is the maximum `ingest_hour_bucket` across the
+   segments in the resolved snapshot. It is not the catalog fold watermark.
+   Four reasons, each a live constraint:
+   - The fold watermark is a cost boundary, not a freshness one. A resolve
+     serves hours at or below it from snapshot parts and lists everything
+     above it live, so a query already sees data the watermark does not
+     cover, and docs/consistency-model.md states that the fold never changes
+     which commits a query sees.
+   - Its lag is large. An hour seals only once `now >= end(hour) +
+     max_flush_lifetime + clock_skew_allowance + fold_safety_margin`, which
+     at the defaults of 1 h, 5 m and 15 m puts the worst case between an
+     acknowledged write and a covering watermark at about 2 h 25 m, once the
+     fold's 5 m interval and the 30 s HEAD cache are counted. Reporting that
+     as freshness would tell an agent its data may be hours stale while it
+     holds an answer resolved a minute ago.
+   - It is the costlier of the two. The value is not on the returned
+     `Snapshot`; it lives in a crate-private struct, so a query-path caller
+     needs a ravel-catalog signature change or an extra HEAD GET outside the
+     catalog's 30 s cache. The maximum `ingest_hour_bucket` over
+     `Snapshot::segments` is an in-memory fold over a vector the caller
+     already owns.
+   - It is ingest time, not event time, so a client's clock cannot move it.
+
+   Event-time bounds are a different quantity. `min_event_ts_ns` and
+   `max_event_ts_ns` across the resolved set describe what the data covers
+   and belong in the `coverage` block, not in `visibility`.
+
+   The pinned value is page one's measurement. A later page may have resolved
+   over a superset, because the live listing above the fold watermark picks
+   up whatever committed since. The cursor has always pinned resolve inputs
+   and a lower bound rather than an enumeration, and this field is the same
+   kind of thing.
+
+   The pinned watermark is a new cursor field, so `CURSOR_VERSION` goes from
+   4 to 5, with a test that a version 4 token decodes as invalid, matching
+   the three that already exist for earlier versions.
+5. A redeeming resolve runs at the cursor's `mint_ns`, not at the redeeming
+   call's clock. A page sequence that re-lists at the current instant walks a
+   moving snapshot, and pinning a watermark while resolving against a later
+   one makes the pin decorative. Nothing in the code states this today and
+   there is no production caller, so this ADR is where it is settled.
+6. Correction. D5 defines `visibility.snapshot_id` as a hash of the pinned
+   segment set. The amendment that replaced the segment-enumeration cursor
+   with the resolve-input cursor deleted that set, and the code followed it
+   at `CURSOR_VERSION` 4, so the set exists nowhere in the system. No later
+   amendment respecifies the derivation. `snapshot_id` is a hash over the
+   same resolve inputs the cursor pins: the signal, the half-open time range,
+   the minimum commit-token watermark, the pending erasure predicates, and
+   the declared column set. Two calls resolving the same inputs report the
+   same `snapshot_id`. It identifies those inputs, not the segments they
+   resolved to.
