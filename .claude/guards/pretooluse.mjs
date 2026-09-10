@@ -157,6 +157,21 @@ function stripHeredocBodies(text) {
 // containing a space (`TS=$(date +%s) cargo test | tail -1`) no longer hides
 // it either. The bodies themselves are scanned separately by `scanTexts`, so
 // nothing is lost by blanking them here.
+//
+// THIS is the load-bearing defence, and the single plain assignment
+// alternative in HARMLESS_PREFIX is the fallback. Reverting the alternation
+// alone leaves the suite green, which reads as "unpinned, delete it" and is
+// the opposite of the truth: neutering this function alone fails a case, and
+// reverting both fails four. If this is ever removed or reordered, the plain
+// `NAME=[^\s]*` alternative still catches every space-free value; the older
+// two-alternative form caught none of them. Keep both.
+//
+// A mis-slice here cannot produce a false ALLOW, and the reason is
+// structural rather than careful coding: this feeds only the prefix
+// decision, while `scanTexts` scans every substitution body as its own
+// command. When this swallows too much (an unterminated `$(` collapses the
+// tail to one token), the body scan still sees the gate. A false allow needs
+// both to miss at once.
 function blankSubstitutions(text) {
   let out = "";
   let sq = false;
