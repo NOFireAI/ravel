@@ -23,7 +23,7 @@ the envelope, and the empty-result checklist.
 | --- | --- | --- | --- | --- | --- |
 | `ravel_capabilities` | Protocol and server version, served tools (`tools.enabled`) and declared-but-unserved ones (`tools.catalogued`), effective budget ceilings, dialect summaries, tenant hash, enabled signals | none | `data` | none; reads no data | `unauthorized`, `invalid_argument`, `internal` |
 | `ravel_describe_data` | Effective schema, indexed keys, metric families, freshness watermark, coverage window, exact row counts where available | `signal`, an optional `cursor` | `data`, `scope`, `visibility`, `coverage`, `presentation` | 100 metric families per page | `unauthorized`, `invalid_argument`, `unavailable`, `deadline`, `cursor_expired`, `cursor_invalid`, `internal` |
-| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, plus a filter, `time_range` (required), an optional `evidence_ref`, `deadline_ms`, `max_response_bytes`. An unfiltered tenant-wide list is refused | `data`, `scope`, `coverage`, `evidence` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
+| `ravel_find_labels` | Metric names, label names, or label values for a selector | a selector or a label name, an optional `filter`, `time_range` (required), `deadline_ms`, `max_response_bytes`. A call carrying neither a selector nor a label name is refused, whatever its filter | `data`, `scope`, `coverage` | 2,000 segments admitted for resolution | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `internal` |
 | `ravel_explain_query` | Validate a SQL or PromQL statement, estimate its cost, and return the plan shape. No scan runs. | `query`, `time_range`, `deadline_ms`, `max_response_bytes` | `data` (effective schema as `data.columns`, zero rows), `scope`, `budget`, `plan` (a text block that the explain tool alone populates) | compares the estimate against the effective budget | `unauthorized`, `invalid_argument`, `validation`, `unsupported`, `budget_estimate_exceeds_ceiling`, `internal` |
 | `ravel_query_sql` | One `SELECT` over one table | `query`, `time_range` (required), `max_rows`, lowerable budgets, an optional `cursor`, an optional `evidence_ref` | `data`, `scope`, `visibility`, `accuracy`, `presentation`, `budget`, `evidence` | `max_rows` 200, ceiling 5,000; `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `validation`, `unsupported`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `cursor_expired`, `cursor_invalid`, `internal` |
 | `ravel_query_promql` | Instant or range PromQL evaluation | `query`, either `time_range` and `step` or `evaluation_time` (exactly one mode), partial-coverage consent, an optional `evidence_ref`, `deadline_ms`, `max_bytes_scanned`, `max_response_bytes`, `max_rows`, `max_segments`, `max_store_requests` | `data`, `scope`, `coverage`, `accuracy`, `budget`, `evidence` | `max_response_bytes` 512 KiB default, 256 KiB floor | `unauthorized`, `missing_argument`, `invalid_argument`, `budget_exceeded`, `deadline`, `unavailable`, `snapshot_invalidated`, `internal` |
@@ -34,6 +34,26 @@ the envelope, and the empty-result checklist.
 
 `ravel_capabilities` and `ravel_describe_data` return metadata only.
 Neither tool accepts `evidence_ref` or emits an `evidence` block.
+`ravel_find_labels` accepts no `evidence_ref` and emits no `evidence`
+block either: nothing defines what a label list attests to, so the tool
+mints no reference.
+
+### Filtering a label list
+
+`ravel_find_labels` takes an optional `filter`, a case-sensitive substring
+match over the strings the call is about to return. It is applied after the
+list is produced and before the page cap, so a returned page is complete
+for that filter, and a truncation report means more matches exist. The
+filter is reported in `scope.predicates_applied`.
+
+The match is case-sensitive because label names and values are exact byte
+strings. An empty `filter` string is `invalid_argument`, not a request to
+match everything.
+
+A filter does not stand in for a selector or a label name. Those bound
+which data the call resolves; a filter bounds only the output. A call that
+carries a filter and neither of the other two is still refused with
+`invalid_argument`.
 
 ## The envelope
 
@@ -101,12 +121,35 @@ A result with rows and `ok_bounded` means more rows exist and the
 server minted no cursor. A genuinely empty result is `ok` with
 `row_count` 0.
 
+## Snapshot identity and freshness
+
+`visibility.snapshot_id` is a hash over the resolve inputs a cursor pins:
+the signal, the half-open time range, the minimum commit-token watermark,
+the erasure predicates pending at resolve time, and the typed attribute
+columns declared. Two calls that resolve the same inputs report the same
+`snapshot_id`. It identifies those inputs, not the set of segments they
+resolved to, so a later call reporting the same value is not a promise
+that it read the same objects.
+
+`visibility.watermark_hour` is the greatest ingest hour bucket among the
+segments the call's snapshot resolved to. It is an ingest-time bound, so
+no client clock moves it, and it is not the catalog's fold watermark. The
+fold watermark is a cost boundary: a resolve serves hours at or below it
+from snapshot parts and lists everything above it live, so a query
+routinely reads data the fold has not reached. It also lags an
+acknowledged write by around 2 h 25 m under the default flush lifetime,
+skew allowance, and fold margins, which would read as hours of staleness
+beside an answer resolved a minute ago.
+
+Event-time bounds are a different quantity. What the data covers in event
+time is reported under `coverage`, not here.
+
 ## Failure classes
 
 | Class | Meaning |
 | --- | --- |
 | `unauthorized` | The credential does not resolve to a tenant. |
-| `invalid_argument` | An argument is well-formed but not acceptable as given: two mutually exclusive fields set together, a value out of range, an unfiltered tenant-wide list. |
+| `invalid_argument` | An argument is well-formed but not acceptable as given: two mutually exclusive fields set together, a value out of range, an empty `filter` string, a label list bounded by neither a selector nor a label name. |
 | `missing_argument` | A required argument, most often a time input, was not sent. |
 | `validation` | The query engine rejected the statement itself. The message is the engine's own text, safe to show. |
 | `unsupported` | The request names a construct or an operation the tool does not implement. |
@@ -144,6 +187,11 @@ input and nothing more: redemption never compares it against a watermark
 observed later, because commit tokens from different writers have no
 ordering between them to compare, and whether a pinned token is still
 satisfiable is the catalog's answer at resolve time.
+
+That resolve also runs at the instant the cursor was minted, not at the
+redeeming call's clock. A page sequence that re-listed at the current
+instant would walk a moving snapshot, and pinning a watermark while
+resolving against a later one would leave the pin decorative.
 
 Redemption refuses a structurally valid, correctly bound cursor with
 `cursor_expired` in two cases. The first is that its effective deadline has
@@ -196,12 +244,21 @@ rows it has, up to the row cap, with status `ok_bounded` and no cursor.
 with the same signal and that cursor. The cursor follows the same codec,
 tenant binding, and lifetime as every other cursor.
 
-Every data tool accepts an optional `evidence_ref` input. Redeeming a
-reference re-executes the tool with the reference's own arguments. The
-re-execution runs against the reference's pinned snapshot while the pin is
-valid. The server then compares the BLAKE3-256 digest of the canonical row
-bytes. The digest travels in the evidence entry's `blake3_256` field, named
-for the function that produced it.
+Page one's freshness watermark is pinned into that cursor, and every later
+page reports the same value in `visibility.watermark_hour`. A sequence that
+re-measured the watermark per page would describe a moving state, with
+nothing to say whether two pages differ because time passed or because the
+data differs. The pinned value is page one's measurement: a later page may
+resolve over a superset of page one's segments, because the live listing
+above the fold watermark picks up whatever has committed since.
+
+Every data tool except `ravel_find_labels` accepts an optional
+`evidence_ref` input. Redeeming a reference re-executes the tool with the
+reference's own arguments. The re-execution runs against the reference's
+pinned snapshot while the pin is valid. The server then compares the
+BLAKE3-256 digest of the canonical row bytes. The digest travels in the
+evidence entry's `blake3_256` field, named for the function that produced
+it.
 After the pin expires, redemption re-executes fresh instead of using the
 pin. It reports `pinned: false` and states whether the hash matched.
 `cursor_invalid` and `cursor_expired` do not apply to an evidence reference
