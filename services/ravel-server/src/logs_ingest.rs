@@ -298,14 +298,22 @@ pub async fn handle_export_logs(
             LogIngestRequestError::Write(err)
         })?;
 
-    let partial_success = if rejected_count > 0 {
+    // Both rejection sources gate this, because neither alone covers the
+    // request. Gating on `rejected_count` swallows an attribute-only drop: the
+    // record lands, so its count is 0, yet the sender must still learn the
+    // attribute is gone through `error_message` with `rejected_log_records`
+    // reported as 0 (the OTLP-sanctioned warning channel). Gating on
+    // `normalized.rejected` alone swallows a stream-cap drop: the layer-4 cap
+    // rejects whole records that normalized cleanly, so they never appear in
+    // that list.
+    let partial_success = if normalized.rejected.is_empty() && stream_cap_rejected == 0 {
+        None
+    } else {
         let error_message = build_error_message(&normalized.rejected, stream_cap_rejected);
         Some(ExportLogsPartialSuccess {
             rejected_log_records: rejected_count as i64,
             error_message,
         })
-    } else {
-        None
     };
 
     // Ordering (ADR-0051 section 5): the data is durably
@@ -587,8 +595,11 @@ mod tests {
         let partial_success = outcome
             .response
             .partial_success
-            .expect("one attribute rejected");
-        assert_eq!(partial_success.rejected_log_records, 1);
+            .expect("the dropped attribute is reported");
+        assert_eq!(
+            partial_success.rejected_log_records, 0,
+            "no record was lost, only one attribute"
+        );
         assert!(
             partial_success.error_message.contains("attribute value is"),
             "got: {}",
