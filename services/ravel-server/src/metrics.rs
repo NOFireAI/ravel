@@ -667,6 +667,12 @@ pub struct IngestPipelineSnapshot {
     pub acks_err: u64,
     pub collisions: Option<u64>,
     pub shard_deaths: u64,
+    /// Shards condemned after exhausting their respawn budget (issue #1299).
+    /// `Some` only for the metrics pipeline, whose router is the one registered
+    /// with readiness and the only one that respawns and condemns; logs and
+    /// spans render no sample for this family, the same structural-absence
+    /// convention `collisions` and `exemplars` use.
+    pub shards_condemned: Option<u64>,
     /// Multi-shard Strict writes that committed on at least one shard and
     /// then failed on a sibling: partial multi-shard commits, reported to the
     /// client as a retryable error carrying the durable tokens.
@@ -781,6 +787,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.series_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            shards_condemned: Some(snapshot.shards_condemned),
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
@@ -817,6 +824,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: Some(snapshot.stream_id_collisions),
             shard_deaths: snapshot.shard_deaths,
+            shards_condemned: None,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: Some(PostingsCounters {
@@ -851,6 +859,7 @@ impl IngestPipelineSnapshot {
             acks_err: snapshot.acks_err,
             collisions: None,
             shard_deaths: snapshot.shard_deaths,
+            shards_condemned: None,
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             postings: None,
@@ -1041,7 +1050,8 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     write_header(
         out,
         "ravel_ingest_shard_deaths_total",
-        "Distinct shard actors observed dead by the router, by signal.",
+        "Shard-actor deaths observed by the router, counted once per death including each \
+         respawned incarnation (issue #1299) so it can exceed the shard count, by signal.",
         "counter",
     );
     for pipeline in pipelines {
@@ -1051,6 +1061,31 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             &labels(mode, pipeline.signal),
             pipeline.shard_deaths,
         );
+    }
+
+    // Metrics-only, like ravel_ingest_collisions_total above: only the metrics
+    // router respawns and condemns, so logs and spans render no sample here.
+    let with_condemned: Vec<_> = pipelines
+        .iter()
+        .filter(|pipeline| pipeline.shards_condemned.is_some())
+        .collect();
+    if !with_condemned.is_empty() {
+        write_header(
+            out,
+            "ravel_ingest_shards_condemned_total",
+            "Shards condemned after exhausting their respawn budget (issue #1299), counted at \
+             most once per shard; any nonzero value makes the process report /readyz 503, by \
+             signal.",
+            "counter",
+        );
+        for pipeline in with_condemned {
+            write_sample(
+                out,
+                "ravel_ingest_shards_condemned_total",
+                &labels(mode, pipeline.signal),
+                pipeline.shards_condemned.unwrap_or_default(),
+            );
+        }
     }
 
     write_header(

@@ -26,8 +26,8 @@
 //! probes, routed to the same handler functions so a
 //! Prometheus-shaped client can probe the paths it already knows.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::State;
@@ -67,6 +67,29 @@ pub struct Readiness {
     /// One-way drain latch: `false` until graceful shutdown begins, then `true`
     /// forever.
     draining: Arc<AtomicBool>,
+    /// In-process ingest health sources (issue #1299): each is a router that
+    /// reports not-ready once one of its shard actors has been condemned after
+    /// exhausting its respawn budget. `is_ready` ANDs `shards_ready` across all
+    /// of them, so a condemned shard turns `/readyz` to 503 and the orchestrator
+    /// replaces this replica. Registered once at startup; never mutated after.
+    ingest: Arc<Mutex<Vec<Arc<dyn IngestHealth>>>>,
+}
+
+/// In-process ingest health consulted by the readiness probe (issue #1299): a
+/// router reports not-ready once one of its shard actors has exhausted its
+/// respawn budget and been condemned. Pull-based -- [`Readiness::is_ready`]
+/// reads it on each probe (a cheap atomic load) -- so no code path has to
+/// remember to set a flag, matching the store-probe design's one-truth,
+/// read-on-demand shape.
+pub trait IngestHealth: Send + Sync {
+    /// False once this router has a condemned shard.
+    fn shards_ready(&self) -> bool;
+}
+
+impl IngestHealth for ravel_ingest::IngestRouter {
+    fn shards_ready(&self) -> bool {
+        self.ready()
+    }
 }
 
 impl Readiness {
@@ -75,7 +98,28 @@ impl Readiness {
         Self {
             startup: Arc::new(AtomicBool::new(false)),
             draining: Arc::new(AtomicBool::new(false)),
+            ingest: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Register an in-process ingest health source (issue #1299). Called once
+    /// per router at startup, before `mark_ready`. Poison-recovering: this is
+    /// self-observability plumbing, not a durability path.
+    pub fn register_ingest_health(&self, source: Arc<dyn IngestHealth>) {
+        self.ingest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(source);
+    }
+
+    /// Whether every registered ingest source reports its shards ready. True
+    /// when none is registered (the modes that run no ingest router).
+    fn ingest_shards_ready(&self) -> bool {
+        self.ingest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .all(|source| source.shards_ready())
     }
 
     /// Latch the startup flag to ready. Idempotent; calling it more than once is
@@ -108,11 +152,15 @@ impl Readiness {
     }
 
     /// Whether the process is ready to serve: startup has completed, the process
-    /// is NOT draining, AND the background store probe currently reports the
-    /// store reachable (ADR-0050 section 7). Any condition false yields 503 at
-    /// `/readyz`.
+    /// is NOT draining, the background store probe currently reports the store
+    /// reachable (ADR-0050 section 7), AND every registered ingest router still
+    /// has all its shards (no shard condemned after exhausting its respawn
+    /// budget, issue #1299). Any condition false yields 503 at `/readyz`.
     pub fn is_ready(&self) -> bool {
-        self.startup_complete() && !self.is_draining() && crate::store_probe::store_reachable()
+        self.startup_complete()
+            && !self.is_draining()
+            && crate::store_probe::store_reachable()
+            && self.ingest_shards_ready()
     }
 }
 
@@ -198,5 +246,42 @@ mod tests {
         let clone = readiness.clone();
         assert!(clone.is_draining(), "clone observes the shared drain latch");
         assert!(!clone.is_ready(), "clone is not ready while draining");
+    }
+
+    #[test]
+    fn a_condemned_ingest_shard_makes_readiness_not_ready() {
+        struct Health(bool);
+        impl IngestHealth for Health {
+            fn shards_ready(&self) -> bool {
+                self.0
+            }
+        }
+
+        let readiness = Readiness::new();
+        readiness.mark_ready();
+        assert!(
+            readiness.is_ready(),
+            "ready with startup complete, store reachable, no ingest source condemned"
+        );
+
+        // A healthy ingest source leaves readiness ready.
+        readiness.register_ingest_health(Arc::new(Health(true)));
+        assert!(
+            readiness.is_ready(),
+            "a healthy ingest source keeps it ready"
+        );
+
+        // A second source with a condemned shard (shards_ready == false) turns
+        // the AND false, so /readyz becomes 503 even though startup completed,
+        // the store is reachable, and the process is not draining.
+        readiness.register_ingest_health(Arc::new(Health(false)));
+        assert!(
+            !readiness.is_ready(),
+            "a condemned shard in any registered ingest source turns readiness not-ready"
+        );
+        assert!(
+            readiness.startup_complete() && !readiness.is_draining(),
+            "the condemned-shard path, not draining or an unset startup latch, is what dropped readiness"
+        );
     }
 }
