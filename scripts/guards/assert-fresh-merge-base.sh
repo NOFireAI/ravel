@@ -4,11 +4,30 @@
 # in THIS invocation. Exit 0 when the branch already contains that tip; exit 1
 # when main has moved ahead of it, printing how far behind and what landed.
 #
-# Green CI on a stale base is not evidence about the merge. `main` runs no CI of
-# its own here, so a PR that passed against an older base can still break `main`
-# the moment it lands: that is how commit 8a534f43 left main uncompilable, when a
-# five-argument call site landed minutes before another PR made the same function
-# take six. Both PRs were green. Neither had seen the other.
+# Green CI on a stale base is not evidence about the merge. A PR that passed
+# against an older base can still break `main` the moment it lands: that is how
+# commit 8a534f43 left main uncompilable, when a five-argument call site landed
+# minutes before another PR made the same function take six. Both PRs were
+# green. Neither had seen the other.
+#
+# `main` DOES run its own CI (`ci.yml` carries `on: push: branches: [main]`,
+# and the coverage lane and the publish gate depend on it), so that break is
+# detected. Detected late and after the damage: the run starts once the merge
+# has landed, so whoever pulls in the meantime gets a broken tree, and nothing
+# is prevented. An earlier version of this comment said main runs no CI at all,
+# which overstated the case; the argument is that detection after the fact is
+# not prevention, not that no one would ever notice.
+#
+# One class does survive main's push CI completely, and this guard is its only
+# detector. A landing loop that copies files, working from a file list derived
+# from current main rather than from the branch's own base, can DELETE a change
+# another session landed minutes earlier. That diff is textually clean and
+# green: removing lines someone added compiles exactly as well as never adding
+# them, and the tests covering the reverted work were added in the same commit
+# being reverted. Nothing goes red, on the PR or on main. The only signal is
+# this guard printing a merge-base the author does not recognise, which is a
+# side effect of it reporting the base at all rather than something it looks
+# for. Two such reverts were caught that way on 2026-09-09.
 #
 # It also silently skips gates. A gate added to `main` after a PR went green has
 # never run against that PR, so the branch merges without the check its author

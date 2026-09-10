@@ -381,13 +381,24 @@ there before changing a rule.
   when a PR's merge base is behind `origin/main`, printing how far and what
   it has not seen. `pr-review-status.sh` runs it, so a stale PR never gets
   the merge command printed; run it directly for any merge that bypasses
-  that script. Green CI on a stale base is not evidence about the merge:
-  `main` runs no CI of its own, so a PR green against an older base can
-  still break it (8a534f43 left main uncompilable exactly this way, a
-  five-argument call site landing minutes before another PR made the
-  function take six, both PRs green), and a gate added to `main` after a PR
-  went green has never run against that PR at all. Four PRs were CI-green
-  and behind simultaneously on 2026-09-06. `ALLOW_STALE_MERGE_BASE=1` to
+  that script. Green CI on a stale base is not evidence about the merge: a
+  PR green against an older base can still break `main` (8a534f43 left main
+  uncompilable exactly this way, a five-argument call site landing minutes
+  before another PR made the function take six, both PRs green), and a gate
+  added to `main` after a PR went green has never run against that PR at
+  all. Four PRs were CI-green and behind simultaneously on 2026-09-06.
+  `main` DOES run its own CI (`ci.yml` has `on: push: branches: [main]`;
+  the coverage lane and the publish gate both need it), so a break of the
+  8a534f43 kind is detected, but only once the merge has landed and anyone
+  pulling in between has a broken tree. Detection after the damage is not
+  prevention. One class survives main's push CI entirely and this guard is
+  its only detector: a landing loop that copies files against a list
+  derived from current main can DELETE a change another session landed
+  minutes earlier, and that revert is textually clean and green, because
+  removing lines compiles as well as never adding them and the tests for
+  the reverted work went in the same commit. Two were caught on 2026-09-09,
+  both only because the guard printed a merge-base the author did not
+  recognise. `ALLOW_STALE_MERGE_BASE=1` to
   proceed anyway. It exits 1 for a base that is behind and 2 when it could
   not tell (bad argument, no such pull request, git failed), so a caller
   reporting to a human can say which it got; a caller that only needs "may
