@@ -47,6 +47,29 @@ if [ -z "${SCOPE}" ]; then
   echo "watchdog: scope directory does not exist: ${SCOPE_ARG}" >&2
   exit 2
 fi
+# Scoping every kill by cwd is the whole safety property, and lsof is what
+# reads the cwd. Without it every candidate is skipped, so the watchdog runs
+# forever, matches nothing, and never fires while the volume drains: the same
+# silent no-fire this file rejects for `df -g` a few lines down. Refuse
+# instead.
+if ! command -v lsof >/dev/null 2>&1; then
+    echo "watchdog: lsof is required to scope kills by cwd, and is not installed" >&2
+    exit 2
+fi
+
+# An unrecognised spelling must not silently mean "not a dry run". `=true`
+# took the arming path, DELETED the marker a session had come to read, then
+# looped above the floor printing nothing: one character from the documented
+# spelling, landing on the exact property the dry run exists to protect.
+case "${WATCHDOG_DRY_RUN:-0}" in
+    ''|0|false|no|FALSE|NO) dry_run=0 ;;
+    1|true|yes|TRUE|YES) dry_run=1 ;;
+    *)
+        echo "watchdog: unrecognised WATCHDOG_DRY_RUN='${WATCHDOG_DRY_RUN}'; use 1 or 0" >&2
+        exit 2
+        ;;
+esac
+
 floor_gb=${2:-9}
 warn_gb=${3:-15}
 sample=${4:-45}
@@ -60,7 +83,7 @@ starved=0
 # is what a session is told to reach for instead of testing the kill path,
 # including while working out why a gate just came back red: the check for
 # whether the watchdog fired would have destroyed the answer.
-if [ "${WATCHDOG_DRY_RUN:-0}" != "1" ]; then
+if [ "${dry_run}" -eq 0 ]; then
     rm -f "${marker}" 2>/dev/null || true
 fi
 
@@ -108,7 +131,7 @@ while :; do
             ;;
     esac
 
-    if [ "${WATCHDOG_DRY_RUN:-0}" = "1" ]; then
+    if [ "${dry_run}" -eq 1 ]; then
         # Before the floor comparison on purpose. This is the check CLAUDE.md
         # tells every session to run instead of testing the kill path against
         # live processes, and it is run on a healthy volume, which is exactly
@@ -171,6 +194,15 @@ while :; do
             kill -KILL ${remaining} 2>/dev/null || true
             round=$((round + 1))
         done
+        # The loop kills on its last iteration and then exits without looking
+        # again, so `remaining` still holds the pre-kill snapshot: a kill that
+        # worked was reported as "gave up". One more scan. This can only ever
+        # have produced a false alarm, never a false success, but a guard that
+        # cries wolf on its own success stops being read.
+        if [ -n "${remaining:-}" ]; then
+            sleep 2
+            remaining=$(scoped_pids | sed 's/ *$//')
+        fi
         if [ -n "${remaining:-}" ]; then
             echo "watchdog: gave up with these still running under ${SCOPE}: ${remaining}" >&2
             echo "watchdog: free space now $(free_gb) GB."
