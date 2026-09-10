@@ -226,7 +226,7 @@ elif [[ "${reviews_at_head}" == "0" ]]; then # PROVE-FLIP
       if [[ "${triggers}" == "0" ]]; then
         echo "  -> no review at head and nobody asked for one: comment \`@claude-fleet review\` on the PR (that exact body, arguments after \`review\` are parsed and an unrecognized word gets a confused reaction and no review)"
       else
-        echo "  -> ${triggers} \`@claude-fleet review\` comment(s) but no task comment for ${head_sha}: the mention was malformed (check for a confused reaction on it) or the app is not installed on this repository; post the bare trigger again"
+        echo "  -> ${triggers} \`@claude-fleet review\` comment(s) but no task comment for ${head_sha}: if the last one is seconds old, the task comment lands within seconds, so re-run this; otherwise the mention was malformed (check for a confused reaction on it), the app is not installed here, or the bot is not receiving deliveries"
       fi
       ;;
     running)

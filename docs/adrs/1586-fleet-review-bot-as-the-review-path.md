@@ -74,10 +74,11 @@ GitHub `author_association`, admitting `OWNER`, `MEMBER` and `COLLABORATOR`
 (`internal/reviewbot/webhook.go:61`), behind three further checks: the request
 must come from an address GitHub publishes for webhooks, its signature must
 match the App's webhook secret, and the repository must be on the
-deployment's allowlist. `ravel` is public and has 20 collaborators, 13 of them
-at `write`, and `write` is a `COLLABORATOR` association. So the boundary has
-moved from `maintain` to `write`, and it is enforced in the bot rather than
-here.
+deployment's allowlist. `ravel` is public and has 23 collaborators, 16 of them
+at `write` and 7 at `admin` (counted on 2026-09-10, not carried over from
+ADR-0091's three-week-old figure), and `write` is a `COLLABORATOR`
+association. So the boundary has moved from `maintain` to `write`, and it is
+enforced in the bot rather than here.
 
 ## Decision
 
@@ -112,6 +113,17 @@ here.
    looser. A comment review cannot be a required status check, which is the
    original reason `--auto` is off (#749/#750 landed with 6 real findings
    unaddressed) and it survives the change of reviewer unchanged.
+
+   This decision does NOT settle whether a rebase invalidates a review. It
+   does today, because the head changes and the commit id with it, and that
+   collides with `assert-fresh-merge-base.sh` demanding a rebase whenever main
+   moves: on 2026-09-10 four open PRs had exactly one review each, all at
+   pre-rebase commits. Whether a review should survive a rebase that leaves
+   the branch's own diff unchanged is a real question with a real argument on
+   both sides, and answering it needs a durable diff hash the bot does not
+   emit today. It is #1589, and until it is decided the strict reading holds
+   and the status script says a review at an older commit does not cover the
+   head.
 
 5. **A missing review is five states, not one.** No trigger; a malformed
    trigger (confused reaction, no task); a task queued or running; a task
