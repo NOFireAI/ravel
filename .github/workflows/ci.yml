@@ -662,13 +662,15 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    # 20m, not 15m: the two corrupt-input suites added below (RLOG, RSPAN) add
-    # ~57s of proptest execution at 4096 cases locally (RLOG ~37s, RSPAN ~19s)
-    # plus a from-scratch compile of ravel-logseg and ravel-rspan and their
-    # test binaries, neither of which this job built before. On a CI runner
-    # with a cold-ish sccache that compile is the larger cost, so the extra
-    # 5 minutes is headroom over the previous 15m budget rather than a measured
-    # ceiling.
+    # 20 rather than 15 as headroom for a cold compile of ravel-logseg and
+    # ravel-rspan plus their test binaries, which this job did not build
+    # before. Observed 4m21s on a cache hit (sccache plus rust-cache) for the
+    # run on 4045c1e978865d313329d93b4af230f63fa85396, so 20 is roughly four
+    # times that rather than a measured ceiling. It is sized for the misses:
+    # a Cargo.lock change, a toolchain bump, an evicted cache, or the sccache
+    # install taking its continue-on-error path, which clears RUSTC_WRAPPER
+    # and compiles the job unwrapped. Nothing declares `needs: fuzz`, so a
+    # generous ceiling blocks no other job.
     timeout-minutes: 20
     env:
       # Bounded case count keeps wall-clock in check while exploring far more
