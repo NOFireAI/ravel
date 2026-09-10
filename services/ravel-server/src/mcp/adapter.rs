@@ -69,8 +69,8 @@ pub struct McpSettings {
     pub engine_config: EngineConfig,
     /// The MCP-layer ceilings (today only the response-byte ceiling).
     pub budget_config: McpBudgetConfig,
-    /// The deployment's GC protection horizon, as a duration in nanoseconds.
-    /// Subtracted from the call's own instant to get the oldest readable one.
+    /// The deployment's GC protection horizon, as a duration in nanoseconds:
+    /// how long a pinned snapshot stays protected from the sweeper.
     pub protection_horizon_ns: i64,
     pub clock: Arc<dyn Clock>,
 }
@@ -226,14 +226,13 @@ impl ServerHandler for RavelMcp {
                 return tool_result(&invalid_budget(message, &default));
             }
         };
-        let now_ns = self.clock.now_ns();
-        let ctx = ToolContext {
+        let ctx = build_tool_context(
             tenant_hash,
-            deadline_ns: now_ns.saturating_add(deadline_ns(&budgets)),
-            protection_horizon_ns: now_ns.saturating_sub(self.protection_horizon_ns),
+            self.clock.as_ref(),
+            self.protection_horizon_ns,
             budgets,
-            cursor_key: self.cursor_key,
-        };
+            self.cursor_key,
+        );
 
         // A notification stream the client did not ask for is traffic it did
         // not ask for, so the reporter exists only when a `progressToken`
@@ -371,6 +370,32 @@ fn deadline_ns(budgets: &McpEffectiveBudgets) -> i64 {
     i64::try_from(budgets.deadline.as_nanos()).unwrap_or(i64::MAX)
 }
 
+/// Builds the per-call [`ToolContext`] handed to a tool body.
+///
+/// `protection_horizon_ns` here is the deployment's configured horizon as a
+/// *duration*, added to the call's own instant to get the *instant* through
+/// which the pin the horizon protects stays alive -- the field the cursor
+/// codec (`crates/ravel-mcp/src/cursor.rs`) expects. A saturating add, not a
+/// subtraction: subtracting would hand the codec a past instant, which makes
+/// every `effective_deadline_ns` clamp resolve to the past and every cursor
+/// redemption expire unconditionally.
+fn build_tool_context<'a>(
+    tenant_hash: TenantHash,
+    clock: &dyn Clock,
+    protection_horizon_ns: i64,
+    budgets: McpEffectiveBudgets,
+    cursor_key: &'a CursorKey,
+) -> ToolContext<'a> {
+    let now_ns = clock.now_ns();
+    ToolContext {
+        tenant_hash,
+        deadline_ns: now_ns.saturating_add(deadline_ns(&budgets)),
+        protection_horizon_ns: now_ns.saturating_add(protection_horizon_ns),
+        budgets,
+        cursor_key,
+    }
+}
+
 /// One envelope, as an MCP tool result.
 ///
 /// Both forms carry the same envelope: `structured_content` for a client that
@@ -390,4 +415,59 @@ fn tool_result(envelope: &Envelope) -> Result<CallToolResponse, McpError> {
     };
     result.content = vec![ContentBlock::text(compact::render(envelope))];
     Ok(result.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use ravel_mcp::budget::{McpBudgetConfig, McpRequestBudgets};
+    use ravel_query::EngineConfig;
+
+    use super::*;
+
+    /// Deterministic injected clock: `now_ns()` always answers a fixed
+    /// instant, so a test built on it needs no wall-clock tolerance.
+    struct FixedClock(i64);
+
+    impl Clock for FixedClock {
+        fn now_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    /// Issue #1560: the adapter must hand the cursor codec a FUTURE
+    /// instant for `protection_horizon_ns` (the one through which a pinned
+    /// snapshot stays protected), not a past one. Demonstrated against the
+    /// pre-fix arithmetic: with `protection_horizon_ns:
+    /// now_ns.saturating_sub(self.protection_horizon_ns)` in
+    /// `build_tool_context`, this assertion fails with
+    /// `assertion failed: ctx.protection_horizon_ns > now_ns` (both sides
+    /// equal 1_700_000_000_000_000_000 minus/plus nothing meaningful --
+    /// concretely the built value is `1_700_000_000_000_000_000 -
+    /// 3_600_000_000_000 = 1_699_996_400_000_000_000`, which is less than
+    /// `now_ns`, not greater). Restoring the `saturating_add` fixes it.
+    #[test]
+    fn built_context_carries_a_future_protection_horizon() {
+        let now_ns: i64 = 1_700_000_000_000_000_000;
+        let configured_horizon_ns: i64 = 3_600_000_000_000; // 1 h
+        let clock = FixedClock(now_ns);
+        let key = CursorKey::from_process_secret([0x11u8; CURSOR_KEY_LEN]);
+        let budgets = McpRequestBudgets::default()
+            .clamp(&EngineConfig::default(), &McpBudgetConfig::default());
+
+        let ctx = build_tool_context(
+            TenantHash([0x42u8; 16]),
+            &clock,
+            configured_horizon_ns,
+            budgets,
+            &key,
+        );
+
+        assert!(
+            ctx.protection_horizon_ns > now_ns,
+            "protection_horizon_ns must be strictly after the call's own instant \
+             (now_ns={now_ns}, got={})",
+            ctx.protection_horizon_ns
+        );
+        assert_eq!(ctx.protection_horizon_ns, now_ns + configured_horizon_ns);
+    }
 }
