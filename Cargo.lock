@@ -4618,6 +4618,7 @@ dependencies = [
  "ravel-proto",
  "ravel-segment",
  "ravel-types",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",

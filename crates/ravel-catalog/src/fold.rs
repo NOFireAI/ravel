@@ -97,7 +97,7 @@ pub struct Transaction {
 }
 
 /// Outcome of one [`Catalog::fold`] call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct FoldReport {
     /// HEAD's watermark_hour after this call. `None` only when no hour has
     /// ever been sealed for this (tenant, signal) yet.
@@ -131,6 +131,14 @@ pub struct FoldReport {
     pub parts_reused: u64,
     pub list_requests: u64,
     pub get_requests: u64,
+    /// Number of PUT requests this fold issued to the object store, counted
+    /// unconditionally at the point each request is issued -- an
+    /// `AlreadyExists` or another store-side error still counts, since the
+    /// store received the request and, on an ambiguous error, may have
+    /// durably written the object despite the client-visible failure (#1598).
+    /// This is a request-issued counter, not a request-succeeded one: a
+    /// build/PUT failure that leaves a `*_built` field `false` still counted
+    /// its attempt here.
     pub put_requests: u64,
     /// `true` if this fold successfully built and attached a name-postings
     /// index. `false` covers both "no
@@ -1704,7 +1712,7 @@ impl Catalog {
                         column_stats_object_key(tenant, signal, part_watermark, stats_hash16);
                     let size = stats_bytes.len() as u64;
                     let segment_count = v3_segments.len() as u32;
-                    match self
+                    let put_result = self
                         .store()
                         .put(
                             &stats_key,
@@ -1712,15 +1720,18 @@ impl Catalog {
                             PutOptions::create_if_absent()
                                 .with_checksum(UploadChecksum::Crc32c(stats_crc)),
                         )
-                        .await
-                    {
+                        .await;
+                    // Counted unconditionally, before matching the outcome:
+                    // this is a request-issued counter, not a
+                    // request-succeeded one (#1598).
+                    counters.put_requests += 1;
+                    match put_result {
                         Ok(_) => {}
                         // Content-addressed under the object's own hash:
                         // bytes really are identical by construction here.
                         Err(StoreError::AlreadyExists) => {}
                         Err(e) => return Err(CatalogError::Store(e)),
                     }
-                    counters.put_requests += 1;
                     column_stats_part_objects_built += 1;
                     Some(SnapshotColumnStatsPartRef {
                         key: stats_key,
@@ -1731,7 +1742,7 @@ impl Catalog {
                     })
                 };
 
-                match self
+                let put_result = self
                     .store()
                     .put(
                         &part_key,
@@ -1739,8 +1750,12 @@ impl Catalog {
                         PutOptions::create_if_absent()
                             .with_checksum(UploadChecksum::Crc32c(part_crc)),
                     )
-                    .await
-                {
+                    .await;
+                // Counted unconditionally, before matching the outcome: this
+                // is a request-issued counter, not a request-succeeded one
+                // (#1598).
+                counters.put_requests += 1;
+                match put_result {
                     Ok(_) => {}
                     // Content-addressed key: bytes are identical by
                     // construction, so a losing folder's part is as good as
@@ -1748,7 +1763,6 @@ impl Catalog {
                     Err(StoreError::AlreadyExists) => {}
                     Err(e) => return Err(CatalogError::Store(e)),
                 }
-                counters.put_requests += 1;
                 total_part_bytes += part_bytes_len;
                 part_hashes.push(*part_hash.as_bytes());
 
@@ -1838,7 +1852,7 @@ impl Catalog {
                             postings_object_key(tenant, signal, watermark_hour, postings_hash16);
                         let size = postings_bytes.len() as u64;
                         let name_count = names.len() as u32;
-                        match self
+                        let put_result = self
                             .store()
                             .put(
                                 &postings_key,
@@ -1846,10 +1860,14 @@ impl Catalog {
                                 PutOptions::create_if_absent()
                                     .with_checksum(UploadChecksum::Crc32c(postings_crc)),
                             )
-                            .await
-                        {
+                            .await;
+                        // Counted unconditionally: a real (non-AlreadyExists)
+                        // Err here still means the store received a PUT
+                        // request, and may have durably written the object
+                        // despite the client-visible error (#1598).
+                        counters.put_requests += 1;
+                        match put_result {
                             Ok(_) | Err(StoreError::AlreadyExists) => {
-                                counters.put_requests += 1;
                                 postings_built = true;
                                 postings_size = size;
                                 Some(SnapshotPostingsRef {
@@ -2050,7 +2068,7 @@ impl Catalog {
                             column_stats_object_key(tenant, signal, watermark_hour, stats_hash16);
                         let size = stats_bytes.len() as u64;
                         let segment_count = column_segments.len() as u32;
-                        match self
+                        let put_result = self
                             .store()
                             .put(
                                 &stats_key,
@@ -2058,25 +2076,24 @@ impl Catalog {
                                 PutOptions::create_if_absent()
                                     .with_checksum(UploadChecksum::Crc32c(stats_crc)),
                             )
-                            .await
-                        {
-                            Ok(_) | Err(StoreError::AlreadyExists) => {
-                                counters.put_requests += 1;
-                                (
-                                    true,
+                            .await;
+                        // Counted unconditionally: a real (non-AlreadyExists)
+                        // Err here still means the store received a PUT
+                        // request, and may have durably written the object
+                        // despite the client-visible error (#1598).
+                        counters.put_requests += 1;
+                        match put_result {
+                            Ok(_) | Err(StoreError::AlreadyExists) => (
+                                true,
+                                size,
+                                Some(SnapshotColumnStatsRef {
+                                    key: stats_key,
+                                    blake3: stats_hash.as_bytes().to_vec(),
                                     size,
-                                    Some(SnapshotColumnStatsRef {
-                                        key: stats_key,
-                                        blake3: stats_hash.as_bytes().to_vec(),
-                                        size,
-                                        segment_count,
-                                        part_blake3: part_hashes
-                                            .iter()
-                                            .map(|h| h.to_vec())
-                                            .collect(),
-                                    }),
-                                )
-                            }
+                                    segment_count,
+                                    part_blake3: part_hashes.iter().map(|h| h.to_vec()).collect(),
+                                }),
+                            ),
                             Err(err) => {
                                 tracing::warn!(
                                     error = %err,
@@ -2236,7 +2253,7 @@ impl Catalog {
                             );
                             let size = stats_bytes.len() as u64;
                             let segment_count = part_segments.len() as u32;
-                            match self
+                            let put_result = self
                                 .store()
                                 .put(
                                     &stats_key,
@@ -2244,25 +2261,27 @@ impl Catalog {
                                     PutOptions::create_if_absent()
                                         .with_checksum(UploadChecksum::Crc32c(stats_crc)),
                                 )
-                                .await
-                            {
-                                Ok(_) | Err(StoreError::AlreadyExists) => {
-                                    counters.put_requests += 1;
-                                    (
-                                        true,
+                                .await;
+                            // Counted unconditionally: a real (non-AlreadyExists)
+                            // Err here still means the store received a PUT
+                            // request, and may have durably written the object
+                            // despite the client-visible error (#1598).
+                            counters.put_requests += 1;
+                            match put_result {
+                                Ok(_) | Err(StoreError::AlreadyExists) => (
+                                    true,
+                                    size,
+                                    Some(SnapshotColumnStatsPartRef {
+                                        key: stats_key,
+                                        blake3: stats_hash.as_bytes().to_vec(),
                                         size,
-                                        Some(SnapshotColumnStatsPartRef {
-                                            key: stats_key,
-                                            blake3: stats_hash.as_bytes().to_vec(),
-                                            size,
-                                            segment_count,
-                                            part_blake3: part_hashes
-                                                .iter()
-                                                .map(|h| h.to_vec())
-                                                .collect(),
-                                        }),
-                                    )
-                                }
+                                        segment_count,
+                                        part_blake3: part_hashes
+                                            .iter()
+                                            .map(|h| h.to_vec())
+                                            .collect(),
+                                    }),
+                                ),
                                 Err(err) => {
                                     tracing::warn!(
                                         error = %err,
@@ -2326,7 +2345,7 @@ impl Catalog {
                 }
             };
 
-            match self
+            let head_put_result = self
                 .store()
                 .put(
                     &head_key,
@@ -2336,10 +2355,12 @@ impl Catalog {
                         checksum: Some(UploadChecksum::Crc32c(head_crc)),
                     },
                 )
-                .await
-            {
+                .await;
+            // Counted unconditionally, before matching the outcome: this is
+            // a request-issued counter, not a request-succeeded one (#1598).
+            counters.put_requests += 1;
+            match head_put_result {
                 Ok(_) => {
-                    counters.put_requests += 1;
                     return Ok(FoldReport {
                         watermark_hour: Some(watermark_hour),
                         previous_watermark_hour: head_state.watermark_hour(),
@@ -2371,7 +2392,6 @@ impl Catalog {
                 // the top-of-loop no-op check stops cleanly; otherwise we
                 // rebase onto the winner's parts and retry.
                 Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists) => {
-                    counters.put_requests += 1;
                     attempt += 1;
                     if attempt >= MAX_HEAD_CAS_ATTEMPTS {
                         return Err(CatalogError::FoldCasRetriesExhausted {
