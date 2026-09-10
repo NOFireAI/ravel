@@ -705,3 +705,53 @@ against the 256 KiB `max_response_bytes` floor.
    30 h leaves a 6 h cursor lifetime and opens the window. The 2026-09-10
    amendment says a redemption refuses a cursor in exactly two cases. Those
    are the two a redemption can detect, not every case that breaks a page.
+
+**Amendment (2026-09-12).** Six changes.
+
+1. D6's rule that an unknown estimate component is not zero and does not
+   pass is scoped, not weakened. An unknown component is never read as zero.
+   Where the component has a budget ceiling, unknown fails the comparison and
+   the tool returns `budget_estimate_exceeds_ceiling`. Where it has no
+   ceiling, the estimate names the component unbounded and reports
+   `estimate_is_upper_envelope: false` rather than refusing the call. The
+   reason is structural. `estimated_decompressed_bytes` is unbounded for
+   logs, spans, alerts and audit: those estimators pass a literal zero,
+   because their scan paths never record decompressed bytes. `EffectiveBudgets`
+   holds `max_bytes_scanned`, `max_store_requests` and `max_segments` and
+   nothing else, so that component has no ceiling to fail against. A literal
+   reading of the rule refuses every logs explain, on the signal an agent
+   most needs. The shipped adapter already reports each unbounded component
+   as a warning and performs no comparison at all, so this corrects a rule
+   that has never had an implementation.
+2. D2: `ravel_explain_query` is SQL-only in its first shipped phase. A
+   statement that fails SQL validation returns the `validation` class with
+   the engine's own text, and a `next_steps` entry naming
+   `ravel_query_promql`. A statement that is not a `SELECT` returns
+   `unsupported`. A PromQL explain path is a prerequisite for a later phase.
+   No such path exists anywhere in the tree today: the only explain is
+   `SqlExecutor::explain`.
+3. D5: the 2026-09-10 amendment's list of redemption refusals is exhaustive
+   in exactly two cases. It gains a third. A declared column set observed at
+   redemption that differs from the set the cursor pinned is
+   `cursor_expired`.
+4. D5: `min_commit_watermark` is empty for every tool in this phase. No MCP
+   input struct declares `min_tokens`, so read-your-write is not reachable
+   from this surface. A redemption passes the cursor's own mint instant as
+   the resolve's `now_ns`. That instant bounds which ingest-hour buckets are
+   listed, not which records those buckets hold. So the pagination guarantee
+   is three-part. A row is never repeated. A row may appear on a later page.
+   A late-arriving row that sorts before the cursor position is silently
+   omitted from every page. The third part is the one a caller must know.
+5. D2: `ravel_find_labels` states whether its list is complete for the
+   requested window, and that the list is observed from data over that
+   window. The declared, observed and exact trichotomy is narrowed to what
+   the metadata outcomes support. `LabelsOutcome` and `LabelValuesOutcome`
+   carry the names, a partial flag and warnings, and no basis. A basis field
+   on the metadata path is named here as a follow-up, not promised by this
+   phase.
+6. D1 bookkeeping: the tool layer owns envelope finishing. Finishing is the
+   row cap, the byte fit, status resolution, cursor minting and `next_steps`.
+   The module doc of `crates/ravel-mcp/src/service.rs` gives a reason for the
+   port returning finished envelopes. That reason is superseded for the
+   envelope frame. It still holds for the `data` block, which the adapter
+   keeps building.
