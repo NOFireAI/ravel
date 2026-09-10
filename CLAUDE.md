@@ -528,10 +528,21 @@ into a false green. When you write or edit any such script:
   the names the argument rested on. Two sessions hit this within an hour.
   Use `--body-file` or `-F body=@file` with text written by the Write
   tool or a quoted heredoc, then verify the artifact rather than the exit
-  code: `gh api repos/<o>/<r>/issues/comments/<id> --jq .body` piped to
-  `grep -cF` for an identifier you expect, plus a second grep for a
-  string you know is absent so that a zero means something. Repair in
-  place with `gh api -X PATCH .../issues/comments/<id> -F body=@file`.
+  code. Save the body to a file first and refuse on a failed fetch,
+  because piping `gh api` into `grep -cF` loses the API status to the
+  pipeline and a failed call returns the same `0` as a response missing
+  the identifier, which is the could-not-ask/asked-and-got-nothing
+  collapse this file warns about elsewhere:
+
+      gh api repos/<o>/<r>/issues/comments/<id> --jq .body > /tmp/posted.txt \
+        || { echo "could not fetch the comment" >&2; exit 1; }
+      grep -cF '<an identifier you expect>' /tmp/posted.txt   # want >= 1
+      grep -cF '<a string you know is absent>' /tmp/posted.txt # want 0
+
+  Do not reach for `PIPESTATUS` instead: it is a bashism and expands to
+  the empty string in zsh, so it prints `EXIT=` and reads as success.
+  Repair in place with
+  `gh api -X PATCH .../issues/comments/<id> -F body=@file`.
 - Never name a variable `status`, `path`, `argv`, or `PWD`: zsh reserves
   them, and assignment kills the loop with `read-only variable`.
 - Never pipe a gate OR A GUARD through `grep`, `head`, or `tail`, and never
