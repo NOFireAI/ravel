@@ -49,7 +49,30 @@ check deny  "guard captured through a pipe"    "$(bash_payload 'out=$(scripts/gu
 check deny  "guard piped to grep"              "$(bash_payload 'scripts/guards/check-disk-headroom.sh . 20 | grep LOW')"
 check allow "guard with no pipe"               "$(bash_payload 'scripts/guards/assert-fresh-merge-base.sh 1556')"
 check allow "guard output read from a file"    "$(bash_payload 'scripts/guards/assert-fresh-merge-base.sh 1556 > /tmp/g.txt 2>&1')"
-check allow "an env prefix before a gate"      "$(bash_payload 'CARGO_INCREMENTAL=0 cargo test -p ravel-sql')"
+# An allow case only has teeth when something could deny it. This one carried
+# no pipe and no `&& echo`, so no rule could ever have fired on it and it
+# passed against every mutation of the prefix list. What the harmless-prefix
+# list actually has to do is let the gate BEHIND the prefix still be seen.
+check deny  "an env prefix does not launder a gate" \
+  "$(bash_payload 'CARGO_INCREMENTAL=0 cargo test -p ravel-sql | tail -20')"
+check allow "an env prefix before an unpiped gate" \
+  "$(bash_payload 'CARGO_INCREMENTAL=0 cargo test -p ravel-sql')"
+
+# Quoting the substitution, or spelling it with backticks, runs the same gate
+# and reads the same pipe status. Each of these was allowed while the bare
+# `out=$(...)` form above was denied.
+check deny  "guard in a quoted substitution"   "$(bash_payload 'out="$(scripts/guards/assert-fresh-merge-base.sh 1556 | tail -1)"')"
+check deny  "guard in a backtick substitution" "$(bash_payload 'out=`scripts/guards/assert-fresh-merge-base.sh 1556 | tail -1`')"
+check deny  "gate in a bare substitution"      "$(bash_payload 'echo "$(cargo test -p ravel-sql | tail -5)"')"
+check deny  "gate substituted inside a string" "$(bash_payload 'git commit -m "ran $(scripts/gates.sh | grep -c passed)"')"
+check deny  "gate in a nested substitution"    "$(bash_payload 'x=$(echo "$(cargo clippy --workspace | head -3)")')"
+check deny  "guard piped inside an if"         "$(bash_payload 'if scripts/guards/check-disk-headroom.sh . 20 | grep -q LOW; then echo low; fi')"
+# No substitution happens inside single quotes, so no gate runs and there is
+# nothing to mask.
+check allow "substitution syntax, single-quoted" "$(bash_payload "echo 'ran \$(cargo test | tail -1)'")"
+check allow "the text of a gate pipe, quoted"  "$(bash_payload "echo 'cargo test | tail -5'")"
+check allow "an unpiped guard in a quoted sub" "$(bash_payload 'out="$(scripts/guards/assert-fresh-merge-base.sh 1556)"')"
+check allow "jq inside a quoted substitution"  "$(bash_payload 'n="$(cargo metadata --format-version 1 | jq -r .packages)"')"
 
 check allow "git log into head"               "$(bash_payload 'git log --oneline | head -5')"
 check allow "grepping a saved gate log"       "$(bash_payload 'grep -c FAILED /tmp/gate.log')"

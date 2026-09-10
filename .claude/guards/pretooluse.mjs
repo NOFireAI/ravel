@@ -52,13 +52,58 @@ const GATE_HEAD =
 // pipe unseen. Ordered before the bare-assignment alternative, which is
 // guarded against `$(` so it cannot re-swallow it.
 const HARMLESS_PREFIX =
-  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=\$\(|[A-Za-z_][A-Za-z0-9_]*=(?!\$\()[^\s]*|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh)\s*)+/;
+  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=\$\(|[A-Za-z_][A-Za-z0-9_]*=(?!\$\()[^\s]*|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh|if|while|until|!)\s*)+/;
 const MASKING_FILTER = /^\s*(tail|head|grep|rg|sed)\b/;
 const MASKING_ECHO = /&&\s*echo\b/;
 
 // zsh marks these read-only; assigning to one kills the enclosing loop with
 // no output that looks like a failure.
 const RESERVED_ASSIGN = /(^|[;&|(]|\bdo\b|\bthen\b|\blocal\b|\bexport\b)\s*(status|path|argv|PWD)=/;
+
+// Command substitutions are checked as commands in their own right. Extending
+// the harmless-prefix list instead only ever covers the spellings someone
+// thought to enumerate: `out=$(gate | tail -1)` was covered and the same line
+// with quotes around the substitution, or in backticks, was not, though all
+// three run the gate and read the pipe's status. Single-quoted text is skipped
+// because no substitution happens inside it.
+function substitutionBodies(text) {
+  const bodies = [];
+  let sq = false;
+  let dq = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "'" && !dq) {
+      sq = !sq;
+      continue;
+    }
+    if (c === '"' && !sq) {
+      dq = !dq;
+      continue;
+    }
+    if (sq) continue;
+    if (c === "$" && text[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < text.length && depth > 0; j++) {
+        if (text[j] === "(") depth++;
+        else if (text[j] === ")") depth--;
+      }
+      bodies.push(text.slice(i + 2, depth === 0 ? j - 1 : text.length));
+      i = j - 1;
+      continue;
+    }
+    if (c === "`") {
+      const end = text.indexOf("`", i + 1);
+      bodies.push(text.slice(i + 1, end === -1 ? text.length : end));
+      i = end === -1 ? text.length : end;
+    }
+  }
+  return bodies;
+}
 
 function splitStatements(command) {
   // Rough statement split. Over-splitting only weakens a rule; it never
@@ -76,10 +121,24 @@ function startsWithGate(fragment) {
   return GATE_HEAD.test(fragment.replace(HARMLESS_PREFIX, ""));
 }
 
+// The command itself plus every command substitution nested inside it. The
+// depth cap is a backstop against pathological input, not a real limit: two
+// levels covers anything a session writes by hand.
+function scanTexts(command) {
+  const texts = [];
+  const queue = [command];
+  while (queue.length > 0 && texts.length < 64) {
+    const text = queue.shift();
+    texts.push(text);
+    for (const body of substitutionBodies(text)) queue.push(body);
+  }
+  return texts;
+}
+
 function checkBash(command) {
   if (typeof command !== "string" || command === "") return;
 
-  for (const raw of splitStatements(command)) {
+  for (const raw of scanTexts(command).flatMap(splitStatements)) {
     const stmt = raw.trim();
     if (stmt === "") continue;
 
