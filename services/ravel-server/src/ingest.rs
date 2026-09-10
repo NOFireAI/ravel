@@ -183,8 +183,9 @@ pub async fn handle_export(
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
     // Layer 3's rejections, counted where they are observed rather than inside
     // the normalizer, which knows no tenant. Classified per point, so the
-    // counter moves by exactly what the sender is told in `rejected_data_points`
-    // below.
+    // counter moves by exactly the normalization share of the
+    // `rejected_data_points` reported below; the layer-4 cap count is added to
+    // that field separately and counted by the admission controller.
     state.normalize_metrics.record(
         &tenant,
         ravel_types::Signal::Metrics,
@@ -247,14 +248,22 @@ pub async fn handle_export(
             IngestRequestError::Write(err)
         })?;
 
-    let partial_success = if rejected_count > 0 {
+    // Both rejection sources gate this, because neither alone covers the
+    // request. Gating on `rejected_count` swallows an informational drop: the
+    // point lands, so its count is 0, yet the sender must still learn that its
+    // min/max, its exemplars, or its integer precision is gone, through
+    // `error_message` with `rejected_data_points` reported as 0 (the
+    // OTLP-sanctioned warning channel). Gating on `normalized.rejected` alone
+    // swallows an active-series-cap drop: layer 4 turns away whole points that
+    // normalized cleanly, so they never appear in that list.
+    let partial_success = if normalized.rejected.is_empty() && series_cap_rejected == 0 {
+        None
+    } else {
         let error_message = build_error_message(&normalized.rejected, series_cap_rejected);
         Some(ExportMetricsPartialSuccess {
             rejected_data_points: rejected_count as i64,
             error_message,
         })
-    } else {
-        None
     };
 
     Ok(IngestOutcome {
@@ -276,6 +285,12 @@ pub async fn handle_export(
 /// `series_cap_rejected` folds in the layer-4 active-series-cap count (0
 /// when nothing was capped) as one more reason, aggregated the same way as
 /// every normalization rejection.
+///
+/// A reason whose `rejected_count()` is 0 still gets an entry, rendered
+/// without a count suffix. That is an informational drop: the point landed
+/// and only a field of it was dropped, so the message is the only channel
+/// that can name it, and filtering zero-count reasons out here would leave
+/// the partial success with an empty `error_message`.
 fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -336,7 +351,7 @@ fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> St
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-    use ravel_ingest::{AdmissionLimits, IngestConfig, SystemClock};
+    use ravel_ingest::{AdmissionLimits, CountLimit, IngestConfig, SystemClock};
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::Signal;
@@ -350,6 +365,13 @@ mod tests {
     const BASE_TS_NS: i64 = 1_767_225_600_000_000_000;
 
     fn state() -> IngestState {
+        state_with_admission_limits(AdmissionLimits::default())
+    }
+
+    /// The same fixture state as [`state`], with the tenant admission limits
+    /// (layer 4, ADR-0051) supplied, so a test can bound the active-series cap
+    /// low enough to reach the per-series partial-success path.
+    fn state_with_admission_limits(limits: AdmissionLimits) -> IngestState {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router = Arc::new(IngestRouter::new(
             IngestConfig::default(),
@@ -361,10 +383,7 @@ mod tests {
             router,
             limits: IngestLimits::default(),
             ack_deadline: Duration::from_secs(5),
-            admission: Arc::new(AdmissionController::new(
-                Arc::new(SystemClock),
-                AdmissionLimits::default(),
-            )),
+            admission: Arc::new(AdmissionController::new(Arc::new(SystemClock), limits)),
             recovery: None,
             provisioning: None,
             metadata_sink: None,
@@ -724,6 +743,180 @@ mod tests {
         assert_eq!(entries[0].kind, ravel_catalog::MetricKind::Counter);
         assert_eq!(entries[0].help, "size of each request");
         assert_eq!(entries[0].unit, "bytes");
+    }
+
+    /// A cumulative explicit-bucket histogram whose data point carries
+    /// `min`/`max`, which the Prometheus-convention mapping has nowhere to
+    /// store (ADR-0047 decision 6). The point itself is admitted, so the
+    /// rejection's `rejected_count()` is 0.
+    fn histogram_with_min_max_request() -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Histogram, HistogramDataPoint, Metric, ResourceMetrics, ScopeMetrics,
+            metric::Data as MetricData,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "latency".to_string(),
+                        data: Some(MetricData::Histogram(Histogram {
+                            data_points: vec![HistogramDataPoint {
+                                time_unix_nano: BASE_TS_NS as u64,
+                                count: 3,
+                                sum: Some(6.0),
+                                bucket_counts: vec![1, 2],
+                                explicit_bounds: vec![1.0],
+                                min: Some(0.5),
+                                max: Some(4.0),
+                                ..Default::default()
+                            }],
+                            // AGGREGATION_TEMPORALITY_CUMULATIVE.
+                            aggregation_temporality: 2,
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// `count` cleanly normalizing gauge points, one distinct series each, so
+    /// a bounded active-series cap turns away exactly `count - cap` of them
+    /// and nothing appears in `normalized.rejected`.
+    fn multi_series_gauge_request(count: usize) -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+            metric::Data as MetricData,
+        };
+
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: (0..count)
+                        .map(|i| Metric {
+                            name: format!("flood_series_{i}"),
+                            data: Some(MetricData::Gauge(Gauge {
+                                data_points: vec![NumberDataPoint {
+                                    time_unix_nano: BASE_TS_NS as u64,
+                                    value: Some(NumberValue::AsDouble(i as f64)),
+                                    ..Default::default()
+                                }],
+                            })),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// An informational drop costs no point, so `rejected_data_points` is 0
+    /// and `error_message` is the only channel that can tell the sender the
+    /// min/max fields are gone. A response that omitted the partial success
+    /// would be byte-identical to a clean write.
+    #[tokio::test]
+    async fn one_dropped_min_max_is_reported_and_the_point_still_lands() {
+        let state = state();
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            histogram_with_min_max_request(),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("strict write publishes");
+
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the dropped min/max is reported");
+        assert_eq!(
+            partial_success.rejected_data_points, 0,
+            "no point was lost, only the histogram's min/max fields"
+        );
+        assert!(
+            partial_success.error_message.contains("min/max"),
+            "got: {}",
+            partial_success.error_message
+        );
+        assert!(
+            !outcome.tokens.is_empty(),
+            "the point itself is admitted, so at least one shard commits"
+        );
+    }
+
+    /// Every point normalizes cleanly and the layer-4 active-series cap turns
+    /// some away. Capped points never enter `normalized.rejected`, so a gate
+    /// reading only that list would report a fully clean write while real
+    /// points were lost. `admission_e2e.rs`'s `fresh_series_flood_capped_
+    /// per_tenant` covers the same shape over HTTP; this is the unit-level
+    /// guard on the gate itself.
+    #[tokio::test]
+    async fn a_series_cap_rejection_alone_is_reported() {
+        const CAP: usize = 3;
+        const FLOOD: usize = 10;
+
+        let state = state_with_admission_limits(AdmissionLimits {
+            max_active_series: CountLimit::Bounded(CAP as u64),
+            ..AdmissionLimits::default()
+        });
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            multi_series_gauge_request(FLOOD),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("strict write publishes the admitted points");
+
+        let partial_success = outcome
+            .response
+            .partial_success
+            .expect("the capped series are reported");
+        assert_eq!(
+            partial_success.rejected_data_points,
+            (FLOOD - CAP) as i64,
+            "exactly the points beyond the cap are rejected"
+        );
+        assert!(
+            partial_success
+                .error_message
+                .contains("active series cap exceeded"),
+            "got: {}",
+            partial_success.error_message
+        );
+    }
+
+    /// Nothing rejected and nothing dropped: the response carries no partial
+    /// success at all. This is what a gate widened into always-`Some` breaks,
+    /// telling every sender its clean write was partial.
+    #[tokio::test]
+    async fn a_fully_clean_export_reports_no_partial_success() {
+        let state = state();
+        let outcome = handle_export(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            multi_series_gauge_request(3),
+            BASE_TS_NS,
+        )
+        .await
+        .expect("strict write publishes");
+
+        assert!(
+            outcome.response.partial_success.is_none(),
+            "nothing was rejected or dropped, got: {:?}",
+            outcome.response.partial_success
+        );
+        assert!(!outcome.tokens.is_empty(), "the points landed");
     }
 
     #[tokio::test]
