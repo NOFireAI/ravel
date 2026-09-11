@@ -668,8 +668,8 @@ pub struct IngestPipelineSnapshot {
     pub collisions: Option<u64>,
     pub shard_deaths: u64,
     /// Shards condemned after exhausting their respawn budget (issue #1299).
-    /// `Some` only for the metrics pipeline, whose router is the one registered
-    /// with readiness and the only one that respawns and condemns; logs and
+    /// `Some` only for the metrics pipeline, whose router is the one readiness
+    /// consults and the only one that respawns and condemns; logs and
     /// spans render no sample for this family, the same structural-absence
     /// convention `collisions` and `exemplars` use.
     pub shards_condemned: Option<u64>,
@@ -4907,6 +4907,71 @@ mod tests {
                 "ravel_ingest_metadata_flush_gets_total{mode=\"gateway\",signal=\"spans\""
             ),
             "spans pipeline must render no metadata_sink sample"
+        );
+    }
+
+    /// `shards_condemned` renders for the metrics pipeline with the driven
+    /// value and renders nothing for logs/spans (issue #1299): only the metrics
+    /// router respawns and condemns shard actors, so this family follows the
+    /// same structural-absence convention as `metadata_sink` above. Pins the
+    /// conditional render, whose input is `Option<u64>`: a `None` that started
+    /// being unwrapped to `Some(0)` would silently export a 0 for two
+    /// pipelines that have no such concept, and a family that stopped
+    /// rendering would silently disarm the `shards_condemned > 0` alert
+    /// docs/guides/observability.md tells operators to set.
+    #[test]
+    fn shards_condemned_counters_render_for_metrics_only() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                shards_condemned: 2,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &ingest,
+            &CatalogCountersSnapshot::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(
+            body.contains(
+                "ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"metrics\"} 2"
+            ),
+            "the metrics pipeline must render the driven condemned count"
+        );
+        assert!(
+            !body.contains("ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"logs\""),
+            "logs pipeline must render no shards_condemned sample"
+        );
+        assert!(
+            !body.contains("ravel_ingest_shards_condemned_total{mode=\"gateway\",signal=\"spans\""),
+            "spans pipeline must render no shards_condemned sample"
         );
     }
 

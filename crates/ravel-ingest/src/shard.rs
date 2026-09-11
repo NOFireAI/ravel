@@ -20,6 +20,7 @@ use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use bytes::Bytes;
 use ravel_commit::keys;
@@ -864,15 +865,25 @@ pub(crate) struct ShardActor {
     writer_id: Uuid,
     epoch: u64,
     next_seq: u64,
-    /// Per-writer monotonic floor for the flush-open stamp (ADR-1307): the
-    /// largest `created_unix_ns` this actor has stamped. `flush_tenant` raises
-    /// each raw clock reading to this floor before stamping, so a backwards
-    /// wall-clock step never mints a `created_unix_ns` below one already
-    /// committed. In-process state only, never persisted: it resets to 0 on
-    /// restart by construction (a fresh actor starts the floor at 0). The
-    /// guarantee is therefore per-process; ADR-1307 records the cross-restart
-    /// limitation (see [`ShardActor::monotonic_flush_open_ns`]).
-    last_flush_open_ns: i64,
+    /// Monotonic floor for the flush-open stamp (ADR-1307): the largest
+    /// `created_unix_ns` stamped for this SHARD, not just by this actor.
+    /// `flush_tenant` raises each raw clock reading to this floor before
+    /// stamping, so a backwards wall-clock step never mints a
+    /// `created_unix_ns` below one already committed.
+    ///
+    /// Owned by the router's `ShardHandle` and shared with every incarnation of
+    /// the shard's actor, so a supervisor respawn (issue #1299) carries the
+    /// floor forward instead of restarting it at 0. Scoping it to one actor
+    /// would narrow ADR-1307's guarantee to an incarnation, and a fresh
+    /// `writer_id` does not make that safe: `writer_id` is not part of the
+    /// query-time duplicate-resolution comparator (ADR-1307 "Known
+    /// limitation").
+    ///
+    /// In-process state only, never persisted: it starts at 0 on process start
+    /// by construction, so the guarantee is per-process and ADR-1307 records
+    /// the cross-restart limitation (see
+    /// [`ShardActor::monotonic_flush_open_ns`]).
+    flush_floor_ns: Arc<AtomicI64>,
     clock: Arc<dyn Clock>,
     config: IngestConfig,
     metrics: Arc<IngestMetrics>,
@@ -908,6 +919,7 @@ impl ShardActor {
         config: IngestConfig,
         metrics: Arc<IngestMetrics>,
         rx: mpsc::Receiver<ShardMsg>,
+        flush_floor_ns: Arc<AtomicI64>,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<MetricStageTimings>,
     ) -> Self {
         let rtt = Arc::new(RttTracker::new());
@@ -930,7 +942,7 @@ impl ShardActor {
             writer_id,
             epoch,
             next_seq: 0,
-            last_flush_open_ns: 0,
+            flush_floor_ns,
             clock,
             config,
             metrics,
@@ -1284,8 +1296,9 @@ impl ShardActor {
     /// `created_unix_ns` would let a stale duplicate sample outrank its own
     /// correction under the query-time dedup order (docs/catalog-and-mvcc.md
     /// "Cross-segment duplicate samples"), whose primary key is
-    /// `created_unix_ns`. Raising each reading to `last_flush_open_ns` keeps
-    /// stamps non-decreasing within this writer's process lifetime and counts
+    /// `created_unix_ns`. Raising each reading to the shard's floor keeps
+    /// stamps non-decreasing for this shard within the process lifetime,
+    /// across supervisor respawns as well as within one actor, and counts
     /// every step it absorbs (`clock_regressions`).
     ///
     /// A backwards step is absorbed only up to [`MAX_FLUSH_CLOCK_HOLD_NS`].
@@ -1301,15 +1314,24 @@ impl ShardActor {
     /// fail-loud path for a non-positive clock: the raw check above rejects the
     /// reading before the floor is consulted. The guarantee is per-process;
     /// ADR-1307 records the cross-restart limitation.
+    ///
+    /// The floor lives in the router's per-shard `ShardHandle` rather than in
+    /// this actor, so a respawn after a shard death (issue #1299) continues the
+    /// same floor. One incarnation of a shard runs at a time (the router
+    /// spawns the replacement only after observing the previous actor's channel
+    /// close), so the atomic is uncontended here; the `fetch_max` on the
+    /// advancing path keeps it correct anyway, while the refusal path below
+    /// deliberately re-anchors DOWNWARD and so must store rather than max.
     fn monotonic_flush_open_ns(&mut self, raw_ns: i64) -> Result<i64, FlushClockError> {
         checked_ingest_hour_bucket(raw_ns).map_err(FlushClockError::InvalidReading)?;
-        if raw_ns >= self.last_flush_open_ns {
-            self.last_flush_open_ns = raw_ns;
+        let floor_ns = self.flush_floor_ns.load(Ordering::Acquire);
+        if raw_ns >= floor_ns {
+            self.flush_floor_ns.fetch_max(raw_ns, Ordering::AcqRel);
             return Ok(raw_ns);
         }
-        let held_ns = self.last_flush_open_ns - raw_ns;
+        let held_ns = floor_ns - raw_ns;
         if held_ns > MAX_FLUSH_CLOCK_HOLD_NS {
-            self.last_flush_open_ns = raw_ns;
+            self.flush_floor_ns.store(raw_ns, Ordering::Release);
             self.metrics.record_clock_regression_refused();
             tracing::warn!(
                 shard = self.shard,
@@ -1327,9 +1349,9 @@ impl ShardActor {
         tracing::warn!(
             shard = self.shard,
             regression_ns = held_ns,
-            "ravel-ingest: flush clock stepped backwards; held flush-open stamp to per-writer monotonic floor"
+            "ravel-ingest: flush clock stepped backwards; held flush-open stamp to the shard's monotonic floor"
         );
-        Ok(self.last_flush_open_ns)
+        Ok(floor_ns)
     }
 
     /// Pins `buf`'s flush identity, then moves `buf`'s payload and waiters

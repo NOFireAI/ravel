@@ -159,10 +159,19 @@ operator credential rather than a service credential:
 
 ## Readiness and the store reachability probe
 
-`/readyz` reflects store reachability, not just startup completion. Each process
+`/readyz` reflects store reachability, not just startup completion. It also
+reflects ingest health: an `all` or `gateway` process turns 503 permanently once
+one of its metrics shard actors exhausts its respawn budget and is condemned
+(`shards_condemned > 0` at `/metrics`), which no probe can recover and which
+needs the process rolled -- see
+[troubleshooting.md](troubleshooting.md). The rest of
+this section is about the store condition, the one that recovers on its own.
+
+Each process
 runs one background probe that reads the fixed `sys/tenancy` object every
 `--store-probe-interval` (default `30s`, jittered so replicas do not probe in
-lockstep). Readiness is the startup latch and this probe's health together:
+lockstep). Readiness ANDs the startup latch, the drain latch, ingest health and
+this probe's health; for the probe alone:
 
 - After **four consecutive** failed probes, readiness flips and `/readyz`, and
   its Prometheus spelling `/-/ready`, return 503.
