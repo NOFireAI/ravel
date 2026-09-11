@@ -72,8 +72,11 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 
 # Exact number of external `uses:` action references across every workflow and
 # composite action file. Update deliberately whenever a workflow gains,
-# loses, or repoints a `uses:` step.
-WORKFLOW_EXPECTED_ACTION_COUNT=92
+# loses, or repoints a `uses:` step. Last raised 92->94 when the ci `features`
+# job was split into `features` and `features-otap` (issue #1590): the new job
+# adds a checkout and a rust-cache `uses:` (its free-disk-space and
+# setup-sccache steps are local `./...` actions, which this scan excludes).
+WORKFLOW_EXPECTED_ACTION_COUNT=94
 
 # A pinned image reference ends in `@sha256:` followed by exactly 64 hex
 # digits. Matching the bare substring `@sha256:` is not enough: `repo:tag@sha256:`
