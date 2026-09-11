@@ -2,6 +2,7 @@
 //! (docs/ingest.md "Structure").
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,6 +45,15 @@ pub struct WriteReceipt {
 /// sender when it respawns the actor after a death (issue #1299).
 struct ShardHandle {
     inner: Mutex<ShardInner>,
+    /// The ADR-1307 monotonic flush-open floor for this shard index, owned here
+    /// and handed to every incarnation of the actor. The guarantee is
+    /// per-shard, not per-actor: `writer_id` is not part of the query-time
+    /// duplicate-resolution comparator (ADR-1307 "Known limitation",
+    /// docs/catalog-and-mvcc.md), so a fresh writer identity does not rescue a
+    /// `created_unix_ns` that ran backwards across a respawn. A floor reset per
+    /// incarnation would narrow the guarantee to one actor's lifetime, which is
+    /// exactly the window a respawn ends.
+    flush_floor_ns: Arc<AtomicI64>,
 }
 
 /// Supervisor state guarded together so a death observation, the respawn that
@@ -56,25 +66,32 @@ struct ShardInner {
     /// on; a later death report carrying a stale incarnation is a duplicate of a
     /// death already counted and already respawned, and is ignored.
     incarnation: u64,
-    /// Respawns already spent on this shard. Once it reaches
+    /// Respawns spent on this shard since the last decay. Once it reaches
     /// [`IngestRouter::MAX_SHARD_RESPAWNS`] the next death condemns the shard
-    /// instead of respawning it.
+    /// instead of respawning it. Decays to zero when the shard has run a whole
+    /// [`IngestRouter::respawn_decay_window_ns`] without dying, so the budget
+    /// bounds a crash loop rather than a process lifetime.
     respawns: u32,
+    /// Clock reading at the most recent respawn, for the decay above. Only read
+    /// when `respawns > 0`, so the initial zero is never compared.
+    last_respawn_ns: i64,
     /// Set once the shard has exhausted its respawn budget: the router stops
-    /// respawning it and reports not-ready so the orchestrator replaces this
-    /// replica. One-way.
+    /// respawning it and reports not-ready, which sheds traffic from this
+    /// replica but does not replace it. One-way.
     condemned: bool,
 }
 
 impl ShardHandle {
-    fn new(tx: mpsc::Sender<ShardMsg>) -> Self {
+    fn new(tx: mpsc::Sender<ShardMsg>, flush_floor_ns: Arc<AtomicI64>) -> Self {
         ShardHandle {
             inner: Mutex::new(ShardInner {
                 tx,
                 incarnation: 0,
                 respawns: 0,
+                last_respawn_ns: 0,
                 condemned: false,
             }),
+            flush_floor_ns,
         }
     }
 
@@ -140,11 +157,43 @@ impl IngestRouter {
     /// reproduces on every incarnation, so unbounded respawning is a hot crash
     /// loop that never makes progress. Three bounds the loop: enough to ride
     /// out a couple of independent transients, few enough that a deterministic
-    /// killer condemns the shard quickly and hands it to the orchestrator. The
+    /// killer condemns the shard quickly. The
     /// buffered points the dead actor held are lost on every respawn (a respawn
     /// restores write capacity for the shard, not its buffer); the strict-mode
     /// writer already saw `ShardUnavailable` for them.
+    ///
+    /// The budget is spent within a window, not over the process lifetime: see
+    /// [`IngestRouter::respawn_decay_window_ns`].
     pub const MAX_SHARD_RESPAWNS: u32 = 3;
+
+    /// How long a shard actor must run without dying before its spent respawns
+    /// decay to zero (issue #1299): `config.max_flush_lifetime`, one hour by
+    /// default.
+    ///
+    /// Without a decay the budget is a process-lifetime allowance, so three
+    /// unrelated transients spread over days condemn a shard that recovered
+    /// cleanly from each one, and a long-lived replica is condemned by its own
+    /// age rather than by a crash loop. The budget is supposed to separate a
+    /// deterministic killer from independent transients, and time is what
+    /// distinguishes them.
+    ///
+    /// The window has to be long enough that a deterministic killer cannot
+    /// outlive it between deaths. A poison-pill point kills the actor on the
+    /// next flush it is part of, and every flush path is bounded by a flush
+    /// cadence far shorter than this: `max_flush_delay` (2s by default) when a
+    /// tenant is writing, `max_flush_delay_idle` (40s) when it is quiet, so an
+    /// hour is at least 90 times the slowest cadence that can carry the killer
+    /// to the next death. `max_flush_lifetime` is the reference rather than a
+    /// fresh constant because it is already the configured outer bound on how
+    /// long one flush attempt may take: no single flush, and therefore no
+    /// death caused by one, can straddle a whole window.
+    ///
+    /// Decay does not un-condemn a shard. Condemnation stays one-way and
+    /// `ready()` stays monotonic; what decays is the budget that has not been
+    /// exhausted yet.
+    fn respawn_decay_window_ns(&self) -> i64 {
+        i64::try_from(self.config.max_flush_lifetime.as_nanos()).unwrap_or(i64::MAX)
+    }
 
     /// Construct with the production OS-entropy randomness source. Writer ids
     /// and PUT-retry backoff jitter draw from OS entropy, unchanged from
@@ -191,6 +240,9 @@ impl IngestRouter {
                 (0..shard_count)
                     .map(|shard| {
                         let (tx, rx) = mpsc::channel(config.channel_depth);
+                        // One flush-open floor per shard index, shared with
+                        // every later incarnation of this actor (ADR-1307).
+                        let flush_floor_ns = Arc::new(AtomicI64::new(0));
                         let actor = ShardActor::new(
                             shard,
                             signal,
@@ -202,11 +254,12 @@ impl IngestRouter {
                             config,
                             Arc::clone(&metrics),
                             rx,
+                            Arc::clone(&flush_floor_ns),
                             #[cfg(feature = "stage-timing")]
                             Arc::clone(&stage_timings),
                         );
                         tokio::spawn(actor.run());
-                        ShardHandle::new(tx)
+                        ShardHandle::new(tx, flush_floor_ns)
                     })
                     .collect()
             }
@@ -586,9 +639,14 @@ impl IngestRouter {
     /// count the death once. Within the respawn budget it spawns a fresh actor
     /// and swaps in its sender under the same lock, so the next write to this
     /// shard reaches a live actor; past the budget the shard is condemned (no
-    /// further respawn) and [`Self::ready`] reports not-ready so the
-    /// orchestrator replaces this replica. The dead actor's buffered points are
-    /// lost either way (docs/ingest.md "Metrics (self-observability)").
+    /// further respawn) and [`Self::ready`] reports not-ready, which sheds
+    /// traffic from this replica without replacing it. The dead actor's
+    /// buffered points are lost either way (docs/ingest.md "Metrics
+    /// (self-observability)").
+    ///
+    /// The budget decays first: a shard that ran a whole
+    /// [`Self::respawn_decay_window_ns`] without a death starts this one from
+    /// zero, so the budget bounds a crash loop instead of a process lifetime.
     fn observe_shard_death(&self, shard: u32, handle: &ShardHandle, observed_incarnation: u64) {
         let mut inner = handle.lock();
         // A duplicate report of a death already handled: another observer got
@@ -598,14 +656,21 @@ impl IngestRouter {
             return;
         }
         self.metrics.record_shard_death();
+        let now_ns = self.clock.now_ns();
+        if inner.respawns > 0
+            && now_ns.saturating_sub(inner.last_respawn_ns) >= self.respawn_decay_window_ns()
+        {
+            inner.respawns = 0;
+        }
         if inner.respawns >= Self::MAX_SHARD_RESPAWNS {
             inner.condemned = true;
             self.metrics.record_shard_condemned();
             return;
         }
         inner.respawns += 1;
+        inner.last_respawn_ns = now_ns;
         inner.incarnation += 1;
-        inner.tx = self.spawn_shard_actor(shard);
+        inner.tx = self.spawn_shard_actor(shard, Arc::clone(&handle.flush_floor_ns));
     }
 
     /// Spawn a replacement actor for `shard` with a fresh writer identity and
@@ -614,7 +679,15 @@ impl IngestRouter {
     /// incarnation's, so a late PUT from the old actor cannot collide with the
     /// new one. This restores write capacity for the shard, not the buffered
     /// points the dead actor lost.
-    fn spawn_shard_actor(&self, shard: u32) -> mpsc::Sender<ShardMsg> {
+    ///
+    /// `flush_floor_ns` is the shard's existing ADR-1307 floor, not a fresh
+    /// one: the replacement must not be free to stamp a `created_unix_ns`
+    /// behind what the dead incarnation already published for the same shard.
+    fn spawn_shard_actor(
+        &self,
+        shard: u32,
+        flush_floor_ns: Arc<AtomicI64>,
+    ) -> mpsc::Sender<ShardMsg> {
         let writer_id = self.rng.new_uuid();
         let epoch =
             u64::try_from(self.clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
@@ -630,6 +703,7 @@ impl IngestRouter {
             self.config,
             Arc::clone(&self.metrics),
             rx,
+            flush_floor_ns,
             #[cfg(feature = "stage-timing")]
             Arc::clone(&self.stage_timings),
         );
@@ -639,9 +713,22 @@ impl IngestRouter {
 
     /// Whether every shard actor this router owns is live enough to serve:
     /// false once any shard has exhausted its respawn budget and been condemned
-    /// (issue #1299). A condemned shard cannot recover in-process, so a false
-    /// here is the router asking the orchestrator to replace this replica;
-    /// `services/ravel-server` ANDs it into `/readyz`.
+    /// (issue #1299). `services/ravel-server` ANDs it into `/readyz`, so a
+    /// false here sheds traffic from this replica: Kubernetes removes the pod
+    /// from its Service endpoints. It does not restart or reschedule the pod
+    /// (`/healthz` is deliberately independent of ingest health), so recovering
+    /// the shard needs an operator to roll it.
+    ///
+    /// Monotonic, deliberately. It reads the condemned-shard counter rather
+    /// than counting live condemned handles, because a `ShardHandle` is never
+    /// dropped for the process lifetime: `GenerationSwitch::evict_idle` sweeps
+    /// only the per-tenant views and never the shard-actor sets (see
+    /// `generation.rs`), so a live count would equal this counter and cost a
+    /// generation lock plus a per-handle lock on a path that must stay
+    /// lock-free. Condemnation is terminal for the process either way, since
+    /// nothing un-condemns a shard; what recovers a transient is the respawn
+    /// budget's decay ([`Self::respawn_decay_window_ns`]), which keeps a shard
+    /// out of condemnation in the first place.
     pub fn ready(&self) -> bool {
         self.metrics.condemned_shards() == 0
     }

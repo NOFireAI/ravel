@@ -206,14 +206,17 @@ pub struct IngestMetrics {
     shard_deaths: AtomicU64,
     /// Shards condemned after exhausting their respawn budget (issue #1299):
     /// the router stopped respawning the shard and reports itself not-ready
-    /// (`IngestRouter::ready`) so the orchestrator replaces this replica.
+    /// (`IngestRouter::ready`), which sheds traffic from this replica
+    /// (Kubernetes drops the pod from its Service endpoints) but does not
+    /// restart or reschedule it, so an operator has to roll the pod.
     /// Condemnation is deduped by the per-generation `ShardHandle`'s
     /// `condemned` bool, so it counts each shard at most once per live
     /// generation and is bounded by `live_generations * shard_count`, not
     /// `shard_count`: under resharding each live generation's handle for the
     /// same shard index can condemn independently. Nonzero means at least one
     /// shard is permanently down in this process and its series keep failing
-    /// until the replica is replaced.
+    /// until the process is replaced, which nothing does automatically: this is
+    /// the counter to alert on.
     shards_condemned: AtomicU64,
     /// Flushes failed closed because the router's cached provisioning view for
     /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).

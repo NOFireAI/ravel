@@ -1494,9 +1494,14 @@ Queries dedup by (series_id, ts) under the provenance order
 (commit created_unix_ns, writer_epoch, writer_seq, in-page index); the
 greatest wins. Values compare by f64 bit pattern (ADR-0010 §5). The primary
 key `created_unix_ns` is the flush-open clock reading; each ingest shard actor
-(metrics, logs, spans) raises every reading to a per-writer monotonic floor
+(metrics, logs, spans) raises every reading to a monotonic floor
 within its process lifetime, so a backwards wall-clock step cannot stamp a
-correction below the stale sample it supersedes (ADR-1307). A step larger than a
+correction below the stale sample it supersedes (ADR-1307). The floor is scoped
+to the shard index, not to one actor: where the router respawns a dead metrics
+shard actor (docs/ingest.md "Shard actor"), the replacement
+continues the same floor. Scoping it to an actor would end ADR-1307's guarantee
+at each respawn, and the fresh `writer_id` the replacement mints does not make
+that safe, for the reason given at the end of this paragraph. A step larger than a
 bounded hold (the catalog clock-skew allowance, 5 min) is refused rather than
 absorbed. Only the ingest shard actors apply this floor: the maintenance writers
 (compaction, migration, erasure rewrite in `ravel-maintain`) mint their commit
