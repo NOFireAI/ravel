@@ -173,6 +173,11 @@ pub use pushdown::Pushdown;
 /// dependency to name a value it can already read off the struct.
 #[cfg(feature = "pin-codec")]
 pub use ravel_catalog::SegmentLevel;
+/// Re-exported for [`SqlOutcome::pending_erasure`], which is typed as a
+/// `Vec` of these: a caller reading that field off the outcome would
+/// otherwise need its own `ravel-query` dependency to name what it is holding.
+/// Same reason as the [`SegmentLevel`] re-export above.
+pub use ravel_query::erasure::ErasurePredicate;
 pub use redact::{RedactError, redact};
 pub use schema::{internal_schema, public_schema};
 pub use session::{
