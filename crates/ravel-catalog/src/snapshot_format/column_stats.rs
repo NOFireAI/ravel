@@ -3,8 +3,10 @@
 //!
 //! ```text
 //! magic           "RCST" (4 bytes)
-//! version         u8 = 1 (ADR-0850, L0-tuple keyed), 2 (ADR-0942, part-keyed)
-//!                      or 3 (ADR-1413, per-part, content-hash keyed)
+//! version         u8 = 3 (ADR-1413, per-part, content-hash keyed), the only
+//!                      accepted read version. 1 (ADR-0850, L0-tuple keyed)
+//!                      and 2 (ADR-0942, part-keyed) are retired: an object
+//!                      carrying either is rejected, never decoded.
 //! reserved        u8[3] = 0
 //! header_len      u32 LE
 //! header          protobuf ravel.catalog.v1.ColumnStatsHeader
@@ -19,19 +21,24 @@
 //! header_crc32c   u32 LE          over magic..header inclusive
 //! ```
 //!
-//! Three envelope versions coexist during the ADR-1413 dual-publish window
-//! (which itself extends the ADR-0942 dual-publish window). The
-//! `ColumnStatsSegment` record shape is frozen and shared; the key model is the
-//! version's. v1 keys each record by the five-field identity tuple (writer_id is
-//! the 16-byte flush-writer uuid) and covers L0 only. v2 keys by the covered
-//! part's content hash, which the writer carries in the `writer_id` slot as 32
-//! bytes (the same slot an L1 `SnapshotEntry` already repurposes for a 32-byte
-//! hash), and covers L0 and L1 uniformly, over the WHOLE tenant/signal. v3
-//! reuses v2's content-hash keying exactly, but the header's `part_blake3`
-//! names exactly one part: the object covers only that part's segments, so its
-//! size scales with one part rather than the whole tenant. The keying is
-//! self-describing in the version byte, so an object read outside its head ref
-//! declares which key model it carries.
+//! v3 is the only version the decoder accepts. ADR-1413 decision 6 retired the
+//! v1 and v2 whole-object forms from both the write and the read path, so a
+//! legacy object carrying either version is rejected as unsupported rather
+//! than decoded. Both are still described below because v3's keying is defined
+//! by reference to theirs, and because `#[cfg(test)]` encoders build them for
+//! the tests that prove the rejection.
+//!
+//! The `ColumnStatsSegment` record shape is frozen and shared; the key model is
+//! the version's. v1 keys each record by the five-field identity tuple
+//! (writer_id is the 16-byte flush-writer uuid) and covers L0 only. v2 keys by
+//! the covered part's content hash, which the writer carries in the `writer_id`
+//! slot as 32 bytes (the same slot an L1 `SnapshotEntry` already repurposes for
+//! a 32-byte hash), and covers L0 and L1 uniformly, over the WHOLE
+//! tenant/signal. v3 reuses v2's content-hash keying exactly, but the header's
+//! `part_blake3` names exactly one part: the object covers only that part's
+//! segments, so its size scales with one part rather than the whole tenant.
+//! The keying is self-describing in the version byte, so a rejected object
+//! still declares which key model it was written under.
 //!
 //! Deliberately reuses `part.rs`'s plain length-delimited-protobuf body
 //! convention rather than `postings.rs`'s hand-rolled varint dictionary:
@@ -112,7 +119,7 @@ pub fn encode_column_stats_v2(
 }
 
 /// The uncompressed, length-delimited protobuf concatenation of `segments`:
-/// exactly the bytes [`frame_column_stats`] compresses, and exactly what a
+/// exactly the bytes `frame_column_stats` compresses, and exactly what a
 /// pre-encode ceiling check must measure to agree with the encoder. Shared by
 /// [`encode_column_stats_v3`]'s ceiling check and the fold's degrade loop
 /// (`ravel_catalog::fold`) so the two can never drift apart on what "over
@@ -127,7 +134,7 @@ pub fn column_stats_segments_concat(segments: &[ColumnStatsSegment]) -> Vec<u8> 
 
 /// Encodes a **v3** (ADR-1413, per-part, content-hash-keyed) column-statistics
 /// object, referenced by `SnapshotPartRef.column_stats` (field 7). Unlike
-/// [`encode_column_stats_v2`], the header's `part_blake3` names exactly the
+/// the retired `encode_column_stats_v2`, the header's `part_blake3` names the
 /// one part this object covers, and `segments` must be exactly that part's
 /// segments (each still carrying its covered part's content hash in
 /// `writer_id`, v2 semantics).
