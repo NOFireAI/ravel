@@ -395,6 +395,186 @@ mod tests {
         assert!(matches!(resolve_key(3, 4), Ok(3)));
     }
 
+    /// One raw map entry: `None` is a null map entry; `Some(pairs)` is a
+    /// present entry, where `(name, None)` is a present key with a null
+    /// value.
+    type RawMapEntry<'a> = Option<&'a [(&'a str, Option<&'a str>)]>;
+
+    /// Build a raw `Dictionary(Int32, Map(Utf8, Utf8))` array straight from
+    /// map entries, bypassing `build_labels_dict` so a null map entry or a
+    /// null value inside a present entry can be constructed.
+    fn raw_map_dict(entries: &[RawMapEntry<'_>], keys: &[i32]) -> ArrayRef {
+        let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+        for entry in entries {
+            match entry {
+                None => {
+                    builder.append(false).unwrap();
+                }
+                Some(pairs) => {
+                    for (name, value) in *pairs {
+                        builder.keys().append_value(name);
+                        match value {
+                            Some(v) => builder.values().append_value(v),
+                            None => builder.values().append_null(),
+                        }
+                    }
+                    builder.append(true).unwrap();
+                }
+            }
+        }
+        let values: MapArray = builder.finish();
+        let keys = Int32Array::from(keys.to_vec());
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).unwrap();
+        Arc::new(dict)
+    }
+
+    /// Decode compacted row `i`'s `(name, value)` pairs, `None` for a null
+    /// value, in stored order.
+    fn decode_compacted(compacted: &ArrayRef, i: usize) -> Vec<(String, Option<String>)> {
+        let dict = compacted
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let maps = dict.values().as_any().downcast_ref::<MapArray>().unwrap();
+        let keys = maps.keys().as_any().downcast_ref::<StringArray>().unwrap();
+        let values = maps
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let entry = dict.keys().value(i) as usize;
+        let offsets = maps.value_offsets();
+        let start = offsets[entry] as usize;
+        let end = offsets[entry + 1] as usize;
+        (start..end)
+            .map(|j| {
+                (
+                    keys.value(j).to_string(),
+                    if values.is_null(j) {
+                        None
+                    } else {
+                        Some(values.value(j).to_string())
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compact_labels_keeps_aliasing_free_distinct_entries() {
+        // A canonicalization that concatenated name+value bytes without
+        // length-prefixing would map ("ab","c") and ("a","bc") to the same
+        // byte string "abc", aliasing two different label sets into one
+        // dictionary entry and silently rewriting one row's labels to the
+        // other's. `intern_entry`'s canonical form length-prefixes every
+        // string, so they must stay distinct.
+        let distinct = vec![set(&[("ab", "c")]), set(&[("a", "bc")])];
+        let keys = [0i32, 1];
+        let labels = build_labels_dict(&distinct, &keys).unwrap();
+
+        let compacted = compact_labels(&labels).unwrap();
+        let dict = compacted
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let maps = dict.values().as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(
+            maps.len(),
+            2,
+            "different label sets must not collapse into one dictionary entry"
+        );
+        assert_eq!(
+            decode_compacted(&compacted, 0),
+            vec![("ab".to_string(), Some("c".to_string()))],
+            "row 0 must resolve to its own original label set"
+        );
+        assert_eq!(
+            decode_compacted(&compacted, 1),
+            vec![("a".to_string(), Some("bc".to_string()))],
+            "row 1 must resolve to its own original label set, not row 0's"
+        );
+    }
+
+    #[test]
+    fn compact_labels_dedupes_null_map_entries() {
+        // Rows 0, 1, and 3 all reference the null (no label set) source
+        // entry at old index 0; row 2 references the one real entry at old
+        // index 1. `intern_entry`'s `maps.is_null(old)` branch must
+        // canonicalize the null entry once and every referencing row must
+        // resolve to that same compacted entry, kept null and distinct from
+        // any real one.
+        let raw = raw_map_dict(&[None, Some(&[("host", Some("a"))])], &[0, 0, 1, 0]);
+
+        let compacted = compact_labels(&raw).unwrap();
+        let dict = compacted
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let maps = dict.values().as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(
+            maps.len(),
+            2,
+            "one compacted entry for the null source entry, one for the real one"
+        );
+
+        let k0 = dict.keys().value(0);
+        let k1 = dict.keys().value(1);
+        let k2 = dict.keys().value(2);
+        let k3 = dict.keys().value(3);
+        assert_eq!(
+            k0, k1,
+            "both null-entry rows resolve to the same compacted key"
+        );
+        assert_eq!(k0, k3, "the third null-entry row also resolves to it");
+        assert_ne!(k0, k2, "the real entry must not alias the null entry");
+        assert!(
+            maps.is_null(k0 as usize),
+            "the compacted entry for a null source entry must still be null"
+        );
+        assert!(!maps.is_null(k2 as usize));
+    }
+
+    #[test]
+    fn compact_labels_dedupes_entries_with_null_values() {
+        // A present map entry with a null value (distinct from an absent
+        // key) exercises `entry_values.is_null(j)`. Two rows share the same
+        // source entry so the null-value canonicalization only fires once,
+        // and the null must survive compaction rather than becoming an empty
+        // string.
+        let raw = raw_map_dict(
+            &[
+                Some(&[("host", None), ("region", Some("us"))]),
+                Some(&[("host", Some("a"))]),
+            ],
+            &[0, 0, 1],
+        );
+
+        let compacted = compact_labels(&raw).unwrap();
+        let dict = compacted
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .unwrap();
+        let maps = dict.values().as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(maps.len(), 2);
+
+        assert_eq!(
+            decode_compacted(&compacted, 0),
+            vec![
+                ("host".to_string(), None),
+                ("region".to_string(), Some("us".to_string())),
+            ]
+        );
+        assert_eq!(
+            decode_compacted(&compacted, 1),
+            decode_compacted(&compacted, 0),
+            "the two rows referencing the same source entry share one compacted entry"
+        );
+        assert_eq!(
+            decode_compacted(&compacted, 2),
+            vec![("host".to_string(), Some("a".to_string()))]
+        );
+    }
+
     #[test]
     fn udf_name_and_invocation() {
         // The registered UDF is named `label` and returns Utf8.
