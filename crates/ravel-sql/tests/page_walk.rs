@@ -13,24 +13,64 @@
 //! assertion cannot see that the name the tiebreak claimed row identity on
 //! belongs to a different value than the one the schema described.
 //!
-//! So this suite executes. For every statement the planner reports a total
-//! order for, it pages the statement with a row cap of 1, collects the rows
-//! every page returned, and asserts MULTISET EQUALITY against the same
-//! statement run unpaged. A row count is not enough: a count still passes when
-//! one row is dropped and another duplicated, and both happen under a keyset
-//! predicate built over the wrong column.
+//! # What the walk asserts
+//!
+//! For every statement the planner reports a total order for, this suite pages
+//! the statement with a row cap of 1 and asserts that **page k holds rows k of
+//! the unpaged ordering, as a sequence**. Not the set of rows the walk
+//! returned: the sequence, page by page, in page order.
+//!
+//! A multiset comparison of the walked rows against the unpaged result is the
+//! weaker statement this suite used to make, and it is order-blind by
+//! construction. It cannot see a `DESC` term the planner read as `ASC`, and it
+//! cannot see a page statement rendered with no `ORDER BY` on the wrapper at
+//! all: both still deliver every row exactly once, in an order no caller
+//! asked for. The whole point of a total-order claim is the sequence, so the
+//! sequence is what gets asserted.
+//!
+//! The ordering compared against is [`reference_statement`]: the caller's own
+//! text, plus whatever columns the plan says it appended as a tiebreak, run
+//! unpaged. It is deliberately NOT built from `plan.order_by`, because a plan
+//! that misread the caller's `ORDER BY ts DESC` as ascending would then be
+//! compared against its own misreading and agree with itself. Building the
+//! reference from the caller's text hands the reading of it to DataFusion.
+//! The reference is proved to be a reordering of the unpaged result, and
+//! nothing else, by a multiset comparison against it.
+//!
+//! Two more properties fall out of asserting per page rather than over the
+//! concatenation: a page that returns fewer rows than the cap while rows
+//! remain is a finding (it breaks the indexing the claim rests on), and a walk
+//! that ends early is reported against the ordering's length rather than
+//! against a row set that happens to match.
 //!
 //! # The fixture has to be able to fail
 //!
-//! [`samples_fixture`] carries deliberate ties and a deliberate NULL source:
-//! two rows share `(ts, value)` under distinct `series_id`, and one row's
-//! `value` is `0.0`, so a projected `nullif(value, 0)` is NULL for it. Without
-//! the ties, a keyset predicate over the wrong pair of columns still walks
-//! every row and the suite is a tautology; without the zero, a projection that
-//! shadows a NOT NULL name with a nullable expression loses nothing.
-//! [`the_fixture_can_expose_a_broken_keyset_predicate`] pins both properties as
-//! exact counts, so a later edit to the fixture that removes them fails here
-//! rather than quietly turning every walk below into a statement about nothing.
+//! [`FIXTURE`] is six rows in deliberately unsorted insertion order, each
+//! property present because a mutation of the planner survives without it:
+//!
+//! - two rows share `(ts, value)` under distinct `series_id`, so a keyset
+//!   predicate over the wrong pair of columns cannot walk the tie;
+//! - one `value` is `0.0`, so a projected `nullif(value, 0)` is NULL for it
+//!   and a projection that shadows a NOT NULL name with a nullable expression
+//!   loses rows;
+//! - one `value` is `-0.0`, which DataFusion holds to be a DIFFERENT value
+//!   from `0.0` (it compares floats by a total order, so `-0.0 = 0` is FALSE
+//!   and `-0.0` sorts first);
+//! - one `value` is NaN, which no cursor can carry, so a page ending on it
+//!   mints no resume position;
+//! - `series_id` is anti-correlated with `ts` at the head of the ordering (the
+//!   smallest `ts` carries the largest `series_id`), so a tiebreak that orders
+//!   on the wrong one of the two produces a different sequence rather than the
+//!   same one;
+//! - one `ts` is not a multiple of 1000 ns, so a truncating or rescaling
+//!   round trip through a cursor value is visible;
+//! - the same walk runs over a one-row table (an empty second page) and a
+//!   zero-row table (an empty first page).
+//!
+//! [`the_fixture_can_expose_a_broken_keyset_predicate`] pins every one of
+//! those as an exact count, so a later edit to the fixture that removes one
+//! fails there rather than quietly turning the walks into a statement about
+//! nothing.
 //!
 //! `samples` is registered as a plain in-memory table over
 //! `ravel_sql::public_schema()`. The planner's row-identity claim is about what
@@ -56,7 +96,7 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
 use ravel_sql::{
-    PagePlanError, ResumePosition, ResumeValue, SAMPLES_TABLE, plan_page, public_schema,
+    PagePlan, PagePlanError, ResumePosition, ResumeValue, SAMPLES_TABLE, plan_page, public_schema,
 };
 
 /// The `ts` the two tied rows share.
@@ -66,12 +106,26 @@ const TIED_TS: i64 = 1_000;
 /// this same number rather than NULL for both.
 const TIED_VALUE: f64 = 1.0;
 
-/// The third row's `value`. Zero, which is what makes a projected
-/// `nullif(value, 0)` NULL for exactly one row of the fixture.
+/// The `value` that a projected `nullif(value, 0)` turns into NULL.
 const NULLING_VALUE: f64 = 0.0;
 
-/// The third row's `ts`, distinct from [`TIED_TS`].
+/// A `value` distinct from [`NULLING_VALUE`] under DataFusion's total float
+/// order: `-0.0 = 0` is FALSE and `-0.0` sorts before `0.0`, so the two zero
+/// rows are two values rather than one repeated.
+const NEGATIVE_ZERO: f64 = -0.0;
+
+/// A `ts` distinct from [`TIED_TS`], on the row carrying [`NULLING_VALUE`].
 const LONE_TS: i64 = 2_000;
+
+/// The smallest `ts` in the fixture, on the row carrying the largest
+/// `series_id`. That anti-correlation is what makes ordering on `ts` and
+/// ordering on `series_id` produce different sequences over this fixture.
+const ANTI_TS: i64 = 500;
+
+/// A `ts` that is not a multiple of 1000 ns, so a cursor round trip that
+/// truncates or rescales the value lands the walk on the wrong row rather than
+/// on the same one.
+const ODD_TS: i64 = 1_234_567;
 
 /// A page's row cap. One row per page is the smallest cap and the one that
 /// makes a lost row visible at the first tie rather than only when a tie
@@ -79,31 +133,84 @@ const LONE_TS: i64 = 2_000;
 const PAGE_CAP: usize = 1;
 
 /// How many pages a walk may take before it is treated as non-terminating.
-/// Three rows at a cap of one needs four pages including the empty last one;
+/// Six rows at a cap of one needs seven pages including the empty last one;
 /// anything near this bound is a planner that is not advancing.
 const MAX_PAGES: usize = 32;
 
-/// Three rows, two of them tied on `(ts, value)`, one of them carrying the
-/// `value` that a projected `nullif(value, 0)` turns into NULL.
-///
-/// The `series_id`s are distinct, so the fixture respects the `samples` row
-/// identity the planner's total-order claim rests on: `(series_id, ts)` is
-/// unique across the three rows.
-fn samples_fixture() -> RecordBatch {
-    let ts = TimestampNanosecondArray::from(vec![TIED_TS, TIED_TS, LONE_TS]);
-    let value = Float64Array::from(vec![TIED_VALUE, TIED_VALUE, NULLING_VALUE]);
-    let series_id = FixedSizeBinaryArray::try_from_iter([[1u8; 16], [2u8; 16], [3u8; 16]].iter())
-        .expect("series id array");
+/// One fixture row. `labels` is not a parameter: it is NOT NULL and its
+/// content is irrelevant to paging, so every row carries an empty label set.
+#[derive(Clone, Copy)]
+struct FixtureRow {
+    ts: i64,
+    value: f64,
+    series_id: [u8; 16],
+}
+
+/// The six-row fixture, in insertion order, which is deliberately not the
+/// order any statement below asks for.
+const FIXTURE: &[FixtureRow] = &[
+    FixtureRow {
+        ts: TIED_TS,
+        value: TIED_VALUE,
+        series_id: [1u8; 16],
+    },
+    FixtureRow {
+        ts: TIED_TS,
+        value: TIED_VALUE,
+        series_id: [2u8; 16],
+    },
+    FixtureRow {
+        ts: LONE_TS,
+        value: NULLING_VALUE,
+        series_id: [3u8; 16],
+    },
+    // Anti-correlated: the smallest `ts` under the largest `series_id`.
+    FixtureRow {
+        ts: ANTI_TS,
+        value: 3.0,
+        series_id: [9u8; 16],
+    },
+    FixtureRow {
+        ts: ODD_TS,
+        value: f64::NAN,
+        series_id: [4u8; 16],
+    },
+    FixtureRow {
+        ts: 3_000,
+        value: NEGATIVE_ZERO,
+        series_id: [5u8; 16],
+    },
+];
+
+/// One row, so a walk's second page is the empty one.
+const ONE_ROW: &[FixtureRow] = &[FixtureRow {
+    ts: TIED_TS,
+    value: TIED_VALUE,
+    series_id: [1u8; 16],
+}];
+
+/// No rows, so a walk's first page is the empty one.
+const NO_ROWS: &[FixtureRow] = &[];
+
+/// `rows` as a `samples` batch.
+fn samples_batch(rows: &[FixtureRow]) -> RecordBatch {
+    let ts = TimestampNanosecondArray::from(rows.iter().map(|row| row.ts).collect::<Vec<i64>>());
+    let value = Float64Array::from(rows.iter().map(|row| row.value).collect::<Vec<f64>>());
+    let series_id = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+        rows.iter().map(|row| Some(row.series_id)),
+        16,
+    )
+    .expect("series id array");
 
     // One empty label set per row. The label content is irrelevant to paging
     // and the column is NOT NULL, so it has to be present and well-formed.
     let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
-    for _ in 0..3 {
+    for _ in rows {
         maps.append(true).expect("label map append");
     }
     let maps: MapArray = maps.finish();
     let labels = DictionaryArray::<Int32Type>::try_new(
-        Int32Array::from(vec![0, 1, 2]),
+        Int32Array::from((0..rows.len() as i32).collect::<Vec<i32>>()),
         Arc::new(maps) as ArrayRef,
     )
     .expect("labels dictionary");
@@ -120,18 +227,23 @@ fn samples_fixture() -> RecordBatch {
     .expect("fixture batch")
 }
 
-/// A context with the fixture registered as `samples`.
+/// A context with `rows` registered as `samples`.
 ///
 /// One target partition, so `collect` returns the sorted rows in the order the
 /// `ORDER BY` produced them and "the first row of the result" is the row a
 /// page cap of one would keep.
-fn context() -> SessionContext {
+fn context_of(rows: &[FixtureRow]) -> SessionContext {
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
     let table =
-        MemTable::try_new(public_schema(), vec![vec![samples_fixture()]]).expect("mem table");
+        MemTable::try_new(public_schema(), vec![vec![samples_batch(rows)]]).expect("mem table");
     ctx.register_table(SAMPLES_TABLE, Arc::new(table))
         .expect("registered samples");
     ctx
+}
+
+/// A context over the full [`FIXTURE`].
+fn context() -> SessionContext {
+    context_of(FIXTURE)
 }
 
 async fn execute(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
@@ -147,8 +259,8 @@ async fn execute(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
 ///
 /// Rendered rather than compared as arrays because the statements below
 /// project different column sets and types, `labels` among them, and the only
-/// property under test is which rows came back. NULL renders as the literal
-/// `NULL`, distinct from an empty string.
+/// property under test is which rows came back in which order. NULL renders as
+/// the literal `NULL`, distinct from an empty string.
 fn rows_of(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     let options = FormatOptions::default().with_null("NULL");
     let mut rows = Vec::new();
@@ -172,16 +284,40 @@ fn rows_of(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     rows
 }
 
-/// `rows` as a multiset: the row-to-count map two walks are compared by.
-///
-/// A count alone passes when one row is dropped and another duplicated, which
-/// is what a keyset predicate over a mis-resolved column actually does.
+/// `rows` as a multiset: the row-to-count map two results are compared by when
+/// only their contents are under test.
 fn multiset(rows: &[Vec<String>]) -> BTreeMap<Vec<String>, usize> {
     let mut counts: BTreeMap<Vec<String>, usize> = BTreeMap::new();
     for row in rows {
         *counts.entry(row.clone()).or_default() += 1;
     }
     counts
+}
+
+/// The statement whose unpaged result is the ordering a walk of `sql` has to
+/// reproduce page by page: the caller's own text, plus the tiebreak columns
+/// the plan says it appended, which the planner always appends ascending.
+///
+/// Built from the caller's text and not from `plan.order_by` on purpose. A
+/// planner that reads `ORDER BY ts DESC` as ascending renders an ascending
+/// `order_by`, and a reference built from that would be ascending too and
+/// agree with the walk. Handing the caller's text to DataFusion instead means
+/// the direction under test is never the planner's own reading of it.
+fn reference_statement(sql: &str, plan: &PagePlan) -> String {
+    if plan.tiebreak_appended.is_empty() {
+        return sql.to_string();
+    }
+    let appended = plan
+        .tiebreak_appended
+        .iter()
+        .map(|column| format!("\"{column}\" ASC"))
+        .collect::<Vec<String>>()
+        .join(", ");
+    if sql.to_ascii_uppercase().contains(" ORDER BY ") {
+        format!("{sql}, {appended}")
+    } else {
+        format!("{sql} ORDER BY {appended}")
+    }
 }
 
 /// The resume value for one order-term column of one row, or `None` when that
@@ -262,6 +398,10 @@ fn resume_value(array: &ArrayRef, index: usize) -> Option<ResumeValue> {
                 .value(index)
                 .to_vec(),
         ),
+        // Reachable only from a plan that claimed a total order over a term no
+        // cursor can carry, which `plan_page` now refuses outright
+        // (`OrderTermNotRepresentable`). It stays as the harness's own last
+        // check on that refusal.
         other => panic!("no resume value for an order term of type {other}"),
     };
     Some(value)
@@ -269,8 +409,9 @@ fn resume_value(array: &ArrayRef, index: usize) -> Option<ResumeValue> {
 
 /// What an executed walk found.
 struct Walk {
-    /// The rows the walk collected, page by page, in page order.
-    rows: Vec<Vec<String>>,
+    /// The rows each non-empty page returned, in page order. The terminating
+    /// empty page contributes no entry; [`Self::pages`] counts it.
+    page_rows: Vec<Vec<Vec<String>>>,
     /// The pages taken, the terminating empty one included.
     pages: usize,
     /// Set when the walk stopped because the last row's order term was NULL,
@@ -278,11 +419,18 @@ struct Walk {
     stopped_at_null: Option<String>,
 }
 
+impl Walk {
+    /// Every row the walk collected, page order preserved.
+    fn rows(&self) -> Vec<Vec<String>> {
+        self.page_rows.iter().flatten().cloned().collect()
+    }
+}
+
 /// Page `sql` with a cap of [`PAGE_CAP`] rows, from the first page to the
 /// empty one, exactly as a paging caller would: each page's statement comes
 /// from `plan_page` resumed at the previous page's last row.
 async fn walk(ctx: &SessionContext, sql: &str) -> Walk {
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut page_rows: Vec<Vec<Vec<String>>> = Vec::new();
     let mut resume: Option<ResumePosition> = None;
     let mut pages = 0usize;
     loop {
@@ -297,7 +445,7 @@ async fn walk(ctx: &SessionContext, sql: &str) -> Walk {
         let page: Vec<Vec<String>> = rows_of(&batches).into_iter().take(PAGE_CAP).collect();
         if page.is_empty() {
             return Walk {
-                rows,
+                page_rows,
                 pages,
                 stopped_at_null: None,
             };
@@ -316,16 +464,16 @@ async fn walk(ctx: &SessionContext, sql: &str) -> Walk {
             match resume_value(column, offset) {
                 Some(value) => tuple.push(value),
                 None => {
-                    rows.extend(page);
+                    page_rows.push(page);
                     return Walk {
-                        rows,
+                        page_rows,
                         pages,
                         stopped_at_null: Some(term.column.clone()),
                     };
                 }
             }
         }
-        rows.extend(page);
+        page_rows.push(page);
         resume = Some(ResumePosition::new(tuple));
     }
 }
@@ -341,6 +489,55 @@ fn row_at(batches: &[RecordBatch], index: usize) -> (&RecordBatch, usize) {
         remaining -= batch.num_rows();
     }
     panic!("row {index} is past the end of the result");
+}
+
+/// Where the walk's page sequence departs from `reference`, or `None` when
+/// page k held rows k of it from the first page to the last.
+fn sequence_finding(reference: &[Vec<String>], found: &Walk) -> Option<String> {
+    let mut cursor = 0usize;
+    for (index, page) in found.page_rows.iter().enumerate() {
+        let page_number = index + 1;
+        let end = cursor + page.len();
+        if end > reference.len() {
+            return Some(format!(
+                "page {page_number} runs past the end of the ordering: it starts at ordering \
+                 row {cursor} and holds {} rows, and the ordering has {}",
+                page.len(),
+                reference.len(),
+            ));
+        }
+        if page.as_slice() != &reference[cursor..end] {
+            return Some(format!(
+                "page {page_number} is not rows {cursor}..{end} of the ordering\n      page     \
+                 {page:?}\n      ordering {:?}",
+                &reference[cursor..end],
+            ));
+        }
+        if page.len() != PAGE_CAP && end != reference.len() {
+            return Some(format!(
+                "page {page_number} returned {} of the {PAGE_CAP} rows a page holds while {} \
+                 rows were still unwalked, so page k stopped meaning rows k of the ordering",
+                page.len(),
+                reference.len() - end,
+            ));
+        }
+        cursor = end;
+    }
+    let stopped = match &found.stopped_at_null {
+        Some(column) => format!(", stopped at a NULL {column}"),
+        None => String::new(),
+    };
+    if cursor != reference.len() {
+        return Some(format!(
+            "the walk delivered {cursor} of the ordering's {} rows in {} pages{stopped}",
+            reference.len(),
+            found.pages,
+        ));
+    }
+    found
+        .stopped_at_null
+        .as_ref()
+        .map(|column| format!("the walk delivered every row but stopped at a NULL {column}"))
 }
 
 /// The four statements this round exists for, plus the shapes that must keep
@@ -368,29 +565,26 @@ const STATEMENTS: &[&str] = &[
     "SELECT * FROM samples",
     "SELECT ts, series_id FROM samples ORDER BY ts",
     "SELECT ts, series_id, value FROM samples ORDER BY ts DESC, series_id",
+    "SELECT ts, series_id FROM samples ORDER BY series_id",
     "SELECT * FROM samples WHERE value > 0.5 ORDER BY ts",
-    // Refused now rather than walked: `value` is a float, and NaN satisfies no
-    // disjunct of a keyset predicate. Kept in the table so the refusal is
-    // exercised on the same path the walks take.
+    // Refused now rather than walked, both for a term whose values no cursor
+    // carries. `value` is a float, so it admits the NaN that
+    // `ResumeValue::Float` refuses; `labels` is a `Dictionary` over a `Map`,
+    // which no variant carries at all. Kept in the table so both refusals are
+    // exercised on the same path the walks take: a planner that admits either
+    // one reaches the cursor mint and dies there.
     "SELECT ts, series_id, value FROM samples ORDER BY value DESC, ts",
+    "SELECT * FROM samples ORDER BY labels, ts, series_id",
 ];
 
-/// The acceptance gate: every statement the planner claims a total order for
-/// pages to exactly the rows it returns unpaged.
-///
-/// Statements the planner refuses, and statements it plans with a
-/// `not_total` reason, are outside the claim: D5 pages the second kind under
-/// the equal-group rule, which is the caller's half and not this planner's. So
-/// a refusal and a not-total plan both satisfy this test, and the pinned
-/// classification in [`the_four_defect_statements_are_classified_exactly`] is
-/// what stops a fix from satisfying it by refusing everything.
-#[tokio::test]
-async fn a_total_order_claim_survives_an_executed_page_walk() {
-    let ctx = context();
+/// Walk every total-order statement over one fixture, returning how many were
+/// walked and what each departure from the ordering was.
+async fn walk_findings(rows: &[FixtureRow]) -> (usize, Vec<String>) {
+    let ctx = context_of(rows);
     let mut walked = 0usize;
     // Collected rather than asserted per statement: the first failing walk is
     // not the only one, and a suite that stops at it hides how wide the defect
-    // is. Every finding below names the rows that went missing.
+    // is.
     let mut findings: Vec<String> = Vec::new();
     for sql in STATEMENTS {
         let plan = match plan_page(sql, None) {
@@ -402,46 +596,67 @@ async fn a_total_order_claim_survives_an_executed_page_walk() {
         }
         walked += 1;
 
-        let unpaged = multiset(&rows_of(&execute(&ctx, sql).await));
-        let found = walk(&ctx, sql).await;
-        let walked_rows = multiset(&found.rows);
-        if walked_rows == unpaged && found.stopped_at_null.is_none() {
+        let unpaged = rows_of(&execute(&ctx, sql).await);
+        let reference_sql = reference_statement(sql, &plan);
+        let reference = rows_of(&execute(&ctx, &reference_sql).await);
+        // The reference has to be the same rows in some order, or the sequence
+        // assertion below is about the wrong result rather than about the walk.
+        if multiset(&reference) != multiset(&unpaged) {
+            findings.push(format!(
+                "{sql:?}\n    the tiebreak reference {reference_sql:?} returned {} rows against \
+                 the statement's own {}",
+                reference.len(),
+                unpaged.len(),
+            ));
             continue;
         }
 
-        let mut missing: Vec<String> = Vec::new();
-        for (row, count) in &unpaged {
-            let seen = walked_rows.get(row).copied().unwrap_or(0);
-            if seen != *count {
-                missing.push(format!("{row:?} unpaged {count} times, walked {seen}"));
-            }
+        let found = walk(&ctx, sql).await;
+        if let Some(finding) = sequence_finding(&reference, &found) {
+            findings.push(format!(
+                "{sql:?}\n    order_by {:?}, tiebreak {:?}, ordering {reference_sql:?}\n    \
+                 {finding}",
+                plan.order_by
+                    .iter()
+                    .map(|term| term.render())
+                    .collect::<Vec<String>>(),
+                plan.tiebreak_appended,
+            ));
         }
-        for (row, count) in &walked_rows {
-            if !unpaged.contains_key(row) {
-                missing.push(format!("{row:?} walked {count} times, never unpaged"));
-            }
-        }
-        findings.push(format!(
-            "{sql:?}\n    order_by {:?}, tiebreak {:?}\n    {} pages at a cap of \
-             {PAGE_CAP} returned {} of {} rows{}\n    {}",
-            plan.order_by
-                .iter()
-                .map(|term| term.render())
-                .collect::<Vec<String>>(),
-            plan.tiebreak_appended,
-            found.pages,
-            found.rows.len(),
-            unpaged.values().sum::<usize>(),
-            match &found.stopped_at_null {
-                Some(column) => format!(", stopped at a NULL {column}"),
-                None => String::new(),
-            },
-            missing.join("\n    "),
-        ));
+    }
+    (walked, findings)
+}
+
+/// The acceptance gate: every statement the planner claims a total order for
+/// pages to the unpaged ordering, page k holding rows k of it.
+///
+/// Statements the planner refuses, and statements it plans with a
+/// `not_total` reason, are outside the claim: D5 pages the second kind under
+/// the equal-group rule, which is the caller's half and not this planner's. So
+/// a refusal and a not-total plan both satisfy this test, and the pinned
+/// classification in [`the_four_defect_statements_are_classified_exactly`] is
+/// what stops a fix from satisfying it by refusing everything.
+#[tokio::test]
+async fn a_total_order_claim_survives_an_executed_page_walk() {
+    let fixtures: [(&str, &[FixtureRow]); 3] = [
+        ("the six-row fixture", FIXTURE),
+        ("a one-row table", ONE_ROW),
+        ("an empty table", NO_ROWS),
+    ];
+    let mut walked = 0usize;
+    let mut findings: Vec<String> = Vec::new();
+    for (label, rows) in fixtures {
+        let (count, found) = walk_findings(rows).await;
+        walked += count;
+        findings.extend(
+            found
+                .into_iter()
+                .map(|finding| format!("{label}: {finding}")),
+        );
     }
     assert!(
         findings.is_empty(),
-        "{} of {walked} total-order claims lost rows under an executed walk:\n  {}",
+        "{} of {walked} total-order claims did not page to their own ordering:\n  {}",
         findings.len(),
         findings.join("\n  "),
     );
@@ -452,17 +667,46 @@ async fn a_total_order_claim_survives_an_executed_page_walk() {
     );
 }
 
+/// A one-row table ends the walk on an empty SECOND page, and a zero-row table
+/// on an empty FIRST one.
+///
+/// Both are page counts the six-row fixture cannot produce, and both are the
+/// boundary a resume position is never built at: the first has exactly one
+/// cursor mint and the second has none.
+#[tokio::test]
+async fn a_walk_terminates_on_an_empty_page_at_both_table_boundaries() {
+    let sql = "SELECT * FROM samples ORDER BY ts";
+
+    let one = walk(&context_of(ONE_ROW), sql).await;
+    assert_eq!(one.pages, 2, "pages over a one-row table");
+    assert_eq!(
+        one.page_rows.len(),
+        1,
+        "non-empty pages over a one-row table"
+    );
+    assert_eq!(one.rows().len(), 1, "rows walked from a one-row table");
+    assert_eq!(one.stopped_at_null, None);
+
+    let none = walk(&context_of(NO_ROWS), sql).await;
+    assert_eq!(none.pages, 1, "pages over an empty table");
+    assert!(
+        none.page_rows.is_empty(),
+        "non-empty pages over an empty table"
+    );
+    assert_eq!(none.stopped_at_null, None);
+}
+
 /// The fixture can actually expose the defects it is here to expose.
 ///
-/// Pinned as exact counts. A fixture edit that drops the tie or the zero
-/// leaves every walk above passing over rows that no keyset predicate could
-/// lose, which is how a suite of this shape goes vacuous.
+/// Pinned as exact counts. A fixture edit that drops one of these leaves every
+/// walk above passing over rows that no mutation of the planner could disturb,
+/// which is how a suite of this shape goes vacuous.
 #[tokio::test]
 async fn the_fixture_can_expose_a_broken_keyset_predicate() {
     let ctx = context();
 
     let rows = rows_of(&execute(&ctx, "SELECT ts, value, series_id FROM samples").await);
-    assert_eq!(rows.len(), 3, "fixture row count");
+    assert_eq!(rows.len(), 6, "fixture row count");
 
     let tied = rows_of(
         &execute(
@@ -488,6 +732,9 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
         "rows sharing one (ts, value)",
     );
 
+    // One, not two: DataFusion compares floats by a total order, so `-0.0 = 0`
+    // is FALSE and only the positive zero is NULLed. Measured, not assumed:
+    // `SELECT value, value = 0 FROM samples` returns false for the `-0.0` row.
     let nulled = rows_of(
         &execute(
             &ctx,
@@ -500,6 +747,18 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
         vec![vec!["1".to_string()]],
         "rows a projected nullif(value, 0) nulls",
     );
+    let zeroes = rows_of(
+        &execute(
+            &ctx,
+            "SELECT count(*) AS n FROM samples WHERE value = 0 OR value = -0.0",
+        )
+        .await,
+    );
+    assert_eq!(
+        zeroes,
+        vec![vec!["2".to_string()]],
+        "the two zero rows are distinct values, not one repeated",
+    );
 
     let distinct_identity = rows_of(
         &execute(
@@ -510,8 +769,44 @@ async fn the_fixture_can_expose_a_broken_keyset_predicate() {
     );
     assert_eq!(
         distinct_identity,
-        vec![vec!["3".to_string()]],
+        vec![vec!["6".to_string()]],
         "the fixture respects the samples row identity",
+    );
+
+    let rendered = rows_of(&execute(&ctx, "SELECT value FROM samples").await);
+    let negative_zeroes = rendered.iter().filter(|row| row[0] == "-0.0").count();
+    assert_eq!(negative_zeroes, 1, "rows rendering as a negative zero");
+    let nans = rendered.iter().filter(|row| row[0] == "NaN").count();
+    assert_eq!(nans, 1, "rows rendering as NaN");
+
+    let odd_ts = rows_of(
+        &execute(
+            &ctx,
+            "SELECT count(*) AS n FROM samples WHERE arrow_cast(ts, 'Int64') % 1000 != 0",
+        )
+        .await,
+    );
+    assert_eq!(
+        odd_ts,
+        vec![vec!["2".to_string()]],
+        "rows whose ts is not a whole microsecond",
+    );
+
+    // Anti-correlation: ordering on `ts` and ordering on `series_id` do not
+    // agree at the head, so a tiebreak that appends the wrong one of the two
+    // produces a different sequence rather than the same one.
+    let by_ts = rows_of(&execute(&ctx, "SELECT series_id FROM samples ORDER BY ts LIMIT 1").await);
+    let by_series = rows_of(
+        &execute(
+            &ctx,
+            "SELECT series_id FROM samples ORDER BY series_id DESC LIMIT 1",
+        )
+        .await,
+    );
+    assert_eq!(
+        by_ts, by_series,
+        "the smallest ts does not carry the largest series_id, so the fixture is \
+         not anti-correlated",
     );
 }
 
@@ -564,6 +859,7 @@ fn the_four_defect_statements_are_classified_exactly() {
         // passes here. `value DESC` used to be this case and is now refused
         // outright: a float term admits NaN, which no keyset disjunct places.
         "SELECT ts, series_id, value FROM samples ORDER BY ts DESC, series_id",
+        "SELECT ts, series_id FROM samples ORDER BY series_id",
         "SELECT * FROM samples WHERE value > 0.5 ORDER BY ts",
     ];
     for sql in must_stay_total {
