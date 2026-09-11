@@ -122,8 +122,9 @@ new_scenario() {
   printf '10 feature-a aaaaaaaaaaaa\n' >"${SCN_DIR}/prs.txt"
 }
 
-# A single job row: name, start, end (ISO-8601).
-job_row() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+# A single job row: name, start, end (ISO-8601), optional conclusion
+# (defaults to blank, matching a bare cancelled-run job).
+job_row() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-}"; }
 
 cleanup_dirs=()
 cleanup() { for d in "${cleanup_dirs[@]:-}"; do [[ -n "${d}" ]] && rm -rf "${d}"; done; }
@@ -187,6 +188,37 @@ check_eq "D: dry run reruns nothing" "" "${RERUNS}"
 check_eq "D: dry run exits 0" "0" "${RC}"
 grep -q "dry run" "${SCN_DIR}/out.txt" && d_dry=1 || d_dry=0
 check_eq "D: dry run says so" "1" "${d_dry}"
+
+# === Case E: a job's startedAt is the Go zero-value sentinel (job cancelled
+#     before it ever started -- gh's JSON null decodes to this string, not
+#     blank). A second, normal job in the same run is far below its cap.
+#     The sentinel job must not manufacture a bogus multi-thousand-year
+#     duration that gets refused as a timeout -> RERUN.
+new_scenario; cleanup_dirs+=("${SCN_DIR}")
+printf '500 ci\n' >"${SCN_DIR}/runs.txt"
+printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-500.meta"
+{
+  job_row quick 0001-01-01T00:00:00Z 2026-09-10T06:05:00Z cancelled
+  job_row features 2026-09-10T06:00:00Z 2026-09-10T06:12:00Z cancelled
+} >"${SCN_DIR}/run-500.jobs"
+run_sweep -y
+check_eq "E: zero-value startedAt job is not a false timeout (rerun)" "500" "${RERUNS}"
+check_eq "E: zero-value startedAt run exits 0" "0" "${RC}"
+
+# === Case F: a job that finished successfully happens to land inside the
+#     near-cap margin. A timed-out job never has conclusion "success", so
+#     this must not be read as a timeout. A second, cancelled job in the
+#     same run is nowhere near its cap -> RERUN.
+new_scenario; cleanup_dirs+=("${SCN_DIR}")
+printf '600 ci\n' >"${SCN_DIR}/runs.txt"
+printf '.github/workflows/ci.yml\taaaaaaaaaaaa\n' >"${SCN_DIR}/run-600.meta"
+{
+  job_row features 2026-09-10T06:00:00Z 2026-09-10T06:29:50Z success
+  job_row quick 2026-09-10T06:00:00Z 2026-09-10T06:02:00Z cancelled
+} >"${SCN_DIR}/run-600.jobs"
+run_sweep -y
+check_eq "F: successful near-cap job is not a false timeout (rerun)" "600" "${RERUNS}"
+check_eq "F: successful near-cap run exits 0" "0" "${RC}"
 
 echo
 echo "passed: ${pass}  failed: ${fail}"
